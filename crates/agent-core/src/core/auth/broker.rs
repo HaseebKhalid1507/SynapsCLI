@@ -373,11 +373,20 @@ pub trait CloudBackend: Send + Sync {
 
 #[derive(Clone)]
 struct ProductionCloudBackend {
+    /// Dedicated credential-bearing client: redirects are always disabled and
+    /// both connect and whole-request time are bounded, independent of callers.
     http: reqwest::Client,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl ProductionCloudBackend {
-    fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    fn new(_http: reqwest::Client) -> Self {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(90))
+            .build()
+            .expect("cloud HTTPS client configuration is valid");
+        Self { http, refresh_lock: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     fn state(&self, provider: CloudProviderId) -> Result<serde_json::Value, BrokerError> {
@@ -431,6 +440,14 @@ impl ProductionCloudBackend {
                 .map(str::to_owned)
                 .ok_or_else(|| BrokerError::Credential("invalid Azure token state".into()));
         }
+        // Serialize refresh and re-read after waiting so concurrent catalog and
+        // invocation calls reuse the single atomically persisted rotation.
+        let _refresh = self.refresh_lock.lock().await;
+        *state = self.state(CloudProviderId::AzureOpenAi)?;
+        if state[key]["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
+            return state[key]["access_token"].as_str().map(str::to_owned)
+                .ok_or_else(|| BrokerError::Credential("invalid Azure token state".into()));
+        }
         let config: super::cloud::AzureOpenAiConfig =
             serde_json::from_value(state["config"].clone())
                 .map_err(|_| BrokerError::Credential("invalid Azure broker state".into()))?;
@@ -482,6 +499,12 @@ impl ProductionCloudBackend {
             return state["access_token"]
                 .as_str()
                 .map(str::to_owned)
+                .ok_or_else(|| BrokerError::Credential("invalid Vertex token state".into()));
+        }
+        let _refresh = self.refresh_lock.lock().await;
+        *state = self.state(CloudProviderId::GoogleVertex)?;
+        if state["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
+            return state["access_token"].as_str().map(str::to_owned)
                 .ok_or_else(|| BrokerError::Credential("invalid Vertex token state".into()));
         }
         let client_id = state["client_id"]
@@ -624,8 +647,10 @@ impl CloudBackend for ProductionCloudBackend {
                 for _ in 0..20 {
                     let mut url=format!("https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models",config.location,config.project_id,config.location);
                     if let Some(p) = &page {
-                        url.push_str("?pageToken=");
-                        url.push_str(p);
+                        let mut parsed = url::Url::parse(&url)
+                            .map_err(|_| BrokerError::Transport("invalid Vertex catalog URL".into()))?;
+                        parsed.query_pairs_mut().append_pair("pageToken", p);
+                        url = parsed.into();
                     }
                     let r = self
                         .http
@@ -683,6 +708,17 @@ impl CloudBackend for ProductionCloudBackend {
         if context_ref != provider.as_str() {
             return Err(BrokerError::Denied(
                 "cloud context does not match stored provider".into(),
+            ));
+        }
+        if !request.tools.is_empty() {
+            return Err(BrokerError::Denied(
+                "tools are not yet supported by cloud providers".into(),
+            ));
+        }
+        let authorized = self.catalog(provider, context_ref, false).await?;
+        if !authorized.iter().any(|entry| entry.id == model_id) {
+            return Err(BrokerError::Denied(
+                "model is not present in the current provider catalog".into(),
             ));
         }
         match provider {

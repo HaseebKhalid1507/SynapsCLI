@@ -130,6 +130,7 @@ async fn run_cloud_login(provider: LoginProvider, profile: Option<String>) {
                 "\n\x1b[31m✗ {} login failed: {}\x1b[0m",
                 provider.name, message
             );
+            std::process::exit(1);
         }
     }
 }
@@ -228,7 +229,21 @@ async fn login_azure_openai() -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let endpoint = format!("https://{}.openai.azure.com", config.resource_name);
+    // Resolve the data-plane endpoint from ARM metadata before committing any
+    // state; never derive an authority from the user-supplied resource name.
+    let account_url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}?api-version=2023-05-01",
+        config.subscription_id, config.resource_group, config.resource_name
+    );
+    let account: serde_json::Value = http.get(account_url)
+        .bearer_auth(arm["access_token"].as_str().ok_or("invalid Azure ARM token")?)
+        .send().await.map_err(|_| "Azure ARM endpoint resolution failed")?
+        .error_for_status().map_err(|_| "Azure ARM resource validation failed")?
+        .json().await.map_err(|_| "invalid Azure ARM resource metadata")?;
+    let endpoint = account.pointer("/properties/endpoint").and_then(|v| v.as_str())
+        .ok_or("Azure ARM metadata omitted the resource endpoint")?;
+    auth::azure_openai::AzureEndpoint::parse(endpoint)
+        .map_err(|_| "Azure ARM returned an untrusted resource endpoint")?;
     auth::save_cloud_state(
         "azure-openai",
         &serde_json::json!({"config":config,"client_id":client_id,"endpoint":endpoint,"refresh_token":infer["refresh_token"].as_str().unwrap_or(&refresh),"arm":{"access_token":arm["access_token"],"expires_at":now+arm["expires_in"].as_u64().unwrap_or(3600)*1000},"inference":{"access_token":infer["access_token"],"expires_at":now+infer["expires_in"].as_u64().unwrap_or(3600)*1000}}),

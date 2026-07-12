@@ -699,7 +699,11 @@ pub fn decode_converse_stream(mut bytes: &[u8]) -> Result<Vec<ConverseEvent>, Aw
         bytes = &bytes[total..];
     }
     if !matches!(out.last(), Some(ConverseEvent::Done)) {
-        out.push(ConverseEvent::Done);
+        // EOF without messageStop is truncation, never successful completion.
+        return Err(AwsError::Upstream);
+    }
+    if out.iter().filter(|e| matches!(e, ConverseEvent::Done)).count() != 1 {
+        return Err(AwsError::Upstream);
     }
     Ok(out)
 }
