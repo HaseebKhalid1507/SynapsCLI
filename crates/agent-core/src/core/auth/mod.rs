@@ -20,6 +20,7 @@ pub mod cloud;
 mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
+pub mod google_vertex;
 mod openai_codex;
 mod pkce;
 pub mod provider;
