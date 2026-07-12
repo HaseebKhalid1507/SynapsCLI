@@ -20,7 +20,7 @@ use anyhow::Context;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use futures::StreamExt;
@@ -150,16 +150,21 @@ async fn terminal_flush(state: &Mutex<RpcState>) {
 
 /// Spawn a streaming task for a `Prompt` or `FollowUp` command.
 ///
-/// **Race fix (issue 1):** `in_flight` is set on the shared state **before** the
-/// function returns so the drainer always sees `is_streaming() == true` for the
-/// entirety of the active prompt.  The previous pattern set it _after_ returning,
-/// which left a window where a concurrently-woken drainer could see `busy = false`
-/// and inject events as idle instead of buffering them.
+/// **Race fix — oneshot start barrier (issue 1):**
+/// The spawned task must NOT touch shared state or call `terminal_flush` until
+/// `in_flight` has been set, otherwise a fast error path can call
+/// `terminal_flush` (clearing `in_flight = None`) before `in_flight` is even
+/// written — leaving a zombie `JoinHandle` in the slot.
 ///
-/// The task takes a snapshot of `api_messages` while briefly holding the mutex,
-/// then releases it before the long-running LLM stream begins so that `Abort`
-/// and read-only commands (`GetState`, `GetSessionStats`) can still acquire the
-/// lock while the stream is in flight.
+/// Protocol:
+/// 1. Create a `oneshot` channel `(start_tx, start_rx)`.
+/// 2. Spawn the task — it immediately awaits `start_rx` before any state work.
+/// 3. Set `in_flight = Some(InFlight { handle, … })` under the lock.
+/// 4. Send `start_tx` to release the task.
+///
+/// This guarantees: `terminal_flush` cannot run until `in_flight` is set, so
+/// every `in_flight = None` from inside the task sees a previously-set handle
+/// and leaves state consistent. Abort can always find the handle.
 async fn spawn_prompt(
     prompt_id: String,
     state: Arc<Mutex<RpcState>>,
@@ -176,9 +181,18 @@ async fn spawn_prompt(
     let messages: Vec<synaps_cli::SharedMessage> =
         state.lock().await.api_messages.clone();
 
+    // Start barrier: task awaits this before touching any state/stream work.
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+
     let state_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
         let state = state_task;
+
+        // Wait until in_flight has been registered so terminal_flush is safe.
+        // If the sender is dropped (caller panicked), just exit cleanly.
+        if start_rx.await.is_err() {
+            return;
+        }
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
@@ -309,9 +323,14 @@ async fn spawn_prompt(
         terminal_flush(&state).await;
     });
 
-    // Issue 1 fix: set in_flight BEFORE returning so the drainer always sees
-    // is_streaming() == true from the moment the prompt is accepted.
+    // Register in_flight BEFORE releasing the start barrier.
+    // This guarantees the task cannot call terminal_flush (which clears in_flight)
+    // before in_flight is set — eliminating the zombie-handle race.
     state.lock().await.in_flight = Some(InFlight { prompt_id, cancel, handle });
+
+    // Release the task. From this point the task may proceed with stream work.
+    // If send fails the task already exited (should never happen in practice).
+    let _ = start_tx.send(());
 }
 
 // ─── Per-command handlers ─────────────────────────────────────────────────────
@@ -852,12 +871,29 @@ pub async fn run(
 
                         // Spec: let an in-flight stream finish naturally (no cancel).
                         // Poll in_flight until the streaming task clears it.
-                        loop {
-                            let done = state.lock().await.in_flight.is_none();
-                            if done {
-                                break;
+                        // Bounded by 30 s to prevent a zombie stream from hanging shutdown.
+                        let shutdown_poll = async {
+                            loop {
+                                let done = state.lock().await.in_flight.is_none();
+                                if done {
+                                    break;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        };
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(30),
+                            shutdown_poll,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Shutdown: in-flight stream did not finish within 30 s; \
+                                     proceeding with shutdown anyway"
+                                );
+                            }
                         }
 
                         state.lock().await.save_session().await;

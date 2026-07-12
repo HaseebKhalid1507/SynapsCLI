@@ -244,3 +244,44 @@ fn event_metadata_survives_drain_and_payload_construction() {
     // Source is never the fake sentinel
     assert_ne!(payload.source, "buffered");
 }
+
+// ─── T3: claim_auto_turn uniform cap semantics ───────────────────────────────
+
+/// Verifies the uniform cap semantics used by TUI, chat, and server.
+/// First 5 claims (0..AUTO_TURN_CAP) allowed; 6th and beyond denied until reset.
+#[test]
+fn claim_auto_turn_uniform_boundary_semantics() {
+    use agent_engine::engine::reactor::{claim_auto_turn, AUTO_TURN_CAP};
+
+    let mut counter: u32 = 0;
+
+    // First AUTO_TURN_CAP (5) turns allowed.
+    for i in 1..=AUTO_TURN_CAP {
+        assert!(
+            claim_auto_turn(&mut counter),
+            "turn {i} of {AUTO_TURN_CAP} must be allowed"
+        );
+        assert_eq!(counter, i, "counter must equal {i} after {i} claims");
+    }
+
+    // 6th turn denied; counter must remain at cap.
+    assert!(
+        !claim_auto_turn(&mut counter),
+        "turn {} must be denied (cap = {})", AUTO_TURN_CAP + 1, AUTO_TURN_CAP
+    );
+    assert_eq!(counter, AUTO_TURN_CAP, "counter must remain at cap when denied");
+
+    // Repeated denials keep counter stable.
+    for _ in 0..3 {
+        assert!(!claim_auto_turn(&mut counter), "must remain denied");
+        assert_eq!(counter, AUTO_TURN_CAP);
+    }
+
+    // User input resets; first turn immediately re-allowed.
+    counter = 0;
+    assert!(
+        claim_auto_turn(&mut counter),
+        "first turn after reset must be allowed"
+    );
+    assert_eq!(counter, 1);
+}

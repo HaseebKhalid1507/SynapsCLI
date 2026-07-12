@@ -123,3 +123,83 @@ fn rpc_wake_action_never_run_turn_because_auto_turn_disabled() {
     assert_ne!(action, agent_engine::engine::reactor::WakeAction::RunTurn,
         "RPC mode must not auto-turn on event drain");
 }
+
+// ─── T5: RPC start-barrier ordering — terminal_flush cannot precede in_flight ─
+
+/// Seam test for the oneshot start-barrier ordering guarantee in `spawn_prompt`.
+///
+/// We simulate the race by using a oneshot channel directly:
+///   1. Spawn a task that awaits `start_rx` before calling `terminal_flush`.
+///   2. Register "in_flight" (simulated here as a flag).
+///   3. Send on `start_tx` to release the task.
+///   4. Join the task and assert that `in_flight` was set before the task ran.
+///
+/// This is a deterministic seam test — it does not call `spawn_prompt` directly
+/// (which needs a full Runtime) but exercises the identical ordering invariant.
+#[tokio::test]
+async fn rpc_start_barrier_in_flight_set_before_task_proceeds() {
+    use tokio::sync::{oneshot, Mutex};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct FakeState {
+        in_flight_set: bool,
+        task_started: bool,
+    }
+
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+
+    let state_task = Arc::clone(&state);
+    let handle = tokio::spawn(async move {
+        // Task MUST wait for start signal before observing/mutating state.
+        start_rx.await.expect("start_tx should not be dropped");
+        let mut st = state_task.lock().await;
+        // By the time we run, in_flight_set MUST already be true.
+        assert!(
+            st.in_flight_set,
+            "task ran before in_flight was registered — start barrier violated!"
+        );
+        st.task_started = true;
+    });
+
+    // Register in_flight BEFORE releasing the barrier.
+    {
+        let mut st = state.lock().await;
+        st.in_flight_set = true;
+    }
+
+    // Release the barrier — task may now proceed.
+    start_tx.send(()).expect("task should be alive");
+
+    handle.await.expect("task panicked");
+
+    let st = state.lock().await;
+    assert!(st.in_flight_set, "in_flight must remain set after task completes");
+    assert!(st.task_started, "task must have run");
+}
+
+/// Complementary: if start_tx is dropped (caller panic), task exits cleanly —
+/// no zombie, no state mutation.
+#[tokio::test]
+async fn rpc_start_barrier_dropped_tx_exits_task_cleanly() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use tokio::sync::oneshot;
+
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+    let side_effect = Arc::new(AtomicBool::new(false));
+    let side_effect_task = Arc::clone(&side_effect);
+
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            // Correct: caller dropped — exit without touching state.
+            return;
+        }
+        // Should NOT reach here.
+        side_effect_task.store(true, Ordering::SeqCst);
+    });
+
+    drop(start_tx); // Simulate caller panic / drop.
+    handle.await.expect("task should exit cleanly");
+    assert!(!side_effect.load(Ordering::SeqCst), "task must not execute state work when start_tx is dropped");
+}

@@ -16,7 +16,7 @@ use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::engine::session::ConversationState;
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::{CancellationToken, flush_stdout};
 use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
@@ -183,9 +183,10 @@ pub async fn run(
             PromptRead::EventWake { run_turn: true } => {
                 // A runtime event was injected; policy says RunTurn.
                 // Events were already drained + injected by drain_event_queue above.
-                // Issue 6 fix: increment consecutive_auto_turns BEFORE the turn so
-                // the cap counter is correct if further events arrive mid-stream.
-                consecutive_auto_turns += 1;
+                // claim_auto_turn: increment only if allowed; if denied (cap) we
+                // got run_turn=true from wake_action which already checked < cap,
+                // so this should always succeed here — but use the gate for safety.
+                let _ = claim_auto_turn(&mut consecutive_auto_turns);
             }
 
             PromptRead::Line(raw_line) => {
@@ -424,14 +425,17 @@ pub async fn run(
                     );
                     match action {
                         WakeAction::RunTurn => {
-                            consecutive_auto_turns += 1;
-                            if consecutive_auto_turns >= AUTO_TURN_CAP {
+                            if claim_auto_turn(&mut consecutive_auto_turns) {
+                                continue 'turn_loop;
+                            } else {
+                                // claim denied: counter was already at cap.
+                                // fall through to park (treated as Forward).
                                 eprintln!(
                                     "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
                                     AUTO_TURN_CAP
                                 );
+                                break 'turn_loop;
                             }
-                            continue 'turn_loop;
                         }
                         WakeAction::Forward | WakeAction::Nothing => {
                             // Cap reached or nothing more — park at prompt.

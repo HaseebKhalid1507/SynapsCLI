@@ -163,6 +163,35 @@ pub fn event_payload_from_drained(drained: &DrainedEvent) -> EventPayload {
     }
 }
 
+// ── Auto-turn cap helper ──────────────────────────────────────────────────────
+
+/// Centralised auto-turn claim gate.
+///
+/// **Semantics (single source of truth):**
+/// * `counter < AUTO_TURN_CAP` → allowed: increment `counter` and return `true`.
+/// * `counter >= AUTO_TURN_CAP` → denied: leave `counter` unchanged, return `false`.
+/// * User input resets `counter` to 0 (caller responsibility — not this function).
+///
+/// All paths that may fire an auto-triggered model turn (TUI event arm, TUI
+/// stream arm, chat EventWake, chat AutoTriggerEvents, server idle wake, server
+/// AutoTriggerEvents) **must** call this function and bail when it returns `false`
+/// instead of duplicating the `fetch_add / >= cap` pattern inline.
+///
+/// # Arguments
+/// * `counter` — mutable reference to the caller's `u32` counter.
+///
+/// # Returns
+/// `true` if a turn is allowed (counter was incremented), `false` if parked.
+#[inline]
+pub fn claim_auto_turn(counter: &mut u32) -> bool {
+    if *counter < AUTO_TURN_CAP {
+        *counter += 1;
+        true
+    } else {
+        false
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Returns `true` when the agent idle loop should park on `queue.notified()`
@@ -477,5 +506,55 @@ mod tests {
     #[test]
     fn idle_should_wait_true_when_large_queue() {
         assert!(idle_should_wait(false, 999));
+    }
+
+    // ── claim_auto_turn boundary tests ─────────────────────────────────────
+
+    #[test]
+    fn claim_auto_turn_first_five_allowed() {
+        let mut counter: u32 = 0;
+        for _ in 0..AUTO_TURN_CAP {
+            assert!(claim_auto_turn(&mut counter), "turn within cap must be allowed");
+        }
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must equal cap after 5 claims");
+    }
+
+    #[test]
+    fn claim_auto_turn_sixth_denied() {
+        let mut counter: u32 = AUTO_TURN_CAP;
+        assert!(!claim_auto_turn(&mut counter), "turn at cap must be denied");
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must remain unchanged when denied");
+    }
+
+    #[test]
+    fn claim_auto_turn_remains_denied_until_reset() {
+        let mut counter: u32 = AUTO_TURN_CAP;
+        assert!(!claim_auto_turn(&mut counter));
+        assert!(!claim_auto_turn(&mut counter));
+        assert!(!claim_auto_turn(&mut counter));
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must not change while denied");
+    }
+
+    #[test]
+    fn claim_auto_turn_reset_re_enables() {
+        let mut counter: u32 = AUTO_TURN_CAP;
+        assert!(!claim_auto_turn(&mut counter));
+        // Simulate user input reset
+        counter = 0;
+        assert!(claim_auto_turn(&mut counter), "after reset first turn must be allowed");
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn claim_auto_turn_exact_boundary_sequence() {
+        // Exactly AUTO_TURN_CAP (5) allowed, 6th denied
+        let mut c: u32 = 0;
+        for i in 1..=AUTO_TURN_CAP {
+            assert!(claim_auto_turn(&mut c), "turn {i} must be allowed");
+            assert_eq!(c, i);
+        }
+        // 6th
+        assert!(!claim_auto_turn(&mut c));
+        assert_eq!(c, AUTO_TURN_CAP);
     }
 }
