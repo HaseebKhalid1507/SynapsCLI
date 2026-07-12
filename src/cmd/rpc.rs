@@ -236,10 +236,25 @@ async fn spawn_prompt(
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
 
-    // Snapshot messages while holding the lock.
-    // Vec<SharedMessage> clone = pointer bumps only.
-    let messages: Vec<synaps_cli::SharedMessage> =
-        state.lock().await.api_messages.clone();
+    // Snapshot messages under the lock.
+    // For auto: IDs we also re-validate the reservation atomically — same lock
+    // acquisition for both the guard check and the snapshot so there is no
+    // window between "reservation still valid" and "messages snapshotted".
+    // Normal client prompts skip the guard (they were already validated by
+    // handle_prompt's is_busy() check before reaching here).
+    let messages: Vec<synaps_cli::SharedMessage> = {
+        let st = state.lock().await;
+        if prompt_id.starts_with("auto:") && (!st.auto_turn_pending || st.in_flight.is_some()) {
+            tracing::warn!(
+                prompt_id,
+                auto_turn_pending = st.auto_turn_pending,
+                in_flight_live = st.in_flight.is_some(),
+                "rpc: spawn_prompt: auto-turn reservation invalidated — aborting"
+            );
+            return;
+        }
+        st.api_messages.clone()
+    };
 
     // Start barrier: task awaits this before touching any state/stream work.
     let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -936,6 +951,26 @@ pub async fn run(
         let auto_turn_tx_s = auto_turn_tx.clone();
         tokio::spawn(async move {
             while let Some(auto_id) = auto_turn_rx.recv().await {
+                // ── Stale-reservation guard ───────────────────────────────────
+                // An Abort or new Prompt can clear `auto_turn_pending` between
+                // the drainer/Done-path reserving the id and the scheduler
+                // receiving it.  Validate under lock before proceeding so we
+                // never overwrite a live `in_flight` with a ghost auto-turn.
+                {
+                    let mut st = state_s.lock().await;
+                    if !st.auto_turn_pending || st.in_flight.is_some() {
+                        tracing::warn!(
+                            auto_id,
+                            auto_turn_pending = st.auto_turn_pending,
+                            in_flight_live = st.in_flight.is_some(),
+                            "rpc: scheduler: stale auto-turn reservation — dropping"
+                        );
+                        // Clear the pending flag in case it's still set but
+                        // in_flight raced in from a concurrent real prompt.
+                        st.auto_turn_pending = false;
+                        continue;
+                    }
+                }
                 tracing::debug!(auto_id, "rpc: auto-turn scheduler: calling spawn_prompt");
                 spawn_prompt(auto_id, Arc::clone(&state_s), writer_s.clone(), auto_turn_tx_s.clone()).await;
             }
