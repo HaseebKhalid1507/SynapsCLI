@@ -1,11 +1,13 @@
 //! Provider registry — catalog of known OpenAI-compatible endpoints.
 //!
-//! Ported from `openai-runtime::registry`, extended to accept a config map
-//! override for API keys (checked before env vars).
+//! Connection/credential metadata (base URLs, key discovery) is broker-owned
+//! (`agent_core::auth::static_providers` / `agent_core::auth::broker`). This
+//! module keeps the engine-side model catalog and produces credential-free
+//! routing data: no function here returns or accepts an API key.
 
 use serde::Deserialize;
 use super::types::ProviderConfig;
-use std::collections::BTreeMap;
+use agent_core::auth::broker;
 
 #[derive(Debug)]
 pub struct ProviderSpec {
@@ -258,18 +260,17 @@ pub fn providers() -> &'static [ProviderSpec] {
     &PROVIDERS
 }
 
-/// Look up a provider by key and resolve its API key (config override first, then env vars).
-pub fn resolve_provider(
-    key: &str,
-    overrides: &BTreeMap<String, String>,
-) -> Option<(ProviderConfig, &'static str)> {
+/// Look up a provider by key. Returns routing data only when the broker
+/// reports a credential is available; the key itself never leaves the broker.
+pub fn resolve_provider(key: &str) -> Option<(ProviderConfig, &'static str)> {
     let specs = providers();
     let spec = specs.iter().find(|s| s.key == key)?;
-    let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)?;
+    if !broker::static_key_configured(spec.key) {
+        return None;
+    }
     Some((
         ProviderConfig {
             base_url: spec.base_url.to_string(),
-            api_key,
             model: spec.default_model.to_string(),
             provider: spec.key.to_string(),
         },
@@ -277,31 +278,28 @@ pub fn resolve_provider(
     ))
 }
 
-/// Resolve a provider + specific model.
-pub fn resolve_provider_model(
-    key: &str,
-    model: &str,
-    overrides: &BTreeMap<String, String>,
-) -> Option<ProviderConfig> {
-    // Special case: local provider — dynamic URL from config/env
+/// Resolve a provider + specific model to credential-free routing data.
+pub fn resolve_provider_model(key: &str, model: &str) -> Option<ProviderConfig> {
+    // Special case: local provider — dynamic (non-secret) URL configuration.
     if key == "local" {
-        return Some(resolve_local(model, overrides));
+        return Some(resolve_local(model));
     }
     let specs = providers();
     let spec = specs.iter().find(|s| s.key == key)?;
-    let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)?;
+    if !broker::static_key_configured(spec.key) {
+        return None;
+    }
     Some(ProviderConfig {
         base_url: spec.base_url.to_string(),
-        api_key,
         model: model.to_string(),
         provider: spec.key.to_string(),
     })
 }
 
 /// Resolve `"provider/model"` shorthand.
-pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
+pub fn resolve_shorthand(s: &str) -> Option<ProviderConfig> {
     let (provider_key, model) = s.split_once('/')?;
-    resolve_provider_model(provider_key, model, overrides)
+    resolve_provider_model(provider_key, model)
 }
 
 /// Resolve `"openai-codex/model"` shorthand if Codex OAuth is configured.
@@ -313,8 +311,7 @@ pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
     Some(ProviderConfig {
         base_url: "https://chatgpt.com/backend-api".to_string(),
         // Credentials are resolved immediately before the request through the
-        // credential broker. Routing metadata must never capture env secrets.
-        api_key: String::new(),
+        // credential broker. Routing metadata never carries secrets.
         model: model.to_string(),
         provider: "openai-codex".to_string(),
     })
@@ -322,68 +319,48 @@ pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
 
 /// Resolve a local model endpoint (Ollama, LM Studio, vLLM, llama.cpp, etc.)
 ///
-/// URL resolution: `provider.local.url` in config → `LOCAL_ENDPOINT` env → `http://localhost:11434/v1`
-/// API key: `provider.local` in config → `LOCAL_API_KEY` env → `"local"` (most local servers don't need one)
-fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> ProviderConfig {
-    let base_url = overrides
-        .get("local.url")
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .or_else(|| std::env::var("LOCAL_ENDPOINT").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
-
-    let api_key = overrides
-        .get("local")
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .or_else(|| std::env::var("LOCAL_API_KEY").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "local".to_string());
-
+/// URL resolution (non-secret): `provider.local.url` config → `LOCAL_ENDPOINT`
+/// env → `http://localhost:11434/v1`. Any optional key stays broker-owned and
+/// is applied at request time by the broker proxy.
+fn resolve_local(model: &str) -> ProviderConfig {
     ProviderConfig {
-        base_url,
-        api_key,
+        base_url: broker::local_endpoint_url(),
         model: model.to_string(),
         provider: "local".to_string(),
     }
 }
 
 pub async fn fetch_provider_models(
-    client: &reqwest::Client,
     provider_key: &str,
-    overrides: &BTreeMap<String, String>,
 ) -> Result<Vec<ProviderModelInfo>, String> {
     let spec = providers()
         .iter()
         .find(|spec| spec.key == provider_key)
         .ok_or_else(|| format!("unknown provider: {provider_key}"))?;
-    let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)
-        .ok_or_else(|| format!("{} is not configured", spec.name))?;
-    let url = format!("{}/models", spec.base_url.trim_end_matches('/'));
-    let response = client
-        .get(url)
-        .bearer_auth(api_key)
-        .send()
+    // The broker applies the credential; this path never sees the key.
+    let response = broker::global_broker()
+        .proxy(broker::ProxyRequest {
+            provider: spec.key.to_string(),
+            method: broker::ProxyMethod::Get,
+            path: "/models".to_string(),
+            body: None,
+            stream: false,
+        })
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("failed to read response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("model list failed: HTTP {status}"));
+        .map_err(|e| e.to_string())?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("model list failed: HTTP {}", response.status));
     }
-    parse_provider_models_response(&body).map_err(|e| format!("failed to parse model list: {e}"))
+    parse_provider_models_response(&response.body)
+        .map_err(|e| format!("failed to parse model list: {e}"))
 }
 
-/// List all providers with key status.
-pub fn list_providers(
-    overrides: &BTreeMap<String, String>,
-) -> Vec<(&'static str, &'static str, bool, usize)> {
+/// List all providers with (non-secret) key status.
+pub fn list_providers() -> Vec<(&'static str, &'static str, bool, usize)> {
     providers()
         .iter()
         .map(|s| {
-            let has_key = resolve_api_key(s.key, s.env_vars, overrides).is_some();
+            let has_key = broker::static_key_configured(s.key);
             (s.key, s.name, has_key, s.models.len())
         })
         .collect()
@@ -396,38 +373,51 @@ pub fn list_models(key: &str) -> Option<Vec<(&'static str, &'static str, &'stati
     Some(spec.models.to_vec())
 }
 
-/// Find all providers with a resolvable API key.
-pub fn configured_providers(
-    overrides: &BTreeMap<String, String>,
-) -> Vec<(&'static str, &'static str, &'static str)> {
+/// Find all providers with a broker-available credential.
+pub fn configured_providers() -> Vec<(&'static str, &'static str, &'static str)> {
     providers()
         .iter()
-        .filter_map(|s| {
-            resolve_api_key(s.key, s.env_vars, overrides)
-                .map(|_| (s.key, s.name, s.default_model))
-        })
+        .filter(|s| broker::static_key_configured(s.key))
+        .map(|s| (s.key, s.name, s.default_model))
         .collect()
-}
-
-/// Resolve an API key. Config override (keyed by provider `key`) wins over env vars.
-fn resolve_api_key(
-    provider_key: &str,
-    env_vars: &[&str],
-    overrides: &BTreeMap<String, String>,
-) -> Option<String> {
-    if let Some(v) = overrides.get(provider_key) {
-        if !v.is_empty() {
-            return Some(v.clone());
-        }
-    }
-    env_vars.iter().find_map(|var| {
-        std::env::var(var).ok().filter(|v| !v.is_empty())
-    })
 }
 
 #[cfg(test)]
 mod model_list_tests {
     use super::*;
+
+    /// Cross-registry invariant: every engine provider joins onto a broker
+    /// static-provider spec with identical connection metadata, so the URL a
+    /// route uses is exactly the URL the broker pins for the credential.
+    #[test]
+    fn engine_registry_matches_broker_static_provider_table() {
+        for spec in providers() {
+            let core = agent_core::auth::static_provider(spec.key).unwrap_or_else(|| {
+                panic!("engine provider '{}' missing from broker static table", spec.key)
+            });
+            assert_eq!(spec.base_url, core.base_url, "base_url drift for {}", spec.key);
+            assert_eq!(spec.env_vars, core.env_vars, "env_vars drift for {}", spec.key);
+            assert_eq!(spec.name, core.name, "name drift for {}", spec.key);
+        }
+        assert_eq!(
+            providers().len(),
+            agent_core::auth::static_providers::STATIC_PROVIDERS.len(),
+            "broker table and engine catalog must cover the same providers"
+        );
+    }
+
+    /// Routing data is credential-free by construction: `ProviderConfig` has
+    /// no field that could hold a key, and local resolution keeps only the
+    /// non-secret endpoint URL.
+    #[test]
+    fn resolve_local_carries_endpoint_but_no_credential() {
+        let cfg = resolve_provider_model("local", "llama3").expect("local always resolves");
+        assert_eq!(cfg.provider, "local");
+        assert_eq!(cfg.model, "llama3");
+        assert!(!cfg.base_url.is_empty());
+        let debug = format!("{cfg:?}");
+        assert!(!debug.to_lowercase().contains("api_key"), "no key field may exist: {debug}");
+    }
 
     #[test]
     fn parses_openrouter_models_response() {

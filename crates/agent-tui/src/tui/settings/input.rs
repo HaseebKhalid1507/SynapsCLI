@@ -57,9 +57,7 @@ pub(crate) fn handle_event(
                 match key.code {
                     KeyCode::Enter => {
                         state.row_error = None;
-                        let current_url = snap.provider_keys.get("local.url")
-                            .cloned()
-                            .unwrap_or_default();
+                        let current_url = snap.local_url_explicit.clone().unwrap_or_default();
                         state.edit_mode = Some(ActiveEditor::ApiKey {
                             provider_id: "local.url".to_string(),
                             buffer: current_url,
@@ -67,7 +65,7 @@ pub(crate) fn handle_event(
                         return InputOutcome::None;
                     }
                     KeyCode::Delete | KeyCode::Char('d') => {
-                        if snap.provider_keys.contains_key("local.url") {
+                        if snap.local_url_explicit.is_some() {
                             state.row_error = None;
                             return InputOutcome::SetProviderKey {
                                 provider_id: "local.url".to_string(),
@@ -91,7 +89,10 @@ pub(crate) fn handle_event(
                             return InputOutcome::None;
                         }
                         KeyCode::Delete | KeyCode::Char('d') => {
-                            let has_key = snap.provider_keys.get(p.key).map(|v| !v.is_empty()).unwrap_or(false);
+                            let has_key = snap
+                                .provider_key_status
+                                .get(p.key)
+                                .is_some_and(|status| status.is_configured());
                             if has_key {
                                 state.row_error = None;
                                 return InputOutcome::SetProviderKey {
@@ -302,10 +303,11 @@ pub(crate) fn handle_event(
                         // Provider models (only for configured providers)
                         let registry = synaps_cli::runtime::openai::registry::providers();
                         for spec in registry {
-                            let has_config_key = snap.provider_keys.contains_key(spec.key);
-                            let has_env_key = spec.env_vars.iter()
-                                .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
-                            if !has_config_key && !has_env_key { continue; }
+                            let configured = snap
+                                .provider_key_status
+                                .get(spec.key)
+                                .is_some_and(|status| status.is_configured());
+                            if !configured { continue; }
                             opts.push(format!("── {} ──", spec.name));
                             for (id, label, tier) in spec.models {
                                 let full = format!("{}/{}", spec.key, id);
@@ -575,7 +577,8 @@ mod tests {
                 super::super::PluginRow { name: "p2".into(), skill_count: 2 },
             ],
             disabled_plugins: vec!["p2".into()],
-            provider_keys: std::collections::BTreeMap::new(),
+            provider_key_status: std::collections::BTreeMap::new(),
+            local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: Vec::new(),

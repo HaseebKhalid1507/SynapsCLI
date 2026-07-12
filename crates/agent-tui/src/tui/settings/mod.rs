@@ -76,7 +76,12 @@ pub(crate) struct RuntimeSnapshot {
     pub theme_name: String,
     pub plugins: Vec<PluginRow>,
     pub disabled_plugins: Vec<String>,
-    pub provider_keys: std::collections::BTreeMap<String, String>,
+    /// Non-secret static-key status per provider (masked preview / from-env /
+    /// not set), sourced from the credential broker. Raw key values never
+    /// enter the TUI.
+    pub provider_key_status: std::collections::BTreeMap<String, synaps_cli::auth::StaticKeyStatus>,
+    /// Explicitly configured local endpoint URL (non-secret), if any.
+    pub local_url_explicit: Option<String>,
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
     pub model_health:
@@ -151,7 +156,8 @@ impl RuntimeSnapshot {
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
             plugins,
             disabled_plugins: config.disabled_plugins.clone(),
-            provider_keys: config.provider_keys.clone(),
+            provider_key_status: synaps_cli::auth::broker::static_key_status_map(),
+            local_url_explicit: synaps_cli::auth::broker::local_endpoint_config(),
             model_health,
             plugin_categories: registry.plugin_settings_categories(),
             lifecycle_claims: registry.lifecycle_claims(),
@@ -351,7 +357,8 @@ mod wireup_tests {
             theme_name: "t".into(),
             plugins: Vec::new(),
             disabled_plugins: Vec::new(),
-            provider_keys: std::collections::BTreeMap::new(),
+            provider_key_status: std::collections::BTreeMap::new(),
+            local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: claims,
@@ -430,8 +437,7 @@ mod wireup_tests {
         // proves the visible-list mapping didn't regress in-range lookups.
         for (idx, &cat) in visible.iter().enumerate() {
             state.category_idx = idx;
-            let expected = if cat == schema::Category::Plugins
-                || cat == schema::Category::Providers
+            let expected = if cat == schema::Category::Plugins || cat == schema::Category::Providers
             {
                 0
             } else {

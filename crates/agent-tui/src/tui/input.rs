@@ -630,14 +630,27 @@ fn route_settings(
                     };
                 }
                 super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
-                    let cfg_key = format!("provider.{}", provider_id);
-                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
+                    // `local.url` is non-secret endpoint configuration and
+                    // stays in the config file. Actual API keys are
+                    // broker-owned: persist them into the broker credential
+                    // store instead of plaintext config.
+                    let result = if provider_id == "local.url" {
+                        synaps_cli::config::write_config_value(
+                            &format!("provider.{}", provider_id),
+                            &value,
+                        )
+                        .map_err(|e| e.to_string())
+                    } else {
+                        synaps_cli::auth::save_static_key(&provider_id, &value)
+                    };
+                    let row_key = format!("provider.{}", provider_id);
+                    match result {
                         Ok(()) => {
                             state.edit_mode = None;
-                            state.row_error = Some((cfg_key, "saved".to_string()));
+                            state.row_error = Some((row_key, "saved".to_string()));
                         }
                         Err(e) => {
-                            state.row_error = Some((cfg_key, e.to_string()));
+                            state.row_error = Some((row_key, e));
                         }
                     }
                 }

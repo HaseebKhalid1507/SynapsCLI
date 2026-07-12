@@ -118,13 +118,12 @@ pub(crate) async fn run_setup(
     // First-run guidance: no Anthropic credentials and no provider keys means
     // the first message will fail — tell the user up front instead.
     {
-        let has_anthropic = synaps_cli::auth::load_auth()
-            .ok()
-            .flatten()
-            .map(|a| a.anthropic.auth_type == "oauth" && !a.anthropic.access.is_empty())
-            .unwrap_or(false)
-            || std::env::var("ANTHROPIC_API_KEY").is_ok();
-        if !has_anthropic && config.provider_keys.is_empty() {
+        // Capability queries via the broker boundary — no auth.json or
+        // credential env reads here, and answers are booleans only.
+        let has_anthropic = synaps_cli::auth::broker::anthropic_credential_available();
+        let has_provider_key =
+            !synaps_cli::auth::broker::configured_static_provider_keys().is_empty();
+        if !has_anthropic && !has_provider_key {
             app.push_msg(ChatMessage::System(
                 "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or set ANTHROPIC_API_KEY in your environment\n   • or add `provider.<name> = <key>` to ~/.synaps-cli/config (groq, openrouter, …) and pick with /model".to_string(),
             ));
@@ -184,8 +183,7 @@ pub(crate) async fn run_setup(
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
-    let stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> =
-        None;
+    let stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
@@ -222,8 +220,8 @@ pub(crate) async fn run_setup(
     // Track whether the render thread currently has an active boot or exit
     // effect.  The render thread owns the actual Effect values; we track
     // "has been sent and not yet done" on the main side for the tick throttle.
-    let boot_fx_sent  = true;  // boot_effect() is sent at startup above
-    let exit_fx_sent  = false;
+    let boot_fx_sent = true; // boot_effect() is sent at startup above
+    let exit_fx_sent = false;
     let last_draw = Instant::now() - std::time::Duration::from_secs(1);
 
     Ok(RunContext {

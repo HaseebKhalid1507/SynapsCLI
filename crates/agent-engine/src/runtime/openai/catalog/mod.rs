@@ -22,7 +22,6 @@
 //! **Anthropic** `GET https://api.anthropic.com/v1/models` — paginated, Bearer/x-api-key.
 //! Optional capabilities.thinking / capabilities.effort.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -256,7 +255,6 @@ pub trait ModelCatalogProvider: Sync {
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>>;
 }
 
@@ -300,9 +298,11 @@ async fn fetch_anthropic_catalog_models(
     let config = crate::config::load_config();
     let source = config.auth.credential_source();
     let cache = crate::auth::TokenCache::new();
-    let access = crate::auth::resolve_access_token("anthropic", &source, &cache, client)
+    let access = crate::auth::broker::broker_from_source(&source, &cache, client.clone())
+        .access_token(crate::auth::OAuthProviderId::Anthropic)
         .await
-        .map_err(|e| format!("Anthropic is not configured: {e}"))?;
+        .map_err(|e| format!("Anthropic is not configured: {e}"))?
+        .token;
     let mut pages = Vec::new();
     let mut after_id: Option<String> = None;
 
@@ -335,7 +335,6 @@ impl ModelCatalogProvider for OpenRouterCatalogProvider {
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { fetch_openrouter_catalog_models(client).await })
     }
@@ -346,24 +345,10 @@ impl ModelCatalogProvider for GroqCatalogProvider {
 
     fn fetch<'a>(
         &'a self,
-        client: &'a reqwest::Client,
-        overrides: &'a BTreeMap<String, String>,
+        _client: &'a reqwest::Client,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let spec = super::registry::providers()
-                .iter()
-                .find(|s| s.key == "groq")
-                .ok_or_else(|| "unknown provider: groq".to_string())?;
-            let api_key = super::registry::resolve_provider("groq", overrides)
-                .map(|(cfg, _)| cfg.api_key)
-                .ok_or_else(|| format!("{} is not configured", spec.name))?;
-            let url = format!("{}/models", spec.base_url.trim_end_matches('/'));
-            let resp = catalog_get(client, &url)
-                .bearer_auth(api_key)
-                .send()
-                .await
-                .map_err(|e| format!("request failed: {e}"))?;
-            let body = read_catalog_response(resp).await?;
+            let body = broker_catalog_models_body("groq").await?;
             parse_groq_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
         })
     }
@@ -375,7 +360,6 @@ impl ModelCatalogProvider for NvidiaCatalogProvider {
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
             let resp = catalog_get(client, "https://integrate.api.nvidia.com/v1/models")
@@ -394,7 +378,6 @@ impl ModelCatalogProvider for AnthropicCatalogProvider {
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { fetch_anthropic_catalog_models(client).await })
     }
@@ -406,7 +389,6 @@ impl ModelCatalogProvider for CodexCatalogProvider {
     fn fetch<'a>(
         &'a self,
         _client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { Ok(codex_static_catalog_models()) })
     }
@@ -418,7 +400,6 @@ impl ModelCatalogProvider for GenericCatalogProvider {
     fn fetch<'a>(
         &'a self,
         _client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
             Err("generic catalog fetch requires provider key; use fetch_generic_catalog_provider_models".to_string())
@@ -427,27 +408,38 @@ impl ModelCatalogProvider for GenericCatalogProvider {
 }
 
 async fn fetch_generic_catalog_provider_models(
-    client: &reqwest::Client,
     provider_key: &str,
-    overrides: &BTreeMap<String, String>,
 ) -> Result<Vec<CatalogModel>, String> {
     let specs = super::registry::providers();
     let spec = specs
         .iter()
         .find(|s| s.key == provider_key)
         .ok_or_else(|| format!("unknown provider: {provider_key}"))?;
+    if !crate::auth::broker::static_key_configured(provider_key) {
+        return Err(format!("{} is not configured", spec.name));
+    }
+    let body = broker_catalog_models_body(provider_key).await?;
+    parse_generic_catalog_models(&body, provider_key, spec.name)
+        .map_err(|e| format!("parse failed: {e}"))
+}
 
-    let api_key = super::registry::resolve_provider(provider_key, overrides)
-        .map(|(cfg, _)| cfg.api_key)
-        .ok_or_else(|| format!("{} is not configured", spec.name))?;
-
-    fetch_generic_catalog_models(
-        client,
-        provider_key,
-        spec.name,
-        spec.base_url,
-        &api_key,
-    ).await
+/// GET `/models` through the credential broker (the key never enters this
+/// module). Returns the body on 2xx, an HTTP-status error otherwise.
+async fn broker_catalog_models_body(provider_key: &str) -> Result<String, String> {
+    let resp = crate::auth::broker::global_broker()
+        .proxy(crate::auth::ProxyRequest {
+            provider: provider_key.to_string(),
+            method: crate::auth::ProxyMethod::Get,
+            path: "/models".to_string(),
+            body: None,
+            stream: false,
+        })
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("model list failed: HTTP {}", resp.status));
+    }
+    Ok(resp.body)
 }
 
 /// Fetch the OpenRouter live model list. Auth not required.
@@ -462,25 +454,6 @@ pub async fn fetch_openrouter_catalog_models(
     parse_openrouter_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
 }
 
-/// Fetch a generic provider's `/models` endpoint.
-pub async fn fetch_generic_catalog_models(
-    client: &reqwest::Client,
-    provider_key: &str,
-    provider_name: &str,
-    base_url: &str,
-    api_key: &str,
-) -> Result<Vec<CatalogModel>, String> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = catalog_get(client, &url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let body = read_catalog_response(resp).await?;
-    parse_generic_catalog_models(&body, provider_key, provider_name)
-        .map_err(|e| format!("parse failed: {e}"))
-}
-
 /// Fetch catalog models for any registered provider.
 /// OpenRouter uses its rich parser; all others use the generic parser.
 /// Compatible shim: callers that previously used `registry::fetch_provider_models`
@@ -488,13 +461,12 @@ pub async fn fetch_generic_catalog_models(
 pub async fn fetch_catalog_models(
     client: &reqwest::Client,
     provider_key: &str,
-    overrides: &BTreeMap<String, String>,
 ) -> Result<Vec<CatalogModel>, String> {
     let provider = catalog_provider_for(provider_key);
     if provider.provider_key() == "generic" {
-        return fetch_generic_catalog_provider_models(client, provider_key, overrides).await;
+        return fetch_generic_catalog_provider_models(provider_key).await;
     }
-    provider.fetch(client, overrides).await
+    provider.fetch(client).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

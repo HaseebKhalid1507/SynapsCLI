@@ -527,6 +527,15 @@ impl Runtime {
                 AuthMethods::scrub_for_remote(&mut auth);
             }
         }
+        // Install the process-wide credential broker matching this source so
+        // every request path (streams, pings, catalog, TUI status) resolves
+        // credentials through the same boundary. Local sources get the
+        // in-process broker — no separately launched daemon required.
+        crate::auth::set_global_broker(crate::auth::broker_from_source(
+            &self.credential_source,
+            &self.token_cache,
+            self.client.clone(),
+        ));
     }
 
     pub fn thinking_budget(&self) -> u32 {
@@ -648,8 +657,9 @@ impl Runtime {
         // Refresh OAuth token if expired
         self.refresh_if_needed().await?;
 
-        let mut messages: Vec<crate::SharedMessage> =
-            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))];
+        let mut messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": prompt}),
+        )];
 
         loop {
             let response = ApiMethods::call_api(
@@ -952,7 +962,9 @@ impl Runtime {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(
-            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))],
+            vec![std::sync::Arc::new(
+                json!({"role": "user", "content": prompt}),
+            )],
             cancel,
             None,
             None,

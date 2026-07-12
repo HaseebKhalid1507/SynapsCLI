@@ -1,7 +1,7 @@
 pub(crate) mod input;
 pub(crate) use input::{handle_event, InputOutcome};
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DevProviderSelection {
@@ -235,27 +235,40 @@ pub(crate) fn model_id_for_runtime(favorite_id: &str) -> String {
 }
 
 pub(crate) fn build_sections(current_model: &str, state: &ModelsModalState) -> Vec<ModelSection> {
-    let config = synaps_cli::config::load_config();
+    // Non-secret availability data from the credential broker boundary — this
+    // module never reads provider keys or credential env vars.
+    let availability = ProviderAvailability {
+        configured_static: synaps_cli::auth::broker::configured_static_provider_keys(),
+        local_models: synaps_cli::auth::broker::local_model_ids(),
+    };
     let logged_in_oauth = logged_in_oauth_providers();
-    build_sections_from_parts(current_model, state, &config.provider_keys, &logged_in_oauth)
+    build_sections_from_parts(current_model, state, &availability, &logged_in_oauth)
+}
+
+/// Non-secret provider availability: which static providers have a
+/// broker-held credential, and the configured local model list.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderAvailability {
+    pub configured_static: BTreeSet<String>,
+    pub local_models: Vec<String>,
 }
 
 fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
-    ["anthropic", "openai-codex"]
-        .into_iter()
-        .filter(|storage_key| {
-            synaps_cli::auth::load_provider_auth(storage_key)
-                .ok()
-                .flatten()
-                .is_some_and(|creds| !synaps_cli::auth::is_token_expired(&creds))
-        })
-        .collect()
+    // Non-secret login-status queries via the broker boundary.
+    [
+        synaps_cli::auth::OAuthProviderId::Anthropic,
+        synaps_cli::auth::OAuthProviderId::OpenAiCodex,
+    ]
+    .into_iter()
+    .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
+    .map(|id| id.as_str())
+    .collect()
 }
 
 fn build_sections_from_parts(
     current_model: &str,
     state: &ModelsModalState,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
     logged_in_oauth: &BTreeSet<&'static str>,
 ) -> Vec<ModelSection> {
     let query = state.search.trim().to_lowercase();
@@ -264,11 +277,11 @@ fn build_sections_from_parts(
     let mut sections = Vec::new();
 
     for provider in dev_model_providers() {
-        if !dev_provider_is_logged_in(&provider, provider_keys, logged_in_oauth) {
+        if !dev_provider_is_logged_in(&provider, availability, logged_in_oauth) {
             continue;
         }
 
-        let mut entries: Vec<ModelEntry> = provider_model_selections(&provider, provider_keys)
+        let mut entries: Vec<ModelEntry> = provider_model_selections(&provider, availability)
             .into_iter()
             .map(|model| {
                 let (runtime_id, favorite_id) = if provider.key == "claude" {
@@ -367,10 +380,12 @@ struct ModelSelectionItem {
 
 fn provider_model_selections(
     provider: &DevProviderSelection,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
 ) -> Vec<ModelSelectionItem> {
     if provider.auth_kind == DevProviderAuth::LocalModels {
-        return local_model_ids(provider_keys)
+        return availability
+            .local_models
+            .clone()
             .into_iter()
             .enumerate()
             .map(|(order, id)| ModelSelectionItem {
@@ -431,19 +446,6 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
     }
 }
 
-fn local_model_ids(provider_keys: &BTreeMap<String, String>) -> Vec<String> {
-    provider_keys
-        .get("local.models")
-        .map(|value| {
-            value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn local_model_label(id: &str) -> String {
     id.split(':')
         .next()
@@ -463,27 +465,14 @@ fn local_model_label(id: &str) -> String {
 
 fn dev_provider_is_logged_in(
     provider: &DevProviderSelection,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
     logged_in_oauth: &BTreeSet<&'static str>,
 ) -> bool {
     match provider.auth_kind {
-        DevProviderAuth::LocalModels => !local_model_ids(provider_keys).is_empty(),
-        DevProviderAuth::ApiKey => provider_keys
-            .get(provider.key)
-            .is_some_and(|v| !v.is_empty())
-            || registry_env_vars(provider.key)
-                .iter()
-                .any(|var| std::env::var(var).ok().is_some_and(|v| !v.is_empty())),
+        DevProviderAuth::LocalModels => !availability.local_models.is_empty(),
+        DevProviderAuth::ApiKey => availability.configured_static.contains(provider.key),
         DevProviderAuth::OAuth(storage_key) => logged_in_oauth.contains(storage_key),
     }
-}
-
-fn registry_env_vars(provider_key: &str) -> &'static [&'static str] {
-    synaps_cli::runtime::openai::registry::providers()
-        .iter()
-        .find(|provider| provider.key == provider_key)
-        .map(|provider| provider.env_vars)
-        .unwrap_or(&[])
 }
 
 fn model_matches(model: &ModelEntry, query: &str, favorites_only: bool) -> bool {
@@ -836,7 +825,7 @@ mod tests {
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
         let total: usize = sections.iter().map(|s| s.entries.len()).sum();
@@ -847,7 +836,7 @@ mod tests {
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
         assert!(sections.iter().map(|s| s.entries.len()).sum::<usize>() > 1);
@@ -866,7 +855,7 @@ mod tests {
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
         assert!(sections.iter().any(|s| s.provider_key == "claude"));
@@ -905,7 +894,7 @@ mod tests {
         let sections = build_sections_from_parts(
             "openai-codex/gpt-5.5",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["openai-codex"]),
         );
 
@@ -922,13 +911,14 @@ mod tests {
             favorites: BTreeSet::new(),
             expanded: None,
         };
-        let provider_keys = BTreeMap::from([
-            ("local.models".to_string(), "qwen3-coder:latest, devstral:latest".to_string()),
-        ]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::new(),
+            local_models: vec!["qwen3-coder:latest".to_string(), "devstral:latest".to_string()],
+        };
         let sections = build_sections_from_parts(
             "local/qwen3-coder:latest",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::new(),
         );
 
@@ -947,11 +937,14 @@ mod tests {
             favorites: BTreeSet::new(),
             expanded: None,
         };
-        let provider_keys = BTreeMap::from([("openrouter".to_string(), "sk-test".to_string())]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::from(["openrouter".to_string()]),
+            local_models: Vec::new(),
+        };
         let sections = build_sections_from_parts(
             "openai-codex/gpt-5.5",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::from(["anthropic", "openai-codex"]),
         );
 
@@ -978,11 +971,14 @@ mod tests {
             favorites: BTreeSet::new(),
             expanded: None,
         };
-        let provider_keys = BTreeMap::from([("nvidia".to_string(), "sk-test".to_string())]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::from(["nvidia".to_string()]),
+            local_models: Vec::new(),
+        };
         let sections = build_sections_from_parts(
             "nvidia/meta/llama-3.3-70b-instruct",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::new(),
         );
         let nvidia = sections.iter().find(|s| s.provider_key == "nvidia").expect("nvidia section");

@@ -307,15 +307,12 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
         } else {
             Style::default().fg(THEME.load().claude_text)
         };
-        let local_url = snap.provider_keys.get("local.url")
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .or_else(|| std::env::var("LOCAL_ENDPOINT").ok().filter(|s| !s.is_empty()))
+        let local_url = snap
+            .local_url_explicit
+            .clone()
             .unwrap_or_else(|| "localhost:11434".to_string());
 
-        let local_status = if snap.provider_keys.contains_key("local.url")
-            || std::env::var("LOCAL_ENDPOINT").is_ok_and(|s| !s.is_empty())
-        {
+        let local_status = if snap.local_url_explicit.is_some() {
             format!("✅ {}", local_url)
         } else {
             format!("⬚ default ({})", local_url)
@@ -404,12 +401,12 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
 }
 
 fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap: &RuntimeSnapshot) -> String {
-    let key_status = if let Some(k) = snap.provider_keys.get(p.key).filter(|s| !s.is_empty()) {
-        format!("✅ {}", mask_key(k))
-    } else if p.env_vars.iter().any(|v| std::env::var(v).is_ok()) {
-        "✅ (from env)".to_string()
-    } else {
-        return "⬚ not set".to_string(); // No key = no ping data relevant
+    // Broker-sourced, non-secret status: the TUI renders a masked preview and
+    // never holds the key value itself.
+    let key_status = match snap.provider_key_status.get(p.key) {
+        Some(synaps_cli::auth::StaticKeyStatus::Configured { masked }) => format!("✅ {}", masked),
+        Some(synaps_cli::auth::StaticKeyStatus::FromEnv) => "✅ (from env)".to_string(),
+        _ => return "⬚ not set".to_string(), // No key = no ping data relevant
     };
 
     // Append ping summary if available — count online/total models for this provider
@@ -440,16 +437,6 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
     };
 
     format!("{}{}", key_status, ping_str)
-}
-
-fn mask_key(key: &str) -> String {
-    // Use char-count (not byte-length) so non-ASCII keys can't cause a
-    // byte-slice panic on the render thread (#tui-safety fix 2).
-    let chars: Vec<char> = key.chars().collect();
-    let n = chars.len();
-    if n <= 8 { return "*".repeat(n); }
-    let suffix: String = chars[n - 4..].iter().collect();
-    format!("***...{}", suffix)
 }
 
 

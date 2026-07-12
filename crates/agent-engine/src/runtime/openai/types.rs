@@ -238,20 +238,12 @@ pub enum OaiEvent {
 
 // ─── Provider config ─────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+/// Credential-free routing data for one provider/model pair. Deliberately has
+/// no API-key field: credentials are broker-owned and applied broker-side at
+/// request time (see `agent_core::auth::broker`).
+#[derive(Clone, Debug)]
 pub struct ProviderConfig {
     pub base_url: String,
-    pub api_key: String,
     pub model: String,
     pub provider: String,
-}
-
-impl std::fmt::Debug for ProviderConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProviderConfig")
-            .field("base_url", &self.base_url)
-            .field("api_key", &"[REDACTED]")
-            .field("model", &self.model)
-            .finish()
-    }
 }

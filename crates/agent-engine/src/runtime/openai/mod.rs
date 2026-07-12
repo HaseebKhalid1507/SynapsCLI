@@ -4,8 +4,6 @@
 //! messages/tools/content-blocks (the internal synaps representation) and
 //! OpenAI `chat/completions` SSE wire.
 
-use std::collections::BTreeMap;
-
 pub mod catalog;
 pub mod ping;
 pub mod reasoning;
@@ -67,7 +65,10 @@ pub enum Provider {
 /// - `provider/model` shorthand where `provider` matches a known provider key → `OpenAi`
 /// - `claude-*` → `Anthropic`
 /// - anything else → `Anthropic` (backward compat)
-pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> Provider {
+///
+/// Configured-ness is answered by the credential broker; the routing decision
+/// never touches provider-key config or environment variables directly.
+pub fn resolve_route(model: &str) -> Provider {
     if let Some((prefix, _rest)) = model.split_once('/') {
         if prefix == "openai-codex" {
             if let Some(cfg) = registry::resolve_codex_shorthand(model) {
@@ -76,10 +77,10 @@ pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> P
             return Provider::MissingKey(prefix.to_string());
         }
         if prefix == "local" || registry::providers().iter().any(|s| s.key == prefix) {
-            if let Some(cfg) = registry::resolve_shorthand(model, provider_keys) {
+            if let Some(cfg) = registry::resolve_shorthand(model) {
                 return Provider::OpenAi(cfg);
             }
-            // Known provider but no key
+            // Known provider but no broker-available credential.
             return Provider::MissingKey(prefix.to_string());
         }
     }
@@ -344,26 +345,27 @@ pub async fn try_route(
         .into()));
     }
 
-    let provider_keys = crate::core::config::get_provider_keys();
-    match resolve_route(model, &provider_keys) {
+    match resolve_route(model) {
         Provider::OpenAi(cfg) => {
+            let broker = crate::auth::broker_from_source(source, cache, client.clone());
             let result = stream::call_oai_stream_inner(
-                &cfg, client, tools_schema, system_prompt, messages, tx,
+                &cfg, &broker, tools_schema, system_prompt, messages, tx,
                 temperature, max_tokens, thinking_budget, cancel,
             ).await;
             Some(result)
         }
         Provider::Codex(cfg) => {
+            let broker = crate::auth::broker_from_source(source, cache, client.clone());
             let result = stream::call_codex_stream_inner(
-                &cfg, client, tools_schema, system_prompt, messages, tx,
-                temperature, max_tokens, cancel, source, cache,
+                &cfg, client, &broker, tools_schema, system_prompt, messages, tx,
+                temperature, max_tokens, cancel,
             ).await;
             Some(result)
         }
         Provider::Anthropic => None,
         Provider::MissingKey(provider) => {
             Some(Err(format!(
-                "No API key for '{}'. Set provider.{} in ~/.synaps-cli/config or the corresponding env var.",
+                "No API key for '{}'. Run `synaps login`, set provider.{} in ~/.synaps-cli/config, or export the provider env var.",
                 provider, provider
             ).into()))
         }
@@ -377,7 +379,7 @@ mod tests {
     #[test]
     fn resolves_openai_codex_without_requiring_eager_credentials() {
         std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
-        match resolve_route("openai-codex/gpt-5.1-codex-mini", &BTreeMap::new()) {
+        match resolve_route("openai-codex/gpt-5.1-codex-mini") {
             Provider::Codex(cfg) => {
                 assert_eq!(cfg.provider, "openai-codex");
                 assert_eq!(cfg.model, "gpt-5.1-codex-mini");

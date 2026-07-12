@@ -810,19 +810,16 @@ pub(crate) async fn handle_input_action(
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
                                         app.ping_print = true;
-                                        let client = runtime.http_client().clone();
-                                        let provider_keys = synaps_cli::config::get_provider_keys();
-                                        // Count how many models will be pinged
+                                        // Configured-ness comes from the credential broker; no
+                                        // provider keys are read or held here.
                                         let count: usize = synaps_cli::runtime::openai::registry::providers().iter()
-                                            .filter(|s| synaps_cli::runtime::openai::registry::resolve_provider_model(s.key, s.default_model, &provider_keys).is_some())
+                                            .filter(|s| synaps_cli::runtime::openai::registry::resolve_provider_model(s.key, s.default_model).is_some())
                                             .map(|s| s.models.len())
                                             .sum();
                                         app.ping_pending = count;
                                         let health_tx = app.ping_tx.clone();
                                         tokio::spawn(async move {
-                                            synaps_cli::runtime::openai::ping::ping_all_configured(
-                                                &client, &provider_keys, health_tx,
-                                            ).await;
+                                            synaps_cli::runtime::openai::ping::ping_all_configured(health_tx).await;
                                         });
                                     }
 
@@ -1142,13 +1139,11 @@ pub(crate) async fn handle_input_action(
                                     return ControlFlow::Continue(());
                                 }
                                 let client = runtime.http_client().clone();
-                                let provider_keys = synaps_cli::config::get_provider_keys();
                                 let tx = app.model_list_tx.clone();
                                 tokio::spawn(async move {
                                     let result = synaps_cli::runtime::openai::catalog::fetch_catalog_models(
                                         &client,
                                         &provider_key,
-                                        &provider_keys,
                                     ).await.map(|models| {
                                         models.into_iter().map(|model| {
                                             let full_id = model.runtime_id();
@@ -1403,13 +1398,9 @@ pub(crate) async fn handle_input_action(
                                 }
                             }
                             InputAction::PingModels => {
-                                let client = runtime.http_client().clone();
-                                let provider_keys = synaps_cli::config::get_provider_keys();
                                 let health_tx = app.ping_tx.clone();
                                 tokio::spawn(async move {
-                                    synaps_cli::runtime::openai::ping::ping_all_configured(
-                                        &client, &provider_keys, health_tx,
-                                    ).await;
+                                    synaps_cli::runtime::openai::ping::ping_all_configured(health_tx).await;
                                 });
                             }
                         }

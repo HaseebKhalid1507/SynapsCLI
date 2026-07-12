@@ -41,5 +41,39 @@ metadata.
 
 ## Deferred
 
-xAI callback/login/runtime behavior, generalized callback outcomes, and runtime
-route migration are Checkpoint 2 or later and are intentionally excluded.
+xAI callback/login/runtime behavior and generalized callback outcomes are
+Checkpoint 2 or later and are intentionally excluded.
+
+## Checkpoint 1 completion (third pass): the broker boundary is live
+
+The mandatory broker path is now implemented, not just declared:
+
+* **Typed protocol** (`agent_core::auth::broker`): `CredentialBroker` exposes
+  `access_token` (OAuth, token+expiry only — `AccessToken` has no refresh
+  field), `proxy` / `proxy_stream` (typed, credential-free `ProxyRequest`
+  executed broker-side for static-key providers, covering streaming chat,
+  non-streaming ping, and `/models` catalog), and `capabilities`
+  (configured-ness booleans, never key material).
+* **In-process local broker**: `LocalBroker` is the process-wide default
+  (`global_broker()`), so normal local use requires no separately launched
+  daemon. It is the only module that reads `auth.json`, `provider.<key>`
+  config, or credential environment variables.
+* **Authenticated remote transport**: `synaps auth-broker` adds machine-auth
+  `POST /proxy` (SSE-capable) and `GET /capabilities` beside `GET /token`;
+  `/token` refuses static-key providers, `/proxy` structurally refuses OAuth
+  providers and absolute/escaping paths. Loopback/TLS bind policy unchanged.
+* **Broker-owned static keys**: persisted as `{"type":"api_key","key":…}`
+  entries in the broker credential store with the same atomic merge writer;
+  legacy login-config/env keys are discovered and migrated behind the
+  boundary. Proxy destinations are pinned from the broker's own
+  `static_providers` table; raw keys are never vended, locally or remotely.
+* **Runtime/TUI migration**: `ProviderConfig` has no key field; routing,
+  streaming, ping, catalog, settings/status UI, and model pickers consume
+  broker routing data and non-secret capability queries only. Local endpoint
+  URL (`provider.local.url` / `LOCAL_ENDPOINT`) remains non-secret
+  configuration.
+* **Anthropic unification**: Anthropic refresh flows through the same
+  per-provider single-flight gate + atomic merge persistence as Codex
+  (`ensure_fresh_provider_token`); `ensure_fresh_token` is a compatibility
+  wrapper. Runtime auth state never holds a refresh token in either source
+  mode.

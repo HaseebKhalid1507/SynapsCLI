@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_oai_stream_inner(
     cfg: &ProviderConfig,
-    client: &reqwest::Client,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
     tools_schema: &[Value],
     system_prompt: &Option<String>,
     messages: &[crate::SharedMessage],
@@ -64,43 +64,26 @@ pub(crate) async fn call_oai_stream_inner(
     );
     let body = Value::Object(body);
 
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    tracing::debug!(provider=%cfg.provider, model=%cfg.model, "openai stream request via broker proxy");
 
-    tracing::debug!(url=%url, model=%cfg.model, "openai stream request");
-
-    let resp = match client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
+    // The broker owns the API key and executes/signs the request; this path
+    // never resolves or attaches a credential.
+    let mut stream = broker
+        .proxy_stream(crate::auth::ProxyRequest {
+            provider: cfg.provider.clone(),
+            method: crate::auth::ProxyMethod::Post,
+            path: "/chat/completions".to_string(),
+            body: Some(body),
+            stream: true,
+        })
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            if e.is_connect() && url.contains("localhost") {
-                return Err(format!(
-                    "Can't reach local endpoint at {} — is Ollama/LM Studio running?",
-                    url
-                ).into());
-            }
-            return Err(e.into());
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("openai request failed: {status}: {text}").into());
-    }
+        .map_err(|e| format!("openai request failed: {e}"))?;
 
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
     let mut tool_use_blocks: Vec<Value> = Vec::new();
     let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
     let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
-    let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = tokio::select! {
         chunk = stream.next() => chunk,
@@ -150,6 +133,7 @@ pub(crate) async fn call_oai_stream_inner(
 pub(crate) async fn call_codex_stream_inner(
     cfg: &ProviderConfig,
     client: &reqwest::Client,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
     tools_schema: &[Value],
     system_prompt: &Option<String>,
     messages: &[crate::SharedMessage],
@@ -157,19 +141,18 @@ pub(crate) async fn call_codex_stream_inner(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     cancel: &tokio_util::sync::CancellationToken,
-    source: &crate::auth::CredentialSource,
-    cache: &crate::auth::TokenCache,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    // Every Codex credential, local or remote, crosses the broker abstraction.
-    // Provider routing metadata is deliberately credential-free.
-    let access = crate::auth::resolve_access_token("openai-codex", source, cache, client).await?;
-    let account_id = match source {
-        crate::auth::CredentialSource::Local => crate::auth::load_provider_auth("openai-codex")?
-            .and_then(|creds| creds.account_id)
-            .or_else(|| crate::auth::extract_codex_account_id(&access)),
-        crate::auth::CredentialSource::Remote { .. } => crate::auth::extract_codex_account_id(&access),
-    };
-    let account_id = account_id.ok_or("Failed to extract ChatGPT account id from Codex token")?;
+    // Every Codex credential, local or remote, crosses the broker boundary:
+    // the broker vends an access token + expiry only (refresh tokens are
+    // broker-owned), and this path never opens auth.json.
+    let access = broker
+        .access_token(crate::auth::OAuthProviderId::OpenAiCodex)
+        .await
+        .map_err(|e| e.to_string())?
+        .token;
+    // Account id is provider-owned metadata carried inside the Codex JWT.
+    let account_id = crate::auth::extract_codex_account_id(&access)
+        .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
 
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -1025,5 +1008,107 @@ mod codex_decoder_tests {
         ];
         let (_decoder, text_acc, _events) = drive(&lines);
         assert_eq!(text_acc, "hi");
+    }
+}
+
+#[cfg(test)]
+mod broker_stream_tests {
+    //! Broker-boundary streaming tests: the OpenAI-compatible stream path is
+    //! driven end-to-end through an in-process `LocalBroker` against a fake
+    //! upstream. The runtime side supplies NO credential — the broker applies
+    //! it — and SSE deltas are forwarded to the event channel in real time.
+
+    use super::*;
+    use crate::auth::{CredentialBroker, LocalBroker};
+    use std::sync::Arc;
+
+    async fn spawn_fake_openai_sse() -> (String, Arc<std::sync::Mutex<String>>) {
+        use axum::routing::post;
+        let seen_auth = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = seen_auth.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    ([("content-type", "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen_auth)
+    }
+
+    #[tokio::test]
+    async fn oai_stream_flows_through_broker_and_forwards_deltas() {
+        let (upstream, seen_auth) = spawn_fake_openai_sse().await;
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            upstream,
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result =
+            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
+                .await
+                .expect("stream must complete");
+
+        // Final Anthropic-shaped value carries the accumulated text.
+        assert_eq!(result["content"][0]["text"], "Hello");
+
+        // Deltas were forwarded in real time on the event channel.
+        drop(tx);
+        let mut streamed = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(t)) = ev {
+                streamed.push_str(&t);
+            }
+        }
+        assert_eq!(streamed, "Hello");
+
+        // The credential was applied by the broker, not by this call site.
+        assert_eq!(&*seen_auth.lock().unwrap(), "Bearer local");
+    }
+
+    /// Broker errors surface as typed failures without opening a stream and
+    /// without any credential material in the message.
+    #[tokio::test]
+    async fn oai_stream_broker_error_fails_closed() {
+        // Unconfigured static provider → NotConfigured, no upstream contact.
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::new(reqwest::Client::new()));
+        let cfg = ProviderConfig {
+            base_url: String::new(),
+            model: "m".to_string(),
+            provider: "definitely-not-a-provider".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let err =
+            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("unknown provider"), "got: {err}");
+        assert!(!err.to_lowercase().contains("bearer"));
     }
 }
