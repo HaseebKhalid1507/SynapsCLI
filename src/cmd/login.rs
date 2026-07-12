@@ -261,14 +261,18 @@ fn launch_main_app_or_exit(profile: Option<String>) -> ! {
     }
 }
 
-fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
-    match config::write_config_value(config_key, api_key) {
+fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) {
+    // Static keys are broker-owned: persist into the broker's credential
+    // store (auth.json, 0600, atomic merge write) rather than the plaintext
+    // config file. Legacy `provider.<key>` config entries keep working via
+    // broker-side discovery/migration.
+    match auth::save_static_key(provider.key, api_key) {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ API key saved!\x1b[0m");
-            eprintln!("  Config key: {}", config_key);
+            eprintln!("  Provider: {}", provider.key);
             eprintln!(
-                "  Config file: {}",
-                config::resolve_write_path("config").display()
+                "  Broker credential store: {}",
+                auth::auth_file_path().display()
             );
             eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key);
         }
