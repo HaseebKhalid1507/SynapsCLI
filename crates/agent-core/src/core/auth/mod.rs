@@ -15,7 +15,7 @@ pub mod broker;
 mod browser;
 mod callback;
 mod credential_source;
-mod github_copilot;
+pub mod github_copilot;
 mod openai_codex;
 mod pkce;
 pub mod provider;

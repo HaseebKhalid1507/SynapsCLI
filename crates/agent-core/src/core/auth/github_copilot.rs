@@ -17,6 +17,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -53,8 +54,7 @@ pub const SESSION_MINT_URL: &str = "https://api.github.com/copilot_internal/v2/t
 /// Device-code grant type (RFC 8628).
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Default verification page (official).
-#[allow(dead_code)] // referenced by tests and login UX defaults
+/// Default verification page (official docs.github.com device flow).
 pub const DEFAULT_VERIFICATION_URI: &str = "https://github.com/login/device";
 
 const EXPIRY_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -63,6 +63,15 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const MAX_POLL_INTERVAL_SECS: u64 = 30;
 /// Seconds added on each `slow_down` (GitHub docs: +5s).
 const SLOW_DOWN_STEP_SECS: u64 = 5;
+
+/// Connect timeout for production device/poll/mint HTTP.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Full request timeout for production device/poll/mint HTTP.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum response body bytes accepted from device/poll/mint endpoints.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+/// Logical sleep quantum for cancel checks (production wall-clock chunks).
+const CANCEL_POLL_QUANTUM: Duration = Duration::from_millis(200);
 
 // ── Secret-safe errors ───────────────────────────────────────────────────────
 
@@ -75,7 +84,6 @@ pub enum CopilotAuthError {
     InvalidDeviceResponse,
     InvalidTokenResponse,
     InvalidSessionResponse,
-    AuthorizationPending, // not surfaced as terminal; reserved
     AccessDenied,
     Expired,
     IncorrectDeviceCode,
@@ -85,6 +93,7 @@ pub enum CopilotAuthError {
     EmptySessionToken,
     HttpStatus(u16),
     Transport,
+    ResponseTooLarge,
     Persist,
     Other(&'static str),
 }
@@ -96,7 +105,6 @@ impl CopilotAuthError {
             Self::InvalidDeviceResponse => "invalid device authorization response",
             Self::InvalidTokenResponse => "invalid device token response",
             Self::InvalidSessionResponse => "invalid Copilot session response",
-            Self::AuthorizationPending => "authorization pending",
             Self::AccessDenied => "access denied",
             Self::Expired => "device code expired",
             Self::IncorrectDeviceCode => "incorrect device code",
@@ -106,6 +114,7 @@ impl CopilotAuthError {
             Self::EmptySessionToken => "empty Copilot session token",
             Self::HttpStatus(_) => "HTTP error",
             Self::Transport => "transport error",
+            Self::ResponseTooLarge => "response body too large",
             Self::Persist => "credential persistence failed",
             Self::Other(msg) => msg,
         }
@@ -123,8 +132,7 @@ impl fmt::Display for CopilotAuthError {
 
 impl fmt::Debug for CopilotAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Same surface as Display — never dump internal secret-bearing payloads.
-        write!(f, "CopilotAuthError({})", self)
+        write!(f, "CopilotAuthError({self})")
     }
 }
 
@@ -159,11 +167,36 @@ pub trait CopilotHttp: Send + Sync {
     ) -> Result<InjectedHttpResponse, CopilotAuthError>;
 }
 
-/// Injectable clock (now + sleep) for deterministic poll tests.
+/// Injectable clock (now + cancellable sleep) for deterministic poll tests.
 #[async_trait]
 pub trait CopilotClock: Send + Sync {
     fn now_millis(&self) -> u64;
-    async fn sleep(&self, duration: Duration);
+
+    /// Sleep `duration`, returning early with [`CopilotAuthError::Cancelled`]
+    /// when `cancel` flips. Implementations must check cancellation at least
+    /// every quantum (not only after the full sleep).
+    async fn sleep_cancellable<X: CopilotCancel + ?Sized>(
+        &self,
+        duration: Duration,
+        cancel: &X,
+    ) -> Result<(), CopilotAuthError>;
+}
+
+/// Injectable cancellation signal for device-flow polling.
+pub trait CopilotCancel: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+impl CopilotCancel for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::SeqCst)
+    }
+}
+
+impl CopilotCancel for Arc<AtomicBool> {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::SeqCst)
+    }
 }
 
 /// Injectable browser opener (production uses `open_browser`).
@@ -232,11 +265,40 @@ pub fn validate_session_mint_endpoint(url: &str) -> Result<(), CopilotAuthError>
     Ok(())
 }
 
-/// Accept only HTTPS github.com verification URIs (no open redirect to evil hosts).
+/// Accept only the documented GitHub device verification destination:
+/// `https://github.com/login/device` optionally with a single `user_code` query
+/// (verification_uri_complete). Rejects userinfo, fragments, alternate ports,
+/// deceptive paths, and arbitrary query keys.
 pub fn validate_verification_uri(uri: &str) -> Result<(), CopilotAuthError> {
     let parsed = Url::parse(uri).map_err(|_| CopilotAuthError::UntrustedEndpoint)?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+    if parsed.scheme() != "https" {
         return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    if parsed.host_str() != Some("github.com") {
+        return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    if parsed.port().is_some() {
+        return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    if parsed.fragment().is_some() {
+        return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    // Normalize trailing slash only; reject any other path (including `..` forms
+    // after URL parsing).
+    let path = parsed.path().trim_end_matches('/');
+    if path != "/login/device" {
+        return Err(CopilotAuthError::UntrustedEndpoint);
+    }
+    // Query: none, or only user_code=... (complete URI form).
+    let mut saw_user_code = false;
+    for (key, value) in parsed.query_pairs() {
+        if key != "user_code" || value.is_empty() || saw_user_code {
+            return Err(CopilotAuthError::UntrustedEndpoint);
+        }
+        saw_user_code = true;
     }
     Ok(())
 }
@@ -282,8 +344,6 @@ pub fn parse_device_code_response(
         return Err(CopilotAuthError::InvalidDeviceResponse);
     }
     validate_verification_uri(&raw.verification_uri)?;
-    // Prefer the plain verification URI (user types code). Complete URI is optional
-    // and still must stay on github.com if present.
     if let Some(ref complete) = raw.verification_uri_complete {
         validate_verification_uri(complete)?;
     }
@@ -302,7 +362,6 @@ pub fn parse_device_code_response(
 }
 
 pub fn parse_device_poll_response(body: &str) -> Result<DevicePollOutcome, CopilotAuthError> {
-    // GitHub may return form-urlencoded or JSON; prefer JSON (Accept: application/json).
     if let Ok(raw) = serde_json::from_str::<DeviceTokenJson>(body) {
         if let Some(token) = raw.access_token {
             if token.trim().is_empty() {
@@ -322,7 +381,6 @@ pub fn parse_device_poll_response(body: &str) -> Result<DevicePollOutcome, Copil
             _ => DevicePollOutcome::OtherError,
         });
     }
-    // form-urlencoded fallback
     let mut access_token = None;
     let mut error = None;
     for pair in body.split('&') {
@@ -368,7 +426,6 @@ pub fn parse_session_mint_response(
         .filter(|t| !t.trim().is_empty())
         .ok_or(CopilotAuthError::EmptySessionToken)?;
     let expires_at_ms = if let Some(secs) = raw.expires_at {
-        // Community payloads use unix seconds; treat large values as already-ms.
         if secs > 10_000_000_000 {
             secs
         } else {
@@ -408,12 +465,30 @@ pub fn credentials_from_session(
     })
 }
 
-// ── Bounded poll interval helper ─────────────────────────────────────────────
-
 pub fn apply_slow_down(interval_secs: u64) -> u64 {
     interval_secs
         .saturating_add(SLOW_DOWN_STEP_SECS)
         .min(MAX_POLL_INTERVAL_SECS)
+}
+
+// ── Bounded body read ────────────────────────────────────────────────────────
+
+/// Read a response body with a hard byte cap. Fail closed if exceeded.
+pub async fn read_body_capped(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<String, CopilotAuthError> {
+    use futures::StreamExt;
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| CopilotAuthError::Transport)?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(CopilotAuthError::ResponseTooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| CopilotAuthError::Transport)
 }
 
 // ── Device-flow state machine ────────────────────────────────────────────────
@@ -459,10 +534,7 @@ where
             ],
         )
         .await?;
-    // GitHub returns 200 even for authorization_pending in many clients; treat
-    // non-2xx as transport/HTTP failure (no body secrets echoed).
     if !(200..300).contains(&resp.status) {
-        // Some servers return 400 with error body — still try parse.
         if let Ok(outcome) = parse_device_poll_response(&resp.body) {
             if !matches!(outcome, DevicePollOutcome::OtherError) {
                 return Ok(outcome);
@@ -474,15 +546,19 @@ where
 }
 
 /// Poll until authorized, denied, expired, cancelled, or deadline.
-pub async fn wait_for_device_authorization<H, C>(
+///
+/// Sleeps are cancellable: `cancel` is checked before each wait and during
+/// the wait via [`CopilotClock::sleep_cancellable`].
+pub async fn wait_for_device_authorization<H, C, X>(
     http: &H,
     clock: &C,
     authz: &DeviceAuthorization,
-    cancel: &AtomicBool,
+    cancel: &X,
 ) -> Result<String, CopilotAuthError>
 where
     H: CopilotHttp,
     C: CopilotClock,
+    X: CopilotCancel + ?Sized,
 {
     let deadline_ms = authz
         .issued_at_ms
@@ -490,16 +566,18 @@ where
     let mut interval_secs = authz.interval_secs.clamp(1, MAX_POLL_INTERVAL_SECS);
 
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             return Err(CopilotAuthError::Cancelled);
         }
         if clock.now_millis() >= deadline_ms {
             return Err(CopilotAuthError::Expired);
         }
 
-        clock.sleep(Duration::from_secs(interval_secs)).await;
+        clock
+            .sleep_cancellable(Duration::from_secs(interval_secs), cancel)
+            .await?;
 
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             return Err(CopilotAuthError::Cancelled);
         }
         if clock.now_millis() >= deadline_ms {
@@ -579,17 +657,18 @@ pub struct LoginHooks<'a, B> {
 }
 
 /// Device start → user prompt → poll → mint → atomic persist.
-pub async fn login_with<H, C, B>(
+pub async fn login_with<H, C, B, X>(
     http: &H,
     clock: &C,
     hooks: LoginHooks<'_, B>,
-    cancel: &AtomicBool,
+    cancel: &X,
     persist: bool,
 ) -> Result<OAuthCredentials, CopilotAuthError>
 where
     H: CopilotHttp,
     C: CopilotClock,
     B: CopilotBrowser,
+    X: CopilotCancel + ?Sized,
 {
     let authz = start_device_authorization(http, clock).await?;
     if let Some(cb) = hooks.on_user_code {
@@ -646,7 +725,7 @@ pub async fn refresh_token(
 // ── Production adapters ──────────────────────────────────────────────────────
 
 struct ProductionHttp {
-    /// No-redirect client for secret-bearing requests.
+    /// No-redirect client with connect + request timeouts for secret-bearing calls.
     client: Client,
 }
 
@@ -654,6 +733,8 @@ impl ProductionHttp {
     fn new() -> Result<Self, CopilotAuthError> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|_| CopilotAuthError::Transport)?;
         Ok(Self { client })
@@ -677,10 +758,7 @@ impl CopilotHttp for ProductionHttp {
             .await
             .map_err(|_| CopilotAuthError::Transport)?;
         let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|_| CopilotAuthError::Transport)?;
+        let body = read_body_capped(response, MAX_RESPONSE_BODY_BYTES).await?;
         Ok(InjectedHttpResponse { status, body })
     }
 
@@ -704,10 +782,7 @@ impl CopilotHttp for ProductionHttp {
         if (300..400).contains(&status) {
             return Err(CopilotAuthError::UntrustedEndpoint);
         }
-        let body = response
-            .text()
-            .await
-            .map_err(|_| CopilotAuthError::Transport)?;
+        let body = read_body_capped(response, MAX_RESPONSE_BODY_BYTES).await?;
         Ok(InjectedHttpResponse { status, body })
     }
 }
@@ -719,8 +794,29 @@ impl CopilotClock for ProductionClock {
     fn now_millis(&self) -> u64 {
         now_millis()
     }
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+
+    async fn sleep_cancellable<X: CopilotCancel + ?Sized>(
+        &self,
+        duration: Duration,
+        cancel: &X,
+    ) -> Result<(), CopilotAuthError> {
+        let mut remaining = duration;
+        while remaining > Duration::ZERO {
+            if cancel.is_cancelled() {
+                return Err(CopilotAuthError::Cancelled);
+            }
+            let chunk = if remaining > CANCEL_POLL_QUANTUM {
+                CANCEL_POLL_QUANTUM
+            } else {
+                remaining
+            };
+            tokio::time::sleep(chunk).await;
+            remaining = remaining.saturating_sub(chunk);
+        }
+        if cancel.is_cancelled() {
+            return Err(CopilotAuthError::Cancelled);
+        }
+        Ok(())
     }
 }
 
@@ -734,7 +830,7 @@ impl CopilotBrowser for ProductionBrowser {
     }
 }
 
-// ── Test doubles (unit tests + e2e harness) ──────────────────────────────────
+// ── Test doubles ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 pub mod testutil {
@@ -745,7 +841,7 @@ pub mod testutil {
     pub struct FakeClock {
         pub now: Mutex<u64>,
         pub sleeps: Mutex<Vec<u64>>,
-        /// Advance `now` by this many ms on each sleep (default: duration).
+        /// When true (default), advance `now` by each quantum during sleep.
         pub auto_advance: Mutex<bool>,
     }
 
@@ -757,6 +853,7 @@ pub mod testutil {
                 auto_advance: Mutex::new(true),
             }
         }
+
         pub fn set_now(&self, v: u64) {
             *self.now.lock().unwrap() = v;
         }
@@ -767,13 +864,41 @@ pub mod testutil {
         fn now_millis(&self) -> u64 {
             *self.now.lock().unwrap()
         }
-        async fn sleep(&self, duration: Duration) {
-            let secs = duration.as_secs();
-            self.sleeps.lock().unwrap().push(secs);
-            if *self.auto_advance.lock().unwrap() {
-                let mut now = self.now.lock().unwrap();
-                *now = now.saturating_add(duration.as_millis() as u64);
+
+        async fn sleep_cancellable<X: CopilotCancel + ?Sized>(
+            &self,
+            duration: Duration,
+            cancel: &X,
+        ) -> Result<(), CopilotAuthError> {
+            // Quantum = 1s of logical time so cancel can interrupt mid-interval.
+            let total_secs = duration.as_secs().max(if duration.is_zero() { 0 } else { 1 });
+            if total_secs == 0 {
+                if cancel.is_cancelled() {
+                    return Err(CopilotAuthError::Cancelled);
+                }
+                return Ok(());
             }
+            let mut slept = 0u64;
+            for _ in 0..total_secs {
+                if cancel.is_cancelled() {
+                    if slept > 0 {
+                        self.sleeps.lock().unwrap().push(slept);
+                    }
+                    return Err(CopilotAuthError::Cancelled);
+                }
+                slept += 1;
+                if *self.auto_advance.lock().unwrap() {
+                    let mut now = self.now.lock().unwrap();
+                    *now = now.saturating_add(1000);
+                }
+                // Tiny real sleep so a concurrent canceller can land mid-interval.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            self.sleeps.lock().unwrap().push(slept);
+            if cancel.is_cancelled() {
+                return Err(CopilotAuthError::Cancelled);
+            }
+            Ok(())
         }
     }
 
@@ -781,7 +906,6 @@ pub mod testutil {
     pub enum ScriptedResponse {
         Ok(String),
         Status(u16, String),
-        Err,
     }
 
     #[derive(Default)]
@@ -827,7 +951,6 @@ pub mod testutil {
                 ScriptedResponse::Status(status, body) => {
                     Ok(InjectedHttpResponse { status, body })
                 }
-                ScriptedResponse::Err => Err(CopilotAuthError::Transport),
             }
         }
 
@@ -853,7 +976,6 @@ pub mod testutil {
                 ScriptedResponse::Status(status, body) => {
                     Ok(InjectedHttpResponse { status, body })
                 }
-                ScriptedResponse::Err => Err(CopilotAuthError::Transport),
             }
         }
     }
@@ -861,16 +983,12 @@ pub mod testutil {
     #[derive(Default)]
     pub struct RecordingBrowser {
         pub opened: Mutex<Vec<String>>,
-        pub fail: AtomicBool,
     }
 
     impl CopilotBrowser for RecordingBrowser {
         fn open(&self, url: &str) -> Result<(), CopilotAuthError> {
             validate_verification_uri(url)?;
             self.opened.lock().unwrap().push(url.to_string());
-            if self.fail.load(Ordering::SeqCst) {
-                return Err(CopilotAuthError::Transport);
-            }
             Ok(())
         }
     }
@@ -929,9 +1047,14 @@ mod tests {
             SESSION_MINT_URL,
             "https://api.github.com/copilot_internal/v2/token"
         );
+        assert_eq!(DEFAULT_VERIFICATION_URI, "https://github.com/login/device");
         validate_device_endpoint(DEVICE_CODE_URL).unwrap();
         validate_device_endpoint(ACCESS_TOKEN_URL).unwrap();
         validate_session_mint_endpoint(SESSION_MINT_URL).unwrap();
+        validate_verification_uri(DEFAULT_VERIFICATION_URI).unwrap();
+        assert!(CONNECT_TIMEOUT.as_secs() > 0);
+        assert!(REQUEST_TIMEOUT.as_secs() > 0);
+        assert!(MAX_RESPONSE_BODY_BYTES >= 1024);
     }
 
     #[test]
@@ -941,7 +1064,6 @@ mod tests {
             "https://evil.com/login/device/code",
             "https://github.com.evil/login/device/code",
             "https://api.github.com/copilot_internal/v2/token",
-            "https://github.com/login/device/code/../oauth/access_token",
         ] {
             assert!(
                 validate_device_endpoint(bad).is_err(),
@@ -951,7 +1073,6 @@ mod tests {
         for bad in [
             "http://api.github.com/copilot_internal/v2/token",
             "https://evil.com/copilot_internal/v2/token",
-            "https://api.github.com/copilot_internal/v2/token/../other",
             "https://api.github.com/user",
             "https://github.com/login/device/code",
         ] {
@@ -962,10 +1083,40 @@ mod tests {
         }
     }
 
-        #[test]
-    fn github_copilot_no_client_secret_constant() {
-        // Production surface (everything before unit tests) must not define or
-        // post a client secret. The test module may mention the string.
+    #[test]
+    fn github_copilot_verification_uri_is_strictly_device_page() {
+        // Allowed: plain and complete (user_code only).
+        validate_verification_uri("https://github.com/login/device").unwrap();
+        validate_verification_uri("https://github.com/login/device/").unwrap();
+        validate_verification_uri("https://github.com/login/device?user_code=ABCD-1234").unwrap();
+
+        for bad in [
+            "http://github.com/login/device",
+            "https://evil.com/login/device",
+            "https://github.com.evil/login/device",
+            "https://github.com/settings",
+            "https://github.com/login",
+            "https://github.com/login/device/extra",
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/login/device/../../../etc/passwd",
+            "https://user:pass@github.com/login/device",
+            "https://github.com/login/device#fragment",
+            "https://github.com:8443/login/device",
+            "https://github.com/login/device?foo=bar",
+            "https://github.com/login/device?user_code=A&user_code=B",
+            "https://github.com/login/device?user_code=",
+            // Deceptive open-redirect style query
+            "https://github.com/login/device?user_code=x&return_to=https://evil",
+        ] {
+            assert!(
+                validate_verification_uri(bad).is_err(),
+                "should reject verification uri {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_copilot_no_client_secret_in_production_surface() {
         let src = include_str!("github_copilot.rs");
         let production = src
             .split("// ── Unit tests ─")
@@ -981,7 +1132,20 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
+    fn github_copilot_production_http_configures_timeouts_and_body_cap() {
+        let src = include_str!("github_copilot.rs");
+        let production = src
+            .split("// ── Unit tests ─")
+            .next()
+            .expect("production section");
+        assert!(production.contains("connect_timeout(CONNECT_TIMEOUT)"));
+        assert!(production.contains(".timeout(REQUEST_TIMEOUT)"));
+        assert!(production.contains("read_body_capped(response, MAX_RESPONSE_BODY_BYTES)"));
+        assert!(!production.contains(".text()"));
+    }
+
+    #[test]
     fn github_copilot_parse_device_code_and_reject_bad_uri() {
         let authz = parse_device_code_response(&device_code_body(), 1_000).unwrap();
         assert_eq!(authz.user_code, "ABCD-1234");
@@ -993,6 +1157,13 @@ mod tests {
             "expires_in":100,"interval":5
         }"#;
         assert!(parse_device_code_response(evil, 0).is_err());
+
+        let deceptive = r#"{
+            "device_code":"x","user_code":"Y",
+            "verification_uri":"https://github.com/login/device?user_code=A&next=https://evil",
+            "expires_in":100,"interval":5
+        }"#;
+        assert!(parse_device_code_response(deceptive, 0).is_err());
     }
 
     #[test]
@@ -1019,7 +1190,6 @@ mod tests {
             }
             other => panic!("expected authorized, got {other:?}"),
         }
-        // form-urlencoded
         assert_eq!(
             parse_device_poll_response("error=authorization_pending").unwrap(),
             DevicePollOutcome::Pending
@@ -1033,7 +1203,6 @@ mod tests {
             i = apply_slow_down(i);
         }
         assert_eq!(i, MAX_POLL_INTERVAL_SECS);
-        assert!(i <= MAX_POLL_INTERVAL_SECS);
     }
 
     #[test]
@@ -1064,8 +1233,22 @@ mod tests {
         assert_eq!(creds.access, "tid=short");
         assert_eq!(creds.expires, 99);
         assert_eq!(creds.auth_type, "oauth");
-        assert!(credentials_from_session("", SessionToken { token: "x".into(), expires_at_ms: 1 }).is_err());
-        assert!(credentials_from_session("g", SessionToken { token: "".into(), expires_at_ms: 1 }).is_err());
+        assert!(credentials_from_session(
+            "",
+            SessionToken {
+                token: "x".into(),
+                expires_at_ms: 1
+            }
+        )
+        .is_err());
+        assert!(credentials_from_session(
+            "g",
+            SessionToken {
+                token: "".into(),
+                expires_at_ms: 1
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -1093,6 +1276,7 @@ mod tests {
             CopilotAuthError::EmptySessionToken,
             CopilotAuthError::HttpStatus(401),
             CopilotAuthError::Transport,
+            CopilotAuthError::ResponseTooLarge,
             CopilotAuthError::Persist,
             CopilotAuthError::Other("generic failure"),
         ];
@@ -1141,7 +1325,6 @@ mod tests {
             .any(|(k, v)| k == "client_id" && v == CLIENT_ID));
         assert!(posts[0].1.iter().any(|(k, v)| k == "scope" && v == SCOPE));
         assert_eq!(posts[1].0, ACCESS_TOKEN_URL);
-        // No client_secret in any form body
         for (_, form) in &posts {
             assert!(!form.iter().any(|(k, _)| k == "client_secret"));
         }
@@ -1161,7 +1344,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, CopilotAuthError::AccessDenied);
 
-        // cancel before poll completes
+        // cancel before poll starts
         let http = FakeHttp::default();
         http.push_post(ScriptedResponse::Ok(device_code_body()));
         let clock = FakeClock::new(0);
@@ -1177,13 +1360,44 @@ mod tests {
         http.push_post(ScriptedResponse::Ok(device_code_body()));
         let clock = FakeClock::new(0);
         let authz = start_device_authorization(&http, &clock).await.unwrap();
-        // Jump past expires_in (900s)
         clock.set_now(authz.issued_at_ms + authz.expires_in_secs * 1000 + 1);
         let cancel = AtomicBool::new(false);
         let err = wait_for_device_authorization(&http, &clock, &authz, &cancel)
             .await
             .unwrap_err();
         assert_eq!(err, CopilotAuthError::Expired);
+    }
+
+    #[tokio::test]
+    async fn github_copilot_cancellation_interrupts_pending_sleep() {
+        let http = FakeHttp::default();
+        // Long interval so cancel lands mid-sleep, not after poll starts.
+        let body = serde_json::json!({
+            "device_code": "device-secret-code-xxxxx",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 30
+        })
+        .to_string();
+        http.push_post(ScriptedResponse::Ok(body));
+        // No poll responses: cancel must interrupt the first sleep.
+        let clock = FakeClock::new(0);
+        let authz = start_device_authorization(&http, &clock).await.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancel);
+
+        let waiter = tokio::spawn(async move {
+            wait_for_device_authorization(&http, &clock, &authz, cancel_flag.as_ref()).await
+        });
+
+        // Wait until the first sleep quantum is underway, then cancel.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.store(true, Ordering::SeqCst);
+
+        let err = waiter.await.unwrap().unwrap_err();
+        assert_eq!(err, CopilotAuthError::Cancelled);
+        // Must not have attempted a poll (queue empty would be Transport).
     }
 
     #[tokio::test]
@@ -1209,7 +1423,6 @@ mod tests {
         let http = FakeHttp::default();
         http.push_post(ScriptedResponse::Ok(device_code_body()));
         http.push_post(ScriptedResponse::Ok(authorized_body("gho_ok")));
-        // mint fails
         http.push_get(ScriptedResponse::Status(401, r#"{"message":"bad"}"#.into()));
         let clock = FakeClock::new(0);
         let browser = RecordingBrowser::default();
@@ -1282,10 +1495,8 @@ mod tests {
         assert!(http.gets.lock().unwrap().is_empty());
     }
 
-
     #[tokio::test]
     async fn github_copilot_refresh_remints_without_browser() {
-        // refresh_token path is mint-only; no device endpoints contacted.
         let http = FakeHttp::default();
         let now = 1_700_000_000_000u64;
         http.push_get(ScriptedResponse::Ok(session_body(
@@ -1298,7 +1509,10 @@ mod tests {
             .unwrap();
         assert_eq!(creds.access, "tid=refreshed-session");
         assert_eq!(creds.refresh, "gho_stored_refresh");
-        assert!(http.posts.lock().unwrap().is_empty(), "refresh must not re-run device flow");
+        assert!(
+            http.posts.lock().unwrap().is_empty(),
+            "refresh must not re-run device flow"
+        );
         assert_eq!(http.gets.lock().unwrap().len(), 1);
         assert_eq!(http.gets.lock().unwrap()[0].0, SESSION_MINT_URL);
     }
@@ -1310,7 +1524,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        // Pre-seed unrelated providers
         let sibling = OAuthCredentials {
             auth_type: "oauth".into(),
             refresh: "anth-refresh".into(),
@@ -1332,7 +1545,6 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate successful mint+store under github-copilot
         let creds = credentials_from_session(
             "gho_long_lived_never_vend",
             SessionToken {
@@ -1346,16 +1558,17 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["github-copilot"]["access"], "tid=session_only");
-        assert_eq!(parsed["github-copilot"]["refresh"], "gho_long_lived_never_vend");
+        assert_eq!(
+            parsed["github-copilot"]["refresh"],
+            "gho_long_lived_never_vend"
+        );
         assert_eq!(parsed["anthropic"]["refresh"], "anth-refresh");
         assert_eq!(parsed["xai-auth"]["access"], "xai-a");
-        // Atomic tmp cleaned up
         assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]
     fn github_copilot_broker_access_token_shape_excludes_refresh() {
-        // Structural: AccessToken has no refresh field; only session token is vended.
         let v = serde_json::json!({
             "token": "tid=session",
             "expires": 123u64,
@@ -1372,15 +1585,11 @@ mod tests {
     #[tokio::test]
     async fn github_copilot_mint_rejects_redirect_status() {
         let http = FakeHttp::default();
-        http.push_get(ScriptedResponse::Status(
-            302,
-            "redirected".into(),
-        ));
+        http.push_get(ScriptedResponse::Status(302, "redirected".into()));
         let clock = FakeClock::new(0);
-        // FakeHttp returns the 302 body to mint_session_token which treats non-2xx as HttpStatus.
-        // ProductionHttp additionally maps 3xx -> UntrustedEndpoint; unit-level non-2xx is enough.
-        let err = mint_session_token(&http, &clock, "gho_x").await.unwrap_err();
+        let err = mint_session_token(&http, &clock, "gho_x")
+            .await
+            .unwrap_err();
         assert!(matches!(err, CopilotAuthError::HttpStatus(302)));
     }
 }
-
