@@ -18,8 +18,10 @@
 use std::time::Duration;
 
 use reqwest::Client;
+use serde::Deserialize;
+use url::Url;
 
-use super::OAuthCredentials;
+use super::{now_millis, OAuthCredentials};
 
 // ── Pinned endpoints ─────────────────────────────────────────────────────────
 
@@ -83,8 +85,208 @@ pub async fn login() -> Result<OAuthCredentials, String> {
     Err("google-gemini interactive login is not yet implemented".to_string())
 }
 
-pub async fn refresh_token(_client: &Client, _refresh: &str) -> Result<OAuthCredentials, String> {
-    Err("google-gemini refresh is not yet implemented".to_string())
+pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    if refresh.trim().is_empty() {
+        return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
+    }
+    let form = [
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("refresh_token", refresh),
+        ("grant_type", "refresh_token"),
+    ];
+    token_post(client, &form, Some(refresh), false).await
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Secret-safe login/refresh errors — variants intentionally store neither
+/// tokens, codes, nor client-secret material so Display cannot leak them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeminiAuthError {
+    UntrustedEndpoint,
+    TokenRequestFailed(u16),
+    InvalidTokenResponse,
+    EmptyAccessToken,
+    EmptyRefreshToken,
+    Transport,
+    ResponseTooLarge,
+}
+
+impl GeminiAuthError {
+    fn into_secret_safe(self) -> String {
+        match self {
+            Self::UntrustedEndpoint => "google-gemini: untrusted endpoint".into(),
+            Self::TokenRequestFailed(code) => {
+                format!("google-gemini: token request failed (HTTP {code})")
+            }
+            Self::InvalidTokenResponse => "google-gemini: invalid token response".into(),
+            Self::EmptyAccessToken => "google-gemini: empty access token".into(),
+            Self::EmptyRefreshToken => "google-gemini: empty refresh token".into(),
+            Self::Transport => "google-gemini: transport error".into(),
+            Self::ResponseTooLarge => "google-gemini: response body too large".into(),
+        }
+    }
+}
+
+// ── Pure helpers: URL builder, token parsing, callback parsing ───────────────
+
+/// Validate that `url_str` names an HTTPS endpoint on a Google-owned host.
+/// The token/authorize/userinfo endpoints are pinned; this helper is used both
+/// for the pinned constants and for post-response URL sanity checks.
+pub(crate) fn validate_google_https_endpoint(url_str: &str) -> Result<Url, GeminiAuthError> {
+    let url = Url::parse(url_str).map_err(|_| GeminiAuthError::UntrustedEndpoint)?;
+    if url.scheme() != "https" {
+        return Err(GeminiAuthError::UntrustedEndpoint);
+    }
+    let host = url.host_str().ok_or(GeminiAuthError::UntrustedEndpoint)?;
+    let allowed = host == "accounts.google.com"
+        || host == "oauth2.googleapis.com"
+        || host == "openidconnect.googleapis.com"
+        || host == "cloudcode-pa.googleapis.com";
+    if !allowed {
+        return Err(GeminiAuthError::UntrustedEndpoint);
+    }
+    Ok(url)
+}
+
+/// Build the loopback redirect URI for the Gemini OAuth flow. Always emits a
+/// literal loopback IP (RFC 8252 §7.3) — never `localhost`.
+pub fn redirect_uri(port: u16) -> String {
+    format!("http://{CALLBACK_HOST}:{port}{CALLBACK_PATH}")
+}
+
+/// Build a Google installed-app authorization URL with PKCE (S256), offline
+/// access, and forced consent so a refresh token is always issued.
+pub fn build_authorize_url(challenge: &str, state: &str, port: u16) -> String {
+    let mut url = Url::parse(AUTHORIZE_URL).expect("AUTHORIZE_URL is a valid URL");
+    url.query_pairs_mut()
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", &redirect_uri(port))
+        .append_pair("response_type", "code")
+        .append_pair("scope", SCOPES)
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("include_granted_scopes", "true");
+    url.into()
+}
+
+/// Parse a manually pasted Google OAuth loopback callback URL. Strict:
+/// requires http/127.0.0.1/exact-port/exact-path, both `code` and `state`,
+/// and exact state equality — never defaults a missing state.
+pub fn parse_pasted_callback(
+    input: &str,
+    expected_state: &str,
+    port: u16,
+) -> Option<super::CallbackResult> {
+    let url = Url::parse(input.trim()).ok()?;
+    if url.scheme() != "http"
+        || url.host_str() != Some(CALLBACK_HOST)
+        || url.port_or_known_default() != Some(port)
+        || url.path() != CALLBACK_PATH
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let code = query.get("code")?.to_owned();
+    let state = query.get("state")?.to_owned();
+    if code.is_empty() || state != expected_state {
+        return None;
+    }
+    Some(super::CallbackResult { code, state })
+}
+
+// ── Token exchange wire types (kept private) ─────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+    /// Some Google flows include a `scope` we can echo back for parity with the
+    /// original grant; not enforced structurally to keep parsing lenient.
+    #[allow(dead_code)]
+    scope: Option<String>,
+    #[allow(dead_code)]
+    token_type: Option<String>,
+}
+
+pub(crate) fn credentials_from_token_response(
+    body: &str,
+    previous_refresh: Option<&str>,
+    require_refresh: bool,
+) -> Result<OAuthCredentials, GeminiAuthError> {
+    let token: TokenResponse =
+        serde_json::from_str(body).map_err(|_| GeminiAuthError::InvalidTokenResponse)?;
+
+    let access = token
+        .access_token
+        .filter(|v| !v.trim().is_empty())
+        .ok_or(GeminiAuthError::EmptyAccessToken)?;
+
+    let refresh = token
+        .refresh_token
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| previous_refresh.map(str::to_owned));
+    if require_refresh && refresh.is_none() {
+        return Err(GeminiAuthError::EmptyRefreshToken);
+    }
+
+    let expires_in = token.expires_in.unwrap_or(3600);
+    let expires = now_millis()
+        .saturating_add(expires_in.saturating_mul(1000))
+        .saturating_sub(EXPIRY_SKEW_MS);
+
+    Ok(OAuthCredentials {
+        auth_type: "oauth".into(),
+        refresh: refresh.unwrap_or_default(),
+        access,
+        expires,
+        account_id: None,
+    })
+}
+
+async fn token_post(
+    _client: &Client,
+    form: &[(&str, &str)],
+    previous_refresh: Option<&str>,
+    require_refresh: bool,
+) -> Result<OAuthCredentials, String> {
+    validate_google_https_endpoint(TOKEN_URL).map_err(GeminiAuthError::into_secret_safe)?;
+    // OAuth secrets (refresh tokens, code_verifier, client_secret) must never
+    // be replayed to a redirect target. Use a dedicated no-redirect client.
+    let no_redirect_client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+    let response = no_redirect_client
+        .post(TOKEN_URL)
+        .form(form)
+        .send()
+        .await
+        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(GeminiAuthError::TokenRequestFailed(status.as_u16()).into_secret_safe());
+    }
+    // Bound the body — never trust upstream to be small.
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+    if bytes.len() > MAX_RESPONSE_BODY_BYTES {
+        return Err(GeminiAuthError::ResponseTooLarge.into_secret_safe());
+    }
+    let body = std::str::from_utf8(&bytes)
+        .map_err(|_| GeminiAuthError::InvalidTokenResponse.into_secret_safe())?;
+    credentials_from_token_response(body, previous_refresh, require_refresh)
+        .map_err(GeminiAuthError::into_secret_safe)
 }
 
 #[cfg(test)]
@@ -129,14 +331,198 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_and_refresh_stubs_return_secret_free_error() {
+    async fn login_stub_still_returns_secret_free_error_until_slice_3() {
         let err = login().await.unwrap_err();
         assert!(!err.is_empty());
         assert!(!err.contains(CLIENT_SECRET));
+    }
 
-        let err = refresh_token(&Client::new(), "irrelevant-refresh").await.unwrap_err();
-        assert!(!err.is_empty());
+    #[tokio::test]
+    async fn refresh_rejects_empty_refresh_without_network() {
+        let err = refresh_token(&Client::new(), "").await.unwrap_err();
+        // Must fail before any network call and never leak secrets/inputs.
+        assert!(err.contains("empty refresh token"));
         assert!(!err.contains(CLIENT_SECRET));
-        assert!(!err.contains("irrelevant-refresh"));
+    }
+
+    #[test]
+    fn authorize_url_has_required_installed_app_pkce_params() {
+        let url_str = build_authorize_url("challenge-123", "state-abc", 45289);
+        let url = Url::parse(&url_str).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("accounts.google.com"));
+        assert_eq!(url.path(), "/o/oauth2/v2/auth");
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], CLIENT_ID);
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["redirect_uri"], "http://127.0.0.1:45289/oauth2callback");
+        assert_eq!(q["code_challenge"], "challenge-123");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["state"], "state-abc");
+        // access_type=offline + prompt=consent is what unlocks a refresh token
+        // on re-authorization. Both are required or Google may skip it.
+        assert_eq!(q["access_type"], "offline");
+        assert_eq!(q["prompt"], "consent");
+        assert!(q["scope"].contains("cloud-platform"));
+    }
+
+    #[test]
+    fn redirect_uri_uses_loopback_ip_literal_not_localhost() {
+        let uri = redirect_uri(45289);
+        assert_eq!(uri, "http://127.0.0.1:45289/oauth2callback");
+        assert!(!uri.contains("localhost"));
+    }
+
+    #[test]
+    fn pasted_callback_is_strict_and_state_bound() {
+        // Wrong host — localhost is NOT accepted.
+        assert!(parse_pasted_callback(
+            "http://localhost:45289/oauth2callback?code=c&state=s",
+            "s",
+            45289
+        )
+        .is_none());
+        // Wrong path.
+        assert!(parse_pasted_callback(
+            "http://127.0.0.1:45289/callback?code=c&state=s",
+            "s",
+            45289
+        )
+        .is_none());
+        // Wrong port.
+        assert!(parse_pasted_callback(
+            "http://127.0.0.1:1234/oauth2callback?code=c&state=s",
+            "s",
+            45289
+        )
+        .is_none());
+        // Wrong scheme.
+        assert!(parse_pasted_callback(
+            "https://127.0.0.1:45289/oauth2callback?code=c&state=s",
+            "s",
+            45289
+        )
+        .is_none());
+        // Wrong state — CSRF guard.
+        assert!(parse_pasted_callback(
+            "http://127.0.0.1:45289/oauth2callback?code=c&state=wrong",
+            "s",
+            45289
+        )
+        .is_none());
+        // Missing state — must not silently pass.
+        assert!(parse_pasted_callback(
+            "http://127.0.0.1:45289/oauth2callback?code=c",
+            "s",
+            45289
+        )
+        .is_none());
+        // Missing code.
+        assert!(parse_pasted_callback(
+            "http://127.0.0.1:45289/oauth2callback?state=s",
+            "s",
+            45289
+        )
+        .is_none());
+        // Bare code / garbage.
+        assert!(parse_pasted_callback("bare-code", "s", 45289).is_none());
+        // Happy path.
+        let r = parse_pasted_callback(
+            "http://127.0.0.1:45289/oauth2callback?code=goodcode&state=s",
+            "s",
+            45289,
+        )
+        .unwrap();
+        assert_eq!(r.code, "goodcode");
+        assert_eq!(r.state, "s");
+    }
+
+    #[test]
+    fn validate_google_https_endpoint_rejects_untrusted_hosts_and_http() {
+        assert!(validate_google_https_endpoint("http://accounts.google.com/o/oauth2/v2/auth")
+            .is_err());
+        assert!(validate_google_https_endpoint("https://evil.example/token").is_err());
+        // Look-alike must fail (host suffix rule is exact-host, not endsWith).
+        assert!(validate_google_https_endpoint("https://accounts.google.com.evil/token").is_err());
+        assert!(validate_google_https_endpoint("https://oauth2.googleapis.com/token").is_ok());
+        assert!(
+            validate_google_https_endpoint("https://cloudcode-pa.googleapis.com/v1internal:x")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn credentials_from_token_response_happy_and_carryover() {
+        let body = r#"{"access_token":"aaa","refresh_token":"rrr","expires_in":3600,"token_type":"Bearer"}"#;
+        let creds = credentials_from_token_response(body, None, true).unwrap();
+        assert_eq!(creds.access, "aaa");
+        assert_eq!(creds.refresh, "rrr");
+        assert_eq!(creds.auth_type, "oauth");
+        // Skew is subtracted; expires must be strictly less than now + expires_in.
+        assert!(creds.expires < now_millis() + 3600 * 1000);
+
+        // Refresh omitted, previous provided → carry over (refresh flow behavior).
+        let body_no_r = r#"{"access_token":"newaccess","expires_in":1800}"#;
+        let carried = credentials_from_token_response(body_no_r, Some("old-refresh"), false)
+            .unwrap();
+        assert_eq!(carried.access, "newaccess");
+        assert_eq!(carried.refresh, "old-refresh");
+    }
+
+    #[test]
+    fn credentials_from_token_response_rejects_missing_or_empty_access_token() {
+        assert!(matches!(
+            credentials_from_token_response(r#"{"expires_in":10}"#, None, false),
+            Err(GeminiAuthError::EmptyAccessToken)
+        ));
+        assert!(matches!(
+            credentials_from_token_response(
+                r#"{"access_token":"   ","expires_in":10}"#,
+                None,
+                false
+            ),
+            Err(GeminiAuthError::EmptyAccessToken)
+        ));
+    }
+
+    #[test]
+    fn credentials_from_token_response_requires_refresh_on_login_but_not_on_refresh() {
+        let body = r#"{"access_token":"a","expires_in":10}"#;
+        // Login path (require_refresh=true) with no refresh field and no
+        // previous refresh must fail.
+        assert!(matches!(
+            credentials_from_token_response(body, None, true),
+            Err(GeminiAuthError::EmptyRefreshToken)
+        ));
+        // Refresh path (require_refresh=false) with carry-over is fine.
+        assert!(credentials_from_token_response(body, Some("carry"), false).is_ok());
+    }
+
+    #[test]
+    fn credentials_from_token_response_rejects_non_json_body_secret_safely() {
+        // Note: the caller (token_post) never places the raw body into the
+        // error surface; this test asserts the parser signals a typed error.
+        assert!(matches!(
+            credentials_from_token_response("not-json", None, false),
+            Err(GeminiAuthError::InvalidTokenResponse)
+        ));
+    }
+
+    #[test]
+    fn gemini_auth_error_display_is_secret_safe() {
+        for err in [
+            GeminiAuthError::UntrustedEndpoint,
+            GeminiAuthError::TokenRequestFailed(400),
+            GeminiAuthError::InvalidTokenResponse,
+            GeminiAuthError::EmptyAccessToken,
+            GeminiAuthError::EmptyRefreshToken,
+            GeminiAuthError::Transport,
+            GeminiAuthError::ResponseTooLarge,
+        ] {
+            let msg = err.clone().into_secret_safe();
+            assert!(msg.starts_with("google-gemini:"), "{msg}");
+            assert!(!msg.contains(CLIENT_SECRET));
+            assert!(!msg.contains(CLIENT_ID));
+        }
     }
 }
