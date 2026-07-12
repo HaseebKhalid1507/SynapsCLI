@@ -42,10 +42,13 @@ use serde::Deserialize;
 use serde_json::json;
 use synaps_cli::auth;
 
-/// Providers the broker will vend. Anything else is rejected before any work or
-/// logging — prevents probing for configured providers and log injection via an
-/// arbitrary provider string. (#158 B4)
-const ALLOWED_PROVIDERS: &[&str] = &["anthropic", "openai-codex"];
+/// OAuth providers whose descriptors permit access-token vending. Static-key
+/// strategies are intentionally not served by this endpoint.
+fn broker_provider(value: &str) -> Option<auth::OAuthProviderId> {
+    let id: auth::OAuthProviderId = value.try_into().ok()?;
+    let descriptor = auth::provider::registry().get(id).copied()?;
+    (descriptor.broker_strategy == auth::BrokerCredentialStrategy::OAuthAccessToken).then_some(id)
+}
 
 // ── TLS config types ─────────────────────────────────────────────────────────
 
@@ -101,17 +104,12 @@ pub fn check_bind_policy(is_loopback: bool, has_tls: bool, insecure_http: bool) 
 
 /// Read and validate a cert+key PEM pair. Fails fast with a human-readable error
 /// so the broker never starts with a broken TLS config.
-pub fn load_and_validate_tls(
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
-) -> anyhow::Result<TlsConfig> {
+pub fn load_and_validate_tls(cert_path: &PathBuf, key_path: &PathBuf) -> anyhow::Result<TlsConfig> {
     // Read files first — surface "file not found" before doing any parsing.
-    let cert_pem = std::fs::read(cert_path).map_err(|e| {
-        anyhow::anyhow!("--tls-cert '{}': {e}", cert_path.display())
-    })?;
-    let key_pem = std::fs::read(key_path).map_err(|e| {
-        anyhow::anyhow!("--tls-key '{}': {e}", key_path.display())
-    })?;
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("--tls-cert '{}': {e}", cert_path.display()))?;
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| anyhow::anyhow!("--tls-key '{}': {e}", key_path.display()))?;
 
     // Parse to catch garbage PEM / wrong file type before binding.
     validate_pem_pair(&cert_pem, &key_pem)?;
@@ -126,19 +124,17 @@ pub fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<()> 
     use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     // Validate cert chain — must have at least one cert.
-    let certs: Vec<CertificateDer<'_>> =
-        CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("TLS cert PEM is malformed: {e}"))?;
+    let certs: Vec<CertificateDer<'_>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS cert PEM is malformed: {e}"))?;
     if certs.is_empty() {
         anyhow::bail!("TLS cert PEM contains no certificates (empty or wrong format)");
     }
 
     // Validate private key — must parse as one of the known key types.
-    let keys: Vec<PrivateKeyDer<'_>> =
-        PrivateKeyDer::pem_slice_iter(key_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("TLS key PEM is malformed: {e}"))?;
+    let keys: Vec<PrivateKeyDer<'_>> = PrivateKeyDer::pem_slice_iter(key_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS key PEM is malformed: {e}"))?;
     if keys.is_empty() {
         anyhow::bail!("TLS key PEM contains no private key (empty or wrong format)");
     }
@@ -212,7 +208,12 @@ pub async fn run(
         None => match machine_token_file {
             Some(ref path) => Some(
                 std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("could not read --machine-token-file {}: {e}", path.display()))?
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "could not read --machine-token-file {}: {e}",
+                            path.display()
+                        )
+                    })?
                     .trim()
                     .to_string(),
             ),
@@ -268,7 +269,10 @@ pub async fn run(
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let state = BrokerState { machine_token: machine_token.clone(), client: client.clone() };
+    let state = BrokerState {
+        machine_token: machine_token.clone(),
+        client: client.clone(),
+    };
 
     // Proactive refresh, SUPERVISED.
     {
@@ -295,18 +299,20 @@ pub async fn run(
         BindDecision::Tls => {
             eprintln!(
                 "synaps auth-broker listening on https://{addr}  (machine auth: {}, TLS: ON)",
-                if machine_token.is_some() { "ON" } else { "OFF — loopback/insecure only!" }
+                if machine_token.is_some() {
+                    "ON"
+                } else {
+                    "OFF — loopback/insecure only!"
+                }
             );
             let tls_cfg = tls.expect("Tls decision requires tls config");
             // rustls 0.23 requires an explicit CryptoProvider when multiple backends
             // are compiled in; install ring as the default (idempotent — Err means already set).
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-                tls_cfg.cert_pem,
-                tls_cfg.key_pem,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to build TLS config from PEM: {e}"))?;
+            let rustls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem(tls_cfg.cert_pem, tls_cfg.key_pem)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to build TLS config from PEM: {e}"))?;
 
             // Handle<SocketAddr> — matches addr type for bind_rustls.
             let handle = axum_server::Handle::<SocketAddr>::new();
@@ -326,12 +332,19 @@ pub async fn run(
         BindDecision::Http { .. } => {
             eprintln!(
                 "synaps auth-broker listening on http://{addr}  (machine auth: {})",
-                if machine_token.is_some() { "ON" } else { "OFF — loopback/insecure only!" }
+                if machine_token.is_some() {
+                    "ON"
+                } else {
+                    "OFF — loopback/insecure only!"
+                }
             );
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         BindDecision::Refuse(_) => unreachable!("Refuse is handled above"),
     }
@@ -357,7 +370,9 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => { sig.recv().await; }
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
             Err(_) => std::future::pending::<()>().await,
         }
     };
@@ -376,8 +391,14 @@ async fn shutdown_signal() {
 async fn healthz() -> impl IntoResponse {
     match auth::load_auth() {
         Ok(Some(_)) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
-        Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "no_credential" }))),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "status": "error" }))),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "no_credential" })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error" })),
+        ),
     }
 }
 
@@ -397,22 +418,33 @@ async fn token(
         let expected_header = format!("Bearer {expected}");
         if !ct_eq(got.as_bytes(), expected_header.as_bytes()) {
             eprintln!("[auth-broker] DENIED from {} (bad machine auth)", peer.ip());
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "bad machine auth" })))
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "bad machine auth" })),
+            )
                 .into_response();
         }
     }
 
     // ── provider allowlist ──
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
-    if !ALLOWED_PROVIDERS.contains(&provider.as_str()) {
-        eprintln!("[auth-broker] DENIED from {} (provider not allowed, {} chars)", peer.ip(), provider.len());
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown provider" }))).into_response();
-    }
+    let Some(provider_id) = broker_provider(&provider) else {
+        eprintln!(
+            "[auth-broker] DENIED from {} (provider not allowed, {} chars)",
+            peer.ip(),
+            provider.len()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
 
-    let creds = if provider == "anthropic" {
+    let creds = if provider_id == auth::OAuthProviderId::Anthropic {
         auth::ensure_fresh_token(&st.client).await
     } else {
-        auth::ensure_fresh_provider_token(&st.client, &provider).await
+        auth::ensure_fresh_provider_token(&st.client, provider_id).await
     };
 
     match creds {
@@ -422,13 +454,27 @@ async fn token(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let ttl_ms = c.expires.saturating_sub(now);
-            eprintln!("[auth-broker] issued {provider} token to {} (expires {})", peer.ip(), c.expires);
-            (StatusCode::OK, Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })))
+            eprintln!(
+                "[auth-broker] issued {provider} token to {} (expires {})",
+                peer.ip(),
+                c.expires
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })),
+            )
                 .into_response()
         }
         Err(e) => {
-            eprintln!("[auth-broker] refresh failed for {provider} from {}: {}", peer.ip(), e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "token refresh failed" })))
+            eprintln!(
+                "[auth-broker] refresh failed for {provider} from {}: {}",
+                peer.ip(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "token refresh failed" })),
+            )
                 .into_response()
         }
     }
@@ -457,13 +503,19 @@ mod tests {
 
     #[test]
     fn policy_loopback_no_tls_is_plain_http() {
-        assert_eq!(check_bind_policy(true, false, false), BindDecision::Http { warn: false });
+        assert_eq!(
+            check_bind_policy(true, false, false),
+            BindDecision::Http { warn: false }
+        );
     }
 
     #[test]
     fn policy_loopback_insecure_flag_is_still_plain_http_no_warn() {
         // loopback + insecure flag → still HTTP, no warning (flag is irrelevant on loopback)
-        assert_eq!(check_bind_policy(true, false, true), BindDecision::Http { warn: false });
+        assert_eq!(
+            check_bind_policy(true, false, true),
+            BindDecision::Http { warn: false }
+        );
     }
 
     #[test]
@@ -476,15 +528,27 @@ mod tests {
         let d = check_bind_policy(false, false, false);
         assert!(matches!(d, BindDecision::Refuse(_)));
         if let BindDecision::Refuse(msg) = d {
-            assert!(msg.contains("non-loopback"), "message should mention non-loopback: {msg}");
-            assert!(msg.contains("--tls-cert"), "message should mention --tls-cert: {msg}");
-            assert!(msg.contains("--insecure-http"), "message should mention --insecure-http: {msg}");
+            assert!(
+                msg.contains("non-loopback"),
+                "message should mention non-loopback: {msg}"
+            );
+            assert!(
+                msg.contains("--tls-cert"),
+                "message should mention --tls-cert: {msg}"
+            );
+            assert!(
+                msg.contains("--insecure-http"),
+                "message should mention --insecure-http: {msg}"
+            );
         }
     }
 
     #[test]
     fn policy_nonloopback_no_tls_insecure_flag_warns() {
-        assert_eq!(check_bind_policy(false, false, true), BindDecision::Http { warn: true });
+        assert_eq!(
+            check_bind_policy(false, false, true),
+            BindDecision::Http { warn: true }
+        );
     }
 
     #[test]
@@ -553,7 +617,10 @@ mod tests {
         let err = load_and_validate_tls(&cert_path, &key_path);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("--tls-cert"), "error should mention --tls-cert flag: {msg}");
+        assert!(
+            msg.contains("--tls-cert"),
+            "error should mention --tls-cert flag: {msg}"
+        );
     }
 
     #[test]
@@ -566,7 +633,10 @@ mod tests {
         let err = load_and_validate_tls(&cert_path, &key_path);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("--tls-key"), "error should mention --tls-key flag: {msg}");
+        assert!(
+            msg.contains("--tls-key"),
+            "error should mention --tls-key flag: {msg}"
+        );
     }
 
     #[test]
@@ -601,7 +671,10 @@ mod tests {
     fn build_test_router(machine_token: Option<String>) -> Router {
         let tok = machine_token.clone();
         Router::new()
-            .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({ "status": "ok" })) }),
+            )
             .route(
                 "/token",
                 get(move |headers: HeaderMap| {
@@ -683,7 +756,11 @@ mod tests {
     async fn tls_healthz_returns_200() {
         let (addr, handle) = spawn_tls_server(None).await;
         let url = format!("https://{addr}/healthz");
-        let resp = insecure_client().get(&url).send().await.expect("GET /healthz over TLS");
+        let resp = insecure_client()
+            .get(&url)
+            .send()
+            .await
+            .expect("GET /healthz over TLS");
         assert_eq!(resp.status(), 200, "/healthz should return 200 over TLS");
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "ok");
@@ -694,8 +771,16 @@ mod tests {
     async fn tls_token_no_auth_returns_401() {
         let (addr, handle) = spawn_tls_server(Some("secret123".to_string())).await;
         let url = format!("https://{addr}/token");
-        let resp = insecure_client().get(&url).send().await.expect("GET /token no auth");
-        assert_eq!(resp.status(), 401, "/token without bearer should 401 over TLS");
+        let resp = insecure_client()
+            .get(&url)
+            .send()
+            .await
+            .expect("GET /token no auth");
+        assert_eq!(
+            resp.status(),
+            401,
+            "/token without bearer should 401 over TLS"
+        );
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
     }
 
@@ -709,7 +794,11 @@ mod tests {
             .send()
             .await
             .expect("GET /token with correct auth");
-        assert_eq!(resp.status(), 200, "/token with correct bearer should 200 over TLS");
+        assert_eq!(
+            resp.status(),
+            200,
+            "/token with correct bearer should 200 over TLS"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["access_token"], "test-tok");
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
@@ -725,7 +814,11 @@ mod tests {
             .send()
             .await
             .expect("GET /token with wrong auth");
-        assert_eq!(resp.status(), 401, "/token with wrong bearer should 401 over TLS");
+        assert_eq!(
+            resp.status(),
+            401,
+            "/token with wrong bearer should 401 over TLS"
+        );
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
     }
 
@@ -736,8 +829,7 @@ mod tests {
     pub(super) fn generate_test_cert_key() -> (Vec<u8>, Vec<u8>) {
         use rcgen::generate_simple_self_signed;
         let san = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        let cert = generate_simple_self_signed(san)
-            .expect("rcgen cert generation should succeed");
+        let cert = generate_simple_self_signed(san).expect("rcgen cert generation should succeed");
         let cert_pem = cert.cert.pem().into_bytes();
         let key_pem = cert.signing_key.serialize_pem().into_bytes();
         (cert_pem, key_pem)

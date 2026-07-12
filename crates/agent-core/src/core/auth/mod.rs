@@ -11,23 +11,35 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-mod pkce;
-mod callback;
-mod token;
-mod storage;
 mod browser;
-mod openai_codex;
+mod callback;
 mod credential_source;
+mod openai_codex;
+mod pkce;
+pub mod provider;
+pub mod providers;
+mod storage;
+mod token;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
-pub use pkce::{generate_code_verifier, generate_code_challenge, generate_state, build_auth_url};
-pub use callback::{CallbackServerHandle, start_callback_server};
-pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token, ensure_fresh_provider_token};
-pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
 pub use browser::open_browser;
-pub use openai_codex::{extract_account_id as extract_codex_account_id, login as login_openai_codex};
-pub use credential_source::{CredentialSource, BrokerToken, BrokerClient, TokenCache, TokenFetcher, resolve_remote, resolve_remote_token, resolve_access_token, is_expired_with_margin, DEFAULT_MARGIN_MS};
+pub use callback::{start_callback_server, CallbackServerHandle};
+pub use credential_source::{
+    is_expired_with_margin, resolve_access_token, resolve_remote, resolve_remote_token,
+    BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
+};
+pub use openai_codex::{
+    extract_account_id as extract_codex_account_id, login as login_openai_codex,
+};
+pub use pkce::{build_auth_url, generate_code_challenge, generate_code_verifier, generate_state};
+pub use provider::{
+    BrokerCredentialStrategy, OAuthProviderDescriptor, OAuthProviderId, OAuthProviderRegistry,
+};
+pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
+pub use token::{
+    ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
+};
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
@@ -54,7 +66,11 @@ pub struct OAuthCredentials {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFile {
     pub anthropic: OAuthCredentials,
-    #[serde(rename = "openai-codex", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "openai-codex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub openai_codex: Option<OAuthCredentials>,
 }
 
@@ -102,8 +118,14 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
 
     // Try as full URL (e.g. the redirect from the browser)
     if let Ok(url) = url::Url::parse(trimmed) {
-        let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string());
-        let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        let code = url
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string());
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
         if code.is_some() {
             return (code, state);
         }
@@ -134,7 +156,10 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
 /// here, a bare code paste or a URL without `state` is rejected outright.
 fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
     let (code, state) = parse_manual_input(input);
-    Some(CallbackResult { code: code?, state: state? })
+    Some(CallbackResult {
+        code: code?,
+        state: state?,
+    })
 }
 
 // ── High-level login flow ───────────────────────────────────────────────────
@@ -245,9 +270,15 @@ mod tests {
     fn test_generate_code_verifier() {
         let verifier = generate_code_verifier();
         assert!(!verifier.is_empty(), "Code verifier should not be empty");
-        assert!(verifier.len() > 20, "Code verifier should be longer than 20 characters");
+        assert!(
+            verifier.len() > 20,
+            "Code verifier should be longer than 20 characters"
+        );
         let verifier2 = generate_code_verifier();
-        assert_ne!(verifier, verifier2, "Two calls should produce different verifiers");
+        assert_ne!(
+            verifier, verifier2,
+            "Two calls should produce different verifiers"
+        );
     }
 
     #[test]
@@ -256,9 +287,15 @@ mod tests {
         let challenge = generate_code_challenge(verifier);
         assert!(!challenge.is_empty(), "Code challenge should not be empty");
         let challenge2 = generate_code_challenge(verifier);
-        assert_eq!(challenge, challenge2, "Same verifier should produce same challenge");
+        assert_eq!(
+            challenge, challenge2,
+            "Same verifier should produce same challenge"
+        );
         let different_challenge = generate_code_challenge("different_verifier_456");
-        assert_ne!(challenge, different_challenge, "Different verifiers should produce different challenges");
+        assert_ne!(
+            challenge, different_challenge,
+            "Different verifiers should produce different challenges"
+        );
     }
 
     #[test]
@@ -311,13 +348,13 @@ mod tests {
     fn test_pkce_challenge_sha256() {
         let verifier = "test_verifier_string";
         let challenge = generate_code_challenge(verifier);
-        
-        use sha2::{Sha256, Digest};
+
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(verifier.as_bytes());
         let hash = hasher.finalize();
         let expected = URL_SAFE_NO_PAD.encode(hash);
-        
+
         assert_eq!(challenge, expected);
     }
 
@@ -345,8 +382,11 @@ mod tests {
 
     #[test]
     fn test_is_token_expired_edge_cases() {
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
         let exactly_now_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
             refresh: "test_refresh".to_string(),
@@ -355,7 +395,7 @@ mod tests {
             account_id: None,
         };
         assert!(is_token_expired(&exactly_now_creds));
-        
+
         let one_ms_future_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
             refresh: "test_refresh".to_string(),
@@ -382,10 +422,11 @@ mod tests {
             expires: 1234567890,
             account_id: None,
         };
-        
+
         let json = serde_json::to_string(&original_creds).expect("Should serialize");
-        let deserialized_creds: OAuthCredentials = serde_json::from_str(&json).expect("Should deserialize");
-        
+        let deserialized_creds: OAuthCredentials =
+            serde_json::from_str(&json).expect("Should deserialize");
+
         assert_eq!(original_creds.auth_type, deserialized_creds.auth_type);
         assert_eq!(original_creds.refresh, deserialized_creds.refresh);
         assert_eq!(original_creds.access, deserialized_creds.access);
@@ -403,10 +444,8 @@ mod tests {
 
     #[test]
     fn anthropic_manual_paste_accepts_full_redirect_url() {
-        let result = manual_paste_to_callback(
-            "http://localhost:53692/callback?code=abc&state=xyz",
-        )
-        .expect("URL with code+state must be accepted");
+        let result = manual_paste_to_callback("http://localhost:53692/callback?code=abc&state=xyz")
+            .expect("URL with code+state must be accepted");
         assert_eq!(result.code, "abc");
         assert_eq!(result.state, "xyz");
     }

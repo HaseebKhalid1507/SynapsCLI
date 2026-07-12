@@ -1,7 +1,7 @@
 use reqwest::Client;
 
-use super::{is_token_expired, now_millis, OAuthCredentials, TokenResponse, CLIENT_ID, TOKEN_URL};
 use super::storage::{auth_file_path, load_provider_auth, save_provider_auth};
+use super::{is_token_expired, now_millis, OAuthCredentials, TokenResponse, CLIENT_ID, TOKEN_URL};
 
 /// Exchange an authorization code for access + refresh tokens.
 pub async fn exchange_code_for_tokens(
@@ -61,7 +61,10 @@ pub async fn exchange_code_for_tokens(
 }
 
 /// Refresh an expired OAuth token.
-pub async fn refresh_token(client: &Client, refresh: &str) -> std::result::Result<OAuthCredentials, String> {
+pub async fn refresh_token(
+    client: &Client,
+    refresh: &str,
+) -> std::result::Result<OAuthCredentials, String> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
@@ -152,13 +155,14 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
         .open(&path)
         .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
 
-    let mut file = tokio::task::spawn_blocking(move || -> std::result::Result<std::fs::File, String> {
-        FileExt::lock_exclusive(&file)
-            .map_err(|e| format!("Failed to lock auth.json: {}", e))?;
-        Ok(file)
-    })
-    .await
-    .map_err(|e| format!("Lock task failed: {}", e))??;
+    let mut file =
+        tokio::task::spawn_blocking(move || -> std::result::Result<std::fs::File, String> {
+            FileExt::lock_exclusive(&file)
+                .map_err(|e| format!("Failed to lock auth.json: {}", e))?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| format!("Lock task failed: {}", e))??;
 
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("Failed to seek auth.json: {}", e))?;
@@ -169,8 +173,8 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
     // network call so we don't hold the lock across I/O we don't control.
     drop(file);
 
-    let root: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse auth.json: {}", e))?;
+    let root: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse auth.json: {}", e))?;
     let anthropic_raw = root
         .get("anthropic")
         .ok_or_else(|| "No anthropic credential in auth.json. Run `login`.".to_string())?;
@@ -195,23 +199,28 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
 }
 
 /// Ensure a non-Anthropic OAuth provider has a fresh token.
-pub async fn ensure_fresh_provider_token(
+pub async fn ensure_fresh_provider_token<P>(
     client: &Client,
-    provider: &str,
-) -> std::result::Result<OAuthCredentials, String> {
-    let Some(creds) = load_provider_auth(provider)? else {
-        return Err(format!("No credentials for {}. Run `synaps login`.", provider));
+    provider: P,
+) -> std::result::Result<OAuthCredentials, String>
+where
+    P: TryInto<super::provider::OAuthProviderId>,
+    P::Error: std::fmt::Display,
+{
+    let provider = provider.try_into().map_err(|e| e.to_string())?;
+    let Some(creds) = load_provider_auth(provider.as_str())? else {
+        return Err(format!(
+            "No credentials for {}. Run `synaps login`.",
+            provider
+        ));
     };
 
     if !is_token_expired(&creds) {
         return Ok(creds);
     }
 
-    let fresh = match provider {
-        "openai-codex" => super::openai_codex::refresh_token(client, &creds.refresh).await?,
-        other => return Err(format!("No refresh handler for OAuth provider {}", other)),
-    };
-    save_provider_auth(provider, &fresh)?;
+    let fresh = super::provider::refresh(client, provider, &creds.refresh).await?;
+    save_provider_auth(provider.as_str(), &fresh)?;
     Ok(fresh)
 }
 

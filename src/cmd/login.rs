@@ -83,10 +83,9 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
         }
     }
 
-    let result = match provider.key {
-        "claude" => auth::login().await,
-        "openai-codex" => auth::login_openai_codex().await,
-        _ => Err(format!("No OAuth login handler for {}", provider.name)),
+    let result = match auth::provider::parse_cli_provider(provider.key) {
+        Ok(id) => auth::provider::login(id).await,
+        Err(_) => Err(format!("No OAuth login handler for {}", provider.name)),
     };
 
     match result {
@@ -106,10 +105,9 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
 }
 
 fn oauth_storage_key(provider: LoginProvider) -> &'static str {
-    match provider.key {
-        "claude" => "anthropic",
-        other => other,
-    }
+    auth::provider::parse_cli_provider(provider.key)
+        .map(|id| id.as_str())
+        .unwrap_or(provider.key)
 }
 
 fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
@@ -123,7 +121,10 @@ fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
     let config_key = format!("provider.{}", provider.key);
     if let Some(existing) = config::load_config().provider_keys.get(provider.key) {
         if !existing.is_empty() {
-            eprintln!("\n\x1b[33m⚠ API key already configured for {}.\x1b[0m", provider.name);
+            eprintln!(
+                "\n\x1b[33m⚠ API key already configured for {}.\x1b[0m",
+                provider.name
+            );
             eprintln!("  Continuing will replace provider.{}.\n", provider.key);
         }
     }
@@ -265,7 +266,10 @@ fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ API key saved!\x1b[0m");
             eprintln!("  Config key: {}", config_key);
-            eprintln!("  Config file: {}", config::resolve_write_path("config").display());
+            eprintln!(
+                "  Config file: {}",
+                config::resolve_write_path("config").display()
+            );
             eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key);
         }
         Err(e) => {
@@ -277,23 +281,29 @@ fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
 
 fn find_provider(providers: &[LoginProvider], key: &str) -> Option<LoginProvider> {
     let key_lower = key.to_lowercase();
-    providers.iter().find(|p| p.key.to_lowercase() == key_lower).copied()
+    providers
+        .iter()
+        .find(|p| p.key.to_lowercase() == key_lower)
+        .copied()
 }
 
 fn login_providers() -> Vec<LoginProvider> {
-    let mut providers = vec![LoginProvider {
-        key: "claude",
-        name: "Claude",
-        description: "Claude account OAuth",
-        auth_kind: AuthKind::OAuth,
-        recommended: true,
-    }, LoginProvider {
-        key: "openai-codex",
-        name: "OpenAI Codex",
-        description: "ChatGPT Plus/Pro OAuth",
-        auth_kind: AuthKind::OAuth,
-        recommended: false,
-    }];
+    let mut oauth: Vec<_> = auth::provider::registry().iter().copied().collect();
+    oauth.sort_by_key(|provider| !provider.recommended);
+    let mut providers: Vec<_> = oauth
+        .into_iter()
+        .map(|provider| LoginProvider {
+            key: if provider.id == auth::OAuthProviderId::Anthropic {
+                "claude"
+            } else {
+                provider.id.as_str()
+            },
+            name: provider.display_name,
+            description: provider.description,
+            auth_kind: AuthKind::OAuth,
+            recommended: provider.recommended,
+        })
+        .collect();
 
     providers.extend(
         synaps_cli::runtime::openai::registry::providers()
@@ -375,8 +385,11 @@ fn filtered_provider_indices(providers: &[LoginProvider], query: &str) -> Vec<us
         .iter()
         .enumerate()
         .filter_map(|(idx, provider)| {
-            let haystack =
-                format!("{} {} {}", provider.key, provider.name, provider.description).to_lowercase();
+            let haystack = format!(
+                "{} {} {}",
+                provider.key, provider.name, provider.description
+            )
+            .to_lowercase();
             haystack.contains(&query).then_some(idx)
         })
         .collect()
@@ -408,19 +421,18 @@ fn render_provider_picker(
     for (row, provider_idx) in visible.iter().enumerate() {
         let provider = providers[*provider_idx];
         let marker = if row == selected { "●" } else { "○" };
-        let suffix = if provider.recommended { " (recommended)" } else { "" };
+        let suffix = if provider.recommended {
+            " (recommended)"
+        } else {
+            ""
+        };
         let auth = match provider.auth_kind {
             AuthKind::OAuth => "oauth",
             AuthKind::ApiKey => "api key",
         };
         eprint!(
             "{}│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
-            LOGIN_PICKER_PADDING,
-            marker,
-            provider.name,
-            suffix,
-            auth,
-            provider.description
+            LOGIN_PICKER_PADDING, marker, provider.name, suffix, auth, provider.description
         );
     }
     eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
@@ -474,7 +486,10 @@ mod tests {
 
     #[test]
     fn relaunch_args_preserve_profile() {
-        assert_eq!(main_app_args(Some("work".to_string())), vec!["--profile", "work"]);
+        assert_eq!(
+            main_app_args(Some("work".to_string())),
+            vec!["--profile", "work"]
+        );
     }
 
     #[test]
@@ -491,7 +506,10 @@ mod tests {
 
     #[test]
     fn relaunch_targets_fallback_to_path_synaps_without_current_exe() {
-        assert_eq!(main_app_launch_targets(None), vec![std::path::PathBuf::from("synaps")]);
+        assert_eq!(
+            main_app_launch_targets(None),
+            vec![std::path::PathBuf::from("synaps")]
+        );
     }
 
     #[test]
@@ -515,9 +533,12 @@ mod tests {
     fn login_providers_include_openai_compatible_api_key_entries() {
         let providers = login_providers();
 
-        assert!(providers
-            .iter()
-            .any(|provider| provider.key == "openrouter" && provider.auth_kind == AuthKind::ApiKey));
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.key == "openrouter"
+                    && provider.auth_kind == AuthKind::ApiKey)
+        );
         assert!(providers
             .iter()
             .any(|provider| provider.key == "google" && provider.auth_kind == AuthKind::ApiKey));
