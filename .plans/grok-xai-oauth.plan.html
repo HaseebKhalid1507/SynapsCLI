@@ -39,25 +39,32 @@
     "checkpoint-4"
   ],
   "created_at": "2026-07-12T02:59:58.033Z",
-  "updated_at": "2026-07-12T03:02:10.975240Z",
+  "updated_at": "2026-07-12T03:07:44.211680Z",
   "sections": [
     {
       "id": "objective",
       "heading": "Objective",
       "type": "prose",
-      "md": "Add xAI/Grok OAuth while replacing scattered string-based OAuth dispatch with a typed registry that remains coherent at seven or more providers. Deliver `xai-auth/grok-4.5` login, refresh, local/remote credential resolution, broker vending, and verified runtime routing without changing Anthropic or OpenAI Codex behavior."
+      "md": "Add xAI/Grok OAuth while replacing scattered string-based OAuth dispatch with a typed registry that remains coherent at seven or more providers. Make the credential broker the **mandatory credential boundary for every OAuth token and API key**: runtimes request usable credentials from the broker and never read provider secrets directly. Deliver `xai-auth/grok-4.5` login, refresh, brokered credential resolution, and verified runtime routing without changing Anthropic or OpenAI Codex behavior."
     },
     {
       "id": "scope",
       "heading": "Scope and non-goals",
       "type": "prose",
-      "md": "**In scope:** typed provider identity; provider descriptors/behavior; Anthropic and Codex migration; xAI OIDC login/refresh; broker and runtime auth integration; one verified xAI model/wire path; headless harness. **Deferred:** every model from the reference package, xAI custom tools, CLI-only Composer/Build routing, and automatic `~/.grok/auth.json` import. Those require separate evidence and slices."
+      "md": "**In scope:** typed provider identity; provider descriptors/behavior; Anthropic and Codex migration; xAI OIDC login/refresh; a mandatory broker path for all OAuth and API-key providers; safe static-secret handling; one verified xAI model/wire path; headless harness. **Deferred:** every model from the reference package, xAI custom tools, CLI-only Composer/Build routing, and automatic `~/.grok/auth.json` import. Those require separate evidence and slices. Direct runtime reads of `auth.json`, provider-key config, or provider environment variables are explicitly out of the target architecture."
     },
     {
       "id": "architecture",
       "heading": "Target architecture",
       "type": "prose",
-      "md": "Separate three dimensions that are currently conflated: **OAuth behavior** (`login`, `refresh`, credential metadata), **authentication policy** (API key, local OAuth, remote broker), and **wire protocol** (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Codex backend). A single typed OAuth registry is the source for login UI, refresh dispatch, storage key, and broker capability. Runtime model descriptors reference an auth policy and wire protocol rather than growing one route variant per vendor."
+      "md": "Separate three dimensions that are currently conflated: **credential ownership** (the broker is the sole owner/resolver of OAuth and API-key secrets), **authentication policy** (OAuth refresh, static key, delegated/ephemeral credential, or broker-proxied request), and **wire protocol** (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Codex backend). A single typed provider registry is the source for login UI, refresh behavior, storage key, broker capability, and runtime auth requirements. Runtime model descriptors reference a broker credential contract and wire protocol rather than reading secrets or growing one route variant per vendor."
+    },
+    {
+      "id": "broker-requirement",
+      "heading": "Mandatory credential-broker requirement",
+      "type": "criteria",
+      "md": "**All provider credentials flow through the credential broker, including local execution.** OAuth refresh tokens and API keys are owned only by the broker process/storage boundary. The runtime receives the minimum usable credential for the shortest practical lifetime and never opens `auth.json`, reads provider API-key config, or consults provider key environment variables. For OAuth, the broker refreshes and returns access token + expiry only. For static API keys, the implementation must choose and document one safe contract before migration: **preferred** broker-side request proxy/signing so the raw key never leaves the broker; an access-key vending mode is acceptable only for same-host compatibility and must be explicitly classified as secret disclosure, disabled for remote clients by default, authenticated, audited, and scheduled for removal. Failure to reach a safe static-key contract blocks the migration gate.",
+      "risk": "security-sensitive"
     },
     {
       "id": "provider-contract",
@@ -75,7 +82,7 @@
       "id": "dependency-graph",
       "heading": "Dependency graph",
       "type": "prose",
-      "md": "`typed IDs + registry contract` \u2192 `Anthropic/Codex registry migration` \u2192 (`xAI auth slice`, `auth-policy/runtime route contract`) \u2192 `xAI request path` \u2192 `CLI/broker integration` \u2192 `headless E2E harness` \u2192 `full verification + adversarial review`. Storage and callback hardening support all provider slices. Runtime protocol selection depends on the route contract, not on login UI."
+      "md": "`typed IDs + registry contract` \u2192 `broker credential protocol + static-key safety decision` \u2192 `Anthropic/Codex registry migration` \u2192 (`xAI auth slice`, `auth-policy/runtime route contract`) \u2192 `all-provider broker migration` \u2192 `xAI request path` \u2192 `CLI integration` \u2192 `headless E2E harness` \u2192 `full verification + adversarial review`. Storage and callback hardening support provider implementations, but only the broker may expose credentials to runtimes. Runtime protocol selection depends on the route contract, not on login UI."
     },
     {
       "id": "convergence-policy",
@@ -102,8 +109,29 @@
       "depends_on": []
     },
     {
+      "id": "task-02-broker-contract",
+      "heading": "T2 \u2014 Define the universal broker credential contract",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Define the broker as the mandatory credential boundary for local and remote runtimes. Model OAuth access-token vending separately from static API-key handling; decide and document proxy/signing versus tightly constrained same-host key vending before provider migration.",
+      "acceptance": [
+        "Every registered provider declares a broker credential strategy and the registry rejects missing strategies",
+        "Remote clients can never obtain OAuth refresh tokens or raw static API keys; same-host compatibility behavior is explicit and deny-by-default",
+        "Runtime-facing interfaces contain no auth-file path, provider-key config map, or provider environment-variable lookup"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::broker_contract",
+        "cargo test --bin synaps cmd::auth_broker",
+        "cargo check --workspace"
+      ],
+      "depends_on": [
+        "task-01"
+      ]
+    },
+    {
       "id": "task-02",
-      "heading": "T2 \u2014 Migrate Anthropic behind the provider contract",
+      "heading": "T3 \u2014 Migrate Anthropic behind the provider contract",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -118,12 +146,13 @@
         "cargo test -p synaps-core auth::storage"
       ],
       "depends_on": [
-        "task-01"
+        "task-01",
+        "task-02-broker-contract"
       ]
     },
     {
       "id": "task-03",
-      "heading": "T3 \u2014 Migrate OpenAI Codex and unify dispatch",
+      "heading": "T4 \u2014 Migrate OpenAI Codex and unify dispatch",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -138,12 +167,13 @@
         "cargo test --bin synaps cmd::login"
       ],
       "depends_on": [
-        "task-01"
+        "task-01",
+        "task-02-broker-contract"
       ]
     },
     {
       "id": "task-04",
-      "heading": "T4 \u2014 Generalize callback outcomes and secret-safe errors",
+      "heading": "T5 \u2014 Generalize callback outcomes and secret-safe errors",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -163,7 +193,7 @@
     },
     {
       "id": "task-05",
-      "heading": "T5 \u2014 Implement xAI OIDC login and refresh",
+      "heading": "T6 \u2014 Implement xAI OIDC login and refresh",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -184,15 +214,15 @@
     },
     {
       "id": "task-06",
-      "heading": "T6 \u2014 Introduce auth-policy and wire-protocol routing",
+      "heading": "T7 \u2014 Introduce auth-policy and wire-protocol routing",
       "type": "task",
       "state": "todo",
       "risk": "none",
-      "md": "Decouple credential acquisition from protocol serialization. Add typed `AuthPolicy`, `WireProtocol`, and resolved route data; preserve current Anthropic, API-key OpenAI, and Codex routing.",
+      "md": "Decouple brokered credential acquisition from protocol serialization. Add typed `BrokerCredentialStrategy`, `AuthPolicy`, `WireProtocol`, and resolved route data; preserve current Anthropic, API-key OpenAI, and Codex routing while removing direct runtime secret lookup.",
       "acceptance": [
-        "Routes declare auth policy independently from endpoint/wire protocol",
-        "OAuth model routes can resolve without an API-key config entry",
-        "Existing Anthropic, API-key provider, local, and Codex route tests remain unchanged in behavior"
+        "Routes declare broker credential strategy independently from endpoint/wire protocol",
+        "No runtime route reads auth.json, provider key config, or provider key environment variables directly",
+        "Existing Anthropic, API-key provider, local, and Codex route behavior remains green through broker-backed test fixtures"
       ],
       "verification": [
         "cargo test -p synaps-engine runtime::openai",
@@ -205,7 +235,7 @@
     },
     {
       "id": "task-07",
-      "heading": "T7 \u2014 Deliver one verified Grok runtime slice",
+      "heading": "T8 \u2014 Deliver one verified Grok runtime slice",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -226,19 +256,20 @@
     },
     {
       "id": "task-08",
-      "heading": "T8 \u2014 Wire login UI, CLI help, and broker capability",
+      "heading": "T9 \u2014 Migrate every OAuth/API-key provider to the broker boundary",
       "type": "task",
       "state": "todo",
       "risk": "none",
-      "md": "Expose xAI through descriptor-driven login selection and non-interactive CLI; derive broker allowability from explicit provider capability while retaining deny-by-default behavior.",
+      "md": "Expose xAI through descriptor-driven login selection and migrate Anthropic, Codex, xAI, and every API-key registry provider to the mandatory broker credential path. Remove direct runtime secret lookup after compatibility migration.",
       "acceptance": [
-        "`synaps login --provider xai-auth` selects the registered implementation",
-        "Broker vends only xAI access token/expiry and never refresh or metadata",
-        "Unknown/unbrokerable provider IDs remain rejected before credential lookup/logging"
+        "`synaps login --provider xai-auth` stores broker-owned credentials and the runtime consumes only broker output",
+        "All API-key providers resolve through their declared broker strategy; direct config/env secret resolution is absent from runtime request paths",
+        "Broker returns OAuth access token/expiry only; raw static keys are never vended remotely and unknown providers remain denied"
       ],
       "verification": [
         "cargo test --bin synaps cmd::login",
-        "cargo test --bin synaps cmd::auth_broker"
+        "cargo test --bin synaps cmd::auth_broker",
+        "cargo test -p synaps-engine brokered_provider_routing"
       ],
       "depends_on": [
         "task-03",
@@ -247,15 +278,15 @@
     },
     {
       "id": "task-09",
-      "heading": "T9 \u2014 Build unattended OAuth and routing harness",
+      "heading": "T10 \u2014 Build unattended OAuth and routing harness",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
-      "md": "Create a zero-network fake OIDC/token/API harness that simulates browser redirect, denial, mismatched state, refresh rotation/omission, broker mode, and streaming model use end-to-end.",
+      "md": "Create a zero-network fake OIDC/token/API/broker harness that simulates browser redirect, denial, mismatched state, refresh rotation/omission, mandatory local and remote broker paths, static API-key handling, and streaming model use end-to-end.",
       "acceptance": [
-        "Harness completes login\u2192persist\u2192expire\u2192refresh\u2192model request without human input",
-        "Fault cases prove no token exchange on bad discovery/state and no refresh-token egress through broker",
-        "A pre-implementation or intentionally disabled-provider run demonstrates red, then the delivered feature demonstrates green"
+        "Harness completes login\u2192broker storage\u2192expire\u2192refresh\u2192model request without human input or runtime secret-file reads",
+        "OAuth and API-key providers both traverse the broker; fault cases prove no refresh-token or raw static-key egress to remote runtimes",
+        "A pre-implementation or intentionally bypassed-broker run demonstrates red, then the delivered broker-only feature demonstrates green"
       ],
       "verification": [
         "cargo test --test oauth_provider_e2e -- --test-threads=1",
@@ -269,7 +300,7 @@
     },
     {
       "id": "task-10",
-      "heading": "T10 \u2014 Compatibility, security, and oracle gate",
+      "heading": "T11 \u2014 Compatibility, security, and oracle gate",
       "type": "task",
       "state": "todo",
       "risk": "security-sensitive",
@@ -293,7 +324,7 @@
       "id": "checkpoint-1",
       "heading": "Checkpoint C1 \u2014 Contracts frozen",
       "type": "gate",
-      "md": "After T1\u2013T3: commit typed IDs/registry plus Anthropic and Codex migrations; all existing auth tests pass. Reconcile Plan Inbox before continuing. Durable artifact: migration commit and registry invariant evidence.",
+      "md": "After T1\u2013T3 plus the universal broker-contract task: commit typed IDs/registry, the frozen credential protocol/static-key decision, and Anthropic/Codex migrations; all existing auth tests pass. Reconcile Plan Inbox before continuing. Durable artifact: migration commit, broker threat-model decision, and registry invariant evidence.",
       "approval": "needs-human-review",
       "risk": "security-sensitive"
     },
@@ -309,7 +340,7 @@
       "id": "checkpoint-3",
       "heading": "Checkpoint C3 \u2014 Runtime vertical slice",
       "type": "gate",
-      "md": "After T6\u2013T8: commit typed routing, one working Grok model path, login UI, and broker integration. Reconcile Plan Inbox. Durable artifact: end-to-end vertical-slice commit and protocol fixture.",
+      "md": "After routing, Grok slice, and universal provider migration: commit typed routing, one working Grok model path, login UI, and mandatory broker integration for all OAuth/API-key providers. Reconcile Plan Inbox. Durable artifact: end-to-end vertical-slice commit and protocol fixture proving no direct runtime secret reads.",
       "approval": "needs-human-review",
       "risk": "security-sensitive"
     },
@@ -325,14 +356,14 @@
       "id": "risks",
       "heading": "Risk register",
       "type": "risk",
-      "md": "**Discovery SSRF/token exfiltration:** strict HTTPS xAI host validation. **Provider drift:** one typed registry + invariant tests. **Protocol mismatch:** start with one fixture-verified model, not README catalog claims. **Refresh races/data loss:** existing file lock + atomic merge and broker single-refresher invariant. **Credential schema bloat:** provider-owned metadata. **Behavior regressions:** migrate Anthropic/Codex before xAI and retain route golden tests. **Fixed callback port collision:** deterministic error and headless coverage; dynamic port only if xAI registration permits it.",
+      "md": "**Discovery SSRF/token exfiltration:** strict HTTPS xAI host validation. **Provider drift:** one typed registry + invariant tests. **Protocol mismatch:** start with one fixture-verified model, not README catalog claims. **Refresh races/data loss:** existing file lock + atomic merge and broker single-refresher invariant. **Credential schema bloat:** provider-owned metadata. **Behavior regressions:** migrate Anthropic/Codex before xAI and retain route golden tests. **Fixed callback port collision:** deterministic error and headless coverage; dynamic port only if xAI registration permits it. **Static API keys are not short-lived:** prefer broker-side proxy/signing; never imply that returning a long-lived key is equivalent to OAuth access-token vending. **Broker availability/blast radius:** authenticated loopback-by-default service, explicit TLS policy remotely, health checks, bounded cache, and fail closed rather than falling back to direct secret reads.",
       "risk": "security-sensitive"
     },
     {
       "id": "definition-of-done",
       "heading": "Definition of done",
       "type": "criteria",
-      "md": "A clean checkout can run the unattended harness and prove xAI OAuth login, persistence, refresh, broker token vending, and one Grok model request without human input or real credentials. Anthropic and OpenAI Codex remain green. Adding an eighth OAuth provider requires one provider module/descriptor plus model descriptors\u2014not edits to login, refresh, broker, and routing string match tables."
+      "md": "A clean checkout can run the unattended harness and prove xAI OAuth login, broker-owned persistence, refresh, and one Grok model request without human input or real credentials. The same harness proves Anthropic, Codex, and representative API-key providers use the broker exclusively. No runtime request path reads `auth.json`, provider-key config, or provider-key environment variables. Remote runtimes never receive refresh tokens or raw static API keys. Adding an eighth OAuth provider requires one provider module/descriptor plus model descriptors\u2014not edits to login, refresh, broker, and routing string match tables."
     }
   ]
 }
