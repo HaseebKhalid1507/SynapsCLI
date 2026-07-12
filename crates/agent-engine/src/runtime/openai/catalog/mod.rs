@@ -45,10 +45,11 @@ pub use anthropic::{
 pub use codex::codex_static_catalog_models;
 pub use generic::parse_generic_catalog_models;
 pub use github_copilot::{
-    copilot_model, copilot_static_catalog_models, models_request_headers, parse_copilot_catalog_models,
+    copilot_model, copilot_static_catalog_models, models_request_headers,
+    parse_copilot_catalog_models, runtime_wire_protocol as github_copilot_runtime_model,
     validate_models_endpoint, CopilotModelDescriptor, COPILOT_API_VERSION, COPILOT_FALLBACK_MODELS,
-    MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL, PROVIDER_KEY as COPILOT_PROVIDER_KEY,
-    PROVIDER_NAME as COPILOT_PROVIDER_NAME,
+    MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL,
+    PROVIDER_KEY as COPILOT_PROVIDER_KEY, PROVIDER_NAME as COPILOT_PROVIDER_NAME,
 };
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
@@ -444,8 +445,9 @@ impl ModelCatalogProvider for GitHubCopilotCatalogProvider {
         // only when the account is not configured for proxy discovery.
         Box::pin(async move {
             match broker_catalog_models_body("github-copilot").await {
-                Ok(body) => parse_copilot_catalog_models(&body)
-                    .map_err(|e| format!("parse failed: {e}")),
+                Ok(body) => {
+                    parse_copilot_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
+                }
                 Err(err) => {
                     // Offline / not-logged-in / transport: surface static fallback
                     // only for explicit not-configured cases; other errors fail closed.
@@ -641,8 +643,7 @@ mod tests {
         assert!(models
             .iter()
             .all(|model| model.runtime_id().starts_with("github-copilot/")));
-        let ids: std::collections::HashSet<_> =
-            models.iter().map(|m| m.id.as_str()).collect();
+        let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
         // High-value ids from the curated set must be present for this account
         // or via static fallback.
         for required in ["gpt-5.3-codex", "claude-sonnet-4.6", "gemini-3.5-flash"] {

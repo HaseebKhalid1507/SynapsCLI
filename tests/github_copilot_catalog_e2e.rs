@@ -39,7 +39,9 @@ fn curated_fallback_ids_are_established_by_fixture() {
 #[test]
 fn parser_filters_non_chat_and_prefixes_runtime_ids() {
     let models = parse_copilot_catalog_models(FIXTURE).expect("fixture");
-    assert!(models.iter().all(|m| m.runtime_id().starts_with("github-copilot/")));
+    assert!(models
+        .iter()
+        .all(|m| m.runtime_id().starts_with("github-copilot/")));
     assert!(!models.iter().any(|m| m.id == "text-embedding-3-small"));
     assert!(!models.iter().any(|m| m.id == "gpt-41-copilot"));
     assert!(models.iter().any(|m| m.id == "gpt-5.3-codex"));
@@ -67,7 +69,7 @@ fn models_endpoint_pin_and_static_catalog_shape() {
 }
 
 #[test]
-fn broker_allowlists_github_copilot_models_only() {
+fn broker_allowlists_only_reviewed_github_copilot_runtime_paths() {
     let ok = ProxyRequest {
         provider: "github-copilot".into(),
         method: ProxyMethod::Get,
@@ -77,7 +79,20 @@ fn broker_allowlists_github_copilot_models_only() {
     };
     assert!(ok.validate().is_ok());
 
-    for path in ["/chat/completions", "/responses", "/models/gpt-5.4/policy"] {
+    for path in ["/chat/completions", "/responses"] {
+        let allowed = ProxyRequest {
+            provider: "github-copilot".into(),
+            method: ProxyMethod::Post,
+            path: path.into(),
+            body: Some(serde_json::json!({"model":"fixture","stream":true})),
+            stream: true,
+        };
+        assert!(
+            allowed.validate().is_ok(),
+            "{path} is a reviewed inference path"
+        );
+    }
+    for path in ["/v1/messages", "/models/gpt-5.4/policy", "/models?all=true"] {
         let denied = ProxyRequest {
             provider: "github-copilot".into(),
             method: ProxyMethod::Post,
@@ -85,10 +100,7 @@ fn broker_allowlists_github_copilot_models_only() {
             body: None,
             stream: false,
         };
-        assert!(
-            denied.validate().is_err(),
-            "{path} must remain deny-listed in catalog-only slice"
-        );
+        assert!(denied.validate().is_err(), "{path} must remain deny-listed");
     }
 
     // Other OAuth providers remain non-proxyable.

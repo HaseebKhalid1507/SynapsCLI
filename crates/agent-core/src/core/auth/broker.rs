@@ -161,7 +161,11 @@ impl ProxyRequest {
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
         if !(self.provider == "xai-auth" && self.path == "/responses")
-            && !(self.provider == "github-copilot" && self.path == "/models")
+            && !(self.provider == "github-copilot"
+                && matches!(
+                    self.path.as_str(),
+                    "/models" | "/chat/completions" | "/responses"
+                ))
             && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
         {
             return Err(BrokerError::Denied(format!(
@@ -379,9 +383,7 @@ impl LocalBroker {
         } else if request.provider == "github-copilot" {
             // Catalog-only OAuth proxy: short-lived Copilot session token only.
             // Never attach the GitHub user token (stored as OAuth refresh).
-            let token = self
-                .access_token(OAuthProviderId::GitHubCopilot)
-                .await?;
+            let token = self.access_token(OAuthProviderId::GitHubCopilot).await?;
             (
                 token.token,
                 super::github_copilot_models_base_url().to_string(),
@@ -401,6 +403,11 @@ impl LocalBroker {
         if request.provider == "github-copilot" {
             for (name, value) in super::github_copilot_models_request_headers() {
                 builder = builder.header(*name, *value);
+            }
+            if request.path != "/models" {
+                builder = builder
+                    .header("Openai-Intent", "conversation-edits")
+                    .header("X-Initiator", "agent");
             }
         }
         if let Some(body) = &request.body {
@@ -1080,10 +1087,9 @@ mod tests {
         }
     }
 
-    /// C2 catalog-only: github-copilot may proxy GET /models (session token),
-    /// but not inference paths yet.
+    /// Copilot is pinned to its catalog and two reviewed inference paths.
     #[test]
-    fn proxy_allows_github_copilot_models_only() {
+    fn proxy_allows_only_pinned_github_copilot_paths() {
         let models = ProxyRequest {
             provider: "github-copilot".into(),
             method: ProxyMethod::Get,
@@ -1100,10 +1106,7 @@ mod tests {
             body: None,
             stream: false,
         };
-        assert!(
-            matches!(chat.validate(), Err(BrokerError::Denied(_))),
-            "chat must remain deny-listed until inference slice"
-        );
+        assert!(chat.validate().is_ok());
         let responses = ProxyRequest {
             provider: "github-copilot".into(),
             method: ProxyMethod::Post,
@@ -1111,7 +1114,17 @@ mod tests {
             body: None,
             stream: false,
         };
-        assert!(matches!(responses.validate(), Err(BrokerError::Denied(_))));
+        assert!(responses.validate().is_ok());
+        for path in ["/v1/messages", "/models?x=1", "/embeddings"] {
+            let request = ProxyRequest {
+                provider: "github-copilot".into(),
+                method: ProxyMethod::Post,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(matches!(request.validate(), Err(BrokerError::Denied(_))));
+        }
     }
 
     #[test]

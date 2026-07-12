@@ -80,6 +80,16 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 wire: WireProtocol::OpenAiResponses,
             });
         }
+        if prefix == "github-copilot" {
+            let descriptor = catalog::github_copilot_runtime_model(rest)?;
+            return Some(ResolvedRoute {
+                endpoint: catalog::MODELS_BASE_URL.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: descriptor,
+            });
+        }
         if prefix == "openai-codex" {
             let c = registry::resolve_codex_shorthand(model)?;
             return Some(ResolvedRoute {
@@ -462,6 +472,14 @@ mod tests {
         let static_route = resolve_route("groq/llama-3.3-70b-versatile").unwrap();
         assert_eq!(static_route.auth, AuthPolicy::BrokerProxy);
         assert_eq!(static_route.wire, WireProtocol::OpenAiChatCompletions);
+
+        let copilot_chat = resolve_route("github-copilot/claude-sonnet-4.6").unwrap();
+        assert_eq!(copilot_chat.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(copilot_chat.wire, WireProtocol::OpenAiChatCompletions);
+        let copilot_responses = resolve_route("github-copilot/gpt-5.3-codex").unwrap();
+        assert_eq!(copilot_responses.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(copilot_responses.wire, WireProtocol::OpenAiResponses);
+        assert!(resolve_route("github-copilot/unverified-model").is_none());
         assert!(resolve_route("unknown-provider/model").is_none());
         assert!(resolve_route("xai-auth/not-a-real-model").is_none());
         assert!(resolve_route("xai-auth/grok-build-0.1").is_none());

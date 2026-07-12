@@ -119,6 +119,27 @@ pub fn copilot_model(id: &str) -> Option<&'static CopilotModelDescriptor> {
     COPILOT_FALLBACK_MODELS.iter().find(|m| m.id == id)
 }
 
+/// Select the wire protocol from endpoints established by the captured live
+/// catalog. This intentionally supports only curated IDs; unknown account
+/// models fail closed until their protocol is represented by a reviewed fixture.
+pub fn runtime_wire_protocol(id: &str) -> Option<crate::runtime::openai::WireProtocol> {
+    use crate::runtime::openai::WireProtocol;
+    copilot_model(id)?;
+    Some(match id {
+        "gpt-5.3-codex" | "gpt-5.4" | "gpt-5.5" | "gpt-5.6-luna" | "gpt-5.6-terra" => {
+            WireProtocol::OpenAiResponses
+        }
+        "claude-sonnet-4.6"
+        | "claude-sonnet-5"
+        | "claude-opus-4.7"
+        | "claude-opus-4.8"
+        | "claude-fable-5"
+        | "gemini-3.1-pro-preview"
+        | "gemini-3.5-flash" => WireProtocol::OpenAiChatCompletions,
+        _ => return None,
+    })
+}
+
 /// Static fallback catalog for offline / seed UI paths.
 pub fn copilot_static_catalog_models() -> Vec<CatalogModel> {
     COPILOT_FALLBACK_MODELS
@@ -241,9 +262,7 @@ pub fn parse_copilot_catalog_models(body: &str) -> Result<Vec<CatalogModel>, Str
                 m.input_modalities = modalities;
                 let thinking = caps.supports.as_ref().is_some_and(|s| {
                     s.adaptive_thinking == Some(true)
-                        || s.reasoning_effort
-                            .as_ref()
-                            .is_some_and(|v| !v.is_null())
+                        || s.reasoning_effort.as_ref().is_some_and(|v| !v.is_null())
                 });
                 m.reasoning = if thinking {
                     ReasoningSupport::GenericOpenAi
@@ -310,7 +329,9 @@ mod tests {
     #[test]
     fn models_endpoint_is_pinned() {
         validate_models_endpoint(MODELS_URL).unwrap();
-        assert!(validate_models_endpoint("https://api.individual.githubcopilot.com/models").is_err());
+        assert!(
+            validate_models_endpoint("https://api.individual.githubcopilot.com/models").is_err()
+        );
         assert!(validate_models_endpoint("https://api.githubcopilot.com/models/").is_err());
         assert!(validate_models_endpoint("https://evil.example/models").is_err());
         assert!(validate_models_endpoint("http://api.githubcopilot.com/models").is_err());
@@ -318,7 +339,8 @@ mod tests {
 
     #[test]
     fn models_headers_include_integration_and_api_version() {
-        let map: std::collections::HashMap<_, _> = models_request_headers().iter().copied().collect();
+        let map: std::collections::HashMap<_, _> =
+            models_request_headers().iter().copied().collect();
         assert_eq!(map.get("User-Agent"), Some(&"SynapsCLI/0.6.0"));
         assert_eq!(map.get("Copilot-Integration-Id"), Some(&"vscode-chat"));
         assert_eq!(map.get("X-Github-Api-Version"), Some(&COPILOT_API_VERSION));
@@ -375,8 +397,7 @@ mod tests {
     #[test]
     fn parse_live_fixture_keeps_high_value_chat_ids() {
         let models = parse_copilot_catalog_models(LIVE_FIXTURE).expect("fixture parse");
-        let ids: std::collections::HashSet<_> =
-            models.iter().map(|m| m.id.as_str()).collect();
+        let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
         for expected in [
             "gpt-5.3-codex",
             "gpt-5.4",
@@ -404,8 +425,7 @@ mod tests {
     #[test]
     fn every_fallback_id_appears_in_live_fixture() {
         let models = parse_copilot_catalog_models(LIVE_FIXTURE).expect("fixture parse");
-        let ids: std::collections::HashSet<_> =
-            models.iter().map(|m| m.id.as_str()).collect();
+        let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
         for d in COPILOT_FALLBACK_MODELS {
             assert!(
                 ids.contains(d.id),
