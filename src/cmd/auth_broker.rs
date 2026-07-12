@@ -1156,7 +1156,10 @@ mod tests {
         for (provider, path) in [
             ("anthropic", "/v1/messages"),
             ("openai-codex", "/responses"),
-            ("github-copilot", "/chat/completions"),
+            // `/v1/messages` is advertised by Anthropic-vendor Copilot rows but
+            // the broker does not currently route it — must fail closed.
+            ("github-copilot", "/v1/messages"),
+            ("github-copilot", "/models/gpt-5.4/policy"),
             ("local", "https://evil.example/steal"),
             ("local", "/../../etc/passwd"),
         ] {
