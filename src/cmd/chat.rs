@@ -4,9 +4,13 @@
 //! compaction) but renders to stdin/stdout. Built for scripting,
 //! piping, SSH, CI, and agent benchmark frameworks like Harbor.
 //!
-//! C4a: chat now correctly continues turns when pending runtime events are
-//! injected at turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
-//! Uses central drain_event_queue + wake_action — no bespoke event formatting.
+//! C4a: chat continues turns when pending runtime events are injected at
+//! turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
+//!
+//! C4b: blocking read_line replaced with tokio::io::stdin + select! against
+//! event_queue.notified(), so runtime events wake the prompt immediately.
+//! Exactly ONE waiter on notified() exists while idle at the prompt.
+//! Piped stdin, EOF, and CRLF behaviour are preserved.
 
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::commands::{self, CommandResult};
@@ -17,7 +21,21 @@ use synaps_cli::{CancellationToken, flush_stdout};
 use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::json;
-use std::io::{self, Write, BufRead};
+use std::io::{self, Write};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
+/// What was read while waiting at the prompt.
+enum PromptRead {
+    /// User typed (or pipe delivered) a line.
+    Line(String),
+    /// EOF on stdin.
+    Eof,
+    /// A runtime event woke us; drain + wake_action already ran.
+    /// `run_turn` = true when wake_action said RunTurn.
+    EventWake { run_turn: bool },
+    /// I/O error.
+    Error(std::io::Error),
+}
 
 pub async fn run(
     continue_session: Option<String>,
@@ -83,7 +101,6 @@ pub async fn run(
     eprintln!();
 
     // ── Main loop ──
-    let stdin = io::stdin();
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut subagents: Vec<SubagentTracker> = Vec::new();
     let compact_threshold: usize = 80_000;
@@ -94,104 +111,170 @@ pub async fn run(
     #[allow(unused_assignments)]
     let mut consecutive_auto_turns: u32 = 0;
 
+    // C4b: async tokio stdin — lets us select! against event_queue.notified()
+    // while idle at the prompt so runtime events can wake us immediately.
+    //
+    // For piped stdin (is_tty=false) this is identical in behaviour to the
+    // old blocking read_line: lines() returns Ok(None) on EOF, each poll
+    // returns one complete line without blocking the executor.
+    let async_stdin = tokio::io::stdin();
+    let mut stdin_lines = TokioBufReader::new(async_stdin).lines();
 
     loop {
+        // ── Prompt ──
         if is_tty {
             eprint!("❯ ");
             io::stderr().flush().ok();
         }
 
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Err(e) => {
+        // C4b: Select between a new stdin line and a runtime event notification.
+        // Exactly ONE waiter on event_queue.notified() exists while we are idle.
+        let read = {
+            let event_queue = runtime.event_queue().clone();
+            tokio::select! {
+                // Branch 1: user typed a line (or pipe delivered one).
+                line = stdin_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => PromptRead::Line(l),
+                        Ok(None)    => PromptRead::Eof,
+                        Err(e)      => PromptRead::Error(e),
+                    }
+                }
+                // Branch 2: a runtime event arrived while we were idle.
+                _ = event_queue.notified() => {
+                    let drained = drain_event_queue(
+                        &event_queue,
+                        &mut conv.api_messages,
+                        &mut conv.pending_events,
+                        false, // idle
+                        None,  // no steer channel
+                    );
+                    for d in &drained {
+                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
+                    }
+                    let action = wake_action(
+                        &drained,
+                        &conv.api_messages,
+                        false,
+                        true,  // auto_turn_enabled in chat mode
+                        consecutive_auto_turns,
+                    );
+                    PromptRead::EventWake { run_turn: action == WakeAction::RunTurn }
+                }
+            }
+        };
+
+        match read {
+            PromptRead::Error(e) => {
                 eprintln!("input error: {}", e);
                 break;
             }
-            Ok(_) => {}
-        }
-        let input = input.trim_end_matches('\r').trim();
-        if input.is_empty() { continue; }
+            PromptRead::Eof => break,
 
-        // Real user input — reset auto-turn counter.
-        consecutive_auto_turns = 0;
-
-        // ── Slash commands ──
-        if let Some((cmd, arg)) = commands::parse_command(input) {
-            // Try engine-level command first
-            if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
-                match result {
-                    CommandResult::Quit => break,
-                    CommandResult::ModelChanged { model } => {
-                        eprintln!("model → {}", model);
-                    }
-                    CommandResult::ThinkingChanged { level, budget } => {
-                        eprintln!("thinking → {} ({})", level, budget);
-                    }
-                    CommandResult::Compact { custom_instructions } => {
-                        eprintln!("compacting...");
-                        if let Ok(summary) = compact_conversation(
-                            &conv.api_messages, &runtime, custom_instructions.as_deref()
-                        ).await {
-                            conv.api_messages = vec![std::sync::Arc::new(json!({
-                                "role": "user",
-                                "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                            }))];
-                            last_compacted_tokens = conv.estimate_tokens();
-                            eprintln!("compacted → ~{} tokens", last_compacted_tokens);
-                        }
-                    }
-                    CommandResult::Error(e) => eprintln!("error: {}", e),
-                    CommandResult::Output(text) => println!("{}", text),
-                    _ => {} // Other results handled by TUI only
+            PromptRead::EventWake { run_turn: false } => {
+                // Forward/Nothing — redraw prompt and wait for real input.
+                if is_tty {
+                    eprint!("❯ ");
+                    io::stderr().flush().ok();
                 }
                 continue;
             }
 
-            // Commands not handled by engine — headless-specific handling
-            match cmd {
-                "clear" => {
-                    conv.clear(&runtime).await;
-                    eprintln!("session cleared → {}", &conv.session.id[..8]);
+            PromptRead::EventWake { run_turn: true } => {
+                // A runtime event was injected; policy says RunTurn.
+                // Events were already drained + injected by drain_event_queue above.
+                // Fall through to 'turn_loop without modifying consecutive_auto_turns
+                // (wake_action already checked the cap; we increment inside the loop).
+            }
+
+            PromptRead::Line(raw_line) => {
+                let trimmed = raw_line.trim_end_matches('\r').trim();
+
+                if trimmed.is_empty() {
+                    continue;
                 }
-                "sessions" => {
-                    match synaps_cli::list_recent_sessions(20) {
-                        Ok(sessions) => {
-                            for s in sessions.iter().take(20) {
-                                let marker = if s.id == conv.session.id { "→ " } else { "  " };
-                                eprintln!("{}{} {} ({}, ${:.4})", 
-                                    marker, &s.id[..8], s.title, s.model, s.session_cost);
+
+                // Real user input — reset auto-turn counter.
+                consecutive_auto_turns = 0;
+
+                // ── Slash commands ──
+                if let Some((cmd, arg)) = commands::parse_command(trimmed) {
+                    // Try engine-level command first
+                    if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
+                        match result {
+                            CommandResult::Quit => break,
+                            CommandResult::ModelChanged { model } => {
+                                eprintln!("model → {}", model);
+                            }
+                            CommandResult::ThinkingChanged { level, budget } => {
+                                eprintln!("thinking → {} ({})", level, budget);
+                            }
+                            CommandResult::Compact { custom_instructions } => {
+                                eprintln!("compacting...");
+                                if let Ok(summary) = compact_conversation(
+                                    &conv.api_messages, &runtime, custom_instructions.as_deref()
+                                ).await {
+                                    conv.api_messages = vec![std::sync::Arc::new(json!({
+                                        "role": "user",
+                                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
+                                    }))];
+                                    last_compacted_tokens = conv.estimate_tokens();
+                                    eprintln!("compacted → ~{} tokens", last_compacted_tokens);
+                                }
+                            }
+                            CommandResult::Error(e) => eprintln!("error: {}", e),
+                            CommandResult::Output(text) => println!("{}", text),
+                            _ => {} // Other results handled by TUI only
+                        }
+                        continue;
+                    }
+
+                    // Commands not handled by engine — headless-specific handling
+                    match cmd {
+                        "clear" => {
+                            conv.clear(&runtime).await;
+                            eprintln!("session cleared → {}", &conv.session.id[..8]);
+                        }
+                        "sessions" => {
+                            match synaps_cli::list_recent_sessions(20) {
+                                Ok(sessions) => {
+                                    for s in sessions.iter().take(20) {
+                                        let marker = if s.id == conv.session.id { "→ " } else { "  " };
+                                        eprintln!("{}{} {} ({}, ${:.4})", 
+                                            marker, &s.id[..8], s.title, s.model, s.session_cost);
+                                    }
+                                }
+                                Err(e) => eprintln!("error: {}", e),
                             }
                         }
-                        Err(e) => eprintln!("error: {}", e),
+                        "status" => {
+                            eprintln!("session: {}", &conv.session.id[..8]);
+                            eprintln!("model: {}", runtime.model());
+                            eprintln!("tokens: {}↑ {}↓", conv.total_input_tokens, conv.total_output_tokens);
+                            eprintln!("cost: ${:.4}", conv.session_cost);
+                            eprintln!("messages: {}", conv.api_messages.len());
+                            eprintln!("est. tokens: ~{}", conv.estimate_tokens());
+                        }
+                        "help" => {
+                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                        }
+                        _ => {
+                            eprintln!("unknown command: /{} (try /help)", cmd);
+                        }
                     }
+                    continue;
                 }
-                "status" => {
-                    eprintln!("session: {}", &conv.session.id[..8]);
-                    eprintln!("model: {}", runtime.model());
-                    eprintln!("tokens: {}↑ {}↓", conv.total_input_tokens, conv.total_output_tokens);
-                    eprintln!("cost: ${:.4}", conv.session_cost);
-                    eprintln!("messages: {}", conv.api_messages.len());
-                    eprintln!("est. tokens: ~{}", conv.estimate_tokens());
-                }
-                "help" => {
-                    eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
-                }
-                _ => {
-                    eprintln!("unknown command: /{} (try /help)", cmd);
-                }
-            }
-            continue;
-        }
 
-        // ── Regular user message ──
-        let message = if let Some(ctx) = conv.abort_context.take() {
-            format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", input, ctx)
-        } else {
-            input.to_string()
-        };
-        conv.api_messages
-            .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
+                // ── Regular user message ──
+                let message = if let Some(ctx) = conv.abort_context.take() {
+                    format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", trimmed, ctx)
+                } else {
+                    trimmed.to_string()
+                };
+                conv.api_messages
+                    .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
+            }
+        }
 
         // ── C4a: turn loop — run until no pending events or cap reached ──
         'turn_loop: loop {
