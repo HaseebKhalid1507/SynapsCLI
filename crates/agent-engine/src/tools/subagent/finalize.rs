@@ -17,8 +17,6 @@ fn wake_disabled() -> bool {
 }
 
 /// Build the completion event. Pure — unit-testable without threads.
-// Called from finalize_subagent and tests; used by start.rs/resume.rs in T1.4/T1.5.
-#[allow(dead_code)]
 pub(crate) fn build_completion_event(
     handle_id: &str,
     subagent_id: u64,
@@ -70,8 +68,6 @@ pub(crate) fn build_completion_event(
 /// OUTSIDE catch_unwind. Reads terminal status from shared state,
 /// stamps finished_at, publishes the completion event with a
 /// never-drop guarantee (push → push_priority fallback).
-// Wired into start.rs/resume.rs in T1.4/T1.5.
-#[allow(dead_code)]
 pub(crate) fn finalize_subagent(
     state: &Arc<RwLock<SubagentState>>,
     parent_queue: Option<&Arc<EventQueue>>,
