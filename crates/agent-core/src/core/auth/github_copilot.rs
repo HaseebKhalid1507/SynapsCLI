@@ -70,6 +70,16 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum response body bytes accepted from device/poll/mint endpoints.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+
+// Session-mint request headers (community-observed; required to avoid 403 on
+// /copilot_internal/v2/token after a successful device-flow authorization).
+// User-Agent identifies Synaps honestly; Copilot-Integration-Id / Editor-* match
+// the conventional vscode-chat integration surface used by public clients.
+// See docs/github-copilot-oauth-spec.md §C5 / U4.
+pub const MINT_USER_AGENT: &str = "SynapsCLI/0.6.0";
+pub const MINT_EDITOR_VERSION: &str = "vscode/1.107.0";
+pub const MINT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
+pub const MINT_COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 /// Logical sleep quantum for cancel checks (production wall-clock chunks).
 const CANCEL_POLL_QUANTUM: Duration = Duration::from_millis(200);
 
@@ -92,6 +102,8 @@ pub enum CopilotAuthError {
     EmptyGitHubToken,
     EmptySessionToken,
     HttpStatus(u16),
+    /// Session mint endpoint rejected the request (often missing integration headers).
+    SessionMintRejected(u16),
     Transport,
     ResponseTooLarge,
     Persist,
@@ -113,6 +125,7 @@ impl CopilotAuthError {
             Self::EmptyGitHubToken => "empty GitHub user token",
             Self::EmptySessionToken => "empty Copilot session token",
             Self::HttpStatus(_) => "HTTP error",
+            Self::SessionMintRejected(_) => "Copilot session mint rejected",
             Self::Transport => "transport error",
             Self::ResponseTooLarge => "response body too large",
             Self::Persist => "credential persistence failed",
@@ -125,6 +138,9 @@ impl fmt::Display for CopilotAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpStatus(code) => write!(f, "HTTP error {code}"),
+            Self::SessionMintRejected(code) => {
+                write!(f, "Copilot session mint rejected (HTTP {code})")
+            }
             other => f.write_str(other.label()),
         }
     }
@@ -160,10 +176,12 @@ pub trait CopilotHttp: Send + Sync {
         form: &[(&str, &str)],
     ) -> Result<InjectedHttpResponse, CopilotAuthError>;
 
+    /// GET with bearer auth and extra request headers (mint path attaches GitHub/Copilot headers).
     async fn get_bearer(
         &self,
         url: &str,
         bearer: &str,
+        headers: &[(&str, &str)],
     ) -> Result<InjectedHttpResponse, CopilotAuthError>;
 }
 
@@ -301,6 +319,24 @@ pub fn validate_verification_uri(uri: &str) -> Result<(), CopilotAuthError> {
         saw_user_code = true;
     }
     Ok(())
+}
+
+// ── Session-mint headers ─────────────────────────────────────────────────────
+
+/// Headers attached only to the pinned session-mint request.
+///
+/// GitHub rejects API calls without a User-Agent. The Copilot internal mint
+/// endpoint additionally requires the conventional integration/editor headers
+/// (community-observed); missing them yields HTTP 403 after a successful device
+/// authorization.
+pub fn session_mint_request_headers() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Accept", "application/json"),
+        ("User-Agent", MINT_USER_AGENT),
+        ("Editor-Version", MINT_EDITOR_VERSION),
+        ("Editor-Plugin-Version", MINT_EDITOR_PLUGIN_VERSION),
+        ("Copilot-Integration-Id", MINT_COPILOT_INTEGRATION_ID),
+    ]
 }
 
 // ── Parsing (pure) ───────────────────────────────────────────────────────────
@@ -627,9 +663,16 @@ where
         return Err(CopilotAuthError::EmptyGitHubToken);
     }
     validate_session_mint_endpoint(SESSION_MINT_URL)?;
-    let resp = http.get_bearer(SESSION_MINT_URL, github_token).await?;
+    let resp = http
+        .get_bearer(
+            SESSION_MINT_URL,
+            github_token,
+            session_mint_request_headers(),
+        )
+        .await?;
     if !(200..300).contains(&resp.status) {
-        return Err(CopilotAuthError::HttpStatus(resp.status));
+        // Stage-specific: device flow already succeeded; mint is the failing step.
+        return Err(CopilotAuthError::SessionMintRejected(resp.status));
     }
     parse_session_mint_response(&resp.body, clock.now_millis())
 }
@@ -766,17 +809,22 @@ impl CopilotHttp for ProductionHttp {
         &self,
         url: &str,
         bearer: &str,
+        headers: &[(&str, &str)],
     ) -> Result<InjectedHttpResponse, CopilotAuthError> {
         // Pin again immediately before attaching the GitHub token.
         validate_session_mint_endpoint(url)?;
-        let response = self
+        let mut req = self
             .client
             .get(url)
-            .header("Accept", "application/json")
-            .header("Authorization", format!("Bearer {bearer}"))
-            .send()
-            .await
-            .map_err(|_| CopilotAuthError::Transport)?;
+            .header("Authorization", format!("Bearer {bearer}"));
+        for (name, value) in headers {
+            // Never let a caller-supplied Authorization override the bearer we set.
+            if name.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            req = req.header(*name, *value);
+        }
+        let response = req.send().await.map_err(|_| CopilotAuthError::Transport)?;
         let status = response.status().as_u16();
         // Redirects are disabled; a 3xx means fail closed without following.
         if (300..400).contains(&status) {
@@ -913,7 +961,8 @@ pub mod testutil {
         pub post_queue: Mutex<Vec<ScriptedResponse>>,
         pub get_queue: Mutex<Vec<ScriptedResponse>>,
         pub posts: Mutex<Vec<(String, Vec<(String, String)>)>>,
-        pub gets: Mutex<Vec<(String, String)>>,
+        /// (url, bearer, headers)
+        pub gets: Mutex<Vec<(String, String, Vec<(String, String)>)>>,
     }
 
     impl FakeHttp {
@@ -958,12 +1007,17 @@ pub mod testutil {
             &self,
             url: &str,
             bearer: &str,
+            headers: &[(&str, &str)],
         ) -> Result<InjectedHttpResponse, CopilotAuthError> {
             validate_session_mint_endpoint(url)?;
-            self.gets
-                .lock()
-                .unwrap()
-                .push((url.to_string(), bearer.to_string()));
+            self.gets.lock().unwrap().push((
+                url.to_string(),
+                bearer.to_string(),
+                headers
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            ));
             let next = {
                 let mut q = self.get_queue.lock().unwrap();
                 if q.is_empty() {
@@ -1275,6 +1329,7 @@ mod tests {
             CopilotAuthError::EmptyGitHubToken,
             CopilotAuthError::EmptySessionToken,
             CopilotAuthError::HttpStatus(401),
+            CopilotAuthError::SessionMintRejected(403),
             CopilotAuthError::Transport,
             CopilotAuthError::ResponseTooLarge,
             CopilotAuthError::Persist,
@@ -1439,7 +1494,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, CopilotAuthError::HttpStatus(401)));
+        assert!(matches!(err, CopilotAuthError::SessionMintRejected(401)));
         assert_eq!(
             browser.opened.lock().unwrap().as_slice(),
             &[DEFAULT_VERIFICATION_URI.to_string()]
@@ -1486,7 +1541,85 @@ mod tests {
         );
     }
 
+
+
+    #[test]
+    fn github_copilot_session_mint_headers_include_required_integration_fields() {
+        let headers = session_mint_request_headers();
+        let map: std::collections::HashMap<_, _> = headers.iter().copied().collect();
+        assert_eq!(map.get("Accept"), Some(&"application/json"));
+        assert_eq!(map.get("User-Agent"), Some(&MINT_USER_AGENT));
+        assert_eq!(map.get("Editor-Version"), Some(&MINT_EDITOR_VERSION));
+        assert_eq!(
+            map.get("Editor-Plugin-Version"),
+            Some(&MINT_EDITOR_PLUGIN_VERSION)
+        );
+        assert_eq!(
+            map.get("Copilot-Integration-Id"),
+            Some(&MINT_COPILOT_INTEGRATION_ID)
+        );
+        // Authorization is never part of the static header table (bearer is separate).
+        assert!(!map.contains_key("Authorization"));
+        // Synaps identifies itself honestly in User-Agent.
+        assert!(MINT_USER_AGENT.contains("Synaps"));
+    }
+
     #[tokio::test]
+    async fn github_copilot_session_mint_sends_integration_headers_or_maps_403() {
+        // Live failure mode: device flow succeeds, mint returns 403 without
+        // Copilot-Integration-Id / editor headers. Regression: mint must attach
+        // session_mint_request_headers() and stage-map non-2xx as SessionMintRejected.
+        let http = FakeHttp::default();
+        let now = 1_700_000_000_000u64;
+        http.push_get(ScriptedResponse::Status(
+            403,
+            r#"{"message":"token not authorized for this integration"}"#.into(),
+        ));
+        let clock = FakeClock::new(now);
+        let err = mint_session_token(&http, &clock, "gho_after_device_ok")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CopilotAuthError::SessionMintRejected(403)),
+            "mint 403 must be staged as SessionMintRejected, not generic HttpStatus: {err:?}"
+        );
+        // Error surface must not echo body secrets / raw tokens.
+        let rendered = err.to_string();
+        assert!(!rendered.contains("gho_"));
+        assert!(!rendered.contains("authorized for this integration"));
+        assert!(rendered.contains("403"));
+
+        // Successful mint path must send the full header set.
+        let http = FakeHttp::default();
+        http.push_get(ScriptedResponse::Ok(session_body(
+            "tid=ok",
+            now / 1000 + 1800,
+        )));
+        let creds = mint_credentials(&http, &clock, "gho_after_device_ok")
+            .await
+            .unwrap();
+        assert_eq!(creds.access, "tid=ok");
+        let gets = http.gets.lock().unwrap().clone();
+        assert_eq!(gets.len(), 1);
+        assert_eq!(gets[0].0, SESSION_MINT_URL);
+        assert_eq!(gets[0].1, "gho_after_device_ok");
+        let hdrs: std::collections::HashMap<_, _> = gets[0].2.iter().cloned().collect();
+        assert_eq!(
+            hdrs.get("Copilot-Integration-Id").map(String::as_str),
+            Some(MINT_COPILOT_INTEGRATION_ID)
+        );
+        assert_eq!(
+            hdrs.get("Editor-Version").map(String::as_str),
+            Some(MINT_EDITOR_VERSION)
+        );
+        assert_eq!(
+            hdrs.get("User-Agent").map(String::as_str),
+            Some(MINT_USER_AGENT)
+        );
+        assert_eq!(hdrs.get("Accept").map(String::as_str), Some("application/json"));
+    }
+
+#[tokio::test]
     async fn github_copilot_empty_github_token_rejected_before_mint() {
         let http = FakeHttp::default();
         let clock = FakeClock::new(0);
@@ -1590,6 +1723,6 @@ mod tests {
         let err = mint_session_token(&http, &clock, "gho_x")
             .await
             .unwrap_err();
-        assert!(matches!(err, CopilotAuthError::HttpStatus(302)));
+        assert!(matches!(err, CopilotAuthError::SessionMintRejected(302)));
     }
 }

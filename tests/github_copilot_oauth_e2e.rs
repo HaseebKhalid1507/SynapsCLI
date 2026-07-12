@@ -88,7 +88,7 @@ enum Scripted {
 #[derive(Default)]
 struct FakeHttp {
     posts: Mutex<Vec<(String, Vec<(String, String)>)>>,
-    gets: Mutex<Vec<(String, String)>>,
+    gets: Mutex<Vec<(String, String, Vec<(String, String)>)>>,
     post_q: Mutex<Vec<Scripted>>,
     get_q: Mutex<Vec<Scripted>>,
 }
@@ -130,12 +130,17 @@ impl CopilotHttp for FakeHttp {
         &self,
         url: &str,
         bearer: &str,
+        headers: &[(&str, &str)],
     ) -> Result<InjectedHttpResponse, CopilotAuthError> {
         validate_session_mint_endpoint(url)?;
-        self.gets
-            .lock()
-            .unwrap()
-            .push((url.to_string(), bearer.to_string()));
+        self.gets.lock().unwrap().push((
+            url.to_string(),
+            bearer.to_string(),
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        ));
         let next = {
             let mut q = self.get_q.lock().unwrap();
             if q.is_empty() {
@@ -243,6 +248,13 @@ async fn github_copilot_oauth_e2e_start_pending_slow_down_authorize_mint_store()
         .iter()
         .all(|(u, _)| u.starts_with("https://github.com/")));
     assert_eq!(http.gets.lock().unwrap()[0].0, SESSION_MINT_URL);
+    let mint_headers: std::collections::HashMap<_, _> =
+        http.gets.lock().unwrap()[0].2.iter().cloned().collect();
+    assert_eq!(
+        mint_headers.get("Copilot-Integration-Id").map(String::as_str),
+        Some(agent_core::auth::github_copilot::MINT_COPILOT_INTEGRATION_ID)
+    );
+    assert!(mint_headers.contains_key("User-Agent"));
 
     save_provider_auth(
         "anthropic",
