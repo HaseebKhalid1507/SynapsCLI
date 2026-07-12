@@ -508,6 +508,12 @@ impl ProductionCloudBackend {
                         raw["sso_refresh_token"] = rotated.into();
                     }
                     raw["sso_expires_at"] = (now + token.expires_in * 1000).into();
+                    // A refresh token is single-use and may rotate. Commit the
+                    // refreshed SSO session before the independent role fetch;
+                    // otherwise a transient GetRoleCredentials failure loses
+                    // the only usable token and strands the persisted login.
+                    storage::save_cloud_state("aws-bedrock", &raw)
+                        .map_err(BrokerError::Credential)?;
                     s = decode(raw.clone())?;
                 }
                 use super::aws_bedrock::AwsApi;
@@ -1021,11 +1027,23 @@ impl CloudBackend for ProductionCloudBackend {
                             })
                         })
                     });
+                    use std::sync::{
+                        atomic::{AtomicBool, Ordering},
+                        Arc,
+                    };
+                    let terminal = Arc::new(AtomicBool::new(false));
+                    let terminal_in_events = terminal.clone();
                     let stream = events
-                        .flat_map(|item| {
+                        .flat_map(move |item| {
                             let mut out = Vec::new();
                             match item {
                                 Ok(v) => {
+                                    if terminal_in_events.load(Ordering::SeqCst) {
+                                        out.push(Err(BrokerError::Transport(
+                                            "Vertex emitted data after terminal metadata".into(),
+                                        )));
+                                        return futures::stream::iter(out);
+                                    }
                                     for c in v["candidates"].as_array().into_iter().flatten() {
                                         for p in
                                             c["content"]["parts"].as_array().into_iter().flatten()
@@ -1034,6 +1052,34 @@ impl CloudBackend for ProductionCloudBackend {
                                                 out.push(Ok(CloudEvent::TextDelta {
                                                     delta: delta.into(),
                                                 }));
+                                            }
+                                        }
+                                        if let Some(reason) = c["finishReason"].as_str() {
+                                            const VALID: &[&str] = &[
+                                                "STOP",
+                                                "MAX_TOKENS",
+                                                "SAFETY",
+                                                "RECITATION",
+                                                "OTHER",
+                                                "BLOCKLIST",
+                                                "PROHIBITED_CONTENT",
+                                                "SPII",
+                                                "MALFORMED_FUNCTION_CALL",
+                                            ];
+                                            if !VALID.contains(&reason) {
+                                                out.push(Err(BrokerError::Transport(
+                                                    "Vertex returned an invalid finish reason"
+                                                        .into(),
+                                                )));
+                                            } else if terminal_in_events
+                                                .swap(true, Ordering::SeqCst)
+                                            {
+                                                out.push(Err(BrokerError::Transport(
+                                                    "Vertex returned duplicate terminal metadata"
+                                                        .into(),
+                                                )));
+                                            } else {
+                                                out.push(Ok(CloudEvent::Done));
                                             }
                                         }
                                     }
@@ -1052,7 +1098,18 @@ impl CloudBackend for ProductionCloudBackend {
                             }
                             futures::stream::iter(out)
                         })
-                        .chain(futures::stream::once(async { Ok(CloudEvent::Done) }));
+                        .chain(futures::stream::unfold(terminal, |terminal| async move {
+                            if terminal.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                Some((
+                                    Err(BrokerError::Transport(
+                                        "Vertex stream ended without finish metadata".into(),
+                                    )),
+                                    terminal,
+                                ))
+                            }
+                        }));
                     Ok(Box::pin(stream))
                 } else {
                     let text = read_body_capped(r, MAX_CLOUD_STREAM_EVENT_BYTES).await?;

@@ -264,6 +264,35 @@ async fn login_azure_openai() -> Result<(), String> {
         .ok_or("Azure ARM metadata omitted the resource endpoint")?;
     auth::azure_openai::AzureEndpoint::parse(endpoint)
         .map_err(|_| "Azure ARM returned an untrusted resource endpoint")?;
+    // Validate the selected resource/deployment against ARM before replacing a
+    // prior login. This is deliberately before the sole persistence point.
+    let deployment_url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version=2023-05-01",
+        config.subscription_id, config.resource_group, config.resource_name
+    );
+    let deployments: serde_json::Value = http
+        .get(deployment_url)
+        .bearer_auth(
+            arm["access_token"]
+                .as_str()
+                .ok_or("invalid Azure ARM token")?,
+        )
+        .send()
+        .await
+        .map_err(|_| "Azure catalog validation failed; prior login preserved")?
+        .error_for_status()
+        .map_err(|_| "Azure catalog validation failed; prior login preserved")?
+        .json()
+        .await
+        .map_err(|_| "invalid Azure deployment catalog")?;
+    let deployment_exists = deployments["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|d| d["name"].as_str() == Some(config.deployment.as_str()));
+    if !deployment_exists {
+        return Err("Azure deployment is absent from catalog; prior login preserved".into());
+    }
     auth::save_cloud_state(
         "azure-openai",
         &serde_json::json!({"config":config,"client_id":client_id,"endpoint":endpoint,"refresh_token":infer["refresh_token"].as_str().unwrap_or(&refresh),"arm":{"access_token":arm["access_token"],"expires_at":now+arm["expires_in"].as_u64().unwrap_or(3600)*1000},"inference":{"access_token":infer["access_token"],"expires_at":now+infer["expires_in"].as_u64().unwrap_or(3600)*1000}}),
@@ -347,6 +376,33 @@ async fn login_google_vertex() -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // Validate access and context before the only commit, preserving old state
+    // on OAuth success followed by an unusable Vertex catalog.
+    let catalog_url = format!(
+        "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models?pageSize=1",
+        config.location, config.project_id, config.location
+    );
+    let catalog: serde_json::Value = http
+        .get(catalog_url)
+        .bearer_auth(
+            v["access_token"]
+                .as_str()
+                .ok_or("invalid Vertex token response")?,
+        )
+        .send()
+        .await
+        .map_err(|_| "Vertex catalog validation failed; prior login preserved")?
+        .error_for_status()
+        .map_err(|_| "Vertex catalog validation failed; prior login preserved")?
+        .json()
+        .await
+        .map_err(|_| "invalid Vertex model catalog")?;
+    if catalog["publisherModels"]
+        .as_array()
+        .map_or(true, |models| models.is_empty())
+    {
+        return Err("Vertex model catalog is empty; prior login preserved".into());
+    }
     auth::save_cloud_state(
         "google-vertex",
         &serde_json::json!({"config":config,"client_id":client_id,"access_token":v["access_token"],"refresh_token":refresh,"expires_at":now+v["expires_in"].as_u64().unwrap_or(3600)*1000}),
@@ -362,7 +418,7 @@ async fn login_aws_bedrock() -> Result<(), String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "cannot initialize HTTPS client")?;
-    let api = AwsHttpApi::new(http, &sso_region);
+    let api = AwsHttpApi::new(http.clone(), &sso_region);
     let client = api
         .register_client(&sso_region)
         .await
@@ -422,6 +478,23 @@ async fn login_aws_bedrock() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let config = auth::AwsBedrockConfig::new(start, sso_region, account, role, bedrock_region)?;
+    // The login transaction is not committed until the selected Bedrock
+    // context can return a non-empty catalog. A failed relogin must leave the
+    // previously working credential untouched.
+    let validation = auth::aws_bedrock::AwsBedrockBroker::from_credentials(
+        auth::aws_bedrock::AwsHttpApi::new(http.clone(), &config.sso_region),
+        config.clone(),
+        auth::aws_bedrock::RoleCredentials::new(
+            credentials.access_key(),
+            credentials.secret_key(),
+            credentials.session_token(),
+            credentials.expires_at,
+        ),
+    );
+    validation
+        .catalog()
+        .await
+        .map_err(|_| "AWS Bedrock catalog validation failed; prior login preserved".to_string())?;
     let state = serde_json::json!({
         "config": config, "access_key": credentials.access_key(), "secret_key": credentials.secret_key(),
         "session_token": credentials.session_token(), "expires_at": credentials.expires_at,
