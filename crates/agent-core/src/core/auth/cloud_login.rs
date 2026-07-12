@@ -1,9 +1,48 @@
 //! Provider-specific interactive cloud login protocols.
 //! Credentials remain persisted only through the broker-owned auth store.
 
-use std::io::IsTerminal;
-
 use super::CloudProviderId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudLoginChallenge {
+    DeviceCode {
+        verification_uri: String,
+        user_code: String,
+    },
+    AuthorizationUrl {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSelectionKind {
+    Account,
+    Role,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudLoginChoice {
+    pub id: String,
+    pub label: String,
+}
+impl CloudLoginChoice {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// Presentation boundary for interactive cloud login. Core never accesses a terminal.
+pub trait CloudLoginUi {
+    fn present_challenge(&mut self, challenge: CloudLoginChallenge);
+    fn select(
+        &mut self,
+        kind: CloudSelectionKind,
+        choices: &[CloudLoginChoice],
+    ) -> Result<String, String>;
+}
 
 /// Whether this build has an explicit login implementation for a cloud provider.
 pub const fn supports_login(provider: CloudProviderId) -> bool {
@@ -15,11 +54,11 @@ pub const fn supports_login(provider: CloudProviderId) -> bool {
 }
 
 /// Execute the provider-specific protocol selected by typed identity.
-pub async fn login(provider: CloudProviderId) -> Result<(), String> {
+pub async fn login(provider: CloudProviderId, ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     match provider {
-        CloudProviderId::AwsBedrock => login_aws_bedrock().await,
-        CloudProviderId::AzureOpenAi => login_azure_openai().await,
-        CloudProviderId::GoogleVertex => login_google_vertex().await,
+        CloudProviderId::AwsBedrock => login_aws_bedrock(ui).await,
+        CloudProviderId::AzureOpenAi => login_azure_openai(ui).await,
+        CloudProviderId::GoogleVertex => login_google_vertex(ui).await,
     }
 }
 
@@ -30,7 +69,7 @@ fn required_env(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing {name}"))
 }
 
-async fn login_azure_openai() -> Result<(), String> {
+async fn login_azure_openai(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     use super::azure_openai::{
         device_code_request, refresh_request, AzureAudience, AzureRegistration,
     };
@@ -60,13 +99,16 @@ async fn login_azure_openai() -> Result<(), String> {
         .json()
         .await
         .map_err(|_| "invalid Azure device response")?;
-    eprintln!(
-        "Open {} and enter code {}",
-        d["verification_uri"]
+    ui.present_challenge(CloudLoginChallenge::DeviceCode {
+        verification_uri: d["verification_uri"]
             .as_str()
-            .unwrap_or("Microsoft sign-in"),
-        d["user_code"].as_str().unwrap_or("(provided by Microsoft)")
-    );
+            .unwrap_or("Microsoft sign-in")
+            .into(),
+        user_code: d["user_code"]
+            .as_str()
+            .unwrap_or("(provided by Microsoft)")
+            .into(),
+    });
     let device = d["device_code"]
         .as_str()
         .ok_or("invalid Azure device response")?;
@@ -187,7 +229,7 @@ async fn login_azure_openai() -> Result<(), String> {
     )
 }
 
-async fn login_google_vertex() -> Result<(), String> {
+async fn login_google_vertex(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     use base64::Engine;
     use sha2::Digest;
     let client_id = std::env::var("SYNAPS_VERTEX_CLIENT_ID")
@@ -213,7 +255,9 @@ async fn login_google_vertex() -> Result<(), String> {
     let state = uuid::Uuid::new_v4().simple().to_string();
     let url = super::google_vertex::build_authorize_url(&reg, &challenge, &state, &redirect)
         .map_err(|e| e.to_string())?;
-    eprintln!("Open this URL to authorize Google Vertex:\n{url}");
+    ui.present_challenge(CloudLoginChallenge::AuthorizationUrl {
+        url: url.to_string(),
+    });
     let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut b = vec![0; 8192];
@@ -297,7 +341,7 @@ async fn login_google_vertex() -> Result<(), String> {
     )
 }
 
-async fn login_aws_bedrock() -> Result<(), String> {
+async fn login_aws_bedrock(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     use super::aws_bedrock::{AwsApi, AwsHttpApi, TokenGrant};
     let start = required_env("SYNAPS_AWS_SSO_START_URL")?;
     let sso_region = required_env("SYNAPS_AWS_SSO_REGION")?;
@@ -315,10 +359,10 @@ async fn login_aws_bedrock() -> Result<(), String> {
         .start_device_authorization(&client, &start)
         .await
         .map_err(|e| e.to_string())?;
-    eprintln!(
-        "Open {} and enter code {}",
-        device.verification_uri, device.user_code
-    );
+    ui.present_challenge(CloudLoginChallenge::DeviceCode {
+        verification_uri: device.verification_uri.clone(),
+        user_code: device.user_code.clone(),
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
     let mut interval = device.interval.max(1);
     let token = loop {
@@ -345,21 +389,26 @@ async fn login_aws_bedrock() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let account = choose(
-        "account",
+        CloudSelectionKind::Account,
         accounts
             .iter()
-            .map(|a| (a.id.as_str(), a.name.as_str()))
+            .map(|a| CloudLoginChoice::new(&a.id, &a.name))
             .collect(),
         std::env::var("SYNAPS_AWS_ACCOUNT_ID").ok().as_deref(),
+        ui,
     )?;
     let roles = api
         .list_account_roles(&sso_region, token.access(), &account)
         .await
         .map_err(|e| e.to_string())?;
     let role = choose(
-        "role",
-        roles.iter().map(|r| (r.name.as_str(), "")).collect(),
+        CloudSelectionKind::Role,
+        roles
+            .iter()
+            .map(|r| CloudLoginChoice::new(&r.name, ""))
+            .collect(),
         std::env::var("SYNAPS_AWS_ROLE_NAME").ok().as_deref(),
+        ui,
     )?;
     let credentials = api
         .get_role_credentials(&sso_region, token.access(), &account, &role)
@@ -394,41 +443,77 @@ async fn login_aws_bedrock() -> Result<(), String> {
 }
 
 fn choose(
-    kind: &str,
-    values: Vec<(&str, &str)>,
+    kind: CloudSelectionKind,
+    values: Vec<CloudLoginChoice>,
     configured: Option<&str>,
+    ui: &mut dyn CloudLoginUi,
 ) -> Result<String, String> {
     if let Some(want) = configured {
         return values
             .iter()
-            .find(|(id, _)| *id == want)
-            .map(|(id, _)| (*id).to_string())
-            .ok_or_else(|| format!("configured {kind} is not assigned"));
+            .find(|v| v.id == want)
+            .map(|v| v.id.clone())
+            .ok_or_else(|| format!("configured {} is not assigned", kind.name()));
     }
     if values.len() == 1 {
-        return Ok(values[0].0.to_string());
+        return Ok(values[0].id.clone());
     }
-    if !std::io::stdin().is_terminal() {
-        return Err(format!(
-            "multiple {kind}s; set SYNAPS_AWS_{}",
-            if kind == "account" {
-                "ACCOUNT_ID"
-            } else {
-                "ROLE_NAME"
-            }
-        ));
+    ui.select(kind, &values)
+}
+
+impl CloudSelectionKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Role => "role",
+        }
     }
-    eprintln!("Select {kind}:");
-    for (i, (id, label)) in values.iter().enumerate() {
-        eprintln!("  {}. {} {}", i + 1, id, label);
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingUi {
+        challenges: Vec<CloudLoginChallenge>,
+        selections: Vec<(CloudSelectionKind, Vec<CloudLoginChoice>)>,
     }
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    let i: usize = line.trim().parse().map_err(|_| "invalid selection")?;
-    values
-        .get(i.saturating_sub(1))
-        .map(|v| v.0.to_string())
-        .ok_or_else(|| "invalid selection".into())
+
+    impl CloudLoginUi for RecordingUi {
+        fn present_challenge(&mut self, challenge: CloudLoginChallenge) {
+            self.challenges.push(challenge);
+        }
+
+        fn select(
+            &mut self,
+            kind: CloudSelectionKind,
+            choices: &[CloudLoginChoice],
+        ) -> Result<String, String> {
+            self.selections.push((kind, choices.to_vec()));
+            Ok(choices[1].id.clone())
+        }
+    }
+
+    #[test]
+    fn injected_ui_receives_typed_challenges_and_selections() {
+        let mut ui = RecordingUi::default();
+        ui.present_challenge(CloudLoginChallenge::DeviceCode {
+            verification_uri: "https://example.test".into(),
+            user_code: "ABCD".into(),
+        });
+        let selected = choose(
+            CloudSelectionKind::Account,
+            vec![
+                CloudLoginChoice::new("1", "first"),
+                CloudLoginChoice::new("2", "second"),
+            ],
+            None,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(selected, "2");
+        assert_eq!(ui.challenges.len(), 1);
+        assert_eq!(ui.selections[0].0, CloudSelectionKind::Account);
+    }
 }

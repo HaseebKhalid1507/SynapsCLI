@@ -128,12 +128,63 @@ fn oauth_storage_key(provider: LoginProvider) -> &'static str {
     }
 }
 
+struct TerminalCloudLoginUi;
+
+impl auth::cloud_login::CloudLoginUi for TerminalCloudLoginUi {
+    fn present_challenge(&mut self, challenge: auth::cloud_login::CloudLoginChallenge) {
+        match challenge {
+            auth::cloud_login::CloudLoginChallenge::DeviceCode {
+                verification_uri,
+                user_code,
+            } => eprintln!("Open {verification_uri} and enter code {user_code}"),
+            auth::cloud_login::CloudLoginChallenge::AuthorizationUrl { url } => {
+                eprintln!("Open this URL to authorize:\n{url}")
+            }
+        }
+    }
+
+    fn select(
+        &mut self,
+        kind: auth::cloud_login::CloudSelectionKind,
+        choices: &[auth::cloud_login::CloudLoginChoice],
+    ) -> Result<String, String> {
+        let name = match kind {
+            auth::cloud_login::CloudSelectionKind::Account => "account",
+            auth::cloud_login::CloudSelectionKind::Role => "role",
+        };
+        if !io::stdin().is_terminal() {
+            return Err(format!(
+                "multiple {name}s; set SYNAPS_AWS_{}",
+                if matches!(kind, auth::cloud_login::CloudSelectionKind::Account) {
+                    "ACCOUNT_ID"
+                } else {
+                    "ROLE_NAME"
+                }
+            ));
+        }
+        eprintln!("Select {name}:");
+        for (i, choice) in choices.iter().enumerate() {
+            eprintln!("  {}. {} {}", i + 1, choice.id, choice.label);
+        }
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        let i: usize = line.trim().parse().map_err(|_| "invalid selection")?;
+        choices
+            .get(i.saturating_sub(1))
+            .map(|v| v.id.clone())
+            .ok_or_else(|| "invalid selection".into())
+    }
+}
+
 async fn run_cloud_login(
     provider: LoginProvider,
     id: auth::CloudProviderId,
     profile: Option<String>,
 ) -> Result<(), String> {
-    let result = auth::cloud_login::login(id).await;
+    let mut ui = TerminalCloudLoginUi;
+    let result = auth::cloud_login::login(id, &mut ui).await;
     match result {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ {} login successful\x1b[0m", provider.name);
