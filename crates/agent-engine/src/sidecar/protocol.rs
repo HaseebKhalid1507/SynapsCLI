@@ -66,7 +66,6 @@ pub enum SidecarFrame {
     Custom,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,8 +88,14 @@ mod tests {
     #[test]
     fn command_round_trip_trigger_shutdown() {
         let commands = vec![
-            SidecarCommand::Trigger { name: "press".into(), payload: None },
-            SidecarCommand::Trigger { name: "release".into(), payload: Some(serde_json::json!({"source":"keybind"})) },
+            SidecarCommand::Trigger {
+                name: "press".into(),
+                payload: None,
+            },
+            SidecarCommand::Trigger {
+                name: "release".into(),
+                payload: Some(serde_json::json!({"source":"keybind"})),
+            },
             SidecarCommand::Shutdown,
         ];
         for cmd in commands {
@@ -105,14 +110,16 @@ mod tests {
         let without_payload = serde_json::to_string(&SidecarCommand::Trigger {
             name: "tap".into(),
             payload: None,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(without_payload.contains("\"type\":\"trigger\""));
         assert!(!without_payload.contains("payload"));
 
         let with_payload = serde_json::to_string(&SidecarCommand::Trigger {
             name: "tap".into(),
             payload: Some(serde_json::json!({"count":2})),
-        }).unwrap();
+        })
+        .unwrap();
         assert!(with_payload.contains("payload"));
     }
 
@@ -137,7 +144,9 @@ mod tests {
                 text: "done".into(),
                 mode: InsertTextMode::Final,
             },
-            SidecarFrame::Error { message: "missing model".into() },
+            SidecarFrame::Error {
+                message: "missing model".into(),
+            },
         ];
         for frame in frames {
             let json = serde_json::to_string(&frame).unwrap();
@@ -151,7 +160,11 @@ mod tests {
         let line = r#"{"type":"hello","protocol_version":2,"extension":"example-plugin","capabilities":["text.insert"]}"#;
         let parsed: SidecarFrame = serde_json::from_str(line).unwrap();
         match parsed {
-            SidecarFrame::Hello { protocol_version, extension, capabilities } => {
+            SidecarFrame::Hello {
+                protocol_version,
+                extension,
+                capabilities,
+            } => {
                 assert_eq!(protocol_version, SIDECAR_PROTOCOL_VERSION);
                 assert_eq!(extension, "example-plugin");
                 assert_eq!(capabilities, vec!["text.insert".to_string()]);

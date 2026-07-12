@@ -98,9 +98,7 @@ impl ReadinessDetector {
         let strategy = if patterns.is_empty() {
             match strategy {
                 ReadinessStrategy::Prompt | ReadinessStrategy::Hybrid => {
-                    tracing::warn!(
-                        "no valid prompt patterns — falling back to Timeout strategy"
-                    );
+                    tracing::warn!("no valid prompt patterns — falling back to Timeout strategy");
                     ReadinessStrategy::Timeout
                 }
                 other => other,
@@ -119,7 +117,8 @@ impl ReadinessDetector {
 
     /// Build from the default `ShellConfig`.
     pub fn from_config(config: &ShellConfig) -> Self {
-        let strategy = crate::tools::shell::readiness::ReadinessStrategy::from_str(&config.readiness_strategy);
+        let strategy =
+            crate::tools::shell::readiness::ReadinessStrategy::from_str(&config.readiness_strategy);
         Self::new(
             strategy,
             &config.prompt_patterns,
@@ -379,12 +378,7 @@ mod tests {
             "[invalid(".into(), // broken regex
             r"[$#] $".into(),   // valid
         ];
-        let det = ReadinessDetector::new(
-            ReadinessStrategy::Hybrid,
-            &patterns,
-            300,
-            10_000,
-        );
+        let det = ReadinessDetector::new(ReadinessStrategy::Hybrid, &patterns, 300, 10_000);
         // Should still work — the valid pattern compiled.
         assert!(det.matches_prompt("user@host:~$ "));
     }
@@ -393,12 +387,7 @@ mod tests {
     #[test]
     fn all_invalid_patterns_fallback_to_timeout() {
         let patterns = vec!["[broken(".into(), "(also[bad".into()];
-        let det = ReadinessDetector::new(
-            ReadinessStrategy::Hybrid,
-            &patterns,
-            300,
-            10_000,
-        );
+        let det = ReadinessDetector::new(ReadinessStrategy::Hybrid, &patterns, 300, 10_000);
         // Strategy downgraded — prompt won't match, silence drives the result.
         assert!(!det.matches_prompt("user@host:~$ "));
         let result = det.check(

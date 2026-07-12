@@ -63,7 +63,10 @@ pub struct GeminiToolFunctionDeclaration {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "parametersJsonSchema")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "parametersJsonSchema"
+    )]
     pub parameters_json_schema: Option<serde_json::Value>,
 }
 
@@ -109,10 +112,20 @@ pub struct GeminiGenerateRequest {
 /// payloads are unsupported in this experimental slice.
 #[derive(Debug, Clone)]
 pub enum ChatTurn {
-    User { text: String },
-    Assistant { text: String },
-    ToolCall { name: String, args: serde_json::Value },
-    ToolResult { name: String, result: serde_json::Value },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        name: String,
+        result: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,7 +219,9 @@ pub fn translate_generate_content_request(
 pub enum GeminiStreamEvent {
     TextDelta(String),
     ToolCall(GeminiFunctionCall),
-    Finish { reason: Option<String> },
+    Finish {
+        reason: Option<String>,
+    },
     /// The upstream chunk was well-formed JSON but did not carry text/tool/
     /// finish info. Callers usually drop these.
     Ignored,
@@ -320,8 +335,12 @@ mod tests {
             Some("be brief".into()),
             &[
                 ChatTurn::User { text: "hi".into() },
-                ChatTurn::Assistant { text: "hello".into() },
-                ChatTurn::User { text: "list files".into() },
+                ChatTurn::Assistant {
+                    text: "hello".into(),
+                },
+                ChatTurn::User {
+                    text: "list files".into(),
+                },
             ],
             &[ToolSpec {
                 name: "list_files".into(),
@@ -336,14 +355,17 @@ mod tests {
         assert_eq!(v["request"]["contents"][0]["role"], "user");
         assert_eq!(v["request"]["contents"][0]["parts"][0]["text"], "hi");
         assert_eq!(v["request"]["contents"][1]["role"], "model");
-        assert_eq!(v["request"]["systemInstruction"]["parts"][0]["text"], "be brief");
+        assert_eq!(
+            v["request"]["systemInstruction"]["parts"][0]["text"],
+            "be brief"
+        );
         assert_eq!(
             v["request"]["tools"][0]["functionDeclarations"][0]["name"],
             "list_files"
         );
-        assert!(v["request"]["tools"][0]["functionDeclarations"][0]
-            ["parametersJsonSchema"]
-            .is_object());
+        assert!(
+            v["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"].is_object()
+        );
     }
 
     #[test]
@@ -353,7 +375,9 @@ mod tests {
             None,
             None,
             &[
-                ChatTurn::User { text: "search".into() },
+                ChatTurn::User {
+                    text: "search".into(),
+                },
                 ChatTurn::ToolCall {
                     name: "search".into(),
                     args: json!({"q": "rust"}),
@@ -391,7 +415,8 @@ mod tests {
 
     #[test]
     fn sse_decodes_text_delta_from_ca_envelope() {
-        let line = r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}}"#;
+        let line =
+            r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}}"#;
         let events = from_stream_line(line).unwrap();
         assert_eq!(events, vec![GeminiStreamEvent::TextDelta("Hello".into())]);
     }

@@ -52,9 +52,10 @@ pub async fn stream_gemini<B: CredentialBroker + ?Sized>(
         provider: "google-gemini".into(),
         method: ProxyMethod::Post,
         path: "/v1internal:streamGenerateContent".into(),
-        body: Some(serde_json::to_value(&body).map_err(|e| {
-            StreamError::Decode(format!("failed to serialize request: {e}"))
-        })?),
+        body: Some(
+            serde_json::to_value(&body)
+                .map_err(|e| StreamError::Decode(format!("failed to serialize request: {e}")))?,
+        ),
         stream: true,
     };
     let mut byte_stream = broker.proxy_stream(request).await?;
@@ -136,7 +137,9 @@ pub async fn stream_gemini<B: CredentialBroker + ?Sized>(
         }
     });
 
-    Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+    Ok(Box::pin(
+        tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+    ))
 }
 
 #[cfg(test)]
@@ -183,9 +186,7 @@ mod tests {
         async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
             Err(BrokerError::Denied("not implemented".into()))
         }
-        async fn capabilities(
-            &self,
-        ) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
             Ok(vec![])
         }
     }
@@ -222,7 +223,10 @@ mod tests {
         assert!(matches!(&got[1], GeminiStreamEvent::TextDelta(t) if t == "world"));
         assert!(matches!(&got[2], GeminiStreamEvent::ToolCall(c) if c.name == "do"));
         assert!(matches!(&got[3], GeminiStreamEvent::Finish { reason: Some(r) } if r == "STOP"));
-        assert!(matches!(&got[4], GeminiStreamEvent::Finish { reason: None }));
+        assert!(matches!(
+            &got[4],
+            GeminiStreamEvent::Finish { reason: None }
+        ));
 
         // Wire request went to the exact pinned method + provider + streamed.
         let seen = broker.seen.lock().unwrap().clone().unwrap();
@@ -244,7 +248,9 @@ mod tests {
         tx.send(chunk("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"one\"}]}}]}}\n"))
             .unwrap();
 
-        struct Blocking(Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<bytes::Bytes, BrokerError>>>>);
+        struct Blocking(
+            Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<bytes::Bytes, BrokerError>>>>,
+        );
         #[async_trait]
         impl CredentialBroker for Blocking {
             async fn access_token(
@@ -256,12 +262,11 @@ mod tests {
             async fn proxy(&self, _r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
                 Err(BrokerError::Denied("not implemented".into()))
             }
-            async fn proxy_stream(
-                &self,
-                _r: ProxyRequest,
-            ) -> Result<ProxyByteStream, BrokerError> {
+            async fn proxy_stream(&self, _r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
                 let rx = self.0.lock().unwrap().take().unwrap();
-                Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
             }
             async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
                 Err(BrokerError::Denied("not implemented".into()))

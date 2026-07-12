@@ -4,15 +4,15 @@
 //! drive persistent interactive terminal sessions (SSH, REPLs, debuggers, etc).
 
 pub mod config;
+mod end;
 pub mod pty;
 pub mod readiness;
+mod send;
 pub mod session;
 mod start;
-mod send;
-mod end;
 
 pub use config::ShellConfig;
-pub use session::{SessionManager, SessionOpts, SendResult, start_reaper};
-pub use start::ShellStartTool;
-pub use send::ShellSendTool;
 pub use end::ShellEndTool;
+pub use send::ShellSendTool;
+pub use session::{start_reaper, SendResult, SessionManager, SessionOpts};
+pub use start::ShellStartTool;

@@ -171,7 +171,8 @@ impl StreamDecoder {
                 // has an id (indicating a full re-send, not a final argument delta).
                 if let Some(tcs) = delta.tool_calls {
                     for tc in tcs {
-                        let is_resend = is_finish && tc.id.as_ref().is_some_and(|id| !id.is_empty());
+                        let is_resend =
+                            is_finish && tc.id.as_ref().is_some_and(|id| !id.is_empty());
                         if !is_resend {
                             self.apply_tool_call_delta(tc, sink);
                         }
@@ -195,7 +196,8 @@ impl StreamDecoder {
             }
         }
         if let Some(u) = chunk.usage {
-            let cached = u.prompt_tokens_details
+            let cached = u
+                .prompt_tokens_details
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
             sink.extend(Some(OaiEvent::Usage {
@@ -206,11 +208,7 @@ impl StreamDecoder {
         }
     }
 
-    fn apply_tool_call_delta<E: Extend<OaiEvent>>(
-        &mut self,
-        tc: RawToolCallDelta,
-        sink: &mut E,
-    ) {
+    fn apply_tool_call_delta<E: Extend<OaiEvent>>(&mut self, tc: RawToolCallDelta, sink: &mut E) {
         let idx = tc.index.unwrap_or(0);
         let acc = self.calls.entry(idx).or_default();
 

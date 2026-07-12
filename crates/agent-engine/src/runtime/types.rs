@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 // Stream event types now live in agent-core so rpc_dispatch can use them
 // without an upward dependency on the engine layer.
-pub use agent_core::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+pub use agent_core::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 /// Shared mutable auth state. Lives behind `Arc<RwLock<_>>` so the spawned
 /// streaming task and the parent Runtime always see the same (freshest) token.
@@ -13,7 +13,6 @@ pub(super) struct AuthState {
     pub(super) refresh_token: Option<String>,
     pub(super) token_expires: Option<u64>,
 }
-
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]

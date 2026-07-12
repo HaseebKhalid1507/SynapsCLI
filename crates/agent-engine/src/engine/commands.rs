@@ -3,7 +3,6 @@
 //! The engine processes a command and returns a `CommandResult`.
 //! Renderers (TUI, headless) decide how to display the result.
 
-
 /// Result of processing a slash command in the engine.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -94,8 +93,12 @@ pub enum CommandResult {
     },
 
     /// Sidecar toggle/status.
-    SidecarToggle { plugin_id: Option<String> },
-    SidecarStatus { plugin_id: Option<String> },
+    SidecarToggle {
+        plugin_id: Option<String>,
+    },
+    SidecarStatus {
+        plugin_id: Option<String>,
+    },
 }
 
 /// TUI-specific modals the engine can request.
@@ -169,7 +172,11 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
         },
         "quit" | "exit" => Some(CommandResult::Quit),
         "compact" => Some(CommandResult::Compact {
-            custom_instructions: if arg.is_empty() { None } else { Some(arg.to_string()) },
+            custom_instructions: if arg.is_empty() {
+                None
+            } else {
+                Some(arg.to_string())
+            },
         }),
         _ => None, // Not an engine-level command — delegate to renderer
     }
@@ -245,8 +252,14 @@ mod tests {
             }
             other => panic!("expected ThinkingChanged, got {:?}", other),
         }
-        assert_eq!(parse_thinking_arg("med").unwrap(), ("medium".to_string(), 4096));
-        assert_eq!(parse_thinking_arg("8192").unwrap(), ("custom(8192)".to_string(), 8192));
+        assert_eq!(
+            parse_thinking_arg("med").unwrap(),
+            ("medium".to_string(), 4096)
+        );
+        assert_eq!(
+            parse_thinking_arg("8192").unwrap(),
+            ("custom(8192)".to_string(), 8192)
+        );
         assert!(parse_thinking_arg("bogus").is_err());
         assert!(evaluate_engine_command("thinking", "").is_none());
     }
@@ -254,14 +267,18 @@ mod tests {
     #[test]
     fn compact_carries_custom_instructions() {
         match evaluate_engine_command("compact", "focus on auth") {
-            Some(CommandResult::Compact { custom_instructions }) => {
+            Some(CommandResult::Compact {
+                custom_instructions,
+            }) => {
                 assert_eq!(custom_instructions.as_deref(), Some("focus on auth"));
             }
             other => panic!("expected Compact, got {:?}", other),
         }
         assert!(matches!(
             evaluate_engine_command("compact", ""),
-            Some(CommandResult::Compact { custom_instructions: None })
+            Some(CommandResult::Compact {
+                custom_instructions: None
+            })
         ));
     }
 

@@ -6,9 +6,9 @@ pub use crate::core::shell_config::ShellConfig;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use serial_test::serial;
     use crate::core::config::load_config;
+    use serial_test::serial;
+    use std::time::Duration;
 
     #[test]
     fn test_shell_config_default() {
@@ -92,7 +92,8 @@ mod tests {
             let _ = std::fs::create_dir_all(&test_dir);
             let config_path = test_dir.join("config");
 
-            let config_content = "shell.max_sessions = not_a_number\nshell.idle_timeout = invalid\n";
+            let config_content =
+                "shell.max_sessions = not_a_number\nshell.idle_timeout = invalid\n";
             std::fs::write(&config_path, config_content).unwrap();
 
             let original_home = std::env::var("HOME").ok();

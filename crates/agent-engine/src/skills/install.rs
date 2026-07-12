@@ -84,9 +84,7 @@ pub fn clone_repo_with_progress(
         on_chunk(&accum);
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("wait git: {}", e))?;
+    let status = child.wait().map_err(|e| format!("wait git: {}", e))?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(dest);
         let trimmed = last_stderr.trim();
@@ -119,7 +117,10 @@ pub fn install_plugin_with_progress(
     on_chunk: impl FnMut(&str),
 ) -> Result<String, String> {
     if dest.exists() {
-        return Err(format!("{} already exists on disk; uninstall first", dest.display()));
+        return Err(format!(
+            "{} already exists on disk; uninstall first",
+            dest.display()
+        ));
     }
     clone_repo_with_progress(source_url, dest, on_chunk)?;
     rev_parse_head(dest)
@@ -157,10 +158,16 @@ pub fn install_plugin_from_subdir_with_progress(
         return Err(format!("refusing unsafe subdir name: {}", subdir));
     }
     if dest.exists() {
-        return Err(format!("{} already exists on disk; uninstall first", dest.display()));
+        return Err(format!(
+            "{} already exists on disk; uninstall first",
+            dest.display()
+        ));
     }
-    let parent = dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
-    let dest_name = dest.file_name()
+    let parent = dest
+        .parent()
+        .ok_or_else(|| "dest has no parent directory".to_string())?;
+    let dest_name = dest
+        .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "dest file name is not utf-8".to_string())?;
     let tmp = parent.join(format!(".{}-clone-tmp", dest_name));
@@ -255,17 +262,23 @@ fn hash_regular_files(path: &Path) -> Result<String, String> {
         let full = path.join(&rel);
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update([0]);
-        let bytes = std::fs::read(&full)
-            .map_err(|e| format!("read {}: {}", full.display(), e))?;
+        let bytes = std::fs::read(&full).map_err(|e| format!("read {}: {}", full.display(), e))?;
         hasher.update(bytes);
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub fn verify_plugin_dir_checksum(path: &Path, algorithm: &str, expected: &str) -> Result<(), String> {
+pub fn verify_plugin_dir_checksum(
+    path: &Path,
+    algorithm: &str,
+    expected: &str,
+) -> Result<(), String> {
     if algorithm != "sha256" {
-        return Err(format!("unsupported plugin checksum algorithm: {}", algorithm));
+        return Err(format!(
+            "unsupported plugin checksum algorithm: {}",
+            algorithm
+        ));
     }
     let actual = plugin_dir_sha256(path)?;
     if actual != expected {
@@ -284,7 +297,9 @@ fn collect_plugin_roots(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Resu
         if entry.file_name().to_string_lossy() == ".git" {
             continue;
         }
-        let ty = entry.file_type().map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        let ty = entry
+            .file_type()
+            .map_err(|e| format!("stat {}: {}", path.display(), e))?;
         if ty.is_dir() {
             if path.join(".synaps-plugin").join("plugin.json").is_file() && path != root {
                 out.push(path);
@@ -389,17 +404,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&work).status().unwrap();
-        std::fs::write(work.join("SKILL.md"),
-            "---\nname: demo\ndescription: d\n---\nbody").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&work).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        std::fs::write(
+            work.join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
 
         let bare = dir.path().join("bare.git");
-        Command::new("git").args(["clone", "--bare", "-q",
-            work.to_str().unwrap(), bare.to_str().unwrap()]).status().unwrap();
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
         (dir, bare)
     }
 
@@ -408,10 +454,7 @@ mod tests {
         let (_tmp, bare) = mk_local_repo();
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("demo");
-        let sha = install_plugin(
-            &format!("file://{}", bare.display()),
-            &dest,
-        ).unwrap();
+        let sha = install_plugin(&format!("file://{}", bare.display()), &dest).unwrap();
         assert!(dest.join("SKILL.md").exists());
         assert_eq!(sha.len(), 40);
     }
@@ -424,12 +467,11 @@ mod tests {
         let dest = dest_parent.path().join("demo");
         let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let chunks_clone = Arc::clone(&chunks);
-        let sha = install_plugin_with_progress(
-            &format!("file://{}", bare.display()),
-            &dest,
-            move |c| chunks_clone.lock().unwrap().push(c.to_string()),
-        )
-        .unwrap();
+        let sha =
+            install_plugin_with_progress(&format!("file://{}", bare.display()), &dest, move |c| {
+                chunks_clone.lock().unwrap().push(c.to_string())
+            })
+            .unwrap();
         assert_eq!(sha.len(), 40);
         assert!(dest.join("SKILL.md").exists());
         let captured = chunks.lock().unwrap().clone();
@@ -468,20 +510,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join(sub)).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&work).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
         std::fs::write(
             work.join(sub).join("SKILL.md"),
             "---\nname: demo\ndescription: d\n---\nbody",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(work.join("README.md"), "top level").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&work).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&work).status().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&work)
+            .status()
+            .unwrap();
 
         let bare = dir.path().join("bare.git");
-        Command::new("git").args(["clone", "--bare", "-q",
-            work.to_str().unwrap(), bare.to_str().unwrap()]).status().unwrap();
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
         (dir, bare)
     }
 
@@ -490,11 +561,8 @@ mod tests {
         let (_tmp, bare) = mk_local_repo_with_subdir("web");
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("web");
-        let sha = install_plugin_from_subdir(
-            &format!("file://{}", bare.display()),
-            "web",
-            &dest,
-        ).unwrap();
+        let sha = install_plugin_from_subdir(&format!("file://{}", bare.display()), "web", &dest)
+            .unwrap();
         assert_eq!(sha.len(), 40);
         // Subdir contents landed directly at dest.
         assert!(dest.join("SKILL.md").exists());
@@ -510,11 +578,9 @@ mod tests {
         let (_tmp, bare) = mk_local_repo_with_subdir("web");
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("web");
-        let err = install_plugin_from_subdir(
-            &format!("file://{}", bare.display()),
-            "../evil",
-            &dest,
-        ).unwrap_err();
+        let err =
+            install_plugin_from_subdir(&format!("file://{}", bare.display()), "../evil", &dest)
+                .unwrap_err();
         assert!(err.contains("unsafe"));
         assert!(!dest.exists());
     }
@@ -524,11 +590,8 @@ mod tests {
         let (_tmp, bare) = mk_local_repo_with_subdir("web");
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("nope");
-        let err = install_plugin_from_subdir(
-            &format!("file://{}", bare.display()),
-            "nope",
-            &dest,
-        ).unwrap_err();
+        let err = install_plugin_from_subdir(&format!("file://{}", bare.display()), "nope", &dest)
+            .unwrap_err();
         assert!(err.contains("not found"));
         assert!(!dest.exists());
     }
@@ -539,10 +602,7 @@ mod tests {
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("demo");
         std::fs::create_dir_all(&dest).unwrap();
-        let err = install_plugin(
-            &format!("file://{}", bare.display()),
-            &dest,
-        ).unwrap_err();
+        let err = install_plugin(&format!("file://{}", bare.display()), &dest).unwrap_err();
         assert!(err.contains("already"));
     }
 
@@ -599,22 +659,43 @@ mod tests {
         let (_tmp, bare) = mk_local_repo();
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("demo");
-        let initial_sha = install_plugin(
-            &format!("file://{}", bare.display()),
-            &dest,
-        ).unwrap();
+        let initial_sha = install_plugin(&format!("file://{}", bare.display()), &dest).unwrap();
 
         // Push a second commit to the bare repo.
         let pusher_parent = tempfile::tempdir().unwrap();
         let pusher = pusher_parent.path().join("push");
-        Command::new("git").args(["clone", "-q"])
-            .arg(&bare).arg(&pusher).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&pusher).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&pusher).status().unwrap();
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&bare)
+            .arg(&pusher)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&pusher)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&pusher)
+            .status()
+            .unwrap();
         std::fs::write(pusher.join("second.md"), "more").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&pusher).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "second"]).current_dir(&pusher).status().unwrap();
-        Command::new("git").args(["push", "-q"]).current_dir(&pusher).status().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&pusher)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "second"])
+            .current_dir(&pusher)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["push", "-q"])
+            .current_dir(&pusher)
+            .status()
+            .unwrap();
 
         let updated_sha = update_plugin(&dest).unwrap();
         assert_eq!(updated_sha.len(), 40);

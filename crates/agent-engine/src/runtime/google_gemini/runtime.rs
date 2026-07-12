@@ -162,10 +162,7 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let args = block
-                                    .get("input")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!({}));
+                                let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
                                 turns.push(ChatTurn::ToolCall { name, args });
                             }
                             // `thinking` and other unknown block types are not
@@ -334,8 +331,8 @@ fn map_finish_reason(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::auth::{
-        AccessToken, BrokerError, OAuthProviderId, ProxyByteStream, ProxyRequest, ProxyResponse,
-        ProviderStatus,
+        AccessToken, BrokerError, OAuthProviderId, ProviderStatus, ProxyByteStream, ProxyRequest,
+        ProxyResponse,
     };
     use async_trait::async_trait;
     use futures::stream;
@@ -357,10 +354,7 @@ mod tests {
 
     #[async_trait]
     impl CredentialBroker for StubBroker {
-        async fn access_token(
-            &self,
-            _p: OAuthProviderId,
-        ) -> Result<AccessToken, BrokerError> {
+        async fn access_token(&self, _p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
             Err(BrokerError::NotConfigured("stub".into()))
         }
         async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -410,20 +404,11 @@ mod tests {
         ]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let msgs: Vec<crate::SharedMessage> =
-            vec![Arc::new(json!({"role":"user","content":"hi"}))];
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
 
-        let out = call_google_gemini_stream_inner(
-            &cfg(),
-            &broker,
-            &[],
-            &None,
-            &msgs,
-            &tx,
-            &cancel,
-        )
-        .await
-        .unwrap();
+        let out = call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .unwrap();
         drop(tx);
 
         // Aggregated content block preserves streamed text.
@@ -488,7 +473,9 @@ mod tests {
                     assert_eq!(tool_name, "search");
                     saw_tool_start = true;
                 }
-                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name, input, ..
+                }) => {
                     assert_eq!(tool_name, "search");
                     assert_eq!(input["q"], "rust");
                     saw_tool_use = true;
@@ -546,20 +533,11 @@ mod tests {
         let broker: Arc<dyn CredentialBroker> = stub;
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let msgs: Vec<crate::SharedMessage> =
-            vec![Arc::new(json!({"role":"user","content":"hi"}))];
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
 
-        call_google_gemini_stream_inner(
-            &cfg(),
-            &broker,
-            &[],
-            &None,
-            &msgs,
-            &tx,
-            &cancel,
-        )
-        .await
-        .expect("stream should succeed once project is resolved");
+        call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .expect("stream should succeed once project is resolved");
 
         let request = seen
             .lock()

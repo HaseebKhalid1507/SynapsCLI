@@ -3,9 +3,9 @@
 //! Extracts the initialization logic that was previously inlined in
 //! chatui/mod.rs so both renderers can use the same boot path.
 
-use crate::{Runtime, Result, Session, latest_session, resolve_session};
-use crate::skills::registry::CommandRegistry;
 use crate::skills::keybinds::KeybindRegistry;
+use crate::skills::registry::CommandRegistry;
+use crate::{latest_session, resolve_session, Result, Runtime, Session};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -38,16 +38,20 @@ pub struct BackgroundTasks {
 impl BackgroundTasks {
     /// Signal all tasks to stop and unregister the session.
     pub fn shutdown(&self) {
-        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Release);
-        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        self.watcher_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.socket_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         crate::events::registry::unregister_session(&self.session_id);
     }
 }
 
 impl Drop for BackgroundTasks {
     fn drop(&mut self) {
-        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.watcher_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.socket_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.watcher_task.abort();
         self.socket_task.abort();
     }
@@ -140,7 +144,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     };
 
     // Helper: abort background tasks on error
-    let abort_tasks = |ws: &Arc<std::sync::atomic::AtomicBool>, wt: &tokio::task::JoinHandle<()>| {
+    let abort_tasks = |ws: &Arc<std::sync::atomic::AtomicBool>,
+                       wt: &tokio::task::JoinHandle<()>| {
         ws.store(true, std::sync::atomic::Ordering::Relaxed);
         wt.abort();
     };
@@ -184,7 +189,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Session start hook
     {
-        let mut index_record = crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
+        let mut index_record =
+            crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
         index_record.model = Some(sb.session.model.clone());
         index_record.profile = crate::core::config::get_profile();
         index_record.cwd = std::env::current_dir().ok();
@@ -192,12 +198,16 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             tracing::warn!("failed to append session start index record: {}", err);
         }
 
-        let hook_event = crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
+        let hook_event =
+            crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
     if mcp_server_count > 0 {
-        tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
+        tracing::info!(
+            "{} MCP servers available (use connect_mcp_server to activate)",
+            mcp_server_count
+        );
     }
 
     let session_id = sb.session.id.clone();
@@ -252,7 +262,10 @@ fn resolve_or_create_session(
         Some(ref maybe_id) => {
             let session = match maybe_id {
                 Some(ref id) => resolve_session(id).map_err(|e| {
-                    crate::error::RuntimeError::Tool(format!("Failed to load session '{}': {}", id, e))
+                    crate::error::RuntimeError::Tool(format!(
+                        "Failed to load session '{}': {}",
+                        id, e
+                    ))
                 })?,
                 None => latest_session().map_err(|e| {
                     crate::error::RuntimeError::Tool(format!("No sessions to continue: {}", e))
@@ -294,7 +307,11 @@ fn resolve_or_create_session(
             })
         }
         None => {
-            let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
+            let session = Session::new(
+                runtime.model(),
+                runtime.thinking_level(),
+                runtime.system_prompt(),
+            );
             Ok(SessionBootResult {
                 session,
                 api_messages: Vec::new(),

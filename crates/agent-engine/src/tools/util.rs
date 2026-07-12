@@ -18,7 +18,9 @@ pub(crate) fn strip_ansi(s: &str) -> String {
                     // CSI: consume until a letter (0x40-0x7E)
                     while let Some(&c) = chars.peek() {
                         chars.next();
-                        if c.is_ascii_alphabetic() || c == '~' || c == '@' { break; }
+                        if c.is_ascii_alphabetic() || c == '~' || c == '@' {
+                            break;
+                        }
                     }
                 }
                 Some(']') => {
@@ -26,14 +28,20 @@ pub(crate) fn strip_ansi(s: &str) -> String {
                     // OSC: consume until BEL (\x07) or ST (\x1b\\)
                     while let Some(&c) = chars.peek() {
                         chars.next();
-                        if c == '\x07' { break; }
+                        if c == '\x07' {
+                            break;
+                        }
                         if c == '\x1b' {
-                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
                             break;
                         }
                     }
                 }
-                Some(_) => { chars.next(); } // simple two-char escape
+                Some(_) => {
+                    chars.next();
+                } // simple two-char escape
                 None => {}
             }
         } else {

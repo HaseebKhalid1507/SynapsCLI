@@ -160,7 +160,10 @@ impl ApiMethods {
             (a.auth_token.clone(), a.auth_type.clone())
         };
         let (name, value) = if auth_type == "oauth" {
-            ("authorization".to_string(), format!("Bearer {}", auth_token))
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", auth_token),
+            )
         } else {
             ("x-api-key".to_string(), auth_token)
         };
@@ -204,7 +207,10 @@ mod beta_header_tests {
     use crate::core::config::CacheTtl;
 
     fn opts(ttl: CacheTtl) -> ApiOptions {
-        ApiOptions { cache_ttl: ttl, ..Default::default() }
+        ApiOptions {
+            cache_ttl: ttl,
+            ..Default::default()
+        }
     }
 
     const MODEL: &str = "claude-sonnet-4-6";
@@ -212,7 +218,10 @@ mod beta_header_tests {
     #[test]
     fn api_key_5m_emits_no_header() {
         // DEFAULT MUST BE INVISIBLE: no header where there was none before.
-        assert_eq!(ApiMethods::build_beta_header("api_key", &opts(CacheTtl::FiveMinutes), MODEL), None);
+        assert_eq!(
+            ApiMethods::build_beta_header("api_key", &opts(CacheTtl::FiveMinutes), MODEL),
+            None
+        );
     }
 
     #[test]

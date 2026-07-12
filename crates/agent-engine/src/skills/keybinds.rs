@@ -72,7 +72,9 @@ pub struct KeybindRegistry {
 }
 
 impl Default for KeybindRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeybindRegistry {
@@ -135,12 +137,22 @@ impl KeybindRegistry {
     }
 
     /// Register keybinds from a plugin manifest.
-    pub fn register_plugin(&mut self, plugin_name: &str, keybinds: &[ManifestKeybind], plugin_dir: &std::path::Path) {
+    pub fn register_plugin(
+        &mut self,
+        plugin_name: &str,
+        keybinds: &[ManifestKeybind],
+        plugin_dir: &std::path::Path,
+    ) {
         for kb in keybinds {
             let combo = match parse_key(&kb.key) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("plugin '{}': invalid keybind '{}': {}", plugin_name, kb.key, e);
+                    tracing::warn!(
+                        "plugin '{}': invalid keybind '{}': {}",
+                        plugin_name,
+                        kb.key,
+                        e
+                    );
                     self.collisions.push(KeybindCollision {
                         losing_plugin: plugin_name.to_string(),
                         key: kb.key.clone(),
@@ -153,7 +165,11 @@ impl KeybindRegistry {
 
             // Skip if reserved (core)
             if self.reserved.contains(&combo) {
-                tracing::warn!("plugin '{}': keybind '{}' conflicts with core — skipped", plugin_name, kb.key);
+                tracing::warn!(
+                    "plugin '{}': keybind '{}' conflicts with core — skipped",
+                    plugin_name,
+                    kb.key
+                );
                 self.collisions.push(KeybindCollision {
                     losing_plugin: plugin_name.to_string(),
                     key: kb.key.clone(),
@@ -174,7 +190,11 @@ impl KeybindRegistry {
                     KeybindSource::User => "user".to_string(),
                     KeybindSource::Core => "core".to_string(),
                 };
-                tracing::warn!("plugin '{}': keybind '{}' already registered — skipped", plugin_name, kb.key);
+                tracing::warn!(
+                    "plugin '{}': keybind '{}' already registered — skipped",
+                    plugin_name,
+                    kb.key
+                );
                 self.collisions.push(KeybindCollision {
                     losing_plugin: plugin_name.to_string(),
                     key: kb.key.clone(),
@@ -188,9 +208,7 @@ impl KeybindRegistry {
                 "slash_command" => {
                     KeybindAction::SlashCommand(kb.command.clone().unwrap_or_default())
                 }
-                "load_skill" => {
-                    KeybindAction::LoadSkill(kb.skill.clone().unwrap_or_default())
-                }
+                "load_skill" => KeybindAction::LoadSkill(kb.skill.clone().unwrap_or_default()),
                 "inject_prompt" => {
                     KeybindAction::InjectPrompt(kb.prompt.clone().unwrap_or_default())
                 }
@@ -199,7 +217,11 @@ impl KeybindRegistry {
                     plugin_dir: plugin_dir.to_path_buf(),
                 },
                 other => {
-                    tracing::warn!("plugin '{}': unknown keybind action '{}'", plugin_name, other);
+                    tracing::warn!(
+                        "plugin '{}': unknown keybind action '{}'",
+                        plugin_name,
+                        other
+                    );
                     continue;
                 }
             };
@@ -231,7 +253,8 @@ impl KeybindRegistry {
             }
 
             // Remove any existing plugin bind for this key
-            self.binds.retain(|b| b.key != combo || b.source == KeybindSource::Core);
+            self.binds
+                .retain(|b| b.key != combo || b.source == KeybindSource::Core);
 
             let action = if value == "disabled" {
                 KeybindAction::Disabled
@@ -257,19 +280,26 @@ impl KeybindRegistry {
     /// slash command, then registers `new_key → /slash_command` as a User
     /// bind. Used by /settings to hot-swap the sidecar toggle key without
     /// requiring a restart.
-    pub fn set_slash_command_key(&mut self, slash_command: &str, new_key: &str) -> Result<(), String> {
+    pub fn set_slash_command_key(
+        &mut self,
+        slash_command: &str,
+        new_key: &str,
+    ) -> Result<(), String> {
         let combo = parse_key(new_key)?;
         if self.reserved.contains(&combo) {
             return Err(format!("'{}' is reserved by core — cannot rebind", new_key));
         }
         // Drop any existing bind for this exact command (any source ≠ Core).
         self.binds.retain(|b| {
-            if b.source == KeybindSource::Core { return true; }
+            if b.source == KeybindSource::Core {
+                return true;
+            }
             !matches!(&b.action, KeybindAction::SlashCommand(c) if c == slash_command)
         });
         // Drop any existing non-core bind sitting on the new key (avoid
         // collision with another plugin bind).
-        self.binds.retain(|b| b.key != combo || b.source == KeybindSource::Core);
+        self.binds
+            .retain(|b| b.key != combo || b.source == KeybindSource::Core);
         self.binds.push(Keybind {
             key: combo,
             action: KeybindAction::SlashCommand(slash_command.to_string()),
@@ -289,7 +319,9 @@ impl KeybindRegistry {
             return None;
         }
 
-        self.binds.iter().find(|b| b.key == combo && !matches!(b.source, KeybindSource::Core))
+        self.binds
+            .iter()
+            .find(|b| b.key == combo && !matches!(b.source, KeybindSource::Core))
     }
 
     /// All registered keybinds (for display in /keybinds and settings).
@@ -299,7 +331,10 @@ impl KeybindRegistry {
 
     /// Non-core keybinds only (plugin + user).
     pub fn custom_binds(&self) -> Vec<&Keybind> {
-        self.binds.iter().filter(|b| !matches!(b.source, KeybindSource::Core)).collect()
+        self.binds
+            .iter()
+            .filter(|b| !matches!(b.source, KeybindSource::Core))
+            .collect()
     }
 }
 
@@ -348,7 +383,12 @@ pub fn parse_key(notation: &str) -> Result<KeyCombo, String> {
             "C" => modifiers |= KeyModifiers::CONTROL,
             "S" => modifiers |= KeyModifiers::SHIFT,
             "A" => modifiers |= KeyModifiers::ALT,
-            other => return Err(format!("unknown modifier: '{}' (expected C, S, or A)", other)),
+            other => {
+                return Err(format!(
+                    "unknown modifier: '{}' (expected C, S, or A)",
+                    other
+                ))
+            }
         }
     }
 
@@ -359,7 +399,9 @@ pub fn parse_key(notation: &str) -> Result<KeyCombo, String> {
             KeyCode::Char(ch.to_ascii_lowercase())
         }
         k if k.starts_with('F') && k.len() <= 3 => {
-            let n: u8 = k[1..].parse().map_err(|_| format!("invalid F-key: '{}'", k))?;
+            let n: u8 = k[1..]
+                .parse()
+                .map_err(|_| format!("invalid F-key: '{}'", k))?;
             if !(1..=12).contains(&n) {
                 return Err(format!("F-key out of range: F{} (expected F1–F12)", n));
             }
@@ -379,7 +421,7 @@ pub fn parse_key(notation: &str) -> Result<KeyCombo, String> {
         "Down" => KeyCode::Down,
         "Left" => KeyCode::Left,
         "Right" => KeyCode::Right,
-        other => return Err(format!("unknown key: '{}'" , other)),
+        other => return Err(format!("unknown key: '{}'", other)),
     };
 
     Ok(KeyCombo { code, modifiers })
@@ -554,21 +596,32 @@ mod tests {
     fn core_binds_are_reserved() {
         let reg = KeybindRegistry::new();
         // Ctrl+C should not match (it's core)
-        assert!(reg.match_key(KeyCode::Char('c'), KeyModifiers::CONTROL).is_none());
+        assert!(reg
+            .match_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .is_none());
     }
 
     #[test]
     fn plugin_bind_matches() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("test", &[ManifestKeybind {
-            key: "C-S-s".to_string(),
-            action: "slash_command".to_string(),
-            command: Some("scholar".to_string()),
-            skill: None, prompt: None, script: None,
-            description: Some("Search papers".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "test",
+            &[ManifestKeybind {
+                key: "C-S-s".to_string(),
+                action: "slash_command".to_string(),
+                command: Some("scholar".to_string()),
+                skill: None,
+                prompt: None,
+                script: None,
+                description: Some("Search papers".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
-        let result = reg.match_key(KeyCode::Char('s'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let result = reg.match_key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().description, "Search papers");
     }
@@ -576,29 +629,42 @@ mod tests {
     #[test]
     fn plugin_cannot_override_core() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("evil", &[ManifestKeybind {
-            key: "C-c".to_string(),
-            action: "inject_prompt".to_string(),
-            command: None, skill: None,
-            prompt: Some("hacked".to_string()),
-            script: None,
-            description: Some("evil".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "evil",
+            &[ManifestKeybind {
+                key: "C-c".to_string(),
+                action: "inject_prompt".to_string(),
+                command: None,
+                skill: None,
+                prompt: Some("hacked".to_string()),
+                script: None,
+                description: Some("evil".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
         // Ctrl+C should still not match (core)
-        assert!(reg.match_key(KeyCode::Char('c'), KeyModifiers::CONTROL).is_none());
+        assert!(reg
+            .match_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .is_none());
     }
 
     #[test]
     fn user_overrides_plugin() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("test", &[ManifestKeybind {
-            key: "F5".to_string(),
-            action: "slash_command".to_string(),
-            command: Some("scholar".to_string()),
-            skill: None, prompt: None, script: None,
-            description: Some("Scholar".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "test",
+            &[ManifestKeybind {
+                key: "F5".to_string(),
+                action: "slash_command".to_string(),
+                command: Some("scholar".to_string()),
+                skill: None,
+                prompt: None,
+                script: None,
+                description: Some("Scholar".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("F5".to_string(), "/compact".to_string());
@@ -612,13 +678,19 @@ mod tests {
     #[test]
     fn user_can_disable_bind() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("test", &[ManifestKeybind {
-            key: "F5".to_string(),
-            action: "slash_command".to_string(),
-            command: Some("scholar".to_string()),
-            skill: None, prompt: None, script: None,
-            description: Some("Scholar".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "test",
+            &[ManifestKeybind {
+                key: "F5".to_string(),
+                action: "slash_command".to_string(),
+                command: Some("scholar".to_string()),
+                skill: None,
+                prompt: None,
+                script: None,
+                description: Some("Scholar".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("F5".to_string(), "disabled".to_string());
@@ -632,21 +704,33 @@ mod tests {
     #[test]
     fn duplicate_plugin_binds_first_wins() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("first", &[ManifestKeybind {
-            key: "F5".to_string(),
-            action: "slash_command".to_string(),
-            command: Some("first".to_string()),
-            skill: None, prompt: None, script: None,
-            description: Some("First".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "first",
+            &[ManifestKeybind {
+                key: "F5".to_string(),
+                action: "slash_command".to_string(),
+                command: Some("first".to_string()),
+                skill: None,
+                prompt: None,
+                script: None,
+                description: Some("First".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
-        reg.register_plugin("second", &[ManifestKeybind {
-            key: "F5".to_string(),
-            action: "slash_command".to_string(),
-            command: Some("second".to_string()),
-            skill: None, prompt: None, script: None,
-            description: Some("Second".to_string()),
-        }], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "second",
+            &[ManifestKeybind {
+                key: "F5".to_string(),
+                action: "slash_command".to_string(),
+                command: Some("second".to_string()),
+                skill: None,
+                prompt: None,
+                script: None,
+                description: Some("Second".to_string()),
+            }],
+            std::path::Path::new("/tmp"),
+        );
 
         let result = reg.match_key(KeyCode::F(5), KeyModifiers::NONE);
         assert!(result.is_some());
@@ -676,7 +760,9 @@ mod tests {
         assert!(reg.match_key(f8.code, f8.modifiers).is_none());
         // C-G now does
         let cg = parse_key("C-G").unwrap();
-        let bind = reg.match_key(cg.code, cg.modifiers).expect("C-G bind missing");
+        let bind = reg
+            .match_key(cg.code, cg.modifiers)
+            .expect("C-G bind missing");
         assert!(matches!(&bind.action, KeybindAction::SlashCommand(c) if c == "sidecar toggle"));
     }
 
@@ -684,8 +770,13 @@ mod tests {
     fn set_slash_command_key_rejects_core_chord() {
         let mut reg = KeybindRegistry::new();
         // Esc is reserved core
-        let err = reg.set_slash_command_key("sidecar toggle", "Esc").unwrap_err();
-        assert!(err.contains("reserved"), "expected reserved error, got: {err}");
+        let err = reg
+            .set_slash_command_key("sidecar toggle", "Esc")
+            .unwrap_err();
+        assert!(
+            err.contains("reserved"),
+            "expected reserved error, got: {err}"
+        );
     }
 
     // ── collision recording (Phase 8 slice 8B.2) ──
@@ -706,7 +797,11 @@ mod tests {
     fn register_plugin_records_core_collision() {
         let mut reg = KeybindRegistry::new();
         // C-c is reserved by core (Quit).
-        reg.register_plugin("evil", &[mk_kb("C-c", "hack")], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "evil",
+            &[mk_kb("C-c", "hack")],
+            std::path::Path::new("/tmp"),
+        );
         assert_eq!(reg.collisions().len(), 1);
         let c = &reg.collisions()[0];
         assert_eq!(c.losing_plugin, "evil");
@@ -719,8 +814,16 @@ mod tests {
     fn register_plugin_records_plugin_vs_plugin_collision() {
         let mut reg = KeybindRegistry::new();
         // C-Space is not reserved by core.
-        reg.register_plugin("A", &[mk_kb("C-Space", "alpha")], std::path::Path::new("/tmp"));
-        reg.register_plugin("B", &[mk_kb("C-Space", "beta")], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "A",
+            &[mk_kb("C-Space", "alpha")],
+            std::path::Path::new("/tmp"),
+        );
+        reg.register_plugin(
+            "B",
+            &[mk_kb("C-Space", "beta")],
+            std::path::Path::new("/tmp"),
+        );
         assert_eq!(reg.collisions().len(), 1);
         let c = &reg.collisions()[0];
         assert_eq!(c.losing_plugin, "B");
@@ -757,10 +860,22 @@ mod tests {
     #[test]
     fn multiple_collisions_are_all_recorded() {
         let mut reg = KeybindRegistry::new();
-        reg.register_plugin("A", &[mk_kb("C-Space", "alpha")], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "A",
+            &[mk_kb("C-Space", "alpha")],
+            std::path::Path::new("/tmp"),
+        );
         // Two more plugins each colliding on the same key.
-        reg.register_plugin("B", &[mk_kb("C-Space", "beta")], std::path::Path::new("/tmp"));
-        reg.register_plugin("C", &[mk_kb("C-Space", "gamma")], std::path::Path::new("/tmp"));
+        reg.register_plugin(
+            "B",
+            &[mk_kb("C-Space", "beta")],
+            std::path::Path::new("/tmp"),
+        );
+        reg.register_plugin(
+            "C",
+            &[mk_kb("C-Space", "gamma")],
+            std::path::Path::new("/tmp"),
+        );
         assert_eq!(reg.collisions().len(), 2);
         assert_eq!(reg.collisions()[0].losing_plugin, "B");
         assert_eq!(reg.collisions()[1].losing_plugin, "C");

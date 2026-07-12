@@ -167,11 +167,36 @@ pub const COPILOT_FALLBACK_MODELS: &[CopilotModelDescriptor] = &[
         vendor: "Azure OpenAI",
         selected_wire: CopilotWire::Responses,
     },
-    CopilotModelDescriptor { id: "gpt-5.5", label: "GPT-5.5", vendor: "OpenAI", selected_wire: CopilotWire::Responses },
-    CopilotModelDescriptor { id: "claude-fable-5", label: "Claude Fable 5", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
-    CopilotModelDescriptor { id: "claude-opus-4.7", label: "Claude Opus 4.7", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
-    CopilotModelDescriptor { id: "claude-opus-4.8", label: "Claude Opus 4.8", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
-    CopilotModelDescriptor { id: "claude-opus-4.8-fast", label: "Claude Opus 4.8 (fast mode)", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
+    CopilotModelDescriptor {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+        vendor: "OpenAI",
+        selected_wire: CopilotWire::Responses,
+    },
+    CopilotModelDescriptor {
+        id: "claude-fable-5",
+        label: "Claude Fable 5",
+        vendor: "Anthropic",
+        selected_wire: CopilotWire::ChatCompletions,
+    },
+    CopilotModelDescriptor {
+        id: "claude-opus-4.7",
+        label: "Claude Opus 4.7",
+        vendor: "Anthropic",
+        selected_wire: CopilotWire::ChatCompletions,
+    },
+    CopilotModelDescriptor {
+        id: "claude-opus-4.8",
+        label: "Claude Opus 4.8",
+        vendor: "Anthropic",
+        selected_wire: CopilotWire::ChatCompletions,
+    },
+    CopilotModelDescriptor {
+        id: "claude-opus-4.8-fast",
+        label: "Claude Opus 4.8 (fast mode)",
+        vendor: "Anthropic",
+        selected_wire: CopilotWire::ChatCompletions,
+    },
     CopilotModelDescriptor {
         id: "claude-sonnet-4.6",
         label: "Claude Sonnet 4.6",
@@ -251,7 +276,9 @@ pub fn preferred_wire_protocol_from_endpoints(
     endpoints: &[CopilotEndpoint],
 ) -> Option<crate::runtime::openai::WireProtocol> {
     use crate::runtime::openai::WireProtocol;
-    let has_responses = endpoints.iter().any(|e| matches!(e, CopilotEndpoint::Responses));
+    let has_responses = endpoints
+        .iter()
+        .any(|e| matches!(e, CopilotEndpoint::Responses));
     let has_chat = endpoints
         .iter()
         .any(|e| matches!(e, CopilotEndpoint::ChatCompletions));
@@ -674,8 +701,11 @@ mod tests {
             "claude-haiku-4.5",
             "gemini-3.1-pro-preview",
             "gemini-3.5-flash",
-            "claude-fable-5", "claude-opus-4.7", "claude-opus-4.8",
-            "claude-opus-4.8-fast", "gpt-5.5",
+            "claude-fable-5",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-opus-4.8-fast",
+            "gpt-5.5",
         ] {
             assert!(ids.contains(expected), "missing {expected}");
         }
@@ -747,7 +777,10 @@ mod tests {
         assert_eq!(
             preferred_wire_protocol_from_endpoints(
                 Some("Anthropic"),
-                &[CopilotEndpoint::V1Messages, CopilotEndpoint::ChatCompletions]
+                &[
+                    CopilotEndpoint::V1Messages,
+                    CopilotEndpoint::ChatCompletions
+                ]
             ),
             Some(WireProtocol::OpenAiChatCompletions)
         );
@@ -769,10 +802,7 @@ mod tests {
         );
         // ws:/responses alone → fail closed regardless of vendor.
         assert_eq!(
-            preferred_wire_protocol_from_endpoints(
-                Some("OpenAI"),
-                &[CopilotEndpoint::WsResponses]
-            ),
+            preferred_wire_protocol_from_endpoints(Some("OpenAI"), &[CopilotEndpoint::WsResponses]),
             None
         );
         // Empty list → None.

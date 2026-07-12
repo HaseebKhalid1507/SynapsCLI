@@ -17,9 +17,9 @@ mod auth;
 #[cfg(test)]
 mod body_golden;
 pub mod compaction;
-pub(crate) mod helpers;
 pub mod google_gemini;
 pub mod google_vertex;
+pub(crate) mod helpers;
 pub mod openai;
 mod request;
 mod sse;
@@ -1124,7 +1124,10 @@ mod tests {
     #[test]
     fn set_model_preserves_qualified_provider_ids_and_bare_claude() {
         let cases = [
-            ("github-copilot/claude-opus-4.8", "github-copilot/claude-opus-4.8"),
+            (
+                "github-copilot/claude-opus-4.8",
+                "github-copilot/claude-opus-4.8",
+            ),
             ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
             ("google/gemini-2.5-pro", "google/gemini-2.5-pro"),
             ("openai/gpt-5", "openai/gpt-5"),
@@ -1142,8 +1145,14 @@ mod tests {
     fn set_model_strips_only_legacy_health_status_decoration() {
         let cases = [
             ("✅  339ms  groq/llama-3.3-70b", "groq/llama-3.3-70b"),
-            ("✅  339ms  github-copilot/claude-opus-4.8", "github-copilot/claude-opus-4.8"),
-            ("⚠️  1200ms  anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+            (
+                "✅  339ms  github-copilot/claude-opus-4.8",
+                "github-copilot/claude-opus-4.8",
+            ),
+            (
+                "⚠️  1200ms  anthropic/claude-sonnet-4-6",
+                "anthropic/claude-sonnet-4-6",
+            ),
         ];
 
         for (input, expected) in cases {

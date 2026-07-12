@@ -18,16 +18,20 @@ struct NvidiaModelItem {
 
 fn infer_nvidia_context_tokens(model_id: &str) -> Option<u64> {
     let id = model_id.to_ascii_lowercase();
-    if id.contains("kimi-k2-thinking") { Some(256_000) }
-    else if id.contains("nemotron-ultra")
+    if id.contains("kimi-k2-thinking") {
+        Some(256_000)
+    } else if id.contains("nemotron-ultra")
         || id.contains("nemotron-super")
         || id.contains("qwen3-next")
         || id.contains("deepseek-v3.1")
         || id.contains("llama-3.1-405b")
         || id.contains("llama-3.2-90b-vision")
         || id.contains("mistral-large-2")
-    { Some(128_000) }
-    else { None }
+    {
+        Some(128_000)
+    } else {
+        None
+    }
 }
 
 pub fn infer_nvidia_reasoning(model_id: &str) -> ReasoningSupport {
@@ -61,7 +65,10 @@ pub fn parse_nvidia_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serd
             }
             let mut m = CatalogModel::new("nvidia", "NVIDIA NIM", id)?;
             m.provider_kind = CatalogProviderKind::NvidiaNim;
-            m.label = item.owned_by.as_ref().map(|owner| format!("{} — {}", m.id, owner));
+            m.label = item
+                .owned_by
+                .as_ref()
+                .map(|owner| format!("{} — {}", m.id, owner));
             m.context_tokens = infer_nvidia_context_tokens(&m.id);
             m.reasoning = infer_nvidia_reasoning(&m.id);
             m.source = if m.context_tokens.is_some() || m.reasoning != ReasoningSupport::None {

@@ -1,15 +1,17 @@
+use super::super::{resolve_agent_prompt, Tool, ToolContext, NEXT_SUBAGENT_ID};
+pub use crate::runtime::subagent::SubagentResult;
+use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentTool {
-    fn name(&self) -> &str { "subagent" }
+    fn name(&self) -> &str {
+        "subagent"
+    }
 
     fn description(&self) -> &str {
         "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
@@ -45,7 +47,8 @@ impl Tool for SubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let task = params["task"].as_str()
+        let task = params["task"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
@@ -64,17 +67,17 @@ impl Tool for SubagentTool {
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
         let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
+        let timeout_secs = params["timeout"]
+            .as_u64()
+            .unwrap_or(ctx.limits.subagent_timeout);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
-            (Some(name), _) => {
-                resolve_agent_prompt(name)
-                    .map_err(RuntimeError::Tool)?
-            }
+            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
             (None, Some(prompt)) => prompt.clone(),
             (None, None) => {
                 return Err(RuntimeError::Tool(
-                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither."
+                        .to_string(),
                 ));
             }
         };
@@ -84,7 +87,12 @@ impl Tool for SubagentTool {
         let task_preview: String = task.chars().take(80).collect();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
 
-        tracing::info!("Dispatching subagent '{}' (id={}) with model {}", label, subagent_id, model);
+        tracing::info!(
+            "Dispatching subagent '{}' (id={}) with model {}",
+            label,
+            subagent_id,
+            model
+        );
 
         if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentStart {
@@ -96,7 +104,8 @@ impl Tool for SubagentTool {
 
         let start_time = std::time::Instant::now();
 
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
+        let (result_tx, result_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
         let label_inner = label.clone();
         let model_inner = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
@@ -111,7 +120,8 @@ impl Tool for SubagentTool {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                        let _ =
+                            result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
                         return;
                     }
                 };
@@ -384,7 +394,14 @@ impl Tool for SubagentTool {
                     }));
                 }
                 let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
-                let _ = tokio::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e)).await;
+                let _ = tokio::fs::write(
+                    &log_path,
+                    format!(
+                        "# Subagent ERROR: {}\nTask: {}\nError: {}\n",
+                        label, task_preview, e
+                    ),
+                )
+                .await;
                 Ok(format!("[subagent:{} ERROR] {}", label, e))
             }
             Err(_) => {
@@ -396,12 +413,14 @@ impl Tool for SubagentTool {
                         duration_secs: elapsed,
                     }));
                 }
-                Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
+                Ok(format!(
+                    "[subagent:{} ERROR] Subagent task panicked or was dropped",
+                    label
+                ))
             }
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -435,6 +454,9 @@ mod tests {
         });
 
         let result = tool.execute(params, ctx).await;
-        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+        assert!(
+            result.is_ok(),
+            "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}"
+        );
     }
 }

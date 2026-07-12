@@ -17,7 +17,8 @@ pub fn is_safe_plugin_name(name: &str) -> bool {
     if name.contains("..") || name.contains('/') || name.contains('\\') {
         return false;
     }
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Convert a user-provided URL to the HTTPS URL that yields `marketplace.json`.
@@ -108,7 +109,9 @@ pub fn trust_host_for_source(source_url: &str) -> Result<String, String> {
     let (host_raw, path) = rest.split_once('/').ok_or("missing path in URL")?;
     let host = host_raw.strip_prefix("www.").unwrap_or(host_raw);
     let owner = path.split('/').next().ok_or("missing owner in URL")?;
-    if owner.is_empty() { return Err("missing owner in URL".into()); }
+    if owner.is_empty() {
+        return Err("missing owner in URL".into());
+    }
     Ok(format!("{}/{}", host, owner))
 }
 
@@ -121,7 +124,7 @@ pub fn is_trusted(source_url: &str, trusted_hosts: &[String]) -> bool {
 }
 
 use crate::skills::manifest::{MarketplaceManifest, MarketplacePluginEntry};
-use crate::skills::plugin_index::{PluginIndex, PluginIndexEntry, validate_plugin_index};
+use crate::skills::plugin_index::{validate_plugin_index, PluginIndex, PluginIndexEntry};
 
 pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
     if !is_safe_plugin_name(&m.name) {
@@ -146,7 +149,11 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
                 p.name
             ));
         }
-        let source = p.source.as_deref().or_else(|| p.index.as_ref().map(|idx| idx.repository.as_str())).ok_or_else(|| format!("plugin '{}' missing source", p.name))?;
+        let source = p
+            .source
+            .as_deref()
+            .or_else(|| p.index.as_ref().map(|idx| idx.repository.as_str()))
+            .ok_or_else(|| format!("plugin '{}' missing source", p.name))?;
         let s = source.trim();
         // Repo-relative source: "./<safe-name>" — a direct child subdir of
         // the marketplace repo. Claude Code marketplaces use this form.
@@ -188,7 +195,11 @@ fn validate_categories(categories: &[String]) -> Result<(), String> {
 }
 
 fn validate_category(category: &str) -> Result<(), String> {
-    if category.is_empty() || !category.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if category.is_empty()
+        || !category
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(format!("invalid marketplace category '{}'", category));
     }
     Ok(())
@@ -199,7 +210,12 @@ fn validate_keywords(label: &str, keywords: &[String]) -> Result<(), String> {
         return Err(format!("{} may contain at most 20 entries", label));
     }
     for keyword in keywords {
-        if keyword.is_empty() || keyword.len() > 40 || !keyword.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        if keyword.is_empty()
+            || keyword.len() > 40
+            || !keyword
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
             return Err(format!("invalid {} entry '{}'", label, keyword));
         }
     }
@@ -210,7 +226,10 @@ use std::time::Duration;
 
 pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
     if !url.starts_with("https://") {
-        return Err(format!("fetch_manifest requires https:// URL, got: {}", url));
+        return Err(format!(
+            "fetch_manifest requires https:// URL, got: {}",
+            url
+        ));
     }
     let body = fetch_raw(url).await?;
     parse_marketplace_or_plugin_index(&body)
@@ -223,8 +242,12 @@ pub fn parse_marketplace_or_plugin_index(body: &str) -> Result<MarketplaceManife
             Ok(m)
         }
         Err(marketplace_err) => {
-            let index: PluginIndex = serde_json::from_str(body)
-                .map_err(|index_err| format!("invalid marketplace/index JSON: marketplace: {}; plugin index: {}", marketplace_err, index_err))?;
+            let index: PluginIndex = serde_json::from_str(body).map_err(|index_err| {
+                format!(
+                    "invalid marketplace/index JSON: marketplace: {}; plugin index: {}",
+                    marketplace_err, index_err
+                )
+            })?;
             marketplace_from_plugin_index(index)
         }
     }
@@ -294,7 +317,10 @@ pub async fn fetch_raw(url: &str) -> Result<String, String> {
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest build: {}", e))?;
-    let resp = client.get(url).send().await
+    let resp = client
+        .get(url)
+        .send()
+        .await
         .map_err(|e| format!("failed to fetch: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
@@ -355,13 +381,19 @@ mod tests {
     #[test]
     fn normalize_github_url_with_git_suffix() {
         let out = normalize_marketplace_url("https://github.com/a/b.git").unwrap();
-        assert_eq!(out, "https://raw.githubusercontent.com/a/b/HEAD/.synaps-plugin/marketplace.json");
+        assert_eq!(
+            out,
+            "https://raw.githubusercontent.com/a/b/HEAD/.synaps-plugin/marketplace.json"
+        );
     }
 
     #[test]
     fn normalize_github_url_with_trailing_slash() {
         let out = normalize_marketplace_url("https://github.com/a/b/").unwrap();
-        assert_eq!(out, "https://raw.githubusercontent.com/a/b/HEAD/.synaps-plugin/marketplace.json");
+        assert_eq!(
+            out,
+            "https://raw.githubusercontent.com/a/b/HEAD/.synaps-plugin/marketplace.json"
+        );
     }
 
     #[test]
@@ -434,66 +466,87 @@ mod tests {
 
     #[test]
     fn validate_manifest_rejects_bad_marketplace_metadata() {
-        let m: MarketplaceManifest = serde_json::from_str(r#"{
+        let m: MarketplaceManifest = serde_json::from_str(
+            r#"{
             "name":"index",
             "categories":["Bad Category"],
             "keywords":["Local First"],
             "trust":{"homepage":"http://example.com"},
             "plugins":[{"name":"p","source":"https://example.com/p.json","category":"bad/category"}]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert!(validate_manifest(&m).is_err());
     }
 
     #[test]
     fn validate_manifest_accepts_https_sources() {
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[{"name":"p","source":"https://github.com/a/b.git"}]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(validate_manifest(&m).is_ok());
     }
 
     #[test]
     fn validate_manifest_accepts_relative_subdir_source() {
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[{"name":"p","source":"./web-tools-plugin"}]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(validate_manifest(&m).is_ok());
     }
 
     #[test]
     fn validate_manifest_rejects_parent_traversal_source() {
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[{"name":"p","source":"../elsewhere"}]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(validate_manifest(&m).is_err());
     }
 
     #[test]
     fn validate_manifest_rejects_nested_relative_source() {
         // "./a/b" is rejected: only a single-component subdir is allowed.
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[{"name":"p","source":"./a/b"}]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(validate_manifest(&m).is_err());
     }
 
     #[test]
     fn validate_manifest_rejects_http_source() {
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[{"name":"p","source":"http://x/y"}]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let err = validate_manifest(&m).unwrap_err();
         assert!(err.contains("https"));
     }
 
     #[test]
     fn validate_manifest_reports_first_bad_entry() {
-        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(
+            r#"
             {"name":"x","plugins":[
                 {"name":"ok","source":"https://github.com/a/b.git"},
                 {"name":"bad","source":"../escape"}
             ]}
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let err = validate_manifest(&m).unwrap_err();
         assert!(err.contains("'bad'"));
     }
@@ -597,10 +650,16 @@ mod tests {
         assert_eq!(plugin.name, "policy-bundle");
         assert_eq!(plugin.source.as_deref(), Some("./policy-bundle-plugin"));
         let index = plugin.index.as_ref().unwrap();
-        assert_eq!(index.repository, "https://github.com/example/synaps-skills.git");
+        assert_eq!(
+            index.repository,
+            "https://github.com/example/synaps-skills.git"
+        );
         assert_eq!(index.checksum.algorithm, "sha256");
         assert_eq!(index.capabilities.permissions, vec!["tools.intercept"]);
-        assert_eq!(index.trust.as_ref().unwrap().publisher.as_deref(), Some("Example"));
+        assert_eq!(
+            index.trust.as_ref().unwrap().publisher.as_deref(),
+            Some("Example")
+        );
     }
 
     #[tokio::test]
@@ -616,7 +675,8 @@ mod tests {
             let body = r#"{"name":"mk","plugins":[]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(), body
+                body.len(),
+                body
             );
             sock.write_all(resp.as_bytes()).await.unwrap();
         });

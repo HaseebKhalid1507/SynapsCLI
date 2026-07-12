@@ -427,7 +427,10 @@ mod tests {
         assert!(input[4]["content"].is_string());
         assert!(input[4]["content"].as_str() == Some("five"));
         // ...while the cleaned copy carries the marker.
-        assert_eq!(cleaned[4]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            cleaned[4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     /// Finding-1 freeze (S241 gate review): the OLD Vec-era sanitize used
@@ -442,8 +445,14 @@ mod tests {
         let before = serde_json::to_string(&msgs[0]).unwrap();
         sanitize_vals(&mut msgs);
         let after = serde_json::to_string(&msgs[0]).unwrap();
-        assert_eq!(before, after, "message without content key must pass through byte-identical");
-        assert!(msgs[0].get("content").is_none(), "content key must NOT be inserted");
+        assert_eq!(
+            before, after,
+            "message without content key must pass through byte-identical"
+        );
+        assert!(
+            msgs[0].get("content").is_none(),
+            "content key must NOT be inserted"
+        );
     }
 
     #[test]

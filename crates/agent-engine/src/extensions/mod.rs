@@ -14,22 +14,22 @@
 //!         └─ Process/JSON-RPC runtime ← phase 1
 //! ```
 
-pub mod hooks;
-pub mod permissions;
-pub mod manifest;
-pub mod runtime;
-pub mod manager;
-pub mod config;
-pub mod config_store;
-pub mod info;
-pub mod commands;
-pub mod settings_editor;
-pub mod tasks;
-pub mod widgets;
 pub mod active_tasks;
-pub mod loader;
-pub mod providers;
-pub mod trust;
 pub mod audit;
 pub mod capability;
+pub mod commands;
+pub mod config;
+pub mod config_store;
+pub mod hooks;
+pub mod info;
+pub mod loader;
+pub mod manager;
+pub mod manifest;
+pub mod permissions;
+pub mod providers;
+pub mod runtime;
+pub mod settings_editor;
+pub mod tasks;
+pub mod trust;
 pub mod validation;
+pub mod widgets;

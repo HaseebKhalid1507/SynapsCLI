@@ -243,7 +243,10 @@ mod tests {
         };
         let sidecar = discover_in(&[plugin]).expect("canonical field should be discovered");
         assert_eq!(sidecar.plugin_name, "modality-neutral");
-        assert_eq!(sidecar.binary, PathBuf::from("/opt/modality-neutral/bin/sidecar"));
+        assert_eq!(
+            sidecar.binary,
+            PathBuf::from("/opt/modality-neutral/bin/sidecar")
+        );
     }
 
     // ---- Phase 8 slice 8A: lifecycle propagation + discover_all -------------
@@ -292,7 +295,10 @@ mod tests {
     fn discovered_lifecycle_is_none_when_absent() {
         let plugins = vec![sidecar_plugin()];
         let s = discover_in(&plugins).unwrap();
-        assert!(s.lifecycle.is_none(), "no lifecycle declared → should be None");
+        assert!(
+            s.lifecycle.is_none(),
+            "no lifecycle declared → should be None"
+        );
     }
 
     #[test]

@@ -318,9 +318,7 @@ fn old_body_bytes(s: &Scenario) -> Vec<u8> {
         }
     }
 
-    if let Some(system) =
-        HelperMethods::build_system_blocks(s.auth_type, &s.system_prompt, s.ttl)
-    {
+    if let Some(system) = HelperMethods::build_system_blocks(s.auth_type, &s.system_prompt, s.ttl) {
         body["system"] = system;
     }
 

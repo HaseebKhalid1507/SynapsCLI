@@ -7,16 +7,18 @@
 //! Fails (non-fatally) if the subagent has already finished or the steering
 //! channel is unavailable — the caller receives a structured error payload.
 
-use serde_json::{json, Value};
-use crate::{Result, RuntimeError};
 use super::super::{Tool, ToolContext};
 use crate::runtime::subagent::SubagentStatus;
+use crate::{Result, RuntimeError};
+use serde_json::{json, Value};
 
 pub struct SubagentSteerTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentSteerTool {
-    fn name(&self) -> &str { "subagent_steer" }
+    fn name(&self) -> &str {
+        "subagent_steer"
+    }
 
     fn description(&self) -> &str {
         "Inject a guidance message into a running reactive subagent. Use this to \
@@ -45,27 +47,27 @@ impl Tool for SubagentSteerTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let handle_id = params["handle_id"].as_str()
+        let handle_id = params["handle_id"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let message = params["message"].as_str()
+        let message = params["message"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'message' parameter".to_string()))?
             .to_string();
 
         // ── Registry lookup ────────────────────────────────────────────────────
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
+        })?;
 
         let reg = registry.lock().unwrap();
 
-        let handle = reg.get(&handle_id)
-            .ok_or_else(|| RuntimeError::Tool(
-                format!("No subagent found with handle_id '{}'", handle_id)
-            ))?;
+        let handle = reg.get(&handle_id).ok_or_else(|| {
+            RuntimeError::Tool(format!("No subagent found with handle_id '{}'", handle_id))
+        })?;
 
         // ── Guard: only steer a running subagent ───────────────────────────────
 
@@ -77,7 +79,8 @@ impl Tool for SubagentSteerTool {
                     handle_id,
                     handle.status().as_str()
                 )
-            }).to_string());
+            })
+            .to_string());
         }
 
         // ── Send over steering channel ─────────────────────────────────────────
@@ -91,12 +94,14 @@ impl Tool for SubagentSteerTool {
             Err(e) => {
                 tracing::debug!(
                     "subagent_steer: steer failed for handle '{}': {}",
-                    handle_id, e
+                    handle_id,
+                    e
                 );
                 Ok(json!({
                     "acknowledged": false,
                     "error": e
-                }).to_string())
+                })
+                .to_string())
             }
         }
     }

@@ -80,10 +80,18 @@ pub struct PluginIndexTrust {
 
 pub fn validate_plugin_index(index: &PluginIndex) -> Result<(), String> {
     if index.schema_version != 1 {
-        return Err(format!("plugin index schema_version must be 1, got {}", index.schema_version));
+        return Err(format!(
+            "plugin index schema_version must be 1, got {}",
+            index.schema_version
+        ));
     }
     for (idx, plugin) in index.plugins.iter().enumerate() {
-        if plugin.id.is_empty() || !plugin.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        if plugin.id.is_empty()
+            || !plugin
+                .id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
             return Err(format!("plugins[{idx}].id must be lower-kebab-case"));
         }
         if plugin.name.trim().is_empty() {
@@ -95,14 +103,25 @@ pub fn validate_plugin_index(index: &PluginIndex) -> Result<(), String> {
         if plugin.description.trim().is_empty() {
             return Err(format!("plugins[{idx}].description is required"));
         }
-        if !(plugin.repository.starts_with("https://") || plugin.repository.starts_with("file://")) {
-            return Err(format!("plugins[{idx}].repository must be https:// or file://"));
+        if !(plugin.repository.starts_with("https://") || plugin.repository.starts_with("file://"))
+        {
+            return Err(format!(
+                "plugins[{idx}].repository must be https:// or file://"
+            ));
         }
         if plugin.checksum.algorithm != "sha256" {
             return Err(format!("plugins[{idx}].checksum.algorithm must be sha256"));
         }
-        if plugin.checksum.value.len() != 64 || !plugin.checksum.value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-            return Err(format!("plugins[{idx}].checksum.value must be 64 lowercase hex characters"));
+        if plugin.checksum.value.len() != 64
+            || !plugin
+                .checksum
+                .value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "plugins[{idx}].checksum.value must be 64 lowercase hex characters"
+            ));
         }
         if let Some(trust) = &plugin.trust {
             if let Some(homepage) = &trust.homepage {
@@ -113,10 +132,14 @@ pub fn validate_plugin_index(index: &PluginIndex) -> Result<(), String> {
         }
         for (provider_idx, provider) in plugin.capabilities.providers.iter().enumerate() {
             if provider.id.trim().is_empty() {
-                return Err(format!("plugins[{idx}].capabilities.providers[{provider_idx}].id is required"));
+                return Err(format!(
+                    "plugins[{idx}].capabilities.providers[{provider_idx}].id is required"
+                ));
             }
             if provider.id.contains(':') {
-                return Err(format!("plugins[{idx}].capabilities.providers[{provider_idx}].id must not contain ':'"));
+                return Err(format!(
+                    "plugins[{idx}].capabilities.providers[{provider_idx}].id must not contain ':'"
+                ));
             }
             for (model_idx, model) in provider.models.iter().enumerate() {
                 if model.trim().is_empty() || model.contains(':') {
@@ -173,27 +196,36 @@ mod tests {
         validate_plugin_index(&index).unwrap();
         assert_eq!(index.plugins[0].id, "session-memory");
         assert!(index.plugins[0].capabilities.has_extension);
-        assert_eq!(index.plugins[0].capabilities.permissions, vec!["session.lifecycle"]);
+        assert_eq!(
+            index.plugins[0].capabilities.permissions,
+            vec!["session.lifecycle"]
+        );
     }
 
     #[test]
     fn rejects_unsupported_schema_version() {
         let mut index: PluginIndex = serde_json::from_str(sample_index_json()).unwrap();
         index.schema_version = 2;
-        assert!(validate_plugin_index(&index).unwrap_err().contains("schema_version"));
+        assert!(validate_plugin_index(&index)
+            .unwrap_err()
+            .contains("schema_version"));
     }
 
     #[test]
     fn rejects_bad_checksum_algorithm() {
         let mut index: PluginIndex = serde_json::from_str(sample_index_json()).unwrap();
         index.plugins[0].checksum.algorithm = "md5".into();
-        assert!(validate_plugin_index(&index).unwrap_err().contains("checksum.algorithm"));
+        assert!(validate_plugin_index(&index)
+            .unwrap_err()
+            .contains("checksum.algorithm"));
     }
 
     #[test]
     fn rejects_bad_checksum_shape() {
         let mut index: PluginIndex = serde_json::from_str(sample_index_json()).unwrap();
         index.plugins[0].checksum.value = "abc123".into();
-        assert!(validate_plugin_index(&index).unwrap_err().contains("checksum.value"));
+        assert!(validate_plugin_index(&index)
+            .unwrap_err()
+            .contains("checksum.value"));
     }
 }

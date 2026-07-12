@@ -5,15 +5,15 @@
 //! messages with source metadata, allowing the agent to respond through
 //! the appropriate channel.
 
-pub mod types;
-pub mod queue;
 pub mod format;
 pub mod ingest;
-pub mod socket;
+pub mod queue;
 pub mod registry;
+pub mod socket;
+pub mod types;
 
-pub use types::{Event, EventSource, EventChannel, EventSender, EventContent, Severity};
-pub use queue::EventQueue;
 pub use format::format_event_for_agent;
 pub use ingest::watch_inbox;
+pub use queue::EventQueue;
 pub use registry::*;
+pub use types::{Event, EventChannel, EventContent, EventSender, EventSource, Severity};

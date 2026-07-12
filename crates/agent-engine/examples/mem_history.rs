@@ -51,7 +51,8 @@ fn rss_anon_kb() -> i64 {
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0
+        self.0 = self
+            .0
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         self.0
@@ -166,9 +167,15 @@ fn main() {
     assert!(
         serial_kb >= lo && serial_kb <= hi,
         "serialised size {} KB outside ±10% of {} KB target ({}–{} KB)",
-        serial_kb, target_kb, lo, hi
+        serial_kb,
+        target_kb,
+        lo,
+        hi
     );
-    println!("✔  Size assert passed: {} KB ∈ [{}–{}] KB\n", serial_kb, lo, hi);
+    println!(
+        "✔  Size assert passed: {} KB ∈ [{}–{}] KB\n",
+        serial_kb, lo, hi
+    );
 
     // Drop the serialised buffer — it was just for the size check.
     drop(serialised);
@@ -240,10 +247,7 @@ fn main() {
         ("4", "body[messages].to_vec() OAI path (C11)", delta4, cum4),
     ];
     for (stage, label, delta, cum) in &rows {
-        println!(
-            "{:<6}  {:<42}  {:>12}  {:>14}",
-            stage, label, delta, cum
-        );
+        println!("{:<6}  {:<42}  {:>12}  {:>14}", stage, label, delta, cum);
     }
     println!("{}", "─".repeat(80));
 
@@ -253,18 +257,12 @@ fn main() {
         let copies: f64 = 4.0;
         let per_copy_kb = cum4 as f64 / copies;
         let inflation = per_copy_kb / serial_kb as f64;
-        println!(
-            "RSS delta across all 4 live copies:   {} KB",
-            cum4
-        );
+        println!("RSS delta across all 4 live copies:   {} KB", cum4);
         println!(
             "Per-copy RSS cost (cum4 / 4):         {:.0} KB",
             per_copy_kb
         );
-        println!(
-            "Inflation factor (per-copy / serial): {:.2}×",
-            inflation
-        );
+        println!("Inflation factor (per-copy / serial): {:.2}×", inflation);
         println!("(scope doc measured 1.43 MB per copy = 2.1× — expect similar)");
     } else {
         println!("(RssAnon probing requires Linux /proc — not available on this platform)");
@@ -283,8 +281,7 @@ fn main() {
     // the slice; the wire-byte buffer exists in both worlds and is counted in
     // neither).
     println!("\n── SHARED pipeline (Arc<Value>, slices 2-5) ──\n");
-    let shared: Vec<std::sync::Arc<Value>> =
-        history.into_iter().map(std::sync::Arc::new).collect();
+    let shared: Vec<std::sync::Arc<Value>> = history.into_iter().map(std::sync::Arc::new).collect();
     let _ = black_box(shared.len());
     let s_base = rss_anon_kb();
 
@@ -306,10 +303,30 @@ fn main() {
     let sa4 = rss_anon_kb();
 
     let s_rows = [
-        ("1'", "shared.clone() → stream task", sa1 - sb1, sa1 - s_base),
-        ("2'", "to_vec() → cleaned_msgs (ptr bumps)", sa2 - sb2, sa2 - s_base),
-        ("3'", "RequestBody borrow (no tree rebuild)", sa3 - sb3, sa3 - s_base),
-        ("4'", "to_vec() OAI path (ptr bumps)", sa4 - sb4, sa4 - s_base),
+        (
+            "1'",
+            "shared.clone() → stream task",
+            sa1 - sb1,
+            sa1 - s_base,
+        ),
+        (
+            "2'",
+            "to_vec() → cleaned_msgs (ptr bumps)",
+            sa2 - sb2,
+            sa2 - s_base,
+        ),
+        (
+            "3'",
+            "RequestBody borrow (no tree rebuild)",
+            sa3 - sb3,
+            sa3 - s_base,
+        ),
+        (
+            "4'",
+            "to_vec() OAI path (ptr bumps)",
+            sa4 - sb4,
+            sa4 - s_base,
+        ),
     ];
     println!(
         "{:<6}  {:<42}  {:>12}  {:>14}",

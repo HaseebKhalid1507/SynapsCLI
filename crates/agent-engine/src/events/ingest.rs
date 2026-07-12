@@ -22,7 +22,11 @@ async fn process_file(path: &Path, queue: &EventQueue) {
     if path.extension().is_some_and(|e| e == "json") {
         if let Ok(meta) = tokio::fs::metadata(path).await {
             if meta.len() > 256 * 1024 {
-                tracing::warn!("inbox file too large ({}B), skipping: {}", meta.len(), path.display());
+                tracing::warn!(
+                    "inbox file too large ({}B), skipping: {}",
+                    meta.len(),
+                    path.display()
+                );
                 let _ = tokio::fs::rename(path, path.with_extension("json.oversized")).await;
                 return;
             }
@@ -30,10 +34,18 @@ async fn process_file(path: &Path, queue: &EventQueue) {
         match tokio::fs::read_to_string(path).await {
             Ok(content) => match serde_json::from_str::<Event>(&content) {
                 Ok(event) => {
-                    tracing::info!("Inbox event: {} from {}", event.id, event.source.source_type);
+                    tracing::info!(
+                        "Inbox event: {} from {}",
+                        event.id,
+                        event.source.source_type
+                    );
                     match queue.push(event) {
-                        Ok(()) => { let _ = tokio::fs::remove_file(path).await; }
-                        Err(e) => { tracing::warn!("Queue full, retry later: {}", e); }
+                        Ok(()) => {
+                            let _ = tokio::fs::remove_file(path).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Queue full, retry later: {}", e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -54,7 +66,11 @@ async fn scan_inbox(dir: &Path, queue: &EventQueue) {
     }
 }
 
-pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+pub async fn watch_inbox(
+    inbox_dir: PathBuf,
+    queue: Arc<EventQueue>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
     #[cfg(unix)]
     {
@@ -77,16 +93,14 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: A
     let inbox_clone = inbox_dir.clone();
     let _watcher_handle = tokio::task::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut _watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
-            tx,
-            notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("inotify unavailable: {}", e);
-                return;
-            }
-        };
+        let mut _watcher: notify::RecommendedWatcher =
+            match notify::RecommendedWatcher::new(tx, notify::Config::default()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("inotify unavailable: {}", e);
+                    return;
+                }
+            };
 
         if let Err(e) = _watcher.watch(&inbox_clone, notify::RecursiveMode::NonRecursive) {
             tracing::warn!("watch failed: {}", e);
@@ -145,7 +159,6 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: A
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,10 +178,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let event = Event::simple("test", "hello inbox", Some(Severity::High));
         let path = inbox.join("1.json");
-        tokio::fs::write(&path, serde_json::to_string(&event).unwrap()).await.unwrap();
+        tokio::fs::write(&path, serde_json::to_string(&event).unwrap())
+            .await
+            .unwrap();
 
         for _ in 0..30 {
-            if !queue.is_empty() { break; }
+            if !queue.is_empty() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -193,7 +210,9 @@ mod tests {
         tokio::fs::write(&path, "not json").await.unwrap();
         let err_path = inbox.join("bad.json.error");
         for _ in 0..30 {
-            if err_path.exists() { break; }
+            if err_path.exists() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

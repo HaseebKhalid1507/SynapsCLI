@@ -739,6 +739,93 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
+        // Cloud models always dispatch through the typed credential broker.
+        if let Some((provider_key, _)) = model.split_once('/') {
+            if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
+                use futures::StreamExt;
+                let broker = crate::auth::broker_from_source(
+                    &options.credential_source,
+                    &options.token_cache,
+                    client.clone(),
+                );
+                let mut normalized = Vec::new();
+                if let Some(system) = system_prompt.as_ref().filter(|s| !s.is_empty()) {
+                    normalized.push(crate::auth::cloud::BrokerMessage {
+                        role: crate::auth::cloud::MessageRole::System,
+                        content: system.clone(),
+                    });
+                }
+                for message in messages {
+                    let role = match message["role"].as_str().unwrap_or("user") {
+                        "assistant" => crate::auth::cloud::MessageRole::Assistant,
+                        "system" => crate::auth::cloud::MessageRole::System,
+                        "tool" => crate::auth::cloud::MessageRole::Tool,
+                        _ => crate::auth::cloud::MessageRole::User,
+                    };
+                    let content = message["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| message["content"].to_string());
+                    normalized.push(crate::auth::cloud::BrokerMessage { role, content });
+                }
+                let request = crate::auth::cloud::InvokeRequest {
+                    messages: normalized,
+                    tools: Vec::new(),
+                    stream: true,
+                    options: Default::default(),
+                };
+                let mut stream = broker
+                    .cloud_invoke(provider, provider.as_str(), model, request)
+                    .await
+                    .map_err(|e| RuntimeError::Config(e.to_string()))?;
+                let mut text = String::new();
+                while let Some(event) = tokio::select! { _ = cancel.cancelled() => return Err(RuntimeError::Config("cloud invocation cancelled".into())), event = stream.next() => event }
+                {
+                    match event.map_err(|e| RuntimeError::Config(e.to_string()))? {
+                        crate::auth::broker::CloudEvent::TextDelta { delta } => {
+                            text.push_str(&delta);
+                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                                crate::runtime::types::LlmEvent::Text(delta),
+                            ));
+                        }
+                        crate::auth::broker::CloudEvent::ToolArguments { id, name, delta } => {
+                            if let Some(name) = name {
+                                let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                                    crate::runtime::types::LlmEvent::ToolUseStart {
+                                        tool_name: name,
+                                        tool_id: id.clone(),
+                                    },
+                                ));
+                            }
+                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                                crate::runtime::types::LlmEvent::ToolUseDelta {
+                                    tool_id: id,
+                                    delta,
+                                },
+                            ));
+                        }
+                        crate::auth::broker::CloudEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                        } => {
+                            let _ = tx.send(crate::runtime::types::StreamEvent::Session(
+                                crate::runtime::types::SessionEvent::Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_input_tokens: 0,
+                                    cache_creation_input_tokens: 0,
+                                    cache_creation_5m: None,
+                                    cache_creation_1h: None,
+                                    model: Some(model.into()),
+                                },
+                            ));
+                        }
+                        crate::auth::broker::CloudEvent::Done => break,
+                    }
+                }
+                return Ok(serde_json::json!({"content":[{"type":"text","text":text}]}));
+            }
+        }
         // Route to OpenAI-compat provider if the model id resolves to one.
         let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
@@ -855,370 +942,414 @@ impl ApiMethods {
         let mut last_reset_hint: Option<String> = None;
         let mut non_429_attempts: u32 = 0; // shared server-error budget
         let mut refusal_attempts: u32 = 0; // refusal-retry budget (separate from error budget)
-        let mut attempt: u32 = 0;          // total attempts (for backoff calc)
+        let mut attempt: u32 = 0; // total attempts (for backoff calc)
 
         loop {
-        let response = {
-            #[allow(unused_assignments)]
-            let mut response = None;
+            let response = {
+                #[allow(unused_assignments)]
+                let mut response = None;
 
-            loop {
-                if attempt > 0 {
-                    // Sleep was already computed and stored in last_err context;
-                    // delay is recomputed here from the empty header map if we
-                    // came from a network error path (no headers available).
-                    // For header-aware delays we sleep in the error arm below.
-                    // Nothing to do here — sleep already happened.
-                }
+                loop {
+                    if attempt > 0 {
+                        // Sleep was already computed and stored in last_err context;
+                        // delay is recomputed here from the empty header map if we
+                        // came from a network error path (no headers available).
+                        // For header-aware delays we sleep in the error arm below.
+                        // Nothing to do here — sleep already happened.
+                    }
 
-                // Rebuild request (consumed on send)
-                let anthropic_base = options.anthropic_base_url.clone()
-                    .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
-                    .unwrap_or_else(|| "https://api.anthropic.com".into());
-                let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
-                let mut req = client
-                    .post(&anthropic_url)
-                    .header(auth_header_name.clone(), auth_header_value.clone())
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json");
-                // Build the anthropic-beta header. The 1M-context opt-in
-                // (`context-1m-2025-08-07`) is only added when the user
-                // explicitly requested 1M AND the model supports it. Without
-                // this opt-in, all models default to 200k mode — which is the
-                // documented "smarter" inference regime (see
-                // anthropic.com/engineering/effective-context-engineering).
-                if let Some(beta) = Self::build_beta_header(&auth_type, options, model) {
-                    req = req.header("anthropic-beta", beta);
-                }
+                    // Rebuild request (consumed on send)
+                    let anthropic_base = options
+                        .anthropic_base_url
+                        .clone()
+                        .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+                        .unwrap_or_else(|| "https://api.anthropic.com".into());
+                    let anthropic_url =
+                        format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+                    let mut req = client
+                        .post(&anthropic_url)
+                        .header(auth_header_name.clone(), auth_header_value.clone())
+                        .header("anthropic-version", "2023-06-01")
+                        .header("content-type", "application/json");
+                    // Build the anthropic-beta header. The 1M-context opt-in
+                    // (`context-1m-2025-08-07`) is only added when the user
+                    // explicitly requested 1M AND the model supports it. Without
+                    // this opt-in, all models default to 200k mode — which is the
+                    // documented "smarter" inference regime (see
+                    // anthropic.com/engineering/effective-context-engineering).
+                    if let Some(beta) = Self::build_beta_header(&auth_type, options, model) {
+                        req = req.header("anthropic-beta", beta);
+                    }
 
-                match req.body(body_bytes.clone()).send().await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            response = Some(resp);
-                            break;
-                        }
+                    match req.body(body_bytes.clone()).send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if status.is_success() {
+                                response = Some(resp);
+                                break;
+                            }
 
-                        // C1: a 401 with a Remote source means the broker token
-                        // was rejected (revoked, or rotated at the broker before
-                        // our cache thought it expired). Invalidate, refetch from
-                        // the broker, and retry ONCE with the fresh token.
-                        if status.as_u16() == 401
-                            && options.credential_source.is_remote()
-                            && !auth_retried
-                        {
-                            auth_retried = true;
-                            let _ = resp.text().await; // drain body
-                            options.token_cache.invalidate("anthropic");
+                            // C1: a 401 with a Remote source means the broker token
+                            // was rejected (revoked, or rotated at the broker before
+                            // our cache thought it expired). Invalidate, refetch from
+                            // the broker, and retry ONCE with the fresh token.
+                            if status.as_u16() == 401
+                                && options.credential_source.is_remote()
+                                && !auth_retried
                             {
-                                let mut g = auth.write().await;
-                                g.auth_token.clear();
-                                g.token_expires = None;
-                            }
-                            super::auth::AuthMethods::refresh_if_needed(
-                                std::sync::Arc::clone(auth),
-                                client,
-                                &options.credential_source,
-                                &options.token_cache,
-                            )
-                            .await?;
-                            let (n, v, _t) = Self::build_auth_header(auth).await;
-                            auth_header_name = n;
-                            auth_header_value = v;
-                            continue;
-                        }
-
-                        let is_429    = status.as_u16() == 429;
-                        let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-
-                        // Capture headers before consuming the body.
-                        let (delay, from_hdr) = telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
-                        let reset_hint = if from_hdr {
-                            Some(format!("{}s", delay.as_secs()))
-                        } else {
-                            None
-                        };
-
-                        let error_text = resp.text().await.unwrap_or_default();
-
-                        // Decide whether we've exhausted retries for this error class.
-                        let retry_exhausted = if is_429 {
-                            attempt >= MAX_429_RETRIES
-                        } else {
-                            non_429_attempts >= max_retries
-                        };
-
-                        if !is_retryable || retry_exhausted {
-                            let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                            return Err(RuntimeError::ApiStatus(
-                                crate::core::error::humanize_api_error_with_reset(
-                                    status.as_u16(),
-                                    &error_text,
-                                    hint,
+                                auth_retried = true;
+                                let _ = resp.text().await; // drain body
+                                options.token_cache.invalidate("anthropic");
+                                {
+                                    let mut g = auth.write().await;
+                                    g.auth_token.clear();
+                                    g.token_expires = None;
+                                }
+                                super::auth::AuthMethods::refresh_if_needed(
+                                    std::sync::Arc::clone(auth),
+                                    client,
+                                    &options.credential_source,
+                                    &options.token_cache,
                                 )
-                            ));
-                        }
-
-                        last_status = Some(status.as_u16());
-                        last_reset_hint = reset_hint.clone();
-                        last_err = format!("{}: {}", status, error_text);
-
-                        if !is_429 {
-                            non_429_attempts += 1;
-                        }
-
-                        // Emit user-visible notice with specific timing when known.
-                        let budget = if is_429 { MAX_429_RETRIES } else { max_retries };
-                        let retry_num = if is_429 { attempt + 1 } else { non_429_attempts };
-                        let notice = if is_429 {
-                            if let Some(ref hint) = reset_hint {
-                                format!("⚠ Rate limited — resuming in {} ({}/{})", hint, retry_num, budget)
-                            } else {
-                                format!("⚠ Rate limited — retrying ({}/{})", retry_num, budget)
+                                .await?;
+                                let (n, v, _t) = Self::build_auth_header(auth).await;
+                                auth_header_name = n;
+                                auth_header_value = v;
+                                continue;
                             }
-                        } else {
-                            format!("⏳ API error, retrying ({}/{})…", retry_num, budget)
-                        };
-                        tracing::warn!("API retry after {:?}: {} — {}", delay, notice, last_err);
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
 
-                        tokio::time::sleep(delay).await;
+                            let is_429 = status.as_u16() == 429;
+                            let is_retryable =
+                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
 
-                        if cancel.is_cancelled() {
-                            return Err(RuntimeError::Canceled);
+                            // Capture headers before consuming the body.
+                            let (delay, from_hdr) =
+                                telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
+                            let reset_hint = if from_hdr {
+                                Some(format!("{}s", delay.as_secs()))
+                            } else {
+                                None
+                            };
+
+                            let error_text = resp.text().await.unwrap_or_default();
+
+                            // Decide whether we've exhausted retries for this error class.
+                            let retry_exhausted = if is_429 {
+                                attempt >= MAX_429_RETRIES
+                            } else {
+                                non_429_attempts >= max_retries
+                            };
+
+                            if !is_retryable || retry_exhausted {
+                                let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
+                                return Err(RuntimeError::ApiStatus(
+                                    crate::core::error::humanize_api_error_with_reset(
+                                        status.as_u16(),
+                                        &error_text,
+                                        hint,
+                                    ),
+                                ));
+                            }
+
+                            last_status = Some(status.as_u16());
+                            last_reset_hint = reset_hint.clone();
+                            last_err = format!("{}: {}", status, error_text);
+
+                            if !is_429 {
+                                non_429_attempts += 1;
+                            }
+
+                            // Emit user-visible notice with specific timing when known.
+                            let budget = if is_429 { MAX_429_RETRIES } else { max_retries };
+                            let retry_num = if is_429 {
+                                attempt + 1
+                            } else {
+                                non_429_attempts
+                            };
+                            let notice = if is_429 {
+                                if let Some(ref hint) = reset_hint {
+                                    format!(
+                                        "⚠ Rate limited — resuming in {} ({}/{})",
+                                        hint, retry_num, budget
+                                    )
+                                } else {
+                                    format!("⚠ Rate limited — retrying ({}/{})", retry_num, budget)
+                                }
+                            } else {
+                                format!("⏳ API error, retrying ({}/{})…", retry_num, budget)
+                            };
+                            tracing::warn!(
+                                "API retry after {:?}: {} — {}",
+                                delay,
+                                notice,
+                                last_err
+                            );
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+
+                            tokio::time::sleep(delay).await;
+
+                            if cancel.is_cancelled() {
+                                return Err(RuntimeError::Canceled);
+                            }
+                        }
+                        Err(e) => {
+                            non_429_attempts += 1;
+                            if non_429_attempts > max_retries {
+                                return Err(RuntimeError::ApiStatus(
+                                    crate::core::error::humanize_network_error(&e),
+                                ));
+                            }
+                            last_err = e.to_string();
+                            last_status = None;
+                            // No headers on network error — plain exponential back-off.
+                            let delay = Duration::from_millis(
+                                1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                            );
+                            tracing::warn!(
+                                "API retry {}/{} after {:?}: {}",
+                                non_429_attempts,
+                                max_retries,
+                                delay,
+                                last_err
+                            );
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                                "⏳ API error, retrying ({}/{})…",
+                                non_429_attempts, max_retries
+                            ))));
+                            tokio::time::sleep(delay).await;
+                            if cancel.is_cancelled() {
+                                return Err(RuntimeError::Canceled);
+                            }
                         }
                     }
-                    Err(e) => {
-                        non_429_attempts += 1;
-                        if non_429_attempts > max_retries {
-                            return Err(RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)));
-                        }
-                        last_err = e.to_string();
-                        last_status = None;
-                        // No headers on network error — plain exponential back-off.
-                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
-                        tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                            format!("⏳ API error, retrying ({}/{})…", non_429_attempts, max_retries)
-                        )));
-                        tokio::time::sleep(delay).await;
-                        if cancel.is_cancelled() {
-                            return Err(RuntimeError::Canceled);
-                        }
-                    }
+
+                    attempt += 1;
                 }
 
-                attempt += 1;
-            }
+                response.ok_or_else(|| {
+                    let hint = last_reset_hint.as_deref();
+                    let status = last_status.unwrap_or(0);
+                    if status == 429 {
+                        RuntimeError::ApiStatus(crate::core::error::humanize_api_error_with_reset(
+                            429, &last_err, hint,
+                        ))
+                    } else {
+                        RuntimeError::Tool(format!("API failed after retries: {}", last_err))
+                    }
+                })?
+            };
 
-            response.ok_or_else(|| {
-                let hint = last_reset_hint.as_deref();
-                let status = last_status.unwrap_or(0);
-                if status == 429 {
-                    RuntimeError::ApiStatus(
-                        crate::core::error::humanize_api_error_with_reset(429, &last_err, hint)
-                    )
+            // ═══ TELEMETRY: capture headers before consuming the response body ═══
+            let request_start = std::time::Instant::now();
+            let telem_request_id = if telemetry_level.enabled() {
+                telemetry::request_id_from_headers(response.headers())
+            } else {
+                None
+            };
+            let telem_ratelimit = if telemetry_level == TelemetryLevel::Full {
+                let rl = telemetry::ratelimit_from_headers(response.headers());
+                if rl.is_empty() {
+                    None
                 } else {
-                    RuntimeError::Tool(format!("API failed after retries: {}", last_err))
+                    Some(rl)
                 }
-            })?
-        };
+            } else {
+                None
+            };
 
-        // ═══ TELEMETRY: capture headers before consuming the response body ═══
-        let request_start = std::time::Instant::now();
-        let telem_request_id = if telemetry_level.enabled() {
-            telemetry::request_id_from_headers(response.headers())
-        } else {
-            None
-        };
-        let telem_ratelimit = if telemetry_level == TelemetryLevel::Full {
-            let rl = telemetry::ratelimit_from_headers(response.headers());
-            if rl.is_empty() { None } else { Some(rl) }
-        } else {
-            None
-        };
+            let mut stream = response.bytes_stream();
+            tracing::debug!("Stream opened");
 
-        let mut stream = response.bytes_stream();
-        tracing::debug!("Stream opened");
+            let mut state = ParseState::new();
+            let ctx = EventCtx {
+                tx: &tx,
+                telemetry_level,
+                request_start,
+                cache_ttl: options.cache_ttl,
+                ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
+                saw_1h_honored: options.saw_1h_honored.clone(),
+                request_has_1h_marker,
+            };
 
-        let mut state = ParseState::new();
-        let ctx = EventCtx {
-            tx: &tx,
-            telemetry_level,
-            request_start,
-            cache_ttl: options.cache_ttl,
-            ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
-            saw_1h_honored: options.saw_1h_honored.clone(),
-            request_has_1h_marker,
-        };
+            // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
+            // buffer raw bytes and only parse complete lines. Zero-copy: lines are
+            // borrowed from the buffer, parsed in place (REVIEW.md P2).
+            let mut line_buffer = super::sse::SseLineBuffer::new();
 
-        // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
-        // buffer raw bytes and only parse complete lines. Zero-copy: lines are
-        // borrowed from the buffer, parsed in place (REVIEW.md P2).
-        let mut line_buffer = super::sse::SseLineBuffer::new();
-
-        while let Some(chunk) = stream.next().await {
-            if cancel.is_cancelled() {
-                break;
-            }
-            // A transport error mid-stream means connection loss. It's the same
-            // transient class as an HTTP 5xx or an in-stream overloaded_error, so
-            // route it through the unified retry budget instead of hard-failing
-            // the turn. Bill any start-captured usage first: the API already
-            // processed the input even if the stream died on us.
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_residual_usage(&mut state, &ctx);
-                    state.stream_error = Some(StreamError {
-                        message: crate::core::error::humanize_network_error(&e),
-                        retryable: true,
-                    });
+            while let Some(chunk) = stream.next().await {
+                if cancel.is_cancelled() {
                     break;
                 }
-            };
-            line_buffer.extend(&chunk);
-
-            // Process complete lines from the buffer (zero-copy borrows)
-            while let Some(line) = line_buffer.next_line() {
-                process_data_line(line, &mut state, &ctx);
-            }
-        }
-
-        // Process any remaining buffered data (final line without trailing
-        // newline) — same seam as the main loop, so all event types in a
-        // partial final line are handled.
-        let remaining = line_buffer.take_remaining().unwrap_or_default();
-        process_data_line(&remaining, &mut state, &ctx);
-
-        // Flush any partial block and return accumulated content
-        state.finalize();
-
-        // Dead-stream billing: if the stream terminated before message_delta
-        // (cancel, transport death mid-stream), emit the one Usage event from
-        // the message_start capture. No-op when the delta already emitted.
-        emit_residual_usage(&mut state, &ctx);
-
-        // Capture the failure signals BEFORE the telemetry block — it moves
-        // `state.telem_stop_reason` into the record when telemetry is enabled.
-        let stream_error = state.stream_error.take();
-        let has_stop_reason = state.stop_reason_seen;
-        let stop_reason_is_refusal = state.stop_reason_is_refusal;
-        let cancelled = cancel.is_cancelled();
-
-
-        // ═══ TELEMETRY: write the record ═══
-        if telemetry_level.enabled() {
-            // Build context record — what we sent
-            let breakpoints: Vec<usize> = cleaned_messages.iter().enumerate()
-                .filter(|(_, m)| {
-                    if let Some(arr) = m["content"].as_array() {
-                        arr.last().and_then(|b| b.get("cache_control")).is_some()
-                    } else {
-                        false
+                // A transport error mid-stream means connection loss. It's the same
+                // transient class as an HTTP 5xx or an in-stream overloaded_error, so
+                // route it through the unified retry budget instead of hard-failing
+                // the turn. Bill any start-captured usage first: the API already
+                // processed the input even if the stream died on us.
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        emit_residual_usage(&mut state, &ctx);
+                        state.stream_error = Some(StreamError {
+                            message: crate::core::error::humanize_network_error(&e),
+                            retryable: true,
+                        });
+                        break;
                     }
-                })
-                .map(|(i, _)| i)
-                .collect();
+                };
+                line_buffer.extend(&chunk);
 
-            let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-
-            let record = telemetry::TelemetryRecord {
-                ts: telemetry::TelemetryRecord::now_ms(),
-                request_id: telem_request_id,
-                msg_id: state.telem_msg_id,
-                model: model.to_string(),
-                attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
-                refusal_retries_used: if refusal_attempts > 0 { Some(refusal_attempts) } else { None },
-                ttft_ms: state.telem_ttft,
-                total_ms: request_start.elapsed().as_millis() as u64,
-                stop_reason: state.telem_stop_reason,
-                usage: state.telem_usage,
-                ratelimit: telem_ratelimit,
-                cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
-                context: telemetry::ContextRecord {
-                    messages: cleaned_messages.len(),
-                    tools: tools_schema.len(),
-                    system_bytes,
-                    breakpoints,
-                },
-            };
-            telemetry::write_record(&record);
-        }
-
-        match classify_stream_outcome(
-            stream_error,
-            std::mem::take(&mut state.accumulated_content),
-            has_stop_reason,
-            stop_reason_is_refusal,
-            cancelled,
-        ) {
-            StreamOutcome::Done(v) => return Ok(v),
-            StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
-            StreamOutcome::Retry(msg) => {
-                // Transient in-stream error (overloaded_error / api_error /
-                // rate_limit_error). Draws from the SAME shared server-error
-                // budget as HTTP 5xx — one unified retry policy, no budget
-                // multiplication across the send and stream phases.
-                if non_429_attempts >= max_retries || cancel.is_cancelled() {
-                    // Budget exhausted (or user cancelled) — surface terminally
-                    // rather than silently. Still loud, never the silent stop.
-                    return Err(RuntimeError::ApiStatus(msg));
+                // Process complete lines from the buffer (zero-copy borrows)
+                while let Some(line) = line_buffer.next_line() {
+                    process_data_line(line, &mut state, &ctx);
                 }
-                let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.min(6)));
-                non_429_attempts += 1;
-                attempt += 1;
-                last_err = msg.clone();
-                last_status = None;
-                tracing::warn!(
-                    "in-stream API error, retrying {}/{} after {:?}: {}",
-                    non_429_attempts, max_retries, delay, msg
-                );
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                    format!("⏳ API stream error — retrying ({}/{})…", non_429_attempts, max_retries),
-                )));
-                tokio::time::sleep(delay).await;
-                if cancel.is_cancelled() {
-                    return Err(RuntimeError::Canceled);
-                }
-                // fall through to the outer `loop` head: rebuild request + re-stream.
             }
-            StreamOutcome::Refusal => {
-                // Model declined the request (stop_reason=refusal). Partial
-                // content was already discarded by std::mem::take in classify.
-                // Check budget before sleeping so an immediate exhaustion is
-                // surfaced without a pointless delay.
-                if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
-                    let msg = format!(
-                        "⚠ model refused the request ({} attempt{})",
-                        refusal_attempts + 1,
-                        if refusal_attempts == 0 { "" } else { "s" }
+
+            // Process any remaining buffered data (final line without trailing
+            // newline) — same seam as the main loop, so all event types in a
+            // partial final line are handled.
+            let remaining = line_buffer.take_remaining().unwrap_or_default();
+            process_data_line(&remaining, &mut state, &ctx);
+
+            // Flush any partial block and return accumulated content
+            state.finalize();
+
+            // Dead-stream billing: if the stream terminated before message_delta
+            // (cancel, transport death mid-stream), emit the one Usage event from
+            // the message_start capture. No-op when the delta already emitted.
+            emit_residual_usage(&mut state, &ctx);
+
+            // Capture the failure signals BEFORE the telemetry block — it moves
+            // `state.telem_stop_reason` into the record when telemetry is enabled.
+            let stream_error = state.stream_error.take();
+            let has_stop_reason = state.stop_reason_seen;
+            let stop_reason_is_refusal = state.stop_reason_is_refusal;
+            let cancelled = cancel.is_cancelled();
+
+            // ═══ TELEMETRY: write the record ═══
+            if telemetry_level.enabled() {
+                // Build context record — what we sent
+                let breakpoints: Vec<usize> = cleaned_messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        if let Some(arr) = m["content"].as_array() {
+                            arr.last().and_then(|b| b.get("cache_control")).is_some()
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
+
+                let record = telemetry::TelemetryRecord {
+                    ts: telemetry::TelemetryRecord::now_ms(),
+                    request_id: telem_request_id,
+                    msg_id: state.telem_msg_id,
+                    model: model.to_string(),
+                    attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
+                    refusal_retries_used: if refusal_attempts > 0 {
+                        Some(refusal_attempts)
+                    } else {
+                        None
+                    },
+                    ttft_ms: state.telem_ttft,
+                    total_ms: request_start.elapsed().as_millis() as u64,
+                    stop_reason: state.telem_stop_reason,
+                    usage: state.telem_usage,
+                    ratelimit: telem_ratelimit,
+                    cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
+                    context: telemetry::ContextRecord {
+                        messages: cleaned_messages.len(),
+                        tools: tools_schema.len(),
+                        system_bytes,
+                        breakpoints,
+                    },
+                };
+                telemetry::write_record(&record);
+            }
+
+            match classify_stream_outcome(
+                stream_error,
+                std::mem::take(&mut state.accumulated_content),
+                has_stop_reason,
+                stop_reason_is_refusal,
+                cancelled,
+            ) {
+                StreamOutcome::Done(v) => return Ok(v),
+                StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
+                StreamOutcome::Retry(msg) => {
+                    // Transient in-stream error (overloaded_error / api_error /
+                    // rate_limit_error). Draws from the SAME shared server-error
+                    // budget as HTTP 5xx — one unified retry policy, no budget
+                    // multiplication across the send and stream phases.
+                    if non_429_attempts >= max_retries || cancel.is_cancelled() {
+                        // Budget exhausted (or user cancelled) — surface terminally
+                        // rather than silently. Still loud, never the silent stop.
+                        return Err(RuntimeError::ApiStatus(msg));
+                    }
+                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.min(6)));
+                    non_429_attempts += 1;
+                    attempt += 1;
+                    last_err = msg.clone();
+                    last_status = None;
+                    tracing::warn!(
+                        "in-stream API error, retrying {}/{} after {:?}: {}",
+                        non_429_attempts,
+                        max_retries,
+                        delay,
+                        msg
                     );
-                    // Surface visible inline notice to TUI (same channel as
-                    // rate-limit notices — renders as a turn-end inline message).
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(msg.clone())));
-                    // Hard-terminate so the turn never silently ends.
-                    return Err(RuntimeError::ApiStatus(msg));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                        "⏳ API stream error — retrying ({}/{})…",
+                        non_429_attempts, max_retries
+                    ))));
+                    tokio::time::sleep(delay).await;
+                    if cancel.is_cancelled() {
+                        return Err(RuntimeError::Canceled);
+                    }
+                    // fall through to the outer `loop` head: rebuild request + re-stream.
                 }
-                refusal_attempts += 1;
-                attempt += 1;
-                // Fixed 1s delay — refusals are not transient load, exponential
-                // backoff doesn't help. Separate budget from the error budget.
-                let delay = Duration::from_secs(1);
-                tracing::warn!(
-                    "stop_reason=refusal — retrying {}/{} after {:?}",
-                    refusal_attempts, refusal_retries, delay
-                );
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                    format!("⏳ model refusal — retrying ({}/{})…", refusal_attempts, refusal_retries),
-                )));
-                tokio::time::sleep(delay).await;
-                if cancel.is_cancelled() {
-                    return Err(RuntimeError::Canceled);
+                StreamOutcome::Refusal => {
+                    // Model declined the request (stop_reason=refusal). Partial
+                    // content was already discarded by std::mem::take in classify.
+                    // Check budget before sleeping so an immediate exhaustion is
+                    // surfaced without a pointless delay.
+                    if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                        let msg = format!(
+                            "⚠ model refused the request ({} attempt{})",
+                            refusal_attempts + 1,
+                            if refusal_attempts == 0 { "" } else { "s" }
+                        );
+                        // Surface visible inline notice to TUI (same channel as
+                        // rate-limit notices — renders as a turn-end inline message).
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(msg.clone())));
+                        // Hard-terminate so the turn never silently ends.
+                        return Err(RuntimeError::ApiStatus(msg));
+                    }
+                    refusal_attempts += 1;
+                    attempt += 1;
+                    // Fixed 1s delay — refusals are not transient load, exponential
+                    // backoff doesn't help. Separate budget from the error budget.
+                    let delay = Duration::from_secs(1);
+                    tracing::warn!(
+                        "stop_reason=refusal — retrying {}/{} after {:?}",
+                        refusal_attempts,
+                        refusal_retries,
+                        delay
+                    );
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                        "⏳ model refusal — retrying ({}/{})…",
+                        refusal_attempts, refusal_retries
+                    ))));
+                    tokio::time::sleep(delay).await;
+                    if cancel.is_cancelled() {
+                        return Err(RuntimeError::Canceled);
+                    }
+                    // fall through to outer `loop` head — fresh request, fresh ParseState
                 }
-                // fall through to outer `loop` head — fresh request, fresh ParseState
             }
-        }
         } // end UNIFIED RETRY LOOP (task #130)
     }
 }
@@ -2734,24 +2865,31 @@ mod on401_tests {
     async fn spawn_mock_anthropic(fail_count: usize) -> (String, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
-        let app = Router::new()
-            .route("/v1/messages", axum_post(move || {
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move || {
                 let counter = Arc::clone(&counter_clone);
                 async move {
                     let n = counter.fetch_add(1, Ordering::SeqCst);
                     if n < fail_count {
-                        (StatusCode::UNAUTHORIZED,
-                         [("content-type", "application/json")],
-                         "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}".to_string()
-                        ).into_response()
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"
+                                .to_string(),
+                        )
+                            .into_response()
                     } else {
-                        (StatusCode::OK,
-                         [("content-type", "text/event-stream")],
-                         SSE_SUCCESS.to_string()
-                        ).into_response()
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_SUCCESS.to_string(),
+                        )
+                            .into_response()
                     }
                 }
-            }));
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2809,17 +2947,18 @@ mod on401_tests {
         ApiMethods::call_api_stream(
             &auth,
             &client,
-            "claude-haiku-4-5",   // fast/cheap model name; routing check just does prefix match
+            "claude-haiku-4-5", // fast/cheap model name; routing check just does prefix match
             &tools,
-            &None,                 // system prompt
-            0,                     // thinking_budget
+            &None, // system prompt
+            0,     // thinking_budget
             &messages,
             tx,
-            0,                     // max_retries (surface errors fast)
-            0,                     // refusal_retries
+            0, // max_retries (surface errors fast)
+            0, // refusal_retries
             &options,
             TelemetryLevel::Off,
-        ).await
+        )
+        .await
     }
 
     // ─── T1: Happy path — first call 401, second call succeeds ───────────────
@@ -2836,11 +2975,14 @@ mod on401_tests {
         };
         // Pre-seed cache with the STALE token (the one that gets the 401)
         let cache = TokenCache::new();
-        cache.put("anthropic", crate::auth::BrokerToken {
-            access_token: "sk-stale".into(),
-            expires: 9_999_999_999_999,
-            ttl_ms: None,
-        });
+        cache.put(
+            "anthropic",
+            crate::auth::BrokerToken {
+                access_token: "sk-stale".into(),
+                expires: 9_999_999_999_999,
+                ttl_ms: None,
+            },
+        );
 
         let auth = auth_with_token("sk-stale");
         let options = make_options(anthropic_url, source, cache);
@@ -2875,11 +3017,14 @@ mod on401_tests {
             machine_token: "machine-tok".into(),
         };
         let cache = TokenCache::new();
-        cache.put("anthropic", crate::auth::BrokerToken {
-            access_token: "sk-stale".into(),
-            expires: 9_999_999_999_999,
-            ttl_ms: None,
-        });
+        cache.put(
+            "anthropic",
+            crate::auth::BrokerToken {
+                access_token: "sk-stale".into(),
+                expires: 9_999_999_999_999,
+                ttl_ms: None,
+            },
+        );
 
         let auth = auth_with_token("sk-stale");
         let options = make_options(anthropic_url, source, cache);

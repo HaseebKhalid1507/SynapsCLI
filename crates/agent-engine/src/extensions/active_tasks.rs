@@ -228,7 +228,10 @@ mod tests {
         let s = t.get("rb").unwrap();
         assert_eq!(s.recent_logs.len(), MAX_RECENT_LOGS);
         assert_eq!(s.recent_logs.last().unwrap(), "line 19");
-        assert_eq!(s.recent_logs.first().unwrap(), &format!("line {}", 20 - MAX_RECENT_LOGS));
+        assert_eq!(
+            s.recent_logs.first().unwrap(),
+            &format!("line {}", 20 - MAX_RECENT_LOGS)
+        );
     }
 
     #[test]

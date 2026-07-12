@@ -110,7 +110,12 @@ mod tests {
 
     #[test]
     fn severity_str_roundtrip() {
-        for s in [Severity::Low, Severity::Medium, Severity::High, Severity::Critical] {
+        for s in [
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
             assert_eq!(Severity::from_str(s.as_str()), s);
         }
         assert_eq!(Severity::from_str("garbage"), Severity::Medium);

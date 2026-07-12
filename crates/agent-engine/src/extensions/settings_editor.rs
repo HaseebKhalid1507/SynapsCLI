@@ -233,7 +233,9 @@ mod tests {
         }
         let frame = parse_inbound(METHOD_CLOSE, json!({"reason":"cancelled"})).unwrap();
         match frame {
-            InboundSettingsEditorFrame::Close(c) => assert_eq!(c.reason.as_deref(), Some("cancelled")),
+            InboundSettingsEditorFrame::Close(c) => {
+                assert_eq!(c.reason.as_deref(), Some("cancelled"))
+            }
             _ => panic!(),
         }
     }

@@ -1,6 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use chrono::{DateTime, Utc};
 
 use crate::core::config::base_dir;
 
@@ -36,7 +36,13 @@ pub fn sanitize_session_id(raw: &str) -> String {
     // complicates path traversal prevention (single-pass ".." replace is
     // incomplete for "..." inputs).
     raw.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
 }
 
@@ -45,7 +51,8 @@ pub fn sanitize_session_id(raw: &str) -> String {
 /// and mode 0700, avoiding /tmp symlink squatting and TOCTOU races.
 pub fn socket_path_for_session(session_id: &str) -> String {
     let safe_id = sanitize_session_id(session_id);
-    registry_dir().join(format!("{}.sock", safe_id))
+    registry_dir()
+        .join(format!("{}.sock", safe_id))
         .to_string_lossy()
         .into_owned()
 }
@@ -60,11 +67,9 @@ fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Resu
     let path = dir.join(format!("{}.json", safe_id));
     let tmp = path.with_extension("tmp");
 
-    let json = serde_json::to_string(reg)
-        .map_err(|e| format!("serialize error: {}", e))?;
+    let json = serde_json::to_string(reg).map_err(|e| format!("serialize error: {}", e))?;
 
-    std::fs::write(&tmp, &json)
-        .map_err(|e| format!("write error: {}", e))?;
+    std::fs::write(&tmp, &json).map_err(|e| format!("write error: {}", e))?;
 
     #[cfg(unix)]
     {
@@ -72,8 +77,7 @@ fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Resu
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
 
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("rename error: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename error: {}", e))?;
 
     Ok(())
 }
@@ -134,7 +138,9 @@ fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json") {
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let Ok(reg) = serde_json::from_str::<SessionRegistration>(&content) else {
                 let _ = std::fs::remove_file(&path);
                 continue;
@@ -326,7 +332,11 @@ mod tests {
     fn socket_path_format() {
         let path = socket_path_for_session("20240101-120000-ab12");
         // Sockets now live in the registry dir, not /tmp
-        assert!(path.ends_with("/run/20240101-120000-ab12.sock"), "got: {}", path);
+        assert!(
+            path.ends_with("/run/20240101-120000-ab12.sock"),
+            "got: {}",
+            path
+        );
         assert!(!path.contains("/tmp/"), "socket should not be in /tmp");
     }
 

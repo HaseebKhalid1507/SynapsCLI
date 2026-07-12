@@ -135,7 +135,10 @@ fn validate_archive_relative_path(path: &Path) -> Result<(), PrebuiltError> {
             path.display()
         )));
     }
-    if path.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
         return Err(PrebuiltError::Extract(format!(
             "archive entry '{}' escapes extraction directory",
             path.display()
@@ -461,9 +464,10 @@ pub async fn try_install_from_prebuilt(
             url: asset.url.clone(),
         });
     }
-    let expected_sha = normalize_sha256(&asset.sha256).ok_or_else(|| PrebuiltError::InvalidSha256 {
-        sha256: asset.sha256.clone(),
-    })?;
+    let expected_sha =
+        normalize_sha256(&asset.sha256).ok_or_else(|| PrebuiltError::InvalidSha256 {
+            sha256: asset.sha256.clone(),
+        })?;
 
     let tmp_archive = plugin_dir.join(format!(".prebuilt-{triple}-download"));
     match std::fs::remove_file(&tmp_archive) {
@@ -472,7 +476,8 @@ pub async fn try_install_from_prebuilt(
         Err(e) => return Err(PrebuiltError::Io(e)),
     }
 
-    let download_res = download_prebuilt_to_file(&asset.url, &tmp_archive, MAX_PREBUILT_ARCHIVE_BYTES).await;
+    let download_res =
+        download_prebuilt_to_file(&asset.url, &tmp_archive, MAX_PREBUILT_ARCHIVE_BYTES).await;
     let actual = match download_res {
         Ok(sha) => sha,
         Err(e) => {
@@ -498,13 +503,12 @@ pub async fn try_install_from_prebuilt(
     extract_res?;
 
     // Post-condition: the binary the manifest promised must now resolve.
-    let resolved = verify_extension_command(manifest, plugin_dir)?
-        .ok_or_else(|| {
-            PrebuiltError::Verify(CommandVerifyError::Missing {
-                path: ext.command.clone(),
-                resolved: plugin_dir.join(&ext.command),
-            })
-        })?;
+    let resolved = verify_extension_command(manifest, plugin_dir)?.ok_or_else(|| {
+        PrebuiltError::Verify(CommandVerifyError::Missing {
+            path: ext.command.clone(),
+            resolved: plugin_dir.join(&ext.command),
+        })
+    })?;
     Ok(resolved)
 }
 
@@ -522,7 +526,9 @@ async fn download_prebuilt_to_file(
         #[cfg(not(test))]
         {
             let _ = path;
-            return Err(PrebuiltError::UnsafeUrl { url: url.to_string() });
+            return Err(PrebuiltError::UnsafeUrl {
+                url: url.to_string(),
+            });
         }
         #[cfg(test)]
         {
@@ -560,7 +566,10 @@ async fn download_prebuilt_to_file(
         .await
         .map_err(|e| PrebuiltError::Download(e.to_string()))?;
     if !response.status().is_success() {
-        return Err(PrebuiltError::Download(format!("HTTP {}", response.status())));
+        return Err(PrebuiltError::Download(format!(
+            "HTTP {}",
+            response.status()
+        )));
     }
     if let Some(len) = response.content_length() {
         if len > max_bytes {
@@ -705,7 +714,10 @@ fn validate_extracted_tree(root: &Path) -> Result<(), PrebuiltError> {
             let p = entry.path();
             if ty.is_symlink() {
                 let target = std::fs::canonicalize(&p).map_err(|e| {
-                    PrebuiltError::Extract(format!("symlink '{}' cannot be resolved: {e}", p.display()))
+                    PrebuiltError::Extract(format!(
+                        "symlink '{}' cannot be resolved: {e}",
+                        p.display()
+                    ))
                 })?;
                 if !target.starts_with(root) {
                     return Err(PrebuiltError::Extract(format!(
@@ -942,13 +954,19 @@ mod tests {
         // Run-time check: triple must be one of the known stable strings
         // on supported hosts (we test on linux/macos/windows in CI).
         let known = [
-            "linux-x86_64", "linux-arm64",
-            "darwin-x86_64", "darwin-arm64",
-            "windows-x86_64", "windows-arm64",
+            "linux-x86_64",
+            "linux-arm64",
+            "darwin-x86_64",
+            "darwin-arm64",
+            "windows-x86_64",
+            "windows-arm64",
         ];
         let got = host_triple();
-        if cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows"))
-            && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
         {
             let s = got.expect("supported host should yield a triple");
             assert!(known.contains(&s), "unexpected triple: {}", s);
@@ -1062,7 +1080,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_setup(Some("/etc/passwd"));
         let err = resolve_setup_script(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, SetupError::EscapesPluginDir { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SetupError::EscapesPluginDir { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1070,7 +1091,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_setup(Some("../escape.sh"));
         let err = resolve_setup_script(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, SetupError::EscapesPluginDir { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SetupError::EscapesPluginDir { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1078,7 +1102,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_setup(Some("scripts/../../etc/passwd"));
         let err = resolve_setup_script(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, SetupError::EscapesPluginDir { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SetupError::EscapesPluginDir { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1103,7 +1130,10 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let m = manifest_with_setup(Some("scripts/setup.sh"));
         let err = resolve_setup_script(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, SetupError::EscapesPluginDir { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SetupError::EscapesPluginDir { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1153,7 +1183,10 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            SetupError::NonZeroExit { exit_code, log_path } => {
+            SetupError::NonZeroExit {
+                exit_code,
+                log_path,
+            } => {
                 assert_eq!(exit_code, 7);
                 assert_eq!(log_path, log);
                 let captured = fs::read_to_string(&log).unwrap();
@@ -1350,7 +1383,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_extension_command("bin/ext");
         let err = verify_extension_command(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, CommandVerifyError::Missing { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, CommandVerifyError::Missing { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1364,7 +1400,10 @@ mod tests {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
         let m = manifest_with_extension_command("bin/ext");
         let err = verify_extension_command(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, CommandVerifyError::NotExecutable { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, CommandVerifyError::NotExecutable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1374,7 +1413,10 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let m = manifest_with_extension_command("bin/ext");
         let err = verify_extension_command(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, CommandVerifyError::NotAFile { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, CommandVerifyError::NotAFile { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1382,7 +1424,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_extension_command("../escape/bin");
         let err = verify_extension_command(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, CommandVerifyError::EscapesPluginDir { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, CommandVerifyError::EscapesPluginDir { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1407,13 +1452,15 @@ mod tests {
         );
     }
 
-
     #[test]
     fn verify_rejects_absolute_extension_command() {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest_with_extension_command("/tmp/ext");
         let err = verify_extension_command(&m, dir.path()).unwrap_err();
-        assert!(matches!(err, CommandVerifyError::EscapesPluginDir { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, CommandVerifyError::EscapesPluginDir { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1503,7 +1550,10 @@ mod tests {
         // Asset under a deliberately wrong host triple.
         let m = manifest_with_prebuilt("bin/ext", "fake-triple-9999", "https://x", "00");
         let err = try_install_from_prebuilt(&m, dir.path()).await.unwrap_err();
-        assert!(matches!(err, PrebuiltError::NoMatchingAsset), "got: {err:?}");
+        assert!(
+            matches!(err, PrebuiltError::NoMatchingAsset),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1513,19 +1563,26 @@ mod tests {
         let triple = host_triple().expect("supported host");
         let m = manifest_with_prebuilt("bin/ext", triple, "http://example.com/x.tar.gz", "00");
         let err = try_install_from_prebuilt(&m, dir.path()).await.unwrap_err();
-        assert!(matches!(err, PrebuiltError::UnsafeUrl { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, PrebuiltError::UnsafeUrl { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_succeeds_with_valid_tarball_and_checksum() {
-                let staging = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
         let url = format!("file://{}", archive.display());
         let triple = host_triple().expect("supported host");
         let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
         let resolved = try_install_from_prebuilt(&m, plugin.path()).await.unwrap();
-        assert!(resolved.exists(), "extracted binary should exist at {}", resolved.display());
+        assert!(
+            resolved.exists(),
+            "extracted binary should exist at {}",
+            resolved.display()
+        );
         // Also confirm the temp download file was cleaned up.
         let leftover = plugin.path().join(format!(".prebuilt-{}-download", triple));
         assert!(!leftover.exists(), "temp archive should be removed");
@@ -1533,14 +1590,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_aborts_on_checksum_mismatch_without_extracting() {
-                let staging = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         let (archive, _real_sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
         let url = format!("file://{}", archive.display());
         let triple = host_triple().expect("supported host");
         let bad_sha = "0".repeat(64);
         let m = manifest_with_prebuilt("bin/ext", triple, &url, &bad_sha);
-        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
+        let err = try_install_from_prebuilt(&m, plugin.path())
+            .await
+            .unwrap_err();
         match err {
             PrebuiltError::ChecksumMismatch { expected, actual } => {
                 assert_eq!(expected, bad_sha);
@@ -1554,7 +1613,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_rejects_unsupported_archive_suffix() {
-                let staging = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         // Make a .rar-named file (we only support tar/zip variants).
         let archive = staging.path().join("ext.rar");
@@ -1567,20 +1626,27 @@ mod tests {
         let url = format!("file://{}", archive.display());
         let triple = host_triple().expect("supported host");
         let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
-        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
-        assert!(matches!(err, PrebuiltError::UnsupportedArchive { .. }), "got: {err:?}");
+        let err = try_install_from_prebuilt(&m, plugin.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PrebuiltError::UnsupportedArchive { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_fails_verify_when_archive_does_not_contain_declared_command() {
-                let staging = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         // Archive ships at bin/wrong-name but manifest declares bin/ext.
         let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/wrong-name");
         let url = format!("file://{}", archive.display());
         let triple = host_triple().expect("supported host");
         let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
-        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
+        let err = try_install_from_prebuilt(&m, plugin.path())
+            .await
+            .unwrap_err();
         assert!(matches!(err, PrebuiltError::Verify(_)), "got: {err:?}");
     }
 }

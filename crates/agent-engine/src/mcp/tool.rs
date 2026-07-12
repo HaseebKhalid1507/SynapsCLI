@@ -1,8 +1,8 @@
 //! McpTool — bridges an MCP server tool into the native Tool trait.
+use crate::{Result, RuntimeError, Tool, ToolContext};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::{Result, RuntimeError, Tool, ToolContext};
 
 use super::connection::McpConnection;
 
@@ -23,20 +23,24 @@ impl Tool for McpTool {
     fn name(&self) -> &str {
         &self.tool_name
     }
-    
+
     fn description(&self) -> &str {
         &self.description
     }
-    
+
     fn parameters(&self) -> Value {
         self.input_schema.clone()
     }
-    
+
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
         let mut conn = self.connection.lock().await;
-        conn.call_tool(&self.server_tool_name, params).await
-            .map_err(|e| RuntimeError::Tool(format!(
-                "MCP tool '{}' (server '{}') failed: {}", self.tool_name, self.server_name, e
-            )))
+        conn.call_tool(&self.server_tool_name, params)
+            .await
+            .map_err(|e| {
+                RuntimeError::Tool(format!(
+                    "MCP tool '{}' (server '{}') failed: {}",
+                    self.tool_name, self.server_name, e
+                ))
+            })
     }
 }

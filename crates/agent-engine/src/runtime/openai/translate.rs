@@ -1,6 +1,8 @@
 //! Anthropic ↔ OpenAI translation layer.
 
-use super::types::{ChatMessage, FunctionCall, FunctionDefinition, OaiEvent, ToolCall, ToolDefinition};
+use super::types::{
+    ChatMessage, FunctionCall, FunctionDefinition, OaiEvent, ToolCall, ToolDefinition,
+};
 use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -13,17 +15,25 @@ pub struct ToolNameMap {
 
 impl ToolNameMap {
     pub fn to_oai<'a>(&'a self, name: &'a str) -> &'a str {
-        self.original_to_oai.get(name).map(String::as_str).unwrap_or(name)
+        self.original_to_oai
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     pub fn to_original<'a>(&'a self, name: &'a str) -> &'a str {
-        self.oai_to_original.get(name).map(String::as_str).unwrap_or(name)
+        self.oai_to_original
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     fn insert(&mut self, original: &str, oai: &str) {
         if original != oai {
-            self.original_to_oai.insert(original.to_string(), oai.to_string());
-            self.oai_to_original.insert(oai.to_string(), original.to_string());
+            self.original_to_oai
+                .insert(original.to_string(), oai.to_string());
+            self.oai_to_original
+                .insert(oai.to_string(), original.to_string());
         }
     }
 }
@@ -63,7 +73,11 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
             // Skip empty names and internal-only tools
-            if name.is_empty() || name == "respond" || name == "send_channel" || name == "watcher_exit" {
+            if name.is_empty()
+                || name == "respond"
+                || name == "send_channel"
+                || name == "watcher_exit"
+            {
                 return None;
             }
             let mut oai_name = sanitize_oai_tool_name(&name);
@@ -125,7 +139,8 @@ pub fn messages_to_oai(
 
     // Build a map of tool_use_id → tool_name from assistant messages
     // so we can populate the name field on tool result messages.
-    let mut tool_name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_name_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for msg in anthropic_messages {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(Value::Array(blocks)) = msg.get("content") {
@@ -176,15 +191,22 @@ pub fn messages_to_oai(
                                         Some(Value::Array(arr)) => arr
                                             .iter()
                                             .filter_map(|b| {
-                                                b.get("text").and_then(|t| t.as_str()).map(String::from)
+                                                b.get("text")
+                                                    .and_then(|t| t.as_str())
+                                                    .map(String::from)
                                             })
                                             .collect::<Vec<_>>()
                                             .join(""),
                                         Some(other) => other.to_string(),
                                         None => String::new(),
                                     };
-                                    let tool_name = tool_name_map.get(&tool_id).cloned().unwrap_or_default();
-                                    out.push(ChatMessage::tool_result(tool_id, tool_name, result_content));
+                                    let tool_name =
+                                        tool_name_map.get(&tool_id).cloned().unwrap_or_default();
+                                    out.push(ChatMessage::tool_result(
+                                        tool_id,
+                                        tool_name,
+                                        result_content,
+                                    ));
                                 }
                                 _ => {}
                             }
@@ -263,7 +285,12 @@ pub fn messages_to_oai(
     // directly by a 'user' message. Insert an empty assistant message if needed.
     let mut fixed = Vec::with_capacity(out.len());
     for msg in out {
-        if msg.role == "user" && fixed.last().map(|m: &ChatMessage| m.role == "tool").unwrap_or(false) {
+        if msg.role == "user"
+            && fixed
+                .last()
+                .map(|m: &ChatMessage| m.role == "tool")
+                .unwrap_or(false)
+        {
             fixed.push(ChatMessage::assistant(" ".to_string()));
         }
         fixed.push(msg);
@@ -291,17 +318,19 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
                 delta: delta.clone(),
             }))
         }
-        OaiEvent::Usage { prompt_tokens, completion_tokens, cached_tokens } => {
-            Some(StreamEvent::Session(SessionEvent::Usage {
-                input_tokens: *prompt_tokens as u64,
-                output_tokens: *completion_tokens as u64,
-                cache_read_input_tokens: *cached_tokens as u64,
-                cache_creation_input_tokens: 0,
-                cache_creation_5m: None,
-                cache_creation_1h: None,
-                model: None,
-            }))
-        }
+        OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } => Some(StreamEvent::Session(SessionEvent::Usage {
+            input_tokens: *prompt_tokens as u64,
+            output_tokens: *completion_tokens as u64,
+            cache_read_input_tokens: *cached_tokens as u64,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
+            model: None,
+        })),
         OaiEvent::Warning(s) => {
             tracing::warn!("openai stream warning: {}", s);
             None
@@ -315,7 +344,8 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
     calls
         .iter()
         .map(|c| {
-            let input: Value = serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| json!({}));
+            let input: Value =
+                serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| json!({}));
             json!({
                 "type": "tool_use",
                 "id": c.id,

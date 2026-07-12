@@ -1,13 +1,15 @@
+use super::{expand_path, Tool, ToolContext};
+use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use tokio::process::Command;
-use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, expand_path};
 
 pub struct LsTool;
 
 #[async_trait::async_trait]
 impl Tool for LsTool {
-    fn name(&self) -> &str { "ls" }
+    fn name(&self) -> &str {
+        "ls"
+    }
 
     fn description(&self) -> &str {
         "List directory contents with details (permissions, size, modification date). Defaults to current directory."
@@ -50,8 +52,8 @@ impl Tool for LsTool {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::create_tool_context;
+    use super::*;
     use crate::tools::Tool;
     use serde_json::json;
 

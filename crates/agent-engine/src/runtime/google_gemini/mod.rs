@@ -2,10 +2,10 @@
 //!
 //! Experimental. See docs/google-gemini-oauth-spec.md.
 
+pub mod runtime;
 pub mod setup;
 pub mod stream;
 pub mod translate;
-pub mod runtime;
 
 pub use setup::{
     setup_user, setup_user_with_sleeper, IneligibleTier, LoadCodeAssistResponse,
@@ -16,6 +16,6 @@ pub use setup::{
 pub use stream::{stream_gemini, StreamError};
 
 pub use translate::{
-    from_stream_line, translate_generate_content_request, ChatTurn, GeminiFunctionCall,
-    GeminiPart, GeminiStreamEvent, ToolSpec, MAX_INBOUND_LINE_BYTES,
+    from_stream_line, translate_generate_content_request, ChatTurn, GeminiFunctionCall, GeminiPart,
+    GeminiStreamEvent, ToolSpec, MAX_INBOUND_LINE_BYTES,
 };

@@ -30,12 +30,7 @@ impl EventQueue {
             Some(Severity::High) => {
                 // insert after trailing Critical events at the front
                 let mut idx = 0;
-                while idx < q.len()
-                    && matches!(
-                        q[idx].content.severity,
-                        Some(Severity::Critical)
-                    )
-                {
+                while idx < q.len() && matches!(q[idx].content.severity, Some(Severity::Critical)) {
                     idx += 1;
                 }
                 q.insert(idx, event);

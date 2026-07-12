@@ -13,9 +13,7 @@
 
 use std::time::Duration;
 
-use agent_core::auth::{
-    BrokerError, CredentialBroker, ProxyMethod, ProxyRequest, ProxyResponse,
-};
+use agent_core::auth::{BrokerError, CredentialBroker, ProxyMethod, ProxyRequest, ProxyResponse};
 use serde::{Deserialize, Serialize};
 
 // ── Wire types (subset needed for setup) ─────────────────────────────────────
@@ -44,7 +42,10 @@ impl ClientMetadata {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadCodeAssistRequest {
-    #[serde(rename = "cloudaicompanionProject", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cloudaicompanionProject",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cloudaicompanion_project: Option<String>,
     pub metadata: ClientMetadata,
 }
@@ -85,7 +86,10 @@ pub struct LoadCodeAssistResponse {
 pub struct OnboardUserRequest {
     #[serde(rename = "tierId")]
     pub tier_id: String,
-    #[serde(rename = "cloudaicompanionProject", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cloudaicompanionProject",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cloudaicompanion_project: Option<String>,
     pub metadata: ClientMetadata,
 }
@@ -140,7 +144,10 @@ pub enum SetupError {
     /// Onboarding polling exhausted the bounded budget.
     OnboardingTimeout,
     /// Upstream returned a validation link that requires user action.
-    ValidationRequired { link: Option<String>, description: Option<String> },
+    ValidationRequired {
+        link: Option<String>,
+        description: Option<String>,
+    },
     /// Broker/transport error surfaced verbatim (already secret-safe).
     Broker(String),
     /// Response body was not valid JSON of the expected shape.
@@ -156,7 +163,11 @@ impl std::fmt::Display for SetupError {
                 "google-gemini: no Cloud project id available. Set GOOGLE_CLOUD_PROJECT.",
             ),
             Self::IneligibleTiers(reasons) => {
-                write!(f, "google-gemini: ineligible for available tiers: {}", reasons.join("; "))
+                write!(
+                    f,
+                    "google-gemini: ineligible for available tiers: {}",
+                    reasons.join("; ")
+                )
             }
             Self::OperationFailed(msg) => {
                 write!(f, "google-gemini: onboarding operation failed: {msg}")
@@ -225,14 +236,16 @@ where
     let load = load_code_assist(broker, project_id_env.clone()).await?;
 
     if let Some(current) = &load.current_tier {
-        if let Some(project_id) = load.cloudaicompanion_project.clone().or(project_id_env.clone()) {
+        if let Some(project_id) = load
+            .cloudaicompanion_project
+            .clone()
+            .or(project_id_env.clone())
+        {
             return Ok(UserData {
                 project_id,
                 tier_id: current.id.clone().unwrap_or_else(|| "STANDARD".into()),
                 tier_name: current.name.clone(),
-                has_onboarded_previously: current
-                    .has_onboarded_previously
-                    .unwrap_or(true),
+                has_onboarded_previously: current.has_onboarded_previously.unwrap_or(true),
             });
         }
         // No project — surface ineligibility reasons if present.
@@ -295,7 +308,9 @@ async fn tokio_sleeper(d: Duration) {
 }
 
 fn default_allowed_tier(res: &LoadCodeAssistResponse) -> Option<&TierMetadata> {
-    res.allowed_tiers.iter().find(|t| t.is_default == Some(true))
+    res.allowed_tiers
+        .iter()
+        .find(|t| t.is_default == Some(true))
 }
 
 fn ineligibility_or_project_id(res: &LoadCodeAssistResponse) -> SetupError {
@@ -457,9 +472,7 @@ mod tests {
         async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
             Err(BrokerError::Denied("not implemented".into()))
         }
-        async fn capabilities(
-            &self,
-        ) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
             Ok(vec![])
         }
     }
@@ -475,11 +488,11 @@ mod tests {
 
     #[tokio::test]
     async fn setup_returns_existing_project_when_current_tier_present() {
-        let broker = FakeBroker::new(vec![ok(
-            r#"{"cloudaicompanionProject":"my-proj",
-                "currentTier":{"id":"STANDARD","name":"Standard","hasOnboardedPreviously":true}}"#,
-        )]);
-        let data = setup_user_with_sleeper(&broker, None, no_sleep).await.unwrap();
+        let broker = FakeBroker::new(vec![ok(r#"{"cloudaicompanionProject":"my-proj",
+                "currentTier":{"id":"STANDARD","name":"Standard","hasOnboardedPreviously":true}}"#)]);
+        let data = setup_user_with_sleeper(&broker, None, no_sleep)
+            .await
+            .unwrap();
         assert_eq!(data.project_id, "my-proj");
         assert_eq!(data.tier_id, "STANDARD");
         assert!(data.has_onboarded_previously);
@@ -531,7 +544,9 @@ mod tests {
             // getOperation poll #2: done, returns project id.
             ok(r#"{"done":true,"response":{"cloudaicompanionProject":{"id":"managed-proj"}}}"#),
         ]);
-        let data = setup_user_with_sleeper(&broker, None, no_sleep).await.unwrap();
+        let data = setup_user_with_sleeper(&broker, None, no_sleep)
+            .await
+            .unwrap();
         assert_eq!(data.project_id, "managed-proj");
         assert_eq!(data.tier_id, "FREE");
 
@@ -541,8 +556,10 @@ mod tests {
         assert_eq!(seen[1].path, "/v1internal:onboardUser");
         // FREE tier must NOT carry cloudaicompanionProject in onboardUser.
         let onboard_body = seen[1].body.as_ref().unwrap();
-        assert!(onboard_body.get("cloudaicompanionProject").is_none()
-            || onboard_body["cloudaicompanionProject"].is_null());
+        assert!(
+            onboard_body.get("cloudaicompanionProject").is_none()
+                || onboard_body["cloudaicompanionProject"].is_null()
+        );
         assert_eq!(seen[2].path, "/v1internal/operations/op-42");
         assert_eq!(seen[3].path, "/v1internal/operations/op-42");
     }
@@ -600,19 +617,22 @@ mod tests {
             .build()
             .unwrap();
         for bad in [
-            "",                              // empty
-            "../secret",                     // does not start with operations/
-            "op-42",                         // missing operations/ prefix
-            "operations/",                   // trailing empty segment
-            "operations/../x",               // traversal
-            "operations/x/../y",             // traversal mid-name
-            "operations//x",                 // empty segment
-            "/operations/x",                 // absolute path
-            "operations/x?y=1",              // query character
-            "operations/x#frag",             // fragment character
+            "",                  // empty
+            "../secret",         // does not start with operations/
+            "op-42",             // missing operations/ prefix
+            "operations/",       // trailing empty segment
+            "operations/../x",   // traversal
+            "operations/x/../y", // traversal mid-name
+            "operations//x",     // empty segment
+            "/operations/x",     // absolute path
+            "operations/x?y=1",  // query character
+            "operations/x#frag", // fragment character
         ] {
             let r = rt.block_on(get_operation(&broker, bad));
-            assert!(matches!(r, Err(SetupError::InvalidResponse)), "must reject {bad:?}");
+            assert!(
+                matches!(r, Err(SetupError::InvalidResponse)),
+                "must reject {bad:?}"
+            );
         }
         // No wire calls emitted for any bad name.
         assert!(broker.seen.lock().unwrap().is_empty());
