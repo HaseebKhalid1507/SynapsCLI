@@ -353,23 +353,54 @@ pub async fn get_operation<B: CredentialBroker + ?Sized>(
     broker: &B,
     operation_name: &str,
 ) -> Result<OperationResponse, SetupError> {
-    // Operation names are of the form `operations/op-xyz`; treat everything
-    // after the last `/` as an opaque token.
-    let last = operation_name.trim_start_matches('/').trim_start_matches("operations/");
-    if last.is_empty() || last.contains('/') || last.contains("..") {
+    // Match the reference client's `getOperationUrl(name) = ${base}/${name}`
+    // and its `getOperation` = HTTP GET. `name` is the full LRO resource name
+    // (e.g. `operations/op-42` or nested `operations/projects/{p}/op-xyz`)
+    // and must be embedded verbatim after the API version — stripping the
+    // `operations/` prefix or rewriting interior slashes yields HTTP 404
+    // from cloudcode-pa.
+    //
+    // We keep a defensive validator so a malformed/hostile name cannot be
+    // used to escape the pinned allowlist prefix `/v1internal/operations/`
+    // enforced by the broker.
+    if !is_safe_operation_name(operation_name) {
         return Err(SetupError::InvalidResponse);
     }
-    let path = format!("/v1internal/operations/{last}");
+    let path = format!("/v1internal/{operation_name}");
     let resp = broker
         .proxy(ProxyRequest {
             provider: "google-gemini".into(),
-            method: ProxyMethod::Post,
+            method: ProxyMethod::Get,
             path,
-            body: Some(serde_json::json!({})),
+            body: None,
             stream: false,
         })
         .await?;
     parse_success::<OperationResponse>(resp)
+}
+
+/// Accept only Google LRO names of the form `operations/<segment>[/<segment>…]`
+/// where each segment is non-empty, does not equal `..`, and contains no
+/// URL-reserved characters that could break the pinned host + path allowlist.
+fn is_safe_operation_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("operations/") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+        if segment
+            .chars()
+            .any(|c| matches!(c, '?' | '#' | '\\' | ' ' | '\t' | '\n' | '\r'))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_success<T: for<'de> Deserialize<'de>>(resp: ProxyResponse) -> Result<T, SetupError> {
@@ -557,21 +588,71 @@ mod tests {
     }
 
     #[test]
-    fn get_operation_rejects_traversal_and_slashes() {
-        // Local sanity: the path builder must not accept traversal tokens.
-        // Actual call would be async, but we can test the helper indirectly
-        // by feeding a bad operation name and asserting the pre-flight fails.
-        // (Async version reuses the same guard.)
+    fn get_operation_rejects_traversal_and_absolute_paths() {
+        // The path builder must reject traversal/absolute-path tokens, but
+        // MUST accept valid Google LRO names which begin with `operations/`
+        // and may contain additional slash-separated segments (e.g.
+        // `projects/{p}/operations/{o}`), matching the reference client's
+        // `getOperationUrl(name)` = `${base}/${name}` construction.
         let broker = FakeBroker::new(vec![]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        for bad in ["../secret", "op/../../etc", "", "operations/../x"] {
+        for bad in [
+            "",                              // empty
+            "../secret",                     // does not start with operations/
+            "op-42",                         // missing operations/ prefix
+            "operations/",                   // trailing empty segment
+            "operations/../x",               // traversal
+            "operations/x/../y",             // traversal mid-name
+            "operations//x",                 // empty segment
+            "/operations/x",                 // absolute path
+            "operations/x?y=1",              // query character
+            "operations/x#frag",             // fragment character
+        ] {
             let r = rt.block_on(get_operation(&broker, bad));
-            assert!(matches!(r, Err(SetupError::InvalidResponse)), "must reject {bad}");
+            assert!(matches!(r, Err(SetupError::InvalidResponse)), "must reject {bad:?}");
         }
         // No wire calls emitted for any bad name.
         assert!(broker.seen.lock().unwrap().is_empty());
+    }
+
+    /// Regression: matches the reference client's `getOperation` contract.
+    /// The wire request MUST be an HTTP GET (not POST), MUST carry no body,
+    /// and MUST embed the full LRO `name` verbatim after the API version —
+    /// including any interior slashes for nested resource names. Failing any
+    /// of these produces `HTTP 404 from cloudcode-pa` in production.
+    #[tokio::test]
+    async fn get_operation_matches_reference_wire_contract() {
+        // Simple LRO name.
+        let broker = FakeBroker::new(vec![ok(r#"{"done":true}"#)]);
+        let _ = get_operation(&broker, "operations/op-42").await.unwrap();
+        let seen = broker.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].provider, "google-gemini");
+        assert_eq!(
+            seen[0].method,
+            ProxyMethod::Get,
+            "reference uses GET for getOperation; POST returns 404 from cloudcode-pa"
+        );
+        assert_eq!(seen[0].path, "/v1internal/operations/op-42");
+        assert!(
+            seen[0].body.is_none(),
+            "GET must not carry a body; reference sends none"
+        );
+        drop(seen);
+
+        // Nested LRO name — must be preserved verbatim, not stripped.
+        let broker = FakeBroker::new(vec![ok(r#"{"done":true}"#)]);
+        let _ = get_operation(&broker, "operations/projects/my-proj/op-xyz")
+            .await
+            .unwrap();
+        let seen = broker.seen.lock().unwrap();
+        assert_eq!(
+            seen[0].path,
+            "/v1internal/operations/projects/my-proj/op-xyz"
+        );
+        assert_eq!(seen[0].method, ProxyMethod::Get);
     }
 }
