@@ -15,6 +15,7 @@ pub mod broker;
 mod browser;
 mod callback;
 mod credential_source;
+mod github_copilot;
 mod openai_codex;
 mod pkce;
 pub mod provider;
@@ -55,6 +56,7 @@ pub use storage::{
 pub use token::{
     ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
 };
+pub use github_copilot::login as login_github_copilot;
 pub use xai::login as login_xai;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────

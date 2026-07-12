@@ -18,6 +18,7 @@ pub enum OAuthProviderId {
     Anthropic,
     OpenAiCodex,
     Xai,
+    GitHubCopilot,
 }
 
 impl OAuthProviderId {
@@ -26,6 +27,7 @@ impl OAuthProviderId {
             Self::Anthropic => "anthropic",
             Self::OpenAiCodex => "openai-codex",
             Self::Xai => "xai-auth",
+            Self::GitHubCopilot => "github-copilot",
         }
     }
 }
@@ -43,6 +45,7 @@ impl FromStr for OAuthProviderId {
             "anthropic" => Ok(Self::Anthropic),
             "openai-codex" => Ok(Self::OpenAiCodex),
             "xai-auth" => Ok(Self::Xai),
+            "github-copilot" => Ok(Self::GitHubCopilot),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
         }
     }
@@ -87,6 +90,7 @@ pub enum ProviderBehavior {
     Anthropic,
     OpenAiCodex,
     Xai,
+    GitHubCopilot,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,7 +155,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 3] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 4] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -176,6 +180,16 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 3] = [
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::Xai,
     },
+    OAuthProviderDescriptor {
+        id: OAuthProviderId::GitHubCopilot,
+        display_name: "GitHub Copilot",
+        description: "GitHub Copilot device OAuth (experimental)",
+        recommended: false,
+        // Vends only the short-lived Copilot session token via AccessToken.
+        // Long-lived GitHub user token remains in refresh, broker-owned.
+        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
+        behavior: ProviderBehavior::GitHubCopilot,
+    },
 ];
 
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
@@ -184,6 +198,8 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
         "claude" | "anthropic" => Ok(OAuthProviderId::Anthropic),
         "openai-codex" => Ok(OAuthProviderId::OpenAiCodex),
         "xai-auth" => Ok(OAuthProviderId::Xai),
+        // Aliases normalize only at CLI parsing; storage key remains github-copilot.
+        "github-copilot" | "copilot" | "gh-copilot" => Ok(OAuthProviderId::GitHubCopilot),
         _ => Err(format!("unknown OAuth provider: {value}")),
     }
 }
@@ -197,6 +213,7 @@ pub async fn login(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
         ProviderBehavior::Anthropic => super::providers::anthropic::login().await,
         ProviderBehavior::OpenAiCodex => super::providers::openai_codex::login().await,
         ProviderBehavior::Xai => super::providers::xai::login().await,
+        ProviderBehavior::GitHubCopilot => super::providers::github_copilot::login().await,
     }
 }
 
@@ -215,6 +232,9 @@ pub async fn refresh(
             super::providers::openai_codex::refresh(client, refresh).await
         }
         ProviderBehavior::Xai => super::providers::xai::refresh(client, refresh).await,
+        ProviderBehavior::GitHubCopilot => {
+            super::providers::github_copilot::refresh(client, refresh).await
+        }
     }
 }
 
@@ -257,5 +277,40 @@ mod tests {
             OAuthProviderId::Anthropic
         );
         assert!(OAuthProviderId::from_str("claude").is_err());
+    }
+
+    #[test]
+    fn github_copilot_canonical_id_and_cli_aliases() {
+        assert_eq!(OAuthProviderId::GitHubCopilot.as_str(), "github-copilot");
+        assert_eq!(
+            OAuthProviderId::from_str("github-copilot").unwrap(),
+            OAuthProviderId::GitHubCopilot
+        );
+        // Aliases are CLI-only — canonical FromStr rejects them.
+        assert!(OAuthProviderId::from_str("copilot").is_err());
+        assert!(OAuthProviderId::from_str("gh-copilot").is_err());
+        assert_eq!(
+            parse_cli_provider("copilot").unwrap(),
+            OAuthProviderId::GitHubCopilot
+        );
+        assert_eq!(
+            parse_cli_provider("GH-Copilot").unwrap(),
+            OAuthProviderId::GitHubCopilot
+        );
+        assert_eq!(
+            parse_cli_provider("github-copilot").unwrap(),
+            OAuthProviderId::GitHubCopilot
+        );
+        let registry = registry();
+        let desc = registry
+            .get(OAuthProviderId::GitHubCopilot)
+            .expect("descriptor");
+        assert_eq!(desc.id, OAuthProviderId::GitHubCopilot);
+        assert_eq!(
+            desc.broker_strategy,
+            BrokerCredentialStrategy::OAuthAccessToken
+        );
+        assert_eq!(desc.behavior, ProviderBehavior::GitHubCopilot);
+        assert!(!desc.recommended);
     }
 }

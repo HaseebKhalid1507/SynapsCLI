@@ -32,3 +32,14 @@ pub mod xai {
         super::super::xai::refresh_token(client, refresh).await
     }
 }
+
+pub mod github_copilot {
+    use crate::auth::OAuthCredentials;
+    use reqwest::Client;
+    pub async fn login() -> Result<OAuthCredentials, String> {
+        super::super::github_copilot::login().await
+    }
+    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+        super::super::github_copilot::refresh_token(client, refresh).await
+    }
+}

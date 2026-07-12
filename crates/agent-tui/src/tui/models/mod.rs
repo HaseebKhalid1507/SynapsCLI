@@ -264,6 +264,7 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::Anthropic,
         synaps_cli::auth::OAuthProviderId::OpenAiCodex,
         synaps_cli::auth::OAuthProviderId::Xai,
+        synaps_cli::auth::OAuthProviderId::GitHubCopilot,
     ]
     .into_iter()
     .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
