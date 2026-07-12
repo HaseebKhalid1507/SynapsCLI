@@ -76,14 +76,28 @@ is non-empty:
 ```toml
 # ~/.config/synaps/config.toml
 events.auto_turn = true    # default — owning session continues automatically
-# events.auto_turn = true  # server triggers model turns on idle events
+# events.auto_turn = false # opt-out: events injected, no model turn spawned
 ```
 
-Default: **false**. When false, the server broadcasts `ServerMessage::Event`
-to all connected clients but does not spawn a new model turn. Clients are
-expected to send a follow-up `Message` if they want the model to react.
+Default: **true** (RPC and server modes). When false:
 
-When true, the server calls `run_injected_event_turn` (NOT `handle_user_message`)
+* **RPC mode:** The event is injected into the owning session's `api_messages`
+  as a `role=user` message. An `RpcEvent::Event` observability frame is still
+  emitted by the drainer. No model turn is spawned automatically. The event is
+  processed on the **next client-initiated `Prompt` or `FollowUp`** — the model
+  will see the event in its conversation history and can respond to it then.
+  No additional raw wire frame is emitted; the drainer already emitted one.
+
+* **Server mode:** The event is injected into the owning conversation's
+  `api_messages`. No raw `ServerMessage::Event` broadcast is sent to other
+  connected clients (the broadcast was removed; the single owning conversation
+  receives and holds the event). No model turn is spawned automatically.
+  The event is processed when the next client `Message` arrives.
+
+In both modes the event is **never silently dropped** when `auto_turn = false`:
+it lands in `api_messages` so the model will see it on the next real turn.
+
+When `auto_turn = true`, the server calls `run_injected_event_turn` (NOT `handle_user_message`)
 which:
 - Atomically acquires the streaming guard; drops the trigger if already streaming.
 - Does **not** inject a sentinel `[event-reactor auto-turn]` user message.

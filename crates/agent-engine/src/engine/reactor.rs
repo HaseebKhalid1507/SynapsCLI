@@ -251,6 +251,39 @@ pub fn terminal_flush_seam(
     None
 }
 
+// ─── spawn_prompt registration seam ─────────────────────────────────────────
+
+/// Pure decision logic for the `spawn_prompt` registration re-check (Bug 1 fix).
+///
+/// Models the guard that runs **inside** the registration lock just before
+/// `in_flight` is written. Returns `true` if it is safe to proceed with
+/// registration (caller should write `in_flight` and clear `auto_turn_pending`);
+/// returns `false` if the reservation was revoked by an intervening Abort and
+/// the caller must abort the spawned task (drop `start_tx`).
+///
+/// Rules (identical to the re-check in `spawn_prompt`):
+/// * Non-auto prompts (`!is_auto`) always return `true` — they are validated
+///   by `handle_prompt`'s `is_busy()` check before reaching here.
+/// * Auto prompts: `true` iff `auto_turn_pending && !in_flight_live`.
+/// * If returning `false`, the helper also defensively clears `auto_turn_pending`.
+///
+/// Used by `spawn_prompt` and by integration tests (not the replica scheduler).
+pub fn spawn_prompt_registration_check(
+    is_auto: bool,
+    auto_turn_pending: &mut bool,
+    in_flight_live: bool,
+) -> bool {
+    if !is_auto {
+        return true;
+    }
+    if *auto_turn_pending && !in_flight_live {
+        return true;
+    }
+    // Reservation revoked — clear pending defensively before returning false.
+    *auto_turn_pending = false;
+    false
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

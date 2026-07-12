@@ -35,6 +35,7 @@ use synaps_cli::{
     engine::reactor::{
         drain_event_queue, event_payload_from_drained,
         wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP,
+        spawn_prompt_registration_check,
     },
 };
 use synaps_cli::core::config::load_config;
@@ -213,12 +214,28 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
 /// Protocol:
 /// 1. Create a `oneshot` channel `(start_tx, start_rx)`.
 /// 2. Spawn the task — it immediately awaits `start_rx` before any state work.
-/// 3. Set `in_flight = Some(InFlight { handle, … })` under the lock.
-/// 4. Send `start_tx` to release the task.
+/// 3. Re-validate reservation under registration lock (see bug-1 fix below).
+/// 4. Set `in_flight = Some(InFlight { handle, … })` under the lock.
+/// 5. Send `start_tx` to release the task.
 ///
 /// This guarantees: `terminal_flush` cannot run until `in_flight` is set, so
 /// every `in_flight = None` from inside the task sees a previously-set handle
 /// and leaves state consistent. Abort can always find the handle.
+///
+/// **Bug 1 fix — Abort-between-snapshot-and-registration:**
+/// There is a narrow window between the snapshot-guard lock release and the
+/// registration lock acquisition during which `Abort` can run and clear
+/// `auto_turn_pending`. Without the re-check, the task would be registered
+/// regardless — leaving a ghost `InFlight` that Abort already acknowledged as
+/// gone. The fix: re-validate `auto_turn_pending` (and `in_flight`) inside the
+/// registration lock. If the reservation was revoked, `start_tx` is dropped
+/// (task sees `Err` on `start_rx.await` and exits cleanly) and we return
+/// without registering `in_flight`.
+///
+/// **Bug 2 fix — guard-fail leaves `auto_turn_pending` set:**
+/// If the snapshot-guard check fails we now clear `auto_turn_pending` before
+/// returning so the session is never left permanently busy by a phantom
+/// reservation.
 ///
 /// `auto_turn_tx`: channel to the scheduler task in `run()`. Terminal paths
 /// that want to chain an additional auto-turn send the reserved `auto_id` here
@@ -243,14 +260,18 @@ async fn spawn_prompt(
     // Normal client prompts skip the guard (they were already validated by
     // handle_prompt's is_busy() check before reaching here).
     let messages: Vec<synaps_cli::SharedMessage> = {
-        let st = state.lock().await;
+        let mut st = state.lock().await;
         if prompt_id.starts_with("auto:") && (!st.auto_turn_pending || st.in_flight.is_some()) {
             tracing::warn!(
                 prompt_id,
                 auto_turn_pending = st.auto_turn_pending,
                 in_flight_live = st.in_flight.is_some(),
-                "rpc: spawn_prompt: auto-turn reservation invalidated — aborting"
+                "rpc: spawn_prompt: auto-turn reservation invalidated at snapshot — aborting"
             );
+            // Bug 2 fix: defensively clear auto_turn_pending before returning so
+            // the session is never left in a permanently-busy phantom state when
+            // the guard check here fails.
+            st.auto_turn_pending = false;
             return;
         }
         st.api_messages.clone()
@@ -412,12 +433,36 @@ async fn spawn_prompt(
     });
 
     // Register in_flight BEFORE releasing the start barrier.
-    // Atomically: set in_flight = Some(...) and clear auto_turn_pending so
-    // the narrow reservation window closes exactly here. This guarantees
-    // terminal_flush cannot run until in_flight is set — eliminating the
-    // zombie-handle race and the double-reservation window.
+    // Bug 1 fix — Abort-between-snapshot-and-registration:
+    // Between the snapshot guard above and this lock, Abort may have run and
+    // cleared auto_turn_pending (+ taken in_flight if any). Re-validate here
+    // under the same registration lock before writing in_flight. If the
+    // reservation was revoked, drop start_tx (the waiting task sees Err on
+    // start_rx.await and exits cleanly) and return without leaving a ghost.
     {
         let mut st = state.lock().await;
+        let is_auto = prompt_id.starts_with("auto:");
+        let in_flight_live = st.in_flight.is_some();
+        if !spawn_prompt_registration_check(
+            is_auto,
+            &mut st.auto_turn_pending,
+            in_flight_live,
+        ) {
+            tracing::warn!(
+                prompt_id,
+                auto_turn_pending = st.auto_turn_pending,
+                in_flight_live,
+                "rpc: spawn_prompt: Abort cleared reservation between snapshot and registration — dropping task"
+            );
+            // Defensively clear pending so the session is not stuck busy.
+            st.auto_turn_pending = false;
+            // Drop start_tx here — the spawned task's start_rx.await returns
+            // Err and the task exits without touching any state.
+            drop(start_tx);
+            // Drop the JoinHandle — task will finish immediately on start_rx Err.
+            drop(handle);
+            return;
+        }
         st.in_flight = Some(InFlight { prompt_id, cancel, handle });
         st.auto_turn_pending = false;
     }

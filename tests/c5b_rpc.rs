@@ -16,6 +16,7 @@
 use agent_engine::engine::reactor::{
     drain_event_queue, event_payload_from_drained, wake_action, claim_auto_turn,
     EventDisposition, WakeAction, AUTO_TURN_CAP,
+    spawn_prompt_registration_check,
 };
 use agent_engine::events::{types::{Event, Severity}, EventQueue};
 use synaps_cli::core::rpc_protocol::RpcEvent;
@@ -425,4 +426,109 @@ fn rpc_event_frame_is_exactly_one_per_drained_event() {
     // Exactly one frame per drained event — no duplicates, no drops.
     assert_eq!(frames.len(), drained.len());
     assert_eq!(frames.len(), 3);
+}
+
+// ─── T10: abort-between-snapshot-and-registration seam ───────────────────────
+
+/// Deterministic seam test for the Bug 1 scenario:
+///   1. Auto-turn is reserved: `auto_turn_pending = true`, `in_flight = false`.
+///   2. Snapshot guard passes (conditions satisfied at snapshot time).
+///   3. Abort arrives and clears `auto_turn_pending` (simulates the race window).
+///   4. Registration check (re-validation inside registration lock) must DENY.
+///   5. `auto_turn_pending` remains false — no ghost, session not stuck.
+///
+/// Uses `spawn_prompt_registration_check` — the tiny pure helper extracted from
+/// `spawn_prompt`'s registration lock block — so no live Runtime is needed.
+#[test]
+fn abort_between_snapshot_and_registration_check_denies() {
+    // Phase 1: auto-turn reserved, snapshot guard would pass.
+    let mut auto_turn_pending = true;
+    let in_flight_live = false;
+    let is_auto = true;
+
+    // Verify: snapshot guard condition (same logic as guard in spawn_prompt).
+    assert!(
+        auto_turn_pending && !in_flight_live,
+        "precondition: guard should pass at snapshot time"
+    );
+
+    // Phase 2: simulate Abort arriving in the race window — clears pending.
+    auto_turn_pending = false; // Abort's handle_abort clears this
+
+    // Phase 3: registration re-check runs inside the lock.
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
+
+    // Must deny — reservation was revoked.
+    assert!(
+        !allowed,
+        "registration must be denied when Abort cleared auto_turn_pending"
+    );
+    // auto_turn_pending must be false (helper cleared it defensively if not already).
+    assert!(
+        !auto_turn_pending,
+        "auto_turn_pending must be false after denied registration — no ghost"
+    );
+}
+
+/// Complementary: registration check allows when reservation is still valid.
+#[test]
+fn registration_check_allows_when_reservation_intact() {
+    let mut auto_turn_pending = true;
+    let in_flight_live = false;
+    let is_auto = true;
+
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
+
+    assert!(allowed, "registration must be allowed when reservation is intact");
+    // Helper must NOT touch auto_turn_pending on the allow path.
+    assert!(
+        auto_turn_pending,
+        "auto_turn_pending must remain true when registration is allowed (caller clears it)"
+    );
+}
+
+/// Non-auto prompts always pass the registration check regardless of flags.
+#[test]
+fn registration_check_always_allows_non_auto_prompts() {
+    // Even with auto_turn_pending=false and in_flight=true, a real prompt passes.
+    let mut auto_turn_pending = false;
+    let in_flight_live = true; // shouldn't matter for non-auto
+    let is_auto = false;
+
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
+
+    assert!(
+        allowed,
+        "non-auto prompts always pass the registration check"
+    );
+}
+
+/// Registration check denies when in_flight is already Some (concurrent real prompt
+/// raced in after snapshot guard and before registration lock).
+#[test]
+fn registration_check_denies_when_in_flight_live() {
+    let mut auto_turn_pending = true; // still set
+    let in_flight_live = true;        // but a real prompt is now live
+    let is_auto = true;
+
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
+
+    assert!(!allowed, "must deny when in_flight is already live");
+    assert!(!auto_turn_pending, "auto_turn_pending must be cleared on denial");
 }
