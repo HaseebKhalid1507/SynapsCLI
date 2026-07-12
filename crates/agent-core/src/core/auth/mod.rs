@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+pub mod broker;
 mod browser;
 mod callback;
 mod credential_source;
@@ -18,11 +19,17 @@ mod openai_codex;
 mod pkce;
 pub mod provider;
 pub mod providers;
+pub mod static_providers;
 mod storage;
 mod token;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
+pub use broker::{
+    broker_from_source, global_broker, set_global_broker, AccessToken, BrokerError,
+    CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream, ProxyMethod,
+    ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
+};
 pub use browser::open_browser;
 pub use callback::{start_callback_server, CallbackServerHandle};
 pub use credential_source::{
@@ -36,7 +43,11 @@ pub use pkce::{build_auth_url, generate_code_challenge, generate_code_verifier, 
 pub use provider::{
     BrokerCredentialStrategy, OAuthProviderDescriptor, OAuthProviderId, OAuthProviderRegistry,
 };
-pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
+pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_KEY};
+pub use storage::{
+    auth_file_path, load_auth, load_provider_auth, load_static_key, save_auth, save_provider_auth,
+    save_static_key,
+};
 pub use token::{
     ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
 };

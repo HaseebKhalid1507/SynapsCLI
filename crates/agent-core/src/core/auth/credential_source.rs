@@ -259,33 +259,22 @@ impl BrokerClient {
     }
 }
 
-/// Provider-aware token resolution honoring the credential source — the single
-/// entry point both the Anthropic and the OpenAI/codex paths use. (#158 C4)
-///
-/// - `Local`: refresh the provider's own local credential (`ensure_fresh_*`).
-/// - `Remote`: fetch a short-lived access token from the broker, keyed by
-///   provider. Reuses the caller's `http` client (no per-call pool — A5), and
-///   never holds a refresh token / never writes `auth.json` (invariant 1).
+/// Provider-aware token resolution honoring the credential source — kept as a
+/// compatibility adapter for CLI callers (`synaps status`). Delegates to the
+/// typed credential broker: the local in-process broker or the authenticated
+/// remote transport. Vends the access token only.
 pub async fn resolve_access_token(
     provider: &str,
     source: &CredentialSource,
     cache: &TokenCache,
     http: &reqwest::Client,
 ) -> Result<String, String> {
-    match source {
-        CredentialSource::Remote { endpoint, machine_token } => {
-            let broker = BrokerClient::with_client(endpoint.clone(), machine_token.clone(), http.clone());
-            Ok(resolve_remote(&broker, cache, provider, DEFAULT_MARGIN_MS).await?.access_token)
-        }
-        CredentialSource::Local => {
-            let creds = if provider == "anthropic" {
-                super::ensure_fresh_token(http).await?
-            } else {
-                super::ensure_fresh_provider_token(http, provider).await?
-            };
-            Ok(creds.access)
-        }
-    }
+    let provider: super::provider::OAuthProviderId = provider.try_into()?;
+    super::broker::broker_from_source(source, cache, http.clone())
+        .access_token(provider)
+        .await
+        .map(|t| t.token)
+        .map_err(|e| e.to_string())
 }
 
 impl TokenFetcher for BrokerClient {

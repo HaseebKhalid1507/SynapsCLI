@@ -106,100 +106,17 @@ pub async fn refresh_token(
     })
 }
 
-/// Acquire an exclusive lock on auth.json, check token freshness, refresh if
+/// Acquire the Anthropic refresh gate, check token freshness, refresh if
 /// needed, and persist the result atomically. Returns the current (possibly
 /// refreshed) credentials.
 ///
-/// # Atomicity fix
-///
-/// Previously used seek(0)+set_len(0)+write_all (truncate-in-place). A crash
-/// between `set_len(0)` and write completion zeroed auth.json. Because
-/// Anthropic rotates the refresh token on every refresh call, the zeroed file
-/// was unrecoverable — the new token existed only in memory.
-///
-/// Fix: delegate the write to `save_provider_auth("anthropic", ...)`, which
-/// calls `save_provider_auth_at` in storage.rs. That uses:
-///   sidecar `.json.lock` → write to `.json.tmp` → `rename(2)` (atomic on POSIX)
-/// A crash at any point leaves auth.json intact with the pre-refresh content.
-///
-/// The read phase still holds an fs4 exclusive lock on the live file to prevent
-/// two concurrent callers from both issuing a network refresh (which would
-/// rotate the refresh token twice, invalidating the first caller's result).
-/// The locks are compatible: read lock on auth.json, write lock on auth.json.lock.
-///
-/// # Task #184 (AuthFile hardcoded-2-field issue)
-///
-/// The old code rebuilt `AuthFile { anthropic, openai_codex }`, silently
-/// dropping any provider beyond those two. Routing through `save_provider_auth`
-/// gets the same read-merge-write as every other save site — all providers
-/// are preserved automatically.
+/// Anthropic now flows through the exact same single-flight gate + atomic
+/// merge-persistence path as every other OAuth provider
+/// (`ensure_fresh_provider_token`), so concurrent async callers can never
+/// double-rotate the refresh token, and the write preserves every other
+/// provider entry (fixes #184) via `save_provider_auth` → tmp+rename(2).
 pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCredentials, String> {
-    use fs4::fs_std::FileExt;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom};
-
-    let path = auth_file_path();
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
-    }
-
-    if !path.exists() {
-        return Err(format!(
-            "No credentials at {}. Run `login` to authenticate.",
-            path.display()
-        ));
-    }
-
-    // Open read-only; we no longer need write access on this handle because
-    // the write goes through save_provider_auth (tmp+rename).
-    let file = OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-
-    let mut file =
-        tokio::task::spawn_blocking(move || -> std::result::Result<std::fs::File, String> {
-            FileExt::lock_exclusive(&file)
-                .map_err(|e| format!("Failed to lock auth.json: {}", e))?;
-            Ok(file)
-        })
-        .await
-        .map_err(|e| format!("Lock task failed: {}", e))??;
-
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("Failed to seek auth.json: {}", e))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|e| format!("Failed to read auth.json: {}", e))?;
-    // Explicit drop: release the exclusive lock before the async refresh
-    // network call so we don't hold the lock across I/O we don't control.
-    drop(file);
-
-    let root: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse auth.json: {}", e))?;
-    let anthropic_raw = root
-        .get("anthropic")
-        .ok_or_else(|| "No anthropic credential in auth.json. Run `login`.".to_string())?;
-    let creds: OAuthCredentials = serde_json::from_value(anthropic_raw.clone())
-        .map_err(|e| format!("Failed to parse anthropic credential: {}", e))?;
-
-    if !is_token_expired(&creds) {
-        return Ok(creds);
-    }
-
-    let new_creds = refresh_token(client, &creds.refresh).await?;
-
-    // Atomic write via save_provider_auth → save_provider_auth_at:
-    //   1. acquire sidecar auth.json.lock
-    //   2. read-merge all providers from current auth.json
-    //   3. write to auth.json.tmp
-    //   4. fsync + rename(auth.json.tmp → auth.json)   ← atomic
-    // Also naturally preserves all providers beyond "anthropic" (fixes #184).
-    save_provider_auth("anthropic", &new_creds)?;
-
-    Ok(new_creds)
+    ensure_fresh_provider_token(client, super::provider::OAuthProviderId::Anthropic).await
 }
 
 /// Process-wide, per-provider refresh gates. The file lock protects persistence;
@@ -217,7 +134,11 @@ fn refresh_gate(provider: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Ensure a non-Anthropic OAuth provider has a fresh token.
+/// Ensure an OAuth provider (including Anthropic) has a fresh token.
+///
+/// Single-flight: concurrent async callers for the same provider serialize on
+/// a per-provider gate; only the first performs the network refresh, later
+/// waiters re-read the persisted (rotated) credential.
 pub async fn ensure_fresh_provider_token<P>(
     client: &Client,
     provider: P,
@@ -227,22 +148,53 @@ where
     P::Error: std::fmt::Display,
 {
     let provider = provider.try_into().map_err(|e| e.to_string())?;
-    let _gate = refresh_gate(provider.as_str()).lock_owned().await;
+    let key = provider.as_str();
+    ensure_fresh_gated(
+        refresh_gate(key),
+        || {
+            load_provider_auth(key)?.ok_or_else(|| {
+                format!(
+                    "No credentials for {} at {}. Run `synaps login`.",
+                    provider,
+                    auth_file_path().display()
+                )
+            })
+        },
+        |refresh| async move { super::provider::refresh(client, provider, &refresh).await },
+        |creds| save_provider_auth(key, creds),
+    )
+    .await
+}
+
+/// Generic single-flight refresh core. Separated from network/storage so the
+/// concurrency, rotation, and failure invariants are directly testable.
+///
+/// Contract:
+/// 1. Exactly one refresh runs at a time per gate; waiters re-`load` after the
+///    gate and observe the rotated credential without a second refresh.
+/// 2. `save` runs only after a successful refresh (failures persist nothing).
+/// 3. The refreshed credential is persisted before the gate is released.
+pub(crate) async fn ensure_fresh_gated<Load, Refresh, RFut, Save>(
+    gate: Arc<Mutex<()>>,
+    load: Load,
+    refresh: Refresh,
+    save: Save,
+) -> std::result::Result<OAuthCredentials, String>
+where
+    Load: Fn() -> std::result::Result<OAuthCredentials, String>,
+    Refresh: FnOnce(String) -> RFut,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
+    Save: FnOnce(&OAuthCredentials) -> std::result::Result<(), String>,
+{
+    let _gate = gate.lock_owned().await;
     // Re-read after entering the gate: a preceding waiter may have refreshed
     // and atomically persisted a rotated refresh token.
-    let Some(creds) = load_provider_auth(provider.as_str())? else {
-        return Err(format!(
-            "No credentials for {}. Run `synaps login`.",
-            provider
-        ));
-    };
-
+    let creds = load()?;
     if !is_token_expired(&creds) {
         return Ok(creds);
     }
-
-    let fresh = super::provider::refresh(client, provider, &creds.refresh).await?;
-    save_provider_auth(provider.as_str(), &fresh)?;
+    let fresh = refresh(creds.refresh).await?;
+    save(&fresh)?;
     Ok(fresh)
 }
 
@@ -354,6 +306,151 @@ mod tests {
             parsed["future-provider"]["refresh"].as_str(),
             Some("future-tok"),
             "future-provider must survive (fixes #184 — 3rd provider not dropped)"
+        );
+    }
+
+    // ── Single-flight refresh invariants (concurrency / rotation / failure) ──
+    //
+    // These drive `ensure_fresh_gated` — the exact core `ensure_fresh_token`
+    // (Anthropic) and `ensure_fresh_provider_token` (all providers) execute —
+    // with injected load/refresh/save so no network or real auth.json is
+    // involved.
+
+    use super::ensure_fresh_gated;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    fn expired_creds(refresh: &str) -> OAuthCredentials {
+        OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: refresh.to_string(),
+            access: "stale-access".to_string(),
+            expires: 0,
+            account_id: None,
+        }
+    }
+
+    /// Shared fake persistence: models auth.json for a single provider.
+    #[derive(Clone)]
+    struct FakeStore {
+        creds: Arc<StdMutex<OAuthCredentials>>,
+        refresh_calls: Arc<AtomicUsize>,
+        save_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeStore {
+        fn new(initial: OAuthCredentials) -> Self {
+            Self {
+                creds: Arc::new(StdMutex::new(initial)),
+                refresh_calls: Arc::new(AtomicUsize::new(0)),
+                save_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        async fn ensure(
+            &self,
+            gate: Arc<tokio::sync::Mutex<()>>,
+        ) -> Result<OAuthCredentials, String> {
+            let store = self.clone();
+            let refresh_calls = self.refresh_calls.clone();
+            ensure_fresh_gated(
+                gate,
+                move || Ok(store.creds.lock().unwrap().clone()),
+                move |old_refresh| async move {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    // Rotate: new refresh token derived from the one presented.
+                    Ok(OAuthCredentials {
+                        auth_type: "oauth".to_string(),
+                        refresh: format!("{old_refresh}-rotated"),
+                        access: "fresh-access".to_string(),
+                        expires: crate::epoch_millis() + 3_600_000,
+                        account_id: None,
+                    })
+                },
+                |c| {
+                    self.save_calls.fetch_add(1, Ordering::SeqCst);
+                    *self.creds.lock().unwrap() = c.clone();
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    /// Concurrency: N concurrent callers with an expired credential perform
+    /// exactly ONE network refresh; everyone observes the rotated result.
+    #[tokio::test]
+    async fn anthropic_refresh_single_flight_under_concurrency() {
+        let store = FakeStore::new(expired_creds("r0"));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move { store.ensure(gate).await }));
+        }
+        for h in handles {
+            let creds = h.await.unwrap().expect("refresh must succeed");
+            assert_eq!(creds.access, "fresh-access");
+            assert_eq!(creds.refresh, "r0-rotated");
+        }
+        assert_eq!(
+            store.refresh_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one caller may rotate the refresh token"
+        );
+        assert_eq!(store.save_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Rotation: the persisted refresh token is the rotated one, and a later
+    /// expiry cycle refreshes FROM the rotated token (never the stale one).
+    #[tokio::test]
+    async fn refresh_rotation_chains_from_persisted_token() {
+        let store = FakeStore::new(expired_creds("gen0"));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        store.ensure(gate.clone()).await.unwrap();
+        assert_eq!(store.creds.lock().unwrap().refresh, "gen0-rotated");
+
+        // Force expiry again; the second cycle must present the rotated token.
+        store.creds.lock().unwrap().expires = 0;
+        let second = store.ensure(gate).await.unwrap();
+        assert_eq!(second.refresh, "gen0-rotated-rotated");
+        assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Freshness: an unexpired credential is returned without refresh or save.
+    #[tokio::test]
+    async fn fresh_credential_short_circuits_without_refresh() {
+        let store = FakeStore::new(fresh_creds("keep"));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let creds = store.ensure(gate).await.unwrap();
+        assert_eq!(creds.refresh, "keep");
+        assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.save_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Failure: a refresh error propagates and persists nothing — the stored
+    /// credential is untouched so a later retry can still present it.
+    #[tokio::test]
+    async fn refresh_failure_persists_nothing() {
+        let saves = Arc::new(AtomicUsize::new(0));
+        let saves2 = saves.clone();
+        let err = ensure_fresh_gated(
+            Arc::new(tokio::sync::Mutex::new(())),
+            || Ok(expired_creds("r-fail")),
+            |_r| async move { Err("provider 500".to_string()) },
+            move |_c| {
+                saves2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("provider 500"));
+        assert_eq!(
+            saves.load(Ordering::SeqCst),
+            0,
+            "failed refresh must not persist"
         );
     }
 }

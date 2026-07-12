@@ -3286,12 +3286,14 @@ dependencies = [
 name = "synaps-core"
 version = "0.6.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "bytes",
  "chrono",
  "dirs",
  "fs4",
+ "futures",
  "rand 0.9.4",
  "reqwest",
  "serde",

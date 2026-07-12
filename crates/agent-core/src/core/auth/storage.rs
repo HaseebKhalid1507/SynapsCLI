@@ -44,9 +44,69 @@ pub fn save_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
 }
 
 /// Save one provider credential while preserving other auth.json entries.
-pub fn save_provider_auth(provider: &str, creds: &OAuthCredentials) -> std::result::Result<(), String> {
+pub fn save_provider_auth(
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), String> {
     let path = crate::config::resolve_write_path("auth.json");
     save_provider_auth_at(&path, provider, creds)
+}
+
+/// Load one provider's broker-owned static API key from auth.json.
+///
+/// Static keys are persisted as `{"type":"api_key","key":"…"}` entries in the
+/// same open JSON object as OAuth credentials, so unknown providers and
+/// provider metadata round-trip through the exact same merge writer.
+pub fn load_static_key(provider: &str) -> std::result::Result<Option<String>, String> {
+    load_static_key_at(&auth_file_path(), provider)
+}
+
+pub(crate) fn load_static_key_at(
+    path: &std::path::Path,
+    provider: &str,
+) -> std::result::Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    let Some(entry) = value.get(provider) else {
+        return Ok(None);
+    };
+    if entry.get("type").and_then(|t| t.as_str()) != Some("api_key") {
+        return Ok(None);
+    }
+    Ok(entry
+        .get("key")
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty())
+        .map(str::to_string))
+}
+
+/// Persist a broker-owned static API key while preserving every other
+/// auth.json entry and any provider metadata.
+pub fn save_static_key(provider: &str, key: &str) -> std::result::Result<(), String> {
+    let path = crate::config::resolve_write_path("auth.json");
+    save_static_key_at(&path, provider, key)
+}
+
+pub(crate) fn save_static_key_at(
+    path: &std::path::Path,
+    provider: &str,
+    key: &str,
+) -> std::result::Result<(), String> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "type".to_string(),
+        serde_json::Value::String("api_key".to_string()),
+    );
+    fields.insert(
+        "key".to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+    save_provider_fields_at(path, provider, &fields)
 }
 
 /// Path-explicit variant of `save_provider_auth`. Splits out the I/O so
@@ -56,6 +116,21 @@ fn save_provider_auth_at(
     path: &std::path::Path,
     provider: &str,
     creds: &OAuthCredentials,
+) -> std::result::Result<(), String> {
+    let encoded =
+        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    let fields = encoded
+        .as_object()
+        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+    save_provider_fields_at(path, provider, fields)
+}
+
+/// Shared merge writer: lock, read-merge every provider entry, merge `fields`
+/// into the one provider object (preserving unknown metadata), atomic rename.
+fn save_provider_fields_at(
+    path: &std::path::Path,
+    provider: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
     use fs4::fs_std::FileExt;
 
@@ -122,8 +197,6 @@ fn save_provider_auth_at(
         serde_json::Map::new()
     };
 
-    let encoded = serde_json::to_value(creds)
-        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
     // Merge known credential fields into an existing provider object rather
     // than replacing it. Providers may add metadata (including nested objects)
     // that must survive refresh/login writes.
@@ -131,7 +204,7 @@ fn save_provider_auth_at(
         .remove(provider)
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-    if let (Some(target), Some(fields)) = (provider_value.as_object_mut(), encoded.as_object()) {
+    if let Some(target) = provider_value.as_object_mut() {
         for (key, value) in fields {
             target.insert(key.clone(), value.clone());
         }
@@ -159,8 +232,9 @@ fn save_provider_auth_at(
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            file.set_permissions(perms)
-                .map_err(|e| format!("Failed to set permissions on {}: {}", tmp_path.display(), e))?;
+            file.set_permissions(perms).map_err(|e| {
+                format!("Failed to set permissions on {}: {}", tmp_path.display(), e)
+            })?;
         }
 
         file.write_all(json.as_bytes())
@@ -207,7 +281,8 @@ mod tests {
         let path = dir.path().join("auth.json");
         std::fs::write(&path, r#"{"openai-codex":{"type":"oauth","refresh":"old","access":"old","expires":1,"metadata":{"tenant":"t1","flags":{"beta":true}}}}"#).unwrap();
         save_provider_auth_at(&path, "openai-codex", &fresh_creds()).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(value["openai-codex"]["metadata"]["tenant"], "t1");
         assert_eq!(value["openai-codex"]["metadata"]["flags"]["beta"], true);
         assert_eq!(value["openai-codex"]["access"], "a");
@@ -236,7 +311,10 @@ mod tests {
         save_provider_auth_at(&path, "openai-codex", &fresh_creds()).expect("save");
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(parsed.get("anthropic").is_some(), "must keep anthropic entry");
+        assert!(
+            parsed.get("anthropic").is_some(),
+            "must keep anthropic entry"
+        );
         assert!(parsed.get("openai-codex").is_some());
     }
 
@@ -252,8 +330,8 @@ mod tests {
         save_provider_auth_at(&path, "openai-codex", &fresh_creds())
             .expect("save must succeed even on corrupt input");
         let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .expect("file must now contain valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("file must now contain valid JSON");
         assert!(parsed.get("openai-codex").is_some());
         assert!(
             parsed.get("anthropic").is_none(),
@@ -274,6 +352,71 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(parsed.is_object());
         assert!(parsed.get("openai-codex").is_some());
+    }
+
+    // ── Broker-owned static-key storage ──────────────────────────────────────
+
+    /// Saving a static key must preserve existing OAuth entries (cross-provider
+    /// isolation at the storage layer), and vice versa.
+    #[test]
+    fn static_key_save_preserves_oauth_entries_and_roundtrips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        save_provider_auth_at(&path, "anthropic", &fresh_creds()).expect("save oauth");
+        save_static_key_at(&path, "groq", "gsk-secret-1").expect("save static key");
+
+        assert_eq!(
+            load_static_key_at(&path, "groq").unwrap().as_deref(),
+            Some("gsk-secret-1")
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["anthropic"]["refresh"], "r",
+            "OAuth entry must survive"
+        );
+        assert_eq!(parsed["groq"]["type"], "api_key");
+    }
+
+    /// An OAuth save must not disturb a broker-owned static key.
+    #[test]
+    fn oauth_save_preserves_static_key_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        save_static_key_at(&path, "openrouter", "sk-or-1").expect("save static key");
+        save_provider_auth_at(&path, "openai-codex", &fresh_creds()).expect("save oauth");
+        assert_eq!(
+            load_static_key_at(&path, "openrouter").unwrap().as_deref(),
+            Some("sk-or-1")
+        );
+    }
+
+    /// Static-key updates merge in place and keep unknown metadata on the entry.
+    #[test]
+    fn static_key_upsert_preserves_entry_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"groq":{"type":"api_key","key":"old","note":{"source":"migrated"}}}"#,
+        )
+        .unwrap();
+        save_static_key_at(&path, "groq", "new-key").expect("upsert");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["groq"]["key"], "new-key");
+        assert_eq!(parsed["groq"]["note"]["source"], "migrated");
+    }
+
+    /// Loading a static key from an OAuth entry must return None — the two
+    /// credential kinds never blur (cross-kind isolation).
+    #[test]
+    fn load_static_key_ignores_oauth_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        save_provider_auth_at(&path, "anthropic", &fresh_creds()).expect("save oauth");
+        assert_eq!(load_static_key_at(&path, "anthropic").unwrap(), None);
+        assert_eq!(load_static_key_at(&path, "missing").unwrap(), None);
     }
 
     // ── Bug #159 regression suite ────────────────────────────────────────────
@@ -305,8 +448,7 @@ mod tests {
             expires: 9_999_999_999_000,
             account_id: Some("acct_codex_123".to_string()),
         };
-        save_provider_auth_at(&path, "openai-codex", &codex_creds)
-            .expect("save openai-codex");
+        save_provider_auth_at(&path, "openai-codex", &codex_creds).expect("save openai-codex");
 
         // Step 2: user then runs `synaps login` (Anthropic Claude OAuth)
         let anthropic_creds = OAuthCredentials {
@@ -316,8 +458,7 @@ mod tests {
             expires: 9_999_999_999_000,
             account_id: None,
         };
-        save_provider_auth_at(&path, "anthropic", &anthropic_creds)
-            .expect("save anthropic");
+        save_provider_auth_at(&path, "anthropic", &anthropic_creds).expect("save anthropic");
 
         // Both providers must be present — bug #159 would wipe openai-codex here
         let content = std::fs::read_to_string(&path).unwrap();
@@ -358,8 +499,7 @@ mod tests {
             expires: 9_999_999_999_000,
             account_id: None,
         };
-        save_provider_auth_at(&path, "anthropic", &anthropic_creds)
-            .expect("save anthropic");
+        save_provider_auth_at(&path, "anthropic", &anthropic_creds).expect("save anthropic");
 
         // Step 2: user runs `synaps login --provider openai-codex`
         let codex_creds = OAuthCredentials {
@@ -369,8 +509,7 @@ mod tests {
             expires: 9_999_999_999_000,
             account_id: Some("acct_456".to_string()),
         };
-        save_provider_auth_at(&path, "openai-codex", &codex_creds)
-            .expect("save openai-codex");
+        save_provider_auth_at(&path, "openai-codex", &codex_creds).expect("save openai-codex");
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -397,36 +536,57 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
 
-        save_provider_auth_at(&path, "anthropic", &OAuthCredentials {
-            auth_type: "oauth".to_string(),
-            refresh: "anth-r".to_string(),
-            access: "anth-a".to_string(),
-            expires: 1,
-            account_id: None,
-        }).expect("save anthropic");
+        save_provider_auth_at(
+            &path,
+            "anthropic",
+            &OAuthCredentials {
+                auth_type: "oauth".to_string(),
+                refresh: "anth-r".to_string(),
+                access: "anth-a".to_string(),
+                expires: 1,
+                account_id: None,
+            },
+        )
+        .expect("save anthropic");
 
-        save_provider_auth_at(&path, "openai-codex", &OAuthCredentials {
-            auth_type: "oauth".to_string(),
-            refresh: "codex-r".to_string(),
-            access: "codex-a".to_string(),
-            expires: 1,
-            account_id: Some("acct_codex".to_string()),
-        }).expect("save openai-codex");
+        save_provider_auth_at(
+            &path,
+            "openai-codex",
+            &OAuthCredentials {
+                auth_type: "oauth".to_string(),
+                refresh: "codex-r".to_string(),
+                access: "codex-a".to_string(),
+                expires: 1,
+                account_id: Some("acct_codex".to_string()),
+            },
+        )
+        .expect("save openai-codex");
 
-        save_provider_auth_at(&path, "future-provider", &OAuthCredentials {
-            auth_type: "oauth".to_string(),
-            refresh: "future-r".to_string(),
-            access: "future-a".to_string(),
-            expires: 1,
-            account_id: None,
-        }).expect("save future-provider");
+        save_provider_auth_at(
+            &path,
+            "future-provider",
+            &OAuthCredentials {
+                auth_type: "oauth".to_string(),
+                refresh: "future-r".to_string(),
+                access: "future-a".to_string(),
+                expires: 1,
+                account_id: None,
+            },
+        )
+        .expect("save future-provider");
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         assert!(parsed.get("anthropic").is_some(), "anthropic must survive");
-        assert!(parsed.get("openai-codex").is_some(), "openai-codex must survive");
-        assert!(parsed.get("future-provider").is_some(), "future-provider must be present");
+        assert!(
+            parsed.get("openai-codex").is_some(),
+            "openai-codex must survive"
+        );
+        assert!(
+            parsed.get("future-provider").is_some(),
+            "future-provider must be present"
+        );
     }
 
     /// Upsert: saving the same provider twice updates the credential in place
@@ -436,21 +596,31 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
 
-        save_provider_auth_at(&path, "anthropic", &OAuthCredentials {
-            auth_type: "oauth".to_string(),
-            refresh: "old-refresh".to_string(),
-            access: "old-access".to_string(),
-            expires: 1,
-            account_id: None,
-        }).expect("initial save");
+        save_provider_auth_at(
+            &path,
+            "anthropic",
+            &OAuthCredentials {
+                auth_type: "oauth".to_string(),
+                refresh: "old-refresh".to_string(),
+                access: "old-access".to_string(),
+                expires: 1,
+                account_id: None,
+            },
+        )
+        .expect("initial save");
 
-        save_provider_auth_at(&path, "anthropic", &OAuthCredentials {
-            auth_type: "oauth".to_string(),
-            refresh: "new-refresh".to_string(),
-            access: "new-access".to_string(),
-            expires: 2,
-            account_id: None,
-        }).expect("upsert save");
+        save_provider_auth_at(
+            &path,
+            "anthropic",
+            &OAuthCredentials {
+                auth_type: "oauth".to_string(),
+                refresh: "new-refresh".to_string(),
+                access: "new-access".to_string(),
+                expires: 2,
+                account_id: None,
+            },
+        )
+        .expect("upsert save");
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
