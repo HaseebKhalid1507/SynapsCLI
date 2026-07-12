@@ -17,6 +17,7 @@ pub mod broker;
 mod browser;
 mod callback;
 pub mod cloud;
+pub mod cloud_login;
 mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;

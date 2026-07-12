@@ -6,19 +6,32 @@ use std::process::Command;
 use synaps_cli::{auth, config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthKind {
-    OAuth,
-    Cloud,
-    ApiKey,
+struct StaticProviderId(&'static str);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginTarget {
+    OAuth(auth::OAuthProviderId),
+    Cloud(auth::CloudProviderId),
+    Static(StaticProviderId),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LoginProvider {
-    key: &'static str,
+    target: LoginTarget,
     name: &'static str,
     description: &'static str,
-    auth_kind: AuthKind,
     recommended: bool,
+}
+
+impl LoginProvider {
+    fn key(self) -> &'static str {
+        match self.target {
+            LoginTarget::OAuth(auth::OAuthProviderId::Anthropic) => "claude",
+            LoginTarget::OAuth(id) => id.as_str(),
+            LoginTarget::Cloud(id) => id.as_str(),
+            LoginTarget::Static(StaticProviderId(key)) => key,
+        }
+    }
 }
 
 const LOGIN_BANNER: &[&str] = &[
@@ -30,7 +43,7 @@ const LOGIN_BANNER: &[&str] = &[
 ];
 const LOGIN_PICKER_PADDING: &str = "  ";
 
-pub async fn run(profile: Option<String>, provider_key: Option<String>) {
+pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Result<(), String> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
@@ -45,9 +58,9 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
                 eprintln!("error: unknown provider '{}'", key);
                 eprintln!("valid provider keys:");
                 for p in &providers {
-                    eprintln!("  {}", p.key);
+                    eprintln!("  {}", p.key());
                 }
-                std::process::exit(1);
+                return Err(format!("unknown provider '{}'", key));
             }
         }
     } else {
@@ -55,19 +68,23 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
             Ok(provider) => provider,
             Err(e) => {
                 eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-                std::process::exit(1);
+                return Err(e);
             }
         }
     };
 
-    match selected.auth_kind {
-        AuthKind::OAuth => run_oauth_login(selected, profile).await,
-        AuthKind::Cloud => run_cloud_login(selected, profile).await,
-        AuthKind::ApiKey => run_api_key_login(selected, profile),
+    match selected.target {
+        LoginTarget::OAuth(id) => run_oauth_login(selected, id, profile).await,
+        LoginTarget::Cloud(id) => run_cloud_login(selected, id, profile).await,
+        LoginTarget::Static(_) => run_api_key_login(selected, profile),
     }
 }
 
-async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
+async fn run_oauth_login(
+    provider: LoginProvider,
+    id: auth::OAuthProviderId,
+    profile: Option<String>,
+) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
@@ -85,10 +102,7 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
         }
     }
 
-    let result = match auth::provider::parse_cli_provider(provider.key) {
-        Ok(id) => auth::provider::login(id).await,
-        Err(_) => Err(format!("No OAuth login handler for {}", provider.name)),
-    };
+    let result = auth::provider::login(id).await;
 
     match result {
         Ok(creds) => {
@@ -97,455 +111,47 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
             eprintln!("  Expires: {}", format_expiry(creds.expires));
             eprintln!("\n  You can now use SynapsCLI.\n");
             continue_to_main_app(profile);
+            Ok(())
         }
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             eprintln!("  Please try again.\n");
-            std::process::exit(1);
+            Err(e)
         }
     }
 }
 
 fn oauth_storage_key(provider: LoginProvider) -> &'static str {
-    auth::provider::parse_cli_provider(provider.key)
-        .map(|id| id.as_str())
-        .unwrap_or(provider.key)
+    match provider.target {
+        LoginTarget::OAuth(id) => id.as_str(),
+        _ => provider.key(),
+    }
 }
 
-async fn run_cloud_login(provider: LoginProvider, profile: Option<String>) {
-    let result = match provider.key {
-        "aws-bedrock" => login_aws_bedrock().await,
-        "azure-openai" => login_azure_openai().await,
-        "google-vertex" => login_google_vertex().await,
-        _ => Err("cloud provider setup is unavailable".into()),
-    };
+async fn run_cloud_login(
+    provider: LoginProvider,
+    id: auth::CloudProviderId,
+    profile: Option<String>,
+) -> Result<(), String> {
+    let result = auth::cloud_login::login(id).await;
     match result {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ {} login successful\x1b[0m", provider.name);
             eprintln!("  Credentials saved to the broker credential store.");
             continue_to_main_app(profile);
+            Ok(())
         }
         Err(message) => {
             eprintln!(
                 "\n\x1b[31m✗ {} login failed: {}\x1b[0m",
                 provider.name, message
             );
-            std::process::exit(1);
+            Err(message)
         }
     }
 }
 
-fn required_env(name: &str) -> Result<String, String> {
-    std::env::var(name)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("missing {name}"))
-}
-
-async fn login_azure_openai() -> Result<(), String> {
-    use auth::azure_openai::{
-        device_code_request, refresh_request, AzureAudience, AzureRegistration,
-    };
-    let client_id = std::env::var("SYNAPS_AZURE_CLIENT_ID")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or("registration_required: configure SYNAPS_AZURE_CLIENT_ID")?;
-    let config = auth::AzureOpenAiConfig::new(
-        required_env("SYNAPS_AZURE_TENANT")?,
-        required_env("SYNAPS_AZURE_SUBSCRIPTION_ID")?,
-        required_env("SYNAPS_AZURE_RESOURCE_GROUP")?,
-        required_env("SYNAPS_AZURE_RESOURCE_NAME")?,
-        std::env::var("SYNAPS_AZURE_DEPLOYMENT").unwrap_or_else(|_| "default".into()),
-    )?;
-    let reg = AzureRegistration::production(Some(client_id.clone())).map_err(|e| e.to_string())?;
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
-    let req = device_code_request(&config, &reg).map_err(|e| e.to_string())?;
-    let d: serde_json::Value = http
-        .post(req.url)
-        .form(&req.form)
-        .send()
-        .await
-        .map_err(|_| "Azure device authorization failed")?
-        .json()
-        .await
-        .map_err(|_| "invalid Azure device response")?;
-    eprintln!(
-        "Open {} and enter code {}",
-        d["verification_uri"]
-            .as_str()
-            .unwrap_or("Microsoft sign-in"),
-        d["user_code"].as_str().unwrap_or("(provided by Microsoft)")
-    );
-    let device = d["device_code"]
-        .as_str()
-        .ok_or("invalid Azure device response")?;
-    let token_url = format!(
-        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-        config.tenant
-    );
-    let mut interval = d["interval"].as_u64().unwrap_or(5).max(1);
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(d["expires_in"].as_u64().unwrap_or(900).min(3600));
-    let arm = loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err("Azure device code expired".into());
-        }
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Err("Azure device authorization cancelled".into()),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-        }
-        let r = http
-            .post(&token_url)
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", device),
-            ])
-            .send()
-            .await
-            .map_err(|_| "Azure token polling failed")?;
-        let v: serde_json::Value = r.json().await.map_err(|_| "invalid Azure token response")?;
-        if v["access_token"].as_str().is_some() {
-            break v;
-        }
-        match v["error"].as_str() {
-            Some("authorization_pending") => {}
-            Some("slow_down") => interval += 5,
-            Some(e) => return Err(format!("Azure authorization failed: {e}")),
-            None => return Err("invalid Azure token response".into()),
-        }
-    };
-    let refresh = arm["refresh_token"]
-        .as_str()
-        .ok_or("Azure did not issue a refresh token")?
-        .to_owned();
-    let rr = refresh_request(&config, &reg, AzureAudience::Inference, &refresh)
-        .map_err(|e| e.to_string())?;
-    let infer: serde_json::Value = http
-        .post(rr.url)
-        .form(&rr.form)
-        .send()
-        .await
-        .map_err(|_| "Azure inference token failed")?
-        .json()
-        .await
-        .map_err(|_| "invalid Azure inference token")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    // Resolve the data-plane endpoint from ARM metadata before committing any
-    // state; never derive an authority from the user-supplied resource name.
-    let account_url = format!(
-        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}?api-version=2023-05-01",
-        config.subscription_id, config.resource_group, config.resource_name
-    );
-    let account: serde_json::Value = http
-        .get(account_url)
-        .bearer_auth(
-            arm["access_token"]
-                .as_str()
-                .ok_or("invalid Azure ARM token")?,
-        )
-        .send()
-        .await
-        .map_err(|_| "Azure ARM endpoint resolution failed")?
-        .error_for_status()
-        .map_err(|_| "Azure ARM resource validation failed")?
-        .json()
-        .await
-        .map_err(|_| "invalid Azure ARM resource metadata")?;
-    let endpoint = account
-        .pointer("/properties/endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or("Azure ARM metadata omitted the resource endpoint")?;
-    auth::azure_openai::AzureEndpoint::parse(endpoint)
-        .map_err(|_| "Azure ARM returned an untrusted resource endpoint")?;
-    // Validate the selected resource/deployment against ARM before replacing a
-    // prior login. This is deliberately before the sole persistence point.
-    let deployment_url = format!(
-        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version=2023-05-01",
-        config.subscription_id, config.resource_group, config.resource_name
-    );
-    let deployments: serde_json::Value = http
-        .get(deployment_url)
-        .bearer_auth(
-            arm["access_token"]
-                .as_str()
-                .ok_or("invalid Azure ARM token")?,
-        )
-        .send()
-        .await
-        .map_err(|_| "Azure catalog validation failed; prior login preserved")?
-        .error_for_status()
-        .map_err(|_| "Azure catalog validation failed; prior login preserved")?
-        .json()
-        .await
-        .map_err(|_| "invalid Azure deployment catalog")?;
-    let deployment_exists = deployments["value"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|d| d["name"].as_str() == Some(config.deployment.as_str()));
-    if !deployment_exists {
-        return Err("Azure deployment is absent from catalog; prior login preserved".into());
-    }
-    auth::save_cloud_state(
-        "azure-openai",
-        &serde_json::json!({"config":config,"client_id":client_id,"endpoint":endpoint,"refresh_token":infer["refresh_token"].as_str().unwrap_or(&refresh),"arm":{"access_token":arm["access_token"],"expires_at":now+arm["expires_in"].as_u64().unwrap_or(3600)*1000},"inference":{"access_token":infer["access_token"],"expires_at":now+infer["expires_in"].as_u64().unwrap_or(3600)*1000}}),
-    )
-}
-
-async fn login_google_vertex() -> Result<(), String> {
-    use base64::Engine;
-    use sha2::Digest;
-    let client_id = std::env::var("SYNAPS_VERTEX_CLIENT_ID")
-        .or_else(|_| std::env::var("SYNAPS_GOOGLE_VERTEX_CLIENT_ID"))
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or("registration_required: configure SYNAPS_VERTEX_CLIENT_ID")?;
-    let reg = auth::google_vertex::VertexRegistration::new(Some(&client_id))
-        .map_err(|e| e.to_string())?;
-    let config = auth::GoogleVertexConfig::new(
-        required_env("SYNAPS_VERTEX_PROJECT")?,
-        required_env("SYNAPS_VERTEX_LOCATION")?,
-    )?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let redirect = format!("http://127.0.0.1:{port}/oauth2callback");
-    let verifier =
-        uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(sha2::Sha256::digest(verifier.as_bytes()));
-    let state = uuid::Uuid::new_v4().simple().to_string();
-    let url = auth::google_vertex::build_authorize_url(&reg, &challenge, &state, &redirect)
-        .map_err(|e| e.to_string())?;
-    eprintln!("Open this URL to authorize Google Vertex:\n{url}");
-    let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut b = vec![0; 8192];
-    let n = socket.read(&mut b).await.map_err(|e| e.to_string())?;
-    let first = std::str::from_utf8(&b[..n])
-        .map_err(|_| "invalid OAuth callback")?
-        .lines()
-        .next()
-        .ok_or("invalid OAuth callback")?;
-    let target = first
-        .split_whitespace()
-        .nth(1)
-        .ok_or("invalid OAuth callback")?;
-    let u = url::Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|_| "invalid OAuth callback")?;
-    let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
-    if q.get("state") != Some(&state) {
-        return Err("OAuth state mismatch".into());
-    }
-    let code = q.get("code").ok_or("Google authorization denied")?;
-    socket
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nAuthorization complete.")
-        .await
-        .ok();
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
-    let v: serde_json::Value = http
-        .post(auth::google_vertex::TOKEN_URL)
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("code_verifier", verifier.as_str()),
-            ("redirect_uri", redirect.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|_| "Vertex token exchange failed")?
-        .json()
-        .await
-        .map_err(|_| "invalid Vertex token response")?;
-    let refresh = v["refresh_token"]
-        .as_str()
-        .ok_or("Google did not issue offline refresh access")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    // Validate access and context before the only commit, preserving old state
-    // on OAuth success followed by an unusable Vertex catalog.
-    let catalog_url = format!(
-        "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models?pageSize=1",
-        config.location, config.project_id, config.location
-    );
-    let catalog: serde_json::Value = http
-        .get(catalog_url)
-        .bearer_auth(
-            v["access_token"]
-                .as_str()
-                .ok_or("invalid Vertex token response")?,
-        )
-        .send()
-        .await
-        .map_err(|_| "Vertex catalog validation failed; prior login preserved")?
-        .error_for_status()
-        .map_err(|_| "Vertex catalog validation failed; prior login preserved")?
-        .json()
-        .await
-        .map_err(|_| "invalid Vertex model catalog")?;
-    if catalog["publisherModels"]
-        .as_array()
-        .map_or(true, |models| models.is_empty())
-    {
-        return Err("Vertex model catalog is empty; prior login preserved".into());
-    }
-    auth::save_cloud_state(
-        "google-vertex",
-        &serde_json::json!({"config":config,"client_id":client_id,"access_token":v["access_token"],"refresh_token":refresh,"expires_at":now+v["expires_in"].as_u64().unwrap_or(3600)*1000}),
-    )
-}
-
-async fn login_aws_bedrock() -> Result<(), String> {
-    use auth::aws_bedrock::{AwsApi, AwsHttpApi, TokenGrant};
-    let start = required_env("SYNAPS_AWS_SSO_START_URL")?;
-    let sso_region = required_env("SYNAPS_AWS_SSO_REGION")?;
-    let bedrock_region = required_env("SYNAPS_AWS_BEDROCK_REGION")?;
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "cannot initialize HTTPS client")?;
-    let api = AwsHttpApi::new(http.clone(), &sso_region);
-    let client = api
-        .register_client(&sso_region)
-        .await
-        .map_err(|e| e.to_string())?;
-    let device = api
-        .start_device_authorization(&client, &start)
-        .await
-        .map_err(|e| e.to_string())?;
-    eprintln!(
-        "Open {} and enter code {}",
-        device.verification_uri, device.user_code
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
-    let mut interval = device.interval.max(1);
-    let token = loop {
-        if std::time::Instant::now() >= deadline {
-            return Err("device authorization expired".into());
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        match api
-            .create_token(
-                &client,
-                &sso_region,
-                TokenGrant::DeviceCode(device.device_code()),
-            )
-            .await
-        {
-            Ok(token) => break token,
-            Err(auth::aws_bedrock::AwsError::AuthorizationPending) => {}
-            Err(auth::aws_bedrock::AwsError::SlowDown) => interval = interval.saturating_add(5),
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    let accounts = api
-        .list_accounts(&sso_region, token.access())
-        .await
-        .map_err(|e| e.to_string())?;
-    let account = choose(
-        "account",
-        accounts
-            .iter()
-            .map(|a| (a.id.as_str(), a.name.as_str()))
-            .collect(),
-        std::env::var("SYNAPS_AWS_ACCOUNT_ID").ok().as_deref(),
-    )?;
-    let roles = api
-        .list_account_roles(&sso_region, token.access(), &account)
-        .await
-        .map_err(|e| e.to_string())?;
-    let role = choose(
-        "role",
-        roles.iter().map(|r| (r.name.as_str(), "")).collect(),
-        std::env::var("SYNAPS_AWS_ROLE_NAME").ok().as_deref(),
-    )?;
-    let credentials = api
-        .get_role_credentials(&sso_region, token.access(), &account, &role)
-        .await
-        .map_err(|e| e.to_string())?;
-    let config = auth::AwsBedrockConfig::new(start, sso_region, account, role, bedrock_region)?;
-    // The login transaction is not committed until the selected Bedrock
-    // context can return a non-empty catalog. A failed relogin must leave the
-    // previously working credential untouched.
-    let validation = auth::aws_bedrock::AwsBedrockBroker::from_credentials(
-        auth::aws_bedrock::AwsHttpApi::new(http.clone(), &config.sso_region),
-        config.clone(),
-        auth::aws_bedrock::RoleCredentials::new(
-            credentials.access_key(),
-            credentials.secret_key(),
-            credentials.session_token(),
-            credentials.expires_at,
-        ),
-    );
-    validation
-        .catalog()
-        .await
-        .map_err(|_| "AWS Bedrock catalog validation failed; prior login preserved".to_string())?;
-    let state = serde_json::json!({
-        "config": config, "access_key": credentials.access_key(), "secret_key": credentials.secret_key(),
-        "session_token": credentials.session_token(), "expires_at": credentials.expires_at,
-        "registered_client": {"id": client.id(), "secret": client.secret(), "expires_at": client.expires_at},
-        "sso_access_token": token.access(), "sso_refresh_token": token.refresh(),
-        "sso_expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + token.expires_in * 1000
-    });
-    auth::save_cloud_state("aws-bedrock", &state)
-}
-
-fn choose(
-    kind: &str,
-    values: Vec<(&str, &str)>,
-    configured: Option<&str>,
-) -> Result<String, String> {
-    if let Some(want) = configured {
-        return values
-            .iter()
-            .find(|(id, _)| *id == want)
-            .map(|(id, _)| (*id).to_string())
-            .ok_or_else(|| format!("configured {kind} is not assigned"));
-    }
-    if values.len() == 1 {
-        return Ok(values[0].0.to_string());
-    }
-    if !io::stdin().is_terminal() {
-        return Err(format!(
-            "multiple {kind}s; set SYNAPS_AWS_{}",
-            if kind == "account" {
-                "ACCOUNT_ID"
-            } else {
-                "ROLE_NAME"
-            }
-        ));
-    }
-    eprintln!("Select {kind}:");
-    for (i, (id, label)) in values.iter().enumerate() {
-        eprintln!("  {}. {} {}", i + 1, id, label);
-    }
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    let i: usize = line.trim().parse().map_err(|_| "invalid selection")?;
-    values
-        .get(i.saturating_sub(1))
-        .map(|v| v.0.to_string())
-        .ok_or_else(|| "invalid selection".into())
-}
-
-fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
+fn run_api_key_login(provider: LoginProvider, profile: Option<String>) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
@@ -553,14 +159,14 @@ fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
     eprintln!("║  OpenAI-compatible endpoint          ║");
     eprintln!("╚══════════════════════════════════════╝");
 
-    let config_key = format!("provider.{}", provider.key);
-    if let Some(existing) = config::load_config().provider_keys.get(provider.key) {
+    let config_key = format!("provider.{}", provider.key());
+    if let Some(existing) = config::load_config().provider_keys.get(provider.key()) {
         if !existing.is_empty() {
             eprintln!(
                 "\n\x1b[33m⚠ API key already configured for {}.\x1b[0m",
                 provider.name
             );
-            eprintln!("  Continuing will replace provider.{}.\n", provider.key);
+            eprintln!("  Continuing will replace provider.{}.\n", provider.key());
         }
     }
 
@@ -572,18 +178,19 @@ fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
         Ok(api_key) => api_key,
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-            std::process::exit(1);
+            return Err(e);
         }
     };
 
     let api_key = api_key.trim();
     if api_key.is_empty() {
         eprintln!("\n\x1b[31m✗ Login failed: API key cannot be empty\x1b[0m");
-        std::process::exit(1);
+        return Err("API key cannot be empty".into());
     }
 
-    save_api_key(&config_key, provider, api_key);
+    save_api_key(&config_key, provider, api_key)?;
     continue_to_main_app(profile);
+    Ok(())
 }
 
 fn read_secret_line() -> Result<String, String> {
@@ -696,24 +303,25 @@ fn launch_main_app_or_exit(profile: Option<String>) -> ! {
     }
 }
 
-fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) {
+fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) -> Result<(), String> {
     // Static keys are broker-owned: persist into the broker's credential
     // store (auth.json, 0600, atomic merge write) rather than the plaintext
     // config file. Legacy `provider.<key>` config entries keep working via
     // broker-side discovery/migration.
-    match auth::save_static_key(provider.key, api_key) {
+    match auth::save_static_key(provider.key(), api_key) {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ API key saved!\x1b[0m");
-            eprintln!("  Provider: {}", provider.key);
+            eprintln!("  Provider: {}", provider.key());
             eprintln!(
                 "  Broker credential store: {}",
                 auth::auth_file_path().display()
             );
-            eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key);
+            eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key());
+            Ok(())
         }
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-            std::process::exit(1);
+            Err(e)
         }
     }
 }
@@ -722,7 +330,7 @@ fn find_provider(providers: &[LoginProvider], key: &str) -> Option<LoginProvider
     let key_lower = key.to_lowercase();
     providers
         .iter()
-        .find(|p| p.key.to_lowercase() == key_lower)
+        .find(|p| p.key().to_lowercase() == key_lower)
         .copied()
 }
 
@@ -732,14 +340,9 @@ fn login_providers() -> Vec<LoginProvider> {
     let mut providers: Vec<_> = oauth
         .into_iter()
         .map(|provider| LoginProvider {
-            key: if provider.id == auth::OAuthProviderId::Anthropic {
-                "claude"
-            } else {
-                provider.id.as_str()
-            },
+            target: LoginTarget::OAuth(provider.id),
             name: provider.display_name,
             description: provider.description,
-            auth_kind: AuthKind::OAuth,
             recommended: provider.recommended,
         })
         .collect();
@@ -748,14 +351,13 @@ fn login_providers() -> Vec<LoginProvider> {
         synaps_cli::auth::cloud::cloud_provider_descriptors()
             .iter()
             .map(|provider| LoginProvider {
-                key: provider.id.as_str(),
+                target: LoginTarget::Cloud(provider.id),
                 name: provider.display_name,
                 description: if provider.registration_required {
                     "typed broker OAuth (registration required)"
                 } else {
                     "IAM Identity Center + broker-side SigV4"
                 },
-                auth_kind: AuthKind::Cloud,
                 recommended: false,
             }),
     );
@@ -764,10 +366,9 @@ fn login_providers() -> Vec<LoginProvider> {
         synaps_cli::runtime::openai::registry::providers()
             .iter()
             .map(|provider| LoginProvider {
-                key: provider.key,
+                target: LoginTarget::Static(StaticProviderId(provider.key)),
                 name: provider.name,
                 description: "API key",
-                auth_kind: AuthKind::ApiKey,
                 recommended: false,
             }),
     );
@@ -842,7 +443,9 @@ fn filtered_provider_indices(providers: &[LoginProvider], query: &str) -> Vec<us
         .filter_map(|(idx, provider)| {
             let haystack = format!(
                 "{} {} {}",
-                provider.key, provider.name, provider.description
+                provider.key(),
+                provider.name,
+                provider.description
             )
             .to_lowercase();
             haystack.contains(&query).then_some(idx)
@@ -881,10 +484,10 @@ fn render_provider_picker(
         } else {
             ""
         };
-        let auth = match provider.auth_kind {
-            AuthKind::OAuth => "oauth",
-            AuthKind::Cloud => "cloud broker",
-            AuthKind::ApiKey => "api key",
+        let auth = match provider.target {
+            LoginTarget::OAuth(_) => "oauth",
+            LoginTarget::Cloud(_) => "cloud broker",
+            LoginTarget::Static(_) => "api key",
         };
         eprint!(
             "{}│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
@@ -943,9 +546,11 @@ mod tests {
     #[test]
     fn login_providers_include_all_typed_cloud_descriptors() {
         let providers = login_providers();
-        for key in ["azure-openai", "aws-bedrock", "google-vertex"] {
-            let provider = find_provider(&providers, key).expect("cloud descriptor missing");
-            assert_eq!(provider.auth_kind, AuthKind::Cloud);
+        for descriptor in auth::cloud::cloud_provider_descriptors() {
+            let provider = find_provider(&providers, descriptor.id.as_str())
+                .expect("cloud descriptor missing");
+            assert_eq!(provider.target, LoginTarget::Cloud(descriptor.id));
+            assert!(auth::cloud_login::supports_login(descriptor.id));
         }
     }
 
@@ -987,20 +592,24 @@ mod tests {
     fn login_providers_include_claude_oauth_first() {
         let providers = login_providers();
 
-        assert_eq!(providers[0].key, "claude");
-        assert_eq!(providers[0].auth_kind, AuthKind::OAuth);
+        assert_eq!(providers[0].key(), "claude");
+        assert_eq!(
+            providers[0].target,
+            LoginTarget::OAuth(auth::OAuthProviderId::Anthropic)
+        );
         assert!(providers[0].recommended);
         // Non-recommended OAuth providers follow; HashMap registry order is not stable.
         assert!(
-            providers
-                .iter()
-                .any(|p| p.key == "openai-codex" && p.auth_kind == AuthKind::OAuth),
+            providers.iter().any(|p| matches!(
+                p.target,
+                LoginTarget::OAuth(auth::OAuthProviderId::OpenAiCodex)
+            )),
             "openai-codex must remain in the OAuth login list"
         );
         assert!(
             providers
                 .iter()
-                .any(|p| p.key == "xai-auth" && p.auth_kind == AuthKind::OAuth),
+                .any(|p| matches!(p.target, LoginTarget::OAuth(auth::OAuthProviderId::Xai))),
             "xai-auth must remain in the OAuth login list"
         );
     }
@@ -1009,15 +618,12 @@ mod tests {
     fn login_providers_include_openai_compatible_api_key_entries() {
         let providers = login_providers();
 
-        assert!(
-            providers
-                .iter()
-                .any(|provider| provider.key == "openrouter"
-                    && provider.auth_kind == AuthKind::ApiKey)
-        );
         assert!(providers
             .iter()
-            .any(|provider| provider.key == "google" && provider.auth_kind == AuthKind::ApiKey));
+            .any(|provider| provider.key() == "openrouter"
+                && matches!(provider.target, LoginTarget::Static(_))));
+        assert!(providers.iter().any(|provider| provider.key() == "google"
+            && matches!(provider.target, LoginTarget::Static(_))));
     }
 
     #[test]
@@ -1026,8 +632,11 @@ mod tests {
         let found = find_provider(&providers, "openai-codex");
         assert!(found.is_some());
         let p = found.unwrap();
-        assert_eq!(p.key, "openai-codex");
-        assert_eq!(p.auth_kind, AuthKind::OAuth);
+        assert_eq!(p.key(), "openai-codex");
+        assert_eq!(
+            p.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::OpenAiCodex)
+        );
 
         // case-insensitive
         assert!(find_provider(&providers, "OpenAI-Codex").is_some());
@@ -1041,8 +650,11 @@ mod tests {
         let providers = login_providers();
         let found = find_provider(&providers, "github-copilot")
             .expect("descriptor-driven login must surface github-copilot");
-        assert_eq!(found.key, "github-copilot");
-        assert_eq!(found.auth_kind, AuthKind::OAuth);
+        assert_eq!(found.key(), "github-copilot");
+        assert_eq!(
+            found.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::GitHubCopilot)
+        );
         assert_eq!(found.name, "GitHub Copilot");
         assert!(!found.recommended);
         // Storage key is canonical, not the claude-style alias rewrite.
@@ -1062,8 +674,11 @@ mod tests {
         let providers = login_providers();
         let found = find_provider(&providers, "google-gemini")
             .expect("descriptor-driven login must surface google-gemini");
-        assert_eq!(found.key, "google-gemini");
-        assert_eq!(found.auth_kind, AuthKind::OAuth);
+        assert_eq!(found.key(), "google-gemini");
+        assert_eq!(
+            found.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::GoogleGemini)
+        );
         assert_eq!(found.name, "Google Gemini (Code Assist)");
         assert!(!found.recommended);
         // Storage key is canonical.
@@ -1071,7 +686,10 @@ mod tests {
         // The static Google AI Studio API-key entry stays reachable at "google".
         let ai_studio = find_provider(&providers, "google")
             .expect("Google AI Studio API-key entry must remain reachable");
-        assert_eq!(ai_studio.auth_kind, AuthKind::ApiKey);
+        assert_eq!(
+            ai_studio.target,
+            LoginTarget::Static(StaticProviderId("google"))
+        );
         // CLI aliases route to google-gemini except the reserved "google".
         assert_eq!(
             auth::provider::parse_cli_provider("gemini")

@@ -380,7 +380,8 @@ pub async fn run(
 /// Build the production auth-broker router with an injected typed cloud backend.
 /// This is the supported construction seam for unattended production-router tests;
 /// credentials and signing remain behind `CloudBackend`.
-pub fn build_router_with_cloud_backend(
+#[cfg(test)]
+fn build_router_with_cloud_backend(
     machine_token: Option<String>,
     backend: Arc<dyn auth::broker::CloudBackend>,
 ) -> Router {

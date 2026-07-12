@@ -12,14 +12,14 @@
     clippy::await_holding_lock,
     clippy::useless_format,
     clippy::cmp_owned,
-    clippy::items_after_test_module,
+    clippy::items_after_test_module
 )]
 
 use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
-mod watcher;
 mod cmd;
+mod watcher;
 
 #[derive(Parser)]
 #[command(
@@ -215,31 +215,87 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            tui::run(
+                cli.continue_session,
+                cli.system,
+                cli.profile,
+                cli.no_extensions,
+            )
+            .await?;
         }
-        Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
+        Some(Command::Chat {
+            continue_session,
+            system,
+            agent,
+            profile,
+            no_extensions,
+        }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
-        Some(Command::Server { port, host, system, continue_session, token, auto_approve_confirms, allowed_origins }) => {
-            cmd::server::run(port, host, system, continue_session, cli.profile, token, auto_approve_confirms, allowed_origins).await?;
+        Some(Command::Server {
+            port,
+            host,
+            system,
+            continue_session,
+            token,
+            auto_approve_confirms,
+            allowed_origins,
+        }) => {
+            cmd::server::run(
+                port,
+                host,
+                system,
+                continue_session,
+                cli.profile,
+                token,
+                auto_approve_confirms,
+                allowed_origins,
+            )
+            .await?;
         }
-        Some(Command::Agent { config, trigger_context }) => {
+        Some(Command::Agent {
+            config,
+            trigger_context,
+        }) => {
             cmd::agent::run(config, trigger_context).await;
         }
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
         Some(Command::Login { provider }) => {
-            cmd::login::run(cli.profile, provider).await;
+            cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
         Some(Command::Auth { action }) => match action {
-            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider).await,
+            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status) => {
-            cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            cmd::status::run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http }) => {
-            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http).await?;
+        Some(Command::AuthBroker {
+            bind,
+            machine_token,
+            machine_token_file,
+            insecure_no_auth,
+            tls_cert,
+            tls_key,
+            insecure_http,
+        }) => {
+            cmd::auth_broker::run(
+                bind,
+                machine_token,
+                machine_token_file,
+                insecure_no_auth,
+                tls_cert,
+                tls_key,
+                insecure_http,
+            )
+            .await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
@@ -250,11 +306,33 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
         }
-        Some(Command::Rpc { continue_id, system, model, profile }) => {
+        Some(Command::Rpc {
+            continue_id,
+            system,
+            model,
+            profile,
+        }) => {
             cmd::rpc::run(continue_id, system, model, profile).await?;
         }
-        Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
-            cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
+        Some(Command::Send {
+            message,
+            source,
+            severity,
+            channel,
+            content_type,
+            session,
+            broadcast,
+        }) => {
+            cmd::send::run(
+                message,
+                source,
+                severity,
+                channel,
+                content_type,
+                session,
+                broadcast,
+            )
+            .await?;
         }
     }
     Ok(())
