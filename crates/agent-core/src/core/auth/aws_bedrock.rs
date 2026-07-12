@@ -580,9 +580,104 @@ impl AwsApi for AwsHttpApi {
             },
         })
     }
-    async fn converse_stream(&self, _: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
-        Err(AwsError::Upstream)
+    async fn converse_stream(&self, q: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
+        let url = format!("https://{}{}", q.host, q.path);
+        let mut request = self.http.post(url).body(q.body);
+        for (name, value) in q.headers {
+            request = request.header(name, value);
+        }
+        let bytes = request
+            .send()
+            .await
+            .map_err(|_| AwsError::Upstream)?
+            .error_for_status()
+            .map_err(|_| AwsError::Upstream)?
+            .bytes()
+            .await
+            .map_err(|_| AwsError::Upstream)?;
+        decode_converse_stream(&bytes)
     }
+}
+
+/// Decode AWS EventStream frames returned by Bedrock ConverseStream. CRCs are
+/// validated before JSON is inspected, preventing truncated/corrupt frames from
+/// being interpreted as model output.
+pub fn decode_converse_stream(mut bytes: &[u8]) -> Result<Vec<ConverseEvent>, AwsError> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 16 {
+            return Err(AwsError::Upstream);
+        }
+        let total = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let headers = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if total < 16 || total > bytes.len() || headers > total - 16 {
+            return Err(AwsError::Upstream);
+        }
+        if crc32(&bytes[..8]) != u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+            || crc32(&bytes[..total - 4])
+                != u32::from_be_bytes(bytes[total - 4..total].try_into().unwrap())
+        {
+            return Err(AwsError::Upstream);
+        }
+        let payload = &bytes[12 + headers..total - 4];
+        let value: serde_json::Value =
+            serde_json::from_slice(payload).map_err(|_| AwsError::Upstream)?;
+        if let Some(delta) = value
+            .pointer("/contentBlockDelta/delta/text")
+            .and_then(|v| v.as_str())
+        {
+            out.push(ConverseEvent::TextDelta(delta.to_owned()));
+        } else if let Some(delta) = value
+            .pointer("/contentBlockDelta/delta/toolUse/input")
+            .and_then(|v| v.as_str())
+        {
+            let id = value
+                .pointer("/contentBlockDelta/delta/toolUse/toolUseId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            out.push(ConverseEvent::ToolArguments {
+                id: id.to_owned(),
+                delta: delta.to_owned(),
+            });
+        } else if let Some(usage) = value.get("metadata").and_then(|v| v.get("usage")) {
+            out.push(ConverseEvent::Usage(Usage {
+                input_tokens: usage
+                    .get("inputTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                output_tokens: usage
+                    .get("outputTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            }));
+        } else if value.get("messageStop").is_some() {
+            out.push(ConverseEvent::Done);
+        } else if value.get("internalServerException").is_some()
+            || value.get("modelStreamErrorException").is_some()
+        {
+            return Err(AwsError::Upstream);
+        }
+        bytes = &bytes[total..];
+    }
+    if !matches!(out.last(), Some(ConverseEvent::Done)) {
+        out.push(ConverseEvent::Done);
+    }
+    Ok(out)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 impl AwsHttpApi {
     async fn send_signed(&self, q: SignedRequest) -> Result<serde_json::Value, AwsError> {
