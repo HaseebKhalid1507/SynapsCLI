@@ -265,6 +265,7 @@ pub struct GroqCatalogProvider;
 pub struct NvidiaCatalogProvider;
 pub struct AnthropicCatalogProvider;
 pub struct CodexCatalogProvider;
+pub struct XaiCatalogProvider;
 pub struct GenericCatalogProvider;
 
 pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProvider {
@@ -274,6 +275,7 @@ pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProv
         "nvidia" => &NvidiaCatalogProvider,
         "claude" | "anthropic" => &AnthropicCatalogProvider,
         "openai-codex" => &CodexCatalogProvider,
+        "xai-auth" => &XaiCatalogProvider,
         _ => &GenericCatalogProvider,
     }
 }
@@ -403,6 +405,19 @@ impl ModelCatalogProvider for CodexCatalogProvider {
         _client: &'a reqwest::Client,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { Ok(codex_static_catalog_models()) })
+    }
+}
+
+impl ModelCatalogProvider for XaiCatalogProvider {
+    fn provider_key(&self) -> &'static str {
+        "xai-auth"
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(xai_static_catalog_models()) })
     }
 }
 
@@ -560,6 +575,17 @@ mod tests {
         assert!(p.has_internal_reasoning_cost());
     }
 
+    #[tokio::test]
+    async fn ui_catalog_fetch_includes_xai_static_models() {
+        let models = fetch_catalog_models(&reqwest::Client::new(), "xai-auth")
+            .await
+            .expect("static xAI catalog");
+        assert_eq!(models, xai_static_catalog_models());
+        assert!(models
+            .iter()
+            .all(|model| model.runtime_id().starts_with("xai-auth/")));
+    }
+
     #[test]
     fn catalog_provider_trait_dispatch_selects_specialized_handlers() {
         assert_eq!(
@@ -573,6 +599,7 @@ mod tests {
             catalog_provider_for("openai-codex").provider_key(),
             "openai-codex"
         );
+        assert_eq!(catalog_provider_for("xai-auth").provider_key(), "xai-auth");
         assert_eq!(catalog_provider_for("cerebras").provider_key(), "generic");
     }
 

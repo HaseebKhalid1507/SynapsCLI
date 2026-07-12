@@ -465,6 +465,7 @@ mod tests {
         assert!(resolve_route("unknown-provider/model").is_none());
         assert!(resolve_route("xai-auth/not-a-real-model").is_none());
         assert!(resolve_route("xai-auth/grok-build-0.1").is_none());
+        assert!(resolve_route("xai-auth/grok-build-latest").is_none());
         assert!(resolve_route("xai-auth/grok-imagine-image").is_none());
     }
 

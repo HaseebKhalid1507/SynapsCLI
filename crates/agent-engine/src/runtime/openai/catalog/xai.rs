@@ -1,10 +1,10 @@
-//! Authoritative xAI text/Responses catalog.
+//! Selectable xAI model IDs documented for public text/Responses use.
 //!
-//! Aliases are kept as first-class selectable IDs because xAI documents them as
-//! valid model IDs. `grok-build-0.1` is deliberately excluded: the models page
-//! lists it as a code model, but the available evidence does not establish that
-//! it supports the public Responses API used by this runtime. Image, video, and
-//! voice models are likewise outside this text runtime.
+//! This is a conservative allowlist, not an exhaustive xAI model list. Aliases
+//! are first-class selectable IDs when xAI documents them as valid model IDs.
+//! Build/code and image, video, and voice models are excluded because the
+//! available public documentation does not establish public Responses support
+//! for this text runtime.
 
 use super::{
     CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport,
@@ -67,12 +67,6 @@ pub const XAI_TEXT_MODELS: &[XaiModelDescriptor] = &[
         context_tokens: None,
         reasoning: true,
     },
-    XaiModelDescriptor {
-        id: "grok-build-latest",
-        label: "Grok Build (latest alias)",
-        context_tokens: None,
-        reasoning: true,
-    },
 ];
 
 pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
@@ -109,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_documented_responses_text_ids_are_exposed() {
+    fn documented_selectable_public_responses_text_ids_are_exposed() {
         assert_eq!(
             XAI_TEXT_MODELS.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![
@@ -121,7 +115,27 @@ mod tests {
                 "grok-4.20-multi-agent-0309",
                 "grok-4.5",
                 "grok-4.5-latest",
-                "grok-build-latest",
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_metadata_is_limited_to_documented_reasoning_models() {
+        let reasoning_ids = xai_static_catalog_models()
+            .into_iter()
+            .filter(|model| model.reasoning != ReasoningSupport::None)
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasoning_ids,
+            vec![
+                "grok-4.3",
+                "grok-4.3-latest",
+                "grok-latest",
+                "grok-4.20-0309-reasoning",
+                "grok-4.20-multi-agent-0309",
+                "grok-4.5",
+                "grok-4.5-latest",
             ]
         );
     }
@@ -133,6 +147,7 @@ mod tests {
             .iter()
             .all(|m| m.input_modalities == vec![Modality::Text]));
         assert!(!models.iter().any(|m| m.id == "grok-build-0.1"));
+        assert!(!models.iter().any(|m| m.id == "grok-build-latest"));
         assert!(!models.iter().any(|m| ["image", "video", "voice"]
             .iter()
             .any(|kind| m.id.contains(kind))));
