@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, EventDisposition, AUTO_TURN_CAP};
+use synaps_cli::engine::reactor::{claim_auto_turn, drain_event_queue, wake_action, WakeAction, EventDisposition, AUTO_TURN_CAP};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
@@ -436,21 +436,10 @@ pub(super) async fn handle_stream_arm(
                             drop(cancel_token.take());
                             drop(steer_tx.take());
 
-                            // Issue 5 fix: enforce counter/cap identical to the
-                            // EventWake → RunTurn path in handle_event_arm.
-                            // wake_action already checked the cap before emitting
-                            // AutoTriggerEvents, but we increment here to track
-                            // this continuation turn so subsequent events see the
-                            // correct counter.
-                            app.consecutive_auto_turns += 1;
-                            if app.consecutive_auto_turns >= AUTO_TURN_CAP {
-                                app.push_msg(ChatMessage::System(format!(
-                                    "auto-turn cap reached ({} consecutive) — waiting for your input",
-                                    AUTO_TURN_CAP
-                                )));
-                                app.invalidate();
-                                // Do NOT spawn a new stream — park at prompt.
-                            } else {
+                            // Use the central claim_auto_turn gate: allows turns 1-5
+                            // (counter < CAP), denies the 6th (counter == CAP).
+                            // Increment happens inside claim on success — no inline +=.
+                            if claim_auto_turn(&mut app.consecutive_auto_turns) {
                                 let ct = CancellationToken::new();
                                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 app.streaming = true;
@@ -459,6 +448,12 @@ pub(super) async fn handle_stream_arm(
                                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                                 *cancel_token = Some(ct);
                                 *steer_tx = Some(s_tx);
+                            } else {
+                                app.push_msg(ChatMessage::System(format!(
+                                    "auto-turn cap reached ({} consecutive) — waiting for your input",
+                                    AUTO_TURN_CAP
+                                )));
+                                app.invalidate();
                             }
                         }
                     }
