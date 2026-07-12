@@ -236,6 +236,12 @@ fn sigv4_is_deterministic_and_secret_safe() {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-west-2/bedrock/aws4_request"
     ));
     assert_eq!(r.header("x-amz-security-token"), Some("token"));
+    assert_eq!(
+        r.header("authorization").unwrap(),
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-west-2/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=067f29cba0db54a62f64051ba66eb4e321a6ac6a347753a2cc5041dca178cdc7"
+    );
+    // Independently computed fixture following AWS IAM's documented SigV4
+    // derivation: https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
     assert_eq!(r.host, "bedrock-runtime.us-west-2.amazonaws.com");
     let control = sign_bedrock_request(
         "us-west-2",
@@ -249,4 +255,69 @@ fn sigv4_is_deterministic_and_secret_safe() {
     assert_eq!(control.host, "bedrock.us-west-2.amazonaws.com");
     let debug = format!("{creds:?}");
     assert!(!debug.contains("secret") && !debug.contains("token"));
+}
+
+fn test_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn event_frame(headers: &[(&str, u8, &str)], payload: &str) -> Vec<u8> {
+    let mut hs = Vec::new();
+    for (name, ty, value) in headers {
+        hs.push(name.len() as u8);
+        hs.extend_from_slice(name.as_bytes());
+        hs.push(*ty);
+        hs.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        hs.extend_from_slice(value.as_bytes());
+    }
+    let total = 16 + hs.len() + payload.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&(hs.len() as u32).to_be_bytes());
+    let prelude_crc = test_crc32(&out);
+    out.extend_from_slice(&prelude_crc.to_be_bytes());
+    out.extend_from_slice(&hs);
+    out.extend_from_slice(payload.as_bytes());
+    let message_crc = test_crc32(&out);
+    out.extend_from_slice(&message_crc.to_be_bytes());
+    out
+}
+
+#[test]
+fn eventstream_headers_exceptions_and_malformed_frames_fail_closed() {
+    let base = [
+        (":message-type", 7, "event"),
+        (":event-type", 7, "messageStop"),
+        (":content-type", 7, "application/json"),
+    ];
+    assert!(decode_converse_stream(&event_frame(&base, r#"{"messageStop":{}}"#)).is_ok());
+
+    let missing = &base[..2];
+    assert!(decode_converse_stream(&event_frame(missing, r#"{"messageStop":{}}"#)).is_err());
+    let duplicate = [base[0], base[0], base[1], base[2]];
+    assert!(decode_converse_stream(&event_frame(&duplicate, r#"{"messageStop":{}}"#)).is_err());
+    let wrong_type = [(":message-type", 6, "event"), base[1], base[2]];
+    assert!(decode_converse_stream(&event_frame(&wrong_type, r#"{"messageStop":{}}"#)).is_err());
+    let mismatch = [base[0], (":event-type", 7, "metadata"), base[2]];
+    assert!(decode_converse_stream(&event_frame(&mismatch, r#"{"messageStop":{}}"#)).is_err());
+    let exception = [
+        (":message-type", 7, "exception"),
+        (":exception-type", 7, "internalServerException"),
+        base[2],
+    ];
+    assert!(decode_converse_stream(&event_frame(
+        &exception,
+        r#"{"internalServerException":{"message":"no"}}"#,
+    ))
+    .is_err());
+    let mut malformed = event_frame(&base, r#"{"messageStop":{}}"#);
+    malformed[0] ^= 1;
+    assert!(decode_converse_stream(&malformed).is_err());
 }

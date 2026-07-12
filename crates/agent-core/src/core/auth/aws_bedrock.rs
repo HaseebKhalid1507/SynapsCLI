@@ -805,43 +805,12 @@ pub fn decode_converse_stream(mut bytes: &[u8]) -> Result<Vec<ConverseEvent>, Aw
         {
             return Err(AwsError::Upstream);
         }
-        let payload = &bytes[12 + headers..total - 4];
-        let value: serde_json::Value =
-            serde_json::from_slice(payload).map_err(|_| AwsError::Upstream)?;
-        if let Some(delta) = value
-            .pointer("/contentBlockDelta/delta/text")
-            .and_then(|v| v.as_str())
-        {
-            out.push(ConverseEvent::TextDelta(delta.to_owned()));
-        } else if let Some(delta) = value
-            .pointer("/contentBlockDelta/delta/toolUse/input")
-            .and_then(|v| v.as_str())
-        {
-            let id = value
-                .pointer("/contentBlockDelta/delta/toolUse/toolUseId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            out.push(ConverseEvent::ToolArguments {
-                id: id.to_owned(),
-                delta: delta.to_owned(),
-            });
-        } else if let Some(usage) = value.get("metadata").and_then(|v| v.get("usage")) {
-            out.push(ConverseEvent::Usage(Usage {
-                input_tokens: usage
-                    .get("inputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                output_tokens: usage
-                    .get("outputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-            }));
-        } else if value.get("messageStop").is_some() {
-            out.push(ConverseEvent::Done);
-        } else if value.get("internalServerException").is_some()
-            || value.get("modelStreamErrorException").is_some()
-        {
-            return Err(AwsError::Upstream);
+        match decode_event_frame(&bytes[..total])? {
+            Some(ConverseEvent::Done) if out.iter().any(|e| matches!(e, ConverseEvent::Done)) => {
+                return Err(AwsError::Upstream);
+            }
+            Some(event) => out.push(event),
+            None => {}
         }
         bytes = &bytes[total..];
     }
