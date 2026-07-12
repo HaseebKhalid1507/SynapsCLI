@@ -58,6 +58,9 @@ pub enum WireProtocol {
     OpenAiChatCompletions,
     OpenAiResponses,
     CodexResponses,
+    /// Google Gemini Code Assist v1internal:streamGenerateContent envelope.
+    /// Broker-proxied only.
+    GoogleGeminiCodeAssist,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoute {
@@ -88,6 +91,19 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 provider: prefix.into(),
                 auth: AuthPolicy::BrokerProxy,
                 wire: descriptor,
+            });
+        }
+        if prefix == "google-gemini" {
+            // Broker-proxied only: broker owns the Google OAuth access token
+            // and pins cloudcode-pa.googleapis.com. Wire IDs are limited to
+            // the conservative catalog.
+            catalog::google_gemini_model(rest)?;
+            return Some(ResolvedRoute {
+                endpoint: crate::auth::broker::GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::GoogleGeminiCodeAssist,
             });
         }
         if prefix == "openai-codex" {
@@ -448,6 +464,11 @@ pub async fn try_route(
             .await,
         ),
         WireProtocol::AnthropicMessages => None,
+        // The Gemini Code Assist wire is dispatched by the broker-proxied
+        // stream builder below, not the OpenAI-style branches. `None` here
+        // is the correct signal for callers that only speak OpenAI-shaped
+        // stream translation.
+        WireProtocol::GoogleGeminiCodeAssist => None,
     }
 }
 
@@ -485,6 +506,30 @@ mod tests {
         assert!(resolve_route("xai-auth/grok-build-0.1").is_none());
         assert!(resolve_route("xai-auth/grok-build-latest").is_none());
         assert!(resolve_route("xai-auth/grok-imagine-image").is_none());
+
+        // ── google-gemini: broker-proxy only, conservative catalog ──────────
+        for id in ["gemini-2.5-pro", "gemini-2.5-flash"] {
+            let route = resolve_route(&format!("google-gemini/{id}")).unwrap();
+            assert_eq!(route.provider, "google-gemini");
+            assert_eq!(route.model, id);
+            assert_eq!(route.endpoint, "https://cloudcode-pa.googleapis.com");
+            assert_eq!(route.auth, AuthPolicy::BrokerProxy);
+            assert_eq!(route.wire, WireProtocol::GoogleGeminiCodeAssist);
+        }
+        // Unverified / preview IDs must not resolve.
+        for banned in [
+            "gemini-3-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+            "auto-gemini-2.5",
+            "text-embedding-004",
+            "gemini-2.5", // family prefix is not a wire id
+        ] {
+            assert!(
+                resolve_route(&format!("google-gemini/{banned}")).is_none(),
+                "{banned} must not resolve"
+            );
+        }
     }
 
     #[test]
