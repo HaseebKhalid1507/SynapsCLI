@@ -529,8 +529,15 @@ mod tests {
         assert_eq!(providers[0].key, "claude");
         assert_eq!(providers[0].auth_kind, AuthKind::OAuth);
         assert!(providers[0].recommended);
-        assert_eq!(providers[1].key, "openai-codex");
-        assert_eq!(providers[1].auth_kind, AuthKind::OAuth);
+        // Non-recommended OAuth providers follow; HashMap registry order is not stable.
+        assert!(
+            providers.iter().any(|p| p.key == "openai-codex" && p.auth_kind == AuthKind::OAuth),
+            "openai-codex must remain in the OAuth login list"
+        );
+        assert!(
+            providers.iter().any(|p| p.key == "xai-auth" && p.auth_kind == AuthKind::OAuth),
+            "xai-auth must remain in the OAuth login list"
+        );
     }
 
     #[test]
@@ -562,5 +569,24 @@ mod tests {
 
         // unknown key returns None
         assert!(find_provider(&providers, "totally-bogus-xyz").is_none());
+    }
+
+    #[test]
+    fn login_providers_include_github_copilot_from_descriptor() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "github-copilot")
+            .expect("descriptor-driven login must surface github-copilot");
+        assert_eq!(found.key, "github-copilot");
+        assert_eq!(found.auth_kind, AuthKind::OAuth);
+        assert_eq!(found.name, "GitHub Copilot");
+        assert!(!found.recommended);
+        // Storage key is canonical, not the claude-style alias rewrite.
+        assert_eq!(oauth_storage_key(found), "github-copilot");
+        // CLI aliases resolve through parse_cli_provider; picker key stays canonical.
+        assert!(find_provider(&providers, "copilot").is_none());
+        assert_eq!(
+            auth::provider::parse_cli_provider("copilot").unwrap().as_str(),
+            "github-copilot"
+        );
     }
 }
