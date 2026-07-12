@@ -32,6 +32,7 @@ use synaps_cli::{
         accumulate_usage, build_user_content, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES,
     },
     engine::setup::{self, EngineOpts},
+    engine::reactor::{drain_event_queue, event_payload_from_drained},
 };
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 
@@ -61,6 +62,9 @@ struct RpcState {
     total_output_tokens: u64,
     session_cost: f64,
     in_flight: Option<InFlight>,
+    /// Events buffered while streaming is in flight. Flushed as `Event` frames
+    /// when the turn completes (Done path), then injected for the next turn.
+    pending_events: Vec<String>,
 }
 
 impl RpcState {
@@ -101,6 +105,12 @@ fn encode_event(ev: &RpcEvent) -> String {
         tracing::error!(error = %e, "BUG: failed to serialise RpcEvent");
         format!(r#"{{"type":"error","message":"internal serialisation error: {e}"}}"#)
     })
+}
+
+/// Generate a UUID v4 string — used for synthesised EventPayload ids when the
+/// original DrainedEvent metadata is not available (buffered-event flush path).
+fn uuid_v4_simple() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 // ─── Writer task ──────────────────────────────────────────────────────────────
@@ -185,6 +195,36 @@ async fn spawn_prompt(
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
+                    // Flush events buffered while streaming was active.
+                    // Lock briefly to drain pending_events; release before sends.
+                    let buffered: Vec<String> = {
+                        let mut st = state.lock().await;
+                        let to_inject = std::mem::take(&mut st.pending_events);
+                        // Inject buffered events into messages for the next turn.
+                        for formatted in &to_inject {
+                            st.api_messages.push(std::sync::Arc::new(
+                                serde_json::json!({"role": "user", "content": formatted})
+                            ));
+                        }
+                        to_inject
+                    };
+                    // Forward buffered events as Event frames (client can follow up).
+                    for formatted in buffered {
+                        // Re-build a minimal EventPayload from the formatted string.
+                        // (Full DrainedEvent is not available here — just the string.)
+                        let ev_frame = RpcEvent::Event {
+                            payload: synaps_cli::core::rpc_protocol::EventPayload {
+                                id: uuid_v4_simple(),
+                                source: "buffered".into(),
+                                severity: "medium".into(),
+                                content_type: "message".into(),
+                                text: formatted.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                formatted,
+                            },
+                        };
+                        let _ = wtx.send(ev_frame).await;
+                    }
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
@@ -661,11 +701,65 @@ pub async fn run(
         total_output_tokens: initial_out,
         session_cost: initial_cost,
         in_flight: None,
+        pending_events: Vec::new(),
     }));
 
     // 5. Spawn the writer task that owns stdout.
     let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
     let writer_handle = spawn_writer(writer_rx);
+
+    // 6. Spawn the exactly-one event-drainer task.
+    //
+    // Policy (per RECON §RPC):
+    //   * Never auto-turn. Forward Event frames always. Client decides.
+    //   * Idle: drain → inject into api_messages + forward Event frames.
+    //   * Busy: drain → buffer in pending_events (flushed at Done).
+    //   * Backpressure: writer channel cap 256 already limits burst.
+    //   * No async mutex held across awaits — we lock, snapshot/mutate,
+    //     release, then send frames.
+    {
+        let state_d = Arc::clone(&state);
+        let writer_d = writer_tx.clone();
+        tokio::spawn(async move {
+            // Snapshot the event queue handle ONCE (Arc clone, cheap).
+            let eq = {
+                let st = state_d.lock().await;
+                st.runtime.event_queue().clone()
+            };
+            loop {
+                // Wait for at least one event (notify_one pattern).
+                eq.notified().await;
+
+                // Drain without holding the mutex across the await above.
+                // Lock briefly: snapshot busy flag + drain + mutate messages/pending.
+                let frames: Vec<RpcEvent> = {
+                    let mut st = state_d.lock().await;
+                    let busy = st.is_streaming();
+                    // Split borrows explicitly to satisfy the borrow checker.
+                    let RpcState { ref mut api_messages, ref mut pending_events, .. } = *st;
+                    let drained = drain_event_queue(
+                        &eq,
+                        api_messages,
+                        pending_events,
+                        busy,
+                        None, // RPC has no steer channel
+                    );
+                    drained
+                        .iter()
+                        .map(|d| RpcEvent::Event { payload: event_payload_from_drained(d) })
+                        .collect()
+                }; // mutex released here
+
+                // Forward ALL Event frames through the writer channel.
+                for frame in frames {
+                    if writer_d.send(frame).await.is_err() {
+                        tracing::warn!("rpc: event drainer: writer channel closed — exiting drainer");
+                        return;
+                    }
+                }
+            }
+        });
+    }
 
     // 9. Emit Ready — guaranteed to be the first byte on stdout.
     writer_tx
