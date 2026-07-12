@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="engplan-schema" content="engplan/1">
+<title>Scalable OAuth Registry + Grok xAI Integration</title>
+<link rel="stylesheet" href="/_assets/plan.css">
+<script defer src="/_assets/engplan.js"></script>
+<script defer src="/_assets/md.js"></script>
+<script defer src="/_assets/sanitize.js"></script>
+<script defer src="/_assets/plan.js"></script>
+<script>window.addEventListener("error",function(){},true);</script>
+</head>
+<body>
+<script id="plan" type="application/json">
+{
+  "schema": "engplan/1",
+  "kind": "plan",
+  "slug": "grok-xai-oauth",
+  "title": "Scalable OAuth Registry + Grok xAI Integration",
+  "status": "drafting",
+  "convergence": "holdout",
+  "convergence_config": {
+    "threshold": 0.85,
+    "axis_weights": {
+      "correctness": 0.3,
+      "security": 0.3,
+      "architecture_type_invariants": 0.2,
+      "readability": 0.1,
+      "performance": 0.1
+    },
+    "max_fix_iterations": 2,
+    "max_total_calls": 10
+  },
+  "checkpoints": [
+    "checkpoint-1",
+    "checkpoint-2",
+    "checkpoint-3",
+    "checkpoint-4"
+  ],
+  "created_at": "2026-07-12T02:59:58.033Z",
+  "updated_at": "2026-07-12T03:02:10.975240Z",
+  "sections": [
+    {
+      "id": "objective",
+      "heading": "Objective",
+      "type": "prose",
+      "md": "Add xAI/Grok OAuth while replacing scattered string-based OAuth dispatch with a typed registry that remains coherent at seven or more providers. Deliver `xai-auth/grok-4.5` login, refresh, local/remote credential resolution, broker vending, and verified runtime routing without changing Anthropic or OpenAI Codex behavior."
+    },
+    {
+      "id": "scope",
+      "heading": "Scope and non-goals",
+      "type": "prose",
+      "md": "**In scope:** typed provider identity; provider descriptors/behavior; Anthropic and Codex migration; xAI OIDC login/refresh; broker and runtime auth integration; one verified xAI model/wire path; headless harness. **Deferred:** every model from the reference package, xAI custom tools, CLI-only Composer/Build routing, and automatic `~/.grok/auth.json` import. Those require separate evidence and slices."
+    },
+    {
+      "id": "architecture",
+      "heading": "Target architecture",
+      "type": "prose",
+      "md": "Separate three dimensions that are currently conflated: **OAuth behavior** (`login`, `refresh`, credential metadata), **authentication policy** (API key, local OAuth, remote broker), and **wire protocol** (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Codex backend). A single typed OAuth registry is the source for login UI, refresh dispatch, storage key, and broker capability. Runtime model descriptors reference an auth policy and wire protocol rather than growing one route variant per vendor."
+    },
+    {
+      "id": "provider-contract",
+      "heading": "Provider contract and invariants",
+      "type": "prose",
+      "md": "Introduce `OAuthProviderId` and an `OAuthProvider` contract/descriptor. Canonical IDs are `anthropic`, `openai-codex`, and `xai-auth`; CLI alias `claude` resolves only at the input boundary. Registry startup/tests reject duplicate IDs and invalid cross-references. Credentials retain common token fields plus validated provider-owned metadata rather than accumulating optional vendor fields. Unknown auth-file entries remain round-trippable. Refresh persistence remains atomic and merge-based."
+    },
+    {
+      "id": "xai-protocol",
+      "heading": "Confirmed xAI protocol",
+      "type": "prose",
+      "md": "Use issuer `https://auth.x.ai`, discovery `https://auth.x.ai/.well-known/openid-configuration`, public native client ID `b1a00492-073a-47ea-816f-4c329264a828`, scopes `openid profile email offline_access grok-cli:access api:access`, redirect `http://127.0.0.1:56121/callback`, PKCE S256, random `state` and OIDC `nonce`. Discovery endpoints must be HTTPS and hosted by `x.ai` or a subdomain before code/refresh-token POSTs. Persist under `xai-auth`; preserve an old refresh token if refresh omits a replacement."
+    },
+    {
+      "id": "dependency-graph",
+      "heading": "Dependency graph",
+      "type": "prose",
+      "md": "`typed IDs + registry contract` \u2192 `Anthropic/Codex registry migration` \u2192 (`xAI auth slice`, `auth-policy/runtime route contract`) \u2192 `xAI request path` \u2192 `CLI/broker integration` \u2192 `headless E2E harness` \u2192 `full verification + adversarial review`. Storage and callback hardening support all provider slices. Runtime protocol selection depends on the route contract, not on login UI."
+    },
+    {
+      "id": "convergence-policy",
+      "heading": "Convergence and execution policy",
+      "type": "prose",
+      "md": "**Mode: holdout** because OAuth handles long-lived secrets and affects remote broker boundaries. Fixed before implementation: threshold **0.85**; axis weights **correctness 0.30, security 0.30, architecture/type invariants 0.20, readability 0.10, performance 0.10**; maximum fix iterations **2**; maximum total calls **10**. Coder subagents work in dedicated worktrees with an explicit agent/system prompt and inherit the session model unless an override is recorded. Independent oracle authors do not see builder tests before freezing adversarial properties."
+    },
+    {
+      "id": "task-01",
+      "heading": "T1 \u2014 Freeze typed provider and credential contracts",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Define IDs, descriptors, auth capabilities, provider-specific metadata boundaries, registry validation, and compatibility aliases before moving behavior.",
+      "acceptance": [
+        "`OAuthProviderId` eliminates raw provider strings at internal dispatch boundaries",
+        "Registry rejects duplicate IDs and model/auth references to missing providers",
+        "Existing auth.json fixtures deserialize and unknown provider entries survive writes"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::provider",
+        "cargo check --workspace"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "task-02",
+      "heading": "T2 \u2014 Migrate Anthropic behind the provider contract",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Move Anthropic-specific constants/login/refresh out of `auth/mod.rs` into a provider module while retaining shared PKCE, callback, storage, and public compatibility functions.",
+      "acceptance": [
+        "Claude login and refresh are invoked through the registry",
+        "`claude` CLI alias maps to canonical storage ID `anthropic` only at parsing",
+        "Existing Anthropic CSRF, refresh rotation, and storage regression tests stay green"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::providers::anthropic",
+        "cargo test -p synaps-core auth::storage"
+      ],
+      "depends_on": [
+        "task-01"
+      ]
+    },
+    {
+      "id": "task-03",
+      "heading": "T3 \u2014 Migrate OpenAI Codex and unify dispatch",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Register Codex login/refresh/account metadata through the same contract; replace login and refresh match statements with registry lookup.",
+      "acceptance": [
+        "Login UI is generated from descriptors rather than a second OAuth list",
+        "Expired Codex credentials refresh through provider behavior",
+        "Codex account-ID extraction remains isolated to Codex metadata/runtime adaptation"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::providers::openai_codex",
+        "cargo test --bin synaps cmd::login"
+      ],
+      "depends_on": [
+        "task-01"
+      ]
+    },
+    {
+      "id": "task-04",
+      "heading": "T4 \u2014 Generalize callback outcomes and secret-safe errors",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Make the shared callback return authorized/denied outcomes, configurable path/port, and reliable shutdown without logging state, code, or callback queries.",
+      "acceptance": [
+        "Provider denial returns sanitized OAuth error information rather than a closed channel",
+        "Wrong/missing state never reaches token exchange and no state values are logged",
+        "Listener shuts down on success, denial, cancellation, exchange error, and persistence error"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::callback",
+        "cargo clippy -p synaps-core --all-targets -- -D warnings"
+      ],
+      "depends_on": [
+        "task-01"
+      ]
+    },
+    {
+      "id": "task-05",
+      "heading": "T5 \u2014 Implement xAI OIDC login and refresh",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Add validated discovery, authorize URL, PKCE/state/nonce, strict manual callback handling, token exchange, expiry skew, refresh fallback, and `xai-auth` persistence.",
+      "acceptance": [
+        "Discovery rejects HTTP and non-xAI endpoints before secrets are sent",
+        "Authorize request contains exact client ID, scopes, redirect, PKCE, state, and nonce",
+        "Refresh preserves prior refresh token when omitted and atomically preserves other providers"
+      ],
+      "verification": [
+        "cargo test -p synaps-core auth::providers::xai",
+        "cargo test -p synaps-core auth::storage"
+      ],
+      "depends_on": [
+        "task-01",
+        "task-04"
+      ]
+    },
+    {
+      "id": "task-06",
+      "heading": "T6 \u2014 Introduce auth-policy and wire-protocol routing",
+      "type": "task",
+      "state": "todo",
+      "risk": "none",
+      "md": "Decouple credential acquisition from protocol serialization. Add typed `AuthPolicy`, `WireProtocol`, and resolved route data; preserve current Anthropic, API-key OpenAI, and Codex routing.",
+      "acceptance": [
+        "Routes declare auth policy independently from endpoint/wire protocol",
+        "OAuth model routes can resolve without an API-key config entry",
+        "Existing Anthropic, API-key provider, local, and Codex route tests remain unchanged in behavior"
+      ],
+      "verification": [
+        "cargo test -p synaps-engine runtime::openai",
+        "cargo check --workspace"
+      ],
+      "depends_on": [
+        "task-01",
+        "task-03"
+      ]
+    },
+    {
+      "id": "task-07",
+      "heading": "T7 \u2014 Deliver one verified Grok runtime slice",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Register `xai-auth/grok-4.5`, resolve its access token locally or remotely, and implement the xAI-supported request/stream path selected by captured protocol evidence.",
+      "acceptance": [
+        "`xai-auth/grok-4.5` routes without configured API key and sends Bearer auth",
+        "Request URL, model, reasoning fields, tool schema, and stream parsing match a fixture from verified xAI protocol behavior",
+        "No ChatGPT account ID or Codex backend semantics enter the xAI path"
+      ],
+      "verification": [
+        "cargo test -p synaps-engine xai",
+        "cargo test -p synaps-engine runtime::openai -- --test-threads=1"
+      ],
+      "depends_on": [
+        "task-05",
+        "task-06"
+      ]
+    },
+    {
+      "id": "task-08",
+      "heading": "T8 \u2014 Wire login UI, CLI help, and broker capability",
+      "type": "task",
+      "state": "todo",
+      "risk": "none",
+      "md": "Expose xAI through descriptor-driven login selection and non-interactive CLI; derive broker allowability from explicit provider capability while retaining deny-by-default behavior.",
+      "acceptance": [
+        "`synaps login --provider xai-auth` selects the registered implementation",
+        "Broker vends only xAI access token/expiry and never refresh or metadata",
+        "Unknown/unbrokerable provider IDs remain rejected before credential lookup/logging"
+      ],
+      "verification": [
+        "cargo test --bin synaps cmd::login",
+        "cargo test --bin synaps cmd::auth_broker"
+      ],
+      "depends_on": [
+        "task-03",
+        "task-05"
+      ]
+    },
+    {
+      "id": "task-09",
+      "heading": "T9 \u2014 Build unattended OAuth and routing harness",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Create a zero-network fake OIDC/token/API harness that simulates browser redirect, denial, mismatched state, refresh rotation/omission, broker mode, and streaming model use end-to-end.",
+      "acceptance": [
+        "Harness completes login\u2192persist\u2192expire\u2192refresh\u2192model request without human input",
+        "Fault cases prove no token exchange on bad discovery/state and no refresh-token egress through broker",
+        "A pre-implementation or intentionally disabled-provider run demonstrates red, then the delivered feature demonstrates green"
+      ],
+      "verification": [
+        "cargo test --test oauth_provider_e2e -- --test-threads=1",
+        "cargo test --test xai_runtime_e2e -- --test-threads=1"
+      ],
+      "depends_on": [
+        "task-05",
+        "task-07",
+        "task-08"
+      ]
+    },
+    {
+      "id": "task-10",
+      "heading": "T10 \u2014 Compatibility, security, and oracle gate",
+      "type": "task",
+      "state": "todo",
+      "risk": "security-sensitive",
+      "md": "Run workspace gates, independently authored adversarial oracle, and holdout review against the fixed scoring policy; address at most two fix iterations.",
+      "acceptance": [
+        "Workspace tests and clippy pass with Anthropic/Codex regressions included",
+        "Independent oracle/1 verdict is pass and fresh for the implementation commit",
+        "Security review finds no secret logging, unvalidated token endpoint, refresh-token egress, or callback listener leak"
+      ],
+      "verification": [
+        "cargo test --workspace -- --test-threads=1",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo build --release",
+        "engineering oracle verdict: oracle/1 pass"
+      ],
+      "depends_on": [
+        "task-09"
+      ]
+    },
+    {
+      "id": "checkpoint-1",
+      "heading": "Checkpoint C1 \u2014 Contracts frozen",
+      "type": "gate",
+      "md": "After T1\u2013T3: commit typed IDs/registry plus Anthropic and Codex migrations; all existing auth tests pass. Reconcile Plan Inbox before continuing. Durable artifact: migration commit and registry invariant evidence.",
+      "approval": "needs-human-review",
+      "risk": "security-sensitive"
+    },
+    {
+      "id": "checkpoint-2",
+      "heading": "Checkpoint C2 \u2014 Secure xAI authentication",
+      "type": "gate",
+      "md": "After T4\u2013T5: commit callback hardening and xAI login/refresh with fake-server tests. Reconcile Plan Inbox. Durable artifact: auth commit plus discovery/state/refresh evidence.",
+      "approval": "needs-human-review",
+      "risk": "security-sensitive"
+    },
+    {
+      "id": "checkpoint-3",
+      "heading": "Checkpoint C3 \u2014 Runtime vertical slice",
+      "type": "gate",
+      "md": "After T6\u2013T8: commit typed routing, one working Grok model path, login UI, and broker integration. Reconcile Plan Inbox. Durable artifact: end-to-end vertical-slice commit and protocol fixture.",
+      "approval": "needs-human-review",
+      "risk": "security-sensitive"
+    },
+    {
+      "id": "checkpoint-4",
+      "heading": "Checkpoint C4 \u2014 Unattended proof and holdout gate",
+      "type": "gate",
+      "md": "After T9\u2013T10: freeze oracle properties before reveal, run unattended harness and all workspace gates, then record oracle/1 and review verdicts. Durable artifact: final verification commit/verdict; no merge on absent or failed oracle.",
+      "approval": "needs-human-review",
+      "risk": "security-sensitive"
+    },
+    {
+      "id": "risks",
+      "heading": "Risk register",
+      "type": "risk",
+      "md": "**Discovery SSRF/token exfiltration:** strict HTTPS xAI host validation. **Provider drift:** one typed registry + invariant tests. **Protocol mismatch:** start with one fixture-verified model, not README catalog claims. **Refresh races/data loss:** existing file lock + atomic merge and broker single-refresher invariant. **Credential schema bloat:** provider-owned metadata. **Behavior regressions:** migrate Anthropic/Codex before xAI and retain route golden tests. **Fixed callback port collision:** deterministic error and headless coverage; dynamic port only if xAI registration permits it.",
+      "risk": "security-sensitive"
+    },
+    {
+      "id": "definition-of-done",
+      "heading": "Definition of done",
+      "type": "criteria",
+      "md": "A clean checkout can run the unattended harness and prove xAI OAuth login, persistence, refresh, broker token vending, and one Grok model request without human input or real credentials. Anthropic and OpenAI Codex remain green. Adding an eighth OAuth provider requires one provider module/descriptor plus model descriptors\u2014not edits to login, refresh, broker, and routing string match tables."
+    }
+  ]
+}
+</script>
+<div id="app">Loading… open via the Plans server for live mode.</div>
+<script>if(!window.PlanRenderer){var b=document.createElement("script");b.src="./_assets/plan.js";document.head.appendChild(b);}</script>
+</body>
+</html>
