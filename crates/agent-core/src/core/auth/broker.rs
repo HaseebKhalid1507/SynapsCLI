@@ -412,6 +412,117 @@ impl ProductionCloudBackend {
             ),
         ))
     }
+    async fn azure_request(
+        &self,
+        state: &mut serde_json::Value,
+        audience: super::azure_openai::AzureAudience,
+    ) -> Result<String, BrokerError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let key = match audience {
+            super::azure_openai::AzureAudience::Arm => "arm",
+            super::azure_openai::AzureAudience::Inference => "inference",
+        };
+        if state[key]["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
+            return state[key]["access_token"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| BrokerError::Credential("invalid Azure token state".into()));
+        }
+        let config: super::cloud::AzureOpenAiConfig =
+            serde_json::from_value(state["config"].clone())
+                .map_err(|_| BrokerError::Credential("invalid Azure broker state".into()))?;
+        let client_id = state["client_id"]
+            .as_str()
+            .ok_or_else(|| BrokerError::Credential("invalid Azure client registration".into()))?;
+        let refresh = state["refresh_token"]
+            .as_str()
+            .ok_or_else(|| BrokerError::Credential("invalid Azure refresh state".into()))?;
+        let reg = super::azure_openai::AzureRegistration::production(Some(client_id.into()))
+            .map_err(|e| BrokerError::Credential(e.to_string()))?;
+        let r = super::azure_openai::refresh_request(&config, &reg, audience, refresh)
+            .map_err(|e| BrokerError::Credential(e.to_string()))?;
+        let response = self
+            .http
+            .post(r.url)
+            .form(&r.form)
+            .send()
+            .await
+            .map_err(|_| BrokerError::Transport("Azure refresh failed".into()))?;
+        if !response.status().is_success() {
+            return Err(BrokerError::Credential(
+                "Azure refresh rejected; login again".into(),
+            ));
+        }
+        let wire: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| BrokerError::Transport("invalid Azure token response".into()))?;
+        let access = wire["access_token"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| BrokerError::Transport("invalid Azure token response".into()))?
+            .to_owned();
+        if let Some(r) = wire["refresh_token"].as_str().filter(|v| !v.is_empty()) {
+            state["refresh_token"] = r.into();
+        }
+        state[key] = serde_json::json!({"access_token": access, "expires_at": now + wire["expires_in"].as_u64().unwrap_or(3600) * 1000});
+        storage::save_cloud_state("azure-openai", state).map_err(BrokerError::Credential)?;
+        Ok(access)
+    }
+
+    async fn vertex_request(&self, state: &mut serde_json::Value) -> Result<String, BrokerError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if state["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
+            return state["access_token"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| BrokerError::Credential("invalid Vertex token state".into()));
+        }
+        let client_id = state["client_id"]
+            .as_str()
+            .ok_or_else(|| BrokerError::Credential("invalid Vertex registration".into()))?;
+        let refresh = state["refresh_token"]
+            .as_str()
+            .ok_or_else(|| BrokerError::Credential("invalid Vertex refresh state".into()))?;
+        let response = self
+            .http
+            .post(super::google_vertex::TOKEN_URL)
+            .form(&[
+                ("client_id", client_id),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+            ])
+            .send()
+            .await
+            .map_err(|_| BrokerError::Transport("Vertex refresh failed".into()))?;
+        if !response.status().is_success() {
+            return Err(BrokerError::Credential(
+                "Vertex refresh rejected; login again".into(),
+            ));
+        }
+        let wire: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| BrokerError::Transport("invalid Vertex token response".into()))?;
+        let access = wire["access_token"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| BrokerError::Transport("invalid Vertex token response".into()))?
+            .to_owned();
+        if let Some(r) = wire["refresh_token"].as_str().filter(|v| !v.is_empty()) {
+            state["refresh_token"] = r.into();
+        }
+        state["access_token"] = access.clone().into();
+        state["expires_at"] = (now + wire["expires_in"].as_u64().unwrap_or(3600) * 1000).into();
+        storage::save_cloud_state("google-vertex", state).map_err(BrokerError::Credential)?;
+        Ok(access)
+    }
 }
 
 #[async_trait]
@@ -431,9 +542,135 @@ impl CloudBackend for ProductionCloudBackend {
             CloudProviderId::AwsBedrock => {
                 let broker = self.aws()?;
                 let label = broker.public_context().bedrock_region;
-                broker.catalog().await.map_err(|_| BrokerError::Transport("AWS catalog failed (details redacted)".into())).map(|xs| xs.into_iter().map(|x| CloudCatalogEntry { provider, id: x.id, display_name: x.display_name, context_ref: provider.as_str().into(), context_label: label.clone(), stale: false }).collect())
+                broker
+                    .catalog()
+                    .await
+                    .map_err(|_| {
+                        BrokerError::Transport("AWS catalog failed (details redacted)".into())
+                    })
+                    .map(|xs| {
+                        xs.into_iter()
+                            .map(|x| CloudCatalogEntry {
+                                provider,
+                                id: x.id,
+                                display_name: x.display_name,
+                                context_ref: provider.as_str().into(),
+                                context_label: label.clone(),
+                                stale: false,
+                            })
+                            .collect()
+                    })
             }
-            CloudProviderId::AzureOpenAi | CloudProviderId::GoogleVertex => Err(BrokerError::RegistrationRequired { provider: provider.to_string(), remediation: "configure the Synaps-owned public OAuth client registration and complete login".into() }),
+            CloudProviderId::AzureOpenAi => {
+                let mut state = self.state(provider)?;
+                let config: super::cloud::AzureOpenAiConfig =
+                    serde_json::from_value(state["config"].clone()).map_err(|_| {
+                        BrokerError::Credential("invalid Azure broker state".into())
+                    })?;
+                let token = self
+                    .azure_request(&mut state, super::azure_openai::AzureAudience::Arm)
+                    .await?;
+                let mut discovery =
+                    super::azure_openai::DeploymentDiscovery::new(config.clone(), 20, 1000);
+                let mut url = Some(discovery.initial_url());
+                while let Some(next) = url {
+                    let r = self
+                        .http
+                        .get(next)
+                        .bearer_auth(&token)
+                        .send()
+                        .await
+                        .map_err(|_| BrokerError::Transport("Azure catalog failed".into()))?;
+                    if !r.status().is_success() {
+                        return Err(BrokerError::Transport("Azure catalog rejected".into()));
+                    }
+                    let body = r
+                        .text()
+                        .await
+                        .map_err(|_| BrokerError::Transport("Azure catalog failed".into()))?;
+                    url = discovery
+                        .accept_page(&body)
+                        .map_err(|_| BrokerError::Transport("invalid Azure catalog".into()))?;
+                }
+                discovery
+                    .finish()
+                    .map_err(|_| BrokerError::Transport("Azure catalog unavailable".into()))
+                    .map(|xs| {
+                        xs.into_iter()
+                            .map(|x| CloudCatalogEntry {
+                                provider,
+                                id: x.id,
+                                display_name: x.display_name,
+                                context_ref: provider.as_str().into(),
+                                context_label: format!(
+                                    "{}/{}",
+                                    config.resource_name, config.resource_group
+                                ),
+                                stale: false,
+                            })
+                            .collect()
+                    })
+            }
+            CloudProviderId::GoogleVertex => {
+                let mut state = self.state(provider)?;
+                let token = self.vertex_request(&mut state).await?;
+                let config: super::cloud::GoogleVertexConfig =
+                    serde_json::from_value(state["config"].clone()).map_err(|_| {
+                        BrokerError::Credential("invalid Vertex broker state".into())
+                    })?;
+                let mut page: Option<String> = None;
+                let mut out = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for _ in 0..20 {
+                    let mut url=format!("https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models",config.location,config.project_id,config.location);
+                    if let Some(p) = &page {
+                        url.push_str("?pageToken=");
+                        url.push_str(p);
+                    }
+                    let r = self
+                        .http
+                        .get(url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await
+                        .map_err(|_| BrokerError::Transport("Vertex catalog failed".into()))?;
+                    if !r.status().is_success() {
+                        return Err(BrokerError::Transport("Vertex catalog rejected".into()));
+                    }
+                    let v: serde_json::Value = r
+                        .json()
+                        .await
+                        .map_err(|_| BrokerError::Transport("invalid Vertex catalog".into()))?;
+                    for m in v["publisherModels"].as_array().into_iter().flatten() {
+                        if let Some(name) = m["name"]
+                            .as_str()
+                            .filter(|n| n.starts_with("publishers/google/models/"))
+                        {
+                            out.push(CloudCatalogEntry {
+                                provider,
+                                id: format!("google-vertex/{name}"),
+                                display_name: m["displayName"].as_str().unwrap_or(name).into(),
+                                context_ref: provider.as_str().into(),
+                                context_label: format!("{}/{}", config.project_id, config.location),
+                                stale: false,
+                            });
+                        }
+                    }
+                    page = v["nextPageToken"].as_str().map(str::to_owned);
+                    match &page {
+                        Some(p) if seen.insert(p.clone()) => {}
+                        Some(_) => {
+                            return Err(BrokerError::Transport("Vertex pagination loop".into()))
+                        }
+                        None => break,
+                    }
+                }
+                if out.is_empty() {
+                    Err(BrokerError::Transport("Vertex catalog is empty".into()))
+                } else {
+                    Ok(out)
+                }
+            }
         }
     }
     async fn invoke(
@@ -452,14 +689,166 @@ impl CloudBackend for ProductionCloudBackend {
             CloudProviderId::AwsBedrock => {
                 let broker = self.aws()?;
                 let events = if request.stream {
-                    broker.converse_stream(model_id, request).await.map_err(|_| BrokerError::Transport("AWS invocation failed (details redacted)".into()))?.into_iter().map(|e| match e { super::aws_bedrock::ConverseEvent::TextDelta(delta) => CloudEvent::TextDelta { delta }, super::aws_bedrock::ConverseEvent::ToolArguments { id, delta } => CloudEvent::ToolArguments { id, name: None, delta }, super::aws_bedrock::ConverseEvent::Usage(u) => CloudEvent::Usage { input_tokens: u.input_tokens, output_tokens: u.output_tokens }, super::aws_bedrock::ConverseEvent::Done => CloudEvent::Done }).collect::<Vec<_>>()
+                    broker
+                        .converse_stream(model_id, request)
+                        .await
+                        .map_err(|_| {
+                            BrokerError::Transport(
+                                "AWS invocation failed (details redacted)".into(),
+                            )
+                        })?
+                        .into_iter()
+                        .map(|e| match e {
+                            super::aws_bedrock::ConverseEvent::TextDelta(delta) => {
+                                CloudEvent::TextDelta { delta }
+                            }
+                            super::aws_bedrock::ConverseEvent::ToolArguments { id, delta } => {
+                                CloudEvent::ToolArguments {
+                                    id,
+                                    name: None,
+                                    delta,
+                                }
+                            }
+                            super::aws_bedrock::ConverseEvent::Usage(u) => CloudEvent::Usage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                            },
+                            super::aws_bedrock::ConverseEvent::Done => CloudEvent::Done,
+                        })
+                        .collect::<Vec<_>>()
                 } else {
-                    let o = broker.converse(model_id, request).await.map_err(|_| BrokerError::Transport("AWS invocation failed (details redacted)".into()))?;
-                    vec![CloudEvent::TextDelta { delta: o.text }, CloudEvent::Usage { input_tokens: o.usage.input_tokens, output_tokens: o.usage.output_tokens }, CloudEvent::Done]
+                    let o = broker.converse(model_id, request).await.map_err(|_| {
+                        BrokerError::Transport("AWS invocation failed (details redacted)".into())
+                    })?;
+                    vec![
+                        CloudEvent::TextDelta { delta: o.text },
+                        CloudEvent::Usage {
+                            input_tokens: o.usage.input_tokens,
+                            output_tokens: o.usage.output_tokens,
+                        },
+                        CloudEvent::Done,
+                    ]
                 };
                 Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
             }
-            CloudProviderId::AzureOpenAi | CloudProviderId::GoogleVertex => Err(BrokerError::RegistrationRequired { provider: provider.to_string(), remediation: "configure the Synaps-owned public OAuth client registration and complete login".into() }),
+            CloudProviderId::AzureOpenAi => {
+                let mut state = self.state(provider)?;
+                let token = self
+                    .azure_request(&mut state, super::azure_openai::AzureAudience::Inference)
+                    .await?;
+                let endpoint = super::azure_openai::AzureEndpoint::parse(
+                    state["endpoint"]
+                        .as_str()
+                        .ok_or_else(|| BrokerError::Credential("invalid Azure endpoint".into()))?,
+                )
+                .map_err(|_| BrokerError::Credential("invalid Azure endpoint".into()))?;
+                let deployment = model_id
+                    .strip_prefix("azure-openai/")
+                    .ok_or_else(|| BrokerError::Denied("invalid Azure model".into()))?;
+                let body = serde_json::json!({"input":request.messages.into_iter().map(|m|serde_json::json!({"role":match m.role{super::cloud::MessageRole::Assistant=>"assistant",super::cloud::MessageRole::System=>"system",_=>"user"},"content":m.content})).collect::<Vec<_>>(),"stream":request.stream});
+                let rr = super::azure_openai::responses_request(
+                    &endpoint,
+                    deployment,
+                    &serde_json::to_vec(&body).unwrap(),
+                )
+                .map_err(|_| BrokerError::Denied("invalid Azure request".into()))?;
+                let r = self
+                    .http
+                    .post(rr.url)
+                    .bearer_auth(token)
+                    .header("content-type", "application/json")
+                    .body(rr.body)
+                    .send()
+                    .await
+                    .map_err(|_| BrokerError::Transport("Azure invocation failed".into()))?;
+                if !r.status().is_success() {
+                    return Err(BrokerError::Transport("Azure invocation rejected".into()));
+                }
+                let text = r
+                    .text()
+                    .await
+                    .map_err(|_| BrokerError::Transport("Azure stream failed".into()))?;
+                let mut events = Vec::new();
+                for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+                    if line == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if let Some(t) = v["delta"].as_str().or_else(|| v["text"].as_str()) {
+                            events.push(CloudEvent::TextDelta { delta: t.into() });
+                        }
+                    }
+                }
+                if events.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(t) = v["output_text"].as_str() {
+                            events.push(CloudEvent::TextDelta { delta: t.into() });
+                        }
+                    }
+                }
+                events.push(CloudEvent::Done);
+                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
+            CloudProviderId::GoogleVertex => {
+                let mut state = self.state(provider)?;
+                let token = self.vertex_request(&mut state).await?;
+                let config: super::cloud::GoogleVertexConfig =
+                    serde_json::from_value(state["config"].clone())
+                        .map_err(|_| BrokerError::Credential("invalid Vertex state".into()))?;
+                let model = model_id
+                    .strip_prefix("google-vertex/publishers/google/models/")
+                    .filter(|m| {
+                        m.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+                    })
+                    .ok_or_else(|| BrokerError::Denied("invalid Vertex model".into()))?;
+                let action = if request.stream {
+                    "streamGenerateContent?alt=sse"
+                } else {
+                    "generateContent"
+                };
+                let url=format!("https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:{}",config.location,config.project_id,config.location,model,action);
+                let body = serde_json::json!({"contents":request.messages.into_iter().map(|m|serde_json::json!({"role":if matches!(m.role,super::cloud::MessageRole::Assistant){"model"}else{"user"},"parts":[{"text":m.content}]})).collect::<Vec<_>>()});
+                let r = self
+                    .http
+                    .post(url)
+                    .bearer_auth(token)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|_| BrokerError::Transport("Vertex invocation failed".into()))?;
+                if !r.status().is_success() {
+                    return Err(BrokerError::Transport("Vertex invocation rejected".into()));
+                }
+                let text = r
+                    .text()
+                    .await
+                    .map_err(|_| BrokerError::Transport("Vertex stream failed".into()))?;
+                let mut events = Vec::new();
+                for data in text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .chain((!request.stream).then_some(text.as_str()).into_iter())
+                {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        for c in v["candidates"].as_array().into_iter().flatten() {
+                            for p in c["content"]["parts"].as_array().into_iter().flatten() {
+                                if let Some(t) = p["text"].as_str() {
+                                    events.push(CloudEvent::TextDelta { delta: t.into() });
+                                }
+                            }
+                        }
+                        if let Some(u) = v.get("usageMetadata") {
+                            events.push(CloudEvent::Usage {
+                                input_tokens: u["promptTokenCount"].as_u64().unwrap_or(0),
+                                output_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+                            });
+                        }
+                    }
+                }
+                events.push(CloudEvent::Done);
+                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
         }
     }
 }

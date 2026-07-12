@@ -115,8 +115,8 @@ fn oauth_storage_key(provider: LoginProvider) -> &'static str {
 async fn run_cloud_login(provider: LoginProvider, profile: Option<String>) {
     let result = match provider.key {
         "aws-bedrock" => login_aws_bedrock().await,
-        "azure-openai" => Err("registration_required: configure SYNAPS_AZURE_CLIENT_ID and Azure tenant/subscription/resource context; Synaps does not ship another product's client ID".into()),
-        "google-vertex" => Err("registration_required: configure SYNAPS_GOOGLE_VERTEX_CLIENT_ID and project/location; Synaps does not ship another product's client ID".into()),
+        "azure-openai" => login_azure_openai().await,
+        "google-vertex" => login_google_vertex().await,
         _ => Err("cloud provider setup is unavailable".into()),
     };
     match result {
@@ -139,6 +139,183 @@ fn required_env(name: &str) -> Result<String, String> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| format!("missing {name}"))
+}
+
+async fn login_azure_openai() -> Result<(), String> {
+    use auth::azure_openai::{
+        device_code_request, refresh_request, AzureAudience, AzureRegistration,
+    };
+    let client_id = std::env::var("SYNAPS_AZURE_CLIENT_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or("registration_required: configure SYNAPS_AZURE_CLIENT_ID")?;
+    let config = auth::AzureOpenAiConfig::new(
+        required_env("SYNAPS_AZURE_TENANT")?,
+        required_env("SYNAPS_AZURE_SUBSCRIPTION_ID")?,
+        required_env("SYNAPS_AZURE_RESOURCE_GROUP")?,
+        required_env("SYNAPS_AZURE_RESOURCE_NAME")?,
+        std::env::var("SYNAPS_AZURE_DEPLOYMENT").unwrap_or_else(|_| "default".into()),
+    )?;
+    let reg = AzureRegistration::production(Some(client_id.clone())).map_err(|e| e.to_string())?;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let req = device_code_request(&config, &reg).map_err(|e| e.to_string())?;
+    let d: serde_json::Value = http
+        .post(req.url)
+        .form(&req.form)
+        .send()
+        .await
+        .map_err(|_| "Azure device authorization failed")?
+        .json()
+        .await
+        .map_err(|_| "invalid Azure device response")?;
+    eprintln!(
+        "Open {} and enter code {}",
+        d["verification_uri"]
+            .as_str()
+            .unwrap_or("Microsoft sign-in"),
+        d["user_code"].as_str().unwrap_or("(provided by Microsoft)")
+    );
+    let device = d["device_code"]
+        .as_str()
+        .ok_or("invalid Azure device response")?;
+    let token_url = format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+        config.tenant
+    );
+    let mut interval = d["interval"].as_u64().unwrap_or(5);
+    let arm = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let r = http
+            .post(&token_url)
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device),
+            ])
+            .send()
+            .await
+            .map_err(|_| "Azure token polling failed")?;
+        let v: serde_json::Value = r.json().await.map_err(|_| "invalid Azure token response")?;
+        if v["access_token"].as_str().is_some() {
+            break v;
+        }
+        match v["error"].as_str() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval += 5,
+            Some(e) => return Err(format!("Azure authorization failed: {e}")),
+            None => return Err("invalid Azure token response".into()),
+        }
+    };
+    let refresh = arm["refresh_token"]
+        .as_str()
+        .ok_or("Azure did not issue a refresh token")?
+        .to_owned();
+    let rr = refresh_request(&config, &reg, AzureAudience::Inference, &refresh)
+        .map_err(|e| e.to_string())?;
+    let infer: serde_json::Value = http
+        .post(rr.url)
+        .form(&rr.form)
+        .send()
+        .await
+        .map_err(|_| "Azure inference token failed")?
+        .json()
+        .await
+        .map_err(|_| "invalid Azure inference token")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let endpoint = format!("https://{}.openai.azure.com", config.resource_name);
+    auth::save_cloud_state(
+        "azure-openai",
+        &serde_json::json!({"config":config,"client_id":client_id,"endpoint":endpoint,"refresh_token":infer["refresh_token"].as_str().unwrap_or(&refresh),"arm":{"access_token":arm["access_token"],"expires_at":now+arm["expires_in"].as_u64().unwrap_or(3600)*1000},"inference":{"access_token":infer["access_token"],"expires_at":now+infer["expires_in"].as_u64().unwrap_or(3600)*1000}}),
+    )
+}
+
+async fn login_google_vertex() -> Result<(), String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let client_id = std::env::var("SYNAPS_VERTEX_CLIENT_ID")
+        .or_else(|_| std::env::var("SYNAPS_GOOGLE_VERTEX_CLIENT_ID"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or("registration_required: configure SYNAPS_VERTEX_CLIENT_ID")?;
+    let reg = auth::google_vertex::VertexRegistration::new(Some(&client_id))
+        .map_err(|e| e.to_string())?;
+    let config = auth::GoogleVertexConfig::new(
+        required_env("SYNAPS_VERTEX_PROJECT")?,
+        required_env("SYNAPS_VERTEX_LOCATION")?,
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let redirect = format!("http://127.0.0.1:{port}/oauth2callback");
+    let verifier =
+        uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    let url = auth::google_vertex::build_authorize_url(&reg, &challenge, &state, &redirect)
+        .map_err(|e| e.to_string())?;
+    eprintln!("Open this URL to authorize Google Vertex:\n{url}");
+    let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut b = vec![0; 8192];
+    let n = socket.read(&mut b).await.map_err(|e| e.to_string())?;
+    let first = std::str::from_utf8(&b[..n])
+        .map_err(|_| "invalid OAuth callback")?
+        .lines()
+        .next()
+        .ok_or("invalid OAuth callback")?;
+    let target = first
+        .split_whitespace()
+        .nth(1)
+        .ok_or("invalid OAuth callback")?;
+    let u = url::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|_| "invalid OAuth callback")?;
+    let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+    if q.get("state") != Some(&state) {
+        return Err("OAuth state mismatch".into());
+    }
+    let code = q.get("code").ok_or("Google authorization denied")?;
+    socket
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nAuthorization complete.")
+        .await
+        .ok();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = http
+        .post(auth::google_vertex::TOKEN_URL)
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", redirect.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Vertex token exchange failed")?
+        .json()
+        .await
+        .map_err(|_| "invalid Vertex token response")?;
+    let refresh = v["refresh_token"]
+        .as_str()
+        .ok_or("Google did not issue offline refresh access")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    auth::save_cloud_state(
+        "google-vertex",
+        &serde_json::json!({"config":config,"client_id":client_id,"access_token":v["access_token"],"refresh_token":refresh,"expires_at":now+v["expires_in"].as_u64().unwrap_or(3600)*1000}),
+    )
 }
 
 async fn login_aws_bedrock() -> Result<(), String> {
