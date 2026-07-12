@@ -62,7 +62,7 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
 
     match selected.auth_kind {
         AuthKind::OAuth => run_oauth_login(selected, profile).await,
-        AuthKind::Cloud => run_cloud_login(selected),
+        AuthKind::Cloud => run_cloud_login(selected, profile).await,
         AuthKind::ApiKey => run_api_key_login(selected, profile),
     }
 }
@@ -112,14 +112,152 @@ fn oauth_storage_key(provider: LoginProvider) -> &'static str {
         .unwrap_or(provider.key)
 }
 
-fn run_cloud_login(provider: LoginProvider) {
-    let message = match provider.key {
-        "azure-openai" => "registration_required: configure a Synaps-owned Microsoft Entra public-client ID plus tenant/subscription/resource context in the credential broker",
-        "google-vertex" => "registration_required: configure a Synaps-owned Google Desktop OAuth client ID plus project/location context in the credential broker",
-        "aws-bedrock" => "AWS Bedrock setup requires SSO start URL, SSO region, explicit account/role, and Bedrock region; credentials and SigV4 remain broker-owned",
-        _ => "cloud provider setup is unavailable",
+async fn run_cloud_login(provider: LoginProvider, profile: Option<String>) {
+    let result = match provider.key {
+        "aws-bedrock" => login_aws_bedrock().await,
+        "azure-openai" => Err("registration_required: configure SYNAPS_AZURE_CLIENT_ID and Azure tenant/subscription/resource context; Synaps does not ship another product's client ID".into()),
+        "google-vertex" => Err("registration_required: configure SYNAPS_GOOGLE_VERTEX_CLIENT_ID and project/location; Synaps does not ship another product's client ID".into()),
+        _ => Err("cloud provider setup is unavailable".into()),
     };
-    eprintln!("{}: {}", provider.name, message);
+    match result {
+        Ok(()) => {
+            eprintln!("\n\x1b[32m✓ {} login successful\x1b[0m", provider.name);
+            eprintln!("  Credentials saved to the broker credential store.");
+            continue_to_main_app(profile);
+        }
+        Err(message) => {
+            eprintln!(
+                "\n\x1b[31m✗ {} login failed: {}\x1b[0m",
+                provider.name, message
+            );
+        }
+    }
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+async fn login_aws_bedrock() -> Result<(), String> {
+    use auth::aws_bedrock::{AwsApi, AwsHttpApi, TokenGrant};
+    let start = required_env("SYNAPS_AWS_SSO_START_URL")?;
+    let sso_region = required_env("SYNAPS_AWS_SSO_REGION")?;
+    let bedrock_region = required_env("SYNAPS_AWS_BEDROCK_REGION")?;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "cannot initialize HTTPS client")?;
+    let api = AwsHttpApi::new(http, &sso_region);
+    let client = api
+        .register_client(&sso_region)
+        .await
+        .map_err(|e| e.to_string())?;
+    let device = api
+        .start_device_authorization(&client, &start)
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "Open {} and enter code {}",
+        device.verification_uri, device.user_code
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
+    let mut interval = device.interval.max(1);
+    let token = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("device authorization expired".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        match api
+            .create_token(
+                &client,
+                &sso_region,
+                TokenGrant::DeviceCode(device.device_code()),
+            )
+            .await
+        {
+            Ok(token) => break token,
+            Err(auth::aws_bedrock::AwsError::AuthorizationPending) => {}
+            Err(auth::aws_bedrock::AwsError::SlowDown) => interval = interval.saturating_add(5),
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let accounts = api
+        .list_accounts(&sso_region, token.access())
+        .await
+        .map_err(|e| e.to_string())?;
+    let account = choose(
+        "account",
+        accounts
+            .iter()
+            .map(|a| (a.id.as_str(), a.name.as_str()))
+            .collect(),
+        std::env::var("SYNAPS_AWS_ACCOUNT_ID").ok().as_deref(),
+    )?;
+    let roles = api
+        .list_account_roles(&sso_region, token.access(), &account)
+        .await
+        .map_err(|e| e.to_string())?;
+    let role = choose(
+        "role",
+        roles.iter().map(|r| (r.name.as_str(), "")).collect(),
+        std::env::var("SYNAPS_AWS_ROLE_NAME").ok().as_deref(),
+    )?;
+    let credentials = api
+        .get_role_credentials(&sso_region, token.access(), &account, &role)
+        .await
+        .map_err(|e| e.to_string())?;
+    let config = auth::AwsBedrockConfig::new(start, sso_region, account, role, bedrock_region)?;
+    let state = serde_json::json!({
+        "config": config, "access_key": credentials.access_key(), "secret_key": credentials.secret_key(),
+        "session_token": credentials.session_token(), "expires_at": credentials.expires_at,
+        "registered_client": {"id": client.id(), "secret": client.secret(), "expires_at": client.expires_at},
+        "sso_access_token": token.access(), "sso_refresh_token": token.refresh(),
+        "sso_expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + token.expires_in * 1000
+    });
+    auth::save_cloud_state("aws-bedrock", &state)
+}
+
+fn choose(
+    kind: &str,
+    values: Vec<(&str, &str)>,
+    configured: Option<&str>,
+) -> Result<String, String> {
+    if let Some(want) = configured {
+        return values
+            .iter()
+            .find(|(id, _)| *id == want)
+            .map(|(id, _)| (*id).to_string())
+            .ok_or_else(|| format!("configured {kind} is not assigned"));
+    }
+    if values.len() == 1 {
+        return Ok(values[0].0.to_string());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(format!(
+            "multiple {kind}s; set SYNAPS_AWS_{}",
+            if kind == "account" {
+                "ACCOUNT_ID"
+            } else {
+                "ROLE_NAME"
+            }
+        ));
+    }
+    eprintln!("Select {kind}:");
+    for (i, (id, label)) in values.iter().enumerate() {
+        eprintln!("  {}. {} {}", i + 1, id, label);
+    }
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    let i: usize = line.trim().parse().map_err(|_| "invalid selection")?;
+    values
+        .get(i.saturating_sub(1))
+        .map(|v| v.0.to_string())
+        .ok_or_else(|| "invalid selection".into())
 }
 
 fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {

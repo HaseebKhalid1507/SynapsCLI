@@ -20,6 +20,12 @@ impl RegisteredClient {
             expires_at,
         }
     }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
 }
 impl fmt::Debug for RegisteredClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,6 +60,9 @@ impl DeviceAuthorization {
             expires_in,
         }
     }
+    pub fn device_code(&self) -> &str {
+        &self.device_code
+    }
 }
 impl fmt::Debug for DeviceAuthorization {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,6 +82,12 @@ impl SsoToken {
             refresh: r.map(str::to_owned),
             expires_in: e,
         }
+    }
+    pub fn access(&self) -> &str {
+        &self.access
+    }
+    pub fn refresh(&self) -> Option<&str> {
+        self.refresh.as_deref()
     }
 }
 impl fmt::Debug for SsoToken {
@@ -95,6 +110,15 @@ impl RoleCredentials {
             session_token: t.into(),
             expires_at: e,
         }
+    }
+    pub fn access_key(&self) -> &str {
+        &self.access_key
+    }
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+    pub fn session_token(&self) -> &str {
+        &self.session_token
     }
 }
 impl fmt::Debug for RoleCredentials {
