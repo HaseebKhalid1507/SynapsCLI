@@ -22,6 +22,7 @@ pub mod providers;
 pub mod static_providers;
 mod storage;
 mod token;
+mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +33,9 @@ pub use broker::{
     MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
 pub use browser::open_browser;
-pub use callback::{start_callback_server, CallbackServerHandle};
+pub use callback::{
+    start_callback_server, start_callback_server_at, CallbackOutcome, CallbackServerHandle,
+};
 pub use credential_source::{
     is_expired_with_margin, resolve_access_token, resolve_remote, resolve_remote_token,
     BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
@@ -52,6 +55,7 @@ pub use storage::{
 pub use token::{
     ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
 };
+pub use xai::login as login_xai;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
@@ -94,7 +98,7 @@ pub(crate) struct TokenResponse {
 }
 
 /// Result from the OAuth callback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackResult {
     pub code: String,
     pub state: String,
@@ -234,7 +238,9 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     let result = tokio::select! {
         callback = rx => {
             match callback {
-                Ok(result) => result,
+                Ok(CallbackOutcome::Authorized(result)) => result,
+                Ok(CallbackOutcome::Denied { error, description }) => return Err(format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default())),
+                Ok(CallbackOutcome::Invalid) => return Err("Invalid OAuth callback".to_string()),
                 Err(_) => return Err("Callback channel closed".to_string()),
             }
         }

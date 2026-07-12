@@ -17,6 +17,7 @@ use super::OAuthCredentials;
 pub enum OAuthProviderId {
     Anthropic,
     OpenAiCodex,
+    Xai,
 }
 
 impl OAuthProviderId {
@@ -24,6 +25,7 @@ impl OAuthProviderId {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAiCodex => "openai-codex",
+            Self::Xai => "xai-auth",
         }
     }
 }
@@ -40,6 +42,7 @@ impl FromStr for OAuthProviderId {
         match value {
             "anthropic" => Ok(Self::Anthropic),
             "openai-codex" => Ok(Self::OpenAiCodex),
+            "xai-auth" => Ok(Self::Xai),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
         }
     }
@@ -83,6 +86,7 @@ pub enum BrokerCredentialStrategy {
 pub enum ProviderBehavior {
     Anthropic,
     OpenAiCodex,
+    Xai,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,7 +151,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 2] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 3] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -164,6 +168,14 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 2] = [
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::OpenAiCodex,
     },
+    OAuthProviderDescriptor {
+        id: OAuthProviderId::Xai,
+        display_name: "xAI (Grok)",
+        description: "xAI account OAuth",
+        recommended: false,
+        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
+        behavior: ProviderBehavior::Xai,
+    },
 ];
 
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
@@ -171,6 +183,7 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
     match value.to_ascii_lowercase().as_str() {
         "claude" | "anthropic" => Ok(OAuthProviderId::Anthropic),
         "openai-codex" => Ok(OAuthProviderId::OpenAiCodex),
+        "xai-auth" => Ok(OAuthProviderId::Xai),
         _ => Err(format!("unknown OAuth provider: {value}")),
     }
 }
@@ -183,6 +196,7 @@ pub async fn login(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
     {
         ProviderBehavior::Anthropic => super::providers::anthropic::login().await,
         ProviderBehavior::OpenAiCodex => super::providers::openai_codex::login().await,
+        ProviderBehavior::Xai => super::providers::xai::login().await,
     }
 }
 
@@ -200,6 +214,7 @@ pub async fn refresh(
         ProviderBehavior::OpenAiCodex => {
             super::providers::openai_codex::refresh(client, refresh).await
         }
+        ProviderBehavior::Xai => super::providers::xai::refresh(client, refresh).await,
     }
 }
 

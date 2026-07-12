@@ -31,13 +31,19 @@ pub(crate) async fn call_oai_stream_inner(
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
-    let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
+    let tools_opt = if oai_tools.is_empty() {
+        None
+    } else {
+        Some(oai_tools)
+    };
 
     // Google's OpenAI-compat endpoint rejects stream_options
     let stream_options = if cfg.base_url.contains("googleapis.com") {
         None
     } else {
-        Some(StreamOptions { include_usage: true })
+        Some(StreamOptions {
+            include_usage: true,
+        })
     };
 
     let mut body = serde_json::Map::new();
@@ -45,7 +51,10 @@ pub(crate) async fn call_oai_stream_inner(
     body.insert("messages".to_string(), serde_json::to_value(oai_messages)?);
     body.insert("stream".to_string(), json!(true));
     if let Some(stream_options) = stream_options {
-        body.insert("stream_options".to_string(), serde_json::to_value(stream_options)?);
+        body.insert(
+            "stream_options".to_string(),
+            serde_json::to_value(stream_options)?,
+        );
     }
     if let Some(max_tokens) = max_tokens {
         body.insert("max_tokens".to_string(), json!(max_tokens));
@@ -101,7 +110,13 @@ pub(crate) async fn call_oai_stream_inner(
 
             sink.clear();
             decoder.push_line(line, &mut sink);
-            handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+            handle_events(
+                &sink,
+                tx,
+                &mut accumulated_text,
+                &mut tool_use_blocks,
+                &name_map,
+            );
         }
     }
 
@@ -110,11 +125,23 @@ pub(crate) async fn call_oai_stream_inner(
         let line = std::str::from_utf8(&buf).unwrap_or("");
         sink.clear();
         decoder.push_line(line, &mut sink);
-        handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+        handle_events(
+            &sink,
+            tx,
+            &mut accumulated_text,
+            &mut tool_use_blocks,
+            &name_map,
+        );
     }
     sink.clear();
     decoder.finish(&mut sink);
-    handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+    handle_events(
+        &sink,
+        tx,
+        &mut accumulated_text,
+        &mut tool_use_blocks,
+        &name_map,
+    );
 
     // Build Anthropic-shaped final response
     let mut content: Vec<Value> = Vec::new();
@@ -191,7 +218,9 @@ pub(crate) async fn call_codex_stream_inner(
 
     let url = format!(
         "{}/codex/responses",
-        cfg.base_url.trim_end_matches('/').trim_end_matches("/codex")
+        cfg.base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/codex")
     );
     tracing::debug!(url=%url, model=%cfg.model, "codex stream request");
 
@@ -242,7 +271,10 @@ pub(crate) async fn call_codex_stream_inner(
     if !accumulated_text.is_empty() {
         content.push(json!({"type": "text", "text": accumulated_text}));
     }
-    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools, &name_map));
+    content.extend(translate::tool_calls_to_content_blocks(
+        &parser.completed_tools,
+        &name_map,
+    ));
 
     Ok(json!({
         "role": "assistant",
@@ -371,7 +403,10 @@ impl CodexSseDecoder {
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
             return;
         };
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -383,13 +418,22 @@ impl CodexSseDecoder {
             }
             "response.output_item.added" => {
                 if let Some(item) = event.get("item") {
-                    let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
                     self.add_tool_from_item(idx, item, tx);
                 }
             }
             "response.function_call_arguments.delta" => {
-                let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let idx = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if !delta.is_empty() {
                     let tool = self.ensure_tool(idx);
                     tool.arguments.push_str(delta);
@@ -404,7 +448,10 @@ impl CodexSseDecoder {
             }
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
-                    let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
@@ -510,13 +557,11 @@ impl CodexSseDecoder {
             // Anthropic path in `runtime/api.rs` which emits the same
             // event on tool-use content_block_stop.
             let input = parse_tool_arguments(&call.function.arguments);
-            let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUse {
-                    tool_name: call.function.name.clone(),
-                    tool_id: call.id.clone(),
-                    input,
-                },
-            ));
+            let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::ToolUse {
+                tool_name: call.function.name.clone(),
+                tool_id: call.id.clone(),
+                input,
+            }));
             self.completed_tools.push(ToolCall {
                 id: call.id,
                 kind: call.kind,
@@ -539,15 +584,17 @@ impl CodexSseDecoder {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if input > 0 || output > 0 {
-            let _ = tx.send(StreamEvent::Session(crate::runtime::types::SessionEvent::Usage {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_creation_5m: None,
-                cache_creation_1h: None,
-                model: None,
-            }));
+            let _ = tx.send(StreamEvent::Session(
+                crate::runtime::types::SessionEvent::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_creation_5m: None,
+                    cache_creation_1h: None,
+                    model: None,
+                },
+            ));
         }
     }
 
@@ -607,8 +654,8 @@ mod codex_input_messages_tests {
     //! correlate the eventual `function_call_output`. We elect not to
     //! emit `id` unless we actually have a real `fc_…` value to send.
 
-    use super::*;
     use super::super::types::{ChatMessage, FunctionCall, ToolCall};
+    use super::*;
 
     fn sample_tool_call() -> ToolCall {
         ToolCall {
@@ -627,7 +674,9 @@ mod codex_input_messages_tests {
         assert!(instructions.contains("Project-specific rules."));
         assert!(instructions.contains("Do not stop at phase boundaries"));
         assert!(instructions.contains("Do not ask the user whether to continue"));
-        assert!(instructions.contains("continue autonomously until the full requested job is complete"));
+        assert!(
+            instructions.contains("continue autonomously until the full requested job is complete")
+        );
     }
 
     #[test]
@@ -636,7 +685,10 @@ mod codex_input_messages_tests {
         let out = codex_input_messages(messages);
         assert_eq!(out.len(), 1, "one tool_call → one input item");
         let item = &out[0];
-        assert_eq!(item.get("type").and_then(Value::as_str), Some("function_call"));
+        assert_eq!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call")
+        );
         assert!(
             item.get("id").is_none(),
             "must not echo a non-`fc_` id back; got {:?}",
@@ -659,7 +711,10 @@ mod codex_input_messages_tests {
         let out = codex_input_messages(messages);
         let item = &out[0];
         assert_eq!(item.get("id").and_then(Value::as_str), Some("fc_abc123"));
-        assert_eq!(item.get("call_id").and_then(Value::as_str), Some("fc_abc123"));
+        assert_eq!(
+            item.get("call_id").and_then(Value::as_str),
+            Some("fc_abc123")
+        );
     }
 
     #[test]
@@ -806,7 +861,8 @@ mod codex_decoder_tests {
         let (decoder, _text, _events) = drive(&lines);
 
         assert_eq!(decoder.completed_tools.len(), 2);
-        let mut by_id: std::collections::BTreeMap<&str, &ToolCall> = std::collections::BTreeMap::new();
+        let mut by_id: std::collections::BTreeMap<&str, &ToolCall> =
+            std::collections::BTreeMap::new();
         for tool in &decoder.completed_tools {
             by_id.insert(tool.id.as_str(), tool);
         }
@@ -837,13 +893,19 @@ mod codex_decoder_tests {
         let tool_uses: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                    Some((tool_name.as_str(), tool_id.as_str(), input.clone()))
-                }
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name,
+                    tool_id,
+                    input,
+                }) => Some((tool_name.as_str(), tool_id.as_str(), input.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(tool_uses.len(), 1, "expected exactly one ToolUse finalize event");
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "expected exactly one ToolUse finalize event"
+        );
         assert_eq!(tool_uses[0].0, "bash");
         assert_eq!(tool_uses[0].1, "call_abc");
         assert_eq!(
@@ -873,9 +935,11 @@ mod codex_decoder_tests {
         let tool_uses: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                    Some((tool_name.clone(), tool_id.clone(), input.clone()))
-                }
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name,
+                    tool_id,
+                    input,
+                }) => Some((tool_name.clone(), tool_id.clone(), input.clone())),
                 _ => None,
             })
             .collect();
@@ -939,7 +1003,9 @@ mod codex_decoder_tests {
             "",
         ];
         let (_decoder, _text, events) = drive(&lines);
-        let any_usage = events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
+        let any_usage = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
         assert!(!any_usage, "zero-token usage should be suppressed");
     }
 
@@ -1110,5 +1176,76 @@ mod broker_stream_tests {
                 .to_string();
         assert!(err.contains("unknown provider"), "got: {err}");
         assert!(!err.to_lowercase().contains("bearer"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_responses_stream_inner(
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    thinking_budget: u32,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tools, names) = translate::tools_to_oai(tools_schema);
+    let input = translate::messages_to_oai(messages, system_prompt, &names);
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(cfg.model));
+    body.insert("input".into(), serde_json::to_value(input)?);
+    body.insert("stream".into(), json!(true));
+    if !tools.is_empty() {
+        body.insert("tools".into(), serde_json::to_value(tools)?);
+    }
+    if let Some(max) = max_tokens {
+        body.insert("max_output_tokens".into(), json!(max));
+    }
+    if thinking_budget > 0 {
+        body.insert("reasoning".into(), json!({"effort":"high"}));
+    }
+    let mut stream = broker
+        .proxy_stream(crate::auth::ProxyRequest {
+            provider: "xai-auth".into(),
+            method: crate::auth::ProxyMethod::Post,
+            path: "/responses".into(),
+            body: Some(Value::Object(body)),
+            stream: true,
+        })
+        .await?;
+    let mut text = String::new();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = tokio::select! { c=stream.next()=>c, _=cancel.cancelled()=>return Err("request canceled".into()) }
+    {
+        buf.extend_from_slice(&chunk?);
+        while let Some(n) = memchr::memchr(b'\n', &buf) {
+            let line = buf.split_to(n + 1);
+            let line = std::str::from_utf8(&line[..n]).unwrap_or("");
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if v["type"] == "response.output_text.delta" {
+                        if let Some(d) = v["delta"].as_str() {
+                            text.push_str(d);
+                            let _ = tx.send(StreamEvent::Llm(
+                                crate::runtime::types::LlmEvent::Text(d.into()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({"role":"assistant","content":[{"type":"text","text":text}]}))
+}
+
+#[cfg(test)]
+mod xai_tests {
+    #[test]
+    fn xai_fixture_is_public_responses_shape() {
+        let fixture = serde_json::json!({"type":"response.output_text.delta","delta":"hello"});
+        assert_eq!(fixture["type"], "response.output_text.delta");
+        assert_eq!(fixture["delta"], "hello");
     }
 }

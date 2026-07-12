@@ -56,6 +56,8 @@ pub enum Provider {
     OpenAi(ProviderConfig),
     /// ChatGPT subscription-backed Codex responses endpoint.
     Codex(ProviderConfig),
+    /// xAI public Responses API using broker-owned OAuth.
+    Xai(ProviderConfig),
     /// Known provider prefix but no API key configured.
     MissingKey(String),
 }
@@ -70,6 +72,16 @@ pub enum Provider {
 /// never touches provider-key config or environment variables directly.
 pub fn resolve_route(model: &str) -> Provider {
     if let Some((prefix, _rest)) = model.split_once('/') {
+        if prefix == "xai-auth" {
+            if model == "xai-auth/grok-4.5" {
+                return Provider::Xai(ProviderConfig {
+                    base_url: "https://api.x.ai/v1".into(),
+                    model: "grok-4.5".into(),
+                    provider: "xai-auth".into(),
+                });
+            }
+            return Provider::MissingKey(prefix.to_string());
+        }
         if prefix == "openai-codex" {
             if let Some(cfg) = registry::resolve_codex_shorthand(model) {
                 return Provider::Codex(cfg);
@@ -353,6 +365,10 @@ pub async fn try_route(
                 temperature, max_tokens, thinking_budget, cancel,
             ).await;
             Some(result)
+        }
+        Provider::Xai(cfg) => {
+            let broker = crate::auth::broker_from_source(source, cache, client.clone());
+            Some(stream::call_xai_responses_stream_inner(&cfg, &broker, tools_schema, system_prompt, messages, tx, max_tokens, thinking_budget, cancel).await)
         }
         Provider::Codex(cfg) => {
             let broker = crate::auth::broker_from_source(source, cache, client.clone());

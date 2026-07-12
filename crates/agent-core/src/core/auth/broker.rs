@@ -142,7 +142,10 @@ impl ProxyRequest {
     /// Validate provider identity and path shape. Fail closed on anything
     /// that could redirect a broker-owned credential.
     pub fn validate(&self) -> Result<(), BrokerError> {
-        if self.provider != LOCAL_PROVIDER_KEY && static_provider(&self.provider).is_none() {
+        if self.provider != LOCAL_PROVIDER_KEY
+            && self.provider != "xai-auth"
+            && static_provider(&self.provider).is_none()
+        {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
         }
         if !self.path.starts_with('/') {
@@ -156,7 +159,9 @@ impl ProxyRequest {
         // Per-provider endpoint allowlist: a signed proxy request can only
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
-        if !allowed_proxy_paths(&self.provider).contains(&self.path.as_str()) {
+        if !(self.provider == "xai-auth" && self.path == "/responses")
+            && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
+        {
             return Err(BrokerError::Denied(format!(
                 "proxy path '{}' is not in the provider's endpoint allowlist",
                 self.path
@@ -366,8 +371,15 @@ impl LocalBroker {
 
     async fn send(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
-        let key = self.resolve_static_key(&request.provider)?;
-        let base = self.base_url_for(&request.provider)?;
+        let (key, base) = if request.provider == "xai-auth" {
+            let token = self.access_token(OAuthProviderId::Xai).await?;
+            (token.token, "https://api.x.ai/v1".to_string())
+        } else {
+            (
+                self.resolve_static_key(&request.provider)?,
+                self.base_url_for(&request.provider)?,
+            )
+        };
         let url = format!("{base}{}", request.path);
         let mut builder = match request.method {
             ProxyMethod::Get => self.http.get(&url),

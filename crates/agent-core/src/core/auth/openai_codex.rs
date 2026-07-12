@@ -5,8 +5,8 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::{
-    generate_code_challenge, generate_code_verifier, generate_state, open_browser, save_provider_auth,
-    start_callback_server, CallbackResult, OAuthCredentials,
+    generate_code_challenge, generate_code_verifier, generate_state, open_browser,
+    save_provider_auth, start_callback_server, CallbackOutcome, CallbackResult, OAuthCredentials,
 };
 
 const PROVIDER: &str = "openai-codex";
@@ -67,7 +67,11 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     });
 
     let result = tokio::select! {
-        callback = rx => callback.map_err(|_| "Callback channel closed".to_string())?,
+        callback = rx => match callback.map_err(|_| "Callback channel closed".to_string())? {
+            CallbackOutcome::Authorized(result) => result,
+            CallbackOutcome::Denied { error, description } => return Err(format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default())),
+            CallbackOutcome::Invalid => return Err("Invalid OAuth callback".into()),
+        },
         manual = manual_rx => manual.map_err(|_| "Manual input channel closed".to_string())?,
     };
     stdin_task.abort();
@@ -87,7 +91,10 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     Ok(creds)
 }
 
-pub async fn refresh_token(client: &Client, refresh: &str) -> std::result::Result<OAuthCredentials, String> {
+pub async fn refresh_token(
+    client: &Client,
+    refresh: &str,
+) -> std::result::Result<OAuthCredentials, String> {
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", CLIENT_ID),
@@ -142,7 +149,9 @@ async fn token_request(
         .map_err(|e| format!("Failed to parse token response: {}", e))
 }
 
-fn credentials_from_token(token: CodexTokenResponse) -> std::result::Result<OAuthCredentials, String> {
+fn credentials_from_token(
+    token: CodexTokenResponse,
+) -> std::result::Result<OAuthCredentials, String> {
     let account_id = extract_account_id(&token.access_token)
         .ok_or_else(|| "Failed to extract ChatGPT account id from token".to_string())?;
     Ok(OAuthCredentials {
@@ -176,8 +185,14 @@ fn parse_authorization_input(input: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     if let Ok(url) = url::Url::parse(value) {
-        let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string())?;
-        let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        let code = url
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string())?;
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
         return Some((code, state));
     }
     if value.contains("code=") {
@@ -206,7 +221,10 @@ fn parse_authorization_input(input: &str) -> Option<(String, Option<String>)> {
 /// or accidental paste with no state (or the wrong state) is rejected.
 fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
     let (code, state) = parse_authorization_input(input)?;
-    Some(CallbackResult { code, state: state? })
+    Some(CallbackResult {
+        code,
+        state: state?,
+    })
 }
 
 pub fn extract_account_id(access_token: &str) -> Option<String> {
@@ -227,7 +245,9 @@ mod tests {
 
     #[test]
     fn parses_redirect_url() {
-        let parsed = parse_authorization_input("http://localhost:1455/auth/callback?code=abc&state=xyz").unwrap();
+        let parsed =
+            parse_authorization_input("http://localhost:1455/auth/callback?code=abc&state=xyz")
+                .unwrap();
         assert_eq!(parsed.0, "abc");
         assert_eq!(parsed.1.as_deref(), Some("xyz"));
     }
@@ -236,10 +256,9 @@ mod tests {
 
     #[test]
     fn manual_paste_accepts_full_redirect_url() {
-        let result = manual_paste_to_callback(
-            "http://localhost:1455/auth/callback?code=abc&state=xyz",
-        )
-        .expect("URL with code+state must be accepted");
+        let result =
+            manual_paste_to_callback("http://localhost:1455/auth/callback?code=abc&state=xyz")
+                .expect("URL with code+state must be accepted");
         assert_eq!(result.code, "abc");
         assert_eq!(result.state, "xyz");
     }
