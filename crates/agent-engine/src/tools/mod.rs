@@ -31,7 +31,7 @@ pub mod watcher_exit;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use crate::runtime::subagent::{
-    SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
+    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
 pub use bash::BashTool;

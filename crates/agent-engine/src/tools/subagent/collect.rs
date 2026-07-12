@@ -123,6 +123,7 @@ mod tests {
         let (_result_tx, result_rx) = oneshot::channel();
         SubagentHandle::new(
             id.to_string(),
+            0,
             "test-agent".to_string(),
             "test task".to_string(),
             "claude-sonnet-4-6".to_string(),

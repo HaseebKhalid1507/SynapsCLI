@@ -66,10 +66,27 @@ impl Default for SubagentState {
     fn default() -> Self { Self::new() }
 }
 
+// ── SubagentDisplayRow ────────────────────────────────────────────────────────────
+
+/// Snapshot row produced by SubagentRegistry::display_rows().
+/// Used by the TUI reconcile path as the registry's liveness authority.
+#[derive(Debug, Clone)]
+pub struct SubagentDisplayRow {
+    pub subagent_id: u64,
+    pub agent_name: String,
+    pub status: SubagentStatus,
+    pub cancel_requested: bool,
+    pub elapsed_secs: f64,
+    pub finished_elapsed: Option<std::time::Duration>,
+}
+
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
 
 pub struct SubagentHandle {
     pub id: String,
+    /// Numeric ID — same value that was passed to SubagentStart/SubagentDone events
+    /// so the TUI can correlate by id without parsing "sa_N" strings.
+    pub subagent_id: u64,
     pub agent_name: String,
     pub task_preview: String,
     pub model: String,
@@ -98,6 +115,7 @@ impl std::fmt::Debug for SubagentHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubagentHandle")
             .field("id", &self.id)
+            .field("subagent_id", &self.subagent_id)
             .field("agent_name", &self.agent_name)
             .field("model", &self.model)
             .finish_non_exhaustive()
@@ -109,6 +127,7 @@ impl SubagentHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
+        subagent_id: u64,
         agent_name: String,
         task_preview: String,
         model: String,
@@ -121,6 +140,7 @@ impl SubagentHandle {
     ) -> Self {
         Self {
             id,
+            subagent_id,
             agent_name,
             task_preview,
             model,
@@ -260,6 +280,26 @@ impl SubagentRegistry {
             .collect()
     }
 
+    /// Snapshot of every tracked handle for TUI reconcile.
+    /// Reads all state under the lock POISON-SAFE; exposes cancel_requested
+    /// which list_active() does not.
+    pub fn display_rows(&self) -> Vec<SubagentDisplayRow> {
+        self.handles
+            .values()
+            .map(|h| {
+                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                SubagentDisplayRow {
+                    subagent_id: h.subagent_id,
+                    agent_name: h.agent_name.clone(),
+                    status: s.status.clone(),
+                    cancel_requested: s.cancel_requested,
+                    elapsed_secs: h.started_at.elapsed().as_secs_f64(),
+                    finished_elapsed: s.finished_at.map(|t| t.elapsed()),
+                }
+            })
+            .collect()
+    }
+
     /// Drop handles that are no longer running.
     /// Iterate over all handles mutably (for bulk operations like cancel-all).
     pub fn iter_mut_handles(&mut self) -> impl Iterator<Item = &mut SubagentHandle> {
@@ -346,9 +386,12 @@ mod tests {
         let (steer_tx, steer_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (_result_tx, result_rx) = oneshot::channel();
+        // Parse numeric id from "sa_N" or use 0 as fallback for tests
+        let numeric_id: u64 = id.strip_prefix("sa_").and_then(|n| n.parse().ok()).unwrap_or(0);
         TestHandle {
             handle: SubagentHandle::new(
                 id.to_string(),
+                numeric_id,
                 "test-agent".to_string(),
                 "test task".to_string(),
                 "claude-sonnet-4-6".to_string(),
@@ -418,7 +461,7 @@ mod tests {
         let (_shutdown_tx, _) = oneshot::channel::<()>();
         let (_, result_rx) = oneshot::channel();
         let h = SubagentHandle::new(
-            "sa_1".into(), "test".into(), "task".into(),
+            "sa_1".into(), 1, "test".into(), "task".into(),
             "model".into(), "prompt".into(), 300, state, None, None, Some(result_rx),
         );
         assert!(h.steer("msg").is_err());
@@ -619,6 +662,56 @@ mod tests {
             s.status = SubagentStatus::Cancelled;
         }
         assert!(h.is_finished(), "Cancelled must count as finished");
+    }
+
+    // D1: display_rows returns a row for each registered handle
+    #[test]
+    fn display_rows_running_handle() {
+        let mut reg = SubagentRegistry::new();
+        reg.register(make_handle("sa_1"));
+        reg.register(make_handle("sa_2"));
+        let rows = reg.display_rows();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.status, SubagentStatus::Running);
+            assert!(!row.cancel_requested);
+            assert!(row.elapsed_secs >= 0.0);
+            assert!(row.finished_elapsed.is_none());
+        }
+    }
+
+    // D2: display_rows reflects finished status and cancel_requested flag
+    #[test]
+    fn display_rows_finished_and_cancel_requested() {
+        let mut reg = SubagentRegistry::new();
+        let h = make_finished_handle("sa_1");
+        reg.register(h);
+
+        // Make a handle with cancel_requested = true
+        let th = make_test_handle("sa_2");
+        {
+            let mut s = th.handle.state.write().unwrap();
+            s.cancel_requested = true;
+        }
+        reg.register(th.handle);
+
+        let rows = reg.display_rows();
+        assert_eq!(rows.len(), 2);
+
+        let finished = rows.iter().find(|r| r.subagent_id == 1).unwrap();
+        assert_eq!(finished.status, SubagentStatus::Completed);
+        assert!(!finished.cancel_requested);
+        assert!(finished.finished_elapsed.is_some());
+
+        let cancelling = rows.iter().find(|r| r.subagent_id == 2).unwrap();
+        assert!(cancelling.cancel_requested);
+    }
+
+    // D3: display_rows on empty registry returns empty vec
+    #[test]
+    fn display_rows_empty_registry() {
+        let reg = SubagentRegistry::new();
+        assert!(reg.display_rows().is_empty());
     }
 }
 

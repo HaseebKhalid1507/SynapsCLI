@@ -23,8 +23,10 @@ use agent_engine::tools::finalize_subagent;
 
 /// Build a minimal SubagentHandle backed by a shared state Arc.
 fn make_handle(id: &str, state: Arc<RwLock<SubagentState>>) -> SubagentHandle {
+    let numeric_id: u64 = id.strip_prefix("sa_").and_then(|n| n.parse().ok()).unwrap_or(0);
     SubagentHandle::new(
         id.to_string(),
+        numeric_id,
         "mock-agent".to_string(),
         "mock task".to_string(),
         "claude-test".to_string(),

@@ -141,6 +141,7 @@ impl Tool for SubagentStartTool {
         let system_prompt_for_handle = system_prompt.clone();
         let handle = SubagentHandle::new(
             handle_id.clone(),
+            subagent_id,
             label.clone(),
             task_preview,
             model.clone(),
