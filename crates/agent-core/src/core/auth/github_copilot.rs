@@ -919,7 +919,9 @@ pub mod testutil {
             cancel: &X,
         ) -> Result<(), CopilotAuthError> {
             // Quantum = 1s of logical time so cancel can interrupt mid-interval.
-            let total_secs = duration.as_secs().max(if duration.is_zero() { 0 } else { 1 });
+            let total_secs = duration
+                .as_secs()
+                .max(if duration.is_zero() { 0 } else { 1 });
             if total_secs == 0 {
                 if cancel.is_cancelled() {
                     return Err(CopilotAuthError::Cancelled);
@@ -997,9 +999,7 @@ pub mod testutil {
             };
             match next {
                 ScriptedResponse::Ok(body) => Ok(InjectedHttpResponse { status: 200, body }),
-                ScriptedResponse::Status(status, body) => {
-                    Ok(InjectedHttpResponse { status, body })
-                }
+                ScriptedResponse::Status(status, body) => Ok(InjectedHttpResponse { status, body }),
             }
         }
 
@@ -1027,9 +1027,7 @@ pub mod testutil {
             };
             match next {
                 ScriptedResponse::Ok(body) => Ok(InjectedHttpResponse { status: 200, body }),
-                ScriptedResponse::Status(status, body) => {
-                    Ok(InjectedHttpResponse { status, body })
-                }
+                ScriptedResponse::Status(status, body) => Ok(InjectedHttpResponse { status, body }),
             }
         }
     }
@@ -1541,8 +1539,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn github_copilot_session_mint_headers_include_required_integration_fields() {
         let headers = session_mint_request_headers();
@@ -1616,10 +1612,13 @@ mod tests {
             hdrs.get("User-Agent").map(String::as_str),
             Some(MINT_USER_AGENT)
         );
-        assert_eq!(hdrs.get("Accept").map(String::as_str), Some("application/json"));
+        assert_eq!(
+            hdrs.get("Accept").map(String::as_str),
+            Some("application/json")
+        );
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn github_copilot_empty_github_token_rejected_before_mint() {
         let http = FakeHttp::default();
         let clock = FakeClock::new(0);

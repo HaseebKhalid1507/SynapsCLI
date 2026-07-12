@@ -52,6 +52,35 @@ pub fn save_provider_auth(
     save_provider_auth_at(&path, provider, creds)
 }
 
+/// Load an opaque broker-owned cloud provider state object.
+pub fn load_cloud_state(provider: &str) -> std::result::Result<Option<serde_json::Value>, String> {
+    let path = auth_file_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let root: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?,
+    )
+    .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    Ok(root
+        .get(provider)
+        .and_then(|v| v.get("cloud_state"))
+        .cloned())
+}
+
+/// Atomically persist opaque cloud state while preserving every unrelated field.
+pub fn save_cloud_state(
+    provider: &str,
+    state: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let path = crate::config::resolve_write_path("auth.json");
+    let mut fields = serde_json::Map::new();
+    fields.insert("type".into(), serde_json::Value::String("cloud".into()));
+    fields.insert("cloud_state".into(), state.clone());
+    save_provider_fields_at(&path, provider, &fields)
+}
+
 /// Load one provider's broker-owned static API key from auth.json.
 ///
 /// Static keys are persisted as `{"type":"api_key","key":"…"}` entries in the

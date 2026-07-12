@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Messages sent from client → server
@@ -56,17 +56,11 @@ pub enum ServerMessage {
 
     /// Tool execution result
     #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_id: String,
-        result: String,
-    },
+    ToolResult { tool_id: String, result: String },
 
     /// Tool execution incremental delta
     #[serde(rename = "tool_result_delta")]
-    ToolResultDelta {
-        tool_id: String,
-        delta: String,
-    },
+    ToolResultDelta { tool_id: String, delta: String },
 
     /// Token usage update
     #[serde(rename = "usage")]
@@ -126,7 +120,11 @@ pub enum HistoryEntry {
     #[serde(rename = "text")]
     Text { content: String, time: String },
     #[serde(rename = "tool_use")]
-    ToolUse { tool_name: String, input: String, time: String },
+    ToolUse {
+        tool_name: String,
+        input: String,
+        time: String,
+    },
     #[serde(rename = "tool_result")]
     ToolResult { result: String, time: String },
     #[serde(rename = "system")]
@@ -286,7 +284,11 @@ mod tests {
         // Deserialize back and verify
         let deserialized: ServerMessage = serde_json::from_value(json_value).unwrap();
         match deserialized {
-            ServerMessage::ToolUse { tool_name, tool_id, input } => {
+            ServerMessage::ToolUse {
+                tool_name,
+                tool_id,
+                input,
+            } => {
                 assert_eq!(tool_name, "execute_bash");
                 assert_eq!(tool_id, "tool_123");
                 assert_eq!(input["command"], "ls -la");
@@ -320,7 +322,12 @@ mod tests {
         // Deserialize back and verify
         let deserialized: ServerMessage = serde_json::from_value(json_value).unwrap();
         match deserialized {
-            ServerMessage::Usage { input_tokens, output_tokens, cache_creation_5m, cache_creation_1h } => {
+            ServerMessage::Usage {
+                input_tokens,
+                output_tokens,
+                cache_creation_5m,
+                cache_creation_1h,
+            } => {
                 assert_eq!(input_tokens, 150);
                 assert_eq!(output_tokens, 75);
                 assert_eq!(cache_creation_5m, None);

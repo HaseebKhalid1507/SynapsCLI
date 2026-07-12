@@ -59,7 +59,9 @@ impl SessionIndexRecord {
 }
 
 pub fn index_path() -> PathBuf {
-    crate::core::config::base_dir().join("sessions").join("index.jsonl")
+    crate::core::config::base_dir()
+        .join("sessions")
+        .join("index.jsonl")
 }
 
 pub fn append_record(record: &SessionIndexRecord) -> crate::Result<()> {
@@ -72,31 +74,42 @@ pub fn read_recent(limit: usize) -> crate::Result<Vec<SessionIndexRecord>> {
 
 fn append_record_to_path(path: &std::path::Path, record: &SessionIndexRecord) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| crate::core::error::RuntimeError::Session(format!("create session index directory: {err}")))?;
+        std::fs::create_dir_all(parent).map_err(|err| {
+            crate::core::error::RuntimeError::Session(format!(
+                "create session index directory: {err}"
+            ))
+        })?;
     }
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("open session index: {err}")))?;
-    let mut line = serde_json::to_string(record)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}")))?;
+        .map_err(|err| {
+            crate::core::error::RuntimeError::Session(format!("open session index: {err}"))
+        })?;
+    let mut line = serde_json::to_string(record).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}"))
+    })?;
     line.push('\n');
     use std::io::Write;
-    file.write_all(line.as_bytes())
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("write session index record: {err}")))?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("write session index record: {err}"))
+    })?;
     Ok(())
 }
 
-fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<Vec<SessionIndexRecord>> {
+fn read_recent_from_path(
+    path: &std::path::Path,
+    limit: usize,
+) -> crate::Result<Vec<SessionIndexRecord>> {
     if limit == 0 || !path.exists() {
         return Ok(Vec::new());
     }
 
-    let contents = std::fs::read_to_string(path)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("read session index: {err}")))?;
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("read session index: {err}"))
+    })?;
     let mut records = Vec::new();
     for line in contents.lines().rev().take(limit) {
         if line.trim().is_empty() {
@@ -117,8 +130,8 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use serde_json::Value;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -186,8 +199,14 @@ mod tests {
         let contents = std::fs::read_to_string(index_path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(serde_json::from_str::<Value>(lines[0]).unwrap()["event"], "start");
-        assert_eq!(serde_json::from_str::<Value>(lines[1]).unwrap()["event"], "end");
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap()["event"],
+            "start"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[1]).unwrap()["event"],
+            "end"
+        );
     }
 
     #[test]

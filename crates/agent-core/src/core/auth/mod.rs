@@ -50,6 +50,7 @@ pub use credential_source::{
     is_expired_with_margin, resolve_access_token, resolve_remote, resolve_remote_token,
     BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
 };
+pub use github_copilot::login as login_github_copilot;
 pub use openai_codex::{
     extract_account_id as extract_codex_account_id, login as login_openai_codex,
 };
@@ -65,7 +66,6 @@ pub use storage::{
 pub use token::{
     ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
 };
-pub use github_copilot::login as login_github_copilot;
 pub use xai::login as login_xai;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────

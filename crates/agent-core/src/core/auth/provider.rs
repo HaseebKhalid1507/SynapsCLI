@@ -350,7 +350,10 @@ mod tests {
             BrokerCredentialStrategy::OAuthAccessToken
         );
         assert_eq!(desc.behavior, ProviderBehavior::GoogleGemini);
-        assert!(!desc.recommended, "gemini is experimental — not recommended");
+        assert!(
+            !desc.recommended,
+            "gemini is experimental — not recommended"
+        );
     }
 
     #[test]

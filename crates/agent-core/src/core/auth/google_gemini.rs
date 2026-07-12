@@ -155,7 +155,10 @@ where
     handle.shutdown().await;
     let callback = match outcome? {
         CallbackOutcome::Authorized(c) => c,
-        CallbackOutcome::Denied { error, description: _ } => {
+        CallbackOutcome::Denied {
+            error,
+            description: _,
+        } => {
             // Never surface `description` — it's attacker-controlled content.
             return Err(format!("google-gemini: OAuth denied ({error})"));
         }
@@ -199,7 +202,8 @@ async fn wait_for_callback(
     rx: oneshot::Receiver<CallbackOutcome>,
     _expected_state: &str,
 ) -> Result<CallbackOutcome, String> {
-    rx.await.map_err(|_| "google-gemini: callback channel closed".into())
+    rx.await
+        .map_err(|_| "google-gemini: callback channel closed".into())
 }
 
 /// Refresh grant against the production Google token endpoint.
@@ -471,12 +475,18 @@ mod tests {
         // "localhost", to avoid DNS-based interception.
         assert_eq!(CALLBACK_HOST, "127.0.0.1");
         assert!(CALLBACK_PATH.starts_with('/'));
-        assert_ne!(CALLBACK_PATH, "/callback", "must not collide with other providers");
+        assert_ne!(
+            CALLBACK_PATH, "/callback",
+            "must not collide with other providers"
+        );
     }
 
     #[test]
     fn provider_id_matches_typed_registry_key() {
-        assert_eq!(PROVIDER, super::super::provider::OAuthProviderId::GoogleGemini.as_str());
+        assert_eq!(
+            PROVIDER,
+            super::super::provider::OAuthProviderId::GoogleGemini.as_str()
+        );
     }
 
     #[tokio::test]
@@ -553,19 +563,15 @@ mod tests {
         )
         .is_none());
         // Missing state — must not silently pass.
-        assert!(parse_pasted_callback(
-            "http://127.0.0.1:45289/oauth2callback?code=c",
-            "s",
-            45289
-        )
-        .is_none());
+        assert!(
+            parse_pasted_callback("http://127.0.0.1:45289/oauth2callback?code=c", "s", 45289)
+                .is_none()
+        );
         // Missing code.
-        assert!(parse_pasted_callback(
-            "http://127.0.0.1:45289/oauth2callback?state=s",
-            "s",
-            45289
-        )
-        .is_none());
+        assert!(
+            parse_pasted_callback("http://127.0.0.1:45289/oauth2callback?state=s", "s", 45289)
+                .is_none()
+        );
         // Bare code / garbage.
         assert!(parse_pasted_callback("bare-code", "s", 45289).is_none());
         // Happy path.
@@ -581,8 +587,9 @@ mod tests {
 
     #[test]
     fn validate_google_https_endpoint_rejects_untrusted_hosts_and_http() {
-        assert!(validate_google_https_endpoint("http://accounts.google.com/o/oauth2/v2/auth")
-            .is_err());
+        assert!(
+            validate_google_https_endpoint("http://accounts.google.com/o/oauth2/v2/auth").is_err()
+        );
         assert!(validate_google_https_endpoint("https://evil.example/token").is_err());
         // Look-alike must fail (host suffix rule is exact-host, not endsWith).
         assert!(validate_google_https_endpoint("https://accounts.google.com.evil/token").is_err());
@@ -605,8 +612,8 @@ mod tests {
 
         // Refresh omitted, previous provided → carry over (refresh flow behavior).
         let body_no_r = r#"{"access_token":"newaccess","expires_in":1800}"#;
-        let carried = credentials_from_token_response(body_no_r, Some("old-refresh"), false)
-            .unwrap();
+        let carried =
+            credentials_from_token_response(body_no_r, Some("old-refresh"), false).unwrap();
         assert_eq!(carried.access, "newaccess");
         assert_eq!(carried.refresh, "old-refresh");
     }

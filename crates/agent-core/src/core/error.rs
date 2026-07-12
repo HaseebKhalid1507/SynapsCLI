@@ -44,7 +44,11 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
         });
     let detail = api_msg.unwrap_or_else(|| {
         let trimmed = body.trim();
-        if trimmed.len() > 200 { format!("{}…", crate::truncate_str(trimmed, 200)) } else { trimmed.to_string() }
+        if trimmed.len() > 200 {
+            format!("{}…", crate::truncate_str(trimmed, 200))
+        } else {
+            trimmed.to_string()
+        }
     });
 
     match status {
@@ -94,7 +98,10 @@ mod tests {
 
     #[test]
     fn test_humanize_529_overloaded() {
-        let msg = humanize_api_error(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+        let msg = humanize_api_error(
+            529,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
         assert!(msg.contains("overloaded"), "got: {msg}");
         assert!(!msg.contains('{'), "raw JSON leaked: {msg}");
     }
@@ -107,13 +114,19 @@ mod tests {
 
     #[test]
     fn test_humanize_400_context_suggests_compact() {
-        let msg = humanize_api_error(400, r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#);
+        let msg = humanize_api_error(
+            400,
+            r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#,
+        );
         assert!(msg.contains("/compact"), "got: {msg}");
     }
 
     #[test]
     fn test_humanize_400_cache_ttl_names_config_key() {
-        let msg = humanize_api_error(400, r#"{"error":{"message":"The extended-cache-ttl-2025-04-11 beta is not enabled for this account"}}"#);
+        let msg = humanize_api_error(
+            400,
+            r#"{"error":{"message":"The extended-cache-ttl-2025-04-11 beta is not enabled for this account"}}"#,
+        );
         assert!(msg.contains("cache_ttl = 5m"), "got: {msg}");
     }
 
@@ -173,15 +186,9 @@ mod tests {
             "Session error: not found"
         );
 
-        assert_eq!(
-            format!("{}", RuntimeError::Timeout),
-            "Request timed out"
-        );
+        assert_eq!(format!("{}", RuntimeError::Timeout), "Request timed out");
 
-        assert_eq!(
-            format!("{}", RuntimeError::Canceled),
-            "Operation canceled"
-        );
+        assert_eq!(format!("{}", RuntimeError::Canceled), "Operation canceled");
     }
 
     #[test]
@@ -206,14 +213,8 @@ mod tests {
             "Session error: not found"
         );
 
-        assert_eq!(
-            RuntimeError::Timeout.to_string(),
-            "Request timed out"
-        );
+        assert_eq!(RuntimeError::Timeout.to_string(), "Request timed out");
 
-        assert_eq!(
-            RuntimeError::Canceled.to_string(),
-            "Operation canceled"
-        );
+        assert_eq!(RuntimeError::Canceled.to_string(), "Operation canceled");
     }
 }

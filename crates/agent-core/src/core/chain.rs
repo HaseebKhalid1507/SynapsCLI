@@ -45,7 +45,9 @@ pub fn save_chain(name: &str, head: &str) -> io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = chain_path(name);
     let tmp = path.with_extension("tmp");
-    let ptr = ChainPointer { head: head.to_string() };
+    let ptr = ChainPointer {
+        head: head.to_string(),
+    };
     let json = serde_json::to_string(&ptr).map_err(io::Error::other)?;
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)
@@ -79,7 +81,10 @@ pub fn list_chains() -> io::Result<Vec<NamedChain>> {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            out.push(NamedChain { name, head: ptr.head });
+            out.push(NamedChain {
+                name,
+                head: ptr.head,
+            });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -91,7 +96,10 @@ pub fn find_chain_by_head(session_id: &str) -> io::Result<Option<NamedChain>> {
 }
 
 pub fn find_all_chains_by_head(session_id: &str) -> io::Result<Vec<NamedChain>> {
-    Ok(list_chains()?.into_iter().filter(|c| c.head == session_id).collect())
+    Ok(list_chains()?
+        .into_iter()
+        .filter(|c| c.head == session_id)
+        .collect())
 }
 
 #[cfg(test)]
@@ -107,14 +115,22 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("synaps-chain-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let prev_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &tmp); }
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v); },
-            None => unsafe { std::env::remove_var("HOME"); },
+            Some(v) => unsafe {
+                std::env::set_var("HOME", v);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
         }
         let _ = std::fs::remove_dir_all(&tmp);
-        if let Err(e) = result { std::panic::resume_unwind(e); }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]

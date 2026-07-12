@@ -24,7 +24,7 @@ pub enum WatcherResponse {
 pub struct AgentStatusInfo {
     pub name: String,
     pub trigger: String,
-    pub status: String,        // "running", "sleeping", "stopped", "crashed"
+    pub status: String, // "running", "sleeping", "stopped", "crashed"
     pub session_count: u64,
     pub uptime_secs: Option<f64>,
     pub pid: Option<u32>,
@@ -88,7 +88,9 @@ impl Default for TriggerConfig {
     }
 }
 
-fn default_debounce() -> u64 { 3 }
+fn default_debounce() -> u64 {
+    3
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionLimits {
@@ -184,22 +186,22 @@ pub struct DailyStats {
 impl AgentConfig {
     /// Load config from a TOML file
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("Failed to parse config: {}", e))
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
+        toml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))
     }
 
     /// Resolve the agent directory (parent of config.toml)
     pub fn agent_dir(path: &std::path::Path) -> PathBuf {
-        path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
     }
 
     /// Load soul.md from the agent directory
     pub fn load_soul(agent_dir: &std::path::Path) -> Result<String, String> {
         let soul_path = agent_dir.join("soul.md");
-        std::fs::read_to_string(&soul_path)
-            .map_err(|e| format!("Failed to read soul.md: {}", e))
+        std::fs::read_to_string(&soul_path).map_err(|e| format!("Failed to read soul.md: {}", e))
     }
 
     /// Load handoff state from the agent directory
@@ -214,18 +216,42 @@ impl AgentConfig {
 
 // -- Defaults ----------------------------------------------------------------
 
-fn default_model() -> String { crate::models::default_model().to_string() }
-fn default_thinking() -> String { "medium".to_string() }
-fn default_trigger() -> String { "manual".to_string() }
-fn default_max_tokens() -> u64 { 100_000 }
-fn default_max_duration() -> u64 { 60 }
-fn default_max_cost() -> f64 { 0.50 }
-fn default_max_daily_cost() -> f64 { 10.0 }
-fn default_max_tool_calls() -> u64 { 200 }
-fn default_cooldown() -> u64 { 10 }
-fn default_max_retries() -> u32 { 3 }
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_heartbeat_stale() -> u64 { 120 }
+fn default_model() -> String {
+    crate::models::default_model().to_string()
+}
+fn default_thinking() -> String {
+    "medium".to_string()
+}
+fn default_trigger() -> String {
+    "manual".to_string()
+}
+fn default_max_tokens() -> u64 {
+    100_000
+}
+fn default_max_duration() -> u64 {
+    60
+}
+fn default_max_cost() -> f64 {
+    0.50
+}
+fn default_max_daily_cost() -> f64 {
+    10.0
+}
+fn default_max_tool_calls() -> u64 {
+    200
+}
+fn default_cooldown() -> u64 {
+    10
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_heartbeat_stale() -> u64 {
+    120
+}
 
 fn default_boot_message() -> String {
     r#"You are waking up for a new session. Current time: {timestamp}
@@ -255,7 +281,9 @@ impl Default for SessionLimits {
 
 impl Default for BootConfig {
     fn default() -> Self {
-        Self { message: default_boot_message() }
+        Self {
+            message: default_boot_message(),
+        }
     }
 }
 

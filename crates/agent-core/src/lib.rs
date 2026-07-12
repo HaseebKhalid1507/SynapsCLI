@@ -12,15 +12,15 @@ pub use core::stream_types::{AgentEvent, LlmEvent, SessionEvent, SharedMessage, 
 
 // Replicate the root lib.rs aliases so internal `crate::config`,
 // `crate::models`, `crate::session`, etc. resolve INSIDE agent-core.
-pub use core::config;
-pub use core::session;
 pub use core::auth;
-pub use core::logging;
-pub use core::protocol;
-pub use core::error;
-pub use core::watcher_types;
-pub use core::models;
 pub use core::chain;
+pub use core::config;
+pub use core::error;
+pub use core::logging;
+pub use core::models;
+pub use core::protocol;
+pub use core::session;
+pub use core::watcher_types;
 
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]

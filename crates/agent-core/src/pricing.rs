@@ -27,11 +27,11 @@
 #[inline]
 fn model_prices(model: &str) -> (f64, f64) {
     match model {
-        m if m.contains("fable")  => (10.0, 50.0),
-        m if m.contains("opus")   => (5.0, 25.0),
+        m if m.contains("fable") => (10.0, 50.0),
+        m if m.contains("opus") => (5.0, 25.0),
         m if m.contains("sonnet") => (3.0, 15.0),
-        m if m.contains("haiku")  => (1.0,  5.0),
-        _                         => (3.0, 15.0), // default: Sonnet pricing
+        m if m.contains("haiku") => (1.0, 5.0),
+        _ => (3.0, 15.0), // default: Sonnet pricing
     }
 }
 
@@ -58,7 +58,14 @@ pub fn calculate_cost(
     cache_read: u64,
     cache_creation: u64,
 ) -> f64 {
-    calculate_cost_split(model, input_tokens, output_tokens, cache_read, cache_creation, 0)
+    calculate_cost_split(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read,
+        cache_creation,
+        0,
+    )
 }
 
 /// Calculate the USD cost of a single model turn with the cache-write TTL
@@ -75,11 +82,11 @@ pub fn calculate_cost_split(
     cache_write_1h: u64,
 ) -> f64 {
     let (input_price, output_price) = model_prices(model);
-    (input_tokens     as f64 / 1_000_000.0) * input_price
-        + (cache_read     as f64 / 1_000_000.0) * input_price * 0.1
+    (input_tokens as f64 / 1_000_000.0) * input_price
+        + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
         + (cache_write_5m as f64 / 1_000_000.0) * input_price * 1.25
         + (cache_write_1h as f64 / 1_000_000.0) * input_price * 2.0
-        + (output_tokens  as f64 / 1_000_000.0) * output_price
+        + (output_tokens as f64 / 1_000_000.0) * output_price
 }
 
 /// Split-aware cost for callers holding an aggregate plus an *optional* TTL
@@ -97,10 +104,20 @@ pub fn calculate_cost_optional_split(
     cache_creation_1h: Option<u64>,
 ) -> f64 {
     match (cache_creation_5m, cache_creation_1h) {
-        (None, None) => calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation),
+        (None, None) => calculate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+        ),
         (c5, c1) => calculate_cost_split(
-            model, input_tokens, output_tokens, cache_read,
-            c5.unwrap_or(0), c1.unwrap_or(0),
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            c5.unwrap_or(0),
+            c1.unwrap_or(0),
         ),
     }
 }
@@ -185,7 +202,7 @@ mod tests {
     #[test]
     fn unknown_model_falls_back_to_sonnet() {
         let cost_unknown = calculate_cost("gpt-99-turbo", 1_000_000, 0, 0, 0);
-        let cost_sonnet  = calculate_cost("claude-sonnet-4-5", 1_000_000, 0, 0, 0);
+        let cost_sonnet = calculate_cost("claude-sonnet-4-5", 1_000_000, 0, 0, 0);
         assert!((cost_unknown - cost_sonnet).abs() < 1e-9);
     }
 

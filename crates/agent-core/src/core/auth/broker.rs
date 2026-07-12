@@ -371,6 +371,99 @@ pub trait CloudBackend: Send + Sync {
     ) -> Result<CloudEventStream, BrokerError>;
 }
 
+#[derive(Clone)]
+struct ProductionCloudBackend {
+    http: reqwest::Client,
+}
+impl ProductionCloudBackend {
+    fn new(http: reqwest::Client) -> Self {
+        Self { http }
+    }
+
+    fn state(&self, provider: CloudProviderId) -> Result<serde_json::Value, BrokerError> {
+        storage::load_cloud_state(provider.as_str())
+            .map_err(BrokerError::Credential)?
+            .ok_or_else(|| BrokerError::NotConfigured(provider.to_string()))
+    }
+
+    fn aws(
+        &self,
+    ) -> Result<super::aws_bedrock::AwsBedrockBroker<super::aws_bedrock::AwsHttpApi>, BrokerError>
+    {
+        #[derive(Deserialize)]
+        struct State {
+            config: super::cloud::AwsBedrockConfig,
+            access_key: String,
+            secret_key: String,
+            session_token: String,
+            expires_at: u64,
+        }
+        let s: State = serde_json::from_value(self.state(CloudProviderId::AwsBedrock)?)
+            .map_err(|_| BrokerError::Credential("invalid AWS broker state".into()))?;
+        let api = super::aws_bedrock::AwsHttpApi::new(self.http.clone(), &s.config.sso_region);
+        Ok(super::aws_bedrock::AwsBedrockBroker::from_credentials(
+            api,
+            s.config,
+            super::aws_bedrock::RoleCredentials::new(
+                s.access_key,
+                s.secret_key,
+                s.session_token,
+                s.expires_at,
+            ),
+        ))
+    }
+}
+
+#[async_trait]
+impl CloudBackend for ProductionCloudBackend {
+    async fn catalog(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        _allow_stale: bool,
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
+        if context_ref != provider.as_str() {
+            return Err(BrokerError::Denied(
+                "cloud context does not match stored provider".into(),
+            ));
+        }
+        match provider {
+            CloudProviderId::AwsBedrock => {
+                let broker = self.aws()?;
+                let label = broker.public_context().bedrock_region;
+                broker.catalog().await.map_err(|_| BrokerError::Transport("AWS catalog failed (details redacted)".into())).map(|xs| xs.into_iter().map(|x| CloudCatalogEntry { provider, id: x.id, display_name: x.display_name, context_ref: provider.as_str().into(), context_label: label.clone(), stale: false }).collect())
+            }
+            CloudProviderId::AzureOpenAi | CloudProviderId::GoogleVertex => Err(BrokerError::RegistrationRequired { provider: provider.to_string(), remediation: "configure the Synaps-owned public OAuth client registration and complete login".into() }),
+        }
+    }
+    async fn invoke(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        model_id: &str,
+        request: InvokeRequest,
+    ) -> Result<CloudEventStream, BrokerError> {
+        if context_ref != provider.as_str() {
+            return Err(BrokerError::Denied(
+                "cloud context does not match stored provider".into(),
+            ));
+        }
+        match provider {
+            CloudProviderId::AwsBedrock => {
+                let broker = self.aws()?;
+                let events = if request.stream {
+                    broker.converse_stream(model_id, request).await.map_err(|_| BrokerError::Transport("AWS invocation failed (details redacted)".into()))?.into_iter().map(|e| match e { super::aws_bedrock::ConverseEvent::TextDelta(delta) => CloudEvent::TextDelta { delta }, super::aws_bedrock::ConverseEvent::ToolArguments { id, delta } => CloudEvent::ToolArguments { id, name: None, delta }, super::aws_bedrock::ConverseEvent::Usage(u) => CloudEvent::Usage { input_tokens: u.input_tokens, output_tokens: u.output_tokens }, super::aws_bedrock::ConverseEvent::Done => CloudEvent::Done }).collect::<Vec<_>>()
+                } else {
+                    let o = broker.converse(model_id, request).await.map_err(|_| BrokerError::Transport("AWS invocation failed (details redacted)".into()))?;
+                    vec![CloudEvent::TextDelta { delta: o.text }, CloudEvent::Usage { input_tokens: o.usage.input_tokens, output_tokens: o.usage.output_tokens }, CloudEvent::Done]
+                };
+                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
+            CloudProviderId::AzureOpenAi | CloudProviderId::GoogleVertex => Err(BrokerError::RegistrationRequired { provider: provider.to_string(), remediation: "configure the Synaps-owned public OAuth client registration and complete login".into() }),
+        }
+    }
+}
+
 /// In-process credential broker. This module is the ONLY place runtime-serving
 /// code may read `auth.json`, `provider.<key>` config values, or credential
 /// environment variables.
@@ -391,6 +484,7 @@ pub struct LocalBroker {
 
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
+        let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
         Self {
             http,
             local_base_url: None,
@@ -398,7 +492,7 @@ impl LocalBroker {
             google_gemini_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
-            cloud_backend: None,
+            cloud_backend: Some(cloud_backend),
         }
     }
 

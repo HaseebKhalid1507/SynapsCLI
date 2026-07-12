@@ -264,6 +264,21 @@ pub struct AwsBedrockBroker<A: AwsApi> {
     credentials: RoleCredentials,
 }
 impl<A: AwsApi> AwsBedrockBroker<A> {
+    /// Restore broker-owned temporary credentials. This is intentionally only a
+    /// typed Bedrock adapter; credentials can never be extracted or used to sign
+    /// caller-selected requests.
+    pub fn from_credentials(
+        api: A,
+        config: AwsBedrockConfig,
+        credentials: RoleCredentials,
+    ) -> Self {
+        Self {
+            api,
+            config,
+            credentials,
+        }
+    }
+
     pub async fn login(api: A, config: AwsBedrockConfig, _: Selection) -> Result<Self, AwsError> {
         let c = api.register_client(&config.sso_region).await?;
         let d = api
