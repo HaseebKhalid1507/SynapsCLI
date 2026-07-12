@@ -1071,6 +1071,8 @@ mod tests {
                 .map(|model| model.id)
                 .collect();
         assert_eq!(ids, catalog_ids);
+        assert!(ids.contains(&"claude-fable-5"));
+        assert!(ids.contains(&"claude-opus-4.8"));
         assert!(copilot
             .entries
             .iter()

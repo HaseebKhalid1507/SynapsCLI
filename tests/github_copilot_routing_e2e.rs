@@ -22,8 +22,8 @@ const FIXTURE: &str = include_str!(
 ///
 /// The tuples are `(id, is_selectable, expected_wire_after_endpoint_review)`.
 ///
-/// Selectability = `type == chat` AND `model_picker_enabled == true`
-/// AND `policy.state != disabled` AND at least one reviewed endpoint
+/// Selectability = `type == chat` AND at least one reviewed endpoint. Picker and
+/// policy fields are account opt-in metadata, not model-support gates
 /// (`/responses` or `/chat/completions`; `/v1/messages` is not currently
 /// broker-reviewed, `ws:/responses` is out of scope).
 fn expected() -> BTreeMap<&'static str, (bool, Option<WireProtocol>)> {
@@ -36,8 +36,8 @@ fn expected() -> BTreeMap<&'static str, (bool, Option<WireProtocol>)> {
     m.insert("gpt-5.6-terra", (true, Some(WireProtocol::OpenAiResponses)));
     // Azure OpenAI vendor treated like OpenAI: /responses preferred when supported.
     m.insert("gpt-5-mini", (true, Some(WireProtocol::OpenAiResponses)));
-    // Disabled OpenAI policy state — filtered.
-    m.insert("gpt-5.5", (false, Some(WireProtocol::OpenAiResponses)));
+    // Disabled policy is account opt-in metadata; endpoint-supported chat rows remain visible.
+    m.insert("gpt-5.5", (true, Some(WireProtocol::OpenAiResponses)));
     // Anthropic vendor: /v1/messages is unreviewed for broker → fall back
     // to /chat/completions where advertised.
     m.insert(
@@ -52,23 +52,22 @@ fn expected() -> BTreeMap<&'static str, (bool, Option<WireProtocol>)> {
         "claude-haiku-4.5",
         (true, Some(WireProtocol::OpenAiChatCompletions)),
     );
-    // Disabled Anthropic policy state — filtered from picker even though
-    // /chat/completions is advertised.
+    // Opt-in metadata does not override advertised endpoint support.
     m.insert(
         "claude-fable-5",
-        (false, Some(WireProtocol::OpenAiChatCompletions)),
+        (true, Some(WireProtocol::OpenAiChatCompletions)),
     );
     m.insert(
         "claude-opus-4.7",
-        (false, Some(WireProtocol::OpenAiChatCompletions)),
+        (true, Some(WireProtocol::OpenAiChatCompletions)),
     );
     m.insert(
         "claude-opus-4.8",
-        (false, Some(WireProtocol::OpenAiChatCompletions)),
+        (true, Some(WireProtocol::OpenAiChatCompletions)),
     );
     m.insert(
         "claude-opus-4.8-fast",
-        (false, Some(WireProtocol::OpenAiChatCompletions)),
+        (true, Some(WireProtocol::OpenAiChatCompletions)),
     );
     // Google Gemini via Copilot: /chat/completions only.
     m.insert(
@@ -113,7 +112,7 @@ fn every_fixture_row_matches_expected_selectability_and_endpoint_pick() {
 }
 
 #[test]
-fn selectable_helper_matches_expected_set_and_excludes_disabled_and_endpointless() {
+fn selectable_helper_matches_expected_set_and_excludes_only_unsupported_rows() {
     let selectable = selectable_copilot_entries(FIXTURE).expect("fixture parses");
     let got: HashSet<_> = selectable.iter().map(|e| e.id.as_str().to_string()).collect();
     let want: HashSet<_> = expected()
@@ -121,18 +120,11 @@ fn selectable_helper_matches_expected_set_and_excludes_disabled_and_endpointless
         .filter_map(|(id, (sel, _))| sel.then(|| id.to_string()))
         .collect();
     assert_eq!(got, want);
-    // Explicit sanity: nothing disabled or endpointless slipped through.
-    for banned in [
-        "claude-fable-5",
-        "claude-opus-4.7",
-        "claude-opus-4.8",
-        "claude-opus-4.8-fast",
-        "gpt-5.5",
-        "gemini-3-flash-preview",
-        "trajectory-compaction",
-        "text-embedding-3-small",
-        "gpt-41-copilot",
-    ] {
+    // Opt-in rows with reviewed endpoints remain visible, while unsupported rows do not.
+    for visible in ["claude-fable-5", "claude-opus-4.8", "gpt-5.5"] {
+        assert!(got.contains(visible), "`{visible}` must remain selectable");
+    }
+    for banned in ["gemini-3-flash-preview", "trajectory-compaction", "text-embedding-3-small", "gpt-41-copilot"] {
         assert!(!got.contains(banned), "`{banned}` must not be selectable");
     }
 }
@@ -155,34 +147,14 @@ fn resolve_route_matches_endpoint_evidence_for_every_selectable_id() {
 }
 
 #[test]
-fn resolve_route_fails_closed_for_disabled_endpointless_and_unknown() {
-    // Disabled policy state → not routable even if the wire is advertised.
-    for id in [
-        "claude-fable-5",
-        "claude-opus-4.7",
-        "claude-opus-4.8",
-        "claude-opus-4.8-fast",
-        "gpt-5.5",
-    ] {
-        assert!(
-            resolve_route(&format!("github-copilot/{id}")).is_none(),
-            "`{id}` is disabled in fixture — must not route"
-        );
+fn resolve_route_supports_opt_in_rows_and_fails_closed_for_unsupported_and_unknown() {
+    for id in ["claude-fable-5", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-4.8-fast", "gpt-5.5"] {
+        assert!(resolve_route(&format!("github-copilot/{id}")).is_some(), "`{id}` has a reviewed fixture endpoint");
     }
-    // No advertised supported_endpoints → fail closed.
     assert!(resolve_route("github-copilot/gemini-3-flash-preview").is_none());
-    // Non-chat catalog rows must not be routable.
-    for id in [
-        "trajectory-compaction",
-        "text-embedding-3-small",
-        "gpt-41-copilot",
-    ] {
-        assert!(
-            resolve_route(&format!("github-copilot/{id}")).is_none(),
-            "`{id}` is non-chat / utility — must not route"
-        );
+    for id in ["trajectory-compaction", "text-embedding-3-small", "gpt-41-copilot"] {
+        assert!(resolve_route(&format!("github-copilot/{id}")).is_none());
     }
-    // Guessed/unobserved names still fail closed.
     for id in ["auto", "gpt-5.6-sol", "gpt-4.1", "gemini-3-pro"] {
         assert!(resolve_route(&format!("github-copilot/{id}")).is_none());
     }

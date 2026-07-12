@@ -128,7 +128,7 @@ pub struct CopilotModelDescriptor {
 
 /// Curated fallback — every entry is proven by [`selectable_copilot_entries`]
 /// on the reviewed fixture: `type == chat`, `model_picker_enabled == true`,
-/// `policy.state != disabled`, and at least one reviewed endpoint. Ordered
+/// and at least one reviewed endpoint. Policy/picker flags are opt-in metadata. Ordered
 /// for UI presentation.
 pub const COPILOT_FALLBACK_MODELS: &[CopilotModelDescriptor] = &[
     CopilotModelDescriptor {
@@ -167,6 +167,11 @@ pub const COPILOT_FALLBACK_MODELS: &[CopilotModelDescriptor] = &[
         vendor: "Azure OpenAI",
         selected_wire: CopilotWire::Responses,
     },
+    CopilotModelDescriptor { id: "gpt-5.5", label: "GPT-5.5", vendor: "OpenAI", selected_wire: CopilotWire::Responses },
+    CopilotModelDescriptor { id: "claude-fable-5", label: "Claude Fable 5", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
+    CopilotModelDescriptor { id: "claude-opus-4.7", label: "Claude Opus 4.7", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
+    CopilotModelDescriptor { id: "claude-opus-4.8", label: "Claude Opus 4.8", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
+    CopilotModelDescriptor { id: "claude-opus-4.8-fast", label: "Claude Opus 4.8 (fast mode)", vendor: "Anthropic", selected_wire: CopilotWire::ChatCompletions },
     CopilotModelDescriptor {
         id: "claude-sonnet-4.6",
         label: "Claude Sonnet 4.6",
@@ -387,8 +392,8 @@ impl CopilotCatalogEntry {
     /// True when this row should surface in the picker AND is routable.
     pub fn is_selectable_for_picker(&self) -> bool {
         self.kind.eq_ignore_ascii_case("chat")
-            && self.model_picker_enabled
-            && !matches!(self.policy_state, CopilotPolicyState::Disabled)
+            && (self.model_picker_enabled
+                || matches!(self.policy_state, CopilotPolicyState::Disabled))
             && self.preferred_wire_protocol().is_some()
     }
 }
@@ -481,9 +486,9 @@ pub fn parse_copilot_catalog_entries(body: &str) -> Result<Vec<CopilotCatalogEnt
 
 /// Parse an experimental Copilot `/models` body into normalized catalog rows.
 ///
-/// The returned view is the picker view: chat rows only, picker-enabled for
-/// the account, policy state not `disabled`, and with at least one reviewed
-/// endpoint. Callers wanting the raw evidence use
+/// The returned view includes chat rows with at least one reviewed endpoint.
+/// A disabled policy identifies an account opt-in row and does not hide it; otherwise
+/// the upstream picker flag remains the utility-row visibility boundary. Callers wanting the raw evidence use
 /// [`parse_copilot_catalog_entries`].
 pub fn parse_copilot_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String> {
     let entries = parse_copilot_catalog_entries(body)?;
@@ -550,20 +555,8 @@ mod tests {
         assert!(copilot_model("gpt-4.1").is_none());
         assert!(copilot_model("claude-sonnet-4").is_none());
         assert!(copilot_model("gemini-3-pro").is_none());
-        // Disabled or endpointless rows must not appear in the fallback.
-        for banned in [
-            "claude-fable-5",
-            "claude-opus-4.7",
-            "claude-opus-4.8",
-            "claude-opus-4.8-fast",
-            "gpt-5.5",
-            "gemini-3-flash-preview",
-        ] {
-            assert!(
-                copilot_model(banned).is_none(),
-                "`{banned}` must not be in curated fallback"
-            );
-        }
+        // Endpointless rows remain excluded.
+        assert!(copilot_model("gemini-3-flash-preview").is_none());
     }
 
     #[test]
@@ -619,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_filters_non_chat_disabled_and_endpointless_rows() {
+    fn parse_filters_non_chat_and_endpointless_but_keeps_opt_in_rows() {
         let body = r#"{
           "object":"list",
           "data":[
@@ -654,8 +647,8 @@ mod tests {
         }"#;
         let models = parse_copilot_catalog_models(body).expect("parse");
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["gpt-x"]);
-        let gpt = &models[0];
+        assert_eq!(ids, vec!["disabled-chat", "gpt-x"]);
+        let gpt = &models[1];
         assert_eq!(gpt.context_tokens, Some(128000));
         assert_eq!(gpt.max_output_tokens, Some(16384));
         assert!(gpt.input_modalities.contains(&Modality::Image));
@@ -668,7 +661,7 @@ mod tests {
     fn parse_live_fixture_keeps_only_selectable_rows() {
         let models = parse_copilot_catalog_models(LIVE_FIXTURE).expect("fixture parse");
         let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
-        // Selectable rows (enabled + reviewed endpoint) MUST be present.
+        // All chat rows with reviewed endpoints MUST be present.
         for expected in [
             "gpt-5.3-codex",
             "gpt-5.4",
@@ -681,16 +674,13 @@ mod tests {
             "claude-haiku-4.5",
             "gemini-3.1-pro-preview",
             "gemini-3.5-flash",
+            "claude-fable-5", "claude-opus-4.7", "claude-opus-4.8",
+            "claude-opus-4.8-fast", "gpt-5.5",
         ] {
             assert!(ids.contains(expected), "missing {expected}");
         }
-        // Disabled or endpointless rows MUST NOT be present.
+        // Endpointless and non-chat rows MUST NOT be present.
         for banned in [
-            "claude-fable-5",
-            "claude-opus-4.7",
-            "claude-opus-4.8",
-            "claude-opus-4.8-fast",
-            "gpt-5.5",
             "gemini-3-flash-preview",
             "text-embedding-3-small",
             "gpt-41-copilot",
