@@ -185,8 +185,7 @@ impl ProxyRequest {
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 ))
-            && !(self.provider == "google-gemini"
-                && is_allowed_google_gemini_path(&self.path))
+            && !(self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path))
             && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
         {
             return Err(BrokerError::Denied(format!(
@@ -683,14 +682,16 @@ pub fn anthropic_credential_available() -> bool {
     oauth || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty())
 }
 
-/// True if the OAuth provider has a stored, unexpired credential. Non-secret
-/// login-status query for UI surfaces; the credential itself stays behind the
-/// broker boundary.
+/// True if the OAuth provider has stored refreshable credentials. This is a
+/// non-secret availability query for UI surfaces; an expired access token is
+/// still a valid login when the broker can refresh it on first use.
 pub fn oauth_provider_logged_in(provider: OAuthProviderId) -> bool {
     load_provider_auth(provider.as_str())
         .ok()
         .flatten()
-        .is_some_and(|creds| !super::is_token_expired(&creds))
+        .is_some_and(|creds| {
+            creds.auth_type == "oauth" && (!creds.refresh.is_empty() || !creds.access.is_empty())
+        })
 }
 
 #[async_trait]
