@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
 use super::static_providers::{
     allowed_proxy_paths, static_provider, StaticProviderSpec, LOCAL_DEFAULT_BASE_URL,
@@ -84,7 +85,10 @@ pub enum BrokerError {
     /// The named provider is not in any broker registry.
     UnknownProvider(String),
     /// A required public-client registration is not configured.
-    RegistrationRequired { provider: String, remediation: String },
+    RegistrationRequired {
+        provider: String,
+        remediation: String,
+    },
     /// The provider is known but has no credential configured.
     NotConfigured(String),
     /// The caller failed broker (machine) authentication.
@@ -101,7 +105,10 @@ impl std::fmt::Display for BrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownProvider(p) => write!(f, "unknown provider: {p}"),
-            Self::RegistrationRequired { provider, remediation } => {
+            Self::RegistrationRequired {
+                provider,
+                remediation,
+            } => {
                 write!(f, "registration required for '{provider}': {remediation}")
             }
             Self::NotConfigured(p) => write!(
@@ -262,6 +269,37 @@ impl StaticKeyStatus {
 
 // ── The broker contract ──────────────────────────────────────────────────────
 
+/// Normalized dynamic cloud model returned across local/remote broker boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudCatalogEntry {
+    pub provider: CloudProviderId,
+    pub id: String,
+    pub display_name: String,
+    pub context_ref: String,
+    pub context_label: String,
+    pub stale: bool,
+}
+
+/// Credential-free normalized cloud invocation event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CloudEvent {
+    TextDelta {
+        delta: String,
+    },
+    ToolArguments {
+        id: String,
+        name: Option<String>,
+        delta: String,
+    },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    Done,
+}
+pub type CloudEventStream = Pin<Box<dyn Stream<Item = Result<CloudEvent, BrokerError>> + Send>>;
+
 /// The typed credential broker protocol. One implementation runs in-process
 /// ([`LocalBroker`]) so normal local use needs no daemon; the other talks to a
 /// remote `synaps auth-broker` over authenticated HTTP(S) ([`RemoteBroker`]).
@@ -286,11 +324,46 @@ pub trait CredentialBroker: Send + Sync {
     /// NOT a generic OAuth proxy: one operation, one fixed endpoint.
     async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError>;
 
+    /// Typed cloud catalog. Credentials and provider authority remain broker-owned.
+    async fn cloud_catalog(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        allow_stale: bool,
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError>;
+
+    /// Typed cloud invocation. The canonical model and normalized request are the
+    /// only caller-controlled inputs; hosts, auth and signing remain broker-owned.
+    async fn cloud_invoke(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        model_id: &str,
+        request: InvokeRequest,
+    ) -> Result<CloudEventStream, BrokerError>;
+
     /// Non-secret provider capability/status list.
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError>;
 }
 
 // ── Local (in-process) broker ────────────────────────────────────────────────
+
+#[async_trait]
+pub trait CloudBackend: Send + Sync {
+    async fn catalog(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        allow_stale: bool,
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError>;
+    async fn invoke(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        model_id: &str,
+        request: InvokeRequest,
+    ) -> Result<CloudEventStream, BrokerError>;
+}
 
 /// In-process credential broker. This module is the ONLY place runtime-serving
 /// code may read `auth.json`, `provider.<key>` config values, or credential
@@ -307,6 +380,7 @@ pub struct LocalBroker {
     request_timeout: Duration,
     /// Buffered response size cap.
     max_response_bytes: usize,
+    cloud_backend: Option<Arc<dyn CloudBackend>>,
 }
 
 impl LocalBroker {
@@ -318,7 +392,13 @@ impl LocalBroker {
             google_gemini_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
+            cloud_backend: None,
         }
+    }
+
+    pub fn with_cloud_backend(mut self, backend: Arc<dyn CloudBackend>) -> Self {
+        self.cloud_backend = Some(backend);
+        self
     }
 
     /// Test/embedding seam: pin the `local` provider endpoint explicitly.
@@ -766,6 +846,33 @@ impl CredentialBroker for LocalBroker {
             .map_err(|e| BrokerError::Transport(format!("invalid usage response: {e}")))
     }
 
+    async fn cloud_catalog(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        allow_stale: bool,
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
+        self.cloud_backend
+            .as_ref()
+            .ok_or_else(|| BrokerError::NotConfigured(provider.to_string()))?
+            .catalog(provider, context_ref, allow_stale)
+            .await
+    }
+
+    async fn cloud_invoke(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        model_id: &str,
+        request: InvokeRequest,
+    ) -> Result<CloudEventStream, BrokerError> {
+        self.cloud_backend
+            .as_ref()
+            .ok_or_else(|| BrokerError::NotConfigured(provider.to_string()))?
+            .invoke(provider, context_ref, model_id, request)
+            .await
+    }
+
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
         let mut out = Vec::new();
         for descriptor in super::provider::registry().iter() {
@@ -935,6 +1042,54 @@ impl CredentialBroker for RemoteBroker {
                     .map_err(|e| BrokerError::Transport(format!("invalid usage response: {e}")))
             }
         }
+    }
+
+    async fn cloud_catalog(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        allow_stale: bool,
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
+        let resp = self.http.post(format!("{}/cloud/catalog", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"allow_stale":allow_stale})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(BrokerError::Unauthorized);
+        }
+        if !resp.status().is_success() {
+            return Err(BrokerError::Transport(format!(
+                "cloud catalog returned HTTP {}",
+                resp.status()
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("invalid cloud catalog: {e}")))
+    }
+
+    async fn cloud_invoke(
+        &self,
+        provider: CloudProviderId,
+        context_ref: &str,
+        model_id: &str,
+        request: InvokeRequest,
+    ) -> Result<CloudEventStream, BrokerError> {
+        let resp = self.http.post(format!("{}/cloud/invoke", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"model_id":model_id,"request":request})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                BrokerError::Unauthorized
+            } else {
+                BrokerError::Transport(format!("cloud invoke returned HTTP {}", resp.status()))
+            });
+        }
+        use futures::StreamExt;
+        let stream = resp.bytes_stream().map(|chunk| {
+            chunk
+                .map_err(|e| BrokerError::Transport(e.to_string()))
+                .and_then(|b| {
+                    serde_json::from_slice::<CloudEvent>(&b)
+                        .map_err(|e| BrokerError::Transport(format!("invalid cloud event: {e}")))
+                })
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
