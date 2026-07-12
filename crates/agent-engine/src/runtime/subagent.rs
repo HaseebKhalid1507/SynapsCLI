@@ -40,6 +40,8 @@ pub struct SubagentState {
     pub partial_text: String,
     pub tool_log: Vec<String>,
     pub conversation_state: Vec<Value>,
+    /// Stamped once by finalize_subagent at thread exit.
+    pub finished_at: Option<std::time::Instant>,
 }
 
 impl SubagentState {
@@ -49,6 +51,7 @@ impl SubagentState {
             partial_text: String::new(),
             tool_log: Vec::new(),
             conversation_state: Vec::new(),
+            finished_at: None,
         }
     }
 }
@@ -76,10 +79,13 @@ pub struct SubagentHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// OS thread running the subagent. Stored for graceful shutdown (join).
     // OS thread handle for graceful shutdown
-    thread_handle: Option<std::thread::JoinHandle<()>>,
+    pub(crate) thread_handle: Option<std::thread::JoinHandle<()>>,
 
     // Final result
     result_rx: Option<oneshot::Receiver<SubagentResult>>,
+
+    /// Set to true once subagent_collect has read the terminal result.
+    collected: bool,
 }
 
 impl std::fmt::Debug for SubagentHandle {
@@ -120,6 +126,7 @@ impl SubagentHandle {
             shutdown_tx,
             thread_handle: None,
             result_rx,
+            collected: false,
         }
     }
 
@@ -175,6 +182,22 @@ impl SubagentHandle {
         !matches!(self.status(), SubagentStatus::Running)
     }
 
+    /// Mark this handle as collected by subagent_collect.
+    pub fn mark_collected(&mut self) {
+        self.collected = true;
+    }
+
+    /// Whether subagent_collect has already read the result.
+    pub fn is_collected(&self) -> bool {
+        self.collected
+    }
+
+    /// Time elapsed since the subagent reached a terminal state.
+    /// Returns `None` if still running or if `finished_at` has not been stamped yet.
+    pub fn finished_elapsed(&self) -> Option<std::time::Duration> {
+        self.state.read().unwrap_or_else(|p| p.into_inner()).finished_at.map(|t| t.elapsed())
+    }
+
     /// Consume the handle and wait for the final result.
     pub async fn collect(mut self) -> Result<SubagentResult, String> {
         match self.result_rx.take() {
@@ -186,9 +209,12 @@ impl SubagentHandle {
 
 // ── SubagentRegistry ─────────────────────────────────────────────────────────────
 
+/// Finished-but-uncollected handles are retained this long before GC.
+pub const FINISHED_HANDLE_TTL: std::time::Duration = std::time::Duration::from_secs(900); // 15 min
+
 #[derive(Debug)]
 pub struct SubagentRegistry {
-    handles: HashMap<String, SubagentHandle>,
+    pub(crate) handles: HashMap<String, SubagentHandle>,
 }
 
 impl SubagentRegistry {
@@ -231,19 +257,31 @@ impl SubagentRegistry {
         self.handles.values_mut()
     }
 
-    pub fn cleanup_finished(&mut self) {
-        let finished_ids: Vec<String> = self.handles.iter()
-            .filter(|(_, h)| h.is_finished())
+    /// Reap a finished handle iff:
+    ///   (a) its result was collected via subagent_collect, OR
+    ///   (b) it has been finished longer than `ttl` (abandoned).
+    /// Finished-but-uncollected handles inside the TTL are RETAINED so the
+    /// completion event can wake the parent and collect still succeeds.
+    pub fn cleanup_finished_with_ttl(&mut self, ttl: std::time::Duration) {
+        let reap_ids: Vec<String> = self.handles.iter()
+            .filter(|(_, h)| h.is_finished()
+                && (h.is_collected()
+                    || h.finished_elapsed().is_some_and(|d| d >= ttl)))
             .map(|(id, _)| id.clone())
             .collect();
-        for id in finished_ids {
+        for id in reap_ids {
             if let Some(mut handle) = self.handles.remove(&id) {
-                // Join the thread to avoid zombies/resource leaks
                 if let Some(th) = handle.thread_handle.take() {
                     let _ = th.join();
                 }
             }
         }
+    }
+
+    /// Reap finished handles using the production TTL.
+    /// Finished-but-uncollected handles within the TTL window are retained.
+    pub fn cleanup_finished(&mut self) {
+        self.cleanup_finished_with_ttl(FINISHED_HANDLE_TTL)
     }
 }
 
@@ -302,6 +340,16 @@ mod tests {
 
     fn make_handle(id: &str) -> SubagentHandle {
         make_test_handle(id).handle
+    }
+
+    fn make_finished_handle(id: &str) -> SubagentHandle {
+        let h = make_handle(id);
+        {
+            let mut s = h.state.write().unwrap();
+            s.status = SubagentStatus::Completed;
+            s.finished_at = Some(std::time::Instant::now());
+        }
+        h
     }
 
     #[test]
@@ -390,19 +438,73 @@ mod tests {
         assert_eq!(active.len(), 2);
     }
 
+    // Rewritten: finished-but-uncollected handles are RETAINED (new semantics).
+    // The old test encoded the buggy behavior where any finished handle was removed.
     #[test]
     fn registry_cleanup_finished() {
         let mut reg = SubagentRegistry::new();
-        let h = make_handle("sa_1");
-        {
-            let mut s = h.state.write().unwrap();
-            s.status = SubagentStatus::Completed;
-        }
+        let mut h = make_finished_handle("sa_1");
+        h.mark_collected(); // mark as collected — should be reaped
         reg.register(h);
-        reg.register(make_handle("sa_2")); // still running
+        reg.register(make_handle("sa_2")); // still running — must survive
+
         reg.cleanup_finished();
-        assert!(reg.get("sa_1").is_none()); // completed, cleaned up
-        assert!(reg.get("sa_2").is_some()); // still running, kept
+
+        assert!(reg.get("sa_1").is_none(), "collected finished handle must be reaped");
+        assert!(reg.get("sa_2").is_some(), "running handle must survive cleanup");
+    }
+
+    // U1: finished, not collected, fresh → retained within TTL
+    #[test]
+    fn reaper_retains_finished_uncollected_within_ttl() {
+        let mut reg = SubagentRegistry::new();
+        let h = make_finished_handle("sa_1"); // not collected
+        reg.register(h);
+
+        reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
+
+        assert!(reg.get("sa_1").is_some(), "finished-uncollected handle within TTL must be retained");
+    }
+
+    // U2: finished + mark_collected → removed immediately
+    #[test]
+    fn reaper_reaps_finished_and_collected() {
+        let mut reg = SubagentRegistry::new();
+        let mut h = make_finished_handle("sa_1");
+        h.mark_collected();
+        reg.register(h);
+
+        reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
+
+        assert!(reg.get("sa_1").is_none(), "finished+collected handle must be reaped");
+    }
+
+    // U3: finished, not collected, but TTL=ZERO (expired) → removed
+    #[test]
+    fn reaper_reaps_abandoned_after_ttl() {
+        let mut reg = SubagentRegistry::new();
+        let h = make_finished_handle("sa_1"); // not collected
+        reg.register(h);
+
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+
+        assert!(reg.get("sa_1").is_none(), "handle past TTL must be reaped even if uncollected");
+    }
+
+    // U4: running handles never touched by any reaper variant
+    #[test]
+    fn reaper_never_touches_running() {
+        let mut reg = SubagentRegistry::new();
+        reg.register(make_handle("sa_1")); // Running
+        reg.register(make_handle("sa_2")); // Running
+
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        assert!(reg.get("sa_1").is_some());
+        assert!(reg.get("sa_2").is_some());
+
+        reg.cleanup_finished(); // production TTL
+        assert!(reg.get("sa_1").is_some());
+        assert!(reg.get("sa_2").is_some());
     }
 
     #[test]
@@ -412,6 +514,7 @@ mod tests {
         assert!(s.partial_text.is_empty());
         assert!(s.tool_log.is_empty());
         assert!(s.conversation_state.is_empty());
+        assert!(s.finished_at.is_none());
     }
 
     #[test]
