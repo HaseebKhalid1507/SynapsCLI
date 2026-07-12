@@ -28,6 +28,8 @@
 //!   GET  /token?provider=X   -> { access_token, expires }  (machine-auth, OAuth providers ONLY)
 //!   POST /proxy              -> typed broker proxy         (machine-auth, static-key providers;
 //!                               the key is applied broker-side and never vended)
+//!   GET  /usage              -> Anthropic usage JSON       (machine-auth, typed operation; the
+//!                               OAuth token is resolved broker-side and never vended)
 //!   GET  /capabilities       -> provider status list       (machine-auth, no secret values)
 
 use std::net::SocketAddr;
@@ -381,7 +383,12 @@ fn build_router(state: BrokerState) -> Router {
         .route("/healthz", get(healthz))
         .route("/token", get(token))
         .route("/proxy", post(proxy))
+        .route("/usage", get(usage))
         .route("/capabilities", get(capabilities))
+        // Bound inbound request bodies to the broker's typed proxy limit.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            auth::MAX_PROXY_REQUEST_BYTES,
+        ))
         // B7: cap concurrent in-flight requests.
         .layer(tower::limit::ConcurrencyLimitLayer::new(64))
         .with_state(state)
@@ -544,6 +551,25 @@ async fn proxy(
             Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
             Err(e) => broker_error_response(e),
         }
+    }
+}
+
+/// Typed usage operation: the local broker resolves the Anthropic OAuth token
+/// behind the boundary and calls the pinned usage URL; clients receive usage
+/// JSON only. No token, refresh token, or URL choice ever crosses this
+/// endpoint — it is deliberately not a general OAuth proxy.
+async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st.local.anthropic_usage().await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(e) => broker_error_response(e),
     }
 }
 
@@ -1020,6 +1046,30 @@ mod tests {
         assert!(
             !body.contains("machine-secret"),
             "denial must not echo the expected token"
+        );
+    }
+
+    /// The typed /usage operation is a credential endpoint: it requires
+    /// machine auth, and denials carry no token material.
+    #[tokio::test]
+    async fn usage_requires_machine_auth_and_denials_are_secret_free() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("{base}/usage")).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "missing bearer must be denied");
+
+        let resp = client
+            .get(format!("{base}/usage"))
+            .bearer_auth("wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "wrong bearer must be denied");
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("machine-secret") && !body.contains("access"),
+            "denial must not echo credentials: {body}"
         );
     }
 

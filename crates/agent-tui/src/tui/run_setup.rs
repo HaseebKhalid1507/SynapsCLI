@@ -118,14 +118,14 @@ pub(crate) async fn run_setup(
     // First-run guidance: no Anthropic credentials and no provider keys means
     // the first message will fail — tell the user up front instead.
     {
-        // Capability queries via the broker boundary — no auth.json or
+        // Capability queries via the broker boundary — no credential file or
         // credential env reads here, and answers are booleans only.
         let has_anthropic = synaps_cli::auth::broker::anthropic_credential_available();
         let has_provider_key =
             !synaps_cli::auth::broker::configured_static_provider_keys().is_empty();
         if !has_anthropic && !has_provider_key {
             app.push_msg(ChatMessage::System(
-                "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or set ANTHROPIC_API_KEY in your environment\n   • or add `provider.<name> = <key>` to ~/.synaps-cli/config (groq, openrouter, …) and pick with /model".to_string(),
+                "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or `synaps login --provider <name>` — store a provider API key with the credential broker (groq, openrouter, …), then pick with /model".to_string(),
             ));
         }
     }

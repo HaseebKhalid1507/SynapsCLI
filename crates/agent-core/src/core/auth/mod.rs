@@ -28,7 +28,8 @@ mod token;
 pub use broker::{
     broker_from_source, global_broker, set_global_broker, AccessToken, BrokerError,
     CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream, ProxyMethod,
-    ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
+    ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES,
+    MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
 pub use browser::open_browser;
 pub use callback::{start_callback_server, CallbackServerHandle};

@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -29,10 +30,33 @@ use serde::{Deserialize, Serialize};
 
 use super::provider::OAuthProviderId;
 use super::static_providers::{
-    static_provider, StaticProviderSpec, LOCAL_DEFAULT_BASE_URL, LOCAL_PROVIDER_KEY,
-    STATIC_PROVIDERS,
+    allowed_proxy_paths, static_provider, StaticProviderSpec, LOCAL_DEFAULT_BASE_URL,
+    LOCAL_PROVIDER_KEY, STATIC_PROVIDERS,
 };
 use super::{load_provider_auth, storage};
+
+// ── Buffering / time limits ──────────────────────────────────────────────────
+//
+// Streaming (SSE) bodies are never buffered — they flow chunk-by-chunk with
+// backpressure. These caps bound everything the broker (or a broker client)
+// must hold in memory, so a hostile or broken upstream cannot balloon the
+// process or smuggle unbounded content through error strings.
+
+/// Maximum serialized size of a proxy request body.
+pub const MAX_PROXY_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum buffered (non-streaming) response body size.
+pub const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Upstream error bodies are diagnostics, not payload: read at most this much.
+pub const MAX_UPSTREAM_ERROR_BYTES: usize = 2 * 1024;
+/// Character cap for sanitized upstream error snippets surfaced in messages.
+const MAX_ERROR_SNIPPET_CHARS: usize = 512;
+/// Total time budget for a buffered (non-streaming) broker-executed request.
+pub const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fixed Anthropic usage endpoint — a typed broker operation, not a general
+/// proxy target. Callers cannot vary the URL or path.
+const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -59,7 +83,7 @@ impl std::fmt::Display for BrokerError {
             Self::UnknownProvider(p) => write!(f, "unknown provider: {p}"),
             Self::NotConfigured(p) => write!(
                 f,
-                "no credential configured for '{p}'. Run `synaps login` or set provider.{p} in config."
+                "no credential configured for '{p}'. Run `synaps login` to add one."
             ),
             Self::Unauthorized => write!(f, "broker rejected machine auth"),
             Self::Denied(msg) => write!(f, "broker denied request: {msg}"),
@@ -128,6 +152,25 @@ impl ProxyRequest {
             return Err(BrokerError::Denied(
                 "proxy path is not a plain relative path".into(),
             ));
+        }
+        // Per-provider endpoint allowlist: a signed proxy request can only
+        // reach the cataloged inference/model paths, never other same-host
+        // endpoints (key management, billing, admin, …).
+        if !allowed_proxy_paths(&self.provider).contains(&self.path.as_str()) {
+            return Err(BrokerError::Denied(format!(
+                "proxy path '{}' is not in the provider's endpoint allowlist",
+                self.path
+            )));
+        }
+        if let Some(body) = &self.body {
+            let size = serde_json::to_vec(body)
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX);
+            if size > MAX_PROXY_REQUEST_BYTES {
+                return Err(BrokerError::Denied(format!(
+                    "request body exceeds the {MAX_PROXY_REQUEST_BYTES}-byte broker limit"
+                )));
+            }
         }
         Ok(())
     }
@@ -199,6 +242,14 @@ pub trait CredentialBroker: Send + Sync {
     /// error statuses are read (bounded) and surfaced as [`BrokerError`].
     async fn proxy_stream(&self, request: ProxyRequest) -> Result<ProxyByteStream, BrokerError>;
 
+    /// Typed operation: fetch the Anthropic account-usage summary.
+    ///
+    /// The destination URL is pinned broker-side and the OAuth access token
+    /// is resolved and attached behind the boundary — callers receive usage
+    /// JSON only and never see a token or `auth.json`. This is deliberately
+    /// NOT a generic OAuth proxy: one operation, one fixed endpoint.
+    async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError>;
+
     /// Non-secret provider capability/status list.
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError>;
 }
@@ -212,6 +263,12 @@ pub struct LocalBroker {
     http: reqwest::Client,
     /// Test seam: overrides the local endpoint URL without env/config.
     local_base_url: Option<String>,
+    /// Test seam: overrides the pinned Anthropic usage URL.
+    anthropic_usage_url: Option<String>,
+    /// Time budget for buffered (non-streaming) requests.
+    request_timeout: Duration,
+    /// Buffered response size cap.
+    max_response_bytes: usize,
 }
 
 impl LocalBroker {
@@ -219,15 +276,39 @@ impl LocalBroker {
         Self {
             http,
             local_base_url: None,
+            anthropic_usage_url: None,
+            request_timeout: PROXY_REQUEST_TIMEOUT,
+            max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
         }
     }
 
     /// Test/embedding seam: pin the `local` provider endpoint explicitly.
     pub fn with_local_base_url(http: reqwest::Client, base_url: impl Into<String>) -> Self {
         Self {
-            http,
             local_base_url: Some(base_url.into()),
+            ..Self::new(http)
         }
+    }
+
+    /// Test seam: point the pinned Anthropic usage operation at a fake server.
+    #[doc(hidden)]
+    pub fn with_anthropic_usage_url(mut self, url: impl Into<String>) -> Self {
+        self.anthropic_usage_url = Some(url.into());
+        self
+    }
+
+    /// Test seam: shrink the buffered-request time budget.
+    #[doc(hidden)]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Test seam: shrink the buffered-response size cap.
+    #[doc(hidden)]
+    pub fn with_max_response_bytes(mut self, cap: usize) -> Self {
+        self.max_response_bytes = cap;
+        self
     }
 
     /// Resolve (and migrate) a static provider key. Broker-owned storage wins;
@@ -298,6 +379,11 @@ impl LocalBroker {
         }
         if request.stream {
             builder = builder.header("accept", "text/event-stream");
+        } else {
+            // Buffered requests get an explicit total time budget; streaming
+            // responses are open-ended by design (SSE) and rely on the
+            // client's connect timeout plus consumer-side backpressure.
+            builder = builder.timeout(self.request_timeout);
         }
         builder.send().await.map_err(|e| {
             if e.is_connect() && request.provider == LOCAL_PROVIDER_KEY {
@@ -310,6 +396,59 @@ impl LocalBroker {
             }
         })
     }
+}
+
+// ── Bounded body handling ────────────────────────────────────────────────────
+
+/// Read a response body up to `cap` bytes; fail closed (no truncated JSON
+/// masquerading as a full payload) if the upstream exceeds the cap.
+async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<String, BrokerError> {
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| BrokerError::Transport(format!("failed to read response: {e}")))?;
+        if buf.len() + chunk.len() > cap {
+            return Err(BrokerError::Transport(format!(
+                "response body exceeded the {cap}-byte broker buffering limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf)
+        .map_err(|_| BrokerError::Transport("response body was not valid UTF-8".into()))
+}
+
+/// Bounded, sanitized snippet of an upstream error body. Reads at most
+/// [`MAX_UPSTREAM_ERROR_BYTES`], then truncates/sanitizes — arbitrary
+/// upstream content is never propagated at full size into error messages.
+async fn upstream_error_snippet(resp: reqwest::Response) -> String {
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(Ok(chunk)) = stream.next().await {
+        let room = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(buf.len());
+        if room == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    sanitize_error_text(&String::from_utf8_lossy(&buf))
+}
+
+/// Strip control characters and cap the length of upstream error text so a
+/// hostile body cannot inject terminal escapes or flood logs/UI.
+fn sanitize_error_text(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_ERROR_SNIPPET_CHARS)
+        .collect();
+    if s.chars().count() > MAX_ERROR_SNIPPET_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// Legacy discovery for a static key: login config first, then env vars.
@@ -461,10 +600,7 @@ impl CredentialBroker for LocalBroker {
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
         let resp = self.send(&request).await?;
         let status = resp.status().as_u16();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| BrokerError::Transport(format!("failed to read response: {e}")))?;
+        let body = read_body_capped(resp, self.max_response_bytes).await?;
         Ok(ProxyResponse { status, body })
     }
 
@@ -474,9 +610,9 @@ impl CredentialBroker for LocalBroker {
         let resp = self.send(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let snippet = upstream_error_snippet(resp).await;
             return Err(BrokerError::Transport(format!(
-                "provider request failed: {status}: {body}"
+                "provider request failed: {status}: {snippet}"
             )));
         }
         use futures::StreamExt;
@@ -484,6 +620,35 @@ impl CredentialBroker for LocalBroker {
             .bytes_stream()
             .map(|chunk| chunk.map_err(|e| BrokerError::Transport(format!("stream error: {e}"))));
         Ok(Box::pin(stream))
+    }
+
+    async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+        // Token resolution happens HERE, behind the boundary — the caller
+        // never touches auth.json or sees the access token.
+        let token = self.access_token(OAuthProviderId::Anthropic).await?;
+        let url = self
+            .anthropic_usage_url
+            .as_deref()
+            .unwrap_or(ANTHROPIC_USAGE_URL);
+        let resp = self
+            .http
+            .get(url)
+            .timeout(self.request_timeout)
+            .bearer_auth(&token.token)
+            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("usage request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet = upstream_error_snippet(resp).await;
+            return Err(BrokerError::Transport(format!(
+                "usage request failed: {status}: {snippet}"
+            )));
+        }
+        let body = read_body_capped(resp, self.max_response_bytes).await?;
+        serde_json::from_str(&body)
+            .map_err(|e| BrokerError::Transport(format!("invalid usage response: {e}")))
     }
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
@@ -557,7 +722,7 @@ impl RemoteBroker {
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             400 | 403 => {
-                let body = resp.text().await.unwrap_or_default();
+                let body = upstream_error_snippet(resp).await;
                 Err(BrokerError::Denied(sanitize_broker_error(&body)))
             }
             _ => Ok(resp),
@@ -606,8 +771,8 @@ impl CredentialBroker for RemoteBroker {
                 resp.status()
             )));
         }
-        resp.json::<ProxyResponse>()
-            .await
+        let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+        serde_json::from_str::<ProxyResponse>(&body)
             .map_err(|e| BrokerError::Transport(format!("invalid broker proxy response: {e}")))
     }
 
@@ -617,7 +782,7 @@ impl CredentialBroker for RemoteBroker {
         let resp = self.post_proxy(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = upstream_error_snippet(resp).await;
             return Err(BrokerError::Transport(format!(
                 "broker proxy stream failed: {status}: {}",
                 sanitize_broker_error(&body)
@@ -628,6 +793,33 @@ impl CredentialBroker for RemoteBroker {
             .bytes_stream()
             .map(|chunk| chunk.map_err(|e| BrokerError::Transport(format!("stream error: {e}"))));
         Ok(Box::pin(stream))
+    }
+
+    async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+        // Machine-authenticated typed operation: the remote broker resolves
+        // the OAuth token on its side and returns usage JSON only.
+        let resp = self
+            .http
+            .get(format!("{}/usage", self.endpoint))
+            .bearer_auth(&self.machine_token)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            s if !(200..300).contains(&s) => {
+                let body = upstream_error_snippet(resp).await;
+                Err(BrokerError::Transport(format!(
+                    "broker usage returned HTTP {s}: {}",
+                    sanitize_broker_error(&body)
+                )))
+            }
+            _ => {
+                let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+                serde_json::from_str(&body)
+                    .map_err(|e| BrokerError::Transport(format!("invalid usage response: {e}")))
+            }
+        }
     }
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
@@ -643,10 +835,12 @@ impl CredentialBroker for RemoteBroker {
             s if !(200..300).contains(&s) => {
                 Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
             }
-            _ => resp
-                .json::<Vec<ProviderStatus>>()
-                .await
-                .map_err(|e| BrokerError::Transport(format!("invalid capabilities response: {e}"))),
+            _ => {
+                let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+                serde_json::from_str::<Vec<ProviderStatus>>(&body).map_err(|e| {
+                    BrokerError::Transport(format!("invalid capabilities response: {e}"))
+                })
+            }
         }
     }
 }
@@ -733,6 +927,71 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-provider endpoint allowlist: a signed proxy request cannot be
+    /// steered at other same-host endpoints (key management, billing, …).
+    #[test]
+    fn proxy_rejects_unlisted_same_host_paths() {
+        for (provider, path) in [
+            ("groq", "/v1/keys"),
+            ("groq", "/admin"),
+            ("openrouter", "/api/v1/auth/keys"),
+            ("local", "/audio/speech"),
+        ] {
+            let req = ProxyRequest {
+                provider: provider.into(),
+                method: ProxyMethod::Get,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            match req.validate() {
+                Err(BrokerError::Denied(msg)) => {
+                    assert!(msg.contains("allowlist"), "got: {msg}")
+                }
+                other => panic!("{provider} {path} must be denied, got {other:?}"),
+            }
+        }
+        // The cataloged paths remain reachable.
+        for path in ["/models", "/chat/completions"] {
+            let req = ProxyRequest {
+                provider: "groq".into(),
+                method: ProxyMethod::Get,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(req.validate().is_ok(), "{path} must be allowed");
+        }
+    }
+
+    /// Request bodies above the broker buffering limit are rejected before
+    /// any credential resolution or upstream contact.
+    #[test]
+    fn proxy_rejects_oversize_request_body() {
+        let req = ProxyRequest {
+            provider: "groq".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: Some(serde_json::json!({
+                "blob": "x".repeat(MAX_PROXY_REQUEST_BYTES + 1)
+            })),
+            stream: false,
+        };
+        match req.validate() {
+            Err(BrokerError::Denied(msg)) => assert!(msg.contains("byte"), "got: {msg}"),
+            other => panic!("oversize body must be denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_error_text_strips_controls_and_caps_length() {
+        let hostile = format!("\x1b[2Jevil{}\x07", "A".repeat(4096));
+        let out = sanitize_error_text(&hostile);
+        assert!(!out.contains('\x1b') && !out.contains('\x07'));
+        assert!(out.chars().count() <= MAX_ERROR_SNIPPET_CHARS + 1);
+        assert!(out.ends_with('…'), "truncation must be visible");
+    }
 
     #[test]
     fn proxy_request_validation_fails_closed() {
@@ -952,6 +1211,99 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("m1"));
+    }
+
+    /// A buffered response above the broker cap fails closed instead of
+    /// ballooning memory or returning silently truncated JSON.
+    #[tokio::test]
+    async fn local_broker_proxy_rejects_oversize_response() {
+        use axum::routing::get;
+        let app = axum::Router::new().route("/models", get(|| async { "x".repeat(4096) }));
+        let url = spawn_upstream(app).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url)
+            .with_max_response_bytes(64);
+        let err = broker
+            .proxy(ProxyRequest {
+                provider: LOCAL_PROVIDER_KEY.into(),
+                method: ProxyMethod::Get,
+                path: "/models".into(),
+                body: None,
+                stream: false,
+            })
+            .await
+            .expect_err("oversize body must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("limit"), "got: {msg}");
+    }
+
+    /// Upstream error bodies are truncated and sanitized — a hostile provider
+    /// cannot flood the caller or inject terminal escapes via error text.
+    #[tokio::test]
+    async fn local_broker_stream_error_body_is_truncated_and_sanitized() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("\x1b[2J{}", "E".repeat(64 * 1024)),
+                )
+            }),
+        );
+        let url = spawn_upstream(app).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url);
+        let err = broker
+            .proxy_stream(ProxyRequest {
+                provider: LOCAL_PROVIDER_KEY.into(),
+                method: ProxyMethod::Post,
+                path: "/chat/completions".into(),
+                body: None,
+                stream: true,
+            })
+            .await
+            .err()
+            .expect("non-2xx upstream must not yield a stream");
+        let msg = format!("{err}");
+        assert!(
+            msg.len() < 700,
+            "error must be bounded, got {} bytes",
+            msg.len()
+        );
+        assert!(!msg.contains('\x1b'), "control chars must be stripped");
+        assert!(msg.contains("500"));
+    }
+
+    /// Buffered proxy requests carry an explicit time budget: a hung upstream
+    /// becomes a typed transport error, not an indefinite stall.
+    #[tokio::test]
+    async fn local_broker_buffered_request_times_out() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/models",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "too late"
+            }),
+        );
+        let url = spawn_upstream(app).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url)
+            .with_request_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let err = broker
+            .proxy(ProxyRequest {
+                provider: LOCAL_PROVIDER_KEY.into(),
+                method: ProxyMethod::Get,
+                path: "/models".into(),
+                body: None,
+                stream: false,
+            })
+            .await
+            .expect_err("hung upstream must time out");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout must be enforced promptly"
+        );
     }
 
     /// Local in-process behavior: the process-wide broker exists without any

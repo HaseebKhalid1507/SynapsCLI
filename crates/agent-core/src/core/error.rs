@@ -60,7 +60,7 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
                 format!("Rate limited by Anthropic ({}). Wait for the limit to reset, or switch models with /model.", detail)
             }
         }
-        401 => "Authentication rejected. Run `synaps login` to re-authenticate, or check ANTHROPIC_API_KEY.".to_string(),
+        401 => "Authentication rejected. Run `synaps login` to re-authenticate.".to_string(),
         403 => format!("Access denied ({}). Your account may not have access to this model.", detail),
         404 => format!("Model or endpoint not found ({}). Check the model name with /model.", detail),
         413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),

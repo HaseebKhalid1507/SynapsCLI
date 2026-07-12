@@ -698,7 +698,7 @@ impl ApiMethods {
         // Fail early with a clear message if no Anthropic credentials
         if auth_type == "none" {
             return Err(RuntimeError::Auth(
-                "No Anthropic credentials. Run `synaps login` or set ANTHROPIC_API_KEY, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
+                "No Anthropic credentials. Run `synaps login`, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
             ));
         }
 

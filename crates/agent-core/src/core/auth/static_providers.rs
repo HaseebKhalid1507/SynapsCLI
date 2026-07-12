@@ -139,6 +139,24 @@ pub const STATIC_PROVIDERS: &[StaticProviderSpec] = &[
     },
 ];
 
+/// Proxy endpoint allowlist for OpenAI-compatible providers (and the local
+/// endpoint). The typed broker proxy may only reach these relative paths —
+/// a signed proxy request can never be steered at other same-host endpoints
+/// (key-management, billing, admin APIs, …).
+pub const OPENAI_COMPAT_ALLOWED_PATHS: &[&str] = &["/models", "/chat/completions"];
+
+/// The per-provider proxy path allowlist. Every static provider in the table
+/// is OpenAI-compatible today, so they share one catalog; the lookup is
+/// per-provider so a future non-uniform provider gets its own list instead of
+/// a widened shared one. Unknown providers get an empty allowlist (fail closed).
+pub fn allowed_proxy_paths(key: &str) -> &'static [&'static str] {
+    if key == LOCAL_PROVIDER_KEY || static_provider(key).is_some() {
+        OPENAI_COMPAT_ALLOWED_PATHS
+    } else {
+        &[]
+    }
+}
+
 /// Look up a static provider spec by key.
 pub fn static_provider(key: &str) -> Option<&'static StaticProviderSpec> {
     STATIC_PROVIDERS.iter().find(|s| s.key == key)
@@ -202,5 +220,23 @@ mod tests {
         assert!(static_provider("local").is_none());
         assert!(static_provider("anthropic").is_none());
         assert!(!is_static_provider("no-such-provider"));
+    }
+
+    /// Allowlist invariant: every proxyable provider gets exactly the
+    /// cataloged OpenAI-compatible paths; unknown keys get nothing.
+    #[test]
+    fn allowed_proxy_paths_fail_closed() {
+        for spec in STATIC_PROVIDERS {
+            assert_eq!(allowed_proxy_paths(spec.key), OPENAI_COMPAT_ALLOWED_PATHS);
+        }
+        assert_eq!(
+            allowed_proxy_paths(LOCAL_PROVIDER_KEY),
+            OPENAI_COMPAT_ALLOWED_PATHS
+        );
+        assert!(allowed_proxy_paths("anthropic").is_empty());
+        assert!(allowed_proxy_paths("no-such-provider").is_empty());
+        for path in OPENAI_COMPAT_ALLOWED_PATHS {
+            assert!(path.starts_with('/'), "catalog paths are relative: {path}");
+        }
     }
 }
