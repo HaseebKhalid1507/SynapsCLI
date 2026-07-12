@@ -3,6 +3,7 @@
 
 use serde_json::json;
 use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, EventDisposition};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
@@ -238,83 +239,115 @@ pub(super) async fn handle_event_queue_arm(
     cancel_token: &mut Option<CancellationToken>,
     steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
-                let mut event_received = false;
-                while let Some(event) = runtime.event_queue().pop() {
-                    event_received = true;
-                    let formatted = synaps_cli::events::format_event_for_agent(&event);
-                    let severity_str = event.content.severity
-                        .as_ref()
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_else(|| "medium".to_string());
-                    app.push_msg(ChatMessage::Event {
-                        source: event.source.source_type.clone(),
-                        severity: severity_str,
-                        text: event.content.text.clone(),
-                    });
+    let busy = app.streaming || app.compact_task.is_some();
 
-                    // Seam 3: subagent_completion → mark HUD entry done directly from
-                    // event data (no lock needed — data was embedded at finalizer time).
-                    if event.content.content_type == "subagent_completion" {
-                        if let Some(data) = &event.content.data {
-                            let maybe_id = data["subagent_id"].as_u64();
-                            let maybe_status = data["status"].as_str();
-                            let maybe_duration = data["duration_secs"].as_f64();
-                            if let (Some(sid), Some(status_str)) = (maybe_id, maybe_status) {
-                                let now = std::time::Instant::now();
-                                if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == sid && !s.done) {
-                                    sa.done = true;
-                                    sa.done_at = Some(now);
-                                    if let Some(dur) = maybe_duration {
-                                        sa.duration_secs = Some(dur);
-                                    }
-                                    sa.status = match status_str {
-                                        "completed" => "\u{2714} done".to_string(),
-                                        "cancelled" => "\u{26a0} cancelled".to_string(),
-                                        "timed_out" => "\u{26a0} timed out".to_string(),
-                                        s if s.starts_with("fail") => {
-                                            let reason = data["error"].as_str().unwrap_or("error");
-                                            let preview: String = reason.chars().take(30).collect();
-                                            format!("\u{2718} {}", preview)
-                                        }
-                                        _ => format!("\u{2714} {status_str}"),
-                                    };
-                                }
+    // Drain via the central reactor function.
+    let drained = drain_event_queue(
+        runtime.event_queue(),
+        &mut app.api_messages,
+        &mut app.pending_events,
+        busy,
+        steer_tx.as_ref(),
+    );
+
+    if drained.is_empty() {
+        return;
+    }
+
+    // Presentation: push each event to the transcript and update the HUD.
+    for de in &drained {
+        let event = &de.event;
+        let severity_str = event.content.severity
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "medium".to_string());
+        app.push_msg(ChatMessage::Event {
+            source: event.source.source_type.clone(),
+            severity: severity_str,
+            text: event.content.text.clone(),
+        });
+
+        // Seam 3: subagent_completion → mark HUD entry done directly from
+        // event data (no lock needed — data was embedded at finalizer time).
+        if event.content.content_type == "subagent_completion" {
+            if let Some(data) = &event.content.data {
+                let maybe_id = data["subagent_id"].as_u64();
+                let maybe_status = data["status"].as_str();
+                let maybe_duration = data["duration_secs"].as_f64();
+                if let (Some(sid), Some(status_str)) = (maybe_id, maybe_status) {
+                    let now = std::time::Instant::now();
+                    if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == sid && !s.done) {
+                        sa.done = true;
+                        sa.done_at = Some(now);
+                        if let Some(dur) = maybe_duration {
+                            sa.duration_secs = Some(dur);
+                        }
+                        sa.status = match status_str {
+                            "completed" => "\u{2714} done".to_string(),
+                            "cancelled" => "\u{26a0} cancelled".to_string(),
+                            "timed_out" => "\u{26a0} timed out".to_string(),
+                            s if s.starts_with("fail") => {
+                                let reason = data["error"].as_str().unwrap_or("error");
+                                let preview: String = reason.chars().take(30).collect();
+                                format!("\u{2718} {}", preview)
                             }
-                        }
-                    }
-
-                    if app.streaming || app.compact_task.is_some() {
-                        // Steer into active stream if possible, otherwise buffer
-                        let steered = steer_tx.as_ref()
-                            .map(|tx| tx.send(formatted.clone()).is_ok())
-                            .unwrap_or(false);
-                        if !steered {
-                            app.pending_events.push(formatted);
-                        }
-                    } else {
-                        app.api_messages.push(std::sync::Arc::new(serde_json::json!({
-                            "role": "user",
-                            "content": formatted
-                        })));
-                    }
-                    app.invalidate();
-                }
-
-                // Auto-trigger model turn when idle — only if we actually received events
-                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
-                    if let Some(last) = app.api_messages.last() {
-                        if last["role"].as_str() == Some("user") {
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.streaming = true;
-                            app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
-                        }
+                            _ => format!("\u{2714} {status_str}"),
+                        };
                     }
                 }
+            }
+        }
+    }
+    app.invalidate();
+
+    // Wake decision.
+    let auto_turn_enabled = true; // C2+ will wire config; always on for C1
+    let action = wake_action(
+        &drained,
+        &app.api_messages,
+        busy,
+        auto_turn_enabled,
+        app.consecutive_auto_turns,
+    );
+
+    match action {
+        WakeAction::RunTurn => {
+            // Cap check: if we ARE at cap this would have returned Forward.
+            // Increment before spawning so cap is visible for the next wake.
+            app.consecutive_auto_turns += 1;
+            let ct = CancellationToken::new();
+            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            app.streaming = true;
+            app.spinner_frame = 0;
+            *stream = Some(runtime.run_stream_with_messages(
+                app.api_messages.clone(),
+                ct.clone(),
+                Some(s_rx),
+                Some(secret_prompt_handle.clone()),
+                false,
+            ).await);
+            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+            *cancel_token = Some(ct);
+            *steer_tx = Some(s_tx);
+        }
+        WakeAction::Forward => {
+            // Check if we hit the cap (some Injected events but cap blocked RunTurn).
+            let hit_cap = drained.iter().any(|d| d.disposition == EventDisposition::Injected)
+                && !busy
+                && auto_turn_enabled
+                && app.consecutive_auto_turns >= synaps_cli::engine::reactor::AUTO_TURN_CAP;
+            if hit_cap {
+                app.push_msg(ChatMessage::System(
+                    format!(
+                        "auto-turn cap reached ({} consecutive) — waiting for your input",
+                        synaps_cli::engine::reactor::AUTO_TURN_CAP
+                    )
+                ));
+                app.invalidate();
+            }
+        }
+        WakeAction::Nothing => {}
+    }
 }
 
 /// Stream-event arm body: route one `StreamEvent` through
@@ -365,7 +398,8 @@ pub(super) async fn handle_stream_arm(
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
                             }
-                            // Auto-send the queued message
+                            // Auto-send the queued message (user-authored — reset auto-turn counter)
+                            app.consecutive_auto_turns = 0;
                             app.push_msg(ChatMessage::User(queued.clone()));
                             app.transcript.scroll_to_bottom();
                             let api_content = if let Some(ref ctx) = app.abort_context {

@@ -112,6 +112,10 @@ pub(crate) struct App {
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
     pub(crate) pending_events: Vec<String>,
+    /// Consecutive auto-triggered model turns since the last real user send.
+    /// Incremented by the event-reactor wake path; reset on Submit / queued user message.
+    /// When this reaches AUTO_TURN_CAP the reactor parks and shows a system message.
+    pub(crate) consecutive_auto_turns: u32,
     /// Cached model ping results: "provider/model" -> (status, latency_ms).
     pub(crate) model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     /// Print ping results to chat as they arrive (set by /ping command).
@@ -233,6 +237,7 @@ impl App {
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compact_task: None,
             pending_events: Vec::new(),
+            consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
             ping_print: false,
             ping_pending: 0,
