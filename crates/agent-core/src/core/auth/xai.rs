@@ -43,12 +43,23 @@ fn validate_endpoint(value: &str) -> Result<(), String> {
     }
     Ok(())
 }
-pub async fn discover(client: &Client) -> Result<Discovery, String> {
+pub async fn discover(_client: &Client) -> Result<Discovery, String> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if validate_endpoint(attempt.url().as_str()).is_ok() && attempt.previous().len() < 3 {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|e| format!("xAI HTTP client failed: {e}"))?;
     let response = client
         .get(DISCOVERY_URL)
         .send()
         .await
         .map_err(|e| format!("xAI discovery failed: {e}"))?;
+    validate_endpoint(response.url().as_str())?;
     if !response.status().is_success() {
         return Err(format!("xAI discovery failed: HTTP {}", response.status()));
     }
@@ -105,14 +116,19 @@ fn credentials(
     })
 }
 async fn token_post(
-    client: &Client,
+    _client: &Client,
     endpoint: &str,
     form: &[(&str, &str)],
     previous: Option<&str>,
     require: bool,
 ) -> Result<OAuthCredentials, String> {
     validate_endpoint(endpoint)?;
-    let response = client
+    // OAuth secrets must never be replayed to a redirect target.
+    let no_redirect_client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("xAI HTTP client failed: {e}"))?;
+    let response = no_redirect_client
         .post(endpoint)
         .form(form)
         .send()
@@ -148,6 +164,25 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCreden
     )
     .await
 }
+fn parse_pasted_callback(input: &str, expected_state: &str) -> Option<super::CallbackResult> {
+    let url = Url::parse(input.trim()).ok()?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port_or_known_default() != Some(CALLBACK_PORT)
+        || url.path() != "/callback"
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let code = query.get("code")?.to_owned();
+    let state = query.get("state")?.to_owned();
+    if code.is_empty() || state != expected_state {
+        return None;
+    }
+    Some(super::CallbackResult { code, state })
+}
+
 pub async fn login() -> Result<OAuthCredentials, String> {
     let client = Client::new();
     let d = discover(&client).await?;
@@ -161,10 +196,22 @@ pub async fn login() -> Result<OAuthCredentials, String> {
         &nonce,
     )?;
     let (rx, handle) =
-        start_callback_server_at(state, "127.0.0.1", CALLBACK_PORT, "/callback").await?;
+        start_callback_server_at(state.clone(), "127.0.0.1", CALLBACK_PORT, "/callback").await?;
     let _ = open_browser(&url);
-    eprintln!("Open this xAI sign-in URL if needed:\n{url}");
-    let outcome = rx.await.map_err(|_| "xAI callback canceled".to_string())?;
+    eprintln!("Complete xAI sign-in in your browser. If the callback cannot connect, paste the full callback URL here.");
+    let expected = state.clone();
+    let paste = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok()?;
+        parse_pasted_callback(&line, &expected)
+    });
+    let outcome = tokio::select! {
+        result = rx => result.map_err(|_| "xAI callback canceled".to_string())?,
+        result = paste => match result.ok().flatten() {
+            Some(callback) => CallbackOutcome::Authorized(callback),
+            None => return Err("Paste the full matching xAI callback URL; bare codes are rejected".into()),
+        }
+    };
     handle.shutdown().await;
     let callback = match outcome {
         CallbackOutcome::Authorized(v) => v,
@@ -227,6 +274,24 @@ mod tests {
         assert_eq!(q["state"], "state");
         assert_eq!(q["nonce"], "nonce");
     }
+    #[test]
+    fn pasted_callback_is_strict_and_state_bound() {
+        assert!(parse_pasted_callback("bare-code", "s").is_none());
+        assert!(
+            parse_pasted_callback("http://localhost:56121/callback?code=c&state=s", "s").is_none()
+        );
+        assert!(
+            parse_pasted_callback("http://127.0.0.1:56121/callback?code=c&state=wrong", "s")
+                .is_none()
+        );
+        assert_eq!(
+            parse_pasted_callback("http://127.0.0.1:56121/callback?code=c&state=s", "s")
+                .unwrap()
+                .code,
+            "c"
+        );
+    }
+
     #[test]
     fn refresh_omission_preserves_previous() {
         let c = credentials(

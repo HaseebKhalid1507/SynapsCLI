@@ -57,6 +57,12 @@ pub async fn start_callback_server_at(
     if !path.starts_with('/') || path.contains("..") {
         return Err("invalid callback path".into());
     }
+    let host_ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|_| "callback host must be a loopback IP address")?;
+    if !host_ip.is_loopback() {
+        return Err("callback host must be loopback".into());
+    }
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
     let handler = {
@@ -65,10 +71,15 @@ pub async fn start_callback_server_at(
             let tx = tx.clone();
             let expected = expected_state.clone();
             async move {
+                let state_matches = query.get("state") == Some(&expected);
                 let outcome = if let Some(error) = query.get("error") {
-                    CallbackOutcome::Denied {
-                        error: sanitize(error),
-                        description: query.get("error_description").map(|s| sanitize(s)),
+                    if state_matches {
+                        CallbackOutcome::Denied {
+                            error: sanitize(error),
+                            description: query.get("error_description").map(|s| sanitize(s)),
+                        }
+                    } else {
+                        CallbackOutcome::Invalid
                     }
                 } else if let (Some(code), Some(state)) = (query.get("code"), query.get("state")) {
                     if state == &expected {

@@ -1191,8 +1191,19 @@ pub(crate) async fn call_xai_responses_stream_inner(
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let (tools, names) = translate::tools_to_oai(tools_schema);
-    let input = translate::messages_to_oai(messages, system_prompt, &names);
+    let (oai_tools, names) = translate::tools_to_oai(tools_schema);
+    let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
+    let tools: Vec<Value> = oai_tools
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.function.name,
+                "description": tool.function.description.unwrap_or_default(),
+                "parameters": tool.function.parameters,
+            })
+        })
+        .collect();
     let mut body = serde_json::Map::new();
     body.insert("model".into(), json!(cfg.model));
     body.insert("input".into(), serde_json::to_value(input)?);
@@ -1216,28 +1227,29 @@ pub(crate) async fn call_xai_responses_stream_inner(
         })
         .await?;
     let mut text = String::new();
+    let mut parser = CodexSseDecoder::default();
     let mut buf = bytes::BytesMut::new();
     while let Some(chunk) = tokio::select! { c=stream.next()=>c, _=cancel.cancelled()=>return Err("request canceled".into()) }
     {
         buf.extend_from_slice(&chunk?);
         while let Some(n) = memchr::memchr(b'\n', &buf) {
             let line = buf.split_to(n + 1);
-            let line = std::str::from_utf8(&line[..n]).unwrap_or("");
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(v) = serde_json::from_str::<Value>(data) {
-                    if v["type"] == "response.output_text.delta" {
-                        if let Some(d) = v["delta"].as_str() {
-                            text.push_str(d);
-                            let _ = tx.send(StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::Text(d.into()),
-                            ));
-                        }
-                    }
-                }
-            }
+            parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
         }
     }
-    Ok(json!({"role":"assistant","content":[{"type":"text","text":text}]}))
+    if !buf.is_empty() {
+        parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
+    }
+    parser.finish();
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({"type":"text","text":text}));
+    }
+    content.extend(translate::tool_calls_to_content_blocks(
+        &parser.completed_tools,
+        &names,
+    ));
+    Ok(json!({"role":"assistant","content":content}))
 }
 
 #[cfg(test)]
