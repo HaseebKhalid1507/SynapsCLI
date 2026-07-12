@@ -17,6 +17,7 @@ fn wake_disabled() -> bool {
 }
 
 /// Build the completion event. Pure — unit-testable without threads.
+/// `resumed_from`: set by resume.rs only (the prior handle_id this run continues from).
 pub(crate) fn build_completion_event(
     handle_id: &str,
     subagent_id: u64,
@@ -24,6 +25,7 @@ pub(crate) fn build_completion_event(
     status: &SubagentStatus,
     result_preview: &str,   // caller pre-truncates to ≤300 chars
     duration_secs: f64,
+    resumed_from: Option<&str>,
 ) -> Event {
     use serde_json::json;
     use chrono::Utc;
@@ -36,6 +38,17 @@ pub(crate) fn build_completion_event(
          Call subagent_collect with handle_id \"{handle_id}\" to retrieve the full result. \
          Preview: {result_preview}"
     );
+
+    let mut data_map = json!({
+        "handle_id":     handle_id,
+        "subagent_id":   subagent_id,
+        "agent_name":    agent_name,
+        "status":        status_str,
+        "duration_secs": (duration_secs * 10.0).round() / 10.0,
+    });
+    if let Some(rf) = resumed_from {
+        data_map["resumed_from"] = json!(rf);
+    }
 
     Event {
         id: Uuid::new_v4().to_string(),
@@ -51,13 +64,7 @@ pub(crate) fn build_completion_event(
             text,
             content_type: "subagent_completion".to_string(),
             severity: Some(Severity::High),
-            data: Some(json!({
-                "handle_id":    handle_id,
-                "subagent_id":  subagent_id,
-                "agent_name":   agent_name,
-                "status":       status_str,
-                "duration_secs": (duration_secs * 10.0).round() / 10.0,
-            })),
+            data: Some(data_map),
         },
         expects_response: false,
         reply_to: None,
@@ -68,6 +75,8 @@ pub(crate) fn build_completion_event(
 /// OUTSIDE catch_unwind. Reads terminal status from shared state,
 /// stamps finished_at, publishes the completion event with a
 /// never-drop guarantee (push → push_priority fallback).
+///
+/// `resumed_from`: `Some(prior_handle_id)` when called from resume.rs, `None` from start.rs.
 pub(crate) fn finalize_subagent(
     state: &Arc<RwLock<SubagentState>>,
     parent_queue: Option<&Arc<EventQueue>>,
@@ -75,6 +84,7 @@ pub(crate) fn finalize_subagent(
     subagent_id: u64,
     agent_name: &str,
     started_at: std::time::Instant,
+    resumed_from: Option<&str>,
 ) {
     let (status, preview) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
@@ -112,6 +122,7 @@ pub(crate) fn finalize_subagent(
         &status,
         &preview,
         started_at.elapsed().as_secs_f64(),
+        resumed_from,
     );
 
     if let Err(e) = queue.push(ev.clone()) {
@@ -147,6 +158,7 @@ mod tests {
             &SubagentStatus::Completed,
             "analysis done",
             3.5,
+            None,
         );
 
         assert_eq!(ev.source.source_type, "subagent");
@@ -177,6 +189,7 @@ mod tests {
             Some(&queue),
             "sa_1", 1, "inline",
             std::time::Instant::now(),
+            None,
         );
 
         // State must now be Failed
@@ -208,6 +221,7 @@ mod tests {
             Some(&queue),
             "sa_8", 8, "worker",
             std::time::Instant::now(),
+            None,
         );
 
         // The completion event must be in the queue (priority-pushed to front)
@@ -238,6 +252,7 @@ mod tests {
             Some(&queue),
             "sa_9", 9, "silent",
             std::time::Instant::now(),
+            None,
         );
 
         // Event should be published (kill-switch is OFF in normal test runs)
@@ -256,6 +271,7 @@ mod tests {
             &SubagentStatus::Completed,
             "clean preview text",
             1.0,
+            None,
         );
         assert!(ev.content.text.contains("clean preview text"));
     }

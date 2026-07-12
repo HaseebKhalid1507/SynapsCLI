@@ -397,6 +397,7 @@ impl Tool for SubagentStartTool {
                 subagent_id,
                 &label_for_finalizer,
                 start_time,
+                None,  // start.rs: not a resume
             );
         });
 

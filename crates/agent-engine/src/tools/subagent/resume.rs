@@ -130,9 +130,16 @@ impl Tool for SubagentResumeTool {
         let model_inner     = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
         let start_time      = std::time::Instant::now();
+        let parent_queue    = ctx.capabilities.event_queue.clone();
+        let handle_id_inner = handle_id.clone();
+        let prior_handle_for_finalizer = prior_handle_id.clone();
 
         let system_prompt_for_handle = system_prompt.clone();
         let thread_handle = std::thread::spawn(move || {
+            // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
+            let state_for_finalizer = Arc::clone(&state_t);
+            let label_for_finalizer = label_inner.clone();
+
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -378,6 +385,19 @@ impl Tool for SubagentResumeTool {
                 tracing::error!("Resumed subagent thread panicked: {}", msg);
                 state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
+
+            // ── Terminal finalizer — exactly once, outside catch_unwind ────────
+            // Covers all paths: Ok, Err, timeout, panic, early tokio-build failure.
+            // Sets data.resumed_from so parent can correlate with the prior handle.
+            super::finalize::finalize_subagent(
+                &state_for_finalizer,
+                parent_queue.as_ref(),
+                &handle_id_inner,
+                subagent_id,
+                &label_for_finalizer,
+                start_time,
+                Some(&prior_handle_for_finalizer),
+            );
         });
 
         let handle = SubagentHandle::new(
