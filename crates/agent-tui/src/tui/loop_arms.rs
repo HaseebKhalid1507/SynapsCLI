@@ -600,6 +600,7 @@ pub(crate) async fn handle_animation_tick(
     exit_done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     boot_fx_sent: &mut bool,
     exit_fx_sent: bool,
+    last_subagent_reconcile: &mut Option<std::time::Instant>,
 ) -> bool {
                 // Active animations/effects always need a redraw each tick.
                 // messages.is_empty() = idle logo screen — its color gradient
@@ -609,7 +610,7 @@ pub(crate) async fn handle_animation_tick(
                 if *boot_fx_sent && boot_done.load(Ordering::Acquire) {
                     *boot_fx_sent = false;
                 }
-                if exit_fx_sent || *boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.is_empty() {
+                if exit_fx_sent || *boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.is_empty() || !app.subagents.is_empty() {
                     app.request_redraw();
                 }
                 app.secret_prompts.poll_requests(secret_prompt_rx);
@@ -617,6 +618,23 @@ pub(crate) async fn handle_animation_tick(
                 // (async queue + auto-chaining); reconcile the stack to the
                 // queue's is_active() so SecretPrompt is pushed/popped (§5).
                 input::reconcile_secret_prompt(app);
+                // Throttled subagent reconcile (~1s cadence) — keeps the mutex off
+                // the 60fps path while still updating timers and catching idle-finish.
+                if !app.subagents.is_empty() {
+                    let now = std::time::Instant::now();
+                    let should_reconcile = last_subagent_reconcile
+                        .map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
+                    if should_reconcile {
+                        let rows = runtime.subagent_registry()
+                            .lock().unwrap_or_else(|p| p.into_inner())
+                            .display_rows();
+                        super::stream_handler::reconcile_subagents(
+                            &mut app.subagents, &rows, now,
+                        );
+                        *last_subagent_reconcile = Some(now);
+                        app.request_redraw();
+                    }
+                }
                 if app.toasts.tick() {
                     app.invalidate();
                 }
