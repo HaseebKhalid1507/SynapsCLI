@@ -281,6 +281,23 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 // See also: openai_codex::tests for the parallel codex test suite.
 // These mirror the codex tests — same invariants, same naming pattern.
 
+/// Pinned experimental Copilot models base URL for broker catalog proxy.
+pub(crate) fn github_copilot_models_base_url() -> &'static str {
+    "https://api.githubcopilot.com"
+}
+
+/// Headers for the experimental Copilot models GET (no secrets).
+pub(crate) fn github_copilot_models_request_headers() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("User-Agent", "SynapsCLI/0.6.0"),
+        ("Accept", "application/json"),
+        ("Editor-Version", "vscode/1.107.0"),
+        ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
+        ("Copilot-Integration-Id", "vscode-chat"),
+        ("X-Github-Api-Version", "2025-10-01"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

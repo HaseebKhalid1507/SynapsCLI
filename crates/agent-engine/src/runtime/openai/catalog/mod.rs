@@ -32,6 +32,7 @@ const ANTHROPIC_MODELS_MAX_PAGES: usize = 20;
 mod anthropic;
 mod codex;
 mod generic;
+mod github_copilot;
 mod groq;
 mod nvidia;
 mod openrouter;
@@ -43,6 +44,12 @@ pub use anthropic::{
 };
 pub use codex::codex_static_catalog_models;
 pub use generic::parse_generic_catalog_models;
+pub use github_copilot::{
+    copilot_model, copilot_static_catalog_models, models_request_headers, parse_copilot_catalog_models,
+    validate_models_endpoint, CopilotModelDescriptor, COPILOT_API_VERSION, COPILOT_FALLBACK_MODELS,
+    MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL, PROVIDER_KEY as COPILOT_PROVIDER_KEY,
+    PROVIDER_NAME as COPILOT_PROVIDER_NAME,
+};
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
@@ -266,6 +273,7 @@ pub struct NvidiaCatalogProvider;
 pub struct AnthropicCatalogProvider;
 pub struct CodexCatalogProvider;
 pub struct XaiCatalogProvider;
+pub struct GitHubCopilotCatalogProvider;
 pub struct GenericCatalogProvider;
 
 pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProvider {
@@ -276,6 +284,7 @@ pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProv
         "claude" | "anthropic" => &AnthropicCatalogProvider,
         "openai-codex" => &CodexCatalogProvider,
         "xai-auth" => &XaiCatalogProvider,
+        "github-copilot" => &GitHubCopilotCatalogProvider,
         _ => &GenericCatalogProvider,
     }
 }
@@ -418,6 +427,40 @@ impl ModelCatalogProvider for XaiCatalogProvider {
         _client: &'a reqwest::Client,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { Ok(xai_static_catalog_models()) })
+    }
+}
+
+impl ModelCatalogProvider for GitHubCopilotCatalogProvider {
+    fn provider_key(&self) -> &'static str {
+        "github-copilot"
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
+        // Prefer broker-proxied live discovery (session token never enters this
+        // module as a caller-supplied secret). Fall back to curated static seeds
+        // only when the account is not configured for proxy discovery.
+        Box::pin(async move {
+            match broker_catalog_models_body("github-copilot").await {
+                Ok(body) => parse_copilot_catalog_models(&body)
+                    .map_err(|e| format!("parse failed: {e}")),
+                Err(err) => {
+                    // Offline / not-logged-in / transport: surface static fallback
+                    // only for explicit not-configured cases; other errors fail closed.
+                    let lower = err.to_lowercase();
+                    if lower.contains("not configured")
+                        || lower.contains("unknown provider")
+                        || lower.contains("not logged")
+                    {
+                        Ok(copilot_static_catalog_models())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -586,6 +629,37 @@ mod tests {
             .all(|model| model.runtime_id().starts_with("xai-auth/")));
     }
 
+    #[tokio::test]
+    async fn ui_catalog_fetch_github_copilot_returns_prefixed_chat_models() {
+        // When the operator has a live session, broker-proxied discovery wins.
+        // Otherwise the curated static fallback is returned. Either way runtime
+        // ids are github-copilot/<wire-id> and include fixture-established IDs.
+        let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
+            .await
+            .expect("GitHub Copilot catalog");
+        assert!(!models.is_empty());
+        assert!(models
+            .iter()
+            .all(|model| model.runtime_id().starts_with("github-copilot/")));
+        let ids: std::collections::HashSet<_> =
+            models.iter().map(|m| m.id.as_str()).collect();
+        // High-value ids from the curated set must be present for this account
+        // or via static fallback.
+        for required in ["gpt-5.3-codex", "claude-sonnet-4.6", "gemini-3.5-flash"] {
+            assert!(ids.contains(required), "missing {required}");
+        }
+        assert!(!ids.contains("text-embedding-3-small"));
+    }
+
+    #[test]
+    fn github_copilot_static_catalog_is_available_without_network() {
+        let models = copilot_static_catalog_models();
+        assert_eq!(models.len(), COPILOT_FALLBACK_MODELS.len());
+        assert!(models
+            .iter()
+            .all(|m| m.source == CatalogSource::StaticFallback));
+    }
+
     #[test]
     fn catalog_provider_trait_dispatch_selects_specialized_handlers() {
         assert_eq!(
@@ -600,6 +674,10 @@ mod tests {
             "openai-codex"
         );
         assert_eq!(catalog_provider_for("xai-auth").provider_key(), "xai-auth");
+        assert_eq!(
+            catalog_provider_for("github-copilot").provider_key(),
+            "github-copilot"
+        );
         assert_eq!(catalog_provider_for("cerebras").provider_key(), "generic");
     }
 

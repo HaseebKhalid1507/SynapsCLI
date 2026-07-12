@@ -34,6 +34,11 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             name: "xAI (Grok)",
             auth_kind: DevProviderAuth::OAuth("xai-auth"),
         },
+        DevProviderSelection {
+            key: "github-copilot",
+            name: "GitHub Copilot",
+            auth_kind: DevProviderAuth::OAuth("github-copilot"),
+        },
     ];
 
     providers.extend(
@@ -443,6 +448,17 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
         "xai-auth" => synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
             .into_iter()
             .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
+            .collect(),
+        "github-copilot" => synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
+            .into_iter()
+            .map(|model| {
+                let tier = match model.id.as_str() {
+                    "gpt-5.3-codex" | "gpt-5.5" | "claude-opus-4.8" | "claude-fable-5" => "S+",
+                    "gpt-5.4" | "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.7" => "S",
+                    _ => "",
+                };
+                (model.id, model.label.unwrap_or_default(), tier.to_string())
+            })
             .collect(),
         key => synaps_cli::runtime::openai::registry::providers()
             .iter()
@@ -1000,6 +1016,47 @@ mod tests {
             .collect();
         assert_eq!(ids, catalog_ids);
         assert!(xai.entries.iter().all(|entry| entry.id.starts_with("xai-auth/")));
+    }
+
+    #[test]
+    fn logged_in_github_copilot_provider_shows_curated_static_catalog_immediately() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+        };
+        let sections = build_sections_from_parts(
+            "github-copilot/gpt-5.3-codex",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["github-copilot"]),
+        );
+
+        let copilot = sections
+            .iter()
+            .find(|section| section.provider_key == "github-copilot")
+            .expect("logged-in GitHub Copilot section");
+        let ids: Vec<_> = copilot
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
+        let catalog_ids: Vec<_> =
+            synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
+                .into_iter()
+                .map(|model| model.id)
+                .collect();
+        assert_eq!(ids, catalog_ids);
+        assert!(copilot
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("github-copilot/")));
+        // No guessed sol / auto ids.
+        assert!(!ids.contains(&"gpt-5.6-sol"));
+        assert!(!ids.contains(&"auto"));
     }
 
     #[test]
