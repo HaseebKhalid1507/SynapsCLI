@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 pub mod broker;
 mod browser;
 mod callback;
+pub mod cloud;
 mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
@@ -37,6 +38,10 @@ pub use broker::{
 pub use browser::open_browser;
 pub use callback::{
     start_callback_server, start_callback_server_at, CallbackOutcome, CallbackServerHandle,
+};
+pub use cloud::{
+    AuthIdentity, AwsBedrockConfig, AzureOpenAiConfig, BrokerMessage, BrokerOperation, BrokerTool,
+    CloudProviderId, GoogleVertexConfig, InvokeOptions, InvokeRequest, MessageRole, ProviderId,
 };
 pub use credential_source::{
     is_expired_with_margin, resolve_access_token, resolve_remote, resolve_remote_token,

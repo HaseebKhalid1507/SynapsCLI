@@ -83,6 +83,8 @@ pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
 pub enum BrokerError {
     /// The named provider is not in any broker registry.
     UnknownProvider(String),
+    /// A required public-client registration is not configured.
+    RegistrationRequired { provider: String, remediation: String },
     /// The provider is known but has no credential configured.
     NotConfigured(String),
     /// The caller failed broker (machine) authentication.
@@ -99,6 +101,9 @@ impl std::fmt::Display for BrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownProvider(p) => write!(f, "unknown provider: {p}"),
+            Self::RegistrationRequired { provider, remediation } => {
+                write!(f, "registration required for '{provider}': {remediation}")
+            }
             Self::NotConfigured(p) => write!(
                 f,
                 "no credential configured for '{p}'. Run `synaps login` to add one."
