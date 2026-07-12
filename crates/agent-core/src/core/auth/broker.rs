@@ -275,9 +275,12 @@ pub struct CloudCatalogEntry {
     pub provider: CloudProviderId,
     pub id: String,
     pub display_name: String,
+    /// Opaque broker route identifier; never a provider, account, project, or resource name.
     pub context_ref: String,
     pub context_label: String,
     pub stale: bool,
+    /// Unix epoch milliseconds when this catalog snapshot was fetched.
+    pub fetched_at: u64,
 }
 
 /// Credential-free normalized cloud invocation event.
@@ -396,6 +399,38 @@ impl ProductionCloudBackend {
         storage::load_cloud_state(provider.as_str())
             .map_err(BrokerError::Credential)?
             .ok_or_else(|| BrokerError::NotConfigured(provider.to_string()))
+    }
+
+    fn context_ref(&self, provider: CloudProviderId) -> Result<String, BrokerError> {
+        use sha2::{Digest, Sha256};
+        let state = self.state(provider)?;
+        let public = serde_json::to_vec(&state["config"])
+            .map_err(|_| BrokerError::Credential("invalid cloud context".into()))?;
+        let digest = Sha256::digest([provider.as_str().as_bytes(), &public].concat());
+        Ok(format!(
+            "ctx-{}",
+            digest[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ))
+    }
+
+    fn validate_context(
+        &self,
+        provider: CloudProviderId,
+        supplied: &str,
+    ) -> Result<String, BrokerError> {
+        let opaque = self.context_ref(provider)?;
+        // The canonical provider id is accepted only as the catalog bootstrap
+        // selector. Every returned entry and persisted model route uses opaque.
+        if supplied == provider.as_str() || supplied == opaque {
+            Ok(opaque)
+        } else {
+            Err(BrokerError::Denied(
+                "cloud context does not match stored provider".into(),
+            ))
+        }
     }
 
     async fn aws(
@@ -646,11 +681,11 @@ impl CloudBackend for ProductionCloudBackend {
         context_ref: &str,
         _allow_stale: bool,
     ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
-        if context_ref != provider.as_str() {
-            return Err(BrokerError::Denied(
-                "cloud context does not match stored provider".into(),
-            ));
-        }
+        let opaque_context = self.validate_context(provider, context_ref)?;
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         match provider {
             CloudProviderId::AwsBedrock => {
                 let broker = self.aws().await?;
@@ -667,9 +702,10 @@ impl CloudBackend for ProductionCloudBackend {
                                 provider,
                                 id: x.id,
                                 display_name: x.display_name,
-                                context_ref: provider.as_str().into(),
+                                context_ref: opaque_context.clone(),
                                 context_label: label.clone(),
                                 stale: false,
+                                fetched_at,
                             })
                             .collect()
                     })
@@ -715,12 +751,13 @@ impl CloudBackend for ProductionCloudBackend {
                                 provider,
                                 id: x.id,
                                 display_name: x.display_name,
-                                context_ref: provider.as_str().into(),
+                                context_ref: opaque_context.clone(),
                                 context_label: format!(
                                     "{}/{}",
                                     config.resource_name, config.resource_group
                                 ),
                                 stale: false,
+                                fetched_at,
                             })
                             .collect()
                     })
@@ -772,12 +809,13 @@ impl CloudBackend for ProductionCloudBackend {
                                     provider,
                                     id: format!("google-vertex/{name}"),
                                     display_name: m["displayName"].as_str().unwrap_or(name).into(),
-                                    context_ref: provider.as_str().into(),
+                                    context_ref: opaque_context.clone(),
                                     context_label: format!(
                                         "{}/{}",
                                         config.project_id, config.location
                                     ),
                                     stale: false,
+                                    fetched_at,
                                 });
                             }
                         }
@@ -806,11 +844,7 @@ impl CloudBackend for ProductionCloudBackend {
         model_id: &str,
         request: InvokeRequest,
     ) -> Result<CloudEventStream, BrokerError> {
-        if context_ref != provider.as_str() {
-            return Err(BrokerError::Denied(
-                "cloud context does not match stored provider".into(),
-            ));
-        }
+        self.validate_context(provider, context_ref)?;
         if !request.tools.is_empty() {
             return Err(BrokerError::Denied(
                 "tools are not yet supported by cloud providers".into(),
@@ -825,8 +859,9 @@ impl CloudBackend for ProductionCloudBackend {
         match provider {
             CloudProviderId::AwsBedrock => {
                 let broker = self.aws().await?;
-                let events = if request.stream {
-                    broker
+                if request.stream {
+                    use futures::StreamExt;
+                    let stream = broker
                         .converse_stream(model_id, request)
                         .await
                         .map_err(|_| {
@@ -834,39 +869,48 @@ impl CloudBackend for ProductionCloudBackend {
                                 "AWS invocation failed (details redacted)".into(),
                             )
                         })?
-                        .into_iter()
-                        .map(|e| match e {
-                            super::aws_bedrock::ConverseEvent::TextDelta(delta) => {
-                                CloudEvent::TextDelta { delta }
-                            }
-                            super::aws_bedrock::ConverseEvent::ToolArguments { id, delta } => {
-                                CloudEvent::ToolArguments {
-                                    id,
-                                    name: None,
-                                    delta,
-                                }
-                            }
-                            super::aws_bedrock::ConverseEvent::Usage(u) => CloudEvent::Usage {
-                                input_tokens: u.input_tokens,
-                                output_tokens: u.output_tokens,
-                            },
-                            super::aws_bedrock::ConverseEvent::Done => CloudEvent::Done,
-                        })
-                        .collect::<Vec<_>>()
+                        .map(|event| {
+                            event
+                                .map_err(|_| {
+                                    BrokerError::Transport(
+                                        "AWS stream failed (details redacted)".into(),
+                                    )
+                                })
+                                .map(|e| match e {
+                                    super::aws_bedrock::ConverseEvent::TextDelta(delta) => {
+                                        CloudEvent::TextDelta { delta }
+                                    }
+                                    super::aws_bedrock::ConverseEvent::ToolArguments {
+                                        id,
+                                        delta,
+                                    } => CloudEvent::ToolArguments {
+                                        id,
+                                        name: None,
+                                        delta,
+                                    },
+                                    super::aws_bedrock::ConverseEvent::Usage(u) => {
+                                        CloudEvent::Usage {
+                                            input_tokens: u.input_tokens,
+                                            output_tokens: u.output_tokens,
+                                        }
+                                    }
+                                    super::aws_bedrock::ConverseEvent::Done => CloudEvent::Done,
+                                })
+                        });
+                    Ok(Box::pin(stream))
                 } else {
                     let o = broker.converse(model_id, request).await.map_err(|_| {
                         BrokerError::Transport("AWS invocation failed (details redacted)".into())
                     })?;
-                    vec![
-                        CloudEvent::TextDelta { delta: o.text },
-                        CloudEvent::Usage {
+                    Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(CloudEvent::TextDelta { delta: o.text }),
+                        Ok(CloudEvent::Usage {
                             input_tokens: o.usage.input_tokens,
                             output_tokens: o.usage.output_tokens,
-                        },
-                        CloudEvent::Done,
-                    ]
-                };
-                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+                        }),
+                        Ok(CloudEvent::Done),
+                    ])))
+                }
             }
             CloudProviderId::AzureOpenAi => {
                 let mut state = self.state(provider)?;
@@ -901,30 +945,39 @@ impl CloudBackend for ProductionCloudBackend {
                 if !r.status().is_success() {
                     return Err(BrokerError::Transport("Azure invocation rejected".into()));
                 }
-                let text = r
-                    .text()
-                    .await
-                    .map_err(|_| BrokerError::Transport("Azure stream failed".into()))?;
-                let mut events = Vec::new();
-                for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
-                    if line == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        if let Some(t) = v["delta"].as_str().or_else(|| v["text"].as_str()) {
-                            events.push(CloudEvent::TextDelta { delta: t.into() });
-                        }
-                    }
+                if request.stream {
+                    use futures::StreamExt;
+                    let stream =
+                        sse_json_stream(r).filter_map(|item| async move {
+                            match item {
+                                Ok(Some(v)) => v["delta"]
+                                    .as_str()
+                                    .or_else(|| v["text"].as_str())
+                                    .map(|delta| {
+                                        Ok(CloudEvent::TextDelta {
+                                            delta: delta.into(),
+                                        })
+                                    }),
+                                Ok(None) => Some(Ok(CloudEvent::Done)),
+                                Err(error) => Some(Err(error)),
+                            }
+                        });
+                    Ok(Box::pin(stream))
+                } else {
+                    let text = read_body_capped(r, MAX_CLOUD_STREAM_EVENT_BYTES).await?;
+                    let v: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|_| BrokerError::Transport("invalid Azure response".into()))?;
+                    let delta = v["output_text"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            BrokerError::Transport("Azure response omitted output".into())
+                        })?
+                        .to_owned();
+                    Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(CloudEvent::TextDelta { delta }),
+                        Ok(CloudEvent::Done),
+                    ])))
                 }
-                if events.is_empty() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(t) = v["output_text"].as_str() {
-                            events.push(CloudEvent::TextDelta { delta: t.into() });
-                        }
-                    }
-                }
-                events.push(CloudEvent::Done);
-                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
             }
             CloudProviderId::GoogleVertex => {
                 let mut state = self.state(provider)?;
@@ -957,34 +1010,67 @@ impl CloudBackend for ProductionCloudBackend {
                 if !r.status().is_success() {
                     return Err(BrokerError::Transport("Vertex invocation rejected".into()));
                 }
-                let text = r
-                    .text()
-                    .await
-                    .map_err(|_| BrokerError::Transport("Vertex stream failed".into()))?;
-                let mut events = Vec::new();
-                for data in text
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("data: "))
-                    .chain((!request.stream).then_some(text.as_str()).into_iter())
-                {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        for c in v["candidates"].as_array().into_iter().flatten() {
-                            for p in c["content"]["parts"].as_array().into_iter().flatten() {
-                                if let Some(t) = p["text"].as_str() {
-                                    events.push(CloudEvent::TextDelta { delta: t.into() });
+                if request.stream {
+                    use futures::StreamExt;
+                    let events = sse_json_stream(r).map(|item| {
+                        item.and_then(|value| {
+                            value.ok_or_else(|| {
+                                BrokerError::Transport(
+                                    "Vertex stream terminated without a provider event".into(),
+                                )
+                            })
+                        })
+                    });
+                    let stream = events
+                        .flat_map(|item| {
+                            let mut out = Vec::new();
+                            match item {
+                                Ok(v) => {
+                                    for c in v["candidates"].as_array().into_iter().flatten() {
+                                        for p in
+                                            c["content"]["parts"].as_array().into_iter().flatten()
+                                        {
+                                            if let Some(delta) = p["text"].as_str() {
+                                                out.push(Ok(CloudEvent::TextDelta {
+                                                    delta: delta.into(),
+                                                }));
+                                            }
+                                        }
+                                    }
+                                    if let Some(u) = v.get("usageMetadata") {
+                                        out.push(Ok(CloudEvent::Usage {
+                                            input_tokens: u["promptTokenCount"]
+                                                .as_u64()
+                                                .unwrap_or(0),
+                                            output_tokens: u["candidatesTokenCount"]
+                                                .as_u64()
+                                                .unwrap_or(0),
+                                        }));
+                                    }
                                 }
+                                Err(error) => out.push(Err(error)),
+                            }
+                            futures::stream::iter(out)
+                        })
+                        .chain(futures::stream::once(async { Ok(CloudEvent::Done) }));
+                    Ok(Box::pin(stream))
+                } else {
+                    let text = read_body_capped(r, MAX_CLOUD_STREAM_EVENT_BYTES).await?;
+                    let v: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|_| BrokerError::Transport("invalid Vertex response".into()))?;
+                    let mut out = Vec::new();
+                    for c in v["candidates"].as_array().into_iter().flatten() {
+                        for p in c["content"]["parts"].as_array().into_iter().flatten() {
+                            if let Some(delta) = p["text"].as_str() {
+                                out.push(Ok(CloudEvent::TextDelta {
+                                    delta: delta.into(),
+                                }));
                             }
                         }
-                        if let Some(u) = v.get("usageMetadata") {
-                            events.push(CloudEvent::Usage {
-                                input_tokens: u["promptTokenCount"].as_u64().unwrap_or(0),
-                                output_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
-                            });
-                        }
                     }
+                    out.push(Ok(CloudEvent::Done));
+                    Ok(Box::pin(futures::stream::iter(out)))
                 }
-                events.push(CloudEvent::Done);
-                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
             }
         }
     }
@@ -992,6 +1078,75 @@ impl CloudBackend for ProductionCloudBackend {
 
 const MAX_CLOUD_CATALOG_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CLOUD_CATALOG_ENTRIES: usize = 10_000;
+const MAX_CLOUD_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Incremental SSE parser. It retains only one bounded event, yields as soon as
+/// an event delimiter arrives, and owns the response so dropping the consumer
+/// cancels the upstream request.
+fn sse_json_stream(
+    resp: reqwest::Response,
+) -> Pin<Box<dyn Stream<Item = Result<Option<serde_json::Value>, BrokerError>> + Send>> {
+    use futures::StreamExt;
+    let chunks = Box::pin(resp.bytes_stream());
+    Box::pin(futures::stream::unfold(
+        (chunks, Vec::<u8>::new(), false),
+        |(mut chunks, mut buf, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                if let Some(end) = buf.windows(2).position(|w| w == b"\n\n") {
+                    let frame: Vec<u8> = buf.drain(..end + 2).collect();
+                    let text = match std::str::from_utf8(&frame[..end]) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Some((
+                                Err(BrokerError::Transport("invalid SSE encoding".into())),
+                                (chunks, buf, true),
+                            ))
+                        }
+                    };
+                    let data = text
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .map(str::trim_start)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == "[DONE]" {
+                        return Some((Ok(None), (chunks, buf, true)));
+                    }
+                    let value = serde_json::from_str(&data)
+                        .map_err(|_| BrokerError::Transport("invalid SSE event".into()));
+                    let terminal = value.is_err();
+                    return Some((value.map(Some), (chunks, buf, terminal)));
+                }
+                match chunks.next().await {
+                    Some(Ok(chunk)) if buf.len() + chunk.len() <= MAX_CLOUD_STREAM_EVENT_BYTES => {
+                        buf.extend_from_slice(&chunk)
+                    }
+                    Some(_) => {
+                        return Some((
+                            Err(BrokerError::Transport(
+                                "cloud stream event exceeded limit".into(),
+                            )),
+                            (chunks, buf, true),
+                        ))
+                    }
+                    None if buf.is_empty() => return None,
+                    None => {
+                        return Some((
+                            Err(BrokerError::Transport("truncated SSE event".into())),
+                            (chunks, buf, true),
+                        ))
+                    }
+                }
+            }
+        },
+    ))
+}
 
 /// Read one catalog page without allowing an upstream to allocate an unbounded body.
 async fn cloud_catalog_json(resp: reqwest::Response) -> Result<serde_json::Value, BrokerError> {
@@ -1559,9 +1714,18 @@ impl RemoteBroker {
         http: reqwest::Client,
         cache: super::TokenCache,
     ) -> Self {
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        // Never trust a caller-supplied redirect policy for credential-bearing
+        // broker RPC. A redirect could otherwise replay machine auth off-origin.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or(http);
         Self {
             http,
-            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            endpoint,
             machine_token: machine_token.into(),
             cache,
         }
@@ -1696,9 +1860,19 @@ impl CredentialBroker for RemoteBroker {
                 resp.status()
             )));
         }
-        resp.json()
-            .await
-            .map_err(|e| BrokerError::Transport(format!("invalid cloud catalog: {e}")))
+        let body = read_body_capped(resp, MAX_CLOUD_CATALOG_BODY_BYTES).await?;
+        let entries: Vec<CloudCatalogEntry> = serde_json::from_str(&body)
+            .map_err(|e| BrokerError::Transport(format!("invalid cloud catalog: {e}")))?;
+        if entries.len() > MAX_CLOUD_CATALOG_ENTRIES
+            || entries.iter().any(|e| {
+                e.provider != provider || !e.context_ref.starts_with("ctx-") || e.id.len() > 512
+            })
+        {
+            return Err(BrokerError::Transport(
+                "broker returned an invalid cloud catalog".into(),
+            ));
+        }
+        Ok(entries)
     }
 
     async fn cloud_invoke(
@@ -1717,14 +1891,46 @@ impl CredentialBroker for RemoteBroker {
             });
         }
         use futures::StreamExt;
-        let stream = resp.bytes_stream().map(|chunk| {
-            chunk
-                .map_err(|e| BrokerError::Transport(e.to_string()))
-                .and_then(|b| {
-                    serde_json::from_slice::<CloudEvent>(&b)
-                        .map_err(|e| BrokerError::Transport(format!("invalid cloud event: {e}")))
-                })
-        });
+        let chunks = Box::pin(resp.bytes_stream());
+        let stream = futures::stream::unfold(
+            (chunks, Vec::<u8>::new()),
+            |(mut chunks, mut buffer)| async move {
+                loop {
+                    if let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = buffer.drain(..=end).collect();
+                        let event = serde_json::from_slice::<CloudEvent>(&line[..end])
+                            .map_err(|_| BrokerError::Transport("invalid cloud event".into()));
+                        return Some((event, (chunks, buffer)));
+                    }
+                    match chunks.next().await {
+                        Some(Ok(chunk))
+                            if buffer.len() + chunk.len() <= MAX_CLOUD_STREAM_EVENT_BYTES =>
+                        {
+                            buffer.extend_from_slice(&chunk)
+                        }
+                        Some(Ok(_)) => {
+                            return Some((
+                                Err(BrokerError::Transport("cloud event exceeded limit".into())),
+                                (chunks, Vec::new()),
+                            ))
+                        }
+                        Some(Err(_)) => {
+                            return Some((
+                                Err(BrokerError::Transport("broker stream failed".into())),
+                                (chunks, Vec::new()),
+                            ))
+                        }
+                        None if buffer.is_empty() => return None,
+                        None => {
+                            return Some((
+                                Err(BrokerError::Transport("truncated cloud event".into())),
+                                (chunks, Vec::new()),
+                            ))
+                        }
+                    }
+                }
+            },
+        );
         Ok(Box::pin(stream))
     }
 

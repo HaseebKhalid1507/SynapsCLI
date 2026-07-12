@@ -78,19 +78,19 @@ impl AwsApi for Fake {
             },
         })
     }
-    async fn converse_stream(&self, _: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
-        Ok(vec![
-            ConverseEvent::TextDelta("he".into()),
-            ConverseEvent::ToolArguments {
+    async fn converse_stream(&self, _: SignedRequest) -> Result<ConverseEventStream, AwsError> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ConverseEvent::TextDelta("he".into())),
+            Ok(ConverseEvent::ToolArguments {
                 id: "1".into(),
                 delta: "{}".into(),
-            },
-            ConverseEvent::Usage(Usage {
+            }),
+            Ok(ConverseEvent::Usage(Usage {
                 input_tokens: 2,
                 output_tokens: 1,
-            }),
-            ConverseEvent::Done,
-        ])
+            })),
+            Ok(ConverseEvent::Done),
+        ])))
     }
 }
 fn config() -> AwsBedrockConfig {
@@ -207,7 +207,7 @@ async fn multiple_accounts_require_explicit_selection() {
         async fn converse(&self, _: SignedRequest) -> Result<ConverseOutput, AwsError> {
             unreachable!()
         }
-        async fn converse_stream(&self, _: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
+        async fn converse_stream(&self, _: SignedRequest) -> Result<ConverseEventStream, AwsError> {
             unreachable!()
         }
     }

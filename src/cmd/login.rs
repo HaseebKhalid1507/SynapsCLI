@@ -186,9 +186,17 @@ async fn login_azure_openai() -> Result<(), String> {
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         config.tenant
     );
-    let mut interval = d["interval"].as_u64().unwrap_or(5);
+    let mut interval = d["interval"].as_u64().unwrap_or(5).max(1);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(d["expires_in"].as_u64().unwrap_or(900).min(3600));
     let arm = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Azure device code expired".into());
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Err("Azure device authorization cancelled".into()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+        }
         let r = http
             .post(&token_url)
             .form(&[
@@ -235,12 +243,24 @@ async fn login_azure_openai() -> Result<(), String> {
         "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}?api-version=2023-05-01",
         config.subscription_id, config.resource_group, config.resource_name
     );
-    let account: serde_json::Value = http.get(account_url)
-        .bearer_auth(arm["access_token"].as_str().ok_or("invalid Azure ARM token")?)
-        .send().await.map_err(|_| "Azure ARM endpoint resolution failed")?
-        .error_for_status().map_err(|_| "Azure ARM resource validation failed")?
-        .json().await.map_err(|_| "invalid Azure ARM resource metadata")?;
-    let endpoint = account.pointer("/properties/endpoint").and_then(|v| v.as_str())
+    let account: serde_json::Value = http
+        .get(account_url)
+        .bearer_auth(
+            arm["access_token"]
+                .as_str()
+                .ok_or("invalid Azure ARM token")?,
+        )
+        .send()
+        .await
+        .map_err(|_| "Azure ARM endpoint resolution failed")?
+        .error_for_status()
+        .map_err(|_| "Azure ARM resource validation failed")?
+        .json()
+        .await
+        .map_err(|_| "invalid Azure ARM resource metadata")?;
+    let endpoint = account
+        .pointer("/properties/endpoint")
+        .and_then(|v| v.as_str())
         .ok_or("Azure ARM metadata omitted the resource endpoint")?;
     auth::azure_openai::AzureEndpoint::parse(endpoint)
         .map_err(|_| "Azure ARM returned an untrusted resource endpoint")?;

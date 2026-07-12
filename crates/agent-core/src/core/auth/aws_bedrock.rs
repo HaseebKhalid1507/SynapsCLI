@@ -2,9 +2,10 @@
 //! The transport trait is intentionally typed: it cannot sign arbitrary URLs or vend credentials.
 use super::cloud::{AwsBedrockConfig, InvokeRequest};
 use async_trait::async_trait;
+use futures::Stream;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, pin::Pin};
 
 #[derive(Clone)]
 pub struct RegisteredClient {
@@ -235,6 +236,9 @@ impl fmt::Debug for SignedRequest {
     }
 }
 
+pub type ConverseEventStream =
+    Pin<Box<dyn Stream<Item = Result<ConverseEvent, AwsError>> + Send + 'static>>;
+
 #[async_trait]
 pub trait AwsApi: Send + Sync + Clone + 'static {
     async fn register_client(&self, region: &str) -> Result<RegisteredClient, AwsError>;
@@ -272,8 +276,10 @@ pub trait AwsApi: Send + Sync + Clone + 'static {
         request: SignedRequest,
     ) -> Result<Vec<FoundationModel>, AwsError>;
     async fn converse(&self, request: SignedRequest) -> Result<ConverseOutput, AwsError>;
-    async fn converse_stream(&self, request: SignedRequest)
-        -> Result<Vec<ConverseEvent>, AwsError>;
+    async fn converse_stream(
+        &self,
+        request: SignedRequest,
+    ) -> Result<ConverseEventStream, AwsError>;
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicContext {
@@ -395,7 +401,7 @@ impl<A: AwsApi> AwsBedrockBroker<A> {
         &self,
         model: &str,
         request: InvokeRequest,
-    ) -> Result<Vec<ConverseEvent>, AwsError> {
+    ) -> Result<ConverseEventStream, AwsError> {
         let id = valid_model(model)?;
         let body = serde_json::to_vec(&request).map_err(|_| AwsError::Upstream)?;
         let path = format!("/model/{id}/converse-stream");
@@ -619,22 +625,108 @@ impl AwsApi for AwsHttpApi {
             },
         })
     }
-    async fn converse_stream(&self, q: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
+    async fn converse_stream(&self, q: SignedRequest) -> Result<ConverseEventStream, AwsError> {
+        use futures::StreamExt;
         let url = format!("https://{}{}", q.host, q.path);
         let mut request = self.http.post(url).body(q.body);
         for (name, value) in q.headers {
             request = request.header(name, value);
         }
-        let bytes = request
+        let response = request
             .send()
             .await
             .map_err(|_| AwsError::Upstream)?
             .error_for_status()
-            .map_err(|_| AwsError::Upstream)?
-            .bytes()
-            .await
             .map_err(|_| AwsError::Upstream)?;
-        decode_converse_stream(&bytes)
+        let chunks = response.bytes_stream();
+        // `unfold` owns the response and parser buffer. Dropping the returned
+        // stream drops the response immediately (cancellation), while yielding
+        // one frame at a time and retaining at most one bounded frame.
+        const MAX_FRAME: usize = 1024 * 1024;
+        let stream = futures::stream::unfold(
+            (Box::pin(chunks), Vec::<u8>::new(), false),
+            |(mut chunks, mut buffer, done)| async move {
+                if done {
+                    return None;
+                }
+                loop {
+                    if buffer.len() >= 4 {
+                        let total = u32::from_be_bytes(buffer[..4].try_into().ok()?) as usize;
+                        if !(16..=MAX_FRAME).contains(&total) {
+                            return Some((Err(AwsError::Upstream), (chunks, buffer, true)));
+                        }
+                        if buffer.len() >= total {
+                            let frame: Vec<u8> = buffer.drain(..total).collect();
+                            let event = decode_event_frame(&frame);
+                            let terminal = matches!(event, Ok(Some(ConverseEvent::Done)) | Err(_));
+                            match event {
+                                Ok(Some(event)) => {
+                                    return Some((Ok(event), (chunks, buffer, terminal)))
+                                }
+                                Ok(None) => continue,
+                                Err(error) => return Some((Err(error), (chunks, buffer, true))),
+                            }
+                        }
+                    }
+                    match chunks.next().await {
+                        Some(Ok(chunk)) if buffer.len() + chunk.len() <= MAX_FRAME => {
+                            buffer.extend_from_slice(&chunk)
+                        }
+                        Some(_) => return Some((Err(AwsError::Upstream), (chunks, buffer, true))),
+                        None => return Some((Err(AwsError::Upstream), (chunks, buffer, true))),
+                    }
+                }
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+fn decode_event_frame(bytes: &[u8]) -> Result<Option<ConverseEvent>, AwsError> {
+    if bytes.len() < 16 {
+        return Err(AwsError::Upstream);
+    }
+    let total = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let headers = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if total != bytes.len()
+        || headers > total - 16
+        || crc32(&bytes[..8]) != u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+        || crc32(&bytes[..total - 4]) != u32::from_be_bytes(bytes[total - 4..].try_into().unwrap())
+    {
+        return Err(AwsError::Upstream);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes[12 + headers..total - 4]).map_err(|_| AwsError::Upstream)?;
+    if let Some(delta) = value
+        .pointer("/contentBlockDelta/delta/text")
+        .and_then(|v| v.as_str())
+    {
+        Ok(Some(ConverseEvent::TextDelta(delta.to_owned())))
+    } else if let Some(delta) = value
+        .pointer("/contentBlockDelta/delta/toolUse/input")
+        .and_then(|v| v.as_str())
+    {
+        Ok(Some(ConverseEvent::ToolArguments {
+            id: value
+                .pointer("/contentBlockDelta/delta/toolUse/toolUseId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            delta: delta.to_owned(),
+        }))
+    } else if let Some(usage) = value.pointer("/metadata/usage") {
+        Ok(Some(ConverseEvent::Usage(Usage {
+            input_tokens: usage["inputTokens"].as_u64().unwrap_or(0),
+            output_tokens: usage["outputTokens"].as_u64().unwrap_or(0),
+        })))
+    } else if value.get("messageStop").is_some() {
+        Ok(Some(ConverseEvent::Done))
+    } else if value.get("internalServerException").is_some()
+        || value.get("modelStreamErrorException").is_some()
+    {
+        Err(AwsError::Upstream)
+    } else {
+        Ok(None)
     }
 }
 
@@ -702,7 +794,12 @@ pub fn decode_converse_stream(mut bytes: &[u8]) -> Result<Vec<ConverseEvent>, Aw
         // EOF without messageStop is truncation, never successful completion.
         return Err(AwsError::Upstream);
     }
-    if out.iter().filter(|e| matches!(e, ConverseEvent::Done)).count() != 1 {
+    if out
+        .iter()
+        .filter(|e| matches!(e, ConverseEvent::Done))
+        .count()
+        != 1
+    {
         return Err(AwsError::Upstream);
     }
     Ok(out)
@@ -802,7 +899,12 @@ pub fn sign_bedrock_request(
         format!("bedrock.{region}.amazonaws.com")
     };
     let payload = hex(Sha256::digest(body));
-    let canonical=format!("{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz}\nx-amz-security-token:{}\n\nhost;x-amz-date;x-amz-security-token\n{payload}",c.session_token);
+    let content_type = if runtime && path.ends_with("converse-stream") {
+        "application/vnd.amazon.eventstream"
+    } else {
+        "application/json"
+    };
+    let canonical=format!("{method}\n{path}\n\ncontent-type:{content_type}\nhost:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{amz}\nx-amz-security-token:{}\n\ncontent-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n{payload}",c.session_token);
     let scope = format!("{date}/{region}/bedrock/aws4_request");
     let sts = format!(
         "AWS4-HMAC-SHA256\n{amz}\n{scope}\n{}",
@@ -814,10 +916,12 @@ pub fn sign_bedrock_request(
     let key = hmac(&ks, b"aws4_request");
     let sig = hex(hmac(&key, sts.as_bytes()));
     let mut headers = BTreeMap::new();
+    headers.insert("content-type".into(), content_type.into());
     headers.insert("host".into(), host.clone());
+    headers.insert("x-amz-content-sha256".into(), payload);
     headers.insert("x-amz-date".into(), amz);
     headers.insert("x-amz-security-token".into(), c.session_token.clone());
-    headers.insert("authorization".into(),format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=host;x-amz-date;x-amz-security-token, Signature={sig}",c.access_key));
+    headers.insert("authorization".into(),format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature={sig}",c.access_key));
     Ok(SignedRequest {
         method: if method == "GET" { "GET" } else { "POST" },
         host,
