@@ -514,22 +514,21 @@ mod tests {
         assert!(resolve_route("xai-auth/grok-build-latest").is_none());
         assert!(resolve_route("xai-auth/grok-imagine-image").is_none());
 
-        // ── google-gemini: broker-proxy only, conservative catalog ──────────
-        for id in ["gemini-2.5-pro", "gemini-2.5-flash"] {
-            let route = resolve_route(&format!("google-gemini/{id}")).unwrap();
+        // Every verified concrete text/tool wire ID in the catalog must resolve.
+        for descriptor in catalog::GOOGLE_GEMINI_TEXT_MODELS {
+            let route = resolve_route(&format!("google-gemini/{}", descriptor.id)).unwrap();
             assert_eq!(route.provider, "google-gemini");
-            assert_eq!(route.model, id);
+            assert_eq!(route.model, descriptor.id);
             assert_eq!(route.endpoint, "https://cloudcode-pa.googleapis.com");
             assert_eq!(route.auth, AuthPolicy::BrokerProxy);
             assert_eq!(route.wire, WireProtocol::GoogleGeminiCodeAssist);
         }
-        // Unverified / preview IDs must not resolve.
+        // Aliases, unsupported media/embedding models, and family prefixes fail closed.
         for banned in [
-            "gemini-3-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-3.5-flash",
             "auto-gemini-2.5",
+            "auto-gemini-3",
             "text-embedding-004",
+            "gemini-2.5-image",
             "gemini-2.5", // family prefix is not a wire id
         ] {
             assert!(
