@@ -11,7 +11,7 @@
 //! 2. `buffered_events_flush_without_duplication_or_metadata_loss`
 //!    - One buffered event yields EXACTLY ONE wire RpcEvent::Event frame total
 //!      (the drainer frame emitted at buffer time; Done flush must NOT emit
-//!       another frame for the same event)
+//!      another frame for the same event)
 //!    - The injected content at Done is raw formatted text only, pushed into
 //!      api_messages — NOT another Event wire frame
 //!    - Real id / source / severity / timestamp are preserved (no fake UUIDs,
