@@ -58,6 +58,24 @@ pub const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// Pinned Code Assist host for the broker-only Google Gemini proxy runtime.
+/// The service is treated as experimental and only the exact `v1internal`
+/// method paths reviewed in the spec are permitted (setup + streaming).
+pub const GOOGLE_GEMINI_CODE_ASSIST_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+
+/// Exhaustive allowlist of `cloudcode-pa` methods the broker may proxy.
+/// Deliberately narrow: setup uses loadCodeAssist + onboardUser + operations
+/// polling, runtime uses streamGenerateContent. Anything else is denied.
+pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1internal:loadCodeAssist"
+            | "/v1internal:onboardUser"
+            | "/v1internal:streamGenerateContent"
+            | "/v1internal:countTokens"
+    ) || path.starts_with("/v1internal/operations/")
+}
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Broker failures. Messages never contain credential values.
@@ -145,6 +163,7 @@ impl ProxyRequest {
         if self.provider != LOCAL_PROVIDER_KEY
             && self.provider != "xai-auth"
             && self.provider != "github-copilot"
+            && self.provider != "google-gemini"
             && static_provider(&self.provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
@@ -166,6 +185,8 @@ impl ProxyRequest {
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 ))
+            && !(self.provider == "google-gemini"
+                && is_allowed_google_gemini_path(&self.path))
             && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
         {
             return Err(BrokerError::Denied(format!(
@@ -388,6 +409,14 @@ impl LocalBroker {
                 token.token,
                 super::github_copilot_models_base_url().to_string(),
             )
+        } else if request.provider == "google-gemini" {
+            // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
+            // broker-owned; runtime never receives it.
+            let token = self.access_token(OAuthProviderId::GoogleGemini).await?;
+            (
+                token.token,
+                GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string(),
+            )
         } else {
             (
                 self.resolve_static_key(&request.provider)?,
@@ -395,9 +424,24 @@ impl LocalBroker {
             )
         };
         let url = format!("{base}{}", request.path);
-        let mut builder = match request.method {
-            ProxyMethod::Get => self.http.get(&url),
-            ProxyMethod::Post => self.http.post(&url),
+        // For google-gemini we deny redirects explicitly: the upstream is
+        // pinned to cloudcode-pa.googleapis.com and any 3xx must not be
+        // followed with the bearer token attached.
+        let mut builder = if request.provider == "google-gemini" {
+            let no_redirect = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
+            match request.method {
+                ProxyMethod::Get => no_redirect.get(&url),
+                ProxyMethod::Post => no_redirect.post(&url),
+            }
+        } else {
+            match request.method {
+                ProxyMethod::Get => self.http.get(&url),
+                ProxyMethod::Post => self.http.post(&url),
+            }
         };
         builder = builder.bearer_auth(&key);
         if request.provider == "github-copilot" {
@@ -409,6 +453,17 @@ impl LocalBroker {
                     .header("Openai-Intent", "conversation-edits")
                     .header("X-Initiator", "agent");
             }
+        }
+        if request.provider == "google-gemini" {
+            // The Code Assist reference client uses `?alt=sse` for streaming.
+            // Match that so upstream returns line-delimited SSE frames rather
+            // than JSON-in-one-response.
+            if request.stream && request.path == "/v1internal:streamGenerateContent" {
+                builder = builder.query(&[("alt", "sse")]);
+            }
+            builder = builder
+                .header("content-type", "application/json")
+                .header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
         if let Some(body) = &request.body {
             builder = builder.json(body);
@@ -1124,6 +1179,52 @@ mod tests {
                 stream: false,
             };
             assert!(matches!(request.validate(), Err(BrokerError::Denied(_))));
+        }
+    }
+
+    /// google-gemini is pinned to the reviewed cloudcode-pa v1internal methods.
+    #[test]
+    fn proxy_allows_only_pinned_google_gemini_paths() {
+        for path in [
+            "/v1internal:loadCodeAssist",
+            "/v1internal:onboardUser",
+            "/v1internal:streamGenerateContent",
+            "/v1internal:countTokens",
+            "/v1internal/operations/op-12345",
+        ] {
+            let req = ProxyRequest {
+                provider: "google-gemini".into(),
+                method: ProxyMethod::Post,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(req.validate().is_ok(), "{path} must be allowed");
+        }
+        for path in [
+            // No arbitrary same-host methods.
+            "/v1internal:listExperiments",
+            "/v1internal:fetchAdminControls",
+            "/v1internal:setCodeAssistGlobalUserSetting",
+            "/v1internal:generateContent",
+            // No unrelated versions.
+            "/v2/models",
+            "/v1beta/models",
+            // No path traversal or root probe.
+            "/",
+            "/v1internal:",
+        ] {
+            let req = ProxyRequest {
+                provider: "google-gemini".into(),
+                method: ProxyMethod::Post,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(
+                matches!(req.validate(), Err(BrokerError::Denied(_))),
+                "{path} must be denied"
+            );
         }
     }
 

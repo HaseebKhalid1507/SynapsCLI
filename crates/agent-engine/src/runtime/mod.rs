@@ -18,6 +18,7 @@ mod auth;
 mod body_golden;
 pub mod compaction;
 pub(crate) mod helpers;
+pub mod google_gemini;
 pub mod openai;
 mod request;
 mod sse;
