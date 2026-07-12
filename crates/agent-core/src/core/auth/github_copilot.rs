@@ -1281,4 +1281,106 @@ mod tests {
         assert_eq!(err, CopilotAuthError::EmptyGitHubToken);
         assert!(http.gets.lock().unwrap().is_empty());
     }
+
+
+    #[tokio::test]
+    async fn github_copilot_refresh_remints_without_browser() {
+        // refresh_token path is mint-only; no device endpoints contacted.
+        let http = FakeHttp::default();
+        let now = 1_700_000_000_000u64;
+        http.push_get(ScriptedResponse::Ok(session_body(
+            "tid=refreshed-session",
+            now / 1000 + 1800,
+        )));
+        let clock = FakeClock::new(now);
+        let creds = mint_credentials(&http, &clock, "gho_stored_refresh")
+            .await
+            .unwrap();
+        assert_eq!(creds.access, "tid=refreshed-session");
+        assert_eq!(creds.refresh, "gho_stored_refresh");
+        assert!(http.posts.lock().unwrap().is_empty(), "refresh must not re-run device flow");
+        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        assert_eq!(http.gets.lock().unwrap()[0].0, SESSION_MINT_URL);
+    }
+
+    #[tokio::test]
+    async fn github_copilot_login_persist_is_atomic_and_preserves_siblings() {
+        use super::super::storage::save_provider_auth_at_test_hook;
+        use super::super::OAuthCredentials;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Pre-seed unrelated providers
+        let sibling = OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: "anth-refresh".into(),
+            access: "anth-access".into(),
+            expires: now_millis() + 3_600_000,
+            account_id: None,
+        };
+        save_provider_auth_at_test_hook(&path, "anthropic", &sibling).unwrap();
+        save_provider_auth_at_test_hook(
+            &path,
+            "xai-auth",
+            &OAuthCredentials {
+                auth_type: "oauth".into(),
+                refresh: "xai-r".into(),
+                access: "xai-a".into(),
+                expires: now_millis() + 3_600_000,
+                account_id: None,
+            },
+        )
+        .unwrap();
+
+        // Simulate successful mint+store under github-copilot
+        let creds = credentials_from_session(
+            "gho_long_lived_never_vend",
+            SessionToken {
+                token: "tid=session_only".into(),
+                expires_at_ms: now_millis() + 1_500_000,
+            },
+        )
+        .unwrap();
+        save_provider_auth_at_test_hook(&path, PROVIDER, &creds).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["github-copilot"]["access"], "tid=session_only");
+        assert_eq!(parsed["github-copilot"]["refresh"], "gho_long_lived_never_vend");
+        assert_eq!(parsed["anthropic"]["refresh"], "anth-refresh");
+        assert_eq!(parsed["xai-auth"]["access"], "xai-a");
+        // Atomic tmp cleaned up
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn github_copilot_broker_access_token_shape_excludes_refresh() {
+        // Structural: AccessToken has no refresh field; only session token is vended.
+        let v = serde_json::json!({
+            "token": "tid=session",
+            "expires": 123u64,
+            "refresh": "gho_MUST_NOT_DESERIALIZE",
+        });
+        let tok: super::super::AccessToken = serde_json::from_value(v).unwrap();
+        assert_eq!(tok.token, "tid=session");
+        assert_eq!(tok.expires, 123);
+        let round = serde_json::to_value(&tok).unwrap();
+        assert!(round.get("refresh").is_none());
+        assert!(!round.to_string().contains("gho_"));
+    }
+
+    #[tokio::test]
+    async fn github_copilot_mint_rejects_redirect_status() {
+        let http = FakeHttp::default();
+        http.push_get(ScriptedResponse::Status(
+            302,
+            "redirected".into(),
+        ));
+        let clock = FakeClock::new(0);
+        // FakeHttp returns the 302 body to mint_session_token which treats non-2xx as HttpStatus.
+        // ProductionHttp additionally maps 3xx -> UntrustedEndpoint; unit-level non-2xx is enough.
+        let err = mint_session_token(&http, &clock, "gho_x").await.unwrap_err();
+        assert!(matches!(err, CopilotAuthError::HttpStatus(302)));
+    }
 }
+

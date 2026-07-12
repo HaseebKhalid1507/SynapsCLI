@@ -1135,6 +1135,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn github_copilot_is_oauth_token_vending_allowlisted() {
+        // Descriptor strategy permits /token for github-copilot (session token only).
+        let id = broker_provider("github-copilot").expect("github-copilot must be allowlisted");
+        assert_eq!(id, auth::OAuthProviderId::GitHubCopilot);
+        assert_eq!(id.as_str(), "github-copilot");
+        // Aliases are not canonical broker ids
+        assert!(broker_provider("copilot").is_none());
+        assert!(broker_provider("gh-copilot").is_none());
+    }
+
     /// Proxy validation fails closed: OAuth providers and absolute/escaping
     /// paths are rejected before any upstream contact.
     #[tokio::test]
@@ -1145,6 +1156,7 @@ mod tests {
         for (provider, path) in [
             ("anthropic", "/v1/messages"),
             ("openai-codex", "/responses"),
+            ("github-copilot", "/chat/completions"),
             ("local", "https://evil.example/steal"),
             ("local", "/../../etc/passwd"),
         ] {
