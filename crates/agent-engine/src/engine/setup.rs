@@ -117,6 +117,10 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let config = crate::config::load_config();
     runtime.apply_config(&config);
 
+    // Resolve the final foreground route before compiling immutable delegation
+    // policy. Continuing a session may replace the configured model.
+    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+
     // Validate and compile an opted-in manifest before any session/network work.
     let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
     if let Some(path) = &opts.prompt_manifest {
@@ -158,6 +162,11 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
     } else {
+        let foreground = agent_core::prompt::QualifiedModelId::parse(runtime.model())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
+        runtime.install_orchestration(Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64),
+        ));
         runtime.set_system_prompt(legacy_prompt);
     }
 
@@ -170,8 +179,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
-    // Session: continue existing or create new
-    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    // Session was resolved before policy compilation so its model is the immutable
+    // foreground identity used by worker inheritance and authorization.
 
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));

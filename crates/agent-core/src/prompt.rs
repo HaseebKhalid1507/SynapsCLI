@@ -330,10 +330,24 @@ struct ManifestPolicies {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestDelegationPolicy {
+    #[serde(alias = "enforcement")]
     mode: crate::orchestration::EnforcementMode,
+    #[serde(default, alias = "same_provider_models")]
     allowed_models: Vec<QualifiedModelId>,
+    #[serde(default)]
+    cross_provider_grants: Vec<ManifestCrossProviderGrant>,
     max_concurrent_workers: usize,
     max_total_workers: usize,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestCrossProviderGrant {
+    id: String,
+    from_provider: String,
+    to_provider: String,
+    allowed_models: Vec<QualifiedModelId>,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -399,15 +413,47 @@ impl PromptManifest {
         &self,
         foreground: QualifiedModelId,
     ) -> Result<Option<crate::orchestration::DelegationPolicy>, PromptError> {
-        Ok(self.policies.delegation.as_ref().map(|policy| {
-            crate::orchestration::DelegationPolicy::new(
-                policy.mode,
-                foreground,
-                policy.allowed_models.clone(),
-                policy.max_concurrent_workers,
-                policy.max_total_workers,
-            )
-        }))
+        let Some(policy) = self.policies.delegation.as_ref() else {
+            return Ok(None);
+        };
+        if policy.mode != crate::orchestration::EnforcementMode::Enforced {
+            return Err(PromptError::Invalid(
+                "delegation policy must use enforced mode".into(),
+            ));
+        }
+        let mut catalog_entries = policy.allowed_models.clone();
+        catalog_entries.push(foreground.clone());
+        let mut grants = Vec::with_capacity(policy.cross_provider_grants.len());
+        for grant in &policy.cross_provider_grants {
+            // Expiring grants require a trusted clock and atomic refresh support. Until
+            // that exists, accepting them would risk use after expiry, so fail closed.
+            if grant.expires_at.is_some() {
+                return Err(PromptError::Invalid(
+                    "expiring cross-provider grants are not supported".into(),
+                ));
+            }
+            catalog_entries.extend(grant.allowed_models.iter().cloned());
+            grants.push(
+                crate::orchestration::CrossProviderGrant::new(
+                    grant.id.clone(),
+                    grant.from_provider.clone(),
+                    grant.to_provider.clone(),
+                    grant.allowed_models.clone(),
+                )
+                .map_err(|error| PromptError::Invalid(error.into()))?,
+            );
+        }
+        let catalog = crate::orchestration::CatalogSnapshot::new(catalog_entries);
+        crate::orchestration::DelegationPolicy::with_grants(
+            foreground,
+            catalog,
+            policy.allowed_models.clone(),
+            grants,
+            policy.max_concurrent_workers,
+            policy.max_total_workers,
+        )
+        .map(Some)
+        .map_err(|error| PromptError::Invalid(error.into()))
     }
     pub fn registry(
         &self,

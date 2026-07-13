@@ -1,5 +1,6 @@
 use agent_core::orchestration::{
-    CompletionGate, DelegationPolicy, WorkerRegistry, WorkerRole, WorkerTerminal, WorkerWritePolicy,
+    CatalogSnapshot, CompletionGate, DelegationPolicy, WorkerRegistry, WorkerRole, WorkerTerminal,
+    WorkerWritePolicy,
 };
 use agent_core::prompt::QualifiedModelId;
 use std::collections::HashMap;
@@ -14,6 +15,16 @@ struct Inner {
     handles: HashMap<String, agent_core::orchestration::WorkerHandle>,
 }
 impl OrchestrationRuntime {
+    /// Secure manifestless baseline: the exact foreground identity is the only
+    /// worker choice in a deterministic runtime-controlled catalog.
+    pub fn baseline(foreground: QualifiedModelId, concurrent: usize, total: usize) -> Self {
+        let catalog = CatalogSnapshot::new([foreground.clone()]);
+        Self::new(
+            DelegationPolicy::baseline(foreground, catalog, concurrent, total)
+                .expect("resolved foreground always forms a valid baseline"),
+        )
+    }
+
     pub fn new(policy: DelegationPolicy) -> Self {
         Self {
             inner: Mutex::new(Inner {

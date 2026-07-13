@@ -58,6 +58,29 @@ modules:
 }
 
 #[test]
+fn manifest_compiles_exact_cross_provider_grants_and_rejects_ambiguous_shapes() {
+    let manifest = PromptManifest::parse(
+        "schema: synaps-prompt/1\nkernel: k\npolicies:\n  delegation:\n    enforcement: enforced\n    same_provider_models: [openai-codex/gpt-5.6-sol]\n    cross_provider_grants:\n      - id: review-01\n        from_provider: openai-codex\n        to_provider: anthropic\n        allowed_models: [anthropic/claude-opus-4-7]\n    max_concurrent_workers: 2\n    max_total_workers: 4\n",
+    )
+    .unwrap();
+    let policy = manifest
+        .delegation_policy(QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.effective_choices().len(), 2);
+    assert!(policy
+        .authorize(&QualifiedModelId::parse("anthropic/claude-opus-4-7").unwrap())
+        .is_ok());
+
+    assert!(PromptManifest::parse(
+        "schema: synaps-prompt/1\nkernel: k\npolicies: {delegation: {enforcement: enforced, same_provider_models: [openai-codex/gpt], cross_provider_grants: [{id: bad, from_provider: openai-codex, to_provider: anthropic, allowed_models: [openai/gpt]}], max_concurrent_workers: 1, max_total_workers: 1}}\n"
+    )
+    .unwrap()
+    .delegation_policy(QualifiedModelId::parse("openai-codex/gpt").unwrap())
+    .is_err());
+}
+
+#[test]
 fn malformed_oversize_and_duplicate_manifest_modules_fail() {
     assert!(PromptManifest::parse("not: [yaml").is_err());
     let huge = format!(
