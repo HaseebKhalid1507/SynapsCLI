@@ -72,6 +72,16 @@ impl Tool for SubagentTool {
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
         let requested_model = params["model"].as_str();
+        let system_prompt = match (&agent_name, &inline_prompt) {
+            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
+            (None, Some(prompt)) => prompt.clone(),
+            (None, None) => {
+                return Err(RuntimeError::Tool(
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither."
+                        .to_string(),
+                ));
+            }
+        };
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let orchestration_id = format!("sa_{}", subagent_id);
         let decision = ctx
@@ -85,17 +95,6 @@ impl Tool for SubagentTool {
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
-
-        let system_prompt = match (&agent_name, &inline_prompt) {
-            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
-            (None, Some(prompt)) => prompt.clone(),
-            (None, None) => {
-                return Err(RuntimeError::Tool(
-                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither."
-                        .to_string(),
-                ));
-            }
-        };
 
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
         let task_preview: String = task.chars().take(80).collect();

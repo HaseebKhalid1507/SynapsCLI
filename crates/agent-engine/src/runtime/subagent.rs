@@ -27,6 +27,11 @@ pub struct SubagentResult {
 #[serde(rename_all = "snake_case")]
 pub enum TerminalCategory {
     Completed,
+    Route,
+    Credential,
+    Runtime,
+    ProviderClient,
+    Transport,
     StartupFailed,
     ExecutionFailed,
     TimedOut,
@@ -40,6 +45,23 @@ pub struct TerminalDiagnostic {
     pub stage: String,
     pub correlation_id: String,
     pub network_attempted: bool,
+    pub safe_message: String,
+}
+
+pub fn safe_failure_message(category: &TerminalCategory) -> &'static str {
+    match category {
+        TerminalCategory::Route => "worker route could not be resolved",
+        TerminalCategory::Credential => "worker credentials are unavailable",
+        TerminalCategory::Runtime | TerminalCategory::StartupFailed => {
+            "worker runtime could not be started"
+        }
+        TerminalCategory::ProviderClient => "provider client could not be initialized",
+        TerminalCategory::Transport => "provider transport failed",
+        TerminalCategory::TimedOut => "worker timed out",
+        TerminalCategory::Cancelled => "worker was cancelled",
+        TerminalCategory::ExecutionFailed => "worker execution failed",
+        TerminalCategory::Completed => "worker completed",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +227,7 @@ impl SubagentHandle {
                 stage: "inference".into(),
                 correlation_id: self.id.clone(),
                 network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::Completed).into(),
             }),
             SubagentStatus::TimedOut => Some(TerminalDiagnostic {
                 category: TerminalCategory::TimedOut,
@@ -212,27 +235,24 @@ impl SubagentHandle {
                 stage: "inference".into(),
                 correlation_id: self.id.clone(),
                 network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::TimedOut).into(),
             }),
-            SubagentStatus::Failed(message) => {
-                let startup = message.starts_with("Failed to create subagent runtime")
-                    || message.starts_with("tokio runtime:");
-                Some(TerminalDiagnostic {
-                    category: if startup {
-                        TerminalCategory::StartupFailed
-                    } else {
-                        TerminalCategory::ExecutionFailed
-                    },
-                    code: if startup {
-                        "runtime_construction_failed"
-                    } else {
-                        "inference_failed"
-                    }
-                    .into(),
-                    stage: if startup { "runtime" } else { "inference" }.into(),
-                    correlation_id: self.id.clone(),
-                    network_attempted: !startup,
-                })
-            }
+            SubagentStatus::Cancelled => Some(TerminalDiagnostic {
+                category: TerminalCategory::Cancelled,
+                code: "worker_cancelled".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::Cancelled).into(),
+            }),
+            SubagentStatus::Failed(_) => Some(TerminalDiagnostic {
+                category: TerminalCategory::ExecutionFailed,
+                code: "inference_failed".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::ExecutionFailed).into(),
+            }),
         }
     }
 

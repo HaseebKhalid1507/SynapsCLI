@@ -175,6 +175,14 @@ impl OrchestrationRuntime {
         })
     }
 
+    pub fn rollback(&self, runtime_handle: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(handle) = inner.handles.get(runtime_handle).cloned() {
+            let _ = inner.registry.rollback_dispatch(&handle);
+            inner.handles.remove(runtime_handle);
+        }
+    }
+
     pub fn effective_choices(&self) -> Vec<String> {
         self.inner
             .lock()
