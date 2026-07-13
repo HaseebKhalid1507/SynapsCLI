@@ -42,7 +42,7 @@ impl PromptModuleId {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct QualifiedModelId(String);
 impl TryFrom<String> for QualifiedModelId {
