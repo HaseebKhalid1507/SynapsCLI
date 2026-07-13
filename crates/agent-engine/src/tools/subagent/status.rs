@@ -64,6 +64,7 @@ impl Tool for SubagentStatusTool {
         let tool_count = handle.tool_log().len();
         let model = handle.model.clone();
         let terminal = handle.terminal_diagnostic();
+        let authorization = handle.authorization.clone();
         let _ = handle;
         drop(reg);
 
@@ -90,6 +91,7 @@ impl Tool for SubagentStatusTool {
             "tool_count":     tool_count,
             "model":          model,
             "terminal_cause": terminal,
+            "authorization":   authorization,
             "output_length":  output_length
         });
         if let Some(reason) = status.failure_reason() {

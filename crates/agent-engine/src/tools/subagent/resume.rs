@@ -159,7 +159,8 @@ impl Tool for SubagentResumeTool {
             Some(steer_tx),
             Some(shutdown_tx),
             Some(result_rx),
-        );
+        )
+        .with_authorization(&decision);
         {
             let mut reg = registry.lock().unwrap();
             reg.register(handle);

@@ -21,6 +21,17 @@ pub struct SubagentResult {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AuthorizationDiagnostic {
+    pub selection_source: String,
+    pub policy_digest: String,
+    pub catalog_snapshot_id: String,
+    pub catalog_digest: String,
+    pub correlation_id: String,
+    pub network_attempted: bool,
+    pub cross_provider_grant_id: Option<String>,
+}
+
 // ── SubagentStatus ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -137,6 +148,7 @@ pub struct SubagentHandle {
     pub system_prompt: String,
     pub started_at: std::time::Instant,
     pub timeout_secs: u64,
+    pub authorization: Option<AuthorizationDiagnostic>,
 
     // Shared state updated by the subagent thread — one lock for everything.
     state: Arc<RwLock<SubagentState>>,
@@ -191,6 +203,7 @@ impl SubagentHandle {
             system_prompt,
             started_at: std::time::Instant::now(),
             timeout_secs,
+            authorization: None,
             state,
             steer_tx,
             shutdown_tx,
@@ -198,6 +211,22 @@ impl SubagentHandle {
             result_rx,
             collected: false,
         }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        decision: &crate::orchestration::AuthorizedWorkerModel,
+    ) -> Self {
+        self.authorization = Some(AuthorizationDiagnostic {
+            selection_source: decision.selection_source.as_str().into(),
+            policy_digest: decision.policy_digest.clone(),
+            catalog_snapshot_id: decision.catalog_snapshot_id.clone(),
+            catalog_digest: decision.catalog_digest.clone(),
+            correlation_id: decision.correlation_id.clone(),
+            network_attempted: decision.network_attempted,
+            cross_provider_grant_id: decision.cross_provider_grant_id.clone(),
+        });
+        self
     }
 
     /// Current status snapshot.
