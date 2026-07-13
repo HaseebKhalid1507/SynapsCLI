@@ -35,7 +35,7 @@ impl Tool for EditTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
@@ -45,6 +45,16 @@ impl Tool for EditTool {
         let new_string = params["new_string"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing new_string parameter".to_string()))?;
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            if matches!(
+                orchestration.check_foreground_write(raw_path),
+                agent_core::orchestration::ScopeDecision::ReconciliationRequired { .. }
+            ) {
+                return Err(RuntimeError::Tool(
+                    "foreground edit overlaps an active worker scope".into(),
+                ));
+            }
+        }
 
         let path = expand_path(raw_path);
 

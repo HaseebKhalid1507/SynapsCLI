@@ -90,6 +90,13 @@ impl OrchestrationRuntime {
     pub fn completion_gate(&self) -> CompletionGate {
         self.inner.lock().unwrap().registry.completion_gate()
     }
+    pub fn check_foreground_write(&self, path: &str) -> agent_core::orchestration::ScopeDecision {
+        self.inner
+            .lock()
+            .unwrap()
+            .registry
+            .check_foreground_write(path)
+    }
     pub fn telemetry_json(&self) -> String {
         serde_json::to_string(self.inner.lock().unwrap().registry.telemetry())
             .unwrap_or_else(|_| "[]".into())
