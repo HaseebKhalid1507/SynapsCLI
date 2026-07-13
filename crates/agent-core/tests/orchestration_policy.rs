@@ -17,7 +17,7 @@ fn dispatch_allowlists_and_foreground_are_enforced_before_network() {
             WorkerWritePolicy::ReadOnly,
         )
         .unwrap_err();
-    assert_eq!(denied.code(), "provider_not_allowed");
+    assert_eq!(denied.code(), "catalog_model_unknown");
     assert_eq!(workers.foreground_model().as_str(), "anthropic/sonnet");
     assert_eq!(workers.total_dispatched(), 0);
     workers

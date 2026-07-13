@@ -1,8 +1,9 @@
 use crate::prompt::QualifiedModelId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementMode {
     Off,
@@ -10,16 +11,108 @@ pub enum EnforcementMode {
     Enforced,
 }
 
+/// Immutable, runtime-controlled worker catalog. Entries are exact qualified identities.
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogSnapshot {
+    id: String,
+    digest_sha256: String,
+    entries: BTreeSet<QualifiedModelId>,
+}
+impl CatalogSnapshot {
+    pub fn new(entries: impl IntoIterator<Item = QualifiedModelId>) -> Self {
+        let entries: BTreeSet<_> = entries.into_iter().collect();
+        let encoded = serde_json::to_vec(&entries).expect("catalog is serializable");
+        let digest_sha256 = format!("{:x}", Sha256::digest(encoded));
+        Self {
+            id: format!("catalog-{}", &digest_sha256[..16]),
+            digest_sha256,
+            entries,
+        }
+    }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn digest_sha256(&self) -> &str {
+        &self.digest_sha256
+    }
+    pub fn contains(&self, model: &QualifiedModelId) -> bool {
+        self.entries.contains(model)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CrossProviderGrant {
+    pub grant_id: String,
+    pub from_provider: String,
+    pub to_provider: String,
+    pub allowed_models: BTreeSet<QualifiedModelId>,
+}
+impl CrossProviderGrant {
+    pub fn new(
+        grant_id: impl Into<String>,
+        from_provider: impl Into<String>,
+        to_provider: impl Into<String>,
+        models: impl IntoIterator<Item = QualifiedModelId>,
+    ) -> Result<Self, &'static str> {
+        let grant_id = grant_id.into();
+        let from_provider = from_provider.into();
+        let to_provider = to_provider.into();
+        let allowed_models: BTreeSet<_> = models.into_iter().collect();
+        if grant_id.is_empty()
+            || from_provider.is_empty()
+            || to_provider.is_empty()
+            || allowed_models.is_empty()
+            || allowed_models.iter().any(|m| m.provider() != to_provider)
+        {
+            return Err("invalid exact cross-provider grant");
+        }
+        Ok(Self {
+            grant_id,
+            from_provider,
+            to_provider,
+            allowed_models,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchFailureCode {
+    InvalidQualifiedModel,
+    CatalogModelUnknown,
+    ProviderNotAllowed,
+    ModelNotAllowed,
+    ConcurrencyLimit,
+    TotalWorkerLimit,
+    PolicyUnavailable,
+}
+impl DispatchFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidQualifiedModel => "invalid_qualified_model",
+            Self::CatalogModelUnknown => "catalog_model_unknown",
+            Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::ModelNotAllowed => "model_not_allowed",
+            Self::ConcurrencyLimit => "concurrency_limit",
+            Self::TotalWorkerLimit => "total_limit",
+            Self::PolicyUnavailable => "policy_unavailable",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DelegationPolicy {
     pub mode: EnforcementMode,
     foreground: QualifiedModelId,
-    allowed_providers: BTreeSet<String>,
+    catalog: CatalogSnapshot,
     allowed_models: BTreeSet<QualifiedModelId>,
+    grants: Vec<CrossProviderGrant>,
+    effective_choices: Vec<QualifiedModelId>,
     pub max_concurrent_workers: usize,
     pub max_total_workers: usize,
 }
 impl DelegationPolicy {
+    /// Compatibility constructor. Its explicit models form the trusted pinned catalog.
     pub fn new(
         mode: EnforcementMode,
         foreground: QualifiedModelId,
@@ -28,18 +121,19 @@ impl DelegationPolicy {
         total: usize,
     ) -> Self {
         let allowed_models: BTreeSet<_> = models.into_iter().collect();
-        let allowed_providers = allowed_models
-            .iter()
-            .map(|m| m.provider().to_owned())
-            .collect();
-        Self {
+        let mut catalog_entries = allowed_models.clone();
+        catalog_entries.insert(foreground.clone());
+        let catalog = CatalogSnapshot::new(catalog_entries);
+        Self::build(
             mode,
             foreground,
-            allowed_providers,
+            catalog,
             allowed_models,
-            max_concurrent_workers: concurrent,
-            max_total_workers: total,
-        }
+            Vec::new(),
+            concurrent,
+            total,
+        )
+        .expect("legacy delegation policy has valid limits")
     }
     pub fn enforced(
         foreground: QualifiedModelId,
@@ -55,14 +149,131 @@ impl DelegationPolicy {
             total,
         )
     }
+    pub fn baseline(
+        foreground: QualifiedModelId,
+        catalog: CatalogSnapshot,
+        concurrent: usize,
+        total: usize,
+    ) -> Result<Self, &'static str> {
+        Self::build(
+            EnforcementMode::Enforced,
+            foreground.clone(),
+            catalog,
+            [foreground].into_iter().collect(),
+            Vec::new(),
+            concurrent,
+            total,
+        )
+    }
+    pub fn with_grants(
+        foreground: QualifiedModelId,
+        catalog: CatalogSnapshot,
+        same_provider_models: impl IntoIterator<Item = QualifiedModelId>,
+        grants: impl IntoIterator<Item = CrossProviderGrant>,
+        concurrent: usize,
+        total: usize,
+    ) -> Result<Self, &'static str> {
+        Self::build(
+            EnforcementMode::Enforced,
+            foreground,
+            catalog,
+            same_provider_models.into_iter().collect(),
+            grants.into_iter().collect(),
+            concurrent,
+            total,
+        )
+    }
+    fn build(
+        mode: EnforcementMode,
+        foreground: QualifiedModelId,
+        catalog: CatalogSnapshot,
+        allowed_models: BTreeSet<QualifiedModelId>,
+        grants: Vec<CrossProviderGrant>,
+        concurrent: usize,
+        total: usize,
+    ) -> Result<Self, &'static str> {
+        if concurrent == 0 || total == 0 || concurrent > total || !catalog.contains(&foreground) {
+            return Err("invalid delegation policy");
+        }
+        if allowed_models
+            .iter()
+            .any(|m| m.provider() != foreground.provider() || !catalog.contains(m))
+        {
+            return Err("same-provider allowlist is invalid");
+        }
+        if grants.iter().any(|g| {
+            g.from_provider != foreground.provider()
+                || g.allowed_models.iter().any(|m| !catalog.contains(m))
+        }) {
+            return Err("cross-provider grant is invalid");
+        }
+        let mut choices = allowed_models.clone();
+        for grant in &grants {
+            choices.extend(grant.allowed_models.iter().cloned());
+        }
+        Ok(Self {
+            mode,
+            foreground,
+            catalog,
+            allowed_models,
+            grants,
+            effective_choices: choices.into_iter().collect(),
+            max_concurrent_workers: concurrent,
+            max_total_workers: total,
+        })
+    }
+    pub fn authorize(&self, model: &QualifiedModelId) -> Result<Option<&str>, DispatchDenied> {
+        if !self.catalog.contains(model) {
+            return Err(DispatchDenied::new(
+                DispatchFailureCode::CatalogModelUnknown,
+            ));
+        }
+        if self.mode != EnforcementMode::Enforced {
+            return Ok(None);
+        }
+        if model.provider() == self.foreground.provider() {
+            return self
+                .allowed_models
+                .contains(model)
+                .then_some(None)
+                .ok_or_else(|| DispatchDenied::new(DispatchFailureCode::ModelNotAllowed));
+        }
+        if let Some(grant) = self
+            .grants
+            .iter()
+            .find(|g| g.to_provider == model.provider() && g.allowed_models.contains(model))
+        {
+            return Ok(Some(&grant.grant_id));
+        }
+        if self
+            .grants
+            .iter()
+            .any(|g| g.to_provider == model.provider())
+        {
+            Err(DispatchDenied::new(DispatchFailureCode::ModelNotAllowed))
+        } else {
+            Err(DispatchDenied::new(DispatchFailureCode::ProviderNotAllowed))
+        }
+    }
+    pub fn effective_choices(&self) -> &[QualifiedModelId] {
+        &self.effective_choices
+    }
+    pub fn foreground_model(&self) -> &QualifiedModelId {
+        &self.foreground
+    }
+    pub fn catalog_snapshot_id(&self) -> &str {
+        self.catalog.id()
+    }
+    pub fn catalog_digest(&self) -> &str {
+        self.catalog.digest_sha256()
+    }
     pub fn digest(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let encoded = serde_json::to_vec(self).expect("delegation policy is serializable");
+        let encoded = serde_json::to_vec(self).expect("policy is serializable");
         format!("{:x}", Sha256::digest(encoded))
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRole {
     Planner,
@@ -72,7 +283,7 @@ pub enum WorkerRole {
     Researcher,
     Debugger,
 }
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "scopes")]
 pub enum WorkerWritePolicy {
     ReadOnly,
@@ -101,10 +312,16 @@ pub enum ScopeDecision {
 }
 #[derive(Debug)]
 pub struct DispatchDenied {
-    code: &'static str,
+    code: DispatchFailureCode,
 }
 impl DispatchDenied {
+    fn new(code: DispatchFailureCode) -> Self {
+        Self { code }
+    }
     pub fn code(&self) -> &'static str {
+        self.code.as_str()
+    }
+    pub fn typed_code(&self) -> DispatchFailureCode {
         self.code
     }
 }
@@ -152,7 +369,10 @@ impl WorkerRegistry {
         }
     }
     pub fn foreground_model(&self) -> &QualifiedModelId {
-        &self.policy.foreground
+        self.policy.foreground_model()
+    }
+    pub fn policy(&self) -> &DelegationPolicy {
+        &self.policy
     }
     pub fn total_dispatched(&self) -> usize {
         self.total
@@ -190,27 +410,20 @@ impl WorkerRegistry {
         Ok(())
     }
     pub fn validate_dispatch(&self, model: &QualifiedModelId) -> Result<(), DispatchDenied> {
-        if self.policy.mode != EnforcementMode::Enforced {
-            return Ok(());
+        self.policy.authorize(model)?;
+        if self.total >= self.policy.max_total_workers {
+            return Err(DispatchDenied::new(DispatchFailureCode::TotalWorkerLimit));
         }
-        let deny = if !self.policy.allowed_providers.contains(model.provider()) {
-            Some("provider_not_allowed")
-        } else if !self.policy.allowed_models.contains(model) {
-            Some("model_not_allowed")
-        } else if self.total >= self.policy.max_total_workers {
-            Some("total_limit")
-        } else if self
+        if self
             .workers
             .values()
             .filter(|w| matches!(w.state, State::Dispatched | State::Running))
             .count()
             >= self.policy.max_concurrent_workers
         {
-            Some("concurrency_limit")
-        } else {
-            None
-        };
-        deny.map_or(Ok(()), |code| Err(DispatchDenied { code }))
+            return Err(DispatchDenied::new(DispatchFailureCode::ConcurrencyLimit));
+        }
+        Ok(())
     }
     pub fn authorize_dispatch(
         &mut self,
@@ -224,12 +437,18 @@ impl WorkerRegistry {
             worker_role: None,
             reason_code: None,
         });
+        self.emit(OrchestrationEvent {
+            name: "worker.model_resolution_requested",
+            worker_id: None,
+            worker_role: None,
+            reason_code: None,
+        });
         if let Err(error) = self.validate_dispatch(model) {
             self.emit(OrchestrationEvent {
                 name: "worker.dispatch_denied",
                 worker_id: None,
                 worker_role: None,
-                reason_code: Some(error.code),
+                reason_code: Some(error.code()),
             });
             return Err(error);
         }
@@ -247,7 +466,7 @@ impl WorkerRegistry {
             },
         );
         self.emit(OrchestrationEvent {
-            name: "worker.dispatched",
+            name: "worker.dispatch_allowed",
             worker_id: Some(h.0.clone()),
             worker_role: Some(role),
             reason_code: None,
@@ -324,9 +543,23 @@ impl WorkerRegistry {
         self.transition(h, &[State::Running], State::Terminal, "worker.terminal")
     }
     pub fn collect(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
+        if self
+            .workers
+            .get(h)
+            .is_some_and(|w| matches!(w.state, State::Collected | State::Reconciled))
+        {
+            return Ok(());
+        }
         self.transition(h, &[State::Terminal], State::Collected, "worker.collected")
     }
     pub fn reconcile(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
+        if self
+            .workers
+            .get(h)
+            .is_some_and(|w| w.state == State::Reconciled)
+        {
+            return Ok(());
+        }
         self.transition(
             h,
             &[State::Collected],
