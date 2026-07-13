@@ -437,7 +437,12 @@ pub fn is_missing_credential_catalog_error(err: &str) -> bool {
         return false;
     }
 
-    lower.contains("no credential configured")
+    // Stable BrokerError::Credential prefix from token.rs load-miss:
+    // "credential error: No credentials for {provider} at {path}. Run `synaps login`."
+    // Match only the stable prefix so account-shape / other Credential variants
+    // (e.g. missing chatgpt account id) remain hard errors above.
+    lower.contains("credential error: no credentials for ")
+        || lower.contains("no credential configured")
         || lower.contains("unknown provider:")
         || lower.contains("not logged")
         || lower.contains("registration required")
@@ -1135,6 +1140,27 @@ mod tests {
                 is_missing_credential_catalog_error(&unknown),
                 "got: {unknown}"
             );
+        }
+
+        #[test]
+        fn missing_credential_fallback_classifies_exact_broker_credential_no_credentials_text() {
+            // Production path: LocalBroker::access_token maps
+            // ensure_fresh_provider_token's load miss through BrokerError::Credential.
+            // Display form is exactly:
+            //   credential error: No credentials for {provider} at {path}. Run `synaps login`.
+            let raw = crate::auth::BrokerError::Credential(format!(
+                "No credentials for openai-codex at {}. Run `synaps login`.",
+                std::path::Path::new("/tmp/auth.json").display()
+            ));
+            let wrapped = format!("request failed: {raw}");
+            assert!(
+                is_missing_credential_catalog_error(&wrapped),
+                "exact BrokerError::Credential missing-login text must fall back to static seeds; got: {wrapped}"
+            );
+            // Prefix-stable form (path/provider vary; Display prefix does not).
+            assert!(is_missing_credential_catalog_error(
+                "request failed: credential error: No credentials for openai-codex at /home/user/.synaps/auth.json. Run `synaps login`."
+            ));
         }
 
         #[test]

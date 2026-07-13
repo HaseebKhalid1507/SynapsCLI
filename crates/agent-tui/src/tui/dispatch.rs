@@ -53,7 +53,8 @@ fn spawn_auto_catalog_refreshes(app: &App, runtime: &synaps_cli::Runtime) {
                             }
                             match model.reasoning {
                                 synaps_cli::runtime::openai::catalog::ReasoningSupport::None => {}
-                                synaps_cli::runtime::openai::catalog::ReasoningSupport::Unknown => {}
+                                synaps_cli::runtime::openai::catalog::ReasoningSupport::Unknown => {
+                                }
                                 _ => metadata.push("thinking".to_string()),
                             }
                             if model.pricing.has_internal_reasoning_cost() {
@@ -69,7 +70,6 @@ fn spawn_auto_catalog_refreshes(app: &App, runtime: &synaps_cli::Runtime) {
         });
     }
 }
-
 
 /// The borrow bundle: everything `run()`'s event loop lends the dispatch for
 /// the duration of one `InputAction`. Constructed fresh per event at the call

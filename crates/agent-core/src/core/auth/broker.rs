@@ -1338,10 +1338,6 @@ pub struct LocalBroker {
     local_base_url: Option<String>,
     /// Test seam: overrides the pinned Anthropic usage URL.
     anthropic_usage_url: Option<String>,
-    /// Test seam: overrides Anthropic catalog base (host only; path still allowlisted).
-    anthropic_catalog_base_url: Option<String>,
-    /// Test seam: overrides OpenAI Codex catalog base (host only; path still allowlisted).
-    openai_codex_catalog_base_url: Option<String>,
     /// Test seam: overrides the pinned cloudcode-pa base URL.
     google_gemini_base_url: Option<String>,
     /// Time budget for buffered (non-streaming) requests.
@@ -1358,8 +1354,6 @@ impl LocalBroker {
             http,
             local_base_url: None,
             anthropic_usage_url: None,
-            anthropic_catalog_base_url: None,
-            openai_codex_catalog_base_url: None,
             google_gemini_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
@@ -1398,27 +1392,6 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_anthropic_usage_url(mut self, url: impl Into<String>) -> Self {
         self.anthropic_usage_url = Some(url.into());
-        self
-    }
-
-    /// Test seam: point Anthropic catalog proxy at a loopback host.
-    #[doc(hidden)]
-    pub fn with_anthropic_catalog_base_url_for_tests(
-        mut self,
-        base_url: impl Into<String>,
-    ) -> Self {
-        self.anthropic_catalog_base_url = Some(base_url.into().trim_end_matches('/').to_string());
-        self
-    }
-
-    /// Test seam: point OpenAI Codex catalog proxy at a loopback host.
-    #[doc(hidden)]
-    pub fn with_openai_codex_catalog_base_url_for_tests(
-        mut self,
-        base_url: impl Into<String>,
-    ) -> Self {
-        self.openai_codex_catalog_base_url =
-            Some(base_url.into().trim_end_matches('/').to_string());
         self
     }
 
@@ -1515,20 +1488,12 @@ impl LocalBroker {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
             let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
-            let base = self
-                .openai_codex_catalog_base_url
-                .clone()
-                .unwrap_or_else(|| OPENAI_CODEX_BACKEND_BASE_URL.to_string());
-            (token.token, base)
+            (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
         } else if request.provider == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
             let token = self.access_token(OAuthProviderId::Anthropic).await?;
-            let base = self
-                .anthropic_catalog_base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-            (token.token, base)
+            (token.token, "https://api.anthropic.com".to_string())
         } else {
             (
                 self.resolve_static_key(&request.provider)?,
