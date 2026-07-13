@@ -115,6 +115,13 @@ impl SubagentState {
             terminal: None,
         }
     }
+
+    /// Persist only typed, allowlisted failure data. Raw provider errors never enter state.
+    pub fn safe_fail(&mut self, mut diagnostic: TerminalDiagnostic) {
+        diagnostic.safe_message = safe_failure_message(&diagnostic.category).into();
+        self.status = SubagentStatus::Failed(diagnostic.safe_message.clone());
+        self.terminal = Some(diagnostic);
+    }
 }
 
 impl Default for SubagentState {
@@ -227,6 +234,11 @@ impl SubagentHandle {
             cross_provider_grant_id: decision.cross_provider_grant_id.clone(),
         });
         self
+    }
+
+    pub fn set_terminal_diagnostic(&self, diagnostic: TerminalDiagnostic) {
+        let mut state = self.state.write().unwrap();
+        state.safe_fail(diagnostic);
     }
 
     /// Current status snapshot.
@@ -560,6 +572,23 @@ mod tests {
             s.finished_at = Some(std::time::Instant::now());
         }
         h
+    }
+
+    #[test]
+    fn typed_failure_drops_raw_provider_secret_canary() {
+        let mut state = SubagentState::new();
+        let canary = "Bearer secret-canary-provider-body";
+        state.safe_fail(TerminalDiagnostic {
+            category: TerminalCategory::Credential,
+            code: "credential_unavailable".into(),
+            stage: "credential".into(),
+            correlation_id: "sa_safe".into(),
+            network_attempted: false,
+            safe_message: canary.into(),
+        });
+        let rendered = format!("{:?}{:?}", state.status, state.terminal);
+        assert!(!rendered.contains(canary));
+        assert!(rendered.contains("credential_unavailable"));
     }
 
     #[test]
