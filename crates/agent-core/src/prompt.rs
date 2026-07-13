@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use thiserror::Error;
 
 pub const PROMPT_SCHEMA: &str = "synaps-prompt/1";
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+pub const MAX_MODULE_BYTES: usize = 1024 * 1024;
+pub const MAX_COMPOSED_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -15,12 +19,20 @@ pub enum PromptError {
     Ambiguous(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+fn valid_atom(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PromptModuleId(String);
 impl PromptModuleId {
     pub fn parse(value: impl Into<String>) -> Result<Self, PromptError> {
         let value = value.into();
-        if value.trim().is_empty() || value.contains(char::is_whitespace) {
+        if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(PromptError::Invalid("module id".into()));
         }
         Ok(Self(value))
@@ -30,61 +42,142 @@ impl PromptModuleId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QualifiedModelId {
-    raw: String,
-    slash: usize,
+#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct QualifiedModelId(String);
+impl TryFrom<String> for QualifiedModelId {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value).map_err(|error| error.to_string())
+    }
+}
+impl From<QualifiedModelId> for String {
+    fn from(value: QualifiedModelId) -> Self {
+        value.0
+    }
 }
 impl QualifiedModelId {
     pub fn parse(value: impl Into<String>) -> Result<Self, PromptError> {
-        let raw = value.into();
-        let slash = raw.find('/').ok_or_else(|| {
-            PromptError::Invalid("qualified model must contain provider/model".into())
-        })?;
-        if slash == 0 || slash + 1 == raw.len() {
+        let value = value.into();
+        let mut parts = value.split('/');
+        let provider = parts.next().unwrap_or_default();
+        let rest: Vec<_> = parts.collect();
+        if !valid_atom(provider) || rest.is_empty() || rest.iter().any(|p| !valid_atom(p)) {
             return Err(PromptError::Invalid(
-                "qualified model has an empty component".into(),
+                "qualified model must contain non-empty provider/model segments".into(),
             ));
         }
-        Ok(Self { raw, slash })
+        Ok(Self(value))
     }
     pub fn provider(&self) -> &str {
-        &self.raw[..self.slash]
+        self.0.split('/').next().unwrap()
     }
     pub fn model(&self) -> &str {
-        &self.raw[self.slash + 1..]
+        &self.0[self.provider().len() + 1..]
     }
     pub fn as_str(&self) -> &str {
-        &self.raw
+        &self.0
+    }
+}
+impl fmt::Debug for QualifiedModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("QualifiedModelId").field(&self.0).finish()
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelFamilyId(String);
+impl ModelFamilyId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, PromptError> {
+        let v = value.into();
+        if !valid_atom(&v) {
+            return Err(PromptError::Invalid("model family".into()));
+        }
+        Ok(Self(v))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectionContext {
+    model: QualifiedModelId,
+    family: ModelFamilyId,
+}
+impl SelectionContext {
+    pub fn new(model: QualifiedModelId, family: ModelFamilyId) -> Result<Self, PromptError> {
+        Ok(Self { model, family })
+    }
+    pub fn model(&self) -> &QualifiedModelId {
+        &self.model
+    }
+    pub fn family(&self) -> &ModelFamilyId {
+        &self.family
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromptSelectors {
     provider: Option<String>,
-    family: Option<String>,
+    family: Option<ModelFamilyId>,
     exact: Option<QualifiedModelId>,
 }
 impl PromptSelectors {
-    pub fn provider(value: impl Into<String>) -> Self {
+    pub fn provider(v: impl Into<String>) -> Result<Self, PromptError> {
+        let v = v.into();
+        if !valid_atom(&v) {
+            return Err(PromptError::Invalid("provider selector".into()));
+        }
+        Ok(Self {
+            provider: Some(v),
+            ..Self::default()
+        })
+    }
+    pub fn family(v: ModelFamilyId) -> Self {
         Self {
-            provider: Some(value.into()),
+            family: Some(v),
             ..Self::default()
         }
     }
-    pub fn family(value: impl Into<String>) -> Self {
+    pub fn exact(v: QualifiedModelId) -> Self {
         Self {
-            family: Some(value.into()),
+            exact: Some(v),
             ..Self::default()
         }
     }
-    pub fn exact(value: QualifiedModelId) -> Self {
-        Self {
-            exact: Some(value),
-            ..Self::default()
+    pub fn provider_and_exact(
+        provider: impl Into<String>,
+        exact: QualifiedModelId,
+    ) -> Result<Self, PromptError> {
+        let provider = provider.into();
+        if !valid_atom(&provider) || provider != exact.provider() {
+            return Err(PromptError::Invalid(
+                "provider/exact selector mismatch".into(),
+            ));
         }
+        Ok(Self {
+            provider: Some(provider),
+            exact: Some(exact),
+            family: None,
+        })
     }
-    fn specificity(&self) -> u8 {
+    fn validate(&self) -> Result<(), PromptError> {
+        if let Some(p) = &self.provider {
+            if !valid_atom(p) {
+                return Err(PromptError::Invalid("provider selector".into()));
+            }
+            if self.exact.as_ref().is_some_and(|e| e.provider() != p) {
+                return Err(PromptError::Invalid(
+                    "provider/exact selector mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn layer(&self) -> u8 {
         if self.exact.is_some() {
             3
         } else if self.family.is_some() {
@@ -95,31 +188,29 @@ impl PromptSelectors {
             0
         }
     }
-    fn matches(&self, target: &QualifiedModelId) -> bool {
-        self.exact.as_ref().map_or(true, |v| v == target)
-            && self
-                .provider
-                .as_deref()
-                .map_or(true, |v| v == target.provider())
-            && self
-                .family
-                .as_deref()
-                .map_or(true, |v| target.model().split('/').next() == Some(v))
+    fn matches(&self, c: &SelectionContext) -> bool {
+        self.provider
+            .as_deref()
+            .map_or(true, |p| p == c.model.provider())
+            && self.family.as_ref().map_or(true, |f| f == &c.family)
+            && self.exact.as_ref().map_or(true, |e| e == &c.model)
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptModuleSource {
     Builtin,
     User,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModuleMutability {
     ImmutablePolicy,
     MutableGuidance,
 }
-#[derive(Clone, Debug)]
+
+#[derive(Clone)]
 pub struct PromptModule {
     pub id: PromptModuleId,
     pub version: String,
@@ -127,8 +218,19 @@ pub struct PromptModule {
     pub priority: u16,
     pub selectors: PromptSelectors,
     pub mutability: ModuleMutability,
-    pub content: String,
+    content: String,
     pub sha256: String,
+    safe_path: Option<String>,
+}
+impl fmt::Debug for PromptModule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptModule")
+            .field("id", &self.id)
+            .field("version", &self.version)
+            .field("sha256", &self.sha256)
+            .field("byte_count", &self.content.len())
+            .finish_non_exhaustive()
+    }
 }
 impl PromptModule {
     pub fn new(
@@ -139,10 +241,14 @@ impl PromptModule {
         selectors: PromptSelectors,
         mutability: ModuleMutability,
         content: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self, PromptError> {
+        selectors.validate()?;
         let content = content.into();
+        if content.len() > MAX_MODULE_BYTES {
+            return Err(PromptError::Invalid("module exceeds size limit".into()));
+        }
         let sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
-        Self {
+        Ok(Self {
             id,
             version: version.into(),
             source,
@@ -151,60 +257,101 @@ impl PromptModule {
             mutability,
             content,
             sha256,
-        }
+            safe_path: None,
+        })
+    }
+    pub fn content(&self) -> &str {
+        &self.content
     }
 }
 
 pub struct AdapterRegistry {
-    modules: Vec<PromptModule>,
+    modules: BTreeMap<PromptModuleId, PromptModule>,
 }
 impl AdapterRegistry {
-    pub fn new(modules: Vec<PromptModule>) -> Self {
-        Self { modules }
+    pub fn new(modules: Vec<PromptModule>) -> Result<Self, PromptError> {
+        let mut map = BTreeMap::new();
+        for m in modules {
+            if map.insert(m.id.clone(), m).is_some() {
+                return Err(PromptError::Invalid("duplicate module id".into()));
+            }
+        }
+        Ok(Self { modules: map })
     }
-    pub fn select(&self, target: &QualifiedModelId) -> Result<Vec<&PromptModule>, PromptError> {
-        let mut selected: Vec<_> = self
+    pub fn select(&self, c: &SelectionContext) -> Result<Vec<&PromptModule>, PromptError> {
+        let mut v: Vec<_> = self
             .modules
-            .iter()
-            .filter(|m| m.selectors.matches(target))
+            .values()
+            .filter(|m| m.selectors.matches(c) && m.selectors.layer() > 0)
             .collect();
-        selected.sort_by_key(|m| (m.selectors.specificity(), m.priority, m.id.as_str()));
-        for pair in selected.windows(2) {
-            if pair[0].selectors.specificity() == pair[1].selectors.specificity()
-                && pair[0].priority == pair[1].priority
-            {
+        v.sort_by_key(|m| (m.selectors.layer(), m.priority, m.id.as_str()));
+        for w in v.windows(2) {
+            if w[0].selectors.layer() == w[1].selectors.layer() && w[0].priority == w[1].priority {
                 return Err(PromptError::Ambiguous(format!(
                     "{} and {}",
-                    pair[0].id.as_str(),
-                    pair[1].id.as_str()
+                    w[0].id.as_str(),
+                    w[1].id.as_str()
                 )));
             }
         }
-        Ok(selected)
+        Ok(v)
+    }
+    fn get(&self, id: &str) -> Result<&PromptModule, PromptError> {
+        self.modules
+            .values()
+            .find(|m| m.id.as_str() == id)
+            .ok_or_else(|| PromptError::UnknownReference(id.into()))
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromptManifest {
     schema: String,
     kernel: String,
     #[serde(default)]
     adapters: Vec<String>,
+    #[serde(default)]
+    modules: Vec<ModuleDeclaration>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleDeclaration {
+    id: PromptModuleId,
+    version: String,
+    source: PromptModuleSource,
+    #[serde(default)]
+    path: Option<String>,
+    priority: u16,
+    selectors: PromptSelectors,
+    mutability: ModuleMutability,
+    content: String,
 }
 impl PromptManifest {
     pub fn parse(input: &str) -> Result<Self, PromptError> {
-        let value: Self =
-            serde_json::from_str(input).map_err(|e| PromptError::Invalid(e.to_string()))?;
-        if value.schema != PROMPT_SCHEMA {
-            return Err(PromptError::Invalid(format!(
-                "unsupported schema {}",
-                value.schema
-            )));
+        if input.len() > MAX_MANIFEST_BYTES {
+            return Err(PromptError::Invalid("manifest exceeds size limit".into()));
         }
-        if value.kernel.is_empty() {
+        let v: Self =
+            serde_yaml::from_str(input).map_err(|e| PromptError::Invalid(e.to_string()))?;
+        if v.schema != PROMPT_SCHEMA {
+            return Err(PromptError::Invalid("unsupported schema".into()));
+        }
+        if v.kernel.is_empty() {
             return Err(PromptError::Invalid("kernel is required".into()));
         }
-        Ok(value)
+        let mut ids = BTreeSet::new();
+        for m in &v.modules {
+            m.selectors.validate()?;
+            if !ids.insert(&m.id) {
+                return Err(PromptError::Invalid("duplicate module id".into()));
+            }
+            if m.content.len() > MAX_MODULE_BYTES {
+                return Err(PromptError::Invalid("module exceeds size limit".into()));
+            }
+            let _ = (&m.version, &m.source, &m.path, m.priority, &m.mutability);
+        }
+        Ok(v)
     }
     pub fn schema(&self) -> &str {
         &self.schema
@@ -213,9 +360,9 @@ impl PromptManifest {
         &self,
         known: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), PromptError> {
-        let known: BTreeSet<_> = known.into_iter().collect();
-        for id in std::iter::once(&self.kernel).chain(self.adapters.iter()) {
-            if !known.contains(id.as_str()) {
+        let k: BTreeSet<_> = known.into_iter().collect();
+        for id in std::iter::once(&self.kernel).chain(&self.adapters) {
+            if !k.contains(id.as_str()) {
                 return Err(PromptError::UnknownReference(id.clone()));
             }
         }
@@ -225,37 +372,111 @@ impl PromptManifest {
 
 pub struct PromptStack {
     modules: Vec<PromptModule>,
+    context: SelectionContext,
+    composed: String,
+}
+impl fmt::Debug for PromptStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptStack")
+            .field("modules", &self.modules)
+            .field("context", &self.context)
+            .field("byte_count", &self.composed.len())
+            .finish()
+    }
+}
+#[derive(Serialize)]
+pub struct PromptInspection<'a> {
+    schema: &'static str,
+    foreground_model: &'a str,
+    enforcement_state: &'static str,
+    byte_count: usize,
+    modules: Vec<PromptModuleMetadata<'a>>,
 }
 #[derive(Serialize)]
 pub struct PromptModuleMetadata<'a> {
     id: &'a PromptModuleId,
     version: &'a str,
-    source: &'a PromptModuleSource,
     sha256: &'a str,
+    selectors: &'a PromptSelectors,
+    mutability: &'a ModuleMutability,
+    source: &'a PromptModuleSource,
+    safe_source: Option<&'a str>,
+    byte_count: usize,
 }
 impl PromptStack {
-    pub fn new(modules: Vec<PromptModule>) -> Self {
-        Self { modules }
+    pub fn new(modules: Vec<PromptModule>, context: SelectionContext) -> Result<Self, PromptError> {
+        let composed = modules
+            .iter()
+            .map(|m| m.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if composed.len() > MAX_COMPOSED_BYTES {
+            return Err(PromptError::Invalid(
+                "composed prompt exceeds size limit".into(),
+            ));
+        }
+        Ok(Self {
+            modules,
+            context,
+            composed,
+        })
     }
     pub fn modules(&self) -> &[PromptModule] {
         &self.modules
     }
-    pub fn inspect(&self) -> Vec<PromptModuleMetadata<'_>> {
-        self.modules
-            .iter()
-            .map(|m| PromptModuleMetadata {
-                id: &m.id,
-                version: &m.version,
-                source: &m.source,
-                sha256: &m.sha256,
-            })
-            .collect()
+    pub fn composed(&self) -> &str {
+        &self.composed
+    }
+    pub fn inspect(&self) -> PromptInspection<'_> {
+        PromptInspection {
+            schema: PROMPT_SCHEMA,
+            foreground_model: self.context.model.as_str(),
+            enforcement_state: "advisory",
+            byte_count: self.composed.len(),
+            modules: self
+                .modules
+                .iter()
+                .map(|m| PromptModuleMetadata {
+                    id: &m.id,
+                    version: &m.version,
+                    sha256: &m.sha256,
+                    selectors: &m.selectors,
+                    mutability: &m.mutability,
+                    source: &m.source,
+                    safe_source: m.safe_path.as_deref(),
+                    byte_count: m.content.len(),
+                })
+                .collect(),
+        }
     }
 }
 
-pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule {
+pub fn compile_prompt_stack(
+    manifest: &PromptManifest,
+    registry: &AdapterRegistry,
+    context: &SelectionContext,
+    user: Option<PromptModule>,
+) -> Result<PromptStack, PromptError> {
+    let mut out = vec![registry.get(&manifest.kernel)?.clone()];
+    let requested: BTreeSet<_> = manifest.adapters.iter().map(String::as_str).collect();
+    for m in registry.select(context)? {
+        if requested.contains(m.id.as_str()) {
+            out.push(m.clone())
+        }
+    }
+    if let Some(u) = user {
+        if out.iter().any(|m| m.id == u.id) {
+            return Err(PromptError::Invalid("duplicate module id".into()));
+        }
+        out.push(u)
+    }
+    PromptStack::new(out, context.clone())
+}
+pub fn resolved_system_prompt_as_user_module(
+    content: impl Into<String>,
+) -> Result<PromptModule, PromptError> {
     PromptModule::new(
-        PromptModuleId::parse("user.system").unwrap(),
+        PromptModuleId::parse("user.system")?,
         "legacy",
         PromptModuleSource::User,
         u16::MAX,
@@ -263,4 +484,7 @@ pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule 
         ModuleMutability::MutableGuidance,
         content,
     )
+}
+pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule {
+    resolved_system_prompt_as_user_module(content).expect("legacy prompt is within size limit")
 }
