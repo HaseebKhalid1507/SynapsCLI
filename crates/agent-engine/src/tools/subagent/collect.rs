@@ -94,19 +94,26 @@ impl Tool for SubagentCollectTool {
             }).to_string());
         }
 
-        if let Some(orchestration) = &ctx.capabilities.orchestration {
-            let terminal = match status {
-                SubagentStatus::Completed => agent_core::orchestration::WorkerTerminal::Completed,
-                SubagentStatus::TimedOut => agent_core::orchestration::WorkerTerminal::TimedOut,
-                _ => agent_core::orchestration::WorkerTerminal::Failed,
-            };
-            orchestration
-                .terminal_and_collect(&handle_id, terminal)
-                .map_err(RuntimeError::Tool)?;
-            if params["reconciled"].as_bool().unwrap_or(false) {
+        // Drive the orchestration terminal transition only on the FIRST
+        // collection. Handles are retained for diagnostically idempotent
+        // re-reads (`collected: true`); re-running the policy transition on a
+        // repeat read would fail (`mark_terminal` is single-shot) and would
+        // wrongly turn an idempotent read into an error.
+        if !already_collected {
+            if let Some(orchestration) = &ctx.capabilities.orchestration {
+                let terminal = match status {
+                    SubagentStatus::Completed => agent_core::orchestration::WorkerTerminal::Completed,
+                    SubagentStatus::TimedOut => agent_core::orchestration::WorkerTerminal::TimedOut,
+                    _ => agent_core::orchestration::WorkerTerminal::Failed,
+                };
                 orchestration
-                    .reconcile(&handle_id)
+                    .terminal_and_collect(&handle_id, terminal)
                     .map_err(RuntimeError::Tool)?;
+                if params["reconciled"].as_bool().unwrap_or(false) {
+                    orchestration
+                        .reconcile(&handle_id)
+                        .map_err(RuntimeError::Tool)?;
+                }
             }
         }
 
@@ -170,6 +177,12 @@ mod tests {
     ) -> crate::tools::ToolContext {
         let mut ctx = create_tool_context();
         ctx.capabilities.subagent_registry = Some(registry);
+        // This suite exercises the registry-level collected/idempotency
+        // contract in isolation. The handle is registered directly (never
+        // dispatched through orchestration), so the policy registry must not
+        // participate — dispatch-path enforcement is covered by the
+        // orchestration and lifecycle suites.
+        ctx.capabilities.orchestration = None;
         ctx
     }
 
