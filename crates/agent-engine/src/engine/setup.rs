@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 pub struct EngineOpts {
     pub continue_session: Option<Option<String>>,
     pub system: Option<String>,
+    pub prompt_manifest: Option<std::path::PathBuf>,
     pub profile: Option<String>,
     pub no_extensions: bool,
 }
@@ -116,9 +117,34 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let config = crate::config::load_config();
     runtime.apply_config(&config);
 
-    // Load system prompt
-    let system_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
-    runtime.set_system_prompt(system_prompt);
+    // Validate and compile an opted-in manifest before any session/network work.
+    let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
+    if let Some(path) = &opts.prompt_manifest {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| crate::RuntimeError::Config("prompt manifest is unavailable".into()))?;
+        let manifest = agent_core::prompt::PromptManifest::parse(&raw)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let registry = manifest
+            .registry(path.parent())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let model = agent_core::prompt::QualifiedModelId::parse(runtime.model())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
+        let context = agent_core::prompt::SelectionContext::new(model, None)
+            .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        let user = opts
+            .system
+            .as_ref()
+            .map(|_| {
+                agent_core::prompt::resolved_system_prompt_as_user_module(legacy_prompt.clone())
+            })
+            .transpose()
+            .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        let stack = agent_core::prompt::compile_prompt_stack(&manifest, &registry, &context, user)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        runtime.set_system_prompt(stack.composed().to_owned());
+    } else {
+        runtime.set_system_prompt(legacy_prompt);
+    }
 
     // Discover plugins/skills, build command registry, register load_skill tool.
     let tools_shared = runtime.tools_shared();

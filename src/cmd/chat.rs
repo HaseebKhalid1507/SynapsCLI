@@ -48,6 +48,7 @@ pub async fn run(
     let boot = setup::boot(EngineOpts {
         continue_session: continue_session.map(Some),
         system,
+        prompt_manifest: None,
         profile,
         no_extensions,
     }).await?;

@@ -41,6 +41,10 @@ struct Cli {
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
 
+    /// Typed modular prompt manifest (validated offline before session start).
+    #[arg(long = "prompt-manifest", value_name = "PATH")]
+    prompt_manifest: Option<std::path::PathBuf>,
+
     /// Disable all extensions for this session.
     #[arg(long)]
     no_extensions: bool,
@@ -229,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
             tui::run(
                 cli.continue_session,
                 cli.system,
+                cli.prompt_manifest,
                 cli.profile,
                 cli.no_extensions,
             )

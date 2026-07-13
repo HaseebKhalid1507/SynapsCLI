@@ -53,6 +53,7 @@ pub(crate) struct RunContext {
 pub(crate) async fn run_setup(
     continue_session: Option<Option<String>>,
     system: Option<String>,
+    prompt_manifest: Option<std::path::PathBuf>,
     profile: Option<String>,
     no_extensions: bool,
 ) -> Result<RunContext> {
@@ -60,6 +61,7 @@ pub(crate) async fn run_setup(
     let boot = synaps_cli::engine::setup::boot(synaps_cli::engine::setup::EngineOpts {
         continue_session: continue_session.clone(),
         system,
+        prompt_manifest,
         profile,
         no_extensions,
     })

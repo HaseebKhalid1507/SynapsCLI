@@ -177,6 +177,7 @@ pub async fn run(
     let boot = setup::boot(EngineOpts {
         continue_session,
         system,
+        prompt_manifest: None,
         profile,
         no_extensions: false,
     })
