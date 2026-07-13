@@ -88,6 +88,10 @@ impl Tool for SubagentResumeTool {
             (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
         };
 
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            policy.preflight(&model).map_err(RuntimeError::Tool)?;
+        }
+
         // ── Build resumed task: new instructions → separator → prior context.
         let resumed_task = format!(
             "{instructions}\n\n\

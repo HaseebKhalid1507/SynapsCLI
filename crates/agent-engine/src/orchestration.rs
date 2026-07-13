@@ -22,6 +22,16 @@ impl OrchestrationRuntime {
             }),
         }
     }
+    pub fn preflight(&self, model: &str) -> Result<(), String> {
+        let model = QualifiedModelId::parse(model)
+            .map_err(|_| "delegation denied: invalid qualified model".to_string())?;
+        self.inner
+            .lock()
+            .unwrap()
+            .registry
+            .validate_dispatch(&model)
+            .map_err(|e| format!("delegation denied: {}", e.code()))
+    }
     pub fn authorize(&self, runtime_handle: &str, model: &str) -> Result<(), String> {
         let model = QualifiedModelId::parse(model)
             .map_err(|_| "delegation denied: invalid qualified model".to_string())?;

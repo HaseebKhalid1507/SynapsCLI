@@ -82,6 +82,11 @@ impl Tool for SubagentStartTool {
         let model_override = params["model"].as_str().map(|s| s.to_string());
         let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
+        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            policy.preflight(&model).map_err(RuntimeError::Tool)?;
+        }
+
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
             (None, Some(p)) => p.clone(),
@@ -93,7 +98,6 @@ impl Tool for SubagentStartTool {
         };
 
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
-        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);

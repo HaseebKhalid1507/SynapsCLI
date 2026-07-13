@@ -134,17 +134,7 @@ impl WorkerRegistry {
     pub fn telemetry(&self) -> &[OrchestrationEvent] {
         &self.events
     }
-    pub fn authorize_dispatch(
-        &mut self,
-        model: &QualifiedModelId,
-        _role: WorkerRole,
-        writes: WorkerWritePolicy,
-    ) -> Result<WorkerHandle, DispatchDenied> {
-        self.events.push(OrchestrationEvent {
-            name: "worker.dispatch_requested",
-            worker_id: None,
-            reason_code: None,
-        });
+    pub fn validate_dispatch(&self, model: &QualifiedModelId) -> Result<(), DispatchDenied> {
         let deny = if !self.policy.allowed_providers.contains(model.provider()) {
             Some("provider_not_allowed")
         } else if !self.policy.allowed_models.contains(model) {
@@ -162,13 +152,26 @@ impl WorkerRegistry {
         } else {
             None
         };
-        if let Some(code) = deny {
+        deny.map_or(Ok(()), |code| Err(DispatchDenied { code }))
+    }
+    pub fn authorize_dispatch(
+        &mut self,
+        model: &QualifiedModelId,
+        _role: WorkerRole,
+        writes: WorkerWritePolicy,
+    ) -> Result<WorkerHandle, DispatchDenied> {
+        self.events.push(OrchestrationEvent {
+            name: "worker.dispatch_requested",
+            worker_id: None,
+            reason_code: None,
+        });
+        if let Err(error) = self.validate_dispatch(model) {
             self.events.push(OrchestrationEvent {
                 name: "worker.dispatch_denied",
                 worker_id: None,
-                reason_code: Some(code),
+                reason_code: Some(error.code),
             });
-            return Err(DispatchDenied { code });
+            return Err(error);
         }
         self.total += 1;
         let h = WorkerHandle(format!("worker-{}", self.total));
