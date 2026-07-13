@@ -1264,16 +1264,17 @@ mod tests {
     fn reload_rejects_policy_change_without_partial_apply() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prompt.yaml");
-        let manifest = |mode: &str, content: &str| {
+        let manifest = |total: &str, content: &str| {
             format!(
-            "schema: synaps-prompt/1\nkernel: kernel\nmodules:\n  - id: kernel\n    version: v1\n    source: builtin\n    priority: 0\n    selectors: {{}}\n    mutability: mutable_guidance\n    content: {content}\npolicies:\n  delegation:\n    mode: {mode}\n    allowed_models: [anthropic/worker]\n    max_concurrent_workers: 1\n    max_total_workers: 1\n"
+            "schema: synaps-prompt/1\nkernel: kernel\nmodules:\n  - id: kernel\n    version: v1\n    source: builtin\n    priority: 0\n    selectors: {{}}\n    mutability: mutable_guidance\n    content: {content}\npolicies:\n  delegation:\n    mode: enforced\n    allowed_models: [anthropic/claude-sonnet-4-6]\n    max_concurrent_workers: 1\n    max_total_workers: {total}\n"
         )
         };
-        std::fs::write(&path, manifest("advisory", "before")).unwrap();
+        std::fs::write(&path, manifest("1", "before")).unwrap();
         let parsed =
             agent_core::prompt::PromptManifest::parse(&std::fs::read_to_string(&path).unwrap())
                 .unwrap();
-        let model = agent_core::prompt::QualifiedModelId::parse("anthropic/foreground").unwrap();
+        let model =
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6").unwrap();
         let context = agent_core::prompt::SelectionContext::new(model.clone(), None).unwrap();
         let stack = agent_core::prompt::compile_prompt_stack(
             &parsed,
@@ -1297,7 +1298,7 @@ mod tests {
         let generation = runtime.prompt_generation();
         let composed = runtime.effective_prompt().unwrap().composed().to_owned();
 
-        std::fs::write(&path, manifest("enforced", "after")).unwrap();
+        std::fs::write(&path, manifest("2", "after")).unwrap();
         let error = runtime.reload_prompt().unwrap_err().to_string();
         assert!(error.contains("cannot safely change delegation policy"));
         assert_eq!(runtime.prompt_generation(), generation);
