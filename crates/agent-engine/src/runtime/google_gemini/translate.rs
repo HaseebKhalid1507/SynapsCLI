@@ -20,7 +20,6 @@ pub struct GeminiRole;
 pub enum GeminiRoleName {
     User,
     Model,
-    Function,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,11 +164,16 @@ pub fn translate_generate_content_request(
                 }],
             },
             ChatTurn::ToolResult { name, result } => GeminiContent {
-                role: GeminiRoleName::Function,
+                // Gemini Content supports only `user` and `model`; a
+                // functionResponse is submitted as a user turn.
+                role: GeminiRoleName::User,
                 parts: vec![GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
                         name: name.clone(),
-                        response: result.clone(),
+                        response: match result {
+                            serde_json::Value::Object(_) => result.clone(),
+                            value => serde_json::json!({ "output": value }),
+                        },
                     },
                 }],
             },
@@ -395,13 +399,48 @@ mod tests {
             v["request"]["contents"][1]["parts"][0]["functionCall"]["name"],
             "search"
         );
-        assert_eq!(v["request"]["contents"][2]["role"], "function");
+        assert_eq!(v["request"]["contents"][2]["role"], "user");
         assert_eq!(
             v["request"]["contents"][2]["parts"][0]["functionResponse"]["name"],
             "search"
         );
+        assert_eq!(
+            v["request"]["contents"][2]["parts"][0]["functionResponse"]["response"],
+            json!({"hits": 3})
+        );
         // tools omitted → key absent, not null.
         assert!(v["request"].get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_result_response_is_always_an_object_at_wire_boundary() {
+        for (result, expected) in [
+            (json!("plain output"), json!({"output":"plain output"})),
+            (json!(42), json!({"output":42})),
+            (json!(null), json!({"output":null})),
+            (json!({"hits":3}), json!({"hits":3})),
+            (
+                json!({"output":"failed","is_error":true}),
+                json!({"output":"failed","is_error":true}),
+            ),
+        ] {
+            let req = translate_generate_content_request(
+                "gemini-2.5-flash",
+                None,
+                None,
+                &[ChatTurn::ToolResult {
+                    name: "tool".into(),
+                    result,
+                }],
+                &[],
+            );
+            let wire = serde_json::to_value(req).unwrap();
+            assert_eq!(wire["request"]["contents"][0]["role"], "user");
+            let response =
+                &wire["request"]["contents"][0]["parts"][0]["functionResponse"]["response"];
+            assert_eq!(response, &expected);
+            assert!(response.is_object());
+        }
     }
 
     #[test]

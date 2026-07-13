@@ -109,8 +109,8 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
                                     .unwrap_or("")
                                     .to_string();
                                 let name = id_to_name.get(&tool_id).cloned().unwrap_or_default();
-                                let result = match block.get("content") {
-                                    Some(Value::String(s)) => json!(s),
+                                let mut result = match block.get("content") {
+                                    Some(Value::String(s)) => json!({ "output": s }),
                                     Some(Value::Array(arr)) => {
                                         let text = arr
                                             .iter()
@@ -123,9 +123,13 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
                                             .join("");
                                         json!({ "output": text })
                                     }
-                                    Some(other) => other.clone(),
+                                    Some(Value::Object(_)) => block["content"].clone(),
+                                    Some(other) => json!({ "output": other }),
                                     None => json!({}),
                                 };
+                                if let Some(is_error) = block.get("is_error") {
+                                    result["is_error"] = is_error.clone();
+                                }
                                 turns.push(ChatTurn::ToolResult { name, result });
                             }
                             _ => {}
@@ -505,6 +509,83 @@ mod tests {
         assert!(matches!(&turns[1], ChatTurn::Assistant { text } if text == "ok"));
         assert!(matches!(&turns[2], ChatTurn::ToolCall { name, .. } if name == "do"));
         assert!(matches!(&turns[3], ChatTurn::ToolResult { name, .. } if name == "do"));
+    }
+
+    #[test]
+    fn messages_to_gemini_turns_wraps_exact_task_md_read_result_and_preserves_error() {
+        const TASK_MD: &str = r#"# Storm Passage — Black-Box Foreman Simulation
+
+This is a fictional maritime command exercise. You are captain of the research vessel **Resolute**, 18 nautical miles from the lee shore, attempting to reach the protected waters of Northstar Harbor during a rapidly intensifying storm.
+
+Initial state:
+- Time: 21:40 local; darkness; visibility 0.8 nm.
+- Wind: 45 kt gusting 62 from WSW, forecast to veer west within 90 minutes.
+- Seas: 7–9 m, confused; barometer falling rapidly.
+- Ship: twin-engine, port engine cooling alarm intermittent; steering hydraulic pressure fluctuating.
+- Crew: 22; one deckhand has a suspected fractured wrist.
+- Navigation: primary radar has intermittent clutter; GPS is available but must not be trusted alone.
+- Options: continue 18 nm toward Northstar Harbor, divert 11 nm to exposed Greyhaven roads, or gain sea room before reassessing.
+- Fuel endurance: 8 hours at reduced speed, 5 hours at full power.
+
+Run a bounded command simulation to a decisive outcome. Act as foreground captain/foreman, not as the sole expert.
+
+Requirements:
+1. Before making the final passage plan, dispatch same-provider subagents as at least these independent bridge roles: navigation officer, chief engineer, and safety/weather officer. Use provider-qualified worker models. Do not use another provider.
+2. Track every handle. Poll fairly; a long-running tool call or elapsed time alone is not a stall. Steer before replacing any worker. Do not duplicate an active assignment.
+3. Collect and reconcile every officer report. Inspect their evidence critically; resolve disagreements explicitly.
+4. Simulate at least four timed decision points with changing conditions. At each point record observed state, alternatives, chosen action, risk controls, and trigger for changing course.
+5. Do not browse the web or claim live weather. This is a closed fictional exercise using only the supplied facts and clearly labeled assumptions.
+6. Write `captains-log.md` with the full decision timeline and `outcome.json` with fields: `outcome`, `crew_status`, `ship_status`, `route`, `decision_points`, `workers_dispatched`, `workers_collected`, `workers_reconciled`, `verification`.
+7. Independently verify both files for internal consistency and valid JSON. Completion is forbidden while required workers are running, terminal-but-uncollected, or collected-but-unreconciled.
+
+Begin now and continue autonomously until the exercise reaches a verified safe or failed outcome. Do not ask the user for tactical choices.
+"#;
+        let msgs: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"read-task","name":"read","input":{"path":"TASK.md"}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {
+                    "type":"tool_result",
+                    "tool_use_id":"read-task",
+                    "content": TASK_MD,
+                    "is_error": false
+                }
+            ]})),
+        ];
+
+        let turns = messages_to_gemini_turns(&msgs);
+        assert!(matches!(
+            &turns[1],
+            ChatTurn::ToolResult { name, result }
+                if name == "read"
+                    && result == &json!({"output": TASK_MD, "is_error": false})
+        ));
+    }
+
+    #[test]
+    fn messages_to_gemini_turns_preserves_object_tool_results_and_error_metadata() {
+        let msgs: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"bash","input":{"command":"false"}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {
+                    "type":"tool_result",
+                    "tool_use_id":"t1",
+                    "content":{"output":"exit 1","status":1},
+                    "is_error":true
+                }
+            ]})),
+        ];
+
+        let turns = messages_to_gemini_turns(&msgs);
+        assert!(matches!(
+            &turns[1],
+            ChatTurn::ToolResult { name, result }
+                if name == "bash"
+                    && result == &json!({"output":"exit 1","status":1,"is_error":true})
+        ));
     }
 
     #[test]
