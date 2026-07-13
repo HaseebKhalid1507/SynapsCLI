@@ -569,15 +569,15 @@ mod tests {
         }
     }
 
+    /// Regression: `gemini-pro-latest` must NOT resolve — it is a public
+    /// Gemini API alias that Code Assist rejects with 404 NOT_FOUND. Routing
+    /// fails closed instead of emitting a doomed upstream request.
     #[test]
-    fn resolves_exact_gemini_pro_latest_code_assist_route() {
-        let route = resolve_route("google-gemini/gemini-pro-latest")
-            .expect("exact Gemini Code Assist wire ID must resolve locally");
-        assert_eq!(route.provider, "google-gemini");
-        assert_eq!(route.model, "gemini-pro-latest");
-        assert_eq!(route.endpoint, "https://cloudcode-pa.googleapis.com");
-        assert_eq!(route.auth, AuthPolicy::BrokerProxy);
-        assert_eq!(route.wire, WireProtocol::GoogleGeminiCodeAssist);
+    fn does_not_resolve_public_api_alias_gemini_pro_latest() {
+        assert!(
+            resolve_route("google-gemini/gemini-pro-latest").is_none(),
+            "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
+        );
     }
 
     #[test]

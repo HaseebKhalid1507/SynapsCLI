@@ -38,12 +38,6 @@ pub struct GoogleGeminiModelDescriptor {
 /// authoritative and may reject models not enabled for a particular user.
 pub const GOOGLE_GEMINI_TEXT_MODELS: &[GoogleGeminiModelDescriptor] = &[
     GoogleGeminiModelDescriptor {
-        id: "gemini-pro-latest",
-        label: "Gemini Pro Latest",
-        context_tokens: Some(1_048_576),
-        thinking: true,
-    },
-    GoogleGeminiModelDescriptor {
         id: "gemini-3.1-pro-preview",
         label: "Gemini 3.1 Pro (Preview)",
         context_tokens: Some(1_048_576),
@@ -128,7 +122,6 @@ mod tests {
                 .map(|m| m.id)
                 .collect::<Vec<_>>(),
             vec![
-                "gemini-pro-latest",
                 "gemini-3.1-pro-preview",
                 "gemini-3-pro-preview",
                 "gemini-3.5-flash",
@@ -140,12 +133,19 @@ mod tests {
         );
     }
 
+    /// Regression: `gemini-pro-latest` is a public Gemini API alias, NOT a
+    /// Code Assist wire ID. Live `streamGenerateContent` on
+    /// `cloudcode-pa.googleapis.com` returns `404 NOT_FOUND: Requested entity
+    /// was not found.` for it (2026-07-13, project witty-bonito-c3bk6), and
+    /// the official gemini-cli `models.ts` does not list it in
+    /// `VALID_GEMINI_MODELS`. It must never re-enter the trusted catalog.
     #[test]
-    fn catalog_exposes_exact_gemini_pro_latest_wire_id() {
-        let descriptor = google_gemini_model("gemini-pro-latest")
-            .expect("Gemini Code Assist wire ID must be in the trusted catalog");
-        assert_eq!(descriptor.id, "gemini-pro-latest");
-        assert!(google_gemini_static_catalog_models()
+    fn catalog_excludes_public_api_alias_gemini_pro_latest() {
+        assert!(
+            google_gemini_model("gemini-pro-latest").is_none(),
+            "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
+        );
+        assert!(!google_gemini_static_catalog_models()
             .iter()
             .any(|model| model.runtime_id() == "google-gemini/gemini-pro-latest"));
     }
