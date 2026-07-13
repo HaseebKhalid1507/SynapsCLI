@@ -11,6 +11,7 @@
 //! `CredentialBroker::proxy_stream` and consumes bytes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -21,7 +22,7 @@ use super::stream::{stream_gemini, StreamError};
 use super::translate::{ChatTurn, GeminiStreamEvent, ToolSpec};
 use crate::auth::CredentialBroker;
 use crate::runtime::openai::types::ProviderConfig;
-use crate::runtime::types::{LlmEvent, StreamEvent};
+use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 
 /// Translate tool schemas (Anthropic-shaped: `{name, description, input_schema}`)
 /// into Gemini `ToolSpec`s. Internal-only tool names are dropped.
@@ -231,17 +232,65 @@ pub(crate) async fn call_google_gemini_stream_inner(
         "google-gemini stream request via broker proxy"
     );
 
-    let mut stream = stream_gemini(
-        broker.as_ref(),
-        cfg.model.clone(),
-        Some(project_id),
-        system_prompt.clone(),
-        &turns,
-        &tools,
-        cancel.clone(),
-    )
-    .await
-    .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("{e}")))?;
+    let mut stream = {
+        // ═══ RESET-HONORING 429 RETRY ═══════════════════════════════════════
+        // Code Assist enforces small per-model windows and reports the reset
+        // delay in the 429 body. Failing fast here made every agentic step die
+        // on tiny-quota accounts; retrying immediately would burn the window
+        // and extend the reset. So: honor the reported reset (plus a small
+        // buffer), bounded by MAX_GEMINI_429_RETRIES / MAX_GEMINI_429_WAIT.
+        // Non-429 errors keep failing fast — they are not capacity.
+        let mut attempt: u32 = 0;
+        loop {
+            match stream_gemini(
+                broker.as_ref(),
+                cfg.model.clone(),
+                Some(project_id.clone()),
+                system_prompt.clone(),
+                &turns,
+                &tools,
+                cancel.clone(),
+            )
+            .await
+            {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    let text = format!("{e}");
+                    let Some(reset_secs) = code_assist_429_reset(&text) else {
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(text));
+                    };
+                    if attempt >= MAX_GEMINI_429_RETRIES {
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(text));
+                    }
+                    attempt += 1;
+                    let wait = reset_secs
+                        .map(|s| Duration::from_secs(s.saturating_add(1)))
+                        .unwrap_or(DEFAULT_GEMINI_429_WAIT)
+                        .min(MAX_GEMINI_429_WAIT);
+                    let notice = format!(
+                        "⚠ Gemini rate limited — resuming in {}s ({}/{})",
+                        wait.as_secs(),
+                        attempt,
+                        MAX_GEMINI_429_RETRIES
+                    );
+                    tracing::warn!(
+                        provider = %cfg.provider,
+                        model = %cfg.model,
+                        wait_secs = wait.as_secs(),
+                        attempt,
+                        "google-gemini 429 rate limited; honoring reported reset"
+                    );
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = cancel.cancelled() => {
+                            return Err("operation canceled".into());
+                        }
+                    }
+                }
+            }
+        }
+    };
 
     let mut assembled_text = String::new();
     let mut content_blocks: Vec<Value> = Vec::new();
@@ -341,6 +390,44 @@ fn map_finish_reason(reason: &str) -> String {
         "TOOL_CALL" | "FUNCTION_CALL" => "tool_use".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Additional attempts allowed after a Code Assist 429 rate-limit rejection.
+/// OAuth Code Assist quotas reset on short windows (observed 14–53s), so a
+/// bounded reset-honoring retry converts tiny-quota accounts from hard
+/// failure into slow-but-working sessions.
+const MAX_GEMINI_429_RETRIES: u32 = 4;
+/// Cap on any single reset wait so a hostile/garbled hint cannot stall us.
+const MAX_GEMINI_429_WAIT: Duration = Duration::from_secs(120);
+/// Wait used when a 429 carries no parsable reset hint.
+const DEFAULT_GEMINI_429_WAIT: Duration = Duration::from_secs(20);
+
+/// Detect a Code Assist rate-limit rejection in a broker transport error.
+///
+/// Returns `None` when the error is not a 429 rate limit; `Some(reset_secs)`
+/// when it is, with the upstream-reported reset delay parsed from the
+/// `"Your quota will reset after Ns"` message text when present. The broker
+/// deliberately flattens upstream status to text (`provider request failed:
+/// 429 Too Many Requests: …`), so this is the transport contract we parse —
+/// a status marker alone is not enough, a rate-limit marker must accompany it.
+fn code_assist_429_reset(err: &str) -> Option<Option<u64>> {
+    let is_429 = err.contains("429");
+    let has_rate_limit_marker = err.contains("RESOURCE_EXHAUSTED")
+        || err.contains("RATE_LIMIT_EXCEEDED")
+        || err.contains("Too Many Requests");
+    if !is_429 || !has_rate_limit_marker {
+        return None;
+    }
+    let secs = err.split("reset after").nth(1).and_then(|rest| {
+        let rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if rest[digits.len()..].starts_with('s') {
+            digits.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+    Some(secs)
 }
 
 #[cfg(test)]
@@ -703,6 +790,202 @@ Begin now and continue autonomously until the exercise reaches a verified safe o
             body["project"].as_str(),
             Some("test-proj"),
             "runtime must forward the setup-resolved project id on the envelope: {body}",
+        );
+    }
+
+    /// Live Code Assist 429 body as surfaced through the broker transport
+    /// error (2026-07-13, gemini-2.5-pro, project witty-bonito-c3bk6).
+    const LIVE_429_TEXT: &str = "gemini stream error: broker transport error: \
+        provider request failed: 429 Too Many Requests: {   \"error\": {     \
+        \"code\": 429,     \"message\": \"You have exhausted your capacity on \
+        this model. Your quota will reset after 30s.\",     \"status\": \
+        \"RESOURCE_EXHAUSTED\",     \"details\": [       {         \"@type\": \
+        \"type.googleapis.com/google.rpc.ErrorInfo\",         \"reason\": \
+        \"RATE_LIMIT_EXCEEDED\",         \"domain\": \
+        \"cloudcode-pa.googleapis.com\"       }     ]   } }";
+
+    #[test]
+    fn code_assist_429_reset_parses_live_reset_hint() {
+        assert_eq!(code_assist_429_reset(LIVE_429_TEXT), Some(Some(30)));
+    }
+
+    #[test]
+    fn code_assist_429_reset_handles_429_without_hint() {
+        let text = "provider request failed: 429 Too Many Requests: RESOURCE_EXHAUSTED";
+        assert_eq!(code_assist_429_reset(text), Some(None));
+    }
+
+    #[test]
+    fn code_assist_429_reset_ignores_non_rate_limit_errors() {
+        for text in [
+            "provider request failed: 404 Not Found: NOT_FOUND",
+            "provider request failed: 400 Bad Request: INVALID_ARGUMENT",
+            "broker transport error: connection reset",
+            // A 429 status alone without a rate-limit marker is not enough.
+            "some error mentioning 429 with no markers",
+        ] {
+            assert_eq!(code_assist_429_reset(text), None, "{text}");
+        }
+    }
+
+    /// Broker whose `proxy_stream` rejects the first N attempts with the live
+    /// Code Assist 429 transport error, then serves the given chunks.
+    struct RateLimitedBroker {
+        failures_remaining: Mutex<u32>,
+        calls: Mutex<u32>,
+        chunks: Mutex<Option<Vec<Result<bytes::Bytes, BrokerError>>>>,
+    }
+
+    impl RateLimitedBroker {
+        fn new(failures: u32, chunks: Vec<Result<bytes::Bytes, BrokerError>>) -> Self {
+            Self {
+                failures_remaining: Mutex::new(failures),
+                calls: Mutex::new(0),
+                chunks: Mutex::new(Some(chunks)),
+            }
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl CredentialBroker for RateLimitedBroker {
+        async fn access_token(&self, _p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+            Err(BrokerError::NotConfigured("stub".into()))
+        }
+        async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            if r.path == "/v1internal:loadCodeAssist" {
+                return Ok(ProxyResponse {
+                    status: 200,
+                    body: r#"{"cloudaicompanionProject":"test-proj","currentTier":{"id":"STANDARD","name":"Std","hasOnboardedPreviously":true}}"#.to_string(),
+                });
+            }
+            Err(BrokerError::Denied("not implemented".into()))
+        }
+        async fn proxy_stream(
+            &self,
+            _request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            *self.calls.lock().unwrap() += 1;
+            let mut failures = self.failures_remaining.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(BrokerError::Transport(
+                    "provider request failed: 429 Too Many Requests: {\"error\":{\"code\":429,\
+                     \"message\":\"You have exhausted your capacity on this model. Your quota \
+                     will reset after 1s.\",\"status\":\"RESOURCE_EXHAUSTED\"}}"
+                        .to_string(),
+                ));
+            }
+            let chunks = self.chunks.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+        async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_429_after_reported_reset_and_succeeds() {
+        let stub = Arc::new(RateLimitedBroker::new(
+            1,
+            vec![chunk(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n",
+            )],
+        ));
+        let broker: Arc<dyn CredentialBroker> = stub.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+
+        let out = call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .expect("429 followed by success must recover");
+        drop(tx);
+
+        assert_eq!(out["content"][0]["text"], "ok");
+        assert_eq!(stub.calls(), 2, "one 429 rejection, one successful retry");
+
+        // The wait is honored and user-visible.
+        let mut saw_notice = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(crate::runtime::types::SessionEvent::Notice(n)) = ev {
+                assert!(n.to_lowercase().contains("rate limit"), "{n}");
+                saw_notice = true;
+            }
+        }
+        assert!(saw_notice, "429 backoff must emit a user-visible notice");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_retry_non_429_stream_errors() {
+        struct HardFailBroker {
+            calls: Mutex<u32>,
+        }
+        #[async_trait]
+        impl CredentialBroker for HardFailBroker {
+            async fn access_token(&self, _p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+                Err(BrokerError::NotConfigured("stub".into()))
+            }
+            async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+                if r.path == "/v1internal:loadCodeAssist" {
+                    return Ok(ProxyResponse {
+                        status: 200,
+                        body: r#"{"cloudaicompanionProject":"test-proj","currentTier":{"id":"STANDARD","name":"Std","hasOnboardedPreviously":true}}"#.to_string(),
+                    });
+                }
+                Err(BrokerError::Denied("not implemented".into()))
+            }
+            async fn proxy_stream(&self, _r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+                *self.calls.lock().unwrap() += 1;
+                Err(BrokerError::Transport(
+                    "provider request failed: 404 Not Found: NOT_FOUND".to_string(),
+                ))
+            }
+            async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+                Err(BrokerError::Denied("not implemented".into()))
+            }
+            async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
+                Ok(vec![])
+            }
+        }
+
+        let stub = Arc::new(HardFailBroker {
+            calls: Mutex::new(0),
+        });
+        let calls = || *stub.calls.lock().unwrap();
+        let broker: Arc<dyn CredentialBroker> = stub.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+
+        let err = call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .expect_err("404 must fail immediately");
+        assert!(err.to_string().contains("404"), "{err}");
+        assert_eq!(calls(), 1, "non-429 errors must not be retried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_429_retry_budget_is_exhausted() {
+        let stub = Arc::new(RateLimitedBroker::new(u32::MAX, vec![]));
+        let broker: Arc<dyn CredentialBroker> = stub.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+
+        let err = call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .expect_err("persistent 429 must eventually surface");
+        assert!(err.to_string().contains("429"), "{err}");
+        assert_eq!(
+            stub.calls(),
+            1 + MAX_GEMINI_429_RETRIES,
+            "429 retries must stop at the budget"
         );
     }
 }
