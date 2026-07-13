@@ -216,6 +216,8 @@ pub struct Runtime {
     compaction_model: Option<String>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    /// Session-scoped orchestration enforcement installed during boot.
+    orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     /// Shared event queue — for Event Bus tooling.
     event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
@@ -306,6 +308,7 @@ impl Runtime {
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
+            orchestration: None,
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -371,6 +374,7 @@ impl Runtime {
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
+            orchestration: None,
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -400,6 +404,17 @@ impl Runtime {
 
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    pub fn install_orchestration(
+        &mut self,
+        runtime: Arc<crate::orchestration::OrchestrationRuntime>,
+    ) {
+        self.orchestration = Some(runtime);
+    }
+
+    pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
+        self.orchestration.as_ref()
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -752,7 +767,7 @@ impl Runtime {
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
-                                        orchestration: None,
+                                        orchestration: self.orchestration.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -820,6 +835,7 @@ impl Runtime {
                     let cfg_subagent_registry = self.subagent_registry.clone();
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
+                    let cfg_orchestration = self.orchestration.clone();
 
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -839,6 +855,7 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let orchestration_inner = cfg_orchestration.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -883,7 +900,7 @@ impl Runtime {
                                                     subagent_registry: Some(registry_inner),
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
-                                                    orchestration: None,
+                                                    orchestration: orchestration_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -1090,6 +1107,7 @@ impl Clone for Runtime {
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),
+            orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
