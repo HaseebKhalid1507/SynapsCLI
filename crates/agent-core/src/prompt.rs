@@ -409,9 +409,21 @@ impl PromptManifest {
         }
         Ok(v)
     }
+    pub fn delegation_catalog_candidates(&self) -> Vec<QualifiedModelId> {
+        let mut models = Vec::new();
+        if let Some(policy) = &self.policies.delegation {
+            models.extend(policy.allowed_models.iter().cloned());
+            for grant in &policy.cross_provider_grants {
+                models.extend(grant.allowed_models.iter().cloned());
+            }
+        }
+        models
+    }
+
     pub fn delegation_policy(
         &self,
         foreground: QualifiedModelId,
+        catalog: &crate::orchestration::CatalogSnapshot,
     ) -> Result<Option<crate::orchestration::DelegationPolicy>, PromptError> {
         let Some(policy) = self.policies.delegation.as_ref() else {
             return Ok(None);
@@ -421,8 +433,6 @@ impl PromptManifest {
                 "delegation policy must use enforced mode".into(),
             ));
         }
-        let mut catalog_entries = policy.allowed_models.clone();
-        catalog_entries.push(foreground.clone());
         let mut grants = Vec::with_capacity(policy.cross_provider_grants.len());
         for grant in &policy.cross_provider_grants {
             // Expiring grants require a trusted clock and atomic refresh support. Until
@@ -432,7 +442,6 @@ impl PromptManifest {
                     "expiring cross-provider grants are not supported".into(),
                 ));
             }
-            catalog_entries.extend(grant.allowed_models.iter().cloned());
             grants.push(
                 crate::orchestration::CrossProviderGrant::new(
                     grant.id.clone(),
@@ -443,10 +452,9 @@ impl PromptManifest {
                 .map_err(|error| PromptError::Invalid(error.into()))?,
             );
         }
-        let catalog = crate::orchestration::CatalogSnapshot::new(catalog_entries);
         crate::orchestration::DelegationPolicy::with_grants(
             foreground,
-            catalog,
+            catalog.clone(),
             policy.allowed_models.clone(),
             grants,
             policy.max_concurrent_workers,

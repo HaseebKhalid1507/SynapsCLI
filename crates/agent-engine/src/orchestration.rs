@@ -57,10 +57,30 @@ impl std::fmt::Display for DispatchDenial {
 }
 impl std::error::Error for DispatchDenial {}
 impl OrchestrationRuntime {
+    /// Build the trusted snapshot from runtime routing descriptors, never from manifest
+    /// authority. Candidates merely request entries; only routable worker identities enter.
+    pub fn trusted_catalog(
+        foreground: &QualifiedModelId,
+        candidates: impl IntoIterator<Item = QualifiedModelId>,
+    ) -> CatalogSnapshot {
+        use agent_core::orchestration::CatalogEntry;
+        let models = std::iter::once((foreground.clone(), true))
+            .chain(candidates.into_iter().map(|model| (model, false)));
+        CatalogSnapshot::from_entries(models.map(|(model, is_foreground)| {
+            let available =
+                is_foreground || crate::runtime::openai::resolve_route(model.as_str()).is_some();
+            CatalogEntry {
+                model,
+                available,
+                worker_eligible: available,
+            }
+        }))
+    }
+
     /// Secure manifestless baseline: the exact foreground identity is the only
     /// worker choice in a deterministic runtime-controlled catalog.
     pub fn baseline(foreground: QualifiedModelId, concurrent: usize, total: usize) -> Self {
-        let catalog = CatalogSnapshot::new([foreground.clone()]);
+        let catalog = Self::trusted_catalog(&foreground, std::iter::empty());
         Self::new(
             DelegationPolicy::baseline(foreground, catalog, concurrent, total)
                 .expect("resolved foreground always forms a valid baseline"),

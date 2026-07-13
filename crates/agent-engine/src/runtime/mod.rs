@@ -457,8 +457,12 @@ impl Runtime {
             agent_core::prompt::PromptError::Invalid("prompt manifest is unavailable".into())
         })?;
         let manifest = agent_core::prompt::PromptManifest::parse(&raw)?;
+        let reload_catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            source.context.model(),
+            manifest.delegation_catalog_candidates(),
+        );
         let candidate_policy_digest = manifest
-            .delegation_policy(source.context.model().clone())?
+            .delegation_policy(source.context.model().clone(), &reload_catalog)?
             .map(|policy| policy.digest());
         if candidate_policy_digest != source.delegation_policy_digest {
             return Err(agent_core::prompt::PromptError::Invalid(
@@ -1277,7 +1281,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let digest = parsed.delegation_policy(model).unwrap().map(|p| p.digest());
+        let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            &model,
+            parsed.delegation_catalog_candidates(),
+        );
+        let digest = parsed
+            .delegation_policy(model, &catalog)
+            .unwrap()
+            .map(|p| p.digest());
         let mut runtime = Runtime::new_headless();
         runtime.apply_prompt_stack(stack).unwrap();
         runtime.retain_prompt_reload_source(path.clone(), context, None, digest.clone());

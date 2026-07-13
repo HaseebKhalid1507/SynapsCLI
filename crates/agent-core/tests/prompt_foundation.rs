@@ -1,4 +1,13 @@
+use agent_core::orchestration::{CatalogEntry, CatalogSnapshot};
 use agent_core::prompt::*;
+
+fn trusted_catalog(models: &[&str]) -> CatalogSnapshot {
+    CatalogSnapshot::from_entries(models.iter().map(|model| CatalogEntry {
+        model: QualifiedModelId::parse(*model).unwrap(),
+        available: true,
+        worker_eligible: true,
+    }))
+}
 
 fn module(id: &str, priority: u16, selectors: PromptSelectors, content: &str) -> PromptModule {
     PromptModule::new(
@@ -46,7 +55,10 @@ modules:
         "schema: synaps-prompt/1\nkernel: k\npolicies:\n  delegation:\n    mode: enforced\n    allowed_models: [anthropic/claude-haiku]\n    max_concurrent_workers: 2\n    max_total_workers: 4\n"
     )
     .unwrap()
-    .delegation_policy(QualifiedModelId::parse("anthropic/claude-sonnet").unwrap())
+    .delegation_policy(
+        QualifiedModelId::parse("anthropic/claude-sonnet").unwrap(),
+        &trusted_catalog(&["anthropic/claude-sonnet", "anthropic/claude-haiku"]),
+    )
     .unwrap()
     .unwrap();
     assert_eq!(policy.max_concurrent_workers, 2);
@@ -64,7 +76,10 @@ fn manifest_compiles_exact_cross_provider_grants_and_rejects_ambiguous_shapes() 
     )
     .unwrap();
     let policy = manifest
-        .delegation_policy(QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap())
+        .delegation_policy(
+            QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap(),
+            &trusted_catalog(&["openai-codex/gpt-5.6-sol", "anthropic/claude-opus-4-7"]),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(policy.effective_choices().len(), 2);
@@ -76,7 +91,10 @@ fn manifest_compiles_exact_cross_provider_grants_and_rejects_ambiguous_shapes() 
         "schema: synaps-prompt/1\nkernel: k\npolicies: {delegation: {enforcement: enforced, same_provider_models: [openai-codex/gpt], cross_provider_grants: [{id: bad, from_provider: openai-codex, to_provider: anthropic, allowed_models: [openai/gpt]}], max_concurrent_workers: 1, max_total_workers: 1}}\n"
     )
     .unwrap()
-    .delegation_policy(QualifiedModelId::parse("openai-codex/gpt").unwrap())
+    .delegation_policy(
+        QualifiedModelId::parse("openai-codex/gpt").unwrap(),
+        &trusted_catalog(&["openai-codex/gpt", "openai/gpt"]),
+    )
     .is_err());
 }
 

@@ -11,16 +11,35 @@ pub enum EnforcementMode {
     Enforced,
 }
 
+/// One runtime-owned model descriptor. A manifest can only narrow these capabilities.
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogEntry {
+    pub model: QualifiedModelId,
+    pub available: bool,
+    pub worker_eligible: bool,
+}
+
 /// Immutable, runtime-controlled worker catalog. Entries are exact qualified identities.
 #[derive(Clone, Debug, Serialize)]
 pub struct CatalogSnapshot {
     id: String,
     digest_sha256: String,
-    entries: BTreeSet<QualifiedModelId>,
+    entries: BTreeMap<QualifiedModelId, CatalogEntry>,
 }
 impl CatalogSnapshot {
+    /// Trusted convenience constructor for callers whose descriptors are all active workers.
     pub fn new(entries: impl IntoIterator<Item = QualifiedModelId>) -> Self {
-        let entries: BTreeSet<_> = entries.into_iter().collect();
+        Self::from_entries(entries.into_iter().map(|model| CatalogEntry {
+            model,
+            available: true,
+            worker_eligible: true,
+        }))
+    }
+    pub fn from_entries(entries: impl IntoIterator<Item = CatalogEntry>) -> Self {
+        let entries: BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|entry| (entry.model.clone(), entry))
+            .collect();
         let encoded = serde_json::to_vec(&entries).expect("catalog is serializable");
         let digest_sha256 = format!("{:x}", Sha256::digest(encoded));
         Self {
@@ -36,7 +55,9 @@ impl CatalogSnapshot {
         &self.digest_sha256
     }
     pub fn contains(&self, model: &QualifiedModelId) -> bool {
-        self.entries.contains(model)
+        self.entries
+            .get(model)
+            .is_some_and(|entry| entry.available && entry.worker_eligible)
     }
 }
 

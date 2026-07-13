@@ -135,8 +135,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         let context = agent_core::prompt::SelectionContext::new(model.clone(), None)
             .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            &model,
+            manifest.delegation_catalog_candidates(),
+        );
         let delegation_policy = manifest
-            .delegation_policy(model)
+            .delegation_policy(model, &catalog)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         let delegation_policy_digest = delegation_policy.as_ref().map(|policy| policy.digest());
         if let Some(policy) = delegation_policy {
