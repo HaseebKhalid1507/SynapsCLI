@@ -151,7 +151,17 @@ pub fn handle_engine_command(
     // Apply the runtime side effects of the (purely computed) result.
     match &result {
         CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
-        CommandResult::ThinkingChanged { budget, .. } => runtime.set_thinking_budget(*budget),
+        CommandResult::ThinkingChanged { level, budget } => {
+            // Named levels (max/ultra) use u32::MAX as a sentinel — do not
+            // write that sentinel to the budget field; let the runtime derive
+            // budget from the named level.
+            if let Some(parsed) = agent_core::reasoning::ReasoningLevel::parse(level) {
+                runtime.set_reasoning_level(parsed);
+            } else {
+                // Numeric custom budget path.
+                runtime.set_thinking_budget(*budget);
+            }
+        }
         _ => {}
     }
     Some(result)
@@ -183,23 +193,25 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
 }
 
 /// Parse a `/thinking` argument into a canonical (level, budget) pair.
+///
+/// Named levels `max` and `ultra` set `budget = None`-sentinel (`u32::MAX`)
+/// to signal "named only, no numeric budget". Callers receiving
+/// `ThinkingChanged` must check `level` first.
 pub fn parse_thinking_arg(arg: &str) -> Result<(String, u32), String> {
-    match arg {
-        "off" | "none" => Ok(("off".to_string(), 0)),
-        // `adaptive` matches the runtime's own label for budget=0
-        // (see core::models::thinking_level_for_budget). Adding
-        // it here removes the need for renderers to pre-intercept
-        // this case before delegating to the engine.
-        "adaptive" => Ok(("adaptive".to_string(), 0)),
-        "low" => Ok(("low".to_string(), 2048)),
-        "medium" | "med" => Ok(("medium".to_string(), 4096)),
-        "high" => Ok(("high".to_string(), 16384)),
-        "xhigh" | "max" => Ok(("xhigh".to_string(), 32768)),
-        other => {
-            if let Ok(n) = other.parse::<u32>() {
+    use agent_core::reasoning::ReasoningLevel;
+    match ReasoningLevel::parse(arg) {
+        Some(level) => {
+            let budget = level.to_legacy_budget().unwrap_or(u32::MAX);
+            Ok((level.as_str().to_string(), budget))
+        }
+        None => {
+            if let Ok(n) = arg.trim().parse::<u32>() {
                 Ok((format!("custom({})", n), n))
             } else {
-                Err(format!("unknown thinking level: {} (use off/adaptive/low/medium/high/xhigh or a number)", other))
+                Err(format!(
+                    "unknown thinking level: {} (use off/adaptive/low/medium/high/xhigh/max/ultra or a number)",
+                    arg
+                ))
             }
         }
     }
@@ -210,7 +222,9 @@ pub fn parse_thinking_arg(arg: &str) -> Result<(String, u32), String> {
 /// `parse_thinking_budget` also accepts; 0 is the adaptive sentinel).
 pub fn thinking_config_value(level: &str, budget: u32) -> String {
     match level {
-        "low" | "medium" | "high" | "xhigh" | "adaptive" => level.to_string(),
+        "off" | "adaptive" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
+            level.to_string()
+        }
         _ => budget.to_string(),
     }
 }
@@ -286,8 +300,24 @@ mod tests {
     fn thinking_config_value_is_parseable() {
         assert_eq!(thinking_config_value("medium", 4096), "medium");
         assert_eq!(thinking_config_value("adaptive", 0), "adaptive");
-        assert_eq!(thinking_config_value("off", 0), "0");
+        assert_eq!(thinking_config_value("off", 0), "off");
         assert_eq!(thinking_config_value("custom(8192)", 8192), "8192");
+        // max/ultra must persist as their exact names
+        assert_eq!(thinking_config_value("max", u32::MAX), "max");
+        assert_eq!(thinking_config_value("ultra", u32::MAX), "ultra");
+    }
+
+    #[test]
+    fn max_and_ultra_are_preserved_not_aliased_to_xhigh() {
+        let (level, budget) = parse_thinking_arg("max").unwrap();
+        assert_eq!(level, "max");
+        assert_eq!(budget, u32::MAX, "max sentinel is u32::MAX");
+        let (level, budget) = parse_thinking_arg("ultra").unwrap();
+        assert_eq!(level, "ultra");
+        assert_eq!(budget, u32::MAX);
+        let (level, budget) = parse_thinking_arg("xhigh").unwrap();
+        assert_eq!(level, "xhigh");
+        assert_eq!(budget, 32768);
     }
 
     #[test]

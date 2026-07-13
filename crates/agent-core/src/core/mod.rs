@@ -7,6 +7,7 @@ pub mod error;
 pub mod logging;
 pub mod models;
 pub mod protocol;
+pub mod reasoning;
 pub mod rpc_dispatch;
 pub mod rpc_protocol;
 pub mod session;

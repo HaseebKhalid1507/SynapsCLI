@@ -260,6 +260,10 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
+    /// Named reasoning level, parsed from the same `thinking = …` key.
+    /// When `Some`, this is the authoritative level. When `None`, fall back
+    /// to `thinking_budget` for legacy numeric-only values.
+    pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>,   // override auto-detected context window (tokens)
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     pub max_tool_output: usize,        // default 30000
@@ -306,6 +310,7 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
+            thinking_level: None,
             context_window: None,
             compaction_model: None,
             max_tool_output: 30000,
@@ -375,14 +380,8 @@ fn did_you_mean(key: &str) -> Option<&'static str> {
 
 
 fn parse_thinking_budget(val: &str) -> Option<u32> {
-    match val {
-        "low" => Some(2048),
-        "medium" => Some(4096),
-        "high" => Some(16384),
-        "xhigh" => Some(32768),
-        "adaptive" => Some(0), // sentinel: model decides depth
-        _ => val.parse::<u32>().ok(),
-    }
+    use crate::core::reasoning::ThinkingSpec;
+    ThinkingSpec::parse(val).and_then(|spec| spec.to_budget())
 }
 
 fn parse_comma_list(val: &str) -> Vec<String> {
@@ -578,9 +577,15 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => {
-                config.thinking_budget = parse_thinking_budget(val);
-                if config.thinking_budget.is_none() {
-                    config.warnings.push(format!("thinking = {val} — expected low|medium|high|xhigh|adaptive or a token count; thinking disabled"));
+                use crate::core::reasoning::ThinkingSpec;
+                match ThinkingSpec::parse(val) {
+                    Some(spec) => {
+                        config.thinking_level = Some(spec.to_level());
+                        config.thinking_budget = spec.to_budget();
+                    }
+                    None => {
+                        config.warnings.push(format!("thinking = {val} — expected off|adaptive|low|medium|high|xhigh|max|ultra or a token count; thinking disabled"));
+                    }
                 }
             }
             "compaction_model" => config.compaction_model = Some(val.to_string()),

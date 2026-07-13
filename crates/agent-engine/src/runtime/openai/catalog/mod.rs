@@ -44,7 +44,8 @@ pub use anthropic::{
     parse_anthropic_catalog_page, AnthropicCatalogPage,
 };
 pub use codex::{
-    codex_models_path, codex_models_url, codex_static_catalog_models, parse_codex_catalog_models,
+    codex_models_path, codex_models_url, codex_static_catalog_models,
+    codex_static_capability, parse_codex_catalog_models, validate_codex_level,
     PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
 };
 pub use generic::parse_generic_catalog_models;
@@ -139,6 +140,14 @@ pub enum ReasoningSupport {
     NvidiaInlineThinking,
     /// Generic OpenAI-compatible (capability unknown).
     GenericOpenAi,
+    /// OpenAI Codex (ChatGPT OAuth): named effort levels, exact set from catalog.
+    CodexNamed {
+        /// Ordered list of supported named reasoning effort strings from the
+        /// live catalog's `supported_reasoning_levels[].effort` field.
+        supported: Vec<agent_core::reasoning::ReasoningLevel>,
+        /// Default level from catalog's `default_reasoning_level`, if present.
+        default_level: Option<agent_core::reasoning::ReasoningLevel>,
+    },
     /// Not yet classified.
     Unknown,
 }
@@ -234,6 +243,22 @@ impl CatalogModel {
     /// Label if present, id otherwise.
     pub fn display_label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.id)
+    }
+
+    /// For Codex models: returns the exact ordered set of supported named levels,
+    /// or `None` if this model has no Codex-named capability data.
+    pub fn codex_supported_levels(&self) -> Option<&[agent_core::reasoning::ReasoningLevel]> {
+        match &self.reasoning {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        }
+    }
+
+    /// For Codex models: true iff the given level is in the supported set.
+    /// Always returns false for models without Codex-named capability data.
+    pub fn codex_supports_level(&self, level: agent_core::reasoning::ReasoningLevel) -> bool {
+        self.codex_supported_levels()
+            .is_some_and(|levels| levels.contains(&level))
     }
 }
 

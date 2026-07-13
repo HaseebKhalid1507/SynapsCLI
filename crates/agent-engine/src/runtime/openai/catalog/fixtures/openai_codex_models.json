@@ -6,7 +6,16 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 1
+      "priority": 1,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"},
+        {"effort": "max"},
+        {"effort": "ultra"}
+      ],
+      "default_reasoning_level": "high"
     },
     {
       "slug": "gpt-5.6-terra",
@@ -14,7 +23,16 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 2
+      "priority": 2,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"},
+        {"effort": "max"},
+        {"effort": "ultra"}
+      ],
+      "default_reasoning_level": "high"
     },
     {
       "slug": "gpt-5.6-luna",
@@ -22,7 +40,15 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 3
+      "priority": 3,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"},
+        {"effort": "max"}
+      ],
+      "default_reasoning_level": "high"
     },
     {
       "slug": "gpt-5.5",
@@ -30,7 +56,14 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 7
+      "priority": 7,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"}
+      ],
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "gpt-5.4",
@@ -38,7 +71,14 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 16
+      "priority": 16,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"}
+      ],
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "gpt-5.4-mini",
@@ -46,7 +86,14 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 23
+      "priority": 23,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"}
+      ],
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "gpt-5.3-codex-spark",
@@ -54,7 +101,14 @@
       "visibility": "list",
       "supported_in_api": false,
       "context_window": 128000,
-      "priority": 26
+      "priority": 26,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"}
+      ],
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "codex-auto-review",

@@ -220,6 +220,10 @@ pub struct Runtime {
     /// Inputs retained from boot so callable reloads compile the same manifest selection.
     prompt_reload_source: Option<PromptReloadSource>,
     thinking_budget: u32,
+    /// Named reasoning level — canonical for Codex and future providers.
+    /// When set, overrides what `thinking_level()` returns. For legacy
+    /// Anthropic models this is derived from `thinking_budget` at read time.
+    named_level: Option<agent_core::reasoning::ReasoningLevel>,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
     /// `models::context_window_for_model`. Lets users cap context at e.g.
@@ -319,6 +323,7 @@ impl Runtime {
             prompt_generation: 0,
             prompt_reload_source: None,
             thinking_budget: 4096,
+            named_level: None,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -388,6 +393,7 @@ impl Runtime {
             prompt_generation: 0,
             prompt_reload_source: None,
             thinking_budget: 4096,
+            named_level: None,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -604,6 +610,26 @@ impl Runtime {
     }
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
+        // Sync named_level from budget so the two fields stay consistent.
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+    }
+
+    /// Set the named reasoning level. Updates `thinking_budget` from the level's
+    /// canonical budget when one exists; for Max/Ultra (no numeric budget),
+    /// leaves `thinking_budget` at its current value so legacy paths don't break.
+    pub fn set_reasoning_level(&mut self, level: agent_core::reasoning::ReasoningLevel) {
+        self.named_level = Some(level);
+        if let Some(budget) = level.to_legacy_budget() {
+            self.thinking_budget = budget;
+        }
+        // Max/Ultra: do NOT overwrite thinking_budget with u32::MAX.
+    }
+
+    /// Named reasoning level. Authoritative for Codex; derived from budget for Anthropic.
+    pub fn reasoning_level(&self) -> agent_core::reasoning::ReasoningLevel {
+        self.named_level.unwrap_or_else(|| {
+            agent_core::reasoning::ReasoningLevel::from_legacy_budget(self.thinking_budget)
+        })
     }
 
     pub fn set_compaction_model(&mut self, model: Option<String>) {
@@ -632,7 +658,10 @@ impl Runtime {
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
-        if let Some(budget) = config.thinking_budget {
+        // Named level takes priority over raw budget.
+        if let Some(level) = config.thinking_level {
+            self.set_reasoning_level(level);
+        } else if let Some(budget) = config.thinking_budget {
             self.set_thinking_budget(budget);
         }
         self.context_window_override = config.context_window;
@@ -760,7 +789,12 @@ impl Runtime {
     }
 
     pub fn thinking_level(&self) -> &str {
-        crate::core::models::thinking_level_for_budget(self.thinking_budget)
+        // For Max/Ultra the named_level wins; for legacy budget-only levels
+        // we fall through to the legacy bucketing.
+        match self.named_level {
+            Some(level) => level.as_str(),
+            None => crate::core::models::thinking_level_for_budget(self.thinking_budget),
+        }
     }
 
     /// Check if the OAuth token is expired and refresh it if needed.
@@ -1252,6 +1286,7 @@ impl Clone for Runtime {
             prompt_generation: self.prompt_generation,
             prompt_reload_source: self.prompt_reload_source.clone(),
             thinking_budget: self.thinking_budget,
+            named_level: self.named_level,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),
