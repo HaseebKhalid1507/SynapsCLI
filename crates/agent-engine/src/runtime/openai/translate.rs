@@ -512,4 +512,29 @@ mod tests {
             json!({"type": "object"})
         );
     }
+
+    /// Regression for session 20260427-235907-2185:
+    ///   400 "Invalid 'tools[18].name': string does not match pattern.
+    ///        Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."
+    /// MCP/extension names carry `.`/`:` separators; the OAI wire name must
+    /// be sanitized and must round-trip back to the original for execution.
+    #[test]
+    fn mcp_tool_names_are_sanitized_for_oai_wire_and_round_trip() {
+        let schema = vec![json!({
+            "name": "ext__lsrf-manager__managerApi.cloudfrontInvalidate",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let (tools, map) = tools_to_oai(&schema);
+        let wire = &tools[0].function.name;
+        assert!(
+            wire.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "wire name must match ^[a-zA-Z0-9_-]+$: {wire}"
+        );
+        assert_eq!(
+            map.to_original(wire),
+            "ext__lsrf-manager__managerApi.cloudfrontInvalidate",
+            "sanitized wire name must map back to the executable tool name"
+        );
+    }
 }
