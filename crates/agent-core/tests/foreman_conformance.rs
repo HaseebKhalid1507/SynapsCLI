@@ -26,6 +26,7 @@ fn sonnet_foreman_cannot_finish_after_delegating_without_reconciliation() {
         registry.completion_gate(),
         CompletionGate::Blocked { .. }
     ));
+    registry.mark_starting(&worker).unwrap();
     registry.mark_running(&worker).unwrap();
     registry
         .mark_terminal(&worker, WorkerTerminal::Completed)
@@ -54,6 +55,7 @@ fn kimi_foreman_does_not_take_over_after_one_unchanged_poll() {
             WorkerWritePolicy::NonOverlappingPaths(vec!["src/**".into()]),
         )
         .unwrap();
+    registry.mark_starting(&worker).unwrap();
     registry.mark_running(&worker).unwrap();
 
     // The first observation establishes a baseline; only a repeated fingerprint

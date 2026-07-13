@@ -182,6 +182,12 @@ impl Tool for SubagentStartTool {
             reg.register(handle);
         }
 
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&handle_id) {
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
+        }
+
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
         let thread_handle = std::thread::spawn(move || {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
@@ -194,9 +200,9 @@ impl Tool for SubagentStartTool {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
+                    Err(_) => {
                         state_t.write().unwrap().status =
-                            SubagentStatus::Failed(format!("tokio runtime: {}", e));
+                            SubagentStatus::Failed("runtime initialization failed".into());
                         return;
                     }
                 };
@@ -214,7 +220,7 @@ impl Tool for SubagentStartTool {
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND
@@ -325,7 +331,7 @@ impl Tool for SubagentStartTool {
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
+                                    crate::StreamEvent::Session(SessionEvent::Error(_)) => return Err("provider request failed".into()),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }
@@ -446,12 +452,21 @@ impl Tool for SubagentStartTool {
             );
         });
 
-        // ── Wire thread handle into the already-registered entry ─────────────
+        // ── Attach the already-persisted handle to the started thread ──────────
         {
             let mut reg = registry.lock().unwrap();
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
+        }
+        if let Err(error) = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .unwrap()
+            .mark_running(&handle_id)
+        {
+            return Err(RuntimeError::Tool(error));
         }
 
         Ok(json!({

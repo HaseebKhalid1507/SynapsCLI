@@ -460,7 +460,8 @@ impl Runtime {
         let reload_catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
             source.context.model(),
             manifest.delegation_catalog_candidates(),
-        );
+        )
+        .map_err(|error| agent_core::prompt::PromptError::Invalid(error.into()))?;
         let candidate_policy_digest = manifest
             .delegation_policy(source.context.model().clone(), &reload_catalog)?
             .map(|policy| policy.digest());
@@ -1284,7 +1285,8 @@ mod tests {
         let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
             &model,
             parsed.delegation_catalog_candidates(),
-        );
+        )
+        .unwrap();
         let digest = parsed
             .delegation_policy(model, &catalog)
             .unwrap()

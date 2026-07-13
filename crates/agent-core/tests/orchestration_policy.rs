@@ -42,6 +42,7 @@ fn lifecycle_completion_and_overlap_are_enforced() {
             WorkerWritePolicy::NonOverlappingPaths(vec!["src/**".into()]),
         )
         .unwrap();
+    r.mark_starting(&h).unwrap();
     r.mark_running(&h).unwrap();
     assert!(matches!(
         r.completion_gate(),
@@ -99,6 +100,7 @@ fn telemetry_is_bounded_and_fingerprint_progress_resets_stall_state() {
             WorkerWritePolicy::ReadOnly,
         )
         .unwrap();
+    r.mark_starting(&h).unwrap();
     r.mark_running(&h).unwrap();
     for _ in 0..300 {
         r.poll(&h, "unchanged").unwrap();

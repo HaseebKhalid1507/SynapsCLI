@@ -138,7 +138,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
             &model,
             manifest.delegation_catalog_candidates(),
-        );
+        )
+        .map_err(|error| crate::RuntimeError::Config(error.into()))?;
         let delegation_policy = manifest
             .delegation_policy(model.clone(), &catalog)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
@@ -149,7 +150,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             ));
         } else {
             runtime.install_orchestration(Arc::new(
-                crate::orchestration::OrchestrationRuntime::baseline(model.clone(), 8, 64),
+                crate::orchestration::OrchestrationRuntime::baseline(model.clone(), 8, 64)
+                    .map_err(|error| crate::RuntimeError::Config(error.into()))?,
             ));
         }
         let user = opts
@@ -173,7 +175,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         let foreground = agent_core::prompt::QualifiedModelId::parse(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         runtime.install_orchestration(Arc::new(
-            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64),
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
+                .map_err(|error| crate::RuntimeError::Config(error.into()))?,
         ));
         runtime.set_system_prompt(legacy_prompt);
     }

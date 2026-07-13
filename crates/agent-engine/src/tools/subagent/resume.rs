@@ -177,9 +177,9 @@ impl Tool for SubagentResumeTool {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
+                    Err(_) => {
                         state_t.write().unwrap().status =
-                            SubagentStatus::Failed(format!("tokio runtime: {}", e));
+                            SubagentStatus::Failed("runtime initialization failed".into());
                         return;
                     }
                 };
@@ -197,7 +197,7 @@ impl Tool for SubagentResumeTool {
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND
@@ -314,7 +314,7 @@ impl Tool for SubagentResumeTool {
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
+                                    crate::StreamEvent::Session(SessionEvent::Error(_)) => return Err("provider request failed".into()),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }

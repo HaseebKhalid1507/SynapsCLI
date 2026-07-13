@@ -70,7 +70,8 @@ pub(crate) fn run(action: PromptAction) -> anyhow::Result<()> {
             let catalog = agent_engine::orchestration::OrchestrationRuntime::trusted_catalog(
                 &foreground,
                 loaded.delegation_catalog_candidates(),
-            );
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
             let mode = loaded
                 .delegation_policy(foreground, &catalog)?
                 .map(|policy| policy.mode)

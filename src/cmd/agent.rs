@@ -250,9 +250,13 @@ pub async fn run(config_path: String, trigger_context: String) {
             );
             std::process::exit(1);
         });
-    runtime.install_orchestration(Arc::new(
-        agent_engine::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64),
-    ));
+    let orchestration =
+        agent_engine::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
+            .unwrap_or_else(|_| {
+                log(agent_name, "FATAL: foreground model is not routable");
+                std::process::exit(1);
+            });
+    runtime.install_orchestration(Arc::new(orchestration));
     runtime.set_system_prompt(soul);
 
     // Handoff path for watcher_exit tool

@@ -19,7 +19,8 @@ pub(crate) fn create_tool_context() -> ToolContext {
             event_queue: None,
             secret_prompt: None,
             orchestration: Some(std::sync::Arc::new(
-                crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64),
+                crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
+                    .expect("test foreground is routable"),
             )),
         },
         limits: ToolLimits {

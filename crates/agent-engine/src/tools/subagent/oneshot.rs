@@ -131,9 +131,8 @@ impl Tool for SubagentTool {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
-                        let _ =
-                            result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                    Err(_) => {
+                        let _ = result_tx.send(Err("runtime initialization failed".into()));
                         return;
                     }
                 };
@@ -143,7 +142,7 @@ impl Tool for SubagentTool {
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND

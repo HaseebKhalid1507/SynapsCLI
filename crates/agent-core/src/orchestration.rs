@@ -67,6 +67,8 @@ pub struct CrossProviderGrant {
     pub from_provider: String,
     pub to_provider: String,
     pub allowed_models: BTreeSet<QualifiedModelId>,
+    /// Trusted Unix expiry. `None` is retained for compatibility with pinned policy files.
+    pub expires_at_unix: Option<u64>,
 }
 impl CrossProviderGrant {
     pub fn new(
@@ -92,7 +94,15 @@ impl CrossProviderGrant {
             from_provider,
             to_provider,
             allowed_models,
+            expires_at_unix: None,
         })
+    }
+    pub fn expiring_at(mut self, expires_at_unix: u64) -> Result<Self, &'static str> {
+        if expires_at_unix == 0 {
+            return Err("invalid cross-provider grant expiry");
+        }
+        self.expires_at_unix = Some(expires_at_unix);
+        Ok(self)
     }
 }
 
@@ -101,7 +111,8 @@ impl CrossProviderGrant {
 pub enum DispatchFailureCode {
     InvalidQualifiedModel,
     CatalogModelUnknown,
-    ProviderNotAllowed,
+    CrossProviderGrantRequired,
+    CrossProviderGrantExpired,
     ModelNotAllowed,
     ConcurrencyLimit,
     TotalWorkerLimit,
@@ -112,7 +123,8 @@ impl DispatchFailureCode {
         match self {
             Self::InvalidQualifiedModel => "invalid_qualified_model",
             Self::CatalogModelUnknown => "catalog_model_unknown",
-            Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::CrossProviderGrantRequired => "cross_provider_grant_required",
+            Self::CrossProviderGrantExpired => "cross_provider_grant_expired",
             Self::ModelNotAllowed => "model_not_allowed",
             Self::ConcurrencyLimit => "concurrency_limit",
             Self::TotalWorkerLimit => "total_limit",
@@ -244,6 +256,19 @@ impl DelegationPolicy {
         })
     }
     pub fn authorize(&self, model: &QualifiedModelId) -> Result<Option<&str>, DispatchDenied> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.authorize_at(model, now)
+    }
+    /// Atomically evaluates exact model, provenance, grant id and expiry against one
+    /// trusted clock sample supplied by the runtime.
+    pub fn authorize_at(
+        &self,
+        model: &QualifiedModelId,
+        now_unix: u64,
+    ) -> Result<Option<&str>, DispatchDenied> {
         if !self.catalog.contains(model) {
             return Err(DispatchDenied::new(
                 DispatchFailureCode::CatalogModelUnknown,
@@ -264,6 +289,14 @@ impl DelegationPolicy {
             .iter()
             .find(|g| g.to_provider == model.provider() && g.allowed_models.contains(model))
         {
+            if grant
+                .expires_at_unix
+                .is_some_and(|expiry| now_unix >= expiry)
+            {
+                return Err(DispatchDenied::new(
+                    DispatchFailureCode::CrossProviderGrantExpired,
+                ));
+            }
             return Ok(Some(&grant.grant_id));
         }
         if self
@@ -273,7 +306,9 @@ impl DelegationPolicy {
         {
             Err(DispatchDenied::new(DispatchFailureCode::ModelNotAllowed))
         } else {
-            Err(DispatchDenied::new(DispatchFailureCode::ProviderNotAllowed))
+            Err(DispatchDenied::new(
+                DispatchFailureCode::CrossProviderGrantRequired,
+            ))
         }
     }
     pub fn effective_choices(&self) -> &[QualifiedModelId] {
@@ -350,6 +385,7 @@ impl DispatchDenied {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Dispatched,
+    Starting,
     Running,
     Terminal,
     Collected,
@@ -417,7 +453,7 @@ impl WorkerRegistry {
     }
     pub fn rollback_dispatch(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
         let worker = self.workers.get(h).ok_or("unknown worker")?;
-        if worker.state != State::Dispatched {
+        if worker.state != State::Dispatched && worker.state != State::Starting {
             return Err("worker already started");
         }
         self.workers.remove(h);
@@ -438,7 +474,12 @@ impl WorkerRegistry {
         if self
             .workers
             .values()
-            .filter(|w| matches!(w.state, State::Dispatched | State::Running))
+            .filter(|w| {
+                matches!(
+                    w.state,
+                    State::Dispatched | State::Starting | State::Running
+                )
+            })
             .count()
             >= self.policy.max_concurrent_workers
         {
@@ -515,8 +556,11 @@ impl WorkerRegistry {
         });
         Ok(())
     }
+    pub fn mark_starting(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
+        self.transition(h, &[State::Dispatched], State::Starting, "worker.starting")
+    }
     pub fn mark_running(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
-        self.transition(h, &[State::Dispatched], State::Running, "worker.running")
+        self.transition(h, &[State::Starting], State::Running, "worker.running")
     }
     pub fn poll(&mut self, h: &WorkerHandle, fingerprint: &str) -> Result<(), &'static str> {
         let w = self.workers.get_mut(h).ok_or("unknown worker")?;
@@ -616,7 +660,10 @@ impl WorkerRegistry {
             .workers
             .iter()
             .filter(|(_, w)| {
-                matches!(w.state, State::Dispatched | State::Running) && overlaps(&w.writes, path)
+                matches!(
+                    w.state,
+                    State::Dispatched | State::Starting | State::Running
+                ) && overlaps(&w.writes, path)
             })
             .map(|(h, _)| h.0.clone())
             .collect();
