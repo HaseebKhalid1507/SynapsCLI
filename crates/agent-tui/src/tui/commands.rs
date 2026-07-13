@@ -404,6 +404,23 @@ pub(super) async fn handle_command(
     }
 
     match cmd {
+        "prompt" => match arg.trim() {
+            "reload" | "apply" => match runtime.reload_prompt() {
+                Ok(generation) => app.push_msg(ChatMessage::System(format!(
+                    "prompt applied (generation {generation})"
+                ))),
+                Err(error) => app.push_msg(ChatMessage::Error(format!(
+                    "prompt reload rejected: {error}"
+                ))),
+            },
+            "status" | "" => match runtime.prompt_inspection_json() {
+                Some(status) => app.push_msg(ChatMessage::System(status)),
+                None => app.push_msg(ChatMessage::Error("no prompt manifest is active".into())),
+            },
+            _ => app.push_msg(ChatMessage::Error(
+                "usage: /prompt [status|reload|apply]".into(),
+            )),
+        },
         "clear" => {
             app.save_session().await;
             app.transcript.clear();
@@ -427,15 +444,6 @@ pub(super) async fn handle_command(
             // Non-empty args are intercepted by handle_engine_command above
             // (set + persist); only the empty-arg picker case reaches here.
             return CommandAction::OpenModels;
-        }
-        "prompt" => {
-            let summary = runtime.prompt_inspection_json().unwrap_or_else(|| {
-                format!(
-                    "prompt: {} bytes; orchestration: advisory/unconfigured",
-                    runtime.system_prompt().map(str::len).unwrap_or(0)
-                )
-            });
-            app.push_msg(ChatMessage::System(summary));
         }
         "system" => {
             if arg.is_empty() {

@@ -200,6 +200,13 @@ pub async fn emit_after_tool_call(
 
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
+#[derive(Clone)]
+struct PromptReloadSource {
+    manifest: PathBuf,
+    context: agent_core::prompt::SelectionContext,
+    user_module: Option<agent_core::prompt::PromptModule>,
+}
+
 pub struct Runtime {
     client: Client,
     auth: Arc<RwLock<AuthState>>,
@@ -209,6 +216,8 @@ pub struct Runtime {
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
     prompt_generation: u64,
+    /// Inputs retained from boot so callable reloads compile the same manifest selection.
+    prompt_reload_source: Option<PromptReloadSource>,
     thinking_budget: u32,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
@@ -307,6 +316,7 @@ impl Runtime {
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
+            prompt_reload_source: None,
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
@@ -375,6 +385,7 @@ impl Runtime {
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
+            prompt_reload_source: None,
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
@@ -419,6 +430,38 @@ impl Runtime {
 
     pub fn prompt_generation(&self) -> u64 {
         self.prompt_generation
+    }
+
+    pub fn retain_prompt_reload_source(
+        &mut self,
+        manifest: PathBuf,
+        context: agent_core::prompt::SelectionContext,
+        user_module: Option<agent_core::prompt::PromptModule>,
+    ) {
+        self.prompt_reload_source = Some(PromptReloadSource {
+            manifest,
+            context,
+            user_module,
+        });
+    }
+
+    /// Recompile retained manifest inputs, validate, then atomically install the candidate.
+    pub fn reload_prompt(&mut self) -> std::result::Result<u64, agent_core::prompt::PromptError> {
+        let source = self.prompt_reload_source.clone().ok_or_else(|| {
+            agent_core::prompt::PromptError::Invalid("no prompt manifest is active".into())
+        })?;
+        let raw = std::fs::read_to_string(&source.manifest).map_err(|_| {
+            agent_core::prompt::PromptError::Invalid("prompt manifest is unavailable".into())
+        })?;
+        let manifest = agent_core::prompt::PromptManifest::parse(&raw)?;
+        let registry = manifest.registry(source.manifest.parent())?;
+        let candidate = agent_core::prompt::compile_prompt_stack(
+            &manifest,
+            &registry,
+            &source.context,
+            source.user_module,
+        )?;
+        self.apply_prompt_stack(candidate)
     }
 
     /// Atomically validate and install a compiled stack. Failed validation leaves all state intact.
@@ -1157,6 +1200,7 @@ impl Clone for Runtime {
             system_prompt: self.system_prompt.clone(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,
+            prompt_reload_source: self.prompt_reload_source.clone(),
             thinking_budget: self.thinking_budget,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
