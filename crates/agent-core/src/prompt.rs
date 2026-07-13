@@ -554,6 +554,28 @@ impl PromptStack {
     pub fn composed(&self) -> &str {
         &self.composed
     }
+    /// Validate a candidate stack completely before the caller atomically swaps it.
+    pub fn validate_hot_reload(&self, candidate: &PromptStack) -> Result<(), PromptError> {
+        if self.context.model != candidate.context.model {
+            return Err(PromptError::Invalid(
+                "hot reload cannot change foreground model".into(),
+            ));
+        }
+        let immutable = |stack: &PromptStack| {
+            stack
+                .modules
+                .iter()
+                .filter(|module| matches!(module.mutability, ModuleMutability::ImmutablePolicy))
+                .map(|module| (module.id.as_str().to_owned(), module.sha256.clone()))
+                .collect::<Vec<_>>()
+        };
+        if immutable(self) != immutable(candidate) {
+            return Err(PromptError::Invalid(
+                "hot reload cannot change immutable policy".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn provenance(&self, delegation_policy_digest: impl Into<String>) -> PromptProvenance {
         PromptProvenance {
             prompt_schema: PROMPT_SCHEMA.into(),
