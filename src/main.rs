@@ -189,6 +189,11 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Offline modular prompt validation and inspection.
+    Prompt {
+        #[command(subcommand)]
+        action: cmd::prompt::PromptAction,
+    },
     /// Tool-surface utilities (schema export, etc.)
     Tools {
         #[command(subcommand)]
@@ -246,6 +251,9 @@ async fn main() -> anyhow::Result<()> {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        }
+        Some(Command::Prompt { action }) => {
+            cmd::prompt::run(action)?;
         }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
