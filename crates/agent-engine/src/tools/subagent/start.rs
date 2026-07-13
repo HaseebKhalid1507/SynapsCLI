@@ -93,6 +93,8 @@ impl Tool for SubagentStartTool {
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
         let requested_model = params["model"].as_str();
+        // Validate the registry before authorization, id allocation, or event emission;
+        // the same borrow is reused below when publishing the authorized handle.
         let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
             RuntimeError::Tool("subagent_start requires a subagent_registry in ToolContext".into())
         })?;
@@ -152,12 +154,6 @@ impl Tool for SubagentStartTool {
         let start_time       = std::time::Instant::now();
         let parent_queue     = ctx.capabilities.event_queue.clone();
         let handle_id_inner  = handle_id.clone();
-
-        // ── Fail fast if no registry — before spawning an unregistered thread ──
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "subagent_start requires a subagent_registry in ToolContext".to_string()
-            ))?;
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can

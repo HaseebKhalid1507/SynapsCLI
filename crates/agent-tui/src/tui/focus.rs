@@ -148,6 +148,14 @@ impl ModalStack {
     }
 
     /// Number of open modal panes (does not count the implicit `Chat` base).
+    ///
+    /// Used under `debug_assertions` (stack-integrity checks), the `testing`
+    /// feature (harness API), and in unit tests. In a normal release library
+    /// build none of those gates are active, so we suppress the lint there.
+    #[cfg_attr(
+        not(any(test, debug_assertions, feature = "testing")),
+        allow(dead_code)
+    )]
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
