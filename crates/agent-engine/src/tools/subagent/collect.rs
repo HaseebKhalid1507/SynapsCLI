@@ -67,6 +67,8 @@ impl Tool for SubagentCollectTool {
         let status = handle.status();
         let output: String = handle.partial_output();
         let elapsed = handle.elapsed_secs();
+        let model = handle.model.clone();
+        let terminal = handle.terminal_diagnostic();
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
@@ -107,11 +109,15 @@ impl Tool for SubagentCollectTool {
             }
         }
 
-        // Done — return full result including collected flag for idempotency signaling
+        // Done — return full result. The registry retains this record, making
+        // repeated collection diagnostically idempotent; `collected` signals
+        // idempotency to the caller.
         let mut body = json!({
             "handle_id": handle_id,
             "status":    status.as_str(),
             "output":    output,
+            "model":     model,
+            "terminal_cause": terminal,
             "collected": already_collected,
         });
         if let Some(reason) = status.failure_reason() {

@@ -540,6 +540,14 @@ impl WorkerRegistry {
         h: &WorkerHandle,
         _: WorkerTerminal,
     ) -> Result<(), &'static str> {
+        if self.workers.get(h).is_some_and(|worker| {
+            matches!(
+                worker.state,
+                State::Terminal | State::Collected | State::Reconciled
+            )
+        }) {
+            return Ok(());
+        }
         self.transition(h, &[State::Running], State::Terminal, "worker.terminal")
     }
     pub fn collect(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {

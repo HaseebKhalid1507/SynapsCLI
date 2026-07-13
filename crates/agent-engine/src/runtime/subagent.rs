@@ -23,6 +23,25 @@ pub struct SubagentResult {
 
 // ── SubagentStatus ───────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCategory {
+    Completed,
+    StartupFailed,
+    ExecutionFailed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TerminalDiagnostic {
+    pub category: TerminalCategory,
+    pub code: String,
+    pub stage: String,
+    pub correlation_id: String,
+    pub network_attempted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubagentStatus {
     Running,
@@ -48,6 +67,7 @@ pub struct SubagentState {
     /// Set by cancel() before the shutdown signal is sent.
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
+    pub terminal: Option<TerminalDiagnostic>,
 }
 
 impl SubagentState {
@@ -59,6 +79,7 @@ impl SubagentState {
             conversation_state: Vec::new(),
             finished_at: None,
             cancel_requested: false,
+            terminal: None,
         }
     }
 }
@@ -172,6 +193,10 @@ impl SubagentHandle {
         self.state.read().unwrap_or_else(|p| p.into_inner()).tool_log.clone()
     }
 
+    pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
+        self.state.read().unwrap().terminal.clone()
+    }
+
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
         self.state.read().unwrap_or_else(|p| p.into_inner()).conversation_state.clone()
@@ -271,6 +296,20 @@ impl SubagentRegistry {
 
     pub fn remove(&mut self, id: &str) -> Option<SubagentHandle> {
         self.handles.remove(id)
+    }
+
+    /// Consume only transport resources while retaining terminal diagnostics and
+    /// output under normal session retention.
+    pub fn release_finished_resources(&mut self, id: &str) {
+        if let Some(handle) = self.handles.get_mut(id) {
+            if handle.is_finished() {
+                handle.shutdown_tx.take();
+                handle.result_rx.take();
+                if let Some(thread) = handle.thread_handle.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
     }
 
     /// Returns (id, agent_name, status) for every tracked handle.
