@@ -166,6 +166,11 @@ impl Tool for SubagentResumeTool {
             reg.register(handle);
         }
 
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&handle_id) {
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
+        }
         // ── Spawn subagent thread ──────────────────────────────────────────────
         let thread_handle = std::thread::spawn(move || {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
@@ -441,6 +446,17 @@ impl Tool for SubagentResumeTool {
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
+        }
+        if let Err(error) = orchestration.mark_running(&handle_id) {
+            let mut handle = registry.lock().unwrap().remove(&handle_id);
+            if let Some(handle) = handle.as_mut() {
+                handle.cancel();
+            }
+            if let Some(handle) = handle {
+                let _ = handle.collect().await;
+            }
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
         }
 
         Ok(json!({

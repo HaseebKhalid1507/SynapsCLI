@@ -69,17 +69,13 @@ impl Tool for SubagentCollectTool {
         let elapsed = handle.elapsed_secs();
         let model = handle.model.clone();
         let terminal = handle.terminal_diagnostic();
-<<<<<<< HEAD
+        let authorization = handle.authorization.clone();
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
         if status != SubagentStatus::Running {
             handle.mark_collected();
         }
-=======
-        let authorization = handle.authorization.clone();
-        let _ = handle;
->>>>>>> a0f1e39 (retain authorization diagnostics across worker inspection)
         drop(reg);
 
         if status == SubagentStatus::Running {
@@ -123,7 +119,7 @@ impl Tool for SubagentCollectTool {
             "output":    output,
             "model":     model,
             "terminal_cause": terminal,
-<<<<<<< HEAD
+            "authorization": authorization,
             "collected": already_collected,
         });
         if let Some(reason) = status.failure_reason() {
@@ -209,10 +205,5 @@ mod tests {
         let reg = registry.lock().unwrap();
         let h = reg.get("sa_42").unwrap();
         assert!(h.is_collected(), "handle must be marked collected in registry");
-=======
-            "authorization": authorization
-        })
-        .to_string())
->>>>>>> a0f1e39 (retain authorization diagnostics across worker inspection)
     }
 }

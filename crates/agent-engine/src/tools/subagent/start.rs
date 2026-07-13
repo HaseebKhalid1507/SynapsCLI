@@ -467,6 +467,15 @@ impl Tool for SubagentStartTool {
             .unwrap()
             .mark_running(&handle_id)
         {
+            let thread = {
+                let mut reg = registry.lock().unwrap();
+                reg.get_mut(&handle_id).map(|handle| handle.cancel());
+                reg.remove(&handle_id)
+            };
+            if let Some(handle) = thread {
+                let _ = handle.collect().await;
+            }
+            orchestration.rollback(&handle_id);
             return Err(RuntimeError::Tool(error));
         }
 
