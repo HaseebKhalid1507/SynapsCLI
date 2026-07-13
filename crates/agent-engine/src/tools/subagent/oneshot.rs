@@ -123,8 +123,13 @@ impl Tool for SubagentTool {
         let tx_events_inner = ctx.channels.tx_events.clone();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&orchestration_id) {
+            orchestration.rollback(&orchestration_id);
+            return Err(RuntimeError::Tool(error));
+        }
 
-        let _thread_handle = std::thread::spawn(move || {
+        let thread_handle = match std::thread::Builder::new().spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -349,12 +354,25 @@ impl Tool for SubagentTool {
                 // result_tx is consumed inside the closure, so we can't send here —
                 // the oneshot receiver will see a RecvError, handled below.
             }
-        });
+        }) {
+            Ok(handle) => handle,
+            Err(_) => {
+                orchestration.rollback(&orchestration_id);
+                return Err(RuntimeError::Tool("worker thread initialization failed".into()));
+            }
+        };
+        if let Err(error) = orchestration.mark_running(&orchestration_id) {
+            drop(shutdown_tx);
+            let _ = thread_handle.join();
+            orchestration.rollback(&orchestration_id);
+            return Err(RuntimeError::Tool(error));
+        }
 
         let result = result_rx.await;
         let elapsed = start_time.elapsed().as_secs_f64();
 
         drop(shutdown_tx);
+        let _ = thread_handle.join();
 
         // One-shot workers have no separate collect call: every outcome must pass
         // through terminal, collected, and reconciled before this tool exits.

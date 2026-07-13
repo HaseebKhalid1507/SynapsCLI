@@ -405,6 +405,34 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_uses_the_full_lifecycle_before_terminal_collection() {
+        let foreground = model("anthropic/foreground");
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            1,
+            1,
+        ));
+        rt.resolve_and_authorize("sa_one_shot", None).unwrap();
+        rt.mark_starting("sa_one_shot").unwrap();
+        rt.mark_running("sa_one_shot").unwrap();
+        rt.finish_one_shot("sa_one_shot", WorkerTerminal::Completed)
+            .unwrap();
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+        let telemetry = rt.telemetry_json();
+        for event in [
+            "worker.dispatch_allowed",
+            "worker.starting",
+            "worker.running",
+            "worker.terminal",
+            "worker.collected",
+            "worker.reconciled",
+        ] {
+            assert!(telemetry.contains(event), "missing {event}: {telemetry}");
+        }
+    }
+
+    #[test]
     fn authorization_happens_before_a_worker_is_registered() {
         let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
             model("anthropic/foreground"),
