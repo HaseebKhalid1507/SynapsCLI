@@ -71,29 +71,20 @@ impl Tool for SubagentTool {
             .as_str()
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
-        let model_override = params["model"].as_str().map(|s| s.to_string());
+        let requested_model = params["model"].as_str();
+        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
+        let orchestration_id = format!("sa_{}", subagent_id);
+        let decision = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .resolve_and_authorize(&orchestration_id, requested_model)
+            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+        let model = decision.model.as_str().to_owned();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
-
-        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
-        let role = params
-            .get("role")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| RuntimeError::Tool(format!("Invalid role: {e}")))?
-            .unwrap_or(agent_core::orchestration::WorkerRole::Implementer);
-        let write_policy = params
-            .get("write_policy")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| RuntimeError::Tool(format!("Invalid write_policy: {e}")))?
-            .unwrap_or(agent_core::orchestration::WorkerWritePolicy::ReadOnly);
-        if let Some(policy) = &ctx.capabilities.orchestration {
-            policy.preflight(&model).map_err(RuntimeError::Tool)?;
-        }
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
@@ -108,14 +99,6 @@ impl Tool for SubagentTool {
 
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
         let task_preview: String = task.chars().take(80).collect();
-        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
-        let orchestration_id = format!("sa_{}", subagent_id);
-        // Authorization is deliberately before channel/thread/runtime creation.
-        if let Some(policy) = &ctx.capabilities.orchestration {
-            policy
-                .authorize_with_policy(&orchestration_id, &model, role, write_policy)
-                .map_err(RuntimeError::Tool)?;
-        }
 
         tracing::info!(
             "Dispatching subagent '{}' (id={}) with model {}",
@@ -496,7 +479,7 @@ mod tests {
             "agent": "",
             "system_prompt": "You are a concise test subagent. Reply with only: ok",
             "task": "Say ok",
-            "model": "claude-sonnet-4-6",
+            "model": "anthropic/claude-sonnet-4-6",
             "timeout": 1
         });
 

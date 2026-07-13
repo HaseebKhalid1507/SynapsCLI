@@ -4,6 +4,8 @@
 use super::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
 pub(crate) fn create_tool_context() -> ToolContext {
+    let foreground = agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6")
+        .expect("test foreground is qualified");
     ToolContext {
         channels: ToolChannels {
             tx_delta: None,
@@ -16,7 +18,9 @@ pub(crate) fn create_tool_context() -> ToolContext {
             subagent_registry: None,
             event_queue: None,
             secret_prompt: None,
-            orchestration: None,
+            orchestration: Some(std::sync::Arc::new(
+                crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64),
+            )),
         },
         limits: ToolLimits {
             max_tool_output: 30000,

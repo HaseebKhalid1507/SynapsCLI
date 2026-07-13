@@ -3,6 +3,7 @@ use agent_core::orchestration::{
     WorkerWritePolicy,
 };
 use agent_core::prompt::QualifiedModelId;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -14,6 +15,47 @@ struct Inner {
     registry: WorkerRegistry,
     handles: HashMap<String, agent_core::orchestration::WorkerHandle>,
 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthorizedWorkerModel {
+    pub model: QualifiedModelId,
+    pub selection_source: SelectionSource,
+    pub network_attempted: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    ForegroundInheritance,
+    ExplicitRequest,
+}
+impl SelectionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForegroundInheritance => "foreground_inheritance",
+            Self::ExplicitRequest => "explicit_request",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct DispatchDenial {
+    pub kind: &'static str,
+    pub code: &'static str,
+    pub requested_model: Option<String>,
+    pub foreground_model: String,
+    pub selection_source: SelectionSource,
+    pub network_attempted: bool,
+    pub remediation: &'static str,
+}
+impl std::fmt::Display for DispatchDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_string(self).unwrap_or_else(|_| self.code.into())
+        )
+    }
+}
+impl std::error::Error for DispatchDenial {}
 impl OrchestrationRuntime {
     /// Secure manifestless baseline: the exact foreground identity is the only
     /// worker choice in a deterministic runtime-controlled catalog.
@@ -42,6 +84,97 @@ impl OrchestrationRuntime {
             .registry
             .validate_dispatch(&model)
             .map_err(|e| format!("delegation denied: {}", e.code()))
+    }
+
+    /// Single parse/resolve/catalog/policy/limits decision point used by every
+    /// public spawn path. No credential or provider object is reachable here.
+    pub fn resolve_and_authorize(
+        &self,
+        runtime_handle: &str,
+        requested: Option<&str>,
+    ) -> Result<AuthorizedWorkerModel, DispatchDenial> {
+        let mut inner = self.inner.lock().unwrap();
+        let foreground = inner.registry.foreground_model().clone();
+        let selection_source = if requested.is_some() {
+            SelectionSource::ExplicitRequest
+        } else {
+            SelectionSource::ForegroundInheritance
+        };
+        let model = match requested {
+            Some(value) => QualifiedModelId::parse(value).map_err(|_| DispatchDenial {
+                kind: "dispatch_denied",
+                code: "invalid_qualified_model",
+                requested_model: None,
+                foreground_model: foreground.as_str().into(),
+                selection_source,
+                network_attempted: false,
+                remediation: "Omit model to inherit foreground or select an exact session choice.",
+            })?,
+            None => foreground.clone(),
+        };
+        if inner.handles.contains_key(runtime_handle) {
+            return Err(DispatchDenial {
+                kind: "dispatch_denied",
+                code: "duplicate_runtime_handle",
+                requested_model: Some(model.as_str().into()),
+                foreground_model: foreground.as_str().into(),
+                selection_source,
+                network_attempted: false,
+                remediation: "Use a new worker handle.",
+            });
+        }
+        let handle = inner
+            .registry
+            .authorize_dispatch(&model, WorkerRole::Implementer, WorkerWritePolicy::ReadOnly)
+            .map_err(|error| DispatchDenial {
+                kind: "dispatch_denied",
+                code: error.code(),
+                requested_model: Some(model.as_str().into()),
+                foreground_model: foreground.as_str().into(),
+                selection_source,
+                network_attempted: false,
+                remediation: "Omit model to inherit foreground or select an exact session choice.",
+            })?;
+        if let Err(error) = inner.registry.mark_running(&handle) {
+            let _ = inner.registry.rollback_dispatch(&handle);
+            return Err(DispatchDenial {
+                kind: "dispatch_denied",
+                code: error,
+                requested_model: Some(model.as_str().into()),
+                foreground_model: foreground.as_str().into(),
+                selection_source,
+                network_attempted: false,
+                remediation: "Retry with a new worker handle.",
+            });
+        }
+        inner.handles.insert(runtime_handle.to_owned(), handle);
+        Ok(AuthorizedWorkerModel {
+            model,
+            selection_source,
+            network_attempted: false,
+        })
+    }
+
+    pub fn effective_choices(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .registry
+            .policy()
+            .effective_choices()
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect()
+    }
+
+    pub fn foreground_model(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .registry
+            .foreground_model()
+            .as_str()
+            .to_owned()
     }
     pub fn authorize_with_policy(
         &self,
