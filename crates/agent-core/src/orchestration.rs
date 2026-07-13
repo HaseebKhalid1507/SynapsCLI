@@ -465,7 +465,18 @@ impl WorkerRegistry {
         Ok(())
     }
     pub fn validate_dispatch(&self, model: &QualifiedModelId) -> Result<(), DispatchDenied> {
-        self.policy.authorize(model)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.validate_dispatch_at(model, now)
+    }
+    pub fn validate_dispatch_at(
+        &self,
+        model: &QualifiedModelId,
+        now_unix: u64,
+    ) -> Result<(), DispatchDenied> {
+        self.policy.authorize_at(model, now_unix)?;
         if self.total >= self.policy.max_total_workers {
             return Err(DispatchDenied::new(DispatchFailureCode::TotalWorkerLimit));
         }
@@ -491,6 +502,19 @@ impl WorkerRegistry {
         role: WorkerRole,
         writes: WorkerWritePolicy,
     ) -> Result<WorkerHandle, DispatchDenied> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.authorize_dispatch_at(model, role, writes, now)
+    }
+    pub fn authorize_dispatch_at(
+        &mut self,
+        model: &QualifiedModelId,
+        role: WorkerRole,
+        writes: WorkerWritePolicy,
+        now_unix: u64,
+    ) -> Result<WorkerHandle, DispatchDenied> {
         self.emit(OrchestrationEvent {
             name: "worker.dispatch_requested",
             worker_id: None,
@@ -503,7 +527,7 @@ impl WorkerRegistry {
             worker_role: None,
             reason_code: None,
         });
-        if let Err(error) = self.validate_dispatch(model) {
+        if let Err(error) = self.validate_dispatch_at(model, now_unix) {
             self.emit(OrchestrationEvent {
                 name: "worker.dispatch_denied",
                 worker_id: None,

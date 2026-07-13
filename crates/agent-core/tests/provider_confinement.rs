@@ -8,6 +8,46 @@ fn model(value: &str) -> QualifiedModelId {
 }
 
 #[test]
+fn expiring_grant_uses_injected_trusted_time_and_exact_code() {
+    use agent_core::orchestration::{WorkerRegistry, WorkerRole, WorkerWritePolicy};
+    let foreground = model("openai/foreground");
+    let worker = model("anthropic/worker");
+    let policy = DelegationPolicy::with_grants(
+        foreground.clone(),
+        CatalogSnapshot::new([foreground.clone(), worker.clone()]),
+        [foreground],
+        [
+            CrossProviderGrant::new("grant-1", "openai", "anthropic", [worker.clone()])
+                .unwrap()
+                .expiring_at(100)
+                .unwrap(),
+        ],
+        1,
+        1,
+    )
+    .unwrap();
+    let mut registry = WorkerRegistry::new(policy);
+    let handle = registry
+        .authorize_dispatch_at(
+            &worker,
+            WorkerRole::Implementer,
+            WorkerWritePolicy::ReadOnly,
+            99,
+        )
+        .unwrap();
+    registry.rollback_dispatch(&handle).unwrap();
+    let denied = registry
+        .authorize_dispatch_at(
+            &worker,
+            WorkerRole::Implementer,
+            WorkerWritePolicy::ReadOnly,
+            100,
+        )
+        .unwrap_err();
+    assert_eq!(denied.code(), "cross_provider_grant_expired");
+}
+
+#[test]
 fn exact_qualified_identity_and_catalog_authority() {
     let foreground = model("openai-codex/gpt-5.6-sol");
     assert_eq!(foreground.provider(), "openai-codex");
