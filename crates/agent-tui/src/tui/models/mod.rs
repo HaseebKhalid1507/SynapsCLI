@@ -242,6 +242,9 @@ pub(crate) struct ExpandedModelsState {
     pub load_state: ExpandedLoadState,
 }
 
+/// Live catalog rows for a provider that should replace static main-section seeds.
+pub(crate) type ProviderCatalogOverride = Vec<(String, String)>; // (model_id, label)
+
 #[derive(Clone, Debug)]
 pub(crate) struct ModelsModalState {
     pub cursor: usize,
@@ -250,6 +253,10 @@ pub(crate) struct ModelsModalState {
     pub collapsed: HashSet<String>,
     pub favorites: BTreeSet<String>,
     pub expanded: Option<ExpandedModelsState>,
+    /// Live OpenAI Codex / Anthropic catalog overrides for main modal sections.
+    /// Populated asynchronously when the modal opens; static seeds remain until
+    /// a successful live list arrives (or while offline / loading).
+    pub provider_catalog_overrides: std::collections::BTreeMap<String, ProviderCatalogOverride>,
 }
 
 impl ModelsModalState {
@@ -271,6 +278,7 @@ impl ModelsModalState {
             collapsed: HashSet::new(),
             favorites,
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         }
     }
 
@@ -310,6 +318,57 @@ fn remove_favorite_compat(id: &str) {
         // Old configurations used both bare and claude/-qualified forms.
         let _ = synaps_cli::config::remove_favorite_model(wire_id);
         let _ = synaps_cli::config::remove_favorite_model(&format!("claude/{wire_id}"));
+    }
+}
+
+/// Providers whose main-section seeds should be replaced by live catalog rows
+/// when the Models modal opens (logged-in OAuth discovery).
+pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
+    &["anthropic", "openai-codex"]
+}
+
+/// Apply a live catalog result to both expanded state and main-section overrides.
+///
+/// On success, main sections for the provider switch from static seeds to the
+/// returned provider-qualified IDs. Errors leave static seeds in place.
+pub(crate) fn apply_model_list_result(
+    state: &mut ModelsModalState,
+    provider_key: &str,
+    result: Result<Vec<ExpandedModelEntry>, String>,
+) {
+    // Always update expanded view when it matches this provider.
+    set_expanded_models(
+        state,
+        provider_key,
+        match &result {
+            Ok(models) => Ok(models.clone()),
+            Err(err) => Err(err.clone()),
+        },
+    );
+
+    if let Ok(models) = result {
+        // Strip provider prefix to store bare model ids for section building,
+        // but keep labels. Entries already use provider-qualified runtime ids.
+        let prefix = format!("{provider_key}/");
+        let override_rows: ProviderCatalogOverride = models
+            .into_iter()
+            .filter_map(|model| {
+                let bare = model
+                    .id
+                    .strip_prefix(&prefix)
+                    .unwrap_or(model.id.as_str())
+                    .to_string();
+                if bare.trim().is_empty() {
+                    return None;
+                }
+                Some((bare, model.label))
+            })
+            .collect();
+        if !override_rows.is_empty() {
+            state
+                .provider_catalog_overrides
+                .insert(provider_key.to_string(), override_rows);
+        }
     }
 }
 
@@ -363,34 +422,35 @@ fn build_sections_from_parts(
             continue;
         }
 
-        let mut entries: Vec<ModelEntry> = provider_model_selections(&provider, availability)
-            .into_iter()
-            .map(|model| {
-                let (runtime_id, favorite_id) = if provider.key == "claude" {
-                    (model.id.clone(), format!("claude/{}", model.id))
-                } else {
-                    let full_id = format!("{}/{}", provider.key, model.id);
-                    (full_id.clone(), full_id)
-                };
-                ModelEntry {
-                    id: runtime_id.clone(),
-                    display_id: model.id.clone(),
-                    label: model.label.clone(),
-                    tier: model.tier.clone(),
-                    provider_key: provider.key.to_string(),
-                    provider_name: provider.name.to_string(),
-                    configured: true,
-                    is_current: current_model == runtime_id || current_fav == favorite_id,
-                    is_favorite: state
-                        .favorites
-                        .iter()
-                        .any(|id| normalize_favorite_id(id) == favorite_id),
-                    favorite_id,
-                    order: model.order,
-                }
-            })
-            .filter(|m| model_matches(m, &query, favorites_only))
-            .collect();
+        let mut entries: Vec<ModelEntry> =
+            provider_model_selections(&provider, availability, &state.provider_catalog_overrides)
+                .into_iter()
+                .map(|model| {
+                    let (runtime_id, favorite_id) = if provider.key == "claude" {
+                        (model.id.clone(), format!("claude/{}", model.id))
+                    } else {
+                        let full_id = format!("{}/{}", provider.key, model.id);
+                        (full_id.clone(), full_id)
+                    };
+                    ModelEntry {
+                        id: runtime_id.clone(),
+                        display_id: model.id.clone(),
+                        label: model.label.clone(),
+                        tier: model.tier.clone(),
+                        provider_key: provider.key.to_string(),
+                        provider_name: provider.name.to_string(),
+                        configured: true,
+                        is_current: current_model == runtime_id || current_fav == favorite_id,
+                        is_favorite: state
+                            .favorites
+                            .iter()
+                            .any(|id| normalize_favorite_id(id) == favorite_id),
+                        favorite_id,
+                        order: model.order,
+                    }
+                })
+                .filter(|m| model_matches(m, &query, favorites_only))
+                .collect();
         pin_favorites_first(&mut entries);
         if !entries.is_empty() || provider.auth_kind == DevProviderAuth::Cloud {
             sections.push(ModelSection {
@@ -491,6 +551,7 @@ struct ModelSelectionItem {
 fn provider_model_selections(
     provider: &DevProviderSelection,
     availability: &ProviderAvailability,
+    catalog_overrides: &std::collections::BTreeMap<String, ProviderCatalogOverride>,
 ) -> Vec<ModelSelectionItem> {
     if provider.auth_kind == DevProviderAuth::LocalModels {
         return availability
@@ -505,6 +566,21 @@ fn provider_model_selections(
                 order,
             })
             .collect();
+    }
+
+    if let Some(live) = catalog_overrides.get(provider.key) {
+        if !live.is_empty() {
+            return live
+                .iter()
+                .enumerate()
+                .map(|(order, (id, label))| ModelSelectionItem {
+                    id: id.clone(),
+                    label: label.clone(),
+                    tier: String::new(),
+                    order,
+                })
+                .collect();
+        }
     }
 
     provider_static_model_seeds(provider)
@@ -1122,6 +1198,7 @@ mod tests {
                 collapsed: HashSet::new(),
                 favorites: BTreeSet::from([favorite.to_string()]),
                 expanded: None,
+                provider_catalog_overrides: std::collections::BTreeMap::new(),
             };
             for current in ["claude-opus-4-7", "anthropic/claude-opus-4-7"] {
                 let sections = build_sections_from_parts(
@@ -1168,6 +1245,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::from(["claude/claude-opus-4-7".to_string()]),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
@@ -1201,6 +1279,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
@@ -1252,6 +1331,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "openai-codex/gpt-5.5",
@@ -1272,6 +1352,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let availability = ProviderAvailability {
             configured_static: BTreeSet::new(),
@@ -1311,6 +1392,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let availability = ProviderAvailability {
             configured_static: BTreeSet::from(["openrouter".to_string()]),
@@ -1345,6 +1427,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "xai-auth/grok-4.3",
@@ -1382,6 +1465,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "github-copilot/gpt-5.3-codex",
@@ -1425,6 +1509,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "google-gemini/gemini-2.5-pro",
@@ -1472,6 +1557,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         // No login for google-gemini in the logged_in set.
         let sections = build_sections_from_parts(
@@ -1494,6 +1580,7 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let availability = ProviderAvailability {
             configured_static: BTreeSet::from(["nvidia".to_string()]),
@@ -1520,5 +1607,135 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.id == "nvidia/stepfun-ai/step-3.5-flash"));
+    }
+    #[test]
+    fn live_catalog_override_replaces_stale_seeds_in_main_sections_with_provider_qualified_ids() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        // Stale static seeds would include gpt-5.5 etc; live list returns different IDs.
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Ok(vec![
+                ExpandedModelEntry::new(
+                    "openai-codex/gpt-5.3-codex".into(),
+                    "GPT-5.3 Codex".into(),
+                    false,
+                ),
+                ExpandedModelEntry::new("openai-codex/o3".into(), "o3".into(), false),
+            ]),
+        );
+        apply_model_list_result(
+            &mut state,
+            "anthropic",
+            Ok(vec![ExpandedModelEntry::new(
+                "anthropic/claude-sonnet-4-7".into(),
+                "Sonnet 4.7".into(),
+                false,
+            )]),
+        );
+
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.3-codex",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["anthropic", "openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        let codex_ids: Vec<_> = codex.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            codex_ids,
+            vec!["openai-codex/gpt-5.3-codex", "openai-codex/o3"]
+        );
+        assert!(!codex_ids.iter().any(|id| *id == "openai-codex/gpt-5.5"));
+
+        let anthropic = sections
+            .iter()
+            .find(|s| s.provider_key == "anthropic")
+            .expect("anthropic section");
+        let anthropic_ids: Vec<_> = anthropic.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(anthropic_ids, vec!["anthropic/claude-sonnet-4-7"]);
+        // Exact provider-qualified IDs only.
+        assert!(anthropic
+            .entries
+            .iter()
+            .all(|e| e.id.starts_with("anthropic/") && e.favorite_id.starts_with("anthropic/")));
+    }
+
+    #[test]
+    fn failed_live_catalog_keeps_static_main_section_seeds() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Err("model list failed: HTTP 500".into()),
+        );
+        assert!(state.provider_catalog_overrides.is_empty());
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        assert!(codex.entries.iter().any(|e| e.id == "openai-codex/gpt-5.5"));
+    }
+
+    #[test]
+    fn apply_model_list_result_also_updates_matching_expanded_state() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: Some(ExpandedModelsState {
+                provider_key: "anthropic".into(),
+                provider_name: "Anthropic".into(),
+                cursor: 0,
+                search: String::new(),
+                load_state: ExpandedLoadState::Loading,
+            }),
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        apply_model_list_result(
+            &mut state,
+            "anthropic",
+            Ok(vec![ExpandedModelEntry::new(
+                "anthropic/claude-haiku-4-5".into(),
+                "Haiku".into(),
+                false,
+            )]),
+        );
+        let expanded = state.expanded.as_ref().expect("expanded");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0].id, "anthropic/claude-haiku-4-5");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(state.provider_catalog_overrides.contains_key("anthropic"));
     }
 }

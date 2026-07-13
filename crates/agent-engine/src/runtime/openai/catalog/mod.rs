@@ -339,7 +339,7 @@ async fn fetch_anthropic_catalog_models(
 }
 
 /// Relative Anthropic models path for the broker allowlist (no host).
-fn anthropic_models_proxy_path(after_id: Option<&str>) -> String {
+pub fn anthropic_models_proxy_path(after_id: Option<&str>) -> String {
     // Keep query shape identical to `anthropic_models_url` without the host.
     let absolute = anthropic_models_url(after_id);
     absolute
@@ -410,6 +410,39 @@ impl ModelCatalogProvider for AnthropicCatalogProvider {
     }
 }
 
+/// True when a broker catalog error means "no credential / not logged in",
+/// so static seeds are an acceptable offline fallback.
+///
+/// Transport, HTTP status, parse, denial, and credential-shape failures must
+/// NOT fall through to static seeds — they are real errors.
+pub fn is_missing_credential_catalog_error(err: &str) -> bool {
+    // Prefer structured BrokerError Display forms when present.
+    // Note: broker_proxy_catalog_body wraps broker errors as
+    // `request failed: {BrokerError}` — so "request failed" alone is NOT
+    // a transport signal.
+    let lower = err.to_lowercase();
+
+    // Hard excludes: real operational failures must never fall back to seeds.
+    if lower.contains("model list failed")
+        || lower.contains("parse failed")
+        || lower.contains("broker denied")
+        || lower.contains("broker transport error")
+        || lower.contains("missing chatgpt account id")
+        || lower.contains("http 4")
+        || lower.contains("http 5")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+
+    lower.contains("no credential configured")
+        || lower.contains("unknown provider:")
+        || lower.contains("not logged")
+        || lower.contains("registration required")
+}
+
 impl ModelCatalogProvider for CodexCatalogProvider {
     fn provider_key(&self) -> &'static str {
         "openai-codex"
@@ -429,11 +462,7 @@ impl ModelCatalogProvider for CodexCatalogProvider {
                     parse_codex_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
                 }
                 Err(err) => {
-                    let lower = err.to_lowercase();
-                    if lower.contains("not configured")
-                        || lower.contains("unknown provider")
-                        || lower.contains("not logged")
-                    {
+                    if is_missing_credential_catalog_error(&err) {
                         Ok(codex_static_catalog_models())
                     } else {
                         Err(err)
@@ -1086,6 +1115,61 @@ mod tests {
             let path = codex_models_path(env!("CARGO_PKG_VERSION"));
             assert!(path.starts_with("/models?client_version="));
             assert!(path.contains(env!("CARGO_PKG_VERSION")));
+        }
+
+        #[test]
+        fn missing_credential_fallback_classifies_real_broker_not_configured_text() {
+            let not_configured = format!(
+                "request failed: {}",
+                crate::auth::BrokerError::NotConfigured("openai-codex".into())
+            );
+            assert!(
+                is_missing_credential_catalog_error(&not_configured),
+                "got: {not_configured}"
+            );
+            let unknown = format!(
+                "request failed: {}",
+                crate::auth::BrokerError::UnknownProvider("openai-codex".into())
+            );
+            assert!(
+                is_missing_credential_catalog_error(&unknown),
+                "got: {unknown}"
+            );
+        }
+
+        #[test]
+        fn missing_credential_fallback_does_not_hide_transport_http_parse_or_account_errors() {
+            for err in [
+                "request failed: broker transport error: connection reset",
+                "model list failed: HTTP 401",
+                "model list failed: HTTP 500",
+                "parse failed: missing field `models`",
+                "request failed: broker denied request: proxy path '/models' is not in the provider's endpoint allowlist",
+                "request failed: credential error: openai-codex credential is missing chatgpt account id",
+                "request failed: broker transport error: provider request failed: 403 Forbidden",
+            ] {
+                assert!(
+                    !is_missing_credential_catalog_error(err),
+                    "must not fallback for: {err}"
+                );
+            }
+        }
+    }
+
+    mod anthropic_paths {
+        use super::super::*;
+
+        #[test]
+        fn proxy_path_round_trips_limit_and_after_id() {
+            assert_eq!(anthropic_models_proxy_path(None), "/v1/models?limit=100");
+            assert_eq!(
+                anthropic_models_proxy_path(Some("claude-opus-4-7")),
+                "/v1/models?limit=100&after_id=claude-opus-4-7"
+            );
+            assert_eq!(
+                anthropic_models_proxy_path(Some("")),
+                "/v1/models?limit=100"
+            );
         }
     }
 

@@ -541,7 +541,7 @@ pub(crate) fn handle_model_list_arm(
 ) {
                 if let Some((provider_key, models_result)) = result {
                     if let Some(state) = app.models.as_mut() {
-                        models::set_expanded_models(state, &provider_key, models_result);
+                        models::apply_model_list_result(state, &provider_key, models_result);
                     }
                     app.request_redraw();
                 }

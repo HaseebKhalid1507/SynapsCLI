@@ -126,16 +126,35 @@ pub(crate) fn is_allowed_anthropic_path(path: &str) -> bool {
     if query.is_empty() {
         return false;
     }
+    let mut saw_limit = false;
+    let mut saw_after_id = false;
     for pair in query.split('&') {
         let Some((k, v)) = pair.split_once('=') else {
             return false;
         };
+        if v.is_empty() {
+            return false;
+        }
         match k {
-            "limit" | "after_id" if !v.is_empty() => {}
+            "limit" if !saw_limit => saw_limit = true,
+            "after_id" if !saw_after_id => saw_after_id = true,
             _ => return false,
         }
     }
+    // limit may be omitted only for bare /v1/models; when a query is present
+    // at least one allowed key must appear (already enforced by the loop).
     true
+}
+
+/// Headers applied by the broker for Anthropic OAuth catalog proxy requests.
+/// Bearer is set separately via `bearer_auth`; this list must NOT include
+/// `x-api-key` (OAuth tokens are never sent as API keys).
+pub(crate) fn anthropic_oauth_catalog_request_headers() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+        ("accept", "application/json"),
+    ]
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -1319,6 +1338,10 @@ pub struct LocalBroker {
     local_base_url: Option<String>,
     /// Test seam: overrides the pinned Anthropic usage URL.
     anthropic_usage_url: Option<String>,
+    /// Test seam: overrides Anthropic catalog base (host only; path still allowlisted).
+    anthropic_catalog_base_url: Option<String>,
+    /// Test seam: overrides OpenAI Codex catalog base (host only; path still allowlisted).
+    openai_codex_catalog_base_url: Option<String>,
     /// Test seam: overrides the pinned cloudcode-pa base URL.
     google_gemini_base_url: Option<String>,
     /// Time budget for buffered (non-streaming) requests.
@@ -1335,6 +1358,8 @@ impl LocalBroker {
             http,
             local_base_url: None,
             anthropic_usage_url: None,
+            anthropic_catalog_base_url: None,
+            openai_codex_catalog_base_url: None,
             google_gemini_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
@@ -1373,6 +1398,27 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_anthropic_usage_url(mut self, url: impl Into<String>) -> Self {
         self.anthropic_usage_url = Some(url.into());
+        self
+    }
+
+    /// Test seam: point Anthropic catalog proxy at a loopback host.
+    #[doc(hidden)]
+    pub fn with_anthropic_catalog_base_url_for_tests(
+        mut self,
+        base_url: impl Into<String>,
+    ) -> Self {
+        self.anthropic_catalog_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test seam: point OpenAI Codex catalog proxy at a loopback host.
+    #[doc(hidden)]
+    pub fn with_openai_codex_catalog_base_url_for_tests(
+        mut self,
+        base_url: impl Into<String>,
+    ) -> Self {
+        self.openai_codex_catalog_base_url =
+            Some(base_url.into().trim_end_matches('/').to_string());
         self
     }
 
@@ -1469,12 +1515,20 @@ impl LocalBroker {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
             let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
-            (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
+            let base = self
+                .openai_codex_catalog_base_url
+                .clone()
+                .unwrap_or_else(|| OPENAI_CODEX_BACKEND_BASE_URL.to_string());
+            (token.token, base)
         } else if request.provider == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
             let token = self.access_token(OAuthProviderId::Anthropic).await?;
-            (token.token, "https://api.anthropic.com".to_string())
+            let base = self
+                .anthropic_catalog_base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            (token.token, base)
         } else {
             (
                 self.resolve_static_key(&request.provider)?,
@@ -1482,10 +1536,12 @@ impl LocalBroker {
             )
         };
         let url = format!("{base}{}", request.path);
-        // For google-gemini we deny redirects explicitly: the upstream is
-        // pinned to cloudcode-pa.googleapis.com and any 3xx must not be
-        // followed with the bearer token attached.
-        let mut builder = if request.provider == "google-gemini" {
+        // Deny redirects for credential-bearing OAuth catalog traffic and
+        // google-gemini: a 3xx must not replay the bearer token off-origin.
+        let mut builder = if request.provider == "google-gemini"
+            || request.provider == "openai-codex"
+            || request.provider == "anthropic"
+        {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
@@ -1503,21 +1559,31 @@ impl LocalBroker {
         };
         builder = builder.bearer_auth(&key);
         if request.provider == "openai-codex" {
-            // ChatGPT backend requires the account id claim from the JWT.
-            if let Some(account_id) = super::extract_codex_account_id(&key) {
-                builder = builder.header("chatgpt-account-id", account_id);
-            }
+            // ChatGPT backend requires the account id. Prefer the stored
+            // credential claim; fall back to JWT extraction. Never silently omit.
+            let account_id = super::load_provider_auth("openai-codex")
+                .ok()
+                .flatten()
+                .and_then(|c| c.account_id)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| super::extract_codex_account_id(&key))
+                .ok_or_else(|| {
+                    BrokerError::Credential(
+                        "openai-codex credential is missing chatgpt account id".into(),
+                    )
+                })?;
             builder = builder
+                .header("chatgpt-account-id", account_id)
                 .header("originator", "synaps")
                 .header("OpenAI-Beta", "responses=experimental")
                 .header("accept", "application/json");
         }
         if request.provider == "anthropic" {
-            // Match Anthropic models listing auth: bearer + x-api-key + version.
-            builder = builder
-                .header("x-api-key", &key)
-                .header("anthropic-version", "2023-06-01")
-                .header("accept", "application/json");
+            // OAuth catalog: Bearer + anthropic-version + anthropic-beta.
+            // Do NOT send the OAuth token as x-api-key.
+            for (name, value) in anthropic_oauth_catalog_request_headers() {
+                builder = builder.header(*name, *value);
+            }
         }
         if request.provider == "github-copilot" {
             for (name, value) in super::github_copilot_models_request_headers() {
@@ -2576,6 +2642,9 @@ mod tests {
             "/v1/models?limit=",
             "/api/oauth/usage",
             "/v1/models?limit=100&evil=1",
+            "/v1/models?limit=100&limit=50",
+            "/v1/models?after_id=a&after_id=b",
+            "/v1/models?limit=100&after_id=a&limit=50",
         ] {
             let req = ProxyRequest {
                 provider: "anthropic".into(),
@@ -2589,6 +2658,43 @@ mod tests {
                 "anthropic path {path} must be denied"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_oauth_catalog_headers_are_bearer_version_beta_not_x_api_key() {
+        let headers = anthropic_oauth_catalog_request_headers();
+        let names: Vec<_> = headers.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"anthropic-version"));
+        assert!(names.contains(&"anthropic-beta"));
+        assert!(names.contains(&"accept"));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("x-api-key")));
+        assert!(!names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("authorization")));
+        let beta = headers
+            .iter()
+            .find(|(n, _)| *n == "anthropic-beta")
+            .map(|(_, v)| *v)
+            .expect("beta");
+        assert_eq!(beta, "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn anthropic_models_path_round_trip_and_rejects_duplicates() {
+        assert!(is_allowed_anthropic_path("/v1/models"));
+        assert!(is_allowed_anthropic_path("/v1/models?limit=100"));
+        assert!(is_allowed_anthropic_path(
+            "/v1/models?limit=100&after_id=claude-opus-4-7"
+        ));
+        assert!(!is_allowed_anthropic_path("/v1/models?limit=100&limit=50"));
+        assert!(!is_allowed_anthropic_path(
+            "/v1/models?after_id=a&after_id=b"
+        ));
+        // Round-trip the catalog helper path shape used by the engine.
+        let page0 = "/v1/models?limit=100";
+        let page1 = "/v1/models?limit=100&after_id=model-1";
+        assert!(is_allowed_anthropic_path(page0));
+        assert!(is_allowed_anthropic_path(page1));
     }
 
     /// google-gemini is pinned to the reviewed cloudcode-pa v1internal methods.

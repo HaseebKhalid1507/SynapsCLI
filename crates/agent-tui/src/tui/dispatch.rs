@@ -27,6 +27,50 @@ use super::*;
 
 use std::ops::ControlFlow;
 
+fn spawn_auto_catalog_refreshes(app: &App, runtime: &synaps_cli::Runtime) {
+    for &provider_key in models::auto_refresh_catalog_providers() {
+        let client = runtime.http_client().clone();
+        let tx = app.model_list_tx.clone();
+        let key = provider_key.to_string();
+        tokio::spawn(async move {
+            let result = synaps_cli::runtime::openai::catalog::fetch_catalog_models(&client, &key)
+                .await
+                .map(|models| {
+                    models
+                        .into_iter()
+                        .map(|model| {
+                            let full_id = model.runtime_id();
+                            let label = model.display_label().to_string();
+                            let mut metadata = Vec::new();
+                            if let Some(context) = model.context_tokens {
+                                metadata.push(if context >= 1_000_000 {
+                                    format!("{}M ctx", context / 1_000_000)
+                                } else if context >= 1_000 {
+                                    format!("{}K ctx", context / 1_000)
+                                } else {
+                                    format!("{context} ctx")
+                                });
+                            }
+                            match model.reasoning {
+                                synaps_cli::runtime::openai::catalog::ReasoningSupport::None => {}
+                                synaps_cli::runtime::openai::catalog::ReasoningSupport::Unknown => {}
+                                _ => metadata.push("thinking".to_string()),
+                            }
+                            if model.pricing.has_internal_reasoning_cost() {
+                                metadata.push("reasoning $".to_string());
+                            }
+                            models::ExpandedModelEntry::with_metadata(
+                                full_id, label, false, metadata,
+                            )
+                        })
+                        .collect()
+                });
+            let _ = tx.send((key, result));
+        });
+    }
+}
+
+
 /// The borrow bundle: everything `run()`'s event loop lends the dispatch for
 /// the duration of one `InputAction`. Constructed fresh per event at the call
 /// site and consumed by value, so no borrow outlives the arm.
@@ -189,6 +233,7 @@ pub(crate) async fn handle_input_action(
                     app.modal_stack.push(focus::PaneId::Models);
                     #[cfg(debug_assertions)]
                     focus::debug_assert_stack_sync(app);
+                    spawn_auto_catalog_refreshes(app, runtime);
                 }
                 CommandAction::OpenSettings => {
                     app.settings = Some(settings::SettingsState::new());
