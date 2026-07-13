@@ -38,6 +38,12 @@ pub struct GoogleGeminiModelDescriptor {
 /// authoritative and may reject models not enabled for a particular user.
 pub const GOOGLE_GEMINI_TEXT_MODELS: &[GoogleGeminiModelDescriptor] = &[
     GoogleGeminiModelDescriptor {
+        id: "gemini-pro-latest",
+        label: "Gemini Pro Latest",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
+    GoogleGeminiModelDescriptor {
         id: "gemini-3.1-pro-preview",
         label: "Gemini 3.1 Pro (Preview)",
         context_tokens: Some(1_048_576),
@@ -122,6 +128,7 @@ mod tests {
                 .map(|m| m.id)
                 .collect::<Vec<_>>(),
             vec![
+                "gemini-pro-latest",
                 "gemini-3.1-pro-preview",
                 "gemini-3-pro-preview",
                 "gemini-3.5-flash",
@@ -131,6 +138,16 @@ mod tests {
                 "gemini-2.5-flash",
             ]
         );
+    }
+
+    #[test]
+    fn catalog_exposes_exact_gemini_pro_latest_wire_id() {
+        let descriptor = google_gemini_model("gemini-pro-latest")
+            .expect("Gemini Code Assist wire ID must be in the trusted catalog");
+        assert_eq!(descriptor.id, "gemini-pro-latest");
+        assert!(google_gemini_static_catalog_models()
+            .iter()
+            .any(|model| model.runtime_id() == "google-gemini/gemini-pro-latest"));
     }
 
     #[test]

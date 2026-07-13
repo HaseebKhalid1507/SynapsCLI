@@ -570,6 +570,17 @@ mod tests {
     }
 
     #[test]
+    fn resolves_exact_gemini_pro_latest_code_assist_route() {
+        let route = resolve_route("google-gemini/gemini-pro-latest")
+            .expect("exact Gemini Code Assist wire ID must resolve locally");
+        assert_eq!(route.provider, "google-gemini");
+        assert_eq!(route.model, "gemini-pro-latest");
+        assert_eq!(route.endpoint, "https://cloudcode-pa.googleapis.com");
+        assert_eq!(route.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(route.wire, WireProtocol::GoogleGeminiCodeAssist);
+    }
+
+    #[test]
     fn resolves_openai_codex_without_requiring_eager_credentials() {
         std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
         let route = resolve_route("openai-codex/gpt-5.1-codex-mini").unwrap();
