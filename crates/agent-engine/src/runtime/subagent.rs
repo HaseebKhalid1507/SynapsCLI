@@ -18,6 +18,7 @@ pub struct SubagentResult {
     pub cache_creation_5m: Option<u64>,
     pub cache_creation_1h: Option<u64>,
     pub tool_count: u32,
+    pub timed_out: bool,
 }
 
 // ── SubagentStatus ───────────────────────────────────────────────────────────────

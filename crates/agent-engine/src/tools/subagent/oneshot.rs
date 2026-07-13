@@ -333,6 +333,7 @@ impl Tool for SubagentTool {
                                 cache_creation_5m: total_cache_5m,
                                 cache_creation_1h: total_cache_1h,
                                 tool_count,
+                                timed_out: true,
                             });
                         }
                     }
@@ -348,6 +349,7 @@ impl Tool for SubagentTool {
                     cache_creation_5m: total_cache_5m,
                     cache_creation_1h: total_cache_1h,
                     tool_count,
+                    timed_out: false,
                 })
             });
 
@@ -377,6 +379,9 @@ impl Tool for SubagentTool {
         // through terminal, collected, and reconciled before this tool exits.
         if let Some(policy) = &ctx.capabilities.orchestration {
             let terminal = match &result {
+                Ok(Ok(result)) if result.timed_out => {
+                    agent_core::orchestration::WorkerTerminal::TimedOut
+                }
                 Ok(Ok(_)) => agent_core::orchestration::WorkerTerminal::Completed,
                 Ok(Err(_)) | Err(_) => agent_core::orchestration::WorkerTerminal::Failed,
             };

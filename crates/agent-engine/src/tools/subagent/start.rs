@@ -372,6 +372,7 @@ impl Tool for SubagentStartTool {
                                     cache_creation_5m: total_cache_5m,
                                     cache_creation_1h: total_cache_1h,
                                     tool_count,
+                                timed_out: true,
                                 });
                             }
                         }
@@ -387,6 +388,7 @@ impl Tool for SubagentStartTool {
                         cache_creation_5m: total_cache_5m,
                         cache_creation_1h: total_cache_1h,
                         tool_count,
+                    timed_out: false,
                     })
                 });
 
