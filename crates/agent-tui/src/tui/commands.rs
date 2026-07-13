@@ -429,18 +429,12 @@ pub(super) async fn handle_command(
             return CommandAction::OpenModels;
         }
         "prompt" => {
-            let summary = if let Some(orchestration) = runtime.orchestration() {
-                format!(
-                    "prompt: {} bytes; orchestration telemetry: {}",
-                    runtime.system_prompt().map(str::len).unwrap_or(0),
-                    orchestration.telemetry_json()
-                )
-            } else {
+            let summary = runtime.prompt_inspection_json().unwrap_or_else(|| {
                 format!(
                     "prompt: {} bytes; orchestration: advisory/unconfigured",
                     runtime.system_prompt().map(str::len).unwrap_or(0)
                 )
-            };
+            });
             app.push_msg(ChatMessage::System(summary));
         }
         "system" => {

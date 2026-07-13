@@ -206,6 +206,9 @@ pub struct Runtime {
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
+    /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
+    effective_prompt: Option<agent_core::prompt::PromptStack>,
+    prompt_generation: u64,
     thinking_budget: u32,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
@@ -302,6 +305,8 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
+            effective_prompt: None,
+            prompt_generation: 0,
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
@@ -368,6 +373,8 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
+            effective_prompt: None,
+            prompt_generation: 0,
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
@@ -404,6 +411,40 @@ impl Runtime {
 
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    pub fn effective_prompt(&self) -> Option<&agent_core::prompt::PromptStack> {
+        self.effective_prompt.as_ref()
+    }
+
+    pub fn prompt_generation(&self) -> u64 {
+        self.prompt_generation
+    }
+
+    /// Atomically validate and install a compiled stack. Failed validation leaves all state intact.
+    pub fn apply_prompt_stack(
+        &mut self,
+        candidate: agent_core::prompt::PromptStack,
+    ) -> std::result::Result<u64, agent_core::prompt::PromptError> {
+        if let Some(current) = &self.effective_prompt {
+            current.validate_hot_reload(&candidate)?;
+        }
+        let composed = candidate.composed().to_owned();
+        self.effective_prompt = Some(candidate);
+        self.system_prompt = Some(composed);
+        self.prompt_generation = self.prompt_generation.saturating_add(1);
+        Ok(self.prompt_generation)
+    }
+
+    pub fn prompt_inspection_json(&self) -> Option<String> {
+        self.effective_prompt.as_ref().and_then(|stack| {
+            serde_json::to_string(&serde_json::json!({
+                "generation": self.prompt_generation,
+                "effective": stack.inspect(),
+                "token_estimate": stack.composed().len().div_ceil(4),
+            }))
+            .ok()
+        })
     }
 
     pub fn install_orchestration(
@@ -1114,6 +1155,8 @@ impl Clone for Runtime {
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
+            effective_prompt: self.effective_prompt.clone(),
+            prompt_generation: self.prompt_generation,
             thinking_budget: self.thinking_budget,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),

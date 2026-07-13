@@ -149,7 +149,9 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
         let stack = agent_core::prompt::compile_prompt_stack(&manifest, &registry, &context, user)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
-        runtime.set_system_prompt(stack.composed().to_owned());
+        runtime
+            .apply_prompt_stack(stack)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
     } else {
         runtime.set_system_prompt(legacy_prompt);
     }

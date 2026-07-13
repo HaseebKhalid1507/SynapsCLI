@@ -497,6 +497,7 @@ pub struct PromptProvenanceModule {
     pub sha256: String,
 }
 
+#[derive(Clone)]
 pub struct PromptStack {
     modules: Vec<PromptModule>,
     context: SelectionContext,
