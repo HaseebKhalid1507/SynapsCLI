@@ -151,6 +151,7 @@ fn empty_tool_context() -> ToolContext {
             subagent_registry: None,
             event_queue: None,
             secret_prompt: None,
+            orchestration: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

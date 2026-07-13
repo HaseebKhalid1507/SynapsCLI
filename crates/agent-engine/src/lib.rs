@@ -38,3 +38,5 @@ pub use watcher_types::{
     AgentConfig, AgentStatusInfo, ExitReason, HandoffState, SessionLimits, SessionStats,
     WatcherCommand, WatcherResponse,
 };
+
+pub mod orchestration;

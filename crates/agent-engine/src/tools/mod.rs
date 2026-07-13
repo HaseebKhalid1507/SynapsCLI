@@ -78,6 +78,9 @@ pub struct ToolCapabilities {
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
     pub secret_prompt: Option<SecretPromptHandle>,
+    /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
+    /// path must authorize before creating channels, threads, or provider runtimes.
+    pub orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
 }
 
 /// Configuration limits and timeouts.

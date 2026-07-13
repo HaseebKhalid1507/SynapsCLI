@@ -86,6 +86,13 @@ impl Tool for SubagentTool {
         let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
         let task_preview: String = task.chars().take(80).collect();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
+        let orchestration_id = format!("sa_{}", subagent_id);
+        // Authorization is deliberately before channel/thread/runtime creation.
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            policy
+                .authorize(&orchestration_id, &model)
+                .map_err(RuntimeError::Tool)?;
+        }
 
         tracing::info!(
             "Dispatching subagent '{}' (id={}) with model {}",

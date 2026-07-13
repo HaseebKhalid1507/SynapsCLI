@@ -1,0 +1,121 @@
+use agent_core::orchestration::{
+    CompletionGate, DelegationPolicy, WorkerRegistry, WorkerRole, WorkerTerminal, WorkerWritePolicy,
+};
+use agent_core::prompt::QualifiedModelId;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Session-scoped runtime enforcement shared by every subagent tool path.
+pub struct OrchestrationRuntime {
+    inner: Mutex<Inner>,
+}
+struct Inner {
+    registry: WorkerRegistry,
+    handles: HashMap<String, agent_core::orchestration::WorkerHandle>,
+}
+impl OrchestrationRuntime {
+    pub fn new(policy: DelegationPolicy) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                registry: WorkerRegistry::new(policy),
+                handles: HashMap::new(),
+            }),
+        }
+    }
+    pub fn authorize(&self, runtime_handle: &str, model: &str) -> Result<(), String> {
+        let model = QualifiedModelId::parse(model)
+            .map_err(|_| "delegation denied: invalid qualified model".to_string())?;
+        let mut inner = self.inner.lock().unwrap();
+        let handle = inner
+            .registry
+            .authorize_dispatch(&model, WorkerRole::Implementer, WorkerWritePolicy::ReadOnly)
+            .map_err(|e| format!("delegation denied: {}", e.code()))?;
+        inner
+            .registry
+            .mark_running(&handle)
+            .map_err(str::to_string)?;
+        inner.handles.insert(runtime_handle.to_string(), handle);
+        Ok(())
+    }
+    pub fn poll(&self, id: &str, fingerprint: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let h = inner
+            .handles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "unknown worker".to_string())?;
+        inner.registry.poll(&h, fingerprint).map_err(str::to_string)
+    }
+    pub fn steer(&self, id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let h = inner
+            .handles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "unknown worker".to_string())?;
+        inner.registry.steer(&h).map_err(str::to_string)
+    }
+    pub fn terminal_and_collect(&self, id: &str, terminal: WorkerTerminal) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let h = inner
+            .handles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "unknown worker".to_string())?;
+        inner
+            .registry
+            .mark_terminal(&h, terminal)
+            .map_err(str::to_string)?;
+        inner.registry.collect(&h).map_err(str::to_string)
+    }
+    pub fn reconcile(&self, id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let h = inner
+            .handles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "unknown worker".to_string())?;
+        inner.registry.reconcile(&h).map_err(str::to_string)
+    }
+    pub fn completion_gate(&self) -> CompletionGate {
+        self.inner.lock().unwrap().registry.completion_gate()
+    }
+    pub fn telemetry_json(&self) -> String {
+        serde_json::to_string(self.inner.lock().unwrap().registry.telemetry())
+            .unwrap_or_else(|_| "[]".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn model(s: &str) -> QualifiedModelId {
+        QualifiedModelId::parse(s).unwrap()
+    }
+    #[test]
+    fn authorization_happens_before_a_worker_is_registered() {
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            model("anthropic/foreground"),
+            [model("anthropic/worker")],
+            1,
+            1,
+        ));
+        assert!(rt.authorize("sa_1", "openrouter/worker").is_err());
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+        rt.authorize("sa_2", "anthropic/worker").unwrap();
+        assert!(matches!(
+            rt.completion_gate(),
+            CompletionGate::Blocked { .. }
+        ));
+        rt.poll("sa_2", "same").unwrap();
+        rt.steer("sa_2").unwrap();
+        rt.terminal_and_collect("sa_2", WorkerTerminal::Completed)
+            .unwrap();
+        assert!(matches!(
+            rt.completion_gate(),
+            CompletionGate::Blocked { .. }
+        ));
+        rt.reconcile("sa_2").unwrap();
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+    }
+}

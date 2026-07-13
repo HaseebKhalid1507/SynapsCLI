@@ -752,6 +752,7 @@ impl Runtime {
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
+                                        orchestration: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -882,6 +883,7 @@ impl Runtime {
                                                     subagent_registry: Some(registry_inner),
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
+                                                    orchestration: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,

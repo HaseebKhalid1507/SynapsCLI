@@ -1053,6 +1053,7 @@ mod tests {
                 subagent_registry: None,
                 event_queue: None,
                 secret_prompt: None,
+                orchestration: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,

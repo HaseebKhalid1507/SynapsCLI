@@ -104,6 +104,12 @@ impl Tool for SubagentResumeTool {
         let task_full = resumed_task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
+        // Authorization is deliberately before channel/thread/runtime creation.
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            policy
+                .authorize(&handle_id, &model)
+                .map_err(RuntimeError::Tool)?;
+        }
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
