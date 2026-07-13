@@ -271,8 +271,9 @@ impl StreamMethods {
                                 agent_core::orchestration::CompletionGate::Warning { workers } => {
                                     let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                                         format!(
-                                            "completion advisory: {} worker(s) still require collection/reconciliation",
-                                            workers.len()
+                                            "completion advisory: {} worker(s) still require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                            workers.len(),
+                                            workers.join(", ")
                                         ),
                                     )));
                                 }
@@ -281,8 +282,9 @@ impl StreamMethods {
                                         SessionEvent::MessageHistory(messages),
                                     ));
                                     return Err(RuntimeError::Tool(format!(
-                                        "completion blocked: {} worker(s) require collection/reconciliation",
-                                        workers.len()
+                                        "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                        workers.len(),
+                                        workers.join(", ")
                                     )));
                                 }
                             }

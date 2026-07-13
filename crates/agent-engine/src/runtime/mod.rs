@@ -861,8 +861,9 @@ impl Runtime {
                             orchestration.completion_gate()
                         {
                             return Err(crate::RuntimeError::Tool(format!(
-                                "completion blocked: {} worker(s) require collection/reconciliation",
-                                workers.len()
+                                "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                workers.len(),
+                                workers.join(", ")
                             )));
                         }
                     }

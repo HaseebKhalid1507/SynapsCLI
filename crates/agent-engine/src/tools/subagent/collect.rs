@@ -6,17 +6,18 @@
 //! start async, check when you want the answer.
 //!
 
-use serde_json::{json, Value};
-use crate::{Result, RuntimeError};
 use super::super::{Tool, ToolContext};
 use crate::runtime::subagent::SubagentStatus;
-
+use crate::{Result, RuntimeError};
+use serde_json::{json, Value};
 
 pub struct SubagentCollectTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentCollectTool {
-    fn name(&self) -> &str { "subagent_collect" }
+    fn name(&self) -> &str {
+        "subagent_collect"
+    }
 
     fn description(&self) -> &str {
         "Check if a reactive subagent is done and return its result. Non-blocking — \
@@ -43,26 +44,25 @@ impl Tool for SubagentCollectTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let handle_id = params["handle_id"].as_str()
+        let handle_id = params["handle_id"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
+        })?;
 
         let mut reg = registry.lock().unwrap();
-        let handle = reg.get_mut(&handle_id)
-            .ok_or_else(|| RuntimeError::Tool(
-                format!(
-                    "No subagent found with handle_id '{}'. \
+        let handle = reg.get_mut(&handle_id).ok_or_else(|| {
+            RuntimeError::Tool(format!(
+                "No subagent found with handle_id '{}'. \
                      Finished handles are retained for {} minutes after completion \
                      and then garbage-collected.",
-                    handle_id,
-                    crate::runtime::subagent::FINISHED_HANDLE_TTL.as_secs() / 60
-                )
-            ))?;
+                handle_id,
+                crate::runtime::subagent::FINISHED_HANDLE_TTL.as_secs() / 60
+            ))
+        })?;
 
         let status = handle.status();
         let output: String = handle.partial_output();
@@ -91,29 +91,35 @@ impl Tool for SubagentCollectTool {
                 "status":       "running",
                 "elapsed_secs": (elapsed * 10.0).round() / 10.0,
                 "output_so_far": output_so_far
-            }).to_string());
+            })
+            .to_string());
         }
 
-        // Drive the orchestration terminal transition only on the FIRST
-        // collection. Handles are retained for diagnostically idempotent
-        // re-reads (`collected: true`); re-running the policy transition on a
-        // repeat read would fail (`mark_terminal` is single-shot) and would
-        // wrongly turn an idempotent read into an error.
-        if !already_collected {
-            if let Some(orchestration) = &ctx.capabilities.orchestration {
+        // Lifecycle (intentional caller attestation — never auto-reconcile):
+        // - First terminal collect always drives terminal_and_collect.
+        // - Any terminal collect with reconciled=true must reconcile, including
+        //   a repeated collect after an earlier unreconciled read. Gating
+        //   reconcile on !already_collected left workers stuck in Collected
+        //   forever and blocked completion.
+        // - terminal_and_collect stays first-collect-only so diagnostic
+        //   re-reads remain read-many idempotent at the handle layer.
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            if !already_collected {
                 let terminal = match status {
-                    SubagentStatus::Completed => agent_core::orchestration::WorkerTerminal::Completed,
+                    SubagentStatus::Completed => {
+                        agent_core::orchestration::WorkerTerminal::Completed
+                    }
                     SubagentStatus::TimedOut => agent_core::orchestration::WorkerTerminal::TimedOut,
                     _ => agent_core::orchestration::WorkerTerminal::Failed,
                 };
                 orchestration
                     .terminal_and_collect(&handle_id, terminal)
                     .map_err(RuntimeError::Tool)?;
-                if params["reconciled"].as_bool().unwrap_or(false) {
-                    orchestration
-                        .reconcile(&handle_id)
-                        .map_err(RuntimeError::Tool)?;
-                }
+            }
+            if params["reconciled"].as_bool().unwrap_or(false) {
+                orchestration
+                    .reconcile(&handle_id)
+                    .map_err(RuntimeError::Tool)?;
             }
         }
 
@@ -139,9 +145,11 @@ impl Tool for SubagentCollectTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::subagent::{
+        SubagentHandle, SubagentRegistry, SubagentState, SubagentStatus,
+    };
     use crate::tools::test_helpers::create_tool_context;
     use crate::tools::Tool;
-    use crate::runtime::subagent::{SubagentRegistry, SubagentHandle, SubagentState, SubagentStatus};
     use serde_json::json;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::sync::{mpsc, oneshot};
@@ -172,9 +180,7 @@ mod tests {
         )
     }
 
-    fn make_ctx_with_registry(
-        registry: Arc<Mutex<SubagentRegistry>>,
-    ) -> crate::tools::ToolContext {
+    fn make_ctx_with_registry(registry: Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
         let mut ctx = create_tool_context();
         ctx.capabilities.subagent_registry = Some(registry);
         // This suite exercises the registry-level collected/idempotency
@@ -196,27 +202,189 @@ mod tests {
         registry.lock().unwrap().register(handle);
 
         // First collect — should return collected=false (not yet collected before this call)
-        let result1 = tool.execute(
-            json!({"handle_id": "sa_42"}),
-            make_ctx_with_registry(registry.clone()),
-        ).await.unwrap();
+        let result1 = tool
+            .execute(
+                json!({"handle_id": "sa_42"}),
+                make_ctx_with_registry(registry.clone()),
+            )
+            .await
+            .unwrap();
         let body1: serde_json::Value = serde_json::from_str(&result1).unwrap();
         assert_eq!(body1["status"], "completed");
         assert_eq!(body1["output"], "result text");
-        assert_eq!(body1["collected"], false, "first collect should report collected=false");
+        assert_eq!(
+            body1["collected"], false,
+            "first collect should report collected=false"
+        );
 
         // Second collect — same handle still in registry (not yet reaped), collected=true
-        let result2 = tool.execute(
-            json!({"handle_id": "sa_42"}),
-            make_ctx_with_registry(registry.clone()),
-        ).await.unwrap();
+        let result2 = tool
+            .execute(
+                json!({"handle_id": "sa_42"}),
+                make_ctx_with_registry(registry.clone()),
+            )
+            .await
+            .unwrap();
         let body2: serde_json::Value = serde_json::from_str(&result2).unwrap();
         assert_eq!(body2["status"], "completed");
-        assert_eq!(body2["collected"], true, "second collect should report collected=true");
+        assert_eq!(
+            body2["collected"], true,
+            "second collect should report collected=true"
+        );
 
         // After collect, the registry should have the handle marked collected
         let reg = registry.lock().unwrap();
         let h = reg.get("sa_42").unwrap();
-        assert!(h.is_collected(), "handle must be marked collected in registry");
+        assert!(
+            h.is_collected(),
+            "handle must be marked collected in registry"
+        );
+    }
+
+    /// Dispatch a finished handle through orchestration so collect can drive
+    /// the terminal → collected → reconciled lifecycle. Returns (registry, orch).
+    fn make_orch_ctx(
+        handle_id: &str,
+        output: &str,
+    ) -> (
+        Arc<Mutex<SubagentRegistry>>,
+        Arc<crate::orchestration::OrchestrationRuntime>,
+        crate::tools::ToolContext,
+    ) {
+        use crate::orchestration::OrchestrationRuntime;
+        use agent_core::orchestration::CompletionGate;
+
+        let foreground = agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6")
+            .expect("test foreground is qualified");
+        let orch =
+            Arc::new(OrchestrationRuntime::baseline(foreground, 8, 64).expect("baseline runtime"));
+        orch.authorize(handle_id, "anthropic/claude-sonnet-4-6")
+            .expect("authorize worker");
+        assert!(
+            matches!(orch.completion_gate(), CompletionGate::Blocked { .. }),
+            "authorized worker must block completion until reconciled"
+        );
+
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        registry
+            .lock()
+            .unwrap()
+            .register(make_finished_handle(handle_id, output));
+
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx.capabilities.orchestration = Some(orch.clone());
+        (registry, orch, ctx)
+    }
+
+    // (a) first collect without reconciled leaves gate blocked; second collect
+    // with reconciled=true advances Collected → Reconciled and allows completion.
+    #[tokio::test]
+    async fn deferred_reconcile_on_repeat_collect_unblocks_completion() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (registry, orch, ctx) = make_orch_ctx("sa_deferred", "result text");
+
+        let result1 = tool
+            .execute(
+                json!({"handle_id": "sa_deferred", "reconciled": false}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        let body1: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        assert_eq!(body1["collected"], false);
+        assert!(
+            matches!(orch.completion_gate(), CompletionGate::Blocked { .. }),
+            "first collect without reconcile must leave completion blocked"
+        );
+
+        // Rebuild ctx so the same shared orch/registry participate on the
+        // second call (create_tool_context would allocate a fresh baseline).
+        let mut ctx2 = create_tool_context();
+        ctx2.capabilities.subagent_registry = Some(registry.clone());
+        ctx2.capabilities.orchestration = Some(orch.clone());
+
+        let result2 = tool
+            .execute(
+                json!({"handle_id": "sa_deferred", "reconciled": true}),
+                ctx2,
+            )
+            .await
+            .unwrap();
+        let body2: serde_json::Value = serde_json::from_str(&result2).unwrap();
+        assert_eq!(body2["collected"], true);
+        assert_eq!(
+            orch.completion_gate(),
+            CompletionGate::Allowed,
+            "repeat collect with reconciled=true must unblock completion"
+        );
+    }
+
+    // (b) first collect with reconciled=true allows completion immediately.
+    #[tokio::test]
+    async fn first_collect_with_reconcile_allows_completion() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (_registry, orch, ctx) = make_orch_ctx("sa_first_true", "result text");
+
+        let result = tool
+            .execute(
+                json!({"handle_id": "sa_first_true", "reconciled": true}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(body["collected"], false);
+        assert_eq!(
+            orch.completion_gate(),
+            CompletionGate::Allowed,
+            "first collect with reconciled=true must allow completion"
+        );
+    }
+
+    // (c) repeated collect with reconciled=true remains read-many idempotent.
+    #[tokio::test]
+    async fn repeated_reconcile_true_is_idempotent() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (registry, orch, ctx) = make_orch_ctx("sa_repeat_true", "result text");
+
+        let result1 = tool
+            .execute(
+                json!({"handle_id": "sa_repeat_true", "reconciled": true}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        let body1: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        assert_eq!(body1["collected"], false);
+        assert_eq!(orch.completion_gate(), CompletionGate::Allowed);
+
+        let mut ctx2 = create_tool_context();
+        ctx2.capabilities.subagent_registry = Some(registry.clone());
+        ctx2.capabilities.orchestration = Some(orch.clone());
+
+        let result2 = tool
+            .execute(
+                json!({"handle_id": "sa_repeat_true", "reconciled": true}),
+                ctx2,
+            )
+            .await
+            .unwrap();
+        let body2: serde_json::Value = serde_json::from_str(&result2).unwrap();
+        assert_eq!(body2["collected"], true);
+        assert_eq!(
+            orch.completion_gate(),
+            CompletionGate::Allowed,
+            "repeat reconciled collect must stay Allowed (idempotent)"
+        );
+        // Registry handle remains readable and marked collected.
+        let reg = registry.lock().unwrap();
+        assert!(reg.get("sa_repeat_true").unwrap().is_collected());
     }
 }
