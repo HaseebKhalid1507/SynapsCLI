@@ -442,6 +442,20 @@ impl PromptManifest {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptProvenance {
+    pub prompt_schema: String,
+    pub prompt_stack: Vec<PromptProvenanceModule>,
+    pub delegation_policy_digest: String,
+    pub foreground_model: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptProvenanceModule {
+    pub id: String,
+    pub version: String,
+    pub sha256: String,
+}
+
 pub struct PromptStack {
     modules: Vec<PromptModule>,
     context: SelectionContext,
@@ -498,6 +512,22 @@ impl PromptStack {
     }
     pub fn composed(&self) -> &str {
         &self.composed
+    }
+    pub fn provenance(&self, delegation_policy_digest: impl Into<String>) -> PromptProvenance {
+        PromptProvenance {
+            prompt_schema: PROMPT_SCHEMA.into(),
+            prompt_stack: self
+                .modules
+                .iter()
+                .map(|module| PromptProvenanceModule {
+                    id: module.id.as_str().into(),
+                    version: module.version.clone(),
+                    sha256: module.sha256.clone(),
+                })
+                .collect(),
+            delegation_policy_digest: delegation_policy_digest.into(),
+            foreground_model: self.context.model.as_str().into(),
+        }
     }
     pub fn inspect(&self) -> PromptInspection<'_> {
         PromptInspection {

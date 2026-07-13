@@ -27,6 +27,8 @@ pub struct Session {
     /// ID of the session created by compacting this one (forward link)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_into: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_provenance: Option<crate::prompt::PromptProvenance>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -67,6 +69,7 @@ impl Session {
             abort_context: None,
             parent_session: None,
             compacted_into: None,
+            prompt_provenance: None,
         }
     }
 
@@ -118,6 +121,7 @@ impl Session {
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
+            prompt_provenance: None,
         }
     }
 
