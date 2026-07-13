@@ -194,7 +194,46 @@ impl SubagentHandle {
     }
 
     pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
-        self.state.read().unwrap().terminal.clone()
+        if let Some(diagnostic) = self.state.read().unwrap().terminal.clone() {
+            return Some(diagnostic);
+        }
+        match self.status() {
+            SubagentStatus::Running => None,
+            SubagentStatus::Completed => Some(TerminalDiagnostic {
+                category: TerminalCategory::Completed,
+                code: "completed".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+            }),
+            SubagentStatus::TimedOut => Some(TerminalDiagnostic {
+                category: TerminalCategory::TimedOut,
+                code: "worker_timeout".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+            }),
+            SubagentStatus::Failed(message) => {
+                let startup = message.starts_with("Failed to create subagent runtime")
+                    || message.starts_with("tokio runtime:");
+                Some(TerminalDiagnostic {
+                    category: if startup {
+                        TerminalCategory::StartupFailed
+                    } else {
+                        TerminalCategory::ExecutionFailed
+                    },
+                    code: if startup {
+                        "runtime_construction_failed"
+                    } else {
+                        "inference_failed"
+                    }
+                    .into(),
+                    stage: if startup { "runtime" } else { "inference" }.into(),
+                    correlation_id: self.id.clone(),
+                    network_attempted: !startup,
+                })
+            }
+        }
     }
 
     /// Snapshot of conversation state (for resume).
