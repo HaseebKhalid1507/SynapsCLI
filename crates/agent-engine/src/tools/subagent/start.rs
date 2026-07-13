@@ -48,7 +48,20 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
+                    "description": "Provider-qualified model override (for example anthropic/claude-sonnet-4-6)."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"],
+                    "description": "Typed orchestration role."
+                },
+                "write_policy": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
+                    ],
+                    "description": "Declared write isolation and path scopes."
                 },
                 "timeout": {
                     "type": "integer",
@@ -83,6 +96,20 @@ impl Tool for SubagentStartTool {
         let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
         let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
+        let role: agent_core::orchestration::WorkerRole = params
+            .get("role")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| RuntimeError::Tool(format!("Invalid role: {e}")))?
+            .unwrap_or(agent_core::orchestration::WorkerRole::Implementer);
+        let write_policy: agent_core::orchestration::WorkerWritePolicy = params
+            .get("write_policy")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| RuntimeError::Tool(format!("Invalid write_policy: {e}")))?
+            .unwrap_or(agent_core::orchestration::WorkerWritePolicy::ReadOnly);
         if let Some(policy) = &ctx.capabilities.orchestration {
             policy.preflight(&model).map_err(RuntimeError::Tool)?;
         }
@@ -105,7 +132,7 @@ impl Tool for SubagentStartTool {
         // Authorization is deliberately before channel/thread/runtime creation.
         if let Some(policy) = &ctx.capabilities.orchestration {
             policy
-                .authorize(&handle_id, &model)
+                .authorize_with_policy(&handle_id, &model, role, write_policy)
                 .map_err(RuntimeError::Tool)?;
         }
 

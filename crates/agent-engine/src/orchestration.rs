@@ -95,6 +95,10 @@ impl OrchestrationRuntime {
             .map_err(str::to_string)?;
         inner.registry.collect(&h).map_err(str::to_string)
     }
+    pub fn finish_one_shot(&self, id: &str, terminal: WorkerTerminal) -> Result<(), String> {
+        self.terminal_and_collect(id, terminal)?;
+        self.reconcile(id)
+    }
     pub fn reconcile(&self, id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
         let h = inner

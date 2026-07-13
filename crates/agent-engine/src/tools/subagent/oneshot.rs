@@ -33,9 +33,14 @@ impl Tool for SubagentTool {
                     "type": "string",
                     "description": "The task/prompt to send to the subagent."
                 },
-                "model": {
-                    "type": "string",
-                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
+                "model": {"type": "string", "description": "Provider-qualified model override."},
+                "role": {"type": "string", "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"]},
+                "write_policy": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
+                    ]
                 },
                 "timeout": {
                     "type": "integer",
@@ -72,6 +77,20 @@ impl Tool for SubagentTool {
             .unwrap_or(ctx.limits.subagent_timeout);
 
         let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
+        let role = params
+            .get("role")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| RuntimeError::Tool(format!("Invalid role: {e}")))?
+            .unwrap_or(agent_core::orchestration::WorkerRole::Implementer);
+        let write_policy = params
+            .get("write_policy")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| RuntimeError::Tool(format!("Invalid write_policy: {e}")))?
+            .unwrap_or(agent_core::orchestration::WorkerWritePolicy::ReadOnly);
         if let Some(policy) = &ctx.capabilities.orchestration {
             policy.preflight(&model).map_err(RuntimeError::Tool)?;
         }
@@ -94,7 +113,7 @@ impl Tool for SubagentTool {
         // Authorization is deliberately before channel/thread/runtime creation.
         if let Some(policy) = &ctx.capabilities.orchestration {
             policy
-                .authorize(&orchestration_id, &model)
+                .authorize_with_policy(&orchestration_id, &model, role, write_policy)
                 .map_err(RuntimeError::Tool)?;
         }
 
@@ -353,6 +372,18 @@ impl Tool for SubagentTool {
         let elapsed = start_time.elapsed().as_secs_f64();
 
         drop(shutdown_tx);
+
+        // One-shot workers have no separate collect call: every outcome must pass
+        // through terminal, collected, and reconciled before this tool exits.
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            let terminal = match &result {
+                Ok(Ok(_)) => agent_core::orchestration::WorkerTerminal::Completed,
+                Ok(Err(_)) | Err(_) => agent_core::orchestration::WorkerTerminal::Failed,
+            };
+            policy
+                .finish_one_shot(&orchestration_id, terminal)
+                .map_err(RuntimeError::Tool)?;
+        }
 
         let log_dir = crate::config::base_dir().join("logs").join("subagents");
         let _ = tokio::fs::create_dir_all(&log_dir).await;
