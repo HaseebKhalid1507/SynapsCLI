@@ -1,22 +1,44 @@
 {
   "models": [
     {
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6-Sol",
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 272000,
+      "priority": 1
+    },
+    {
+      "slug": "gpt-5.6-terra",
+      "display_name": "GPT-5.6-Terra",
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 272000,
+      "priority": 2
+    },
+    {
+      "slug": "gpt-5.6-luna",
+      "display_name": "GPT-5.6-Luna",
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 272000,
+      "priority": 3
+    },
+    {
       "slug": "gpt-5.5",
       "display_name": "GPT-5.5",
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 0,
-      "description": "Frontier model for complex coding, research, and real-world work."
+      "priority": 7
     },
     {
       "slug": "gpt-5.4",
-      "display_name": "gpt-5.4",
+      "display_name": "GPT-5.4",
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 2,
-      "description": "Strong model for everyday coding."
+      "priority": 16
     },
     {
       "slug": "gpt-5.4-mini",
@@ -24,17 +46,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 4,
-      "description": "Small, fast, and cost-efficient model for simpler coding tasks."
-    },
-    {
-      "slug": "gpt-5.3-codex",
-      "display_name": "gpt-5.3-codex",
-      "visibility": "list",
-      "supported_in_api": true,
-      "context_window": 272000,
-      "priority": 6,
-      "description": "Coding-optimized model."
+      "priority": 23
     },
     {
       "slug": "gpt-5.3-codex-spark",
@@ -42,17 +54,7 @@
       "visibility": "list",
       "supported_in_api": false,
       "context_window": 128000,
-      "priority": 7,
-      "description": "Ultra-fast coding model."
-    },
-    {
-      "slug": "gpt-5.2",
-      "display_name": "gpt-5.2",
-      "visibility": "list",
-      "supported_in_api": true,
-      "context_window": 272000,
-      "priority": 10,
-      "description": "Optimized for professional work and long-running agents."
+      "priority": 26
     },
     {
       "slug": "codex-auto-review",
@@ -60,15 +62,15 @@
       "visibility": "hide",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 29,
-      "description": "Automatic approval review model for Codex."
+      "priority": 43
     },
     {
-      "slug": "",
-      "display_name": "Empty — must be filtered",
-      "visibility": "list",
-      "supported_in_api": true,
-      "context_window": 1000
+      "slug": "codex-internal-eval",
+      "display_name": "Codex Internal Eval",
+      "visibility": "internal",
+      "supported_in_api": false,
+      "context_window": 272000,
+      "priority": 44
     }
   ]
 }

@@ -1104,14 +1104,14 @@ mod tests {
         }
 
         #[test]
-        fn live_parser_filters_hide_and_unsupported_from_fixture() {
+        fn live_parser_filters_non_list_visibility_from_fixture() {
             let fixture = include_str!("fixtures/openai_codex_models.json");
             let models = parse_codex_catalog_models(fixture).expect("parse");
             let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
-            assert!(ids.contains("gpt-5.5"));
-            assert!(ids.contains("gpt-5.3-codex"));
-            assert!(!ids.contains("gpt-5.3-codex-spark"));
+            assert!(ids.contains("gpt-5.6-sol"));
+            assert!(ids.contains("gpt-5.3-codex-spark"));
             assert!(!ids.contains("codex-auto-review"));
+            assert!(!ids.contains("codex-internal-eval"));
             assert!(models.iter().all(|m| m.source == CatalogSource::Live));
         }
 

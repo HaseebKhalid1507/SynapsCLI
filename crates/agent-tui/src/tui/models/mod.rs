@@ -576,7 +576,7 @@ fn provider_model_selections(
                 .map(|(order, (id, label))| ModelSelectionItem {
                     id: id.clone(),
                     label: label.clone(),
-                    tier: String::new(),
+                    tier: provider_model_tier(provider.key, id).to_string(),
                     order,
                 })
                 .collect();
@@ -593,6 +593,15 @@ fn provider_model_selections(
             order,
         })
         .collect()
+}
+
+fn provider_model_tier(provider_key: &str, model_id: &str) -> &'static str {
+    match (provider_key, model_id) {
+        ("openai-codex", "gpt-5.6-sol") => "S+",
+        ("openai-codex", "gpt-5.6-terra" | "gpt-5.5") => "A",
+        ("openai-codex", "gpt-5.6-luna") => "B+",
+        _ => "",
+    }
 }
 
 fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, String, String)> {
@@ -612,10 +621,7 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
         "openai-codex" => synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
             .into_iter()
             .map(|model| {
-                let tier = match model.id.as_str() {
-                    "gpt-5.5" => "S+",
-                    _ => "",
-                };
+                let tier = provider_model_tier(provider.key, &model.id);
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
             .collect(),
@@ -1416,6 +1422,54 @@ mod tests {
             .collect();
         assert!(all_ids.contains(&"openrouter/qwen/qwen3-coder"));
         assert!(all_ids.contains(&"openrouter/google/gemma-3-27b-it"));
+    }
+
+    #[test]
+    fn openai_codex_static_models_have_exact_tier_labels() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        let seeds = provider_static_model_seeds(&provider);
+        let tier = |id: &str| {
+            seeds
+                .iter()
+                .find(|(model_id, _, _)| model_id == id)
+                .map(|(_, _, tier)| tier.as_str())
+        };
+
+        assert_eq!(tier("gpt-5.6-sol"), Some("S+"));
+        assert_eq!(tier("gpt-5.6-terra"), Some("A"));
+        assert_eq!(tier("gpt-5.6-luna"), Some("B+"));
+        assert_eq!(tier("gpt-5.5"), Some("A"));
+    }
+
+    #[test]
+    fn openai_codex_live_override_models_have_exact_tier_labels() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        let live = vec![
+            ("gpt-5.6-sol".to_string(), "GPT-5.6 Sol".to_string()),
+            ("gpt-5.6-terra".to_string(), "GPT-5.6 Terra".to_string()),
+            ("gpt-5.6-luna".to_string(), "GPT-5.6 Luna".to_string()),
+            ("gpt-5.5".to_string(), "GPT-5.5".to_string()),
+        ];
+        let overrides = std::collections::BTreeMap::from([("openai-codex".to_string(), live)]);
+        let selections =
+            provider_model_selections(&provider, &ProviderAvailability::default(), &overrides);
+        let tier = |id: &str| {
+            selections
+                .iter()
+                .find(|model| model.id == id)
+                .map(|model| model.tier.as_str())
+        };
+
+        assert_eq!(tier("gpt-5.6-sol"), Some("S+"));
+        assert_eq!(tier("gpt-5.6-terra"), Some("A"));
+        assert_eq!(tier("gpt-5.6-luna"), Some("B+"));
+        assert_eq!(tier("gpt-5.5"), Some("A"));
     }
 
     #[test]

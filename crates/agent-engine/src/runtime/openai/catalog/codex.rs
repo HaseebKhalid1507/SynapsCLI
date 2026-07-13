@@ -13,9 +13,13 @@ pub const MODELS_PATH: &str = "/models";
 /// Offline seed models used only when the account is not configured / offline.
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
+        ("gpt-5.6-sol", "GPT-5.6-Sol"),
+        ("gpt-5.6-terra", "GPT-5.6-Terra"),
+        ("gpt-5.6-luna", "GPT-5.6-Luna"),
         ("gpt-5.5", "GPT-5.5"),
         ("gpt-5.4", "GPT-5.4"),
         ("gpt-5.4-mini", "GPT-5.4 Mini"),
+        ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
     ]
     .into_iter()
     .filter_map(|(id, label)| {
@@ -65,13 +69,13 @@ struct CodexModelItem {
 
 /// True when a Codex catalog row should appear as a selectable model.
 ///
-/// Mirrors official Codex picker rules:
-/// - `supported_in_api` must be true (or absent — treat as selectable)
-/// - `visibility` must be list-visible (`list` / empty / missing; not `hide`)
-pub fn codex_model_is_selectable(visibility: Option<&str>, supported_in_api: Option<bool>) -> bool {
-    if supported_in_api == Some(false) {
-        return false;
-    }
+/// Mirrors the official Codex picker rule: picker eligibility is determined by
+/// list visibility. `supported_in_api` describes API-key support and therefore
+/// must not filter the ChatGPT OAuth catalog.
+pub fn codex_model_is_selectable(
+    visibility: Option<&str>,
+    _supported_in_api: Option<bool>,
+) -> bool {
     match visibility.map(str::trim).filter(|v| !v.is_empty()) {
         None => true,
         Some("list") => true,
@@ -113,20 +117,27 @@ mod tests {
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
     #[test]
-    fn parse_fixture_keeps_list_visible_supported_models() {
+    fn parse_fixture_matches_list_visible_chatgpt_picker_models() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"gpt-5.5"));
-        assert!(ids.contains(&"gpt-5.4"));
-        assert!(ids.contains(&"gpt-5.4-mini"));
-        assert!(ids.contains(&"gpt-5.3-codex"));
-        assert!(ids.contains(&"gpt-5.2"));
-        // supported_in_api=false
-        assert!(!ids.contains(&"gpt-5.3-codex-spark"));
-        // visibility=hide
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+        // `supported_in_api` describes API-key availability, not ChatGPT OAuth
+        // picker eligibility. Spark is list-visible despite this being false.
+        assert!(ids.contains(&"gpt-5.3-codex-spark"));
+        // Non-list-visible backend rows are not user-selectable.
         assert!(!ids.contains(&"codex-auto-review"));
-        // empty slug
-        assert!(!ids.iter().any(|id| id.is_empty()));
+        assert!(!ids.contains(&"codex-internal-eval"));
         assert!(models
             .iter()
             .all(|m| m.runtime_id().starts_with("openai-codex/")));
@@ -156,22 +167,33 @@ mod tests {
     #[test]
     fn selectable_rules_match_codex_picker() {
         assert!(codex_model_is_selectable(Some("list"), Some(true)));
+        assert!(codex_model_is_selectable(Some("list"), Some(false)));
         assert!(codex_model_is_selectable(None, Some(true)));
         assert!(codex_model_is_selectable(Some("list"), None));
-        assert!(!codex_model_is_selectable(Some("list"), Some(false)));
         assert!(!codex_model_is_selectable(Some("hide"), Some(true)));
+        assert!(!codex_model_is_selectable(Some("internal"), Some(false)));
         assert!(!codex_model_is_selectable(Some("hidden"), Some(true)));
     }
 
     #[test]
-    fn static_catalog_uses_fallback_source_and_prefixed_runtime_ids() {
+    fn static_catalog_is_current_safe_chatgpt_oauth_set() {
         let models = codex_static_catalog_models();
-        assert!(models.iter().any(|m| m.id == "gpt-5.5"));
-        assert!(models.iter().any(|m| m.id == "gpt-5.4"));
-        assert!(models.iter().any(|m| m.id == "gpt-5.4-mini"));
-        assert!(!models.iter().any(|m| m.id == "gpt-5.5-pro"));
-        assert!(!models.iter().any(|m| m.id == "gpt-5.4-nano"));
-        assert!(!models.iter().any(|m| m.id == "gpt-5.1-codex-mini"));
+        let ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+        for api_only in ["gpt-5.6-sol-wm", "gpt-5.6-pro", "gpt-5.5-pro"] {
+            assert!(!ids.contains(&api_only));
+        }
         assert!(models
             .iter()
             .all(|m| m.source == CatalogSource::StaticFallback));
