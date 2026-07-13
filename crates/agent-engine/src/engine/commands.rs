@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(synaps_base_dir)]
     fn persist_to_config_reports_write_result() {
         let home = std::path::PathBuf::from("/tmp/synaps-engine-persist-test");
         let _ = std::fs::remove_dir_all(&home);

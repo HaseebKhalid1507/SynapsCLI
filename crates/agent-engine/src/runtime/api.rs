@@ -2761,6 +2761,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn config_refusal_retries_parsed_from_file() {
         // Test 7: load_config() parses "refusal_retries = 5" from the config file.
         // Uses SYNAPS_BASE_DIR to point load_config at a temp dir (no HOME mutation).

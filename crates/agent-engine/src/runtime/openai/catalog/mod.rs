@@ -657,6 +657,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // Broker-proxied discovery reads ambient credentials via base-dir
+    // resolution; racing SYNAPS_BASE_DIR mutators made this flaky.
+    #[serial_test::serial(synaps_base_dir)]
     async fn ui_catalog_fetch_github_copilot_returns_prefixed_chat_models() {
         // When the operator has a live session, broker-proxied discovery wins.
         // Otherwise the curated static fallback is returned. Either way runtime

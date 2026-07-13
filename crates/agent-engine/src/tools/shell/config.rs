@@ -23,7 +23,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    // Keyed to the same lock as every other HOME/SYNAPS_BASE_DIR mutator:
+    // unkeyed `#[serial]` and `#[serial(synaps_base_dir)]` do NOT exclude
+    // each other, which produced cross-test races on base-dir resolution.
+    #[serial(synaps_base_dir)]
     fn test_shell_config_from_file() {
         // These tests must run sequentially since they mutate HOME env var.
         // Combined into one test to avoid parallel races.
