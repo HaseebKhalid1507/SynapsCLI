@@ -723,6 +723,16 @@ impl Runtime {
 
                 // If no tool uses, return the text response
                 if tool_uses.is_empty() {
+                    if let Some(orchestration) = &self.orchestration {
+                        if let agent_core::orchestration::CompletionGate::Blocked { workers } =
+                            orchestration.completion_gate()
+                        {
+                            return Err(crate::RuntimeError::Tool(format!(
+                                "completion blocked: {} worker(s) require collection/reconciliation",
+                                workers.len()
+                            )));
+                        }
+                    }
                     return Ok(response_text);
                 }
 
