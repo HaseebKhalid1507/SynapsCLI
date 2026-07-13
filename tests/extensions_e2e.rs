@@ -193,6 +193,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     subagent_registry: None,
                     event_queue: None,
                     secret_prompt: None,
+            orchestration: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -340,6 +341,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     subagent_registry: None,
                     event_queue: None,
                     secret_prompt: None,
+            orchestration: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,

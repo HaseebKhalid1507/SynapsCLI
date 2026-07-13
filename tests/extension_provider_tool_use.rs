@@ -54,6 +54,7 @@ fn test_context() -> ToolContext {
             subagent_registry: None,
             event_queue: None,
             secret_prompt: None,
+            orchestration: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,
