@@ -55,14 +55,29 @@ fn kimi_foreman_does_not_take_over_after_one_unchanged_poll() {
         )
         .unwrap();
     registry.mark_running(&worker).unwrap();
-    registry.poll(&worker, "unchanged").unwrap();
+
+    // The first observation establishes a baseline; only a repeated fingerprint
+    // counts as unchanged progress.
+    registry.poll(&worker, "initial-progress").unwrap();
+    registry.poll(&worker, "initial-progress").unwrap();
     assert!(!registry.is_stalled(&worker).unwrap());
     assert!(matches!(
         registry.check_foreground_write("src/lib.rs"),
         agent_core::orchestration::ScopeDecision::ReconciliationRequired { .. }
     ));
+
+    // Steering is required before replacement, but subsequent progress clears
+    // both the unchanged-poll streak and the previous steering attempt.
+    registry.steer(&worker).unwrap();
+    registry.poll(&worker, "new-progress").unwrap();
+    assert!(!registry.is_stalled(&worker).unwrap());
+    registry.poll(&worker, "new-progress").unwrap();
+    assert!(!registry.is_stalled(&worker).unwrap());
+
+    // After steering the newly stuck worker, a second unchanged poll makes it
+    // eligible for replacement.
     registry.steer(&worker).unwrap();
     assert!(!registry.is_stalled(&worker).unwrap());
-    registry.poll(&worker, "unchanged").unwrap();
+    registry.poll(&worker, "new-progress").unwrap();
     assert!(registry.is_stalled(&worker).unwrap());
 }
