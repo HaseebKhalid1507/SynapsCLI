@@ -105,17 +105,17 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
     assert_eq!(first_call, expected, "order must be ascending alphabetical");
 }
 
-// ─── 3. Builtin registry (ToolRegistry::new) — 16 tools in sorted order ─────
+// ─── 3. Builtin registry (ToolRegistry::new) — 17 tools in sorted order ─────
 
 #[test]
-fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
+fn iter_tools_sorted_on_default_registry_has_17_tools_in_order() {
     let registry = ToolRegistry::new();
     let tools = registry.iter_tools_sorted();
 
     assert_eq!(
         tools.len(),
-        16,
-        "default registry must contain exactly 16 builtin tools"
+        17,
+        "default registry must contain exactly 17 builtin tools"
     );
 
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -133,6 +133,7 @@ fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
         "shell_start",
         "subagent",
         "subagent_collect",
+        "subagent_models",
         "subagent_resume",
         "subagent_start",
         "subagent_status",
@@ -141,7 +142,7 @@ fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
     ];
 
     assert_eq!(names, expected,
-        "iter_tools_sorted() on ToolRegistry::new() must yield the 16 builtin tools in alphabetical order");
+        "iter_tools_sorted() on ToolRegistry::new() must yield the 17 builtin tools in alphabetical order");
 }
 
 // ─── 4. Each tool has non-empty name, description, well-formed parameters ────
@@ -293,10 +294,10 @@ fn export_shape_has_name_description_parameters_per_tool() {
         );
     }
 
-    // Full manifest must contain all 16 tools.
+    // Full manifest must contain all 17 tools.
     assert_eq!(
         manifest.len(),
-        16,
-        "export manifest must contain exactly 16 builtin tools"
+        17,
+        "export manifest must contain exactly 17 builtin tools"
     );
 }

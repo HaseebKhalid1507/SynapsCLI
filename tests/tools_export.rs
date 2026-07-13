@@ -3,7 +3,7 @@
 //! Spawns the real `synaps` binary (via CARGO_BIN_EXE_synaps) and asserts
 //! the contract described in the P13 acceptance criteria:
 //!   - Output is valid JSON
-//!   - Contains all 16 builtin tools
+//!   - Contains all 17 builtin tools
 //!   - Each tool's parameters is a valid JSON Schema (object-typed, has `properties`)
 //!   - Output is deterministic across runs (byte-identical)
 //!   - `--pretty` output matches the committed docs/tools.json (drift-check contract)
@@ -44,7 +44,7 @@ fn run_export(extra_args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("synaps tools export output is valid UTF-8")
 }
 
-/// The 16 builtin tool names from docs/tools.json (alphabetical, authoritative).
+/// The 17 builtin tool names from docs/tools.json (alphabetical, authoritative).
 const EXPECTED_TOOL_NAMES: &[&str] = &[
     "bash",
     "edit",
@@ -57,6 +57,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "shell_start",
     "subagent",
     "subagent_collect",
+    "subagent_models",
     "subagent_resume",
     "subagent_start",
     "subagent_status",
@@ -80,16 +81,16 @@ fn export_pretty_produces_valid_json() {
         .expect("`synaps tools export --pretty` output must be parseable as valid JSON");
 }
 
-// ─── Test 2: Output contains all 16 builtin tools ────────────────────────────
+// ─── Test 2: Output contains all 17 builtin tools ────────────────────────────
 
 #[test]
-fn export_contains_all_16_builtin_tools() {
+fn export_contains_all_17_builtin_tools() {
     let out = run_export(&[]);
     let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
         .expect("output must be a JSON array");
 
-    assert_eq!(manifest.len(), 16,
-        "export must contain exactly 16 builtin tools, got {}: {:?}",
+    assert_eq!(manifest.len(), 17,
+        "export must contain exactly 17 builtin tools, got {}: {:?}",
         manifest.len(),
         manifest.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>()
     );

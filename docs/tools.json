@@ -227,7 +227,18 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -241,6 +252,50 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -257,11 +312,25 @@
         "handle_id": {
           "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
           "type": "string"
+        },
+        "reconciled": {
+          "default": false,
+          "description": "Confirm the collected result was inspected and reconciled with foreground work.",
+          "type": "boolean"
         }
       },
       "required": [
         "handle_id"
       ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List this session's exact trusted worker model choices. Omit model on delegation to inherit the foreground identity.",
+    "name": "subagent_models",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
       "type": "object"
     }
   },
@@ -296,7 +365,19 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Typed orchestration role.",
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -310,6 +391,51 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "description": "Declared write isolation and path scopes.",
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -319,7 +445,7 @@
     }
   },
   {
-    "description": "Poll the current state of a reactive subagent. Returns status (running/finished/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. Non-blocking — returns immediately.",
+    "description": "Poll the current state of a reactive subagent. Returns status (running/completed/cancelled/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. If the status is 'failed', an 'error' field contains the failure reason. Non-blocking — returns immediately.",
     "name": "subagent_status",
     "parameters": {
       "properties": {

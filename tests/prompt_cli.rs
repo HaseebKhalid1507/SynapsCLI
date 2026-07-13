@@ -68,7 +68,7 @@ fn validate_rejects_invalid_schema_and_reference() {
 fn inspect_emits_ordered_metadata_without_prompt_content() {
     let canary = "PROMPT_CONTENT_MUST_NOT_LEAK";
     let (_dir, path) = manifest(&format!(
-        r#"{{"schema":"synaps-prompt/1","kernel":"kernel.base","adapters":["adapter.provider","adapter.model"],"modules":[{{"id":"kernel.base","version":"1","source":"user","priority":0,"selectors":{{}},"mutability":"immutable_policy","content":"{canary}"}},{{"id":"adapter.provider","version":"1","source":"builtin","priority":10,"selectors":{{"provider":"openai"}},"mutability":"immutable_policy","content":"provider"}},{{"id":"adapter.model","version":"1","source":"builtin","priority":20,"selectors":{{"family":"gpt"}},"mutability":"immutable_policy","content":"family"}}]}}"#
+        r#"{{"schema":"synaps-prompt/1","kernel":"kernel.base","adapters":["adapter.provider","adapter.model"],"modules":[{{"id":"kernel.base","version":"1","source":"user","priority":0,"selectors":{{}},"mutability":"immutable_policy","content":"{canary}"}},{{"id":"adapter.provider","version":"1","source":"builtin","priority":10,"selectors":{{"provider":"openrouter"}},"mutability":"immutable_policy","content":"provider"}},{{"id":"adapter.model","version":"1","source":"builtin","priority":20,"selectors":{{"family":"gpt"}},"mutability":"immutable_policy","content":"family"}}]}}"#
     ));
     let output = synaps(&[
         "prompt",
@@ -76,7 +76,7 @@ fn inspect_emits_ordered_metadata_without_prompt_content() {
         "--manifest",
         path.to_str().unwrap(),
         "--model",
-        "openai/gpt-4o",
+        "openrouter/openai/gpt-4o",
         "--family",
         "gpt",
         "--json",
@@ -89,7 +89,7 @@ fn inspect_emits_ordered_metadata_without_prompt_content() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(!text.contains(canary));
     let json: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["foreground_model"], "openai/gpt-4o");
+    assert_eq!(json["foreground_model"], "openrouter/openai/gpt-4o");
     assert_eq!(json["modules"][0]["id"], "kernel.base");
     assert_eq!(json["modules"][1]["id"], "adapter.provider");
     assert_eq!(json["modules"][2]["id"], "adapter.model");
@@ -173,7 +173,7 @@ fn manifest_paths_are_relative_and_inspection_is_safe() {
         "--manifest",
         path.to_str().unwrap(),
         "--model",
-        "openai/gpt",
+        "openrouter/openai/gpt",
         "--json",
     ]);
     assert!(
