@@ -77,6 +77,67 @@ pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
     ) || path.starts_with("/v1internal/operations/")
 }
 
+/// Pinned ChatGPT backend host for OpenAI Codex catalog traffic.
+pub const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
+/// Allow only the official Codex model-catalog path:
+/// `GET /models?client_version=<non-empty>`.
+///
+/// Query is constrained to a single non-empty `client_version` key — no extra
+/// params, no empty version, no bare `/models`. Same-host inference paths
+/// (`/codex/responses`, …) stay out of this catalog-only allowlist.
+pub(crate) fn is_allowed_openai_codex_path(path: &str) -> bool {
+    let Some((base, query)) = path.split_once('?') else {
+        return false;
+    };
+    if base != "/models" {
+        return false;
+    }
+    let mut client_version: Option<&str> = None;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            return false;
+        };
+        if k != "client_version" || client_version.is_some() {
+            return false;
+        }
+        if v.trim().is_empty() {
+            return false;
+        }
+        client_version = Some(v);
+    }
+    client_version.is_some()
+}
+
+/// Allow only Anthropic's paginated models catalog path:
+/// `/v1/models` or `/v1/models?limit=…` with optional `after_id=…`.
+///
+/// No other same-host endpoints (messages, keys, admin, …) are permitted.
+pub(crate) fn is_allowed_anthropic_path(path: &str) -> bool {
+    if path == "/v1/models" {
+        return true;
+    }
+    let Some((base, query)) = path.split_once('?') else {
+        return false;
+    };
+    if base != "/v1/models" {
+        return false;
+    }
+    if query.is_empty() {
+        return false;
+    }
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            return false;
+        };
+        match k {
+            "limit" | "after_id" if !v.is_empty() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Broker failures. Messages never contain credential values.
@@ -176,6 +237,8 @@ impl ProxyRequest {
             && self.provider != "xai-auth"
             && self.provider != "github-copilot"
             && self.provider != "google-gemini"
+            && self.provider != "openai-codex"
+            && self.provider != "anthropic"
             && static_provider(&self.provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
@@ -198,6 +261,12 @@ impl ProxyRequest {
                     "/models" | "/chat/completions" | "/responses"
                 ))
             && !(self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path))
+            && !(self.provider == "openai-codex"
+                && self.method == ProxyMethod::Get
+                && is_allowed_openai_codex_path(&self.path))
+            && !(self.provider == "anthropic"
+                && self.method == ProxyMethod::Get
+                && is_allowed_anthropic_path(&self.path))
             && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
         {
             return Err(BrokerError::Denied(format!(
@@ -1396,6 +1465,16 @@ impl LocalBroker {
                 .clone()
                 .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
             (token.token, base)
+        } else if request.provider == "openai-codex" {
+            // Catalog-only OAuth proxy for ChatGPT backend models. Access token
+            // never leaves the broker; account header is derived broker-side.
+            let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
+            (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
+        } else if request.provider == "anthropic" {
+            // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
+            // Keeps the access token broker-owned (no runtime token vending).
+            let token = self.access_token(OAuthProviderId::Anthropic).await?;
+            (token.token, "https://api.anthropic.com".to_string())
         } else {
             (
                 self.resolve_static_key(&request.provider)?,
@@ -1423,6 +1502,23 @@ impl LocalBroker {
             }
         };
         builder = builder.bearer_auth(&key);
+        if request.provider == "openai-codex" {
+            // ChatGPT backend requires the account id claim from the JWT.
+            if let Some(account_id) = super::extract_codex_account_id(&key) {
+                builder = builder.header("chatgpt-account-id", account_id);
+            }
+            builder = builder
+                .header("originator", "synaps")
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("accept", "application/json");
+        }
+        if request.provider == "anthropic" {
+            // Match Anthropic models listing auth: bearer + x-api-key + version.
+            builder = builder
+                .header("x-api-key", &key)
+                .header("anthropic-version", "2023-06-01")
+                .header("accept", "application/json");
+        }
         if request.provider == "github-copilot" {
             for (name, value) in super::github_copilot_models_request_headers() {
                 builder = builder.header(*name, *value);
@@ -2320,23 +2416,100 @@ mod tests {
         assert!(matches!(relative.validate(), Err(BrokerError::Denied(_))));
     }
 
-    /// OAuth provider keys are NOT valid proxy targets — static-key proxying
-    /// and OAuth vending stay separate strategies (cross-provider isolation).
+    /// OAuth providers stay fail-closed except reviewed catalog paths.
+    /// Claude alias remains unknown; anthropic/openai-codex only accept
+    /// their exact catalog allowlists (not bare `/models`).
     #[test]
-    fn proxy_rejects_oauth_providers() {
-        for provider in ["anthropic", "openai-codex", "claude"] {
+    fn proxy_rejects_oauth_providers_except_codex_catalog() {
+        // Unrecognized OAuth alias is still unknown.
+        let claude = ProxyRequest {
+            provider: "claude".into(),
+            method: ProxyMethod::Get,
+            path: "/models".into(),
+            body: None,
+            stream: false,
+        };
+        assert!(
+            matches!(claude.validate(), Err(BrokerError::UnknownProvider(_))),
+            "claude alias must not be proxyable"
+        );
+        // Anthropic bare OpenAI-style /models is denied (only /v1/models…).
+        let anth = ProxyRequest {
+            provider: "anthropic".into(),
+            method: ProxyMethod::Get,
+            path: "/models".into(),
+            body: None,
+            stream: false,
+        };
+        assert!(
+            matches!(anth.validate(), Err(BrokerError::Denied(_))),
+            "anthropic /models must be denied"
+        );
+        // openai-codex bare /models (no client_version) must be denied.
+        let bare = ProxyRequest {
+            provider: "openai-codex".into(),
+            method: ProxyMethod::Get,
+            path: "/models".into(),
+            body: None,
+            stream: false,
+        };
+        assert!(
+            matches!(bare.validate(), Err(BrokerError::Denied(_))),
+            "openai-codex /models without client_version must be denied"
+        );
+    }
+
+    /// Codex catalog proxy is pinned to GET /models?client_version=… only.
+    /// Arbitrary same-host paths and query shapes are denied.
+    #[test]
+    fn proxy_allows_only_pinned_openai_codex_models_path() {
+        let allowed = ProxyRequest {
+            provider: "openai-codex".into(),
+            method: ProxyMethod::Get,
+            path: "/models?client_version=0.6.0".into(),
+            body: None,
+            stream: false,
+        };
+        assert!(
+            allowed.validate().is_ok(),
+            "exact codex models path must be allowed"
+        );
+
+        for path in [
+            "/models",
+            "/models?client_version=",
+            "/models?foo=1",
+            "/models?client_version=0.6.0&extra=1",
+            "/codex/responses",
+            "/backend-api/models?client_version=0.6.0",
+            "/v1/models?client_version=0.6.0",
+            "/chat/completions",
+        ] {
             let req = ProxyRequest {
-                provider: provider.into(),
+                provider: "openai-codex".into(),
                 method: ProxyMethod::Get,
-                path: "/models".into(),
+                path: path.into(),
                 body: None,
                 stream: false,
             };
             assert!(
-                matches!(req.validate(), Err(BrokerError::UnknownProvider(_))),
-                "{provider} must not be proxyable"
+                matches!(req.validate(), Err(BrokerError::Denied(_))),
+                "openai-codex path {path} must be denied"
             );
         }
+
+        // POST is never allowed for the catalog path.
+        let post = ProxyRequest {
+            provider: "openai-codex".into(),
+            method: ProxyMethod::Post,
+            path: "/models?client_version=0.6.0".into(),
+            body: None,
+            stream: false,
+        };
+        assert!(
+            matches!(post.validate(), Err(BrokerError::Denied(_))),
+            "POST openai-codex models must be denied"
+        );
     }
 
     /// Copilot is pinned to its catalog and two reviewed inference paths.
@@ -2376,6 +2549,45 @@ mod tests {
                 stream: false,
             };
             assert!(matches!(request.validate(), Err(BrokerError::Denied(_))));
+        }
+    }
+
+    /// Anthropic catalog proxy is pinned to /v1/models (+ limit/after_id) only.
+    #[test]
+    fn proxy_allows_only_pinned_anthropic_models_path() {
+        for path in [
+            "/v1/models",
+            "/v1/models?limit=100",
+            "/v1/models?limit=100&after_id=claude-opus-4-7",
+        ] {
+            let req = ProxyRequest {
+                provider: "anthropic".into(),
+                method: ProxyMethod::Get,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(req.validate().is_ok(), "{path} must be allowed");
+        }
+        for path in [
+            "/v1/messages",
+            "/models",
+            "/v1/models?foo=1",
+            "/v1/models?limit=",
+            "/api/oauth/usage",
+            "/v1/models?limit=100&evil=1",
+        ] {
+            let req = ProxyRequest {
+                provider: "anthropic".into(),
+                method: ProxyMethod::Get,
+                path: path.into(),
+                body: None,
+                stream: false,
+            };
+            assert!(
+                matches!(req.validate(), Err(BrokerError::Denied(_))),
+                "anthropic path {path} must be denied"
+            );
         }
     }
 

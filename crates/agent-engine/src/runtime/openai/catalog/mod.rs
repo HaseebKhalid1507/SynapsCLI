@@ -43,7 +43,10 @@ pub use anthropic::{
     anthropic_models_url, merge_catalog_pages, parse_anthropic_catalog_models,
     parse_anthropic_catalog_page, AnthropicCatalogPage,
 };
-pub use codex::codex_static_catalog_models;
+pub use codex::{
+    codex_models_path, codex_models_url, codex_static_catalog_models, parse_codex_catalog_models,
+    PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
+};
 pub use generic::parse_generic_catalog_models;
 pub use github_copilot::{
     copilot_model, copilot_static_catalog_models, models_request_headers,
@@ -311,32 +314,17 @@ async fn read_catalog_response(resp: reqwest::Response) -> Result<String, String
 }
 
 async fn fetch_anthropic_catalog_models(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
 ) -> Result<Vec<CatalogModel>, String> {
-    // Honor the credential source so a Remote client lists models via a
-    // broker-issued token instead of refreshing (and rotating) auth.json
-    // client-side — which would lock the broker out. (#158 A4)
-    let config = crate::config::load_config();
-    let source = config.auth.credential_source();
-    let cache = crate::auth::TokenCache::new();
-    let access = crate::auth::broker::broker_from_source(&source, &cache, client.clone())
-        .access_token(crate::auth::OAuthProviderId::Anthropic)
-        .await
-        .map_err(|e| format!("Anthropic is not configured: {e}"))?
-        .token;
+    // Paginated live discovery through the broker-owned Anthropic credential.
+    // Tokens never enter this module — each page is a allowlisted ProxyRequest
+    // for `/v1/models` (+ limit/after_id query).
     let mut pages = Vec::new();
     let mut after_id: Option<String> = None;
 
     for _ in 0..ANTHROPIC_MODELS_MAX_PAGES {
-        let url = anthropic_models_url(after_id.as_deref());
-        let resp = catalog_get(client, &url)
-            .bearer_auth(&access)
-            .header("x-api-key", &access)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        let body = read_catalog_response(resp).await?;
+        let path = anthropic_models_proxy_path(after_id.as_deref());
+        let body = broker_proxy_catalog_body("anthropic", &path).await?;
         let page = parse_anthropic_catalog_page(&body).map_err(|e| format!("parse failed: {e}"))?;
         let next_after_id = page.last_id.clone();
         let has_more = page.has_more && next_after_id.is_some();
@@ -348,6 +336,16 @@ async fn fetch_anthropic_catalog_models(
     }
 
     Ok(merge_catalog_pages(pages))
+}
+
+/// Relative Anthropic models path for the broker allowlist (no host).
+fn anthropic_models_proxy_path(after_id: Option<&str>) -> String {
+    // Keep query shape identical to `anthropic_models_url` without the host.
+    let absolute = anthropic_models_url(after_id);
+    absolute
+        .strip_prefix("https://api.anthropic.com")
+        .unwrap_or(&absolute)
+        .to_string()
 }
 
 impl ModelCatalogProvider for OpenRouterCatalogProvider {
@@ -421,7 +419,28 @@ impl ModelCatalogProvider for CodexCatalogProvider {
         &'a self,
         _client: &'a reqwest::Client,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
-        Box::pin(async move { Ok(codex_static_catalog_models()) })
+        // Prefer broker-proxied live discovery against the ChatGPT backend
+        // models endpoint. Static seeds are offline / not-configured fallback
+        // only — never the normal successful result when auth is available.
+        Box::pin(async move {
+            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
+            match broker_proxy_catalog_body("openai-codex", &path).await {
+                Ok(body) => {
+                    parse_codex_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
+                }
+                Err(err) => {
+                    let lower = err.to_lowercase();
+                    if lower.contains("not configured")
+                        || lower.contains("unknown provider")
+                        || lower.contains("not logged")
+                    {
+                        Ok(codex_static_catalog_models())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -525,11 +544,17 @@ async fn fetch_generic_catalog_provider_models(
 /// GET `/models` through the credential broker (the key never enters this
 /// module). Returns the body on 2xx, an HTTP-status error otherwise.
 async fn broker_catalog_models_body(provider_key: &str) -> Result<String, String> {
+    broker_proxy_catalog_body(provider_key, "/models").await
+}
+
+/// GET an allowlisted catalog path through the credential broker.
+/// The credential never enters this module — only the provider key + path.
+async fn broker_proxy_catalog_body(provider_key: &str, path: &str) -> Result<String, String> {
     let resp = crate::auth::broker::global_broker()
         .proxy(crate::auth::ProxyRequest {
             provider: provider_key.to_string(),
             method: crate::auth::ProxyMethod::Get,
-            path: "/models".to_string(),
+            path: path.to_string(),
             body: None,
             stream: false,
         })
@@ -1042,6 +1067,25 @@ mod tests {
             assert!(models
                 .iter()
                 .all(|m| m.runtime_id().starts_with("openai-codex/")));
+        }
+
+        #[test]
+        fn live_parser_filters_hide_and_unsupported_from_fixture() {
+            let fixture = include_str!("fixtures/openai_codex_models.json");
+            let models = parse_codex_catalog_models(fixture).expect("parse");
+            let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
+            assert!(ids.contains("gpt-5.5"));
+            assert!(ids.contains("gpt-5.3-codex"));
+            assert!(!ids.contains("gpt-5.3-codex-spark"));
+            assert!(!ids.contains("codex-auto-review"));
+            assert!(models.iter().all(|m| m.source == CatalogSource::Live));
+        }
+
+        #[test]
+        fn models_path_carries_package_client_version() {
+            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
+            assert!(path.starts_with("/models?client_version="));
+            assert!(path.contains(env!("CARGO_PKG_VERSION")));
         }
     }
 
