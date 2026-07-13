@@ -72,6 +72,12 @@ impl Tool for SubagentStatusTool {
             full
         };
 
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            orchestration
+                .poll(&handle_id, &format!("{}:{}", status_str, tool_count))
+                .map_err(RuntimeError::Tool)?;
+        }
+
         let mut resp = json!({
             "handle_id":      handle_id,
             "agent_name":     agent_name,

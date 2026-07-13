@@ -31,6 +31,11 @@ impl Tool for SubagentCollectTool {
                 "handle_id": {
                     "type": "string",
                     "description": "Handle ID returned by subagent_start (e.g. \"sa_3\")."
+                },
+                "reconciled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Confirm the collected result was inspected and reconciled with foreground work."
                 }
             },
             "required": ["handle_id"]
@@ -84,6 +89,22 @@ impl Tool for SubagentCollectTool {
                 "elapsed_secs": (elapsed * 10.0).round() / 10.0,
                 "output_so_far": output_so_far
             }).to_string());
+        }
+
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            let terminal = match status {
+                SubagentStatus::Completed => agent_core::orchestration::WorkerTerminal::Completed,
+                SubagentStatus::TimedOut => agent_core::orchestration::WorkerTerminal::TimedOut,
+                _ => agent_core::orchestration::WorkerTerminal::Failed,
+            };
+            orchestration
+                .terminal_and_collect(&handle_id, terminal)
+                .map_err(RuntimeError::Tool)?;
+            if params["reconciled"].as_bool().unwrap_or(false) {
+                orchestration
+                    .reconcile(&handle_id)
+                    .map_err(RuntimeError::Tool)?;
+            }
         }
 
         // Done — return full result including collected flag for idempotency signaling

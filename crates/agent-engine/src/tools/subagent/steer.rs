@@ -89,6 +89,11 @@ impl Tool for SubagentSteerTool {
         // Until that wiring is done the channel will be None — return a clear
         // stub response so callers know the shape of the success path.
 
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            orchestration
+                .steer(&handle_id)
+                .map_err(RuntimeError::Tool)?;
+        }
         match handle.steer(&message) {
             Ok(()) => Ok(json!({ "acknowledged": true }).to_string()),
             Err(e) => {
