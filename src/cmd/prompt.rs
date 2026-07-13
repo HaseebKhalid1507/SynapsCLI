@@ -66,8 +66,13 @@ pub(crate) fn run(action: PromptAction) -> anyhow::Result<()> {
                 anyhow::bail!("inspect currently requires --json");
             }
             let foreground = QualifiedModelId::parse(model.clone())?;
-            let mode = load(&manifest)?
-                .delegation_policy(foreground)?
+            let loaded = load(&manifest)?;
+            let catalog = agent_engine::orchestration::OrchestrationRuntime::trusted_catalog(
+                &foreground,
+                loaded.delegation_catalog_candidates(),
+            );
+            let mode = loaded
+                .delegation_policy(foreground, &catalog)?
                 .map(|policy| policy.mode)
                 .unwrap_or(agent_core::orchestration::EnforcementMode::Off);
             let stack = compile(&manifest, model, family)?;

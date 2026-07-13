@@ -140,12 +140,16 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             manifest.delegation_catalog_candidates(),
         );
         let delegation_policy = manifest
-            .delegation_policy(model, &catalog)
+            .delegation_policy(model.clone(), &catalog)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         let delegation_policy_digest = delegation_policy.as_ref().map(|policy| policy.digest());
         if let Some(policy) = delegation_policy {
             runtime.install_orchestration(Arc::new(
                 crate::orchestration::OrchestrationRuntime::new(policy),
+            ));
+        } else {
+            runtime.install_orchestration(Arc::new(
+                crate::orchestration::OrchestrationRuntime::baseline(model.clone(), 8, 64),
             ));
         }
         let user = opts
