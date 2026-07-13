@@ -593,11 +593,19 @@ impl PromptStack {
             foreground_model: self.context.model.as_str().into(),
         }
     }
-    pub fn inspect(&self) -> PromptInspection<'_> {
+    pub fn inspect(
+        &self,
+        enforcement_mode: crate::orchestration::EnforcementMode,
+    ) -> PromptInspection<'_> {
+        let enforcement_state = match enforcement_mode {
+            crate::orchestration::EnforcementMode::Off => "off",
+            crate::orchestration::EnforcementMode::Advisory => "advisory",
+            crate::orchestration::EnforcementMode::Enforced => "enforced",
+        };
         PromptInspection {
             schema: PROMPT_SCHEMA,
             foreground_model: self.context.model.as_str(),
-            enforcement_state: "advisory",
+            enforcement_state,
             byte_count: self.composed.len(),
             modules: self
                 .modules

@@ -122,6 +122,9 @@ impl OrchestrationRuntime {
         serde_json::to_string(self.inner.lock().unwrap().registry.telemetry())
             .unwrap_or_else(|_| "[]".into())
     }
+    pub fn enforcement_mode(&self) -> agent_core::orchestration::EnforcementMode {
+        self.inner.lock().unwrap().registry.mode()
+    }
 }
 
 #[cfg(test)]

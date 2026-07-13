@@ -65,8 +65,13 @@ pub(crate) fn run(action: PromptAction) -> anyhow::Result<()> {
             if !json {
                 anyhow::bail!("inspect currently requires --json");
             }
+            let foreground = QualifiedModelId::parse(model.clone())?;
+            let mode = load(&manifest)?
+                .delegation_policy(foreground)?
+                .map(|policy| policy.mode)
+                .unwrap_or(agent_core::orchestration::EnforcementMode::Off);
             let stack = compile(&manifest, model, family)?;
-            println!("{}", serde_json::to_string_pretty(&stack.inspect())?);
+            println!("{}", serde_json::to_string_pretty(&stack.inspect(mode))?);
         }
     }
     Ok(())

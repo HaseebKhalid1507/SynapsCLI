@@ -131,10 +131,11 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         let context = agent_core::prompt::SelectionContext::new(model.clone(), None)
             .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
-        if let Some(policy) = manifest
+        let delegation_policy = manifest
             .delegation_policy(model)
-            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?
-        {
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let delegation_policy_digest = delegation_policy.as_ref().map(|policy| policy.digest());
+        if let Some(policy) = delegation_policy {
             runtime.install_orchestration(Arc::new(
                 crate::orchestration::OrchestrationRuntime::new(policy),
             ));
@@ -155,7 +156,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime
             .apply_prompt_stack(stack)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
-        runtime.retain_prompt_reload_source(path.clone(), context, user);
+        runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
     } else {
         runtime.set_system_prompt(legacy_prompt);
     }

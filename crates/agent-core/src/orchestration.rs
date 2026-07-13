@@ -10,7 +10,7 @@ pub enum EnforcementMode {
     Enforced,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DelegationPolicy {
     pub mode: EnforcementMode,
     foreground: QualifiedModelId,
@@ -54,6 +54,11 @@ impl DelegationPolicy {
             concurrent,
             total,
         )
+    }
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(self).expect("delegation policy is serializable");
+        format!("{:x}", Sha256::digest(encoded))
     }
 }
 

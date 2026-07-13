@@ -213,7 +213,9 @@ fn inspection_and_debug_never_expose_content() {
         "05a741260e581671b8e7a035e194c14f6f44e3568043376f19b7a3314d710400"
     );
     let stack = PromptStack::new(vec![m], context("openrouter/x/y", "x")).unwrap();
-    let json = serde_json::to_string(&stack.inspect()).unwrap();
+    let json =
+        serde_json::to_string(&stack.inspect(agent_core::orchestration::EnforcementMode::Advisory))
+            .unwrap();
     let debug = format!("{stack:?} {:?}", stack.modules());
     assert!(!json.contains(canary));
     assert!(!debug.contains(canary));
@@ -275,4 +277,27 @@ fn family_selector_does_not_match_when_context_has_no_family() {
     )])
     .unwrap();
     assert!(registry.select(&ctx).unwrap().is_empty());
+}
+
+#[test]
+fn inspection_reports_every_effective_enforcement_mode() {
+    let stack = PromptStack::new(
+        vec![module("kernel", 0, PromptSelectors::default(), "k")],
+        context("openrouter/x/y", "x"),
+    )
+    .unwrap();
+    for (mode, expected) in [
+        (agent_core::orchestration::EnforcementMode::Off, "off"),
+        (
+            agent_core::orchestration::EnforcementMode::Advisory,
+            "advisory",
+        ),
+        (
+            agent_core::orchestration::EnforcementMode::Enforced,
+            "enforced",
+        ),
+    ] {
+        let value = serde_json::to_value(stack.inspect(mode)).unwrap();
+        assert_eq!(value["enforcement_state"], expected);
+    }
 }

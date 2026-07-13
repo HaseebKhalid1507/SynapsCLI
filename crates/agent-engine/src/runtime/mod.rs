@@ -205,6 +205,7 @@ struct PromptReloadSource {
     manifest: PathBuf,
     context: agent_core::prompt::SelectionContext,
     user_module: Option<agent_core::prompt::PromptModule>,
+    delegation_policy_digest: Option<String>,
 }
 
 pub struct Runtime {
@@ -437,11 +438,13 @@ impl Runtime {
         manifest: PathBuf,
         context: agent_core::prompt::SelectionContext,
         user_module: Option<agent_core::prompt::PromptModule>,
+        delegation_policy_digest: Option<String>,
     ) {
         self.prompt_reload_source = Some(PromptReloadSource {
             manifest,
             context,
             user_module,
+            delegation_policy_digest,
         });
     }
 
@@ -454,6 +457,14 @@ impl Runtime {
             agent_core::prompt::PromptError::Invalid("prompt manifest is unavailable".into())
         })?;
         let manifest = agent_core::prompt::PromptManifest::parse(&raw)?;
+        let candidate_policy_digest = manifest
+            .delegation_policy(source.context.model().clone())?
+            .map(|policy| policy.digest());
+        if candidate_policy_digest != source.delegation_policy_digest {
+            return Err(agent_core::prompt::PromptError::Invalid(
+                "hot reload cannot safely change delegation policy".into(),
+            ));
+        }
         let registry = manifest.registry(source.manifest.parent())?;
         let candidate = agent_core::prompt::compile_prompt_stack(
             &manifest,
@@ -480,10 +491,15 @@ impl Runtime {
     }
 
     pub fn prompt_inspection_json(&self) -> Option<String> {
+        let mode = self
+            .orchestration
+            .as_ref()
+            .map(|runtime| runtime.enforcement_mode())
+            .unwrap_or(agent_core::orchestration::EnforcementMode::Off);
         self.effective_prompt.as_ref().and_then(|stack| {
             serde_json::to_string(&serde_json::json!({
                 "generation": self.prompt_generation,
-                "effective": stack.inspect(),
+                "effective": stack.inspect(mode),
                 "token_estimate": stack.composed().len().div_ceil(4),
             }))
             .ok()
@@ -1238,6 +1254,50 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_rejects_policy_change_without_partial_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.yaml");
+        let manifest = |mode: &str, content: &str| {
+            format!(
+            "schema: synaps-prompt/1\nkernel: kernel\nmodules:\n  - id: kernel\n    version: v1\n    source: builtin\n    priority: 0\n    selectors: {{}}\n    mutability: mutable_guidance\n    content: {content}\npolicies:\n  delegation:\n    mode: {mode}\n    allowed_models: [anthropic/worker]\n    max_concurrent_workers: 1\n    max_total_workers: 1\n"
+        )
+        };
+        std::fs::write(&path, manifest("advisory", "before")).unwrap();
+        let parsed =
+            agent_core::prompt::PromptManifest::parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap();
+        let model = agent_core::prompt::QualifiedModelId::parse("anthropic/foreground").unwrap();
+        let context = agent_core::prompt::SelectionContext::new(model.clone(), None).unwrap();
+        let stack = agent_core::prompt::compile_prompt_stack(
+            &parsed,
+            &parsed.registry(path.parent()).unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
+        let digest = parsed.delegation_policy(model).unwrap().map(|p| p.digest());
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_prompt_stack(stack).unwrap();
+        runtime.retain_prompt_reload_source(path.clone(), context, None, digest.clone());
+        let generation = runtime.prompt_generation();
+        let composed = runtime.effective_prompt().unwrap().composed().to_owned();
+
+        std::fs::write(&path, manifest("enforced", "after")).unwrap();
+        let error = runtime.reload_prompt().unwrap_err().to_string();
+        assert!(error.contains("cannot safely change delegation policy"));
+        assert_eq!(runtime.prompt_generation(), generation);
+        assert_eq!(runtime.effective_prompt().unwrap().composed(), composed);
+        assert_eq!(
+            runtime
+                .prompt_reload_source
+                .as_ref()
+                .unwrap()
+                .delegation_policy_digest,
+            digest
+        );
+    }
 
     #[test]
     fn set_model_preserves_qualified_provider_ids_and_bare_claude() {
