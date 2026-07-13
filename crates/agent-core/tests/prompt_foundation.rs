@@ -15,7 +15,7 @@ fn module(id: &str, priority: u16, selectors: PromptSelectors, content: &str) ->
 fn context(model: &str, family: &str) -> SelectionContext {
     SelectionContext::new(
         QualifiedModelId::parse(model).unwrap(),
-        ModelFamilyId::parse(family).unwrap(),
+        Some(ModelFamilyId::parse(family).unwrap()),
     )
     .unwrap()
 }
@@ -31,7 +31,6 @@ modules:
   - id: user.extra
     version: 1.2.0
     source: user
-    path: prompts/extra.md
     priority: 9
     selectors: { provider: openrouter }
     mutability: mutable_guidance
@@ -153,7 +152,7 @@ fn compilation_is_permutation_stable_layered_and_ambiguity_fails() {
         module(
             "family",
             9,
-            PromptSelectors::family(ctx.family().clone()),
+            PromptSelectors::family(ctx.family().unwrap().clone()),
             "f",
         ),
     ];
@@ -237,4 +236,35 @@ fn resolved_legacy_output_is_exact_and_user_last() {
         raw.as_bytes()
     );
     assert_eq!(stack.composed().as_bytes(), b"k\nkeep exact bytes\n");
+}
+
+#[test]
+fn declared_modules_are_materialized_and_requested_mismatch_fails() {
+    let manifest = PromptManifest::parse("schema: synaps-prompt/1\nkernel: kernel\nadapters: [wrong]\nmodules:\n- {id: kernel, version: v, source: user, priority: 0, selectors: {}, mutability: immutable_policy, content: exact-kernel}\n- {id: wrong, version: v, source: user, priority: 1, selectors: {provider: anthropic}, mutability: mutable_guidance, content: wrong}\n").unwrap();
+    let registry = manifest.registry(None).unwrap();
+    let ctx = SelectionContext::new(QualifiedModelId::parse("openai/gpt").unwrap(), None).unwrap();
+    let error = compile_prompt_stack(&manifest, &registry, &ctx, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("wrong") && error.contains("does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn family_selector_does_not_match_when_context_has_no_family() {
+    let ctx = SelectionContext::new(
+        QualifiedModelId::parse("openai/gpt-family-name").unwrap(),
+        None,
+    )
+    .unwrap();
+    let registry = AdapterRegistry::new(vec![module(
+        "family",
+        1,
+        PromptSelectors::family(ModelFamilyId::parse("gpt-family-name").unwrap()),
+        "no",
+    )])
+    .unwrap();
+    assert!(registry.select(&ctx).unwrap().is_empty());
 }

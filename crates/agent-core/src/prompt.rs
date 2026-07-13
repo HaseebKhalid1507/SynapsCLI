@@ -104,17 +104,20 @@ impl ModelFamilyId {
 #[derive(Clone, Debug)]
 pub struct SelectionContext {
     model: QualifiedModelId,
-    family: ModelFamilyId,
+    family: Option<ModelFamilyId>,
 }
 impl SelectionContext {
-    pub fn new(model: QualifiedModelId, family: ModelFamilyId) -> Result<Self, PromptError> {
+    pub fn new(
+        model: QualifiedModelId,
+        family: Option<ModelFamilyId>,
+    ) -> Result<Self, PromptError> {
         Ok(Self { model, family })
     }
     pub fn model(&self) -> &QualifiedModelId {
         &self.model
     }
-    pub fn family(&self) -> &ModelFamilyId {
-        &self.family
+    pub fn family(&self) -> Option<&ModelFamilyId> {
+        self.family.as_ref()
     }
 }
 
@@ -192,7 +195,10 @@ impl PromptSelectors {
         self.provider
             .as_deref()
             .map_or(true, |p| p == c.model.provider())
-            && self.family.as_ref().map_or(true, |f| f == &c.family)
+            && self
+                .family
+                .as_ref()
+                .map_or(true, |f| c.family.as_ref() == Some(f))
             && self.exact.as_ref().map_or(true, |e| e == &c.model)
     }
 }
@@ -325,7 +331,8 @@ struct ModuleDeclaration {
     priority: u16,
     selectors: PromptSelectors,
     mutability: ModuleMutability,
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 impl PromptManifest {
     pub fn parse(input: &str) -> Result<Self, PromptError> {
@@ -346,12 +353,58 @@ impl PromptManifest {
             if !ids.insert(&m.id) {
                 return Err(PromptError::Invalid("duplicate module id".into()));
             }
-            if m.content.len() > MAX_MODULE_BYTES {
+            if m.content
+                .as_ref()
+                .is_some_and(|content| content.len() > MAX_MODULE_BYTES)
+            {
                 return Err(PromptError::Invalid("module exceeds size limit".into()));
             }
-            let _ = (&m.version, &m.source, &m.path, m.priority, &m.mutability);
+            if m.path.is_some() == m.content.is_some() {
+                return Err(PromptError::Invalid(format!(
+                    "module {} must declare exactly one of path or content",
+                    m.id.as_str()
+                )));
+            }
         }
         Ok(v)
+    }
+    pub fn registry(
+        &self,
+        manifest_dir: Option<&std::path::Path>,
+    ) -> Result<AdapterRegistry, PromptError> {
+        let mut modules = Vec::with_capacity(self.modules.len());
+        for declaration in &self.modules {
+            let (content, safe_path) = if let Some(content) = &declaration.content {
+                (content.clone(), None)
+            } else {
+                let relative = std::path::Path::new(declaration.path.as_deref().unwrap());
+                if relative.is_absolute() {
+                    return Err(PromptError::Invalid(format!(
+                        "module {} path must be relative",
+                        declaration.id.as_str()
+                    )));
+                }
+                let base = manifest_dir.ok_or_else(|| {
+                    PromptError::Invalid("manifest directory is required for module paths".into())
+                })?;
+                let content = std::fs::read_to_string(base.join(relative)).map_err(|e| {
+                    PromptError::Invalid(format!("module {}: {e}", declaration.id.as_str()))
+                })?;
+                (content, Some(relative.to_string_lossy().into_owned()))
+            };
+            let mut module = PromptModule::new(
+                declaration.id.clone(),
+                declaration.version.clone(),
+                declaration.source.clone(),
+                declaration.priority,
+                declaration.selectors.clone(),
+                declaration.mutability.clone(),
+                content,
+            )?;
+            module.safe_path = safe_path;
+            modules.push(module);
+        }
+        AdapterRegistry::new(modules)
     }
     pub fn schema(&self) -> &str {
         &self.schema
@@ -459,7 +512,16 @@ pub fn compile_prompt_stack(
 ) -> Result<PromptStack, PromptError> {
     let mut out = vec![registry.get(&manifest.kernel)?.clone()];
     let requested: BTreeSet<_> = manifest.adapters.iter().map(String::as_str).collect();
-    for m in registry.select(context)? {
+    let selected = registry.select(context)?;
+    for id in &requested {
+        let module = registry.get(id)?;
+        if !selected.iter().any(|candidate| candidate.id == module.id) {
+            return Err(PromptError::Invalid(format!(
+                "requested adapter {id} does not match selection context"
+            )));
+        }
+    }
+    for m in selected {
         if requested.contains(m.id.as_str()) {
             out.push(m.clone())
         }
