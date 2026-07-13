@@ -60,6 +60,56 @@ fn sanitize_oai_tool_name(name: &str) -> String {
     }
 }
 
+/// OpenAI's function-schema validator rejects any array schema without
+/// `items` ("array schema missing items"), which turns one loosely-specified
+/// MCP/extension tool into a hard 400 on *every* request of the session
+/// (observed live: `ext__lsrf-manager__managerApi_cloudfrontInvalidate`,
+/// session 20260429-235559-094c). Backfill `"items": {}` — the
+/// accept-anything schema — recursively, preserving all author intent.
+fn sanitize_oai_parameters(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    let is_array_type = match obj.get("type") {
+        Some(Value::String(t)) => t == "array",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
+    };
+    if is_array_type && !obj.contains_key("items") {
+        obj.insert("items".into(), json!({}));
+    }
+
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(sub) = obj.get_mut(key) {
+            sanitize_oai_parameters(sub);
+        }
+    }
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(Value::Object(map)) = obj.get_mut(key) {
+            for sub in map.values_mut() {
+                sanitize_oai_parameters(sub);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(Value::Array(list)) = obj.get_mut(key) {
+            for sub in list.iter_mut() {
+                sanitize_oai_parameters(sub);
+            }
+        }
+    }
+}
+
 /// Convert Anthropic tool schema entries to OpenAI ToolDefinitions.
 ///
 /// Anthropic shape: `{"name", "description", "input_schema", optional cache_control}`.
@@ -107,6 +157,10 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
             let parameters = t
                 .get("input_schema")
                 .cloned()
+                .map(|mut schema| {
+                    sanitize_oai_parameters(&mut schema);
+                    schema
+                })
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
             Some(ToolDefinition {
                 kind: "function".to_string(),
@@ -354,4 +408,108 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression fixture from session 20260429-235559-094c: the lsrf-manager
+    /// extension exposed `managerApi_cloudfrontInvalidate` whose `paths`
+    /// property was `{"type":"array"}` with no `items`. The Codex Responses
+    /// API rejects every request in such a session:
+    ///   400 "Invalid schema for function 'ext__lsrf-manager__managerApi_cloudfrontInvalidate':
+    ///        In context=('properties', 'paths'), array schema missing items."
+    #[test]
+    fn array_property_missing_items_is_backfilled_for_oai_wire() {
+        let schema = vec![json!({
+            "name": "ext__lsrf-manager__managerApi_cloudfrontInvalidate",
+            "description": "Invalidate CloudFront paths",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array" },
+                    "distribution_id": { "type": "string" }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        let params = &tools[0].function.parameters;
+        assert_eq!(
+            params["properties"]["paths"]["items"],
+            json!({}),
+            "array schema without items must be backfilled: {params}"
+        );
+        // Non-array sibling untouched.
+        assert_eq!(
+            params["properties"]["distribution_id"],
+            json!({"type": "string"})
+        );
+    }
+
+    #[test]
+    fn nested_and_composed_array_schemas_are_sanitized() {
+        let schema = vec![json!({
+            "name": "t",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "matrix": {
+                        "type": "array",
+                        "items": { "type": "array" }
+                    },
+                    "either": {
+                        "anyOf": [
+                            { "type": "array" },
+                            { "type": "string" }
+                        ]
+                    },
+                    "nullable": { "type": ["array", "null"] },
+                    "obj": {
+                        "type": "object",
+                        "additionalProperties": { "type": "array" },
+                        "properties": {
+                            "inner": { "type": "array" }
+                        }
+                    }
+                },
+                "$defs": {
+                    "aliasList": { "type": "array" }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        let p = &tools[0].function.parameters;
+        assert_eq!(p["properties"]["matrix"]["items"]["items"], json!({}));
+        assert_eq!(p["properties"]["either"]["anyOf"][0]["items"], json!({}));
+        assert!(p["properties"]["either"]["anyOf"][1].get("items").is_none());
+        assert_eq!(p["properties"]["nullable"]["items"], json!({}));
+        assert_eq!(
+            p["properties"]["obj"]["additionalProperties"]["items"],
+            json!({})
+        );
+        assert_eq!(
+            p["properties"]["obj"]["properties"]["inner"]["items"],
+            json!({})
+        );
+        assert_eq!(p["$defs"]["aliasList"]["items"], json!({}));
+    }
+
+    #[test]
+    fn array_schema_with_existing_items_is_untouched() {
+        let schema = vec![json!({
+            "name": "t",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "ops": { "type": "array", "items": { "type": "object" } }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        assert_eq!(
+            tools[0].function.parameters["properties"]["ops"]["items"],
+            json!({"type": "object"})
+        );
+    }
 }
