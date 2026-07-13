@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use synaps_cli::extensions::runtime::process::{
-    complete_provider_with_tools, ProviderCompleteParams, ProviderCompleteResult,
+    complete_provider_with_tools,
+    ProviderCompleteParams,
+    ProviderCompleteResult,
 };
 use synaps_cli::extensions::runtime::{ExtensionHandler, ExtensionHealth};
 use synaps_cli::tools::{Tool, ToolContext, ToolRegistry};
@@ -12,23 +14,13 @@ struct ToolThenTextProvider;
 
 #[async_trait]
 impl ExtensionHandler for ToolThenTextProvider {
-    fn id(&self) -> &str {
-        "provider"
-    }
+    fn id(&self) -> &str { "provider" }
 
-    async fn provider_complete(
-        &self,
-        params: ProviderCompleteParams,
-    ) -> Result<ProviderCompleteResult, String> {
+    async fn provider_complete(&self, params: ProviderCompleteParams) -> Result<ProviderCompleteResult, String> {
         let has_tool_result = params.messages.iter().any(|message| {
-            message
-                .get("content")
+            message.get("content")
                 .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|block| {
-                        block.get("type").and_then(Value::as_str) == Some("tool_result")
-                    })
-                })
+                .is_some_and(|blocks| blocks.iter().any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result")))
         });
         if has_tool_result {
             Ok(ProviderCompleteResult {
@@ -50,33 +42,22 @@ impl ExtensionHandler for ToolThenTextProvider {
         }
     }
 
-    async fn handle(
-        &self,
-        _event: &synaps_cli::extensions::hooks::events::HookEvent,
-    ) -> synaps_cli::extensions::hooks::events::HookResult {
+    async fn handle(&self, _event: &synaps_cli::extensions::hooks::events::HookEvent) -> synaps_cli::extensions::hooks::events::HookResult {
         synaps_cli::extensions::hooks::events::HookResult::Continue
     }
 
     async fn shutdown(&self) {}
 
-    async fn health(&self) -> ExtensionHealth {
-        ExtensionHealth::Running
-    }
+    async fn health(&self) -> ExtensionHealth { ExtensionHealth::Running }
 }
 
 struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo_test"
-    }
-    fn description(&self) -> &str {
-        "echo test"
-    }
-    fn parameters(&self) -> Value {
-        json!({"type": "object"})
-    }
+    fn name(&self) -> &str { "echo_test" }
+    fn description(&self) -> &str { "echo test" }
+    fn parameters(&self) -> Value { json!({"type": "object"}) }
     async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
         Ok(params["message"].as_str().unwrap_or_default().to_string())
     }
@@ -84,10 +65,7 @@ impl Tool for EchoTool {
 
 fn test_context() -> ToolContext {
     ToolContext {
-        channels: synaps_cli::tools::ToolChannels {
-            tx_delta: None,
-            tx_events: None,
-        },
+        channels: synaps_cli::tools::ToolChannels { tx_delta: None, tx_events: None },
         capabilities: synaps_cli::tools::ToolCapabilities {
             watcher_exit_path: None,
             tool_register_tx: None,
@@ -116,9 +94,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         provider_id: "p".to_string(),
         model_id: "m".to_string(),
         model: "plugin:p:m".to_string(),
-        messages: vec![std::sync::Arc::new(
-            json!({"role": "user", "content": "use a tool"}),
-        )],
+        messages: vec![std::sync::Arc::new(json!({"role": "user", "content": "use a tool"}))],
         system_prompt: None,
         tools: registry.tools_schema().as_ref().clone(),
         temperature: None,
@@ -134,12 +110,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         test_context,
         1000,
         4,
-    )
-    .await
-    .expect("provider loop succeeds");
+    ).await.expect("provider loop succeeds");
 
-    assert_eq!(
-        result.content,
-        vec![json!({"type": "text", "text": "done"})]
-    );
+    assert_eq!(result.content, vec![json!({"type": "text", "text": "done"})]);
 }

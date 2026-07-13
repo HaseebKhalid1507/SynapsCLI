@@ -50,9 +50,7 @@ impl CopilotClock for FakeClock {
         duration: Duration,
         cancel: &X,
     ) -> Result<(), CopilotAuthError> {
-        let total_secs = duration
-            .as_secs()
-            .max(if duration.is_zero() { 0 } else { 1 });
+        let total_secs = duration.as_secs().max(if duration.is_zero() { 0 } else { 1 });
         if total_secs == 0 {
             if cancel.is_cancelled() {
                 return Err(CopilotAuthError::Cancelled);
@@ -253,9 +251,7 @@ async fn github_copilot_oauth_e2e_start_pending_slow_down_authorize_mint_store()
     let mint_headers: std::collections::HashMap<_, _> =
         http.gets.lock().unwrap()[0].2.iter().cloned().collect();
     assert_eq!(
-        mint_headers
-            .get("Copilot-Integration-Id")
-            .map(String::as_str),
+        mint_headers.get("Copilot-Integration-Id").map(String::as_str),
         Some(agent_core::auth::github_copilot::MINT_COPILOT_INTEGRATION_ID)
     );
     assert!(mint_headers.contains_key("User-Agent"));

@@ -9,9 +9,9 @@
 //!
 //! RPC_PROTOCOL_VERSION must stay 1 (additive variant, no break).
 
-use synaps_cli::core::config::{load_config_from_str, EventsConfig};
 use synaps_cli::core::rpc_protocol::{RpcEvent, RPC_PROTOCOL_VERSION};
 use synaps_cli::engine::reactor::EventPayload;
+use synaps_cli::core::config::{EventsConfig, load_config_from_str};
 
 // ─── 1. EventPayload serde roundtrip ─────────────────────────────────────────
 
@@ -100,10 +100,7 @@ fn rpc_protocol_version_still_one_after_event_frame() {
 #[test]
 fn events_config_default_auto_turn_true() {
     let cfg = EventsConfig::default();
-    assert!(
-        cfg.auto_turn,
-        "events.auto_turn must default to true; opt-out via events.auto_turn = false"
-    );
+    assert!(cfg.auto_turn, "events.auto_turn must default to true; opt-out via events.auto_turn = false");
 }
 
 // ─── 5. EventsConfig parses from config key ──────────────────────────────────
@@ -111,10 +108,7 @@ fn events_config_default_auto_turn_true() {
 #[test]
 fn events_config_parse_auto_turn_true() {
     let cfg = load_config_from_str("events.auto_turn = true\n");
-    assert!(
-        cfg.events.auto_turn,
-        "events.auto_turn should parse to true"
-    );
+    assert!(cfg.events.auto_turn, "events.auto_turn should parse to true");
 }
 
 #[test]
@@ -127,10 +121,8 @@ fn events_config_parse_auto_turn_false_explicit() {
 
 #[test]
 fn event_payload_from_drained_populates_all_fields() {
-    use agent_engine::engine::reactor::{
-        event_payload_from_drained, DrainedEvent, EventDisposition,
-    };
     use agent_engine::events::types::{Event, Severity};
+    use agent_engine::engine::reactor::{DrainedEvent, EventDisposition, event_payload_from_drained};
 
     let ev = Event::simple("discord", "ping from discord", Some(Severity::High));
     let formatted = format!("<event id=\"{}\" type=\"message\" severity=\"high\" source=\"discord\">ping from discord</event>", ev.id);

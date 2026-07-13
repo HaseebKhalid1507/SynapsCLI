@@ -13,27 +13,27 @@
 //!   watcher once <name>            — run agent once, no supervision
 //!   watcher logs <name>            — show agent logs
 
-pub(crate) mod bridge_client;
-mod display;
 mod ipc;
 mod supervisor;
+mod display;
+pub(crate) mod bridge_client;
 
-use notify::Watcher;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use synaps_cli::{AgentConfig, AgentStatusInfo, WatcherCommand, WatcherResponse};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use std::os::unix::fs::PermissionsExt;
+use synaps_cli::{AgentConfig, WatcherCommand, WatcherResponse, AgentStatusInfo};
 use tokio::sync::{Mutex, Semaphore};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use notify::Watcher;
 
-use display::*;
 use ipc::*;
 use supervisor::*;
+use display::*;
 
 pub(crate) fn watcher_dir() -> PathBuf {
     synaps_cli::config::base_dir().join("watcher")
@@ -56,14 +56,8 @@ pub(crate) fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.len() > 64 {
         return Err("Agent name too long (max 64 characters)".to_string());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!(
-            "Agent name '{}' contains invalid characters (use a-z, 0-9, -, _)",
-            name
-        ));
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!("Agent name '{}' contains invalid characters (use a-z, 0-9, -, _)", name));
     }
     if name.starts_with('-') || name.starts_with('_') {
         return Err("Agent name cannot start with - or _".to_string());
@@ -71,9 +65,7 @@ pub(crate) fn validate_agent_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn load_agent_stats(
-    agent_dir: &std::path::Path,
-) -> synaps_cli::watcher_types::AgentStats {
+pub(crate) fn load_agent_stats(agent_dir: &std::path::Path) -> synaps_cli::watcher_types::AgentStats {
     let path = agent_dir.join("stats.json");
     std::fs::read_to_string(&path)
         .ok()
@@ -125,6 +117,7 @@ impl ManagedAgent {
         }
     }
 
+
     pub(crate) fn current_uptime_secs(&self) -> Option<f64> {
         if self.is_running() {
             self.last_start.map(|s| s.elapsed().as_secs_f64())
@@ -136,7 +129,7 @@ impl ManagedAgent {
     pub(crate) fn to_status_info(&self) -> AgentStatusInfo {
         let agent_dir = AgentConfig::agent_dir(&self.config_path);
         let stats = load_agent_stats(&agent_dir);
-
+        
         AgentStatusInfo {
             name: self.name.clone(),
             trigger: self.config.agent.trigger.clone(),
@@ -241,8 +234,10 @@ pub async fn run(command: String, args: Vec<String>) {
             if let Some(ref mut child) = agent.child {
                 // Wait for agent with a timeout — agent shutdown can hang
                 // if spawned tasks (shell reaper, etc.) don't terminate
-                let wait_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+                let wait_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    child.wait()
+                ).await;
 
                 let code = match wait_result {
                     Ok(Ok(status)) => status.code().unwrap_or(1),
@@ -254,20 +249,18 @@ pub async fn run(command: String, args: Vec<String>) {
                         log(&format!("[{}] agent didn't exit within 30s, killing", name));
                         let _ = child.kill().await;
                         // Reap the killed process to avoid zombie
-                        let reap_status =
-                            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
-                                .await;
+                        let reap_status = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            child.wait()
+                        ).await;
                         match reap_status {
                             Ok(Ok(s)) => s.code().unwrap_or(137), // killed
-                            _ => 137,                             // SIGKILL exit code
+                            _ => 137 // SIGKILL exit code
                         }
                     }
                 };
 
-                let elapsed = agent
-                    .last_start
-                    .map(|s| s.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
+                let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
                 log(&format!("[{}] exited with code {}", name, code));
                 if agent.config.hooks.notify_inbox {
                     log(&format!("[{}] notify_inbox hook firing", name));
@@ -288,13 +281,9 @@ pub async fn run(command: String, args: Vec<String>) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
-
+                
                 // Detailed status for specific agent
-                match send_ipc_command(WatcherCommand::AgentStatus {
-                    name: agent_name.clone(),
-                })
-                .await
-                {
+                match send_ipc_command(WatcherCommand::AgentStatus { name: agent_name.clone() }).await {
                     Ok(WatcherResponse::AgentDetail { info }) => {
                         print_agent_detail(info);
                     }
@@ -334,10 +323,7 @@ pub async fn run(command: String, args: Vec<String>) {
                         let mut agents: HashMap<String, ManagedAgent> = HashMap::new();
                         for (name, config_path) in discovered {
                             if let Ok(config) = AgentConfig::load(&config_path) {
-                                agents.insert(
-                                    name.clone(),
-                                    ManagedAgent::new(name, config_path, config),
-                                );
+                                agents.insert(name.clone(), ManagedAgent::new(name, config_path, config));
                             }
                         }
                         print_status(&agents);
@@ -358,13 +344,13 @@ pub async fn run(command: String, args: Vec<String>) {
                 eprintln!("Usage: watcher deploy <name>");
                 std::process::exit(1);
             });
-
+            
             // Validate agent name
             if let Err(e) = validate_agent_name(name) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
-
+            
             match send_ipc_command(WatcherCommand::Deploy { name: name.clone() }).await {
                 Ok(WatcherResponse::Ok { message }) => {
                     println!("{}", message);
@@ -389,13 +375,13 @@ pub async fn run(command: String, args: Vec<String>) {
                 eprintln!("Usage: watcher stop <name>");
                 std::process::exit(1);
             });
-
+            
             // Validate agent name
             if let Err(e) = validate_agent_name(name) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
-
+            
             match send_ipc_command(WatcherCommand::Stop { name: name.clone() }).await {
                 Ok(WatcherResponse::Ok { message }) => {
                     println!("{}", message);
@@ -429,16 +415,8 @@ pub async fn run(command: String, args: Vec<String>) {
 
             // Parse flags
             let follow = args.iter().any(|a| a == "--follow" || a == "-f");
-            let session_num = args
-                .iter()
-                .position(|a| a == "--session")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse::<u64>().ok());
-            let last_n = args
-                .iter()
-                .position(|a| a == "--last")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse::<usize>().ok());
+            let session_num = args.iter().position(|a| a == "--session").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<u64>().ok());
+            let last_n = args.iter().position(|a| a == "--last").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<usize>().ok());
 
             if let Err(e) = show_logs(name, follow, session_num, last_n).await {
                 eprintln!("Error: {}", e);
@@ -452,7 +430,7 @@ pub async fn run(command: String, args: Vec<String>) {
             println!("USAGE:");
             println!("  watcher run                 Start supervisor daemon (foreground)");
             println!("  watcher deploy <name>       Deploy/start an agent");
-            println!("  watcher stop <name>         Stop an agent");
+            println!("  watcher stop <name>         Stop an agent");  
             println!("  watcher once <name>         Run agent once without supervision");
             println!("  watcher init <name>         Create new agent from template");
             println!("  watcher list                List configured agents");

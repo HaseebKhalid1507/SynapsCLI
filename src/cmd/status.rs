@@ -16,12 +16,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Could not get a token ({}). Run `synaps login`, or check auth.remote_endpoint / broker reachability.", e
         ))?;
 
-    let resp = client
-        .get("https://api.anthropic.com/api/oauth/usage")
+    let resp = client.get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", access))
         .header("anthropic-beta", "oauth-2025-04-20")
-        .send()
-        .await?;
+        .send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -42,16 +40,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let diff = dt.signed_duration_since(chrono::Utc::now());
                 let hours = diff.num_hours();
                 let mins = diff.num_minutes() % 60;
-                if hours > 24 {
-                    format!("{}d {}h", hours / 24, hours % 24)
-                } else if hours > 0 {
-                    format!("{}h {}m", hours, mins)
-                } else {
-                    format!("{}m", diff.num_minutes())
-                }
-            } else {
-                "—".to_string()
-            };
+                if hours > 24 { format!("{}d {}h", hours / 24, hours % 24) }
+                else if hours > 0 { format!("{}h {}m", hours, mins) }
+                else { format!("{}m", diff.num_minutes()) }
+            } else { "—".to_string() };
 
             let bar_width: usize = 30;
             let filled = ((util / 100.0) * bar_width as f64) as usize;

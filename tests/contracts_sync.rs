@@ -11,9 +11,7 @@ fn plugin_builder_extension_contract_matches_synaps_contract() {
         .expect("worktree parent should have a parent directory");
 
     let candidates = [
-        worktrees_dir.join(
-            "synaps-skills-skill-extension-builder/plugin-builder-plugin/contracts/extensions.json",
-        ),
+        worktrees_dir.join("synaps-skills-skill-extension-builder/plugin-builder-plugin/contracts/extensions.json"),
         worktrees_dir.join("synaps-skills/plugin-builder-plugin/contracts/extensions.json"),
         worktrees_dir.join("synaps-skills/plugin-maker-plugin/contracts/extensions.json"),
         monorepo_dir.join("synaps-skills/plugin-builder-plugin/contracts/extensions.json"),
@@ -53,8 +51,8 @@ fn plugin_builder_extension_contract_matches_synaps_contract() {
 fn extension_protocol_version_present_and_synced_with_stability_docs() {
     let contract_raw = std::fs::read_to_string("docs/extensions/contract.json")
         .expect("docs/extensions/contract.json should exist");
-    let stability_raw =
-        std::fs::read_to_string("docs/STABILITY.md").expect("docs/STABILITY.md should exist");
+    let stability_raw = std::fs::read_to_string("docs/STABILITY.md")
+        .expect("docs/STABILITY.md should exist");
 
     let contract: serde_json::Value =
         serde_json::from_str(&contract_raw).expect("contract.json should be valid JSON");

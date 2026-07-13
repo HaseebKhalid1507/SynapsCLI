@@ -200,35 +200,19 @@ pub(crate) async fn call_codex_stream_inner(
         })
         .collect();
 
-    let mut body = json!({
-        "model": cfg.model,
-        "store": false,
-        "stream": true,
-        "instructions": codex_instructions(system_prompt),
-        "input": codex_input_messages(oai_messages),
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"],
-        "text": { "verbosity": "medium" },
-    });
-    // Emit exact reasoning.effort for the validated level.
-    // Off/Adaptive: omit the field entirely (model default).
-    use agent_core::reasoning::ReasoningLevel;
-    match reasoning_level {
-        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
-        level => {
-            body["reasoning"] = json!({ "effort": level.as_str() });
-        }
-    }
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-    }
-    if let Some(temp) = temperature {
-        body["temperature"] = json!(temp);
-    }
-    if let Some(max) = max_tokens {
-        body["max_output_tokens"] = json!(max);
-    }
+    // Use the shared pure helper so production and unit tests exercise identical
+    // body construction — no duplication between call_codex_stream_inner and tests.
+    let instructions = codex_instructions(system_prompt);
+    let input = serde_json::Value::Array(codex_input_messages(oai_messages));
+    let body = build_codex_body(
+        &cfg.model,
+        reasoning_level,
+        input,
+        instructions,
+        tools,
+        temperature,
+        max_tokens,
+    );
 
     let url = format!(
         "{}/codex/responses",
@@ -302,13 +286,13 @@ pub(crate) async fn call_codex_stream_inner(
 /// any credential access or network I/O.
 ///
 /// # Arguments
-/// - : the Codex model id (already validated by the caller)
-/// - : reasoning level (must already be validated against model capability)
-/// - : pre-built input items (from )
-/// - : pre-built instructions string
-/// - : pre-built tool array
-/// - : optional temperature override
-/// - : optional max_output_tokens override
+/// - `model`: the Codex model id (already validated by the caller)
+/// - `level`: reasoning level (must already be validated against model capability)
+/// - `input`: pre-built input items (from `codex_input_messages`)
+/// - `instructions`: pre-built instructions string (from `codex_instructions`)
+/// - `tools`: pre-built tool array
+/// - `temperature`: optional temperature override
+/// - `max_tokens`: optional max_output_tokens override
 // used in tests
 pub(crate) fn build_codex_body(
     model: &str,

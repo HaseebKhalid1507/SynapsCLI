@@ -45,27 +45,21 @@ impl Symbol {
     /// Weight for RNG — lower = rarer
     fn weight(&self) -> u32 {
         match self {
-            Symbol::Skull => 2, // jackpot — very rare
+            Symbol::Skull => 2,     // jackpot — very rare
             Symbol::Diamond => 4,
             Symbol::Seven => 6,
             Symbol::Lightning => 8,
             Symbol::Fire => 10,
             Symbol::Bar => 12,
             Symbol::Cherry => 14,
-            Symbol::Wild => 3, // wild — rare but not jackpot rare
+            Symbol::Wild => 3,      // wild — rare but not jackpot rare
         }
     }
 }
 
 const ALL_SYMBOLS: [Symbol; 8] = [
-    Symbol::Skull,
-    Symbol::Diamond,
-    Symbol::Seven,
-    Symbol::Lightning,
-    Symbol::Fire,
-    Symbol::Bar,
-    Symbol::Cherry,
-    Symbol::Wild,
+    Symbol::Skull, Symbol::Diamond, Symbol::Seven, Symbol::Lightning,
+    Symbol::Fire, Symbol::Bar, Symbol::Cherry, Symbol::Wild,
 ];
 
 // ── Payout Table ────────────────────────────────────────────────────
@@ -75,22 +69,18 @@ pub fn calculate_multiplier(reels: &[Symbol; 3]) -> f64 {
     let [a, b, c] = reels;
 
     // Expand wilds: wild matches anything
-    let matches_with_wild =
-        |x: &Symbol, y: &Symbol| -> bool { *x == *y || *x == Symbol::Wild || *y == Symbol::Wild };
+    let matches_with_wild = |x: &Symbol, y: &Symbol| -> bool {
+        *x == *y || *x == Symbol::Wild || *y == Symbol::Wild
+    };
 
     let all_match = matches_with_wild(a, b) && matches_with_wild(b, c) && matches_with_wild(a, c);
 
     if all_match {
         // Determine the "real" symbol (non-wild)
-        let real = if *a != Symbol::Wild {
-            a
-        } else if *b != Symbol::Wild {
-            b
-        } else if *c != Symbol::Wild {
-            c
-        } else {
-            &Symbol::Wild
-        }; // three wilds
+        let real = if *a != Symbol::Wild { a }
+            else if *b != Symbol::Wild { b }
+            else if *c != Symbol::Wild { c }
+            else { &Symbol::Wild }; // three wilds
 
         return match real {
             Symbol::Skull => 50.0,
@@ -200,7 +190,7 @@ impl SlotsGame {
         // Generate reel strips with final symbol at the end
         for i in 0..3 {
             let mut strip = generate_reel_strip(30 + i * 8); // staggered lengths
-                                                             // Place the final result at the end
+            // Place the final result at the end
             strip.push(self.reels[i]);
             self.reel_strips[i] = strip;
         }
@@ -251,8 +241,7 @@ impl SlotsGame {
                                 } else {
                                     // All stopped
                                     self.multiplier = calculate_multiplier(&self.reels);
-                                    self.last_payout = (self.bet as f64 * self.multiplier) as i64
-                                        - self.bet as i64;
+                                    self.last_payout = (self.bet as f64 * self.multiplier) as i64 - self.bet as i64;
                                     self.phase = SlotsPhase::Result;
                                     return true;
                                 }
@@ -278,9 +267,7 @@ impl SlotsGame {
     /// Get the current display symbol for a reel
     pub fn display_symbol(&self, reel: usize) -> Symbol {
         let strip = &self.reel_strips[reel];
-        if strip.is_empty() {
-            return Symbol::Cherry;
-        }
+        if strip.is_empty() { return Symbol::Cherry; }
         strip[self.reel_pos[reel] % strip.len()]
     }
 
@@ -288,9 +275,7 @@ impl SlotsGame {
     pub fn reel_window(&self, reel: usize) -> [Symbol; 3] {
         let strip = &self.reel_strips[reel];
         let len = strip.len();
-        if len == 0 {
-            return [Symbol::Cherry; 3];
-        }
+        if len == 0 { return [Symbol::Cherry; 3]; }
         let pos = self.reel_pos[reel] % len;
         let above = if pos == 0 { len - 1 } else { pos - 1 };
         let below = (pos + 1) % len;

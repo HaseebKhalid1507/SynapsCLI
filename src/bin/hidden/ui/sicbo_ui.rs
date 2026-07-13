@@ -1,8 +1,8 @@
+use ratatui::prelude::*;
+use ratatui::buffer::Buffer;
 use crate::app::App;
 use crate::games::sicbo::*;
 use crate::ui::theme;
-use ratatui::buffer::Buffer;
-use ratatui::prelude::*;
 
 // ── Dice Rendering ──────────────────────────────────────────────────
 
@@ -15,30 +15,64 @@ fn draw_dice(buf: &mut Buffer, area: Rect, x: usize, y: usize, value: u8) {
     let ay = area.top() + y as u16;
 
     let pattern = match value {
-        1 => ["┌─────┐", "│     │", "│  ●  │", "│     │", "└─────┘"],
-        2 => ["┌─────┐", "│ ●   │", "│     │", "│   ● │", "└─────┘"],
-        3 => ["┌─────┐", "│ ●   │", "│  ●  │", "│   ● │", "└─────┘"],
-        4 => ["┌─────┐", "│ ● ● │", "│     │", "│ ● ● │", "└─────┘"],
-        5 => ["┌─────┐", "│ ● ● │", "│  ●  │", "│ ● ● │", "└─────┘"],
-        6 => ["┌─────┐", "│ ● ● │", "│ ● ● │", "│ ● ● │", "└─────┘"],
-        _ => ["┌─────┐", "│  ?  │", "│  ?  │", "│  ?  │", "└─────┘"],
+        1 => [
+            "┌─────┐",
+            "│     │",
+            "│  ●  │",
+            "│     │",
+            "└─────┘",
+        ],
+        2 => [
+            "┌─────┐",
+            "│ ●   │",
+            "│     │",
+            "│   ● │",
+            "└─────┘",
+        ],
+        3 => [
+            "┌─────┐",
+            "│ ●   │",
+            "│  ●  │",
+            "│   ● │",
+            "└─────┘",
+        ],
+        4 => [
+            "┌─────┐",
+            "│ ● ● │",
+            "│     │",
+            "│ ● ● │",
+            "└─────┘",
+        ],
+        5 => [
+            "┌─────┐",
+            "│ ● ● │",
+            "│  ●  │",
+            "│ ● ● │",
+            "└─────┘",
+        ],
+        6 => [
+            "┌─────┐",
+            "│ ● ● │",
+            "│ ● ● │",
+            "│ ● ● │",
+            "└─────┘",
+        ],
+        _ => [
+            "┌─────┐",
+            "│  ?  │",
+            "│  ?  │",
+            "│  ?  │",
+            "└─────┘",
+        ],
     };
 
     for (dy, line) in pattern.iter().enumerate() {
         let cy = ay + dy as u16;
-        if cy >= area.bottom() {
-            continue;
-        }
+        if cy >= area.bottom() { continue; }
         let mut cx = ax;
         for ch in line.chars() {
-            if cx >= area.right() {
-                break;
-            }
-            let fg = if ch == '●' {
-                theme::WHITE
-            } else {
-                theme::AMBER_DIM
-            };
+            if cx >= area.right() { break; }
+            let fg = if ch == '●' { theme::WHITE } else { theme::AMBER_DIM };
             buf[(cx, cy)].set_char(ch).set_fg(fg).set_bg(theme::BG);
             cx += 1;
         }
@@ -64,14 +98,10 @@ pub fn draw_sicbo(f: &mut Frame, app: &App, game: &SicBoGame, area: Rect) {
     let table_bot = h.saturating_sub(4);
     for y in table_top..table_bot {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() {
-            continue;
-        }
+        if ay >= area.bottom() { continue; }
         for x in 2..(w.saturating_sub(2)) {
             let ax = area.left() + x as u16;
-            if ax >= area.right() {
-                continue;
-            }
+            if ax >= area.right() { continue; }
             buf[(ax, ay)].set_bg(Color::Rgb(5, 15, 8));
         }
     }
@@ -82,12 +112,8 @@ pub fn draw_sicbo(f: &mut Frame, app: &App, game: &SicBoGame, area: Rect) {
         let at = area.top() + table_top as u16;
         let ab = area.top() + table_bot as u16;
         if ax < area.right() {
-            if at < area.bottom() {
-                buf[(ax, at)].set_char('─').set_fg(theme::AMBER_DIM);
-            }
-            if ab < area.bottom() {
-                buf[(ax, ab)].set_char('─').set_fg(theme::AMBER_DIM);
-            }
+            if at < area.bottom() { buf[(ax, at)].set_char('─').set_fg(theme::AMBER_DIM); }
+            if ab < area.bottom() { buf[(ax, ab)].set_char('─').set_fg(theme::AMBER_DIM); }
         }
     }
 
@@ -172,14 +198,7 @@ fn draw_rolling(buf: &mut Buffer, area: Rect, game: &SicBoGame, _app: &App, w: u
     // Total
     let total: u8 = game.rolling_display.iter().sum();
     let total_str = format!("TOTAL: {}", total);
-    draw_str(
-        buf,
-        area,
-        (w - total_str.len()) / 2,
-        dice_y + DICE_H + 1,
-        &total_str,
-        theme::AMBER,
-    );
+    draw_str(buf, area, (w - total_str.len()) / 2, dice_y + DICE_H + 1, &total_str, theme::AMBER);
 }
 
 fn draw_dice_display(buf: &mut Buffer, area: Rect, game: &SicBoGame, w: usize, h: usize) {
@@ -199,19 +218,8 @@ fn draw_dice_display(buf: &mut Buffer, area: Rect, game: &SicBoGame, w: usize, h
     // Total
     let total: u8 = game.dice.iter().sum();
     let total_str = format!("TOTAL: {}", total);
-    let total_color = if total >= 11 {
-        theme::GREEN
-    } else {
-        theme::CYAN
-    };
-    draw_str(
-        buf,
-        area,
-        (w - total_str.len()) / 2,
-        dice_y + DICE_H + 1,
-        &total_str,
-        total_color,
-    );
+    let total_color = if total >= 11 { theme::GREEN } else { theme::CYAN };
+    draw_str(buf, area, (w - total_str.len()) / 2, dice_y + DICE_H + 1, &total_str, total_color);
 }
 
 fn draw_result(buf: &mut Buffer, area: Rect, game: &SicBoGame, _app: &App, w: usize, h: usize) {
@@ -235,36 +243,10 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &SicBoGame, _app: &App, w: us
     let banner_w = label.len() + 6;
     let bx = (w.saturating_sub(banner_w)) / 2;
 
-    draw_str(
-        buf,
-        area,
-        bx,
-        result_y,
-        &format!("╔{}╗", "═".repeat(banner_w - 2)),
-        color,
-    );
+    draw_str(buf, area, bx, result_y, &format!("╔{}╗", "═".repeat(banner_w - 2)), color);
     let pad = (banner_w - 2 - label.len()) / 2;
-    draw_str(
-        buf,
-        area,
-        bx,
-        result_y + 1,
-        &format!(
-            "║{}{}{}║",
-            " ".repeat(pad),
-            label,
-            " ".repeat(banner_w - 2 - pad - label.len())
-        ),
-        color,
-    );
-    draw_str(
-        buf,
-        area,
-        bx,
-        result_y + 2,
-        &format!("╚{}╝", "═".repeat(banner_w - 2)),
-        color,
-    );
+    draw_str(buf, area, bx, result_y + 1, &format!("║{}{}{}║", " ".repeat(pad), label, " ".repeat(banner_w - 2 - pad - label.len())), color);
+    draw_str(buf, area, bx, result_y + 2, &format!("╚{}╝", "═".repeat(banner_w - 2)), color);
 
     // Payout
     let payout_str = if game.last_payout > 0 {
@@ -274,30 +256,10 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &SicBoGame, _app: &App, w: us
     } else {
         "NO CHANGE".to_string()
     };
-    let payout_color = if game.last_payout > 0 {
-        theme::GREEN
-    } else if game.last_payout < 0 {
-        theme::RED
-    } else {
-        theme::GRAY
-    };
-    draw_str(
-        buf,
-        area,
-        (w - payout_str.len()) / 2,
-        result_y + 4,
-        &payout_str,
-        payout_color,
-    );
+    let payout_color = if game.last_payout > 0 { theme::GREEN } else if game.last_payout < 0 { theme::RED } else { theme::GRAY };
+    draw_str(buf, area, (w - payout_str.len()) / 2, result_y + 4, &payout_str, payout_color);
 
-    draw_str(
-        buf,
-        area,
-        (w - 28) / 2,
-        h - 1,
-        "[ENTER] New Round  ·  [ESC] Back",
-        theme::DARK_GRAY,
-    );
+    draw_str(buf, area, (w - 28) / 2, h - 1, "[ENTER] New Round  ·  [ESC] Back", theme::DARK_GRAY);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -305,13 +267,9 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &SicBoGame, _app: &App, w: us
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() {
-        return;
-    }
+    if cy >= area.bottom() { return; }
     for ch in s.chars() {
-        if cx >= area.right() {
-            break;
-        }
+        if cx >= area.right() { break; }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }

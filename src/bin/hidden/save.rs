@@ -79,7 +79,8 @@ pub fn save(data: &SaveData) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string_pretty(data).map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(data)
+        .map_err(std::io::Error::other)?;
 
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json)?;

@@ -551,14 +551,11 @@ pub(super) async fn handle_command(
                 match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
-                        // Restore thinking level: named levels (incl. max/ultra)
-                        // win over legacy budget lookups.
-                        let level_str = &session.thinking_level;
-                        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(level_str)
-                        {
-                            runtime.set_reasoning_level(level);
-                        } else if let Some(budget) =
-                            synaps_cli::models::budget_for_thinking_level(level_str)
+                        // Restore the session's thinking level alongside model
+                        // and system prompt (it's serialized round-trip, was
+                        // just never re-applied).
+                        if let Some(budget) =
+                            synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
                         {
                             runtime.set_thinking_budget(budget);
                         }

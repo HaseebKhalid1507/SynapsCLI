@@ -6,12 +6,12 @@
 //!  3. server drain injects canonical content without a raw event frame
 //!  4. wake policy respects enabled/disabled configuration
 
-use agent_engine::engine::reactor::{drain_event_queue, wake_action, WakeAction};
-use agent_engine::events::{
-    types::{Event, Severity},
-    EventQueue,
+
+use agent_engine::engine::reactor::{
+    drain_event_queue, wake_action, WakeAction,
 };
-use synaps_cli::core::config::{load_config_from_str, EventsConfig};
+use agent_engine::events::{types::{Event, Severity}, EventQueue};
+use synaps_cli::core::config::{EventsConfig, load_config_from_str};
 
 fn make_queue(items: &[(&str, &str, Option<Severity>)]) -> EventQueue {
     let q = EventQueue::new(64);
@@ -31,10 +31,8 @@ fn user_msg(text: &str) -> synaps_cli::SharedMessage {
 
 #[test]
 fn events_auto_turn_default_true() {
-    assert!(
-        EventsConfig::default().auto_turn,
-        "default auto_turn must be true; opt-out via events.auto_turn = false"
-    );
+    assert!(EventsConfig::default().auto_turn,
+        "default auto_turn must be true; opt-out via events.auto_turn = false");
 }
 
 // ─── 2. EventsConfig parses ───────────────────────────────────────────────────
@@ -73,10 +71,7 @@ fn drain_for_server_injects_canonical_event_without_raw_frame() {
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     assert_eq!(drained.len(), 1);
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0]["content"].as_str(),
-        Some(drained[0].formatted.as_str())
-    );
+    assert_eq!(messages[0]["content"].as_str(), Some(drained[0].formatted.as_str()));
 }
 
 // ─── 5. No auto-turn when events.auto_turn = false (default) ─────────────────
@@ -90,11 +85,8 @@ fn server_event_broadcast_no_auto_turn_when_disabled() {
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     // auto_turn = false → WakeAction must NOT be RunTurn
     let action = wake_action(&drained, &messages, false, false, 0);
-    assert_ne!(
-        action,
-        WakeAction::RunTurn,
-        "server must not auto-turn when events.auto_turn = false"
-    );
+    assert_ne!(action, WakeAction::RunTurn,
+        "server must not auto-turn when events.auto_turn = false");
 }
 
 // ─── 6. Auto-turn fires when explicitly enabled ────────────────────────────────
@@ -109,9 +101,6 @@ fn server_event_broadcast_auto_turn_when_enabled() {
     // Injected events expand messages; last element is now the injected event.
     // auto_turn = true, not busy, consecutive_auto_turns = 0 → RunTurn
     let action = wake_action(&drained, &messages, false, true, 0);
-    assert_eq!(
-        action,
-        WakeAction::RunTurn,
-        "server should RunTurn when events.auto_turn = true and conditions met"
-    );
+    assert_eq!(action, WakeAction::RunTurn,
+        "server should RunTurn when events.auto_turn = true and conditions met");
 }

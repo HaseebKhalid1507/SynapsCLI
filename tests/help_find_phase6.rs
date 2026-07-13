@@ -2,10 +2,7 @@ use synaps_cli::help::{HelpEntry, HelpFindState, HelpRegistry, HelpTopicKind};
 
 fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpEntry {
     HelpEntry {
-        id: command
-            .trim_start_matches('/')
-            .replace(' ', "-")
-            .to_string(),
+        id: command.trim_start_matches('/').replace(' ', "-").to_string(),
         command: command.to_string(),
         title: title.to_string(),
         summary: format!("{} summary", title),
@@ -43,28 +40,10 @@ fn help_find_places_help_commands_category_last_with_parent_command_first() {
     let state = HelpFindState::new(registry.entries().to_vec(), "");
 
     let rows = state.filtered_rows();
-    let help_header_index = rows
-        .iter()
-        .position(|row| row.category() == Some("Help commands"))
-        .unwrap();
-    assert_eq!(
-        help_header_index,
-        rows.iter()
-            .rposition(|row| row.category().is_some())
-            .unwrap()
-    );
-    assert_eq!(
-        rows[help_header_index + 1]
-            .entry()
-            .map(|entry| entry.command.as_str()),
-        Some("/help")
-    );
-    assert_eq!(
-        rows[help_header_index + 2]
-            .entry()
-            .map(|entry| entry.command.as_str()),
-        Some("/help find")
-    );
+    let help_header_index = rows.iter().position(|row| row.category() == Some("Help commands")).unwrap();
+    assert_eq!(help_header_index, rows.iter().rposition(|row| row.category().is_some()).unwrap());
+    assert_eq!(rows[help_header_index + 1].entry().map(|entry| entry.command.as_str()), Some("/help"));
+    assert_eq!(rows[help_header_index + 2].entry().map(|entry| entry.command.as_str()), Some("/help find"));
 }
 
 #[test]
@@ -89,31 +68,13 @@ fn help_find_places_extension_sections_below_help_commands_in_source_alphabetica
         .filter_map(|row| row.category().map(str::to_string))
         .collect::<Vec<_>>();
 
-    let help_index = categories
-        .iter()
-        .position(|category| category == "Help commands")
-        .unwrap();
-    let acme_index = categories
-        .iter()
-        .position(|category| category == "Acme Tools")
-        .unwrap();
-    let zebra_index = categories
-        .iter()
-        .position(|category| category == "Zebra Tools")
-        .unwrap();
+    let help_index = categories.iter().position(|category| category == "Help commands").unwrap();
+    let acme_index = categories.iter().position(|category| category == "Acme Tools").unwrap();
+    let zebra_index = categories.iter().position(|category| category == "Zebra Tools").unwrap();
 
-    assert!(
-        help_index < acme_index,
-        "extension sections should load below Help commands: {categories:?}"
-    );
-    assert!(
-        acme_index < zebra_index,
-        "extension sections should be alphabetical: {categories:?}"
-    );
-    assert!(
-        !categories.contains(&"Plugin".to_string()),
-        "plugin entries should not use generic Plugin header: {categories:?}"
-    );
+    assert!(help_index < acme_index, "extension sections should load below Help commands: {categories:?}");
+    assert!(acme_index < zebra_index, "extension sections should be alphabetical: {categories:?}");
+    assert!(!categories.contains(&"Plugin".to_string()), "plugin entries should not use generic Plugin header: {categories:?}");
 }
 
 #[test]
@@ -154,21 +115,11 @@ fn help_find_groups_help_topics_under_help_commands_and_real_commands_under_thei
     let state = HelpFindState::new(registry.entries().to_vec(), "");
 
     let rows = state.filtered_rows();
-    let help_header_index = rows
-        .iter()
-        .position(|row| row.category() == Some("Help commands"))
-        .unwrap();
-    let plugins_header_index = rows
-        .iter()
-        .position(|row| row.category() == Some("Plugins"))
-        .unwrap();
+    let help_header_index = rows.iter().position(|row| row.category() == Some("Help commands")).unwrap();
+    let plugins_header_index = rows.iter().position(|row| row.category() == Some("Plugins")).unwrap();
 
-    assert!(rows[help_header_index + 1]
-        .entry()
-        .is_some_and(|entry| entry.command == "/help plugins"));
-    assert!(rows[plugins_header_index + 1]
-        .entry()
-        .is_some_and(|entry| entry.command == "/plugins"));
+    assert!(rows[help_header_index + 1].entry().is_some_and(|entry| entry.command == "/help plugins"));
+    assert!(rows[plugins_header_index + 1].entry().is_some_and(|entry| entry.command == "/plugins"));
 }
 
 #[test]
@@ -230,20 +181,11 @@ fn help_find_sections_group_empty_query_by_category_with_header_rows() {
     let rows = state.filtered_rows();
 
     assert_eq!(rows[0].category(), Some("Models"));
-    assert_eq!(
-        rows[1].entry().map(|entry| entry.command.as_str()),
-        Some("/model")
-    );
+    assert_eq!(rows[1].entry().map(|entry| entry.command.as_str()), Some("/model"));
     assert_eq!(rows[2].category(), Some("Settings"));
-    assert_eq!(
-        rows[3].entry().map(|entry| entry.command.as_str()),
-        Some("/settings")
-    );
+    assert_eq!(rows[3].entry().map(|entry| entry.command.as_str()), Some("/settings"));
     assert_eq!(rows[4].category(), Some("Advanced"));
-    assert_eq!(
-        rows[5].entry().map(|entry| entry.command.as_str()),
-        Some("/zeta")
-    );
+    assert_eq!(rows[5].entry().map(|entry| entry.command.as_str()), Some("/zeta"));
 }
 
 #[test]
@@ -257,27 +199,14 @@ fn help_find_navigation_skips_category_headers() {
     );
     let mut state = HelpFindState::new(registry.entries().to_vec(), "");
 
-    assert_eq!(
-        state.cursor(),
-        1,
-        "initial cursor should select first entry, not category header"
-    );
-    assert_eq!(
-        state.selected().map(|entry| entry.command.as_str()),
-        Some("/alpha")
-    );
+    assert_eq!(state.cursor(), 1, "initial cursor should select first entry, not category header");
+    assert_eq!(state.selected().map(|entry| entry.command.as_str()), Some("/alpha"));
 
     state.move_up();
-    assert_eq!(
-        state.selected().map(|entry| entry.command.as_str()),
-        Some("/alpha")
-    );
+    assert_eq!(state.selected().map(|entry| entry.command.as_str()), Some("/alpha"));
 
     state.move_down();
-    assert_eq!(
-        state.selected().map(|entry| entry.command.as_str()),
-        Some("/beta")
-    );
+    assert_eq!(state.selected().map(|entry| entry.command.as_str()), Some("/beta"));
 }
 
 #[test]
@@ -295,10 +224,7 @@ fn help_find_section_headers_are_hidden_when_query_filters() {
 
     assert!(rows.iter().all(|row| row.entry().is_some()));
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].entry().map(|entry| entry.command.as_str()),
-        Some("/model")
-    );
+    assert_eq!(rows[0].entry().map(|entry| entry.command.as_str()), Some("/model"));
 }
 
 #[test]
@@ -316,9 +242,7 @@ fn help_find_highlight_spans_mark_query_matches_in_command_and_summary() {
     assert!(!command_spans[2].matched);
 
     let summary_spans = synaps_cli::help::highlight_segments(&entry.summary, "model");
-    assert!(summary_spans
-        .iter()
-        .any(|span| span.text == "model" && span.matched));
+    assert!(summary_spans.iter().any(|span| span.text == "model" && span.matched));
 }
 
 #[test]
@@ -344,11 +268,7 @@ fn help_find_mru_boosts_recently_opened_entry_without_beating_exact_command() {
         .map(|entry| entry.command.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        commands[..2],
-        ["/model", "/modelist"],
-        "exact command stays first"
-    );
+    assert_eq!(commands[..2], ["/model", "/modelist"], "exact command stays first");
 
     state.clear_filter();
     state.push_char('m');

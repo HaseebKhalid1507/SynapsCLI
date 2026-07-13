@@ -11,32 +11,24 @@ pub enum RouletteColor {
 
 /// European roulette: 0-36
 pub fn number_color(n: u8) -> RouletteColor {
-    if n == 0 {
-        return RouletteColor::Green;
-    }
+    if n == 0 { return RouletteColor::Green; }
     // Standard European roulette color distribution
-    const RED_NUMBERS: [u8; 18] = [
-        1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36,
-    ];
-    if RED_NUMBERS.contains(&n) {
-        RouletteColor::Red
-    } else {
-        RouletteColor::Black
-    }
+    const RED_NUMBERS: [u8; 18] = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+    if RED_NUMBERS.contains(&n) { RouletteColor::Red } else { RouletteColor::Black }
 }
 
 // ── Bet Types ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BetType {
-    Straight(u8), // Single number (0-36), pays 35:1
-    Red,          // All red numbers, pays 1:1
-    Black,        // All black numbers, pays 1:1
-    Odd,          // All odd (1-35), pays 1:1
-    Even,         // All even (2-36), pays 1:1
-    Low,          // 1-18, pays 1:1
-    High,         // 19-36, pays 1:1
-    Dozen(u8),    // 1st(1-12), 2nd(13-24), 3rd(25-36), pays 2:1
+    Straight(u8),   // Single number (0-36), pays 35:1
+    Red,            // All red numbers, pays 1:1
+    Black,          // All black numbers, pays 1:1
+    Odd,            // All odd (1-35), pays 1:1
+    Even,           // All even (2-36), pays 1:1
+    Low,            // 1-18, pays 1:1
+    High,           // 19-36, pays 1:1
+    Dozen(u8),      // 1st(1-12), 2nd(13-24), 3rd(25-36), pays 2:1
 }
 
 impl BetType {
@@ -104,15 +96,10 @@ pub enum RoulettePhase {
 
 /// The available bet options for the UI cursor
 pub const BET_OPTIONS: &[BetType] = &[
-    BetType::Red,
-    BetType::Black,
-    BetType::Odd,
-    BetType::Even,
-    BetType::Low,
-    BetType::High,
-    BetType::Dozen(1),
-    BetType::Dozen(2),
-    BetType::Dozen(3),
+    BetType::Red, BetType::Black,
+    BetType::Odd, BetType::Even,
+    BetType::Low, BetType::High,
+    BetType::Dozen(1), BetType::Dozen(2), BetType::Dozen(3),
 ];
 
 pub struct RouletteGame {
@@ -196,8 +183,7 @@ impl RouletteGame {
         for bet in &self.bets {
             if bet.bet_type.wins(result) {
                 // Winner: get bet back + profit (bet * payout_ratio)
-                total_return +=
-                    bet.amount as i64 + (bet.amount * bet.bet_type.payout_ratio()) as i64;
+                total_return += bet.amount as i64 + (bet.amount * bet.bet_type.payout_ratio()) as i64;
             }
             // Losers: nothing returned
         }
@@ -253,14 +239,14 @@ mod tests {
 
     #[test]
     fn red_bet_wins_on_red_numbers() {
-        assert!(BetType::Red.wins(1)); // red
-        assert!(!BetType::Red.wins(2)); // black
-        assert!(!BetType::Red.wins(0)); // green
+        assert!(BetType::Red.wins(1));   // red
+        assert!(!BetType::Red.wins(2));  // black
+        assert!(!BetType::Red.wins(0));  // green
     }
 
     #[test]
     fn black_bet_wins_on_black_numbers() {
-        assert!(BetType::Black.wins(2)); // black
+        assert!(BetType::Black.wins(2));  // black
         assert!(!BetType::Black.wins(1)); // red
         assert!(!BetType::Black.wins(0)); // green
     }
@@ -317,7 +303,7 @@ mod tests {
         let mut game = RouletteGame::new();
         game.place_bet(BetType::Red, 100);
         game.result = Some(1); // red
-                               // Win: get 100 back + 1*100 = 200 total, minus 100 = 100 profit
+        // Win: get 100 back + 1*100 = 200 total, minus 100 = 100 profit
         assert_eq!(game.calculate_payout(), 100);
     }
 
@@ -326,7 +312,7 @@ mod tests {
         let mut game = RouletteGame::new();
         game.place_bet(BetType::Red, 50);
         game.result = Some(2); // black
-                               // Lose entire bet
+        // Lose entire bet
         assert_eq!(game.calculate_payout(), -50);
     }
 
@@ -336,18 +322,18 @@ mod tests {
         game.place_bet(BetType::Red, 50);
         game.place_bet(BetType::Odd, 50);
         game.result = Some(1); // red AND odd
-                               // Both win: (50+50) + (50+50) = 200 return, minus 100 bet = 100 profit
+        // Both win: (50+50) + (50+50) = 200 return, minus 100 bet = 100 profit
         assert_eq!(game.calculate_payout(), 100);
     }
 
     #[test]
     fn multiple_bets_one_wins() {
         let mut game = RouletteGame::new();
-        game.place_bet(BetType::Red, 50); // wins
-        game.place_bet(BetType::Even, 50); // loses (1 is odd)
+        game.place_bet(BetType::Red, 50);   // wins
+        game.place_bet(BetType::Even, 50);  // loses (1 is odd)
         game.result = Some(1); // red, odd
-                               // Red wins: 50+50 = 100 return, Even loses: 0
-                               // Total return 100, total bet 100, net = 0
+        // Red wins: 50+50 = 100 return, Even loses: 0
+        // Total return 100, total bet 100, net = 0
         assert_eq!(game.calculate_payout(), 0);
     }
 

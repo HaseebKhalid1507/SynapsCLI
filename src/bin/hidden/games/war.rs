@@ -1,11 +1,11 @@
-use crate::games::blackjack::{Card, Deck, Rank};
+use crate::games::blackjack::{Card, Rank, Deck};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WarPhase {
     Betting,
-    Reveal,    // Show both cards
-    War,       // Tie — go to war
-    WarReveal, // War cards revealed
+    Reveal,      // Show both cards
+    War,         // Tie — go to war
+    WarReveal,   // War cards revealed
     Result,
 }
 
@@ -88,13 +88,9 @@ impl WarGame {
 
     pub fn go_to_war(&mut self) {
         // Burn 3 cards, deal 1 each
-        for _ in 0..3 {
-            self.deck.draw();
-        }
+        for _ in 0..3 { self.deck.draw(); }
         self.war_player = Some(self.deck.draw());
-        for _ in 0..3 {
-            self.deck.draw();
-        }
+        for _ in 0..3 { self.deck.draw(); }
         self.war_dealer = Some(self.deck.draw());
         self.phase = WarPhase::WarReveal;
         self.phase_timer = 0;

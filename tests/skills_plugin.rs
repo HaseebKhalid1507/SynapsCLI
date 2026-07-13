@@ -1,12 +1,8 @@
 //! End-to-end: temp HOME → discovered plugins/skills → CommandRegistry.
 
 use std::fs;
+use synaps_cli::skills::{loader, config::filter_disabled, registry::{CommandRegistry, Resolution}};
 use synaps_cli::skills::BUILTIN_COMMANDS;
-use synaps_cli::skills::{
-    config::filter_disabled,
-    loader,
-    registry::{CommandRegistry, Resolution},
-};
 
 fn write(path: &std::path::Path, content: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -56,10 +52,7 @@ fn end_to_end_discovery_and_dispatch() {
     // Built-in wins over the skill named "clear"...
     assert!(matches!(registry.resolve("clear"), Resolution::Builtin));
     // ...but qualified form reaches the skill.
-    assert!(matches!(
-        registry.resolve("web:clear"),
-        Resolution::Skill(_)
-    ));
+    assert!(matches!(registry.resolve("web:clear"), Resolution::Skill(_)));
     // Unique skill resolves.
     assert!(matches!(registry.resolve("search"), Resolution::Skill(_)));
     // Loose skill resolves.
@@ -113,9 +106,9 @@ fn end_to_end_nested_marketplace_discovery() {
 
 #[tokio::test]
 async fn reload_picks_up_new_skill() {
-    use std::sync::Arc;
+    use synaps_cli::{ToolRegistry, SynapsConfig};
     use synaps_cli::skills::{register, reload_registry};
-    use synaps_cli::{SynapsConfig, ToolRegistry};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
     let dir = tempfile::tempdir().unwrap();
@@ -132,35 +125,22 @@ async fn reload_picks_up_new_skill() {
     let (registry, _keybinds) = register(&tools, &config).await;
 
     // No skill yet.
-    assert!(matches!(
-        registry.resolve("fresh"),
-        synaps_cli::skills::registry::Resolution::Unknown
-    ));
+    assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Unknown));
 
     // Drop a new skill on disk.
     let skill_dir = plugins_root.join("freshplug").join("skills").join("fresh");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::create_dir_all(plugins_root.join("freshplug").join(".synaps-plugin")).unwrap();
     std::fs::write(
-        plugins_root
-            .join("freshplug")
-            .join(".synaps-plugin")
-            .join("plugin.json"),
+        plugins_root.join("freshplug").join(".synaps-plugin").join("plugin.json"),
         r#"{"name":"freshplug"}"#,
-    )
-    .unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\nname: fresh\ndescription: d\n---\nbody",
-    )
-    .unwrap();
+    ).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"),
+        "---\nname: fresh\ndescription: d\n---\nbody").unwrap();
 
     reload_registry(&registry, &config);
 
-    assert!(matches!(
-        registry.resolve("fresh"),
-        synaps_cli::skills::registry::Resolution::Skill(_)
-    ));
+    assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Skill(_)));
 
     // Restore HOME so we don't leak into other tests in this binary.
     match prev_home {

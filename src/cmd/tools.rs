@@ -7,9 +7,9 @@
 //! one entry per registered tool (builtin + extension + MCP-bridged).  This is
 //! the "agent-legible API" described in the field report (P13).
 
-use agent_engine::tools::ToolRegistry;
 use anyhow::Result;
 use serde_json::{json, Value};
+use agent_engine::tools::ToolRegistry;
 
 /// Subcommand dispatcher for `synaps tools <subcommand>`.
 pub async fn run(action: ToolsAction) -> Result<()> {

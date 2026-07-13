@@ -27,7 +27,8 @@ fn run_export(extra_args: &[&str]) -> String {
     }
     // Provide a clean HOME so we never hit real user config or live MCP processes.
     let tmp = tempfile::tempdir().expect("tempdir");
-    cmd.env("HOME", tmp.path()).env_remove("ANTHROPIC_API_KEY");
+    cmd.env("HOME", tmp.path())
+        .env_remove("ANTHROPIC_API_KEY");
 
     let output = cmd.output().expect("failed to spawn synaps binary");
 
@@ -85,28 +86,22 @@ fn export_pretty_produces_valid_json() {
 #[test]
 fn export_contains_all_17_builtin_tools() {
     let out = run_export(&[]);
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&out).expect("output must be a JSON array");
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
+        .expect("output must be a JSON array");
 
-    assert_eq!(
-        manifest.len(),
-        17,
+    assert_eq!(manifest.len(), 17,
         "export must contain exactly 17 builtin tools, got {}: {:?}",
         manifest.len(),
-        manifest
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect::<Vec<_>>()
+        manifest.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>()
     );
 
-    let names: Vec<&str> = manifest.iter().filter_map(|t| t["name"].as_str()).collect();
+    let names: Vec<&str> = manifest.iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
 
     for expected in EXPECTED_TOOL_NAMES {
-        assert!(
-            names.contains(expected),
-            "tool '{}' is missing from the export manifest",
-            expected
-        );
+        assert!(names.contains(expected),
+            "tool '{}' is missing from the export manifest", expected);
     }
 }
 
@@ -115,46 +110,31 @@ fn export_contains_all_17_builtin_tools() {
 #[test]
 fn export_each_tool_parameters_is_valid_json_schema() {
     let out = run_export(&[]);
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&out).expect("output must be a JSON array");
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
+        .expect("output must be a JSON array");
 
     for entry in &manifest {
         let name = entry["name"].as_str().unwrap_or("<unknown>");
         let params = &entry["parameters"];
 
-        assert!(
-            params.is_object(),
-            "tool '{}': 'parameters' must be a JSON object",
-            name
-        );
+        assert!(params.is_object(),
+            "tool '{}': 'parameters' must be a JSON object", name);
 
         let schema_type = params["type"].as_str();
-        assert_eq!(
-            schema_type,
-            Some("object"),
-            "tool '{}': parameters schema must have {{\"type\": \"object\"}}",
-            name
-        );
+        assert_eq!(schema_type, Some("object"),
+            "tool '{}': parameters schema must have {{\"type\": \"object\"}}", name);
 
-        assert!(
-            params["properties"].is_object(),
-            "tool '{}': parameters schema must have a 'properties' object",
-            name
-        );
+        assert!(params["properties"].is_object(),
+            "tool '{}': parameters schema must have a 'properties' object", name);
 
         // If there are required fields, they must all appear in properties.
         if let Some(required) = params["required"].as_array() {
-            let properties = params["properties"]
-                .as_object()
+            let properties = params["properties"].as_object()
                 .expect("properties must be an object");
             for req in required {
                 let field = req.as_str().expect("required entries must be strings");
-                assert!(
-                    properties.contains_key(field),
-                    "tool '{}': required field '{}' is missing from 'properties'",
-                    name,
-                    field
-                );
+                assert!(properties.contains_key(field),
+                    "tool '{}': required field '{}' is missing from 'properties'", name, field);
             }
         }
     }
@@ -164,7 +144,7 @@ fn export_each_tool_parameters_is_valid_json_schema() {
 
 #[test]
 fn export_is_deterministic_across_runs() {
-    let first = run_export(&[]);
+    let first  = run_export(&[]);
     let second = run_export(&[]);
 
     assert_eq!(first, second,
@@ -173,13 +153,11 @@ fn export_is_deterministic_across_runs() {
 
 #[test]
 fn export_pretty_is_deterministic_across_runs() {
-    let first = run_export(&["--pretty"]);
+    let first  = run_export(&["--pretty"]);
     let second = run_export(&["--pretty"]);
 
-    assert_eq!(
-        first, second,
-        "`synaps tools export --pretty` must produce byte-identical output across runs"
-    );
+    assert_eq!(first, second,
+        "`synaps tools export --pretty` must produce byte-identical output across runs");
 }
 
 // ─── Test 5: --pretty output is byte-identical to committed docs/tools.json ───
@@ -198,19 +176,14 @@ fn export_pretty_matches_committed_docs_tools_json() {
         // CARGO_MANIFEST_DIR is set at compile time to the crate's Cargo.toml directory.
         // For `tests/tools_export.rs`, that is the synaps root crate (workspace root).
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        std::path::PathBuf::from(manifest_dir)
-            .join("docs")
-            .join("tools.json")
+        std::path::PathBuf::from(manifest_dir).join("docs").join("tools.json")
     };
 
-    assert!(
-        committed_path.exists(),
-        "docs/tools.json not found at {:?} — was it moved or deleted?",
-        committed_path
-    );
+    assert!(committed_path.exists(),
+        "docs/tools.json not found at {:?} — was it moved or deleted?", committed_path);
 
-    let committed =
-        std::fs::read_to_string(&committed_path).expect("failed to read docs/tools.json");
+    let committed = std::fs::read_to_string(&committed_path)
+        .expect("failed to read docs/tools.json");
 
     let generated = run_export(&["--pretty"]);
 
@@ -218,8 +191,7 @@ fn export_pretty_matches_committed_docs_tools_json() {
     // `echo` appends a trailing newline; `println!` in Rust does the same.
     // Both sides should end with a single newline — if this assert fires,
     // re-run `synaps tools export --pretty > docs/tools.json`.
-    assert_eq!(
-        generated, committed,
+    assert_eq!(generated, committed,
         "DRIFT DETECTED: `synaps tools export --pretty` output does not match docs/tools.json.\n\
          Fix: run `synaps tools export --pretty > docs/tools.json` and commit."
     );
@@ -230,19 +202,15 @@ fn export_pretty_matches_committed_docs_tools_json() {
 #[test]
 fn export_output_ends_with_newline() {
     let out = run_export(&[]);
-    assert!(
-        out.ends_with('\n'),
-        "`synaps tools export` output must end with a newline (POSIX convention)"
-    );
+    assert!(out.ends_with('\n'),
+        "`synaps tools export` output must end with a newline (POSIX convention)");
 }
 
 #[test]
 fn export_pretty_output_ends_with_newline() {
     let out = run_export(&["--pretty"]);
-    assert!(
-        out.ends_with('\n'),
-        "`synaps tools export --pretty` output must end with a newline (POSIX convention)"
-    );
+    assert!(out.ends_with('\n'),
+        "`synaps tools export --pretty` output must end with a newline (POSIX convention)");
 }
 
 // ─── Test 7: Output is a JSON array (not object, not primitive) ───────────────
@@ -250,12 +218,11 @@ fn export_pretty_output_ends_with_newline() {
 #[test]
 fn export_output_is_json_array() {
     let out = run_export(&[]);
-    let val: serde_json::Value = serde_json::from_str(&out).expect("output must be valid JSON");
-    assert!(
-        val.is_array(),
+    let val: serde_json::Value = serde_json::from_str(&out)
+        .expect("output must be valid JSON");
+    assert!(val.is_array(),
         "`synaps tools export` must emit a JSON array at the top level, got: {:?}",
-        val.as_object()
-            .map(|o| format!("object with {} keys", o.len()))
+        val.as_object().map(|o| format!("object with {} keys", o.len()))
             .unwrap_or_else(|| "non-array, non-object value".to_string())
     );
 }
@@ -269,48 +236,28 @@ fn export_output_is_json_array() {
 #[test]
 fn export_each_entry_has_name_description_parameters_shape() {
     let out = run_export(&[]);
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&out).expect("output must be a JSON array");
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
+        .expect("output must be a JSON array");
 
     for entry in &manifest {
-        let obj = entry
-            .as_object()
+        let obj = entry.as_object()
             .expect("each manifest entry must be a JSON object");
 
-        assert!(
-            obj.contains_key("name"),
-            "entry missing 'name' key: {:?}",
-            entry
-        );
-        assert!(
-            obj.contains_key("description"),
-            "entry missing 'description' key: {:?}",
-            entry
-        );
-        assert!(
-            obj.contains_key("parameters"),
-            "entry missing 'parameters' key: {:?}",
-            entry
-        );
+        assert!(obj.contains_key("name"),        "entry missing 'name' key: {:?}", entry);
+        assert!(obj.contains_key("description"), "entry missing 'description' key: {:?}", entry);
+        assert!(obj.contains_key("parameters"),  "entry missing 'parameters' key: {:?}", entry);
 
         let name = obj["name"].as_str().unwrap_or("");
         assert!(!name.is_empty(), "entry 'name' must be a non-empty string");
 
         let desc = obj["description"].as_str().unwrap_or("");
-        assert!(
-            !desc.is_empty(),
-            "tool '{}': 'description' must be a non-empty string",
-            name
-        );
+        assert!(!desc.is_empty(), "tool '{}': 'description' must be a non-empty string", name);
 
         // NOTE: we assert parameters is NOT the Anthropic API shape (which uses `input_schema`).
         // The export uses the raw Tool::parameters() which produces `parameters`.
-        assert!(
-            !obj.contains_key("input_schema"),
+        assert!(!obj.contains_key("input_schema"),
             "tool '{}': export must use 'parameters' key (raw Tool trait output), \
-             not 'input_schema' (Anthropic API shape) — wrong schema source?",
-            name
-        );
+             not 'input_schema' (Anthropic API shape) — wrong schema source?", name);
     }
 }
 
@@ -319,20 +266,19 @@ fn export_each_entry_has_name_description_parameters_shape() {
 #[test]
 fn export_tools_are_in_alphabetical_order() {
     let out = run_export(&[]);
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&out).expect("output must be a JSON array");
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
+        .expect("output must be a JSON array");
 
-    let names: Vec<&str> = manifest.iter().filter_map(|t| t["name"].as_str()).collect();
+    let names: Vec<&str> = manifest.iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
 
     let mut sorted = names.clone();
     sorted.sort();
 
-    assert_eq!(
-        names, sorted,
+    assert_eq!(names, sorted,
         "export output must list tools in alphabetical order; \
-         got {:?}, expected {:?}",
-        names, sorted
-    );
+         got {:?}, expected {:?}", names, sorted);
 }
 
 // ─── Test 10: Drift-check script exits 0 when binary matches committed JSON ───
@@ -368,21 +314,13 @@ fn drift_check_script_exits_zero_when_no_drift() {
     let status = std::process::Command::new("bash")
         .arg(&script)
         .env("SYNAPS_BIN", bin)
-        .env(
-            "COMMITTED",
-            std::path::PathBuf::from(manifest_dir)
-                .join("docs")
-                .join("tools.json"),
-        )
+        .env("COMMITTED", std::path::PathBuf::from(manifest_dir).join("docs").join("tools.json"))
         .status()
         .expect("failed to run drift-check script");
 
-    assert!(
-        status.success(),
+    assert!(status.success(),
         "scripts/tools-schema-drift-check.sh must exit 0 when binary matches committed JSON, \
-         got exit code: {:?}",
-        status.code()
-    );
+         got exit code: {:?}", status.code());
 }
 
 // ─── Test 11: Drift-check script exits non-zero when committed JSON is modified
@@ -424,9 +362,7 @@ fn drift_check_script_exits_nonzero_when_drift_detected() {
         .status()
         .expect("failed to run drift-check script");
 
-    assert!(
-        !status.success(),
+    assert!(!status.success(),
         "scripts/tools-schema-drift-check.sh must exit non-zero when committed JSON diverges \
-         from binary output, but it exited 0 — drift detection is broken"
-    );
+         from binary output, but it exited 0 — drift detection is broken");
 }

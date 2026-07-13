@@ -1,5 +1,6 @@
 use rand::seq::SliceRandom;
 
+
 // ── Card Types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,19 +28,8 @@ impl Suit {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rank {
-    Ace,
-    Two,
-    Three,
-    Four,
-    Five,
-    Six,
-    Seven,
-    Eight,
-    Nine,
-    Ten,
-    Jack,
-    Queen,
-    King,
+    Ace, Two, Three, Four, Five, Six, Seven,
+    Eight, Nine, Ten, Jack, Queen, King,
 }
 
 impl Rank {
@@ -94,19 +84,9 @@ impl Card {
 
 const ALL_SUITS: [Suit; 4] = [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs];
 const ALL_RANKS: [Rank; 13] = [
-    Rank::Ace,
-    Rank::Two,
-    Rank::Three,
-    Rank::Four,
-    Rank::Five,
-    Rank::Six,
-    Rank::Seven,
-    Rank::Eight,
-    Rank::Nine,
-    Rank::Ten,
-    Rank::Jack,
-    Rank::Queen,
-    Rank::King,
+    Rank::Ace, Rank::Two, Rank::Three, Rank::Four, Rank::Five,
+    Rank::Six, Rank::Seven, Rank::Eight, Rank::Nine, Rank::Ten,
+    Rank::Jack, Rank::Queen, Rank::King,
 ];
 
 pub struct Deck {
@@ -171,11 +151,11 @@ pub fn is_blackjack(cards: &[Card]) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GamePhase {
     Betting,
-    Dealing, // Animation phase: cards being dealt
+    Dealing,        // Animation phase: cards being dealt
     PlayerTurn,
     DealerTurn,
     DealerRevealing, // Animation phase: dealer drawing
-    Resolving,       // Animation phase: showing result
+    Resolving,      // Animation phase: showing result
     Result(Outcome),
 }
 
@@ -202,10 +182,7 @@ impl Outcome {
     }
 
     pub fn is_win(&self) -> bool {
-        matches!(
-            self,
-            Outcome::PlayerBlackjack | Outcome::PlayerWin | Outcome::DealerBust
-        )
+        matches!(self, Outcome::PlayerBlackjack | Outcome::PlayerWin | Outcome::DealerBust)
     }
 }
 
@@ -276,9 +253,7 @@ impl BlackjackGame {
 
     /// Player hits (takes another card).
     pub fn hit(&mut self) {
-        if self.phase != GamePhase::PlayerTurn {
-            return;
-        }
+        if self.phase != GamePhase::PlayerTurn { return; }
         self.player_hand.push(self.deck.draw());
 
         if is_bust(&self.player_hand) {
@@ -288,21 +263,15 @@ impl BlackjackGame {
 
     /// Player stands.
     pub fn stand(&mut self) {
-        if self.phase != GamePhase::PlayerTurn {
-            return;
-        }
+        if self.phase != GamePhase::PlayerTurn { return; }
         self.phase = GamePhase::DealerTurn;
         self.phase_timer = 0;
     }
 
     /// Player doubles down (double bet, one card, then stand).
     pub fn double_down(&mut self) {
-        if self.phase != GamePhase::PlayerTurn {
-            return;
-        }
-        if self.player_hand.len() != 2 {
-            return;
-        }
+        if self.phase != GamePhase::PlayerTurn { return; }
+        if self.player_hand.len() != 2 { return; }
 
         self.doubled = true;
         self.bet *= 2;
@@ -375,11 +344,11 @@ impl BlackjackGame {
 
     /// Dealer's visible value (only first card during player turn).
     pub fn dealer_showing(&self) -> u8 {
-        if self.dealer_hand.is_empty() {
-            return 0;
-        }
+        if self.dealer_hand.is_empty() { return 0; }
         match self.phase {
-            GamePhase::PlayerTurn | GamePhase::Dealing => self.dealer_hand[0].rank.value(),
+            GamePhase::PlayerTurn | GamePhase::Dealing => {
+                self.dealer_hand[0].rank.value()
+            }
             _ => hand_value(&self.dealer_hand),
         }
     }
@@ -551,10 +520,7 @@ mod tests {
         // All 52 should be unique
         for i in 0..cards.len() {
             for j in (i + 1)..cards.len() {
-                assert_ne!(
-                    (cards[i].rank, cards[i].suit),
-                    (cards[j].rank, cards[j].suit)
-                );
+                assert_ne!((cards[i].rank, cards[i].suit), (cards[j].rank, cards[j].suit));
             }
         }
     }
@@ -563,9 +529,7 @@ mod tests {
     fn deck_reshuffles_when_empty() {
         let mut deck = Deck::new_shuffled();
         // Draw all 52
-        for _ in 0..52 {
-            deck.draw();
-        }
+        for _ in 0..52 { deck.draw(); }
         // Should reshuffle and keep going
         let card = deck.draw();
         assert!(card.rank.value() > 0);

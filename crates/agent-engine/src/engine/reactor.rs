@@ -9,7 +9,7 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::events::{format_event_for_agent, EventQueue};
+use crate::events::{EventQueue, format_event_for_agent};
 use crate::SharedMessage;
 
 // Re-export the shared wire payload so callers can use `engine::reactor::EventPayload`.
@@ -97,11 +97,7 @@ pub fn drain_event_queue(
             EventDisposition::Injected
         };
 
-        drained.push(DrainedEvent {
-            event,
-            formatted,
-            disposition,
-        });
+        drained.push(DrainedEvent { event, formatted, disposition });
     }
 
     drained
@@ -125,18 +121,13 @@ pub fn wake_action(
         return WakeAction::Nothing;
     }
 
-    let has_injected = drained
-        .iter()
-        .any(|d| d.disposition == EventDisposition::Injected);
+    let has_injected = drained.iter().any(|d| d.disposition == EventDisposition::Injected);
 
     if has_injected
         && !busy
         && auto_turn_enabled
         && consecutive_auto_turns < AUTO_TURN_CAP
-        && messages
-            .last()
-            .map(|m| m["role"].as_str() == Some("user"))
-            .unwrap_or(false)
+        && messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
     {
         return WakeAction::RunTurn;
     }
@@ -244,17 +235,14 @@ pub fn terminal_flush_seam(
     let had_buffered = !to_inject.is_empty();
     for formatted in to_inject {
         api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted}),
+            serde_json::json!({"role": "user", "content": formatted})
         ));
     }
     if allow_chain
         && had_buffered
         && events_auto_turn
         && *consecutive_auto_turns < AUTO_TURN_CAP
-        && api_messages
-            .last()
-            .map(|m| m["role"].as_str() == Some("user"))
-            .unwrap_or(false)
+        && api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
         && claim_auto_turn(consecutive_auto_turns)
     {
         *auto_turn_pending = true;
@@ -308,12 +296,7 @@ mod tests {
     fn make_queue_with(texts: &[(&str, Option<Severity>)]) -> EventQueue {
         let q = EventQueue::new(64);
         for (text, sev) in texts {
-            q.push(crate::events::types::Event::simple(
-                "test",
-                text,
-                sev.clone(),
-            ))
-            .unwrap();
+            q.push(crate::events::types::Event::simple("test", text, sev.clone())).unwrap();
         }
         q
     }
@@ -359,9 +342,7 @@ mod tests {
         let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
 
         assert_eq!(drained.len(), 3);
-        assert!(drained
-            .iter()
-            .all(|d| d.disposition == EventDisposition::Injected));
+        assert!(drained.iter().all(|d| d.disposition == EventDisposition::Injected));
         // Canonical order preserved
         assert!(drained[0].formatted.contains("first"));
         assert!(drained[1].formatted.contains("second"));
@@ -448,18 +429,8 @@ mod tests {
     fn priority_ordering_preserved_critical_first() {
         // Push medium first, then critical — critical should be drained first
         let q = EventQueue::new(10);
-        q.push(crate::events::types::Event::simple(
-            "test",
-            "medium",
-            Some(Severity::Medium),
-        ))
-        .unwrap();
-        q.push(crate::events::types::Event::simple(
-            "test",
-            "critical",
-            Some(Severity::Critical),
-        ))
-        .unwrap();
+        q.push(crate::events::types::Event::simple("test", "medium", Some(Severity::Medium))).unwrap();
+        q.push(crate::events::types::Event::simple("test", "critical", Some(Severity::Critical))).unwrap();
 
         let mut messages: Vec<SharedMessage> = Vec::new();
         let mut pending: Vec<String> = Vec::new();
@@ -621,25 +592,16 @@ mod tests {
     fn claim_auto_turn_first_five_allowed() {
         let mut counter: u32 = 0;
         for _ in 0..AUTO_TURN_CAP {
-            assert!(
-                claim_auto_turn(&mut counter),
-                "turn within cap must be allowed"
-            );
+            assert!(claim_auto_turn(&mut counter), "turn within cap must be allowed");
         }
-        assert_eq!(
-            counter, AUTO_TURN_CAP,
-            "counter must equal cap after 5 claims"
-        );
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must equal cap after 5 claims");
     }
 
     #[test]
     fn claim_auto_turn_sixth_denied() {
         let mut counter: u32 = AUTO_TURN_CAP;
         assert!(!claim_auto_turn(&mut counter), "turn at cap must be denied");
-        assert_eq!(
-            counter, AUTO_TURN_CAP,
-            "counter must remain unchanged when denied"
-        );
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must remain unchanged when denied");
     }
 
     #[test]
@@ -648,10 +610,7 @@ mod tests {
         assert!(!claim_auto_turn(&mut counter));
         assert!(!claim_auto_turn(&mut counter));
         assert!(!claim_auto_turn(&mut counter));
-        assert_eq!(
-            counter, AUTO_TURN_CAP,
-            "counter must not change while denied"
-        );
+        assert_eq!(counter, AUTO_TURN_CAP, "counter must not change while denied");
     }
 
     #[test]
@@ -660,10 +619,7 @@ mod tests {
         assert!(!claim_auto_turn(&mut counter));
         // Simulate user input reset
         counter = 0;
-        assert!(
-            claim_auto_turn(&mut counter),
-            "after reset first turn must be allowed"
-        );
+        assert!(claim_auto_turn(&mut counter), "after reset first turn must be allowed");
         assert_eq!(counter, 1);
     }
 

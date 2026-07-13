@@ -1,9 +1,9 @@
+use ratatui::prelude::*;
+use ratatui::buffer::Buffer;
 use crate::app::App;
 use crate::games::baccarat::*;
 use crate::games::blackjack::Card;
 use crate::ui::theme;
-use ratatui::buffer::Buffer;
-use ratatui::prelude::*;
 
 // ── Card Rendering ──────────────────────────────────────────────────
 
@@ -17,11 +17,7 @@ fn draw_card(buf: &mut Buffer, area: Rect, x: usize, y: usize, card: &Card) {
 
     let rank = card.rank.label();
     let suit = card.suit.symbol();
-    let suit_color = if card.suit.is_red() {
-        theme::CARD_RED
-    } else {
-        theme::CARD_BLACK
-    };
+    let suit_color = if card.suit.is_red() { theme::CARD_RED } else { theme::CARD_BLACK };
 
     let r_pad = if rank.len() == 1 { " " } else { "" };
     let lines = [
@@ -34,16 +30,11 @@ fn draw_card(buf: &mut Buffer, area: Rect, x: usize, y: usize, card: &Card) {
 
     for (dy, line) in lines.iter().enumerate() {
         let cy = ay + dy as u16;
-        if cy >= area.bottom() {
-            continue;
-        }
+        if cy >= area.bottom() { continue; }
         let mut cx = ax;
         for ch in line.chars() {
-            if cx >= area.right() {
-                break;
-            }
-            let fg = if ch == '┌' || ch == '┐' || ch == '└' || ch == '┘' || ch == '─' || ch == '│'
-            {
+            if cx >= area.right() { break; }
+            let fg = if ch == '┌' || ch == '┐' || ch == '└' || ch == '┘' || ch == '─' || ch == '│' {
                 theme::AMBER_DIM
             } else if ch == '♠' || ch == '♥' || ch == '♦' || ch == '♣' {
                 suit_color
@@ -84,14 +75,10 @@ pub fn draw_baccarat(f: &mut Frame, app: &App, game: &BaccaratGame, area: Rect) 
     let table_bot = h.saturating_sub(4);
     for y in table_top..table_bot {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() {
-            continue;
-        }
+        if ay >= area.bottom() { continue; }
         for x in 2..(w.saturating_sub(2)) {
             let ax = area.left() + x as u16;
-            if ax >= area.right() {
-                continue;
-            }
+            if ax >= area.right() { continue; }
             buf[(ax, ay)].set_bg(Color::Rgb(5, 15, 8));
         }
     }
@@ -102,12 +89,8 @@ pub fn draw_baccarat(f: &mut Frame, app: &App, game: &BaccaratGame, area: Rect) 
         let at = area.top() + table_top as u16;
         let ab = area.top() + table_bot as u16;
         if ax < area.right() {
-            if at < area.bottom() {
-                buf[(ax, at)].set_char('─').set_fg(theme::AMBER_DIM);
-            }
-            if ab < area.bottom() {
-                buf[(ax, ab)].set_char('─').set_fg(theme::AMBER_DIM);
-            }
+            if at < area.bottom() { buf[(ax, at)].set_char('─').set_fg(theme::AMBER_DIM); }
+            if ab < area.bottom() { buf[(ax, ab)].set_char('─').set_fg(theme::AMBER_DIM); }
         }
     }
 
@@ -124,30 +107,9 @@ pub fn draw_baccarat(f: &mut Frame, app: &App, game: &BaccaratGame, area: Rect) 
 fn draw_betting(buf: &mut Buffer, area: Rect, game: &BaccaratGame, app: &App, w: usize, h: usize) {
     let cy = h / 2 - 4;
 
-    draw_str(
-        buf,
-        area,
-        (w - 20) / 2,
-        cy,
-        "╔══════════════════╗",
-        theme::AMBER,
-    );
-    draw_str(
-        buf,
-        area,
-        (w - 20) / 2,
-        cy + 1,
-        "║   BACCARAT BET    ║",
-        theme::AMBER,
-    );
-    draw_str(
-        buf,
-        area,
-        (w - 20) / 2,
-        cy + 2,
-        "╚══════════════════╝",
-        theme::AMBER,
-    );
+    draw_str(buf, area, (w - 20) / 2, cy, "╔══════════════════╗", theme::AMBER);
+    draw_str(buf, area, (w - 20) / 2, cy + 1, "║   BACCARAT BET    ║", theme::AMBER);
+    draw_str(buf, area, (w - 20) / 2, cy + 2, "╚══════════════════╝", theme::AMBER);
 
     let bet_display = if game.bet_input.is_empty() {
         "_ ".to_string()
@@ -156,19 +118,12 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &BaccaratGame, app: &App, w:
     };
 
     let bet_line = format!("◈ {} TOKENS", bet_display);
-    draw_str(
-        buf,
-        area,
-        (w - bet_line.len()) / 2,
-        cy + 4,
-        &bet_line,
-        theme::GREEN,
-    );
+    draw_str(buf, area, (w - bet_line.len()) / 2, cy + 4, &bet_line, theme::GREEN);
 
     // Bet type selection
     let bet_options = ["PLAYER", "BANKER", "TIE"];
     let odds = ["1:1", "0.95:1", "8:1"];
-
+    
     for (i, (option, odd)) in bet_options.iter().zip(odds.iter()).enumerate() {
         let selected = game.cursor == i;
         let fg = if selected { theme::CYAN } else { theme::GRAY };
@@ -178,14 +133,7 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &BaccaratGame, app: &App, w:
     }
 
     let balance = format!("Balance: {} tokens", app.tokens);
-    draw_str(
-        buf,
-        area,
-        (w - balance.len()) / 2,
-        cy + 10,
-        &balance,
-        theme::GRAY,
-    );
+    draw_str(buf, area, (w - balance.len()) / 2, cy + 10, &balance, theme::GRAY);
 
     let hint = "[↑↓] Select  ·  [0-9] Amount  ·  [ENTER] Deal  ·  [A] All-in  ·  [ESC] Back";
     let hx = (w.saturating_sub(hint.len())) / 2;
@@ -226,18 +174,11 @@ fn draw_hands(buf: &mut Buffer, area: Rect, game: &BaccaratGame, _app: &App, w: 
     // Bet display
     let bet_type_str = match game.bet_type {
         BaccaratBet::Player => "PLAYER",
-        BaccaratBet::Banker => "BANKER",
+        BaccaratBet::Banker => "BANKER", 
         BaccaratBet::Tie => "TIE",
     };
     let bet_str = format!("BET: {} on {}", game.bet, bet_type_str);
-    draw_str(
-        buf,
-        area,
-        (w - bet_str.len()) / 2,
-        h / 2,
-        &bet_str,
-        theme::AMBER_DIM,
-    );
+    draw_str(buf, area, (w - bet_str.len()) / 2, h / 2, &bet_str, theme::AMBER_DIM);
 }
 
 fn draw_result(buf: &mut Buffer, area: Rect, game: &BaccaratGame, _app: &App, w: usize, h: usize) {
@@ -247,49 +188,17 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &BaccaratGame, _app: &App, w:
             BaccaratOutcome::BankerWins => "BANKER WINS",
             BaccaratOutcome::Tie => "TIE",
         };
-        let color = if game.last_payout > 0 {
-            theme::GREEN
-        } else if game.last_payout < 0 {
-            theme::RED
-        } else {
-            theme::AMBER
-        };
+        let color = if game.last_payout > 0 { theme::GREEN } else if game.last_payout < 0 { theme::RED } else { theme::AMBER };
 
         // Result banner
         let banner_w = label.len() + 6;
         let bx = (w.saturating_sub(banner_w)) / 2;
         let by = h / 2 + 3;
 
-        draw_str(
-            buf,
-            area,
-            bx,
-            by,
-            &format!("╔{}╗", "═".repeat(banner_w - 2)),
-            color,
-        );
+        draw_str(buf, area, bx, by, &format!("╔{}╗", "═".repeat(banner_w - 2)), color);
         let pad = (banner_w - 2 - label.len()) / 2;
-        draw_str(
-            buf,
-            area,
-            bx,
-            by + 1,
-            &format!(
-                "║{}{}{}║",
-                " ".repeat(pad),
-                label,
-                " ".repeat(banner_w - 2 - pad - label.len())
-            ),
-            color,
-        );
-        draw_str(
-            buf,
-            area,
-            bx,
-            by + 2,
-            &format!("╚{}╝", "═".repeat(banner_w - 2)),
-            color,
-        );
+        draw_str(buf, area, bx, by + 1, &format!("║{}{}{}║", " ".repeat(pad), label, " ".repeat(banner_w - 2 - pad - label.len())), color);
+        draw_str(buf, area, bx, by + 2, &format!("╚{}╝", "═".repeat(banner_w - 2)), color);
 
         // Payout
         let payout_str = if game.last_payout > 0 {
@@ -299,30 +208,10 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &BaccaratGame, _app: &App, w:
         } else {
             "BET RETURNED".to_string()
         };
-        let payout_color = if game.last_payout > 0 {
-            theme::GREEN
-        } else if game.last_payout < 0 {
-            theme::RED
-        } else {
-            theme::GRAY
-        };
-        draw_str(
-            buf,
-            area,
-            (w - payout_str.len()) / 2,
-            by + 4,
-            &payout_str,
-            payout_color,
-        );
+        let payout_color = if game.last_payout > 0 { theme::GREEN } else if game.last_payout < 0 { theme::RED } else { theme::GRAY };
+        draw_str(buf, area, (w - payout_str.len()) / 2, by + 4, &payout_str, payout_color);
 
-        draw_str(
-            buf,
-            area,
-            (w - 28) / 2,
-            h - 2,
-            "[ENTER] New Hand  ·  [ESC] Back",
-            theme::DARK_GRAY,
-        );
+        draw_str(buf, area, (w - 28) / 2, h - 2, "[ENTER] New Hand  ·  [ESC] Back", theme::DARK_GRAY);
     }
 }
 
@@ -331,13 +220,9 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &BaccaratGame, _app: &App, w:
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() {
-        return;
-    }
+    if cy >= area.bottom() { return; }
     for ch in s.chars() {
-        if cx >= area.right() {
-            break;
-        }
+        if cx >= area.right() { break; }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }

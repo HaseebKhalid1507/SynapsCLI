@@ -1,8 +1,8 @@
+use ratatui::prelude::*;
+use ratatui::buffer::Buffer;
 use crate::app::App;
 use crate::games::slots::*;
 use crate::ui::theme;
-use ratatui::buffer::Buffer;
-use ratatui::prelude::*;
 
 pub fn draw_slots(f: &mut Frame, app: &App, game: &SlotsGame, area: Rect) {
     let buf = f.buffer_mut();
@@ -18,9 +18,7 @@ pub fn draw_slots(f: &mut Frame, app: &App, game: &SlotsGame, area: Rect) {
 
     match &game.phase {
         SlotsPhase::Betting => draw_betting(buf, area, game, app, w, h),
-        SlotsPhase::Spinning | SlotsPhase::Revealing(_) => {
-            draw_reels(buf, area, game, app, w, h, false)
-        }
+        SlotsPhase::Spinning | SlotsPhase::Revealing(_) => draw_reels(buf, area, game, app, w, h, false),
         SlotsPhase::Result => draw_reels(buf, area, game, app, w, h, true),
     }
 }
@@ -30,79 +28,25 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &SlotsGame, app: &App, w: us
     draw_machine_frame(buf, area, w, h);
 
     let cy = h / 2 - 3;
-    draw_str(
-        buf,
-        area,
-        (w - 16) / 2,
-        cy,
-        "╔══════════════╗",
-        theme::MAGENTA,
-    );
-    draw_str(
-        buf,
-        area,
-        (w - 16) / 2,
-        cy + 1,
-        "║  INSERT BET  ║",
-        theme::MAGENTA,
-    );
-    draw_str(
-        buf,
-        area,
-        (w - 16) / 2,
-        cy + 2,
-        "╚══════════════╝",
-        theme::MAGENTA,
-    );
+    draw_str(buf, area, (w - 16) / 2, cy, "╔══════════════╗", theme::MAGENTA);
+    draw_str(buf, area, (w - 16) / 2, cy + 1, "║  INSERT BET  ║", theme::MAGENTA);
+    draw_str(buf, area, (w - 16) / 2, cy + 2, "╚══════════════╝", theme::MAGENTA);
 
-    let bet_display = if game.bet_input.is_empty() {
-        "_ ".to_string()
-    } else {
-        format!("{}_", game.bet_input)
-    };
+    let bet_display = if game.bet_input.is_empty() { "_ ".to_string() } else { format!("{}_", game.bet_input) };
     let bet_line = format!("◈ {} TOKENS", bet_display);
-    draw_str(
-        buf,
-        area,
-        (w - bet_line.len()) / 2,
-        cy + 4,
-        &bet_line,
-        theme::GREEN,
-    );
+    draw_str(buf, area, (w - bet_line.len()) / 2, cy + 4, &bet_line, theme::GREEN);
 
     let balance = format!("Balance: {} tokens", app.tokens);
-    draw_str(
-        buf,
-        area,
-        (w - balance.len()) / 2,
-        cy + 6,
-        &balance,
-        theme::GRAY,
-    );
+    draw_str(buf, area, (w - balance.len()) / 2, cy + 6, &balance, theme::GRAY);
 
     // Payout table on the right
     draw_payout_table(buf, area, w, h);
 
     let hint = "[0-9] Amount  ·  [ENTER] Spin  ·  [A] All-in  ·  [ESC] Back";
-    draw_str(
-        buf,
-        area,
-        (w.saturating_sub(hint.len())) / 2,
-        h - 2,
-        hint,
-        theme::DARK_GRAY,
-    );
+    draw_str(buf, area, (w.saturating_sub(hint.len())) / 2, h - 2, hint, theme::DARK_GRAY);
 }
 
-fn draw_reels(
-    buf: &mut Buffer,
-    area: Rect,
-    game: &SlotsGame,
-    app: &App,
-    w: usize,
-    h: usize,
-    show_result: bool,
-) {
+fn draw_reels(buf: &mut Buffer, area: Rect, game: &SlotsGame, app: &App, w: usize, h: usize, show_result: bool) {
     draw_machine_frame(buf, area, w, h);
 
     let reel_w = 9;
@@ -166,14 +110,7 @@ fn draw_reels(
             let suffix = if is_center { "◂" } else { " " };
 
             let label = sym.label();
-            draw_str(
-                buf,
-                area,
-                rx + 1,
-                y,
-                &format!("{}{}{}", prefix, label, suffix),
-                sym_color,
-            );
+            draw_str(buf, area, rx + 1, y, &format!("{}{}{}", prefix, label, suffix), sym_color);
             draw_str(buf, area, rx + 8, y, "║", border_color);
         }
 
@@ -182,14 +119,7 @@ fn draw_reels(
 
     // Bet display
     let bet_str = format!("BET: {}", game.bet);
-    draw_str(
-        buf,
-        area,
-        (w - bet_str.len()) / 2,
-        reel_y + 6,
-        &bet_str,
-        theme::AMBER_DIM,
-    );
+    draw_str(buf, area, (w - bet_str.len()) / 2, reel_y + 6, &bet_str, theme::AMBER_DIM);
 
     // Result
     if show_result {
@@ -205,33 +135,15 @@ fn draw_reels(
                 draw_str(buf, area, (w - 10) / 2, y, "NO MATCH", theme::RED_DIM);
             }
 
-            let payout_color = if game.last_payout > 0 {
-                theme::GREEN
-            } else {
-                theme::RED
-            };
+            let payout_color = if game.last_payout > 0 { theme::GREEN } else { theme::RED };
             let payout_str = if game.last_payout > 0 {
                 format!("+{}", game.last_payout)
             } else {
                 format!("{}", game.last_payout)
             };
-            draw_str(
-                buf,
-                area,
-                (w - payout_str.len()) / 2,
-                y + 1,
-                &payout_str,
-                payout_color,
-            );
+            draw_str(buf, area, (w - payout_str.len()) / 2, y + 1, &payout_str, payout_color);
 
-            draw_str(
-                buf,
-                area,
-                (w - 30) / 2,
-                h - 2,
-                "[ENTER] Spin Again  ·  [ESC] Back",
-                theme::DARK_GRAY,
-            );
+            draw_str(buf, area, (w - 30) / 2, h - 2, "[ENTER] Spin Again  ·  [ESC] Back", theme::DARK_GRAY);
         }
     }
 
@@ -243,9 +155,7 @@ fn draw_machine_frame(buf: &mut Buffer, area: Rect, w: usize, h: usize) {
     // Side decorations — neon strips
     for y in 2..(h.saturating_sub(2)) {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() {
-            continue;
-        }
+        if ay >= area.bottom() { continue; }
 
         let left = area.left() + 1;
         let right = area.left() + (w - 2) as u16;
@@ -271,64 +181,33 @@ fn draw_payout_table(buf: &mut Buffer, area: Rect, w: usize, h: usize) {
 
     draw_str(buf, area, tx, ty, "┌──────────────────┐", theme::DARK_GRAY);
     draw_str(buf, area, tx, ty + 1, "│   PAYOUT TABLE   │", theme::GRAY);
-    draw_str(
-        buf,
-        area,
-        tx,
-        ty + 2,
-        "├──────────────────┤",
-        theme::DARK_GRAY,
-    );
+    draw_str(buf, area, tx, ty + 2, "├──────────────────┤", theme::DARK_GRAY);
 
     for (i, (name, mult, note)) in table.iter().enumerate() {
         let y = ty + 3 + i;
-        if y >= h.saturating_sub(2) {
-            break;
-        }
+        if y >= h.saturating_sub(2) { break; }
 
-        let color = if *note == "JACKPOT" {
-            theme::RED
-        } else {
-            theme::GRAY
-        };
+        let color = if *note == "JACKPOT" { theme::RED } else { theme::GRAY };
         let line = format!("│ {:8} {:>4}   │", name, mult);
         draw_str(buf, area, tx, y, &line, color);
     }
 
     let bot_y = ty + 3 + table.len().min(h.saturating_sub(ty + 5));
-    draw_str(
-        buf,
-        area,
-        tx,
-        bot_y,
-        "└──────────────────┘",
-        theme::DARK_GRAY,
-    );
+    draw_str(buf, area, tx, bot_y, "└──────────────────┘", theme::DARK_GRAY);
 }
 
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() {
-        return;
-    }
+    if cy >= area.bottom() { return; }
     for ch in s.chars() {
-        if cx >= area.right() {
-            break;
-        }
+        if cx >= area.right() { break; }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }
 }
 
-fn draw_jackpot_takeover(
-    buf: &mut Buffer,
-    area: Rect,
-    app: &App,
-    w: usize,
-    h: usize,
-    game: &SlotsGame,
-) {
+fn draw_jackpot_takeover(buf: &mut Buffer, area: Rect, app: &App, w: usize, h: usize, game: &SlotsGame) {
     // Strobe background
     let phase = (app.frame / 4) % 6;
     let bg_color = match phase {
@@ -348,14 +227,7 @@ fn draw_jackpot_takeover(
 
     // Explosion particles
     let spark_chars = ['★', '✦', '✧', '◆', '◇', '⬥', '·', '✶'];
-    let spark_colors = [
-        theme::MAGENTA,
-        theme::AMBER,
-        theme::CYAN,
-        theme::GREEN,
-        theme::RED,
-        theme::WHITE,
-    ];
+    let spark_colors = [theme::MAGENTA, theme::AMBER, theme::CYAN, theme::GREEN, theme::RED, theme::WHITE];
     for i in 0..30 {
         let seed = (app.frame as usize).wrapping_add(i * 997);
         let px = (seed * 31 + i * 17) % w;
@@ -388,24 +260,10 @@ fn draw_jackpot_takeover(
     // Payout
     let payout_str = format!("+{} TOKENS!", game.last_payout);
     let payout_color = if blink1 { theme::GREEN } else { theme::CYAN };
-    draw_str(
-        buf,
-        area,
-        (w - payout_str.len()) / 2,
-        cy + 4,
-        &payout_str,
-        payout_color,
-    );
+    draw_str(buf, area, (w - payout_str.len()) / 2, cy + 4, &payout_str, payout_color);
 
     let mult = format!("{}x MULTIPLIER", game.multiplier);
     draw_str(buf, area, (w - mult.len()) / 2, cy + 5, &mult, theme::WHITE);
 
-    draw_str(
-        buf,
-        area,
-        (w - 30) / 2,
-        h - 2,
-        "[ENTER] Spin Again  ·  [ESC] Back",
-        theme::GRAY,
-    );
+    draw_str(buf, area, (w - 30) / 2, h - 2, "[ENTER] Spin Again  ·  [ESC] Back", theme::GRAY);
 }

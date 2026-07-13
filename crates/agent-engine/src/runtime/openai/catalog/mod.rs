@@ -44,9 +44,9 @@ pub use anthropic::{
     parse_anthropic_catalog_page, AnthropicCatalogPage,
 };
 pub use codex::{
-    codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
-    parse_codex_catalog_models, validate_codex_level, PROVIDER_KEY as CODEX_PROVIDER_KEY,
-    PROVIDER_NAME as CODEX_PROVIDER_NAME,
+    codex_models_path, codex_models_url, codex_static_catalog_models,
+    codex_static_capability, parse_codex_catalog_models, validate_codex_level,
+    PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
 };
 pub use generic::parse_generic_catalog_models;
 pub use github_copilot::{

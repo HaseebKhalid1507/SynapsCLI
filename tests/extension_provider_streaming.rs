@@ -39,10 +39,13 @@ async fn spawn_fixture() -> ProcessExtension {
 async fn spawn_named_fixture(file: &str, ext_id: &str) -> ProcessExtension {
     let fixture = fixture_path(file);
     assert!(fixture.exists(), "fixture missing: {:?}", fixture);
-    let handler =
-        ProcessExtension::spawn(ext_id, "python3", &[fixture.to_string_lossy().to_string()])
-            .await
-            .expect("spawn fixture");
+    let handler = ProcessExtension::spawn(
+        ext_id,
+        "python3",
+        &[fixture.to_string_lossy().to_string()],
+    )
+    .await
+    .expect("spawn fixture");
     handler
         .initialize_for_test(None)
         .await
@@ -57,7 +60,9 @@ async fn provider_stream_forwards_events_and_returns_final_result() {
 
     let drainer = tokio::spawn(async move {
         let mut events = Vec::new();
-        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+        {
             events.push(ev);
         }
         events
@@ -69,7 +74,12 @@ async fn provider_stream_forwards_events_and_returns_final_result() {
         .expect("provider_stream should succeed");
 
     let events = drainer.await.expect("drainer task");
-    assert_eq!(events.len(), 4, "expected 4 events, got {:?}", events);
+    assert_eq!(
+        events.len(),
+        4,
+        "expected 4 events, got {:?}",
+        events
+    );
     assert_eq!(
         events[0],
         ProviderStreamEvent::TextDelta {
@@ -151,7 +161,9 @@ async fn provider_stream_skips_malformed_notification_events() {
 
     let drainer = tokio::spawn(async move {
         let mut events = Vec::new();
-        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+        {
             events.push(ev);
         }
         events
@@ -201,7 +213,9 @@ async fn provider_stream_ignores_unknown_notification_methods() {
 
     let drainer = tokio::spawn(async move {
         let mut events = Vec::new();
-        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+        {
             events.push(ev);
         }
         events

@@ -50,10 +50,7 @@ fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
 async fn manager_returns_plugin_supplied_spawn_args() {
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager
-        .load("spawn-args-ext", &manifest_with_mode(Some("ok")))
-        .await
-        .unwrap();
+    manager.load("spawn-args-ext", &manifest_with_mode(Some("ok"))).await.unwrap();
 
     let spawn_args = manager
         .sidecar_spawn_args("spawn-args-ext")
@@ -78,10 +75,7 @@ async fn manager_returns_plugin_supplied_spawn_args() {
 async fn manager_propagates_method_not_found_error() {
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager
-        .load("legacy-ext", &manifest_with_mode(Some("missing")))
-        .await
-        .unwrap();
+    manager.load("legacy-ext", &manifest_with_mode(Some("missing"))).await.unwrap();
 
     let err = manager.sidecar_spawn_args("legacy-ext").await.unwrap_err();
     assert!(
@@ -96,12 +90,12 @@ async fn manager_propagates_method_not_found_error() {
 async fn manager_rejects_invalid_response_payload() {
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager
-        .load("invalid-ext", &manifest_with_mode(Some("invalid")))
-        .await
-        .unwrap();
+    manager.load("invalid-ext", &manifest_with_mode(Some("invalid"))).await.unwrap();
 
-    let err = manager.sidecar_spawn_args("invalid-ext").await.unwrap_err();
+    let err = manager
+        .sidecar_spawn_args("invalid-ext")
+        .await
+        .unwrap_err();
     assert!(
         err.contains("Invalid sidecar.spawn_args response"),
         "expected decode-error message, got: {err}"
@@ -114,10 +108,7 @@ async fn manager_rejects_invalid_response_payload() {
 async fn manager_accepts_empty_object_as_defaults() {
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager
-        .load("min-ext", &manifest_with_mode(Some("minimal")))
-        .await
-        .unwrap();
+    manager.load("min-ext", &manifest_with_mode(Some("minimal"))).await.unwrap();
 
     let spawn_args = manager.sidecar_spawn_args("min-ext").await.unwrap();
     assert!(spawn_args.args.is_empty());

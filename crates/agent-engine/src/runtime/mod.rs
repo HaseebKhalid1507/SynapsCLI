@@ -611,9 +611,7 @@ impl Runtime {
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
         // Sync named_level from budget so the two fields stay consistent.
-        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
-            budget,
-        ));
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
     }
 
     /// Set the named reasoning level. Updates `thinking_budget` from the level's

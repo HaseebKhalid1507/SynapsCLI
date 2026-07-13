@@ -13,22 +13,20 @@ pub(crate) async fn handle_ipc_command(
             }
 
             let mut agents = agents.lock().await;
-
+            
             // Check if agent config exists
             let config_path = watcher_dir().join(&name).join("config.toml");
             if !config_path.exists() {
                 return WatcherResponse::Error {
-                    message: format!("Agent '{}' not found. Run: watcher init {}", name, name),
+                    message: format!("Agent '{}' not found. Run: watcher init {}", name, name)
                 };
             }
 
             // Load config
             let config = match AgentConfig::load(&config_path) {
                 Ok(config) => config,
-                Err(e) => {
-                    return WatcherResponse::Error {
-                        message: format!("Failed to load agent '{}': {}", name, e),
-                    }
+                Err(e) => return WatcherResponse::Error {
+                    message: format!("Failed to load agent '{}': {}", name, e)
                 }
             };
 
@@ -36,7 +34,7 @@ pub(crate) async fn handle_ipc_command(
             if let Some(agent) = agents.get_mut(&name) {
                 if agent.is_running() {
                     return WatcherResponse::Error {
-                        message: format!("Agent '{}' is already running", name),
+                        message: format!("Agent '{}' is already running", name)
                     };
                 }
                 // Un-stop it and restart if needed
@@ -44,37 +42,37 @@ pub(crate) async fn handle_ipc_command(
                 if agent.config.agent.trigger == "always" {
                     match spawn_agent(agent, "deploy restart").await {
                         Ok(()) => WatcherResponse::Ok {
-                            message: format!("Agent '{}' deployed and started", name),
+                            message: format!("Agent '{}' deployed and started", name)
                         },
                         Err(e) => WatcherResponse::Error {
-                            message: format!("Failed to start agent '{}': {}", name, e),
-                        },
+                            message: format!("Failed to start agent '{}': {}", name, e)
+                        }
                     }
                 } else {
                     WatcherResponse::Ok {
-                        message: format!("Agent '{}' deployed", name),
+                        message: format!("Agent '{}' deployed", name)
                     }
                 }
             } else {
                 // Add new agent
                 let mut agent = ManagedAgent::new(name.clone(), config_path, config);
-
+                
                 if agent.config.agent.trigger == "always" {
                     match spawn_agent(&mut agent, "deploy start").await {
                         Ok(()) => {
                             agents.insert(name.clone(), agent);
                             WatcherResponse::Ok {
-                                message: format!("Agent '{}' deployed and started", name),
+                                message: format!("Agent '{}' deployed and started", name)
                             }
-                        }
-                        Err(e) => WatcherResponse::Error {
-                            message: format!("Failed to start agent '{}': {}", name, e),
                         },
+                        Err(e) => WatcherResponse::Error {
+                            message: format!("Failed to start agent '{}': {}", name, e)
+                        }
                     }
                 } else {
                     agents.insert(name.clone(), agent);
                     WatcherResponse::Ok {
-                        message: format!("Agent '{}' deployed", name),
+                        message: format!("Agent '{}' deployed", name)
                     }
                 }
             }
@@ -89,19 +87,18 @@ pub(crate) async fn handle_ipc_command(
                     let _ = child.wait().await;
                 }
                 WatcherResponse::Ok {
-                    message: format!("Agent '{}' stopped", name),
+                    message: format!("Agent '{}' stopped", name)
                 }
             } else {
                 WatcherResponse::Error {
-                    message: format!("Agent '{}' not found or not running", name),
+                    message: format!("Agent '{}' not found or not running", name)
                 }
             }
         }
 
         WatcherCommand::Status => {
             let agents = agents.lock().await;
-            let agent_info: Vec<AgentStatusInfo> = agents
-                .values()
+            let agent_info: Vec<AgentStatusInfo> = agents.values()
                 .map(|agent| agent.to_status_info())
                 .collect();
             WatcherResponse::Status { agents: agent_info }
@@ -111,11 +108,11 @@ pub(crate) async fn handle_ipc_command(
             let agents = agents.lock().await;
             if let Some(agent) = agents.get(&name) {
                 WatcherResponse::AgentDetail {
-                    info: agent.to_status_info(),
+                    info: agent.to_status_info()
                 }
             } else {
                 WatcherResponse::Error {
-                    message: format!("Agent '{}' not found", name),
+                    message: format!("Agent '{}' not found", name)
                 }
             }
         }
@@ -125,14 +122,11 @@ pub(crate) async fn handle_ipc_command(
 /// IPC listener task
 pub(crate) async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>>>) {
     let socket_path = watcher_dir().join("watcher.sock");
-
+    
     // Check if socket exists and test if it's alive
     if socket_path.exists() {
         // Try to connect to existing socket
-        if tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
-            .await
-            .is_ok()
-        {
+        if tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path)).await.is_ok() {
             log("Another supervisor is already running");
             std::process::exit(1);
         } else {
@@ -141,7 +135,7 @@ pub(crate) async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>
             let _ = std::fs::remove_file(&socket_path);
         }
     }
-
+    
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(e) => {
@@ -193,17 +187,17 @@ pub(crate) async fn handle_ipc_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
-
+    
     reader.read_line(&mut line).await?;
     let command: WatcherCommand = serde_json::from_str(line.trim())?;
-
+    
     let response = handle_ipc_command(command, agents).await;
     let response_json = serde_json::to_string(&response)?;
-
+    
     stream.write_all(response_json.as_bytes()).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await?;
-
+    
     Ok(())
 }
 
@@ -213,47 +207,39 @@ pub(crate) async fn send_ipc_command(command: WatcherCommand) -> Result<WatcherR
     if !socket_path.exists() {
         return Err("Supervisor not running. Start with: watcher run".to_string());
     }
-
+    
     // Add timeout to avoid hanging on stale socket
-    let connect_result =
-        tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path)).await;
-
+    let connect_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        UnixStream::connect(&socket_path)
+    ).await;
+    
     let mut stream = match connect_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) => {
             // Socket exists but can't connect — stale
-            return Err(
-                "Supervisor socket is stale. Remove it and restart: watcher run".to_string(),
-            );
+            return Err("Supervisor socket is stale. Remove it and restart: watcher run".to_string());
         }
         Err(_) => {
             return Err("Supervisor not responding (timeout). Try: watcher run".to_string());
         }
     };
-
+    
     let command_json = serde_json::to_string(&command)
         .map_err(|e| format!("Failed to serialize command: {}", e))?;
-
-    stream
-        .write_all(command_json.as_bytes())
-        .await
+    
+    stream.write_all(command_json.as_bytes()).await
         .map_err(|e| format!("Failed to send command: {}", e))?;
-    stream
-        .write_all(b"\n")
-        .await
+    stream.write_all(b"\n").await
         .map_err(|e| format!("Failed to send command: {}", e))?;
-    stream
-        .flush()
-        .await
+    stream.flush().await
         .map_err(|e| format!("Failed to send command: {}", e))?;
-
+    
     let mut reader = BufReader::new(&mut stream);
     let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .await
+    reader.read_line(&mut response_line).await
         .map_err(|e| format!("Failed to read response: {}", e))?;
-
+    
     serde_json::from_str(response_line.trim())
         .map_err(|e| format!("Failed to parse response: {}", e))
 }

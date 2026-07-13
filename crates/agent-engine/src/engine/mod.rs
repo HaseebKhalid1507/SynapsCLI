@@ -4,8 +4,8 @@
 //! Renderers (chatui TUI, headless chat) call into the engine for
 //! all non-visual operations.
 
-pub mod commands;
-pub mod reactor;
-pub mod session;
 pub mod setup;
+pub mod commands;
 pub mod stream;
+pub mod session;
+pub mod reactor;

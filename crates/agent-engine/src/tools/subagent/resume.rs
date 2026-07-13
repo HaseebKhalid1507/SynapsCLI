@@ -10,17 +10,15 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
 use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
-use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
-use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
+use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
 pub struct SubagentResumeTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentResumeTool {
-    fn name(&self) -> &str {
-        "subagent_resume"
-    }
+    fn name(&self) -> &str { "subagent_resume" }
 
     fn description(&self) -> &str {
         "Resume a finished or timed-out reactive subagent with new instructions. \
@@ -49,29 +47,26 @@ impl Tool for SubagentResumeTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let prior_handle_id = params["handle_id"]
-            .as_str()
+        let prior_handle_id = params["handle_id"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let instructions = params["instructions"]
-            .as_str()
+        let instructions = params["instructions"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'instructions' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
-            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
-        })?;
+        let registry = ctx.capabilities.subagent_registry.as_ref()
+            .ok_or_else(|| RuntimeError::Tool(
+                "SubagentRegistry not available on this ToolContext".to_string()
+            ))?;
 
         // Extract prior state under the lock, release immediately.
         let (agent_name, model, prior_context, prior_system_prompt, prior_timeout) = {
             let reg = registry.lock().unwrap();
-            let handle = reg.get(&prior_handle_id).ok_or_else(|| {
-                RuntimeError::Tool(format!(
-                    "No subagent found with handle_id '{}'",
-                    prior_handle_id
-                ))
-            })?;
+            let handle = reg.get(&prior_handle_id)
+                .ok_or_else(|| RuntimeError::Tool(
+                    format!("No subagent found with handle_id '{}'", prior_handle_id)
+                ))?;
 
             if handle.status() == SubagentStatus::Running {
                 return Err(RuntimeError::Tool(format!(
@@ -90,13 +85,7 @@ impl Tool for SubagentResumeTool {
                 }
             };
 
-            (
-                handle.agent_name.clone(),
-                handle.model.clone(),
-                prior,
-                handle.system_prompt.clone(),
-                handle.timeout_secs,
-            )
+            (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
         };
 
         // The inherited prior model is still re-authorized as an explicit exact
@@ -129,10 +118,7 @@ impl Tool for SubagentResumeTool {
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
-            label,
-            handle_id,
-            prior_handle_id,
-            model
+            label, handle_id, prior_handle_id, model
         );
 
         let state = Arc::new(RwLock::new(SubagentState::new()));
@@ -149,13 +135,13 @@ impl Tool for SubagentResumeTool {
             }));
         }
 
-        let state_t = Arc::clone(&state);
-        let task_full_a = task_full.clone();
-        let label_inner = label.clone();
-        let model_inner = model.clone();
+        let state_t         = Arc::clone(&state);
+        let task_full_a     = task_full.clone();
+        let label_inner     = label.clone();
+        let model_inner     = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
-        let start_time = std::time::Instant::now();
-        let parent_queue = ctx.capabilities.event_queue.clone();
+        let start_time      = std::time::Instant::now();
+        let parent_queue    = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
 
@@ -204,13 +190,13 @@ impl Tool for SubagentResumeTool {
                     }
                 };
 
-                let state_a = Arc::clone(&state_t);
-                let label_a = label_inner.clone();
-                let model_a = model_inner.clone();
-                let tx_events_a = tx_events_inner.clone();
-                let task_for_timeout = task_full_a.clone();
+                let state_a           = Arc::clone(&state_t);
+                let label_a           = label_inner.clone();
+                let model_a           = model_inner.clone();
+                let tx_events_a       = tx_events_inner.clone();
+                let task_for_timeout  = task_full_a.clone();
                 let task_for_complete = task_full_a.clone();
-                let task_for_stream = task_full_a;
+                let task_for_stream   = task_full_a;
 
                 let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
                     use futures::StreamExt;
@@ -437,8 +423,7 @@ impl Tool for SubagentResumeTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Resumed subagent thread panicked: {}", msg);
-                state_t.write().unwrap_or_else(|p| p.into_inner()).status =
-                    SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
 
             // ── Terminal finalizer — exactly once, outside catch_unwind ────────
@@ -479,7 +464,6 @@ impl Tool for SubagentResumeTool {
             "resumed_from": prior_handle_id,
             "agent_name":   label,
             "status":       "running"
-        })
-        .to_string())
+        }).to_string())
     }
 }

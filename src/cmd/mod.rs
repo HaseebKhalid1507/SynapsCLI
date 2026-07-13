@@ -5,7 +5,7 @@ pub(crate) mod login;
 pub(crate) mod prompt;
 pub(crate) mod rpc;
 pub(crate) mod send;
-pub(crate) mod server;
 pub(crate) mod status;
+pub(crate) mod server;
 pub(crate) mod tools;
 pub(crate) mod watcher;

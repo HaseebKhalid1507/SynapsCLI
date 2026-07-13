@@ -14,13 +14,11 @@
 //! `wake_action`, and `claim_auto_turn` seams only.
 
 use agent_engine::engine::reactor::{
-    claim_auto_turn, drain_event_queue, event_payload_from_drained,
-    spawn_prompt_registration_check, wake_action, EventDisposition, WakeAction, AUTO_TURN_CAP,
+    drain_event_queue, event_payload_from_drained, wake_action, claim_auto_turn,
+    EventDisposition, WakeAction, AUTO_TURN_CAP,
+    spawn_prompt_registration_check,
 };
-use agent_engine::events::{
-    types::{Event, Severity},
-    EventQueue,
-};
+use agent_engine::events::{types::{Event, Severity}, EventQueue};
 use synaps_cli::core::rpc_protocol::RpcEvent;
 
 /// Build a queue with a set of events.
@@ -56,9 +54,7 @@ fn drain_idle_queue_produces_rpc_event_frames() {
     // Build RpcEvent::Event frames from the drained batch.
     let frames: Vec<RpcEvent> = drained
         .iter()
-        .map(|d| RpcEvent::Event {
-            payload: Box::new(event_payload_from_drained(d)),
-        })
+        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
         .collect();
 
     assert_eq!(frames.len(), 2);
@@ -91,9 +87,7 @@ fn rpc_event_event_frames_serialise_to_wire_json() {
     let mut pending = Vec::new();
 
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
-    let frame = RpcEvent::Event {
-        payload: Box::new(event_payload_from_drained(&drained[0])),
-    };
+    let frame = RpcEvent::Event { payload: Box::new(event_payload_from_drained(&drained[0])) };
 
     let json = serde_json::to_string(&frame).expect("serialize");
     let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -103,10 +97,7 @@ fn rpc_event_event_frames_serialise_to_wire_json() {
     assert_eq!(val["payload"]["severity"], "medium");
     assert_eq!(val["payload"]["text"], "ping");
     assert!(!val["payload"]["timestamp"].as_str().unwrap().is_empty());
-    assert!(val["payload"]["formatted"]
-        .as_str()
-        .unwrap()
-        .starts_with("<event "));
+    assert!(val["payload"]["formatted"].as_str().unwrap().starts_with("<event "));
 }
 
 // ─── T3: disposition is Injected when idle, Buffered when busy ────────────────
@@ -139,11 +130,8 @@ fn wake_action_run_turn_when_auto_turn_enabled() {
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     // events_auto_turn = true → RunTurn expected when counter < cap
     let action = wake_action(&drained, &messages, false, true, 0);
-    assert_eq!(
-        action,
-        WakeAction::RunTurn,
-        "auto-turn enabled: drainer should produce RunTurn on idle inject"
-    );
+    assert_eq!(action, WakeAction::RunTurn,
+        "auto-turn enabled: drainer should produce RunTurn on idle inject");
 }
 
 #[test]
@@ -157,11 +145,8 @@ fn wake_action_forward_when_auto_turn_disabled() {
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     // events_auto_turn = false → must NOT auto-turn
     let action = wake_action(&drained, &messages, false, false, 0);
-    assert_ne!(
-        action,
-        WakeAction::RunTurn,
-        "RPC opt-out: auto_turn_enabled=false must not produce RunTurn"
-    );
+    assert_ne!(action, WakeAction::RunTurn,
+        "RPC opt-out: auto_turn_enabled=false must not produce RunTurn");
 }
 
 // ─── T5: terminal_flush_seam — false path never reserves, counter unchanged ───
@@ -177,9 +162,9 @@ fn terminal_flush_false_never_reserves_and_counter_unchanged() {
 
     let mut auto_turn_pending = true; // was set; must be cleared
     let mut pending_events = vec!["<event>test</event>".to_string()];
-    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "prior"}),
-    )];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
     let events_auto_turn = true; // enabled — must still not fire on false path
     let mut counter: u32 = 0;
 
@@ -193,28 +178,15 @@ fn terminal_flush_false_never_reserves_and_counter_unchanged() {
     );
 
     // Must return None — no auto-turn scheduled
-    assert!(
-        result.is_none(),
-        "false path must never return a reserved id"
-    );
+    assert!(result.is_none(), "false path must never return a reserved id");
     // auto_turn_pending must be cleared
-    assert!(
-        !auto_turn_pending,
-        "false path must clear auto_turn_pending"
-    );
+    assert!(!auto_turn_pending, "false path must clear auto_turn_pending");
     // pending_events must be drained
     assert!(pending_events.is_empty(), "pending_events must be flushed");
     // events injected into api_messages (event not lost)
-    assert_eq!(
-        api_messages.len(),
-        2,
-        "buffered event must be injected into api_messages"
-    );
+    assert_eq!(api_messages.len(), 2, "buffered event must be injected into api_messages");
     // Counter must NOT change — critical invariant
-    assert_eq!(
-        counter, 0,
-        "false path must not increment consecutive_auto_turns"
-    );
+    assert_eq!(counter, 0, "false path must not increment consecutive_auto_turns");
 }
 
 // ─── T7: terminal_flush_seam — true path reserves when eligible ───────────────
@@ -228,9 +200,9 @@ fn terminal_flush_true_reserves_when_eligible() {
 
     let mut auto_turn_pending = false;
     let mut pending_events = vec!["<event>ev</event>".to_string()];
-    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "prior"}),
-    )];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
     let events_auto_turn = true;
     let mut counter: u32 = 0;
 
@@ -244,20 +216,11 @@ fn terminal_flush_true_reserves_when_eligible() {
     );
 
     // Must return Some — auto-turn was reserved
-    assert!(
-        result.is_some(),
-        "true path must return auto_id when conditions met"
-    );
+    assert!(result.is_some(), "true path must return auto_id when conditions met");
     // auto_turn_pending must be set
-    assert!(
-        auto_turn_pending,
-        "true path must set auto_turn_pending = true"
-    );
+    assert!(auto_turn_pending, "true path must set auto_turn_pending = true");
     // counter incremented
-    assert_eq!(
-        counter, 1,
-        "true path must increment consecutive_auto_turns"
-    );
+    assert_eq!(counter, 1, "true path must increment consecutive_auto_turns");
 }
 
 #[test]
@@ -266,9 +229,9 @@ fn terminal_flush_true_does_not_reserve_at_cap() {
 
     let mut auto_turn_pending = false;
     let mut pending_events = vec!["<event>ev</event>".to_string()];
-    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "prior"}),
-    )];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
     let events_auto_turn = true;
     let mut counter: u32 = AUTO_TURN_CAP; // already at cap
 
@@ -282,14 +245,8 @@ fn terminal_flush_true_does_not_reserve_at_cap() {
     );
 
     assert!(result.is_none(), "true path at cap must not reserve");
-    assert!(
-        !auto_turn_pending,
-        "auto_turn_pending must stay false when denied"
-    );
-    assert_eq!(
-        counter, AUTO_TURN_CAP,
-        "counter must not change when denied"
-    );
+    assert!(!auto_turn_pending, "auto_turn_pending must stay false when denied");
+    assert_eq!(counter, AUTO_TURN_CAP, "counter must not change when denied");
 }
 
 #[test]
@@ -299,9 +256,9 @@ fn terminal_flush_false_does_not_reserve_even_at_zero_counter() {
     // Stress-test: even with perfect conditions, false path must never reserve.
     let mut auto_turn_pending = false;
     let mut pending_events = vec!["<event>ev</event>".to_string()];
-    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "prior"}),
-    )];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
     let events_auto_turn = true;
     let mut counter: u32 = 0;
 
@@ -315,10 +272,7 @@ fn terminal_flush_false_does_not_reserve_even_at_zero_counter() {
             &mut counter,
         );
         assert!(result.is_none());
-        assert_eq!(
-            counter, 0,
-            "counter must remain 0 across all false-path calls"
-        );
+        assert_eq!(counter, 0, "counter must remain 0 across all false-path calls");
         // Re-arm pending for next iteration
         pending_events.push("<event>more</event>".to_string());
     }
@@ -338,10 +292,7 @@ fn claim_auto_turn_coalesces_one_per_batch() {
     // Verify the cap boundary is still respected:
     let mut counter: u32 = AUTO_TURN_CAP;
     assert!(!claim_auto_turn(&mut counter), "at cap — must deny");
-    assert_eq!(
-        counter, AUTO_TURN_CAP,
-        "counter must not change when denied"
-    );
+    assert_eq!(counter, AUTO_TURN_CAP, "counter must not change when denied");
 }
 
 // ─── T7: real user input resets consecutive counter ──────────────────────────
@@ -359,9 +310,9 @@ fn consecutive_counter_reset_on_real_user_input() {
 
     // Now a Done-path flush should be able to reserve again.
     let mut pending_events = vec!["<event>ev</event>".to_string()];
-    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "user msg"}),
-    )];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "user msg"}))
+    ];
     let result = terminal_flush_seam(
         true,
         &mut auto_turn_pending,
@@ -370,14 +321,8 @@ fn consecutive_counter_reset_on_real_user_input() {
         true,
         &mut counter,
     );
-    assert!(
-        result.is_some(),
-        "after counter reset, true-path must be able to reserve"
-    );
-    assert_eq!(
-        counter, 1,
-        "counter must be incremented to 1 after reset and claim"
-    );
+    assert!(result.is_some(), "after counter reset, true-path must be able to reserve");
+    assert_eq!(counter, 1, "counter must be incremented to 1 after reset and claim");
 }
 
 // ─── T8: RPC start-barrier ordering — terminal_flush cannot precede in_flight ─
@@ -394,8 +339,8 @@ fn consecutive_counter_reset_on_real_user_input() {
 /// (which needs a full Runtime) but exercises the identical ordering invariant.
 #[tokio::test]
 async fn rpc_start_barrier_in_flight_set_before_task_proceeds() {
-    use std::sync::Arc;
     use tokio::sync::{oneshot, Mutex};
+    use std::sync::Arc;
 
     #[derive(Default)]
     struct FakeState {
@@ -431,10 +376,7 @@ async fn rpc_start_barrier_in_flight_set_before_task_proceeds() {
     handle.await.expect("task panicked");
 
     let st = state.lock().await;
-    assert!(
-        st.in_flight_set,
-        "in_flight must remain set after task completes"
-    );
+    assert!(st.in_flight_set, "in_flight must remain set after task completes");
     assert!(st.task_started, "task must have run");
 }
 
@@ -442,10 +384,7 @@ async fn rpc_start_barrier_in_flight_set_before_task_proceeds() {
 /// no zombie, no state mutation.
 #[tokio::test]
 async fn rpc_start_barrier_dropped_tx_exits_task_cleanly() {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     use tokio::sync::oneshot;
 
     let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -463,10 +402,7 @@ async fn rpc_start_barrier_dropped_tx_exits_task_cleanly() {
 
     drop(start_tx); // Simulate caller panic / drop.
     handle.await.expect("task should exit cleanly");
-    assert!(
-        !side_effect.load(Ordering::SeqCst),
-        "task must not execute state work when start_tx is dropped"
-    );
+    assert!(!side_effect.load(Ordering::SeqCst), "task must not execute state work when start_tx is dropped");
 }
 
 // ─── T9: RPC event frame is exactly one frame per event ──────────────────────
@@ -475,7 +411,7 @@ async fn rpc_start_barrier_dropped_tx_exits_task_cleanly() {
 fn rpc_event_frame_is_exactly_one_per_drained_event() {
     let q = make_queue(&[
         ("src-a", "alpha", Some(Severity::Low)),
-        ("src-b", "beta", Some(Severity::High)),
+        ("src-b", "beta",  Some(Severity::High)),
         ("src-c", "gamma", Some(Severity::Medium)),
     ]);
     let mut messages = Vec::new();
@@ -484,9 +420,7 @@ fn rpc_event_frame_is_exactly_one_per_drained_event() {
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     let frames: Vec<RpcEvent> = drained
         .iter()
-        .map(|d| RpcEvent::Event {
-            payload: Box::new(event_payload_from_drained(d)),
-        })
+        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
         .collect();
 
     // Exactly one frame per drained event — no duplicates, no drops.
@@ -522,7 +456,11 @@ fn abort_between_snapshot_and_registration_check_denies() {
     auto_turn_pending = false; // Abort's handle_abort clears this
 
     // Phase 3: registration re-check runs inside the lock.
-    let allowed = spawn_prompt_registration_check(is_auto, &mut auto_turn_pending, in_flight_live);
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
 
     // Must deny — reservation was revoked.
     assert!(
@@ -543,12 +481,13 @@ fn registration_check_allows_when_reservation_intact() {
     let in_flight_live = false;
     let is_auto = true;
 
-    let allowed = spawn_prompt_registration_check(is_auto, &mut auto_turn_pending, in_flight_live);
-
-    assert!(
-        allowed,
-        "registration must be allowed when reservation is intact"
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
     );
+
+    assert!(allowed, "registration must be allowed when reservation is intact");
     // Helper must NOT touch auto_turn_pending on the allow path.
     assert!(
         auto_turn_pending,
@@ -563,18 +502,10 @@ fn registration_check_revalidates_non_auto_prompts() {
     assert!(spawn_prompt_registration_check(false, &mut clear, false));
 
     let mut auto_reserved = true;
-    assert!(!spawn_prompt_registration_check(
-        false,
-        &mut auto_reserved,
-        false
-    ));
+    assert!(!spawn_prompt_registration_check(false, &mut auto_reserved, false));
 
     let mut no_reservation = false;
-    assert!(!spawn_prompt_registration_check(
-        false,
-        &mut no_reservation,
-        true
-    ));
+    assert!(!spawn_prompt_registration_check(false, &mut no_reservation, true));
 }
 
 /// Registration check denies when in_flight is already Some (concurrent real prompt
@@ -582,14 +513,15 @@ fn registration_check_revalidates_non_auto_prompts() {
 #[test]
 fn registration_check_denies_when_in_flight_live() {
     let mut auto_turn_pending = true; // still set
-    let in_flight_live = true; // but a real prompt is now live
+    let in_flight_live = true;        // but a real prompt is now live
     let is_auto = true;
 
-    let allowed = spawn_prompt_registration_check(is_auto, &mut auto_turn_pending, in_flight_live);
+    let allowed = spawn_prompt_registration_check(
+        is_auto,
+        &mut auto_turn_pending,
+        in_flight_live,
+    );
 
     assert!(!allowed, "must deny when in_flight is already live");
-    assert!(
-        !auto_turn_pending,
-        "auto_turn_pending must be cleared on denial"
-    );
+    assert!(!auto_turn_pending, "auto_turn_pending must be cleared on denial");
 }

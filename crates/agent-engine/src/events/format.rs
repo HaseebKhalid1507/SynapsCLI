@@ -11,9 +11,7 @@ fn regex_strip_event_close(s: &str) -> String {
         if i + 7 < chars.len() && lower_chars[i] == '<' && lower_chars[i + 1] == '/' {
             // Scan for "event" after optional whitespace
             let mut j = i + 2;
-            while j < chars.len() && lower_chars[j].is_whitespace() {
-                j += 1;
-            }
+            while j < chars.len() && lower_chars[j].is_whitespace() { j += 1; }
             if j + 5 <= chars.len()
                 && lower_chars[j] == 'e'
                 && lower_chars[j + 1] == 'v'
@@ -22,9 +20,7 @@ fn regex_strip_event_close(s: &str) -> String {
                 && lower_chars[j + 4] == 't'
             {
                 let mut k = j + 5;
-                while k < chars.len() && lower_chars[k].is_whitespace() {
-                    k += 1;
-                }
+                while k < chars.len() && lower_chars[k].is_whitespace() { k += 1; }
                 if k < chars.len() && chars[k] == '>' {
                     i = k + 1; // skip the entire closing tag
                     continue;
@@ -97,11 +93,7 @@ mod tests {
 
     #[test]
     fn format_with_channel() {
-        let mut e = Event::simple(
-            "uptime-kuma",
-            "Jellyfin is DOWN. Status 503.",
-            Some(Severity::High),
-        );
+        let mut e = Event::simple("uptime-kuma", "Jellyfin is DOWN. Status 503.", Some(Severity::High));
         e.content.content_type = "alert".into();
         e.channel = Some(EventChannel {
             id: "1".into(),
@@ -145,10 +137,8 @@ mod tests {
         // The formatted output must end with exactly one </event> — the terminal tag
         // added by format_event_for_agent itself.
         let close_count = s.matches("</event>").count();
-        assert_eq!(
-            close_count, 1,
-            "output must contain exactly one </event> — injected ones must be stripped. Got: {s}"
-        );
+        assert_eq!(close_count, 1,
+            "output must contain exactly one </event> — injected ones must be stripped. Got: {s}");
         assert!(s.ends_with("</event>"));
     }
 
@@ -163,10 +153,8 @@ mod tests {
         e.content.content_type = "subagent_completion".into();
         let s = format_event_for_agent(&e);
         let close_count = s.matches("</event>").count();
-        assert_eq!(
-            close_count, 1,
-            "tab-separated </\\tevent> must be stripped, leaving only the terminal tag: {s}"
-        );
+        assert_eq!(close_count, 1,
+            "tab-separated </\\tevent> must be stripped, leaving only the terminal tag: {s}");
         assert!(s.ends_with("</event>"));
     }
 }

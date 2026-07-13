@@ -3,16 +3,16 @@ use rand::Rng;
 #[derive(Debug, Clone, PartialEq)]
 pub enum CrapsPhase {
     Betting,
-    ComeOut, // Come-out roll
-    Point,   // Point established, keep rolling
+    ComeOut,     // Come-out roll
+    Point,       // Point established, keep rolling
     Result,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CrapsBet {
-    Pass,     // Win on 7/11 come-out, lose on 2/3/12, establish point
-    DontPass, // Opposite of pass
-    Field,    // One-roll: win on 2,3,4,9,10,11,12. Double on 2/12.
+    Pass,         // Win on 7/11 come-out, lose on 2/3/12, establish point
+    DontPass,     // Opposite of pass
+    Field,        // One-roll: win on 2,3,4,9,10,11,12. Double on 2/12.
 }
 
 impl CrapsBet {
@@ -66,15 +66,7 @@ impl CrapsGame {
         self.phase_timer += 1;
         let mut rng = rand::rng();
 
-        let speed = if self.phase_timer < 15 {
-            2
-        } else if self.phase_timer < 30 {
-            4
-        } else if self.phase_timer < 40 {
-            8
-        } else {
-            0
-        };
+        let speed = if self.phase_timer < 15 { 2 } else if self.phase_timer < 30 { 4 } else if self.phase_timer < 40 { 8 } else { 0 };
         if speed > 0 && self.phase_timer % speed == 0 {
             self.rolling_display = [rng.random_range(1..=6), rng.random_range(1..=6)];
         }
@@ -86,9 +78,7 @@ impl CrapsGame {
         false
     }
 
-    pub fn total(&self) -> u8 {
-        self.dice[0] + self.dice[1]
-    }
+    pub fn total(&self) -> u8 { self.dice[0] + self.dice[1] }
 
     pub fn start_round(&mut self, bet: u64, bet_type: CrapsBet) {
         self.bet = bet;
@@ -109,7 +99,7 @@ impl CrapsGame {
             CrapsBet::Field => {
                 // One-roll bet
                 let payout = match total {
-                    2 | 12 => (self.bet * 2) as i64, // double
+                    2 | 12 => (self.bet * 2) as i64,  // double
                     3 | 4 | 9 | 10 | 11 => self.bet as i64,
                     _ => -(self.bet as i64),
                 };

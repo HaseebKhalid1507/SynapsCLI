@@ -1,6 +1,6 @@
 use synaps_cli::extensions::hooks::events::{HookEvent, HookResult};
-use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::{ExtensionHandler, ExtensionHealth};
+use synaps_cli::extensions::runtime::process::ProcessExtension;
 
 fn temp_state_path(label: &str) -> std::path::PathBuf {
     tempfile::TempDir::keep(tempfile::tempdir().unwrap()).join(format!("{label}.log"))
@@ -54,10 +54,7 @@ async fn crashes_after_success_then_respawns_on_next_hook() {
     let process = spawn_fixture("respawn-after-success", "crash_after_success").await;
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
-    assert!(matches!(
-        process.extension.handle(&event).await,
-        HookResult::Continue
-    ));
+    assert!(matches!(process.extension.handle(&event).await, HookResult::Continue));
 
     let result = process.extension.handle(&event).await;
     match result {
@@ -74,18 +71,12 @@ async fn restart_exhaustion_marks_failed_and_fails_open() {
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
     for _ in 0..4 {
-        assert!(matches!(
-            process.extension.handle(&event).await,
-            HookResult::Continue
-        ));
+        assert!(matches!(process.extension.handle(&event).await, HookResult::Continue));
     }
 
     assert_eq!(process.extension.health().await, ExtensionHealth::Failed);
     assert_eq!(process.extension.restart_count(), 4);
-    assert!(matches!(
-        process.extension.handle(&event).await,
-        HookResult::Continue
-    ));
+    assert!(matches!(process.extension.handle(&event).await, HookResult::Continue));
     process.extension.shutdown().await;
 }
 
@@ -118,9 +109,7 @@ async fn process_extension_initializes_before_hooks() {
     .await
     .unwrap();
 
-    ext.initialize_for_test(Some(std::env::current_dir().unwrap()))
-        .await
-        .unwrap();
+    ext.initialize_for_test(Some(std::env::current_dir().unwrap())).await.unwrap();
     let result = ext.handle(&before_tool_event()).await;
     assert!(matches!(result, HookResult::Continue));
     ext.shutdown().await;
@@ -148,10 +137,7 @@ async fn process_extension_rejects_unsupported_initialize_protocol() {
     .await
     .unwrap();
 
-    let err = ext
-        .initialize_for_test(Some(std::env::current_dir().unwrap()))
-        .await
-        .unwrap_err();
+    let err = ext.initialize_for_test(Some(std::env::current_dir().unwrap())).await.unwrap_err();
     assert!(err.contains("unsupported protocol_version 999"));
     ext.shutdown().await;
 }
