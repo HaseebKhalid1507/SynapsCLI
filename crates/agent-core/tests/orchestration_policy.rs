@@ -86,3 +86,50 @@ fn advisory_completion_warns_and_telemetry_is_structured_and_safe() {
     assert!(json.contains("worker.dispatch_requested"));
     assert!(!json.contains("prompt") && !json.contains("secret"));
 }
+
+#[test]
+fn telemetry_is_bounded_and_fingerprint_progress_resets_stall_state() {
+    let policy =
+        DelegationPolicy::enforced(model("anthropic/sonnet"), [model("anthropic/haiku")], 1, 1);
+    let mut r = WorkerRegistry::new(policy);
+    let h = r
+        .authorize_dispatch(
+            &model("anthropic/haiku"),
+            WorkerRole::Tester,
+            WorkerWritePolicy::ReadOnly,
+        )
+        .unwrap();
+    r.mark_running(&h).unwrap();
+    for _ in 0..300 {
+        r.poll(&h, "unchanged").unwrap();
+    }
+    r.steer(&h).unwrap();
+    assert!(r.is_stalled(&h).unwrap());
+    r.poll(&h, "progress").unwrap();
+    assert!(!r.is_stalled(&h).unwrap());
+    assert_eq!(r.telemetry().len(), 256);
+    assert!(r.dropped_telemetry() > 0);
+}
+
+#[test]
+fn rollback_restores_dispatch_budget() {
+    let policy =
+        DelegationPolicy::enforced(model("anthropic/sonnet"), [model("anthropic/haiku")], 1, 1);
+    let mut r = WorkerRegistry::new(policy);
+    let h = r
+        .authorize_dispatch(
+            &model("anthropic/haiku"),
+            WorkerRole::Tester,
+            WorkerWritePolicy::ReadOnly,
+        )
+        .unwrap();
+    r.rollback_dispatch(&h).unwrap();
+    assert_eq!(r.total_dispatched(), 0);
+    assert!(r
+        .authorize_dispatch(
+            &model("anthropic/haiku"),
+            WorkerRole::Tester,
+            WorkerWritePolicy::ReadOnly,
+        )
+        .is_ok());
+}

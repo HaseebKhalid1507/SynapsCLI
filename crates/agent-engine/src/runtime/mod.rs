@@ -1088,6 +1088,7 @@ impl Runtime {
             hook_bus: self.hook_bus.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
+            orchestration: self.orchestration.clone(),
         };
 
         tokio::spawn(async move {

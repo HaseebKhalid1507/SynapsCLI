@@ -1,6 +1,6 @@
 use crate::prompt::QualifiedModelId;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,7 +57,7 @@ impl DelegationPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRole {
     Planner,
@@ -67,7 +67,8 @@ pub enum WorkerRole {
     Researcher,
     Debugger,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "scopes")]
 pub enum WorkerWritePolicy {
     ReadOnly,
     IsolatedWorktree,
@@ -117,6 +118,7 @@ struct Worker {
     writes: WorkerWritePolicy,
     unchanged_polls: usize,
     steered: bool,
+    last_fingerprint: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct OrchestrationEvent {
@@ -129,7 +131,8 @@ pub struct WorkerRegistry {
     policy: DelegationPolicy,
     workers: BTreeMap<WorkerHandle, Worker>,
     total: usize,
-    events: Vec<OrchestrationEvent>,
+    events: VecDeque<OrchestrationEvent>,
+    dropped_events: u64,
 }
 impl WorkerRegistry {
     pub fn new(policy: DelegationPolicy) -> Self {
@@ -137,7 +140,8 @@ impl WorkerRegistry {
             policy,
             workers: BTreeMap::new(),
             total: 0,
-            events: vec![],
+            events: VecDeque::new(),
+            dropped_events: 0,
         }
     }
     pub fn foreground_model(&self) -> &QualifiedModelId {
@@ -146,10 +150,41 @@ impl WorkerRegistry {
     pub fn total_dispatched(&self) -> usize {
         self.total
     }
-    pub fn telemetry(&self) -> &[OrchestrationEvent] {
+    pub fn telemetry(&self) -> &VecDeque<OrchestrationEvent> {
         &self.events
     }
+    pub fn dropped_telemetry(&self) -> u64 {
+        self.dropped_events
+    }
+    fn emit(&mut self, event: OrchestrationEvent) {
+        const CAPACITY: usize = 256;
+        if self.events.len() == CAPACITY {
+            self.events.pop_front();
+            self.dropped_events += 1;
+        }
+        self.events.push_back(event);
+    }
+    pub fn mode(&self) -> EnforcementMode {
+        self.policy.mode
+    }
+    pub fn rollback_dispatch(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
+        let worker = self.workers.get(h).ok_or("unknown worker")?;
+        if worker.state != State::Dispatched {
+            return Err("worker already started");
+        }
+        self.workers.remove(h);
+        self.total = self.total.saturating_sub(1);
+        self.emit(OrchestrationEvent {
+            name: "worker.dispatch_rolled_back",
+            worker_id: Some(h.0.clone()),
+            reason_code: Some("post_authorization_failure"),
+        });
+        Ok(())
+    }
     pub fn validate_dispatch(&self, model: &QualifiedModelId) -> Result<(), DispatchDenied> {
+        if self.policy.mode != EnforcementMode::Enforced {
+            return Ok(());
+        }
         let deny = if !self.policy.allowed_providers.contains(model.provider()) {
             Some("provider_not_allowed")
         } else if !self.policy.allowed_models.contains(model) {
@@ -175,13 +210,13 @@ impl WorkerRegistry {
         _role: WorkerRole,
         writes: WorkerWritePolicy,
     ) -> Result<WorkerHandle, DispatchDenied> {
-        self.events.push(OrchestrationEvent {
+        self.emit(OrchestrationEvent {
             name: "worker.dispatch_requested",
             worker_id: None,
             reason_code: None,
         });
         if let Err(error) = self.validate_dispatch(model) {
-            self.events.push(OrchestrationEvent {
+            self.emit(OrchestrationEvent {
                 name: "worker.dispatch_denied",
                 worker_id: None,
                 reason_code: Some(error.code),
@@ -197,9 +232,10 @@ impl WorkerRegistry {
                 writes,
                 unchanged_polls: 0,
                 steered: false,
+                last_fingerprint: None,
             },
         );
-        self.events.push(OrchestrationEvent {
+        self.emit(OrchestrationEvent {
             name: "worker.dispatched",
             worker_id: Some(h.0.clone()),
             reason_code: None,
@@ -218,7 +254,7 @@ impl WorkerRegistry {
             return Err("invalid lifecycle transition");
         }
         w.state = to;
-        self.events.push(OrchestrationEvent {
+        self.emit(OrchestrationEvent {
             name: event,
             worker_id: Some(h.0.clone()),
             reason_code: None,
@@ -228,13 +264,19 @@ impl WorkerRegistry {
     pub fn mark_running(&mut self, h: &WorkerHandle) -> Result<(), &'static str> {
         self.transition(h, &[State::Dispatched], State::Running, "worker.running")
     }
-    pub fn poll(&mut self, h: &WorkerHandle, _fingerprint: &str) -> Result<(), &'static str> {
+    pub fn poll(&mut self, h: &WorkerHandle, fingerprint: &str) -> Result<(), &'static str> {
         let w = self.workers.get_mut(h).ok_or("unknown worker")?;
         if w.state != State::Running {
             return Err("worker not running");
         }
-        w.unchanged_polls += 1;
-        self.events.push(OrchestrationEvent {
+        if w.last_fingerprint.as_deref() == Some(fingerprint) {
+            w.unchanged_polls += 1;
+        } else {
+            w.unchanged_polls = 0;
+            w.steered = false;
+            w.last_fingerprint = Some(fingerprint.to_owned());
+        }
+        self.emit(OrchestrationEvent {
             name: "worker.polled",
             worker_id: Some(h.0.clone()),
             reason_code: None,
@@ -251,7 +293,7 @@ impl WorkerRegistry {
             return Err("worker not running");
         }
         w.steered = true;
-        self.events.push(OrchestrationEvent {
+        self.emit(OrchestrationEvent {
             name: "worker.steered",
             worker_id: Some(h.0.clone()),
             reason_code: None,

@@ -32,20 +32,37 @@ impl OrchestrationRuntime {
             .validate_dispatch(&model)
             .map_err(|e| format!("delegation denied: {}", e.code()))
     }
-    pub fn authorize(&self, runtime_handle: &str, model: &str) -> Result<(), String> {
+    pub fn authorize_with_policy(
+        &self,
+        runtime_handle: &str,
+        model: &str,
+        role: WorkerRole,
+        writes: WorkerWritePolicy,
+    ) -> Result<(), String> {
         let model = QualifiedModelId::parse(model)
             .map_err(|_| "delegation denied: invalid qualified model".to_string())?;
         let mut inner = self.inner.lock().unwrap();
+        if inner.handles.contains_key(runtime_handle) {
+            return Err("delegation denied: duplicate runtime handle".to_string());
+        }
         let handle = inner
             .registry
-            .authorize_dispatch(&model, WorkerRole::Implementer, WorkerWritePolicy::ReadOnly)
+            .authorize_dispatch(&model, role, writes)
             .map_err(|e| format!("delegation denied: {}", e.code()))?;
-        inner
-            .registry
-            .mark_running(&handle)
-            .map_err(str::to_string)?;
+        if let Err(error) = inner.registry.mark_running(&handle) {
+            let _ = inner.registry.rollback_dispatch(&handle);
+            return Err(error.to_string());
+        }
         inner.handles.insert(runtime_handle.to_string(), handle);
         Ok(())
+    }
+    pub fn authorize(&self, runtime_handle: &str, model: &str) -> Result<(), String> {
+        self.authorize_with_policy(
+            runtime_handle,
+            model,
+            WorkerRole::Implementer,
+            WorkerWritePolicy::ReadOnly,
+        )
     }
     pub fn poll(&self, id: &str, fingerprint: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
