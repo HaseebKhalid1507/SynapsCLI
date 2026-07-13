@@ -725,3 +725,56 @@ pub fn resolved_system_prompt_as_user_module(
 pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule {
     resolved_system_prompt_as_user_module(content).expect("legacy prompt is within size limit")
 }
+
+/// Subagent supervision doctrine for OpenAI Codex models: keep a polling
+/// loop open over dispatched workers and never end the turn while any
+/// worker is still running.
+const CODEX_SUBAGENT_SUPERVISION: &str =
+    include_str!("builtin_prompts/codex_subagent_supervision.md");
+
+/// Builtin orchestration prompt adapters, shipped in source. Selection is
+/// typed: each adapter carries exact [`PromptSelectors`] (today a single
+/// `provider = openai-codex` module), so matching is provider-atom equality
+/// — never substring or inferred-family matching.
+pub fn builtin_orchestration_adapters() -> Vec<PromptModule> {
+    vec![PromptModule::new(
+        PromptModuleId::parse("builtin.codex.subagent-supervision")
+            .expect("builtin module id is valid"),
+        "1.0.0",
+        PromptModuleSource::Builtin,
+        10,
+        PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
+        ModuleMutability::MutableGuidance,
+        CODEX_SUBAGENT_SUPERVISION.trim_end(),
+    )
+    .expect("builtin doctrine is within size limit")]
+}
+
+/// Compose `base` with every builtin orchestration adapter matching
+/// `context`, in registry selection order. When nothing matches, `base`
+/// passes through byte-identical (`None` stays `None`); internal registry
+/// errors also fall back to `base` — composition must never take a session
+/// down.
+pub fn compose_orchestration_prompt(
+    base: Option<&str>,
+    context: &SelectionContext,
+) -> Option<String> {
+    let fallback = || base.map(str::to_owned);
+    let Ok(registry) = AdapterRegistry::new(builtin_orchestration_adapters()) else {
+        return fallback();
+    };
+    let Ok(selected) = registry.select(context) else {
+        return fallback();
+    };
+    if selected.is_empty() {
+        return fallback();
+    }
+    let mut parts: Vec<&str> = Vec::with_capacity(1 + selected.len());
+    if let Some(base) = base {
+        if !base.is_empty() {
+            parts.push(base);
+        }
+    }
+    parts.extend(selected.iter().map(|module| module.content()));
+    Some(parts.join("\n\n"))
+}

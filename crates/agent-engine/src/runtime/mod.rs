@@ -425,6 +425,33 @@ impl Runtime {
         self.system_prompt.as_deref()
     }
 
+    /// The system prompt that actually goes on the wire for the next
+    /// request: the configured base plus any builtin orchestration adapter
+    /// (see [`agent_core::prompt::builtin_orchestration_adapters`]) selected
+    /// by the *current* model identity, so the doctrine follows mid-session
+    /// model switches. Composition is skipped when:
+    /// - a typed prompt manifest is active — the manifest author owns the
+    ///   full stack;
+    /// - the runtime exposes no subagent tools (worker runtimes) — the
+    ///   doctrine would be unactionable noise;
+    /// - the model identity cannot be canonicalized — fail closed to the
+    ///   unmodified base.
+    pub async fn effective_system_prompt(&self) -> Option<String> {
+        if self.effective_prompt.is_some() {
+            return self.system_prompt.clone();
+        }
+        if self.tools.read().await.get("subagent_start").is_none() {
+            return self.system_prompt.clone();
+        }
+        let Ok(model) = crate::orchestration::canonical_foreground_identity(&self.model) else {
+            return self.system_prompt.clone();
+        };
+        let Ok(context) = agent_core::prompt::SelectionContext::new(model, None) else {
+            return self.system_prompt.clone();
+        };
+        agent_core::prompt::compose_orchestration_prompt(self.system_prompt.as_deref(), &context)
+    }
+
     pub fn effective_prompt(&self) -> Option<&agent_core::prompt::PromptStack> {
         self.effective_prompt.as_ref()
     }
@@ -783,6 +810,7 @@ impl Runtime {
         let mut messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(
             json!({"role": "user", "content": prompt}),
         )];
+        let system_prompt = self.effective_system_prompt().await;
 
         loop {
             let response = ApiMethods::call_api(
@@ -790,7 +818,7 @@ impl Runtime {
                 &self.client,
                 &self.model,
                 &*self.tools.read().await,
-                &self.system_prompt,
+                &system_prompt,
                 self.thinking_budget,
                 &messages,
                 self.api_retries,
@@ -1138,7 +1166,7 @@ impl Runtime {
         let token_cache = self.token_cache.clone();
         let model = self.model.clone();
         let tools = self.tools.clone();
-        let system_prompt = self.system_prompt.clone();
+        let system_prompt = self.effective_system_prompt().await;
         let thinking_budget = self.thinking_budget;
         let watcher_exit_path = self.watcher_exit_path.clone();
         let max_tool_output = self.max_tool_output;
@@ -1551,5 +1579,85 @@ mod tests {
         assert_eq!(thinking_level_for_budget(16385), "xhigh");
         assert_eq!(thinking_level_for_budget(32768), "xhigh");
         assert_eq!(thinking_level_for_budget(100000), "xhigh");
+    }
+}
+
+#[cfg(test)]
+mod effective_prompt_tests {
+    use super::*;
+
+    fn headless(model: &str, base: &str) -> Runtime {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model(model.to_string());
+        runtime.set_system_prompt(base.to_string());
+        runtime
+    }
+
+    #[tokio::test]
+    async fn codex_foreground_with_subagent_tools_composes_doctrine() {
+        let runtime = headless("openai-codex/gpt-5.6-sol", "BASE.");
+        let prompt = runtime
+            .effective_system_prompt()
+            .await
+            .expect("prompt must compose");
+        assert!(prompt.starts_with("BASE."), "base must lead");
+        assert!(prompt.contains("## Subagent supervision"));
+        assert!(prompt.contains("NEVER end your turn"));
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_without_subagent_tools_stays_clean() {
+        let mut runtime = headless("openai-codex/gpt-5.6-sol", "WORKER.");
+        runtime.set_tools(ToolRegistry::without_subagent());
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("WORKER."),
+            "workers have no subagent tools; doctrine would be unactionable noise"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_codex_foreground_stays_clean() {
+        let runtime = headless("xai-auth/grok-4.5-latest", "BASE.");
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_prompt_is_returned_verbatim() {
+        let mut runtime = headless("openai-codex/gpt-5.6-sol", "IGNORED.");
+        let module = agent_core::prompt::PromptModule::new(
+            agent_core::prompt::PromptModuleId::parse("kernel.test").unwrap(),
+            "1.0.0",
+            agent_core::prompt::PromptModuleSource::User,
+            0,
+            agent_core::prompt::PromptSelectors::default(),
+            agent_core::prompt::ModuleMutability::MutableGuidance,
+            "KERNEL.",
+        )
+        .unwrap();
+        let context = agent_core::prompt::SelectionContext::new(
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap(),
+            None,
+        )
+        .unwrap();
+        let stack = agent_core::prompt::PromptStack::new(vec![module], context).unwrap();
+        runtime.apply_prompt_stack(stack).unwrap();
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("KERNEL."),
+            "manifest authors own the full stack; no builtin injection on top"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolvable_model_identity_fails_closed_to_base() {
+        let runtime = headless("definitely-not-a-model", "BASE.");
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
     }
 }
