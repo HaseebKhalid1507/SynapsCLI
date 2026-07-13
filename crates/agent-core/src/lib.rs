@@ -47,3 +47,5 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+
+pub mod prompt;
