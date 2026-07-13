@@ -88,9 +88,8 @@ impl Tool for SubagentResumeTool {
             (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
         };
 
-        if let Some(policy) = &ctx.capabilities.orchestration {
-            policy.preflight(&model).map_err(RuntimeError::Tool)?;
-        }
+        // The inherited prior model is still re-authorized as an explicit exact
+        // identity; a stale handle cannot bypass current session policy.
 
         // ── Build resumed task: new instructions → separator → prior context.
         let resumed_task = format!(
@@ -108,12 +107,14 @@ impl Tool for SubagentResumeTool {
         let task_full = resumed_task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
-        // Authorization is deliberately before channel/thread/runtime creation.
-        if let Some(policy) = &ctx.capabilities.orchestration {
-            policy
-                .authorize(&handle_id, &model)
-                .map_err(RuntimeError::Tool)?;
-        }
+        let decision = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .resolve_and_authorize(&handle_id, Some(&model))
+            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+        let model = decision.model.as_str().to_owned();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
