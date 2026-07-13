@@ -377,18 +377,37 @@ impl PromptManifest {
             let (content, safe_path) = if let Some(content) = &declaration.content {
                 (content.clone(), None)
             } else {
+                use std::path::Component;
                 let relative = std::path::Path::new(declaration.path.as_deref().unwrap());
-                if relative.is_absolute() {
-                    return Err(PromptError::Invalid(format!(
-                        "module {} path must be relative",
-                        declaration.id.as_str()
-                    )));
+                if relative.is_absolute()
+                    || relative.components().any(|component| {
+                        !matches!(component, Component::Normal(_) | Component::CurDir)
+                    })
+                {
+                    return Err(PromptError::Invalid(
+                        "module path must be confined to manifest directory".into(),
+                    ));
                 }
                 let base = manifest_dir.ok_or_else(|| {
                     PromptError::Invalid("manifest directory is required for module paths".into())
                 })?;
-                let content = std::fs::read_to_string(base.join(relative)).map_err(|e| {
-                    PromptError::Invalid(format!("module {}: {e}", declaration.id.as_str()))
+                let canonical_base = base.canonicalize().map_err(|_| {
+                    PromptError::Invalid("manifest directory is unavailable".into())
+                })?;
+                let candidate = base.join(relative);
+                let canonical_candidate = candidate
+                    .canonicalize()
+                    .map_err(|_| PromptError::Invalid("module path is unavailable".into()))?;
+                if !canonical_candidate.starts_with(&canonical_base) {
+                    return Err(PromptError::Invalid(
+                        "module path must be confined to manifest directory".into(),
+                    ));
+                }
+                let content = std::fs::read_to_string(&canonical_candidate).map_err(|_| {
+                    PromptError::Invalid(format!(
+                        "module {} could not be read",
+                        declaration.id.as_str()
+                    ))
                 })?;
                 (content, Some(relative.to_string_lossy().into_owned()))
             };
