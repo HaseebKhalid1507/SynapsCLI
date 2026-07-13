@@ -299,33 +299,44 @@ pub(crate) fn handle_event(
         }
         (KeyCode::Left, _) | (KeyCode::Right, _) if state.focus == Focus::Right => {
             if let Some(def) = state.current_setting(snap) {
-                if let EditorKind::Cycler(options) = def.editor {
-                    let current = cycler_current_value(def.key, snap);
-                    let idx = options.iter().position(|o| *o == current).unwrap_or(0);
-                    let new_idx = match key.code {
-                        KeyCode::Left => {
-                            if idx > 0 {
-                                idx - 1
-                            } else {
-                                idx
-                            }
-                        }
-                        KeyCode::Right => {
-                            if idx + 1 < options.len() {
-                                idx + 1
-                            } else {
-                                idx
-                            }
-                        }
-                        _ => idx,
-                    };
-                    if new_idx != idx {
-                        state.row_error = None;
-                        return InputOutcome::Apply {
-                            key: def.key,
-                            value: options[new_idx].to_string(),
-                        };
+                let dyn_opts: Vec<String>;
+                let opts_ref: &[&str];
+                let dyn_strs: Vec<&str>;
+                let options: &[&str] = match &def.editor {
+                    EditorKind::Cycler(opts) => opts,
+                    EditorKind::DynamicCycler => {
+                        dyn_opts = snap.thinking_options.clone();
+                        dyn_strs = dyn_opts.iter().map(|s| s.as_str()).collect();
+                        opts_ref = &dyn_strs;
+                        opts_ref
                     }
+                    _ => return InputOutcome::None,
+                };
+                let current = cycler_current_value(def.key, snap);
+                let idx = options.iter().position(|o| *o == current).unwrap_or(0);
+                let new_idx = match key.code {
+                    KeyCode::Left => {
+                        if idx > 0 {
+                            idx - 1
+                        } else {
+                            idx
+                        }
+                    }
+                    KeyCode::Right => {
+                        if idx + 1 < options.len() {
+                            idx + 1
+                        } else {
+                            idx
+                        }
+                    }
+                    _ => idx,
+                };
+                if new_idx != idx {
+                    state.row_error = None;
+                    return InputOutcome::Apply {
+                        key: def.key,
+                        value: options[new_idx].to_string(),
+                    };
                 }
             }
             InputOutcome::None
@@ -706,6 +717,13 @@ mod tests {
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: Vec::new(),
+            thinking_options: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "adaptive".into(),
+            ],
         }
     }
 

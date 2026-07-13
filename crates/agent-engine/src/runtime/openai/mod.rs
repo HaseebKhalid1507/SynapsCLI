@@ -181,6 +181,7 @@ pub async fn try_route(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
     source: &crate::auth::CredentialSource,
     cache: &crate::auth::TokenCache,
@@ -469,6 +470,7 @@ pub async fn try_route(
                 tx,
                 temperature,
                 max_tokens,
+                reasoning_level,
                 cancel,
             )
             .await,
@@ -632,6 +634,7 @@ mod tests {
             None,
             None,
             0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
             &cancel,
             &source,
             &cache,

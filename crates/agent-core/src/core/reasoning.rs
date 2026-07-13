@@ -346,7 +346,10 @@ mod tests {
 
     #[test]
     fn thinking_spec_numeric_budget_parse() {
-        assert_eq!(ThinkingSpec::parse("8192"), Some(ThinkingSpec::Budget(8192)));
+        assert_eq!(
+            ThinkingSpec::parse("8192"),
+            Some(ThinkingSpec::Budget(8192))
+        );
         assert_eq!(ThinkingSpec::parse("0"), Some(ThinkingSpec::Budget(0)));
     }
 

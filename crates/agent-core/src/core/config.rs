@@ -1,19 +1,23 @@
+use crate::core::shell_config::ShellConfig;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use crate::core::shell_config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 static IDENTITY: OnceLock<String> = OnceLock::new();
 
-pub const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
+pub const DEFAULT_IDENTITY: &str =
+    "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
 /// Returns the configured identity string for the system prompt preamble.
 /// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set
 /// in config. Initialized by `load_config()` — safe to call anytime after boot.
 pub fn get_identity() -> String {
-    IDENTITY.get().cloned().unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+    IDENTITY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
 }
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.
@@ -26,7 +30,9 @@ pub fn get_provider_keys() -> BTreeMap<String, String> {
 /// Returns the active profile name, if any.
 /// Reads from `SYNAPS_PROFILE` environment variable if not already set programmatically.
 pub fn get_profile() -> Option<String> {
-    PROFILE_NAME.get_or_init(|| std::env::var("SYNAPS_PROFILE").ok()).clone()
+    PROFILE_NAME
+        .get_or_init(|| std::env::var("SYNAPS_PROFILE").ok())
+        .clone()
 }
 
 /// Sets the active profile name. Must be called before any `get_profile()` call
@@ -55,39 +61,39 @@ pub fn set_base_dir_for_tests(path: PathBuf) {
 /// Resolves a path for reading. Checks the profile folder first, then falls back to the default folder.
 pub fn resolve_read_path(filename: &str) -> PathBuf {
     let base = base_dir();
-    
+
     if let Some(profile) = get_profile() {
         let profile_path = base.join(&profile).join(filename);
         if profile_path.exists() {
             return profile_path;
         }
     }
-    
+
     base.join(filename)
 }
 
 /// Resolves a path for reading with an extended arbitrary path tree.
 pub fn resolve_read_path_extended(path: &str) -> PathBuf {
     let base = base_dir();
-    
+
     if let Some(profile) = get_profile() {
         let profile_path = base.join(&profile).join(path);
         if profile_path.exists() {
             return profile_path;
         }
     }
-    
+
     base.join(path)
 }
 
 /// Resolves a path for writing. Unconditionally writes to the profile folder if a profile is active.
 pub fn resolve_write_path(filename: &str) -> PathBuf {
     let mut base = base_dir();
-    
+
     if let Some(profile) = get_profile() {
         base.push(profile);
     }
-    
+
     let _ = std::fs::create_dir_all(&base);
     base.join(filename)
 }
@@ -264,16 +270,16 @@ pub struct SynapsConfig {
     /// When `Some`, this is the authoritative level. When `None`, fall back
     /// to `thinking_budget` for legacy numeric-only values.
     pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
-    pub context_window: Option<u64>,   // override auto-detected context window (tokens)
+    pub context_window: Option<u64>, // override auto-detected context window (tokens)
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
-    pub max_tool_output: usize,        // default 30000
-    pub bash_timeout: u64,             // default 30
-    pub bash_max_timeout: u64,         // default 300
-    pub subagent_timeout: u64,         // default 300
-    pub api_retries: u32,              // default 3
-    pub refusal_retries: u32,          // default 2 — retries on stop_reason=refusal
-    pub telemetry: String,             // off | basic | full (default off)
-    pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
+    pub max_tool_output: usize,      // default 30000
+    pub bash_timeout: u64,           // default 30
+    pub bash_max_timeout: u64,       // default 300
+    pub subagent_timeout: u64,       // default 300
+    pub api_retries: u32,            // default 3
+    pub refusal_retries: u32,        // default 2 — retries on stop_reason=refusal
+    pub telemetry: String,           // off | basic | full (default off)
+    pub cache_diagnostics: bool,     // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
@@ -345,10 +351,28 @@ impl Default for SynapsConfig {
 
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
 const KNOWN_CONFIG_KEYS: &[&str] = &[
-    "model", "thinking", "compaction_model", "context_window", "max_tool_output",
-    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries", "refusal_retries",
-    "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "scroll_lines", "theme", "agent_name", "identity",
-    "disabled_plugins", "favorite_models", "disabled_skills", "disabled_tools",
+    "model",
+    "thinking",
+    "compaction_model",
+    "context_window",
+    "max_tool_output",
+    "bash_timeout",
+    "bash_max_timeout",
+    "subagent_timeout",
+    "api_retries",
+    "refusal_retries",
+    "telemetry",
+    "cache_diagnostics",
+    "cache_ttl",
+    "max_fps",
+    "scroll_lines",
+    "theme",
+    "agent_name",
+    "identity",
+    "disabled_plugins",
+    "favorite_models",
+    "disabled_skills",
+    "disabled_tools",
 ];
 
 /// Simple Levenshtein distance for did-you-mean suggestions.
@@ -378,11 +402,7 @@ fn did_you_mean(key: &str) -> Option<&'static str> {
         .map(|(k, _)| k)
 }
 
-
-fn parse_thinking_budget(val: &str) -> Option<u32> {
-    use crate::core::reasoning::ThinkingSpec;
-    ThinkingSpec::parse(val).and_then(|spec| spec.to_budget())
-}
+// parse_thinking_budget replaced by ThinkingSpec::parse in apply_config_content.
 
 fn parse_comma_list(val: &str) -> Vec<String> {
     val.split(',')
@@ -402,21 +422,30 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
             if let Ok(sessions) = val.parse::<usize>() {
                 shell_config.max_sessions = sessions;
             } else {
-                eprintln!("Warning: invalid value for shell.max_sessions: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.max_sessions: '{}', using default",
+                    val
+                );
             }
         }
         "shell.idle_timeout" => {
             if let Ok(timeout) = val.parse::<u64>() {
                 shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
             } else {
-                eprintln!("Warning: invalid value for shell.idle_timeout: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.idle_timeout: '{}', using default",
+                    val
+                );
             }
         }
         "shell.readiness_timeout_ms" => {
             if let Ok(timeout) = val.parse::<u64>() {
                 shell_config.readiness_timeout_ms = timeout;
             } else {
-                eprintln!("Warning: invalid value for shell.readiness_timeout_ms: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.readiness_timeout_ms: '{}', using default",
+                    val
+                );
             }
         }
         "shell.max_readiness_timeout_ms" => {
@@ -430,14 +459,20 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
             if let Ok(rows) = val.parse::<u16>() {
                 shell_config.default_rows = rows;
             } else {
-                eprintln!("Warning: invalid value for shell.default_rows: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.default_rows: '{}', using default",
+                    val
+                );
             }
         }
         "shell.default_cols" => {
             if let Ok(cols) = val.parse::<u16>() {
                 shell_config.default_cols = cols;
             } else {
-                eprintln!("Warning: invalid value for shell.default_cols: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.default_cols: '{}', using default",
+                    val
+                );
             }
         }
         "shell.readiness_strategy" => {
@@ -447,7 +482,10 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
                     shell_config.readiness_strategy = val.to_string();
                 }
                 _ => {
-                    eprintln!("Warning: invalid value for shell.readiness_strategy: '{}', using default", val);
+                    eprintln!(
+                        "Warning: invalid value for shell.readiness_strategy: '{}', using default",
+                        val
+                    );
                 }
             }
         }
@@ -455,7 +493,10 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
             if let Ok(max_output) = val.parse::<usize>() {
                 shell_config.max_output = max_output;
             } else {
-                eprintln!("Warning: invalid value for shell.max_output: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for shell.max_output: '{}', using default",
+                    val
+                );
             }
         }
         _ => {
@@ -483,7 +524,10 @@ fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &st
             if let Ok(size) = val.parse::<usize>() {
                 server_config.max_message_size = Some(size);
             } else {
-                eprintln!("Warning: invalid value for server.max_message_size: '{}', ignored", val);
+                eprintln!(
+                    "Warning: invalid value for server.max_message_size: '{}', ignored",
+                    val
+                );
             }
         }
         _ => {
@@ -509,7 +553,10 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
             if let Ok(ms) = val.parse::<u64>() {
                 bridge_config.heartbeat_timeout_ms = ms;
             } else {
-                eprintln!("Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default", val);
+                eprintln!(
+                    "Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default",
+                    val
+                );
             }
         }
         _ => {
@@ -523,10 +570,18 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
     let v = val.trim();
     match key {
         "auth.remote_endpoint" => {
-            auth_config.remote_endpoint = if v.is_empty() { None } else { Some(v.to_string()) };
+            auth_config.remote_endpoint = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
         }
         "auth.machine_token" => {
-            auth_config.machine_token = if v.is_empty() { None } else { Some(v.to_string()) };
+            auth_config.machine_token = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
         }
         _ => {
             // Unknown auth.* keys preserved (not rejected)
@@ -547,11 +602,11 @@ pub fn load_config_from_str(content: &str) -> SynapsConfig {
 pub fn load_config() -> SynapsConfig {
     let path = resolve_read_path("config");
     let mut config = SynapsConfig::default();
-    
+
     let Ok(content) = std::fs::read_to_string(&path) else {
         return config;
     };
-    
+
     apply_config_content(&mut config, &content);
 
     // Publish provider keys to the process-wide cache for the API router.
@@ -559,7 +614,10 @@ pub fn load_config() -> SynapsConfig {
     let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
 
     // Publish identity to the process-wide cache for API system prompt preamble.
-    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
+    let identity_val = config
+        .identity
+        .clone()
+        .unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
     let _ = IDENTITY.set(identity_val);
 
     config
@@ -570,8 +628,12 @@ pub fn load_config() -> SynapsConfig {
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        let Some((key, val)) = line.split_once('=') else { continue };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let val = val.trim();
         match key {
@@ -596,23 +658,30 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     _ => val.parse::<u64>().ok(),
                 };
                 if parsed.is_none() {
-                    config.warnings.push(format!("context_window = {val} — expected 200k, 1m, or a token count; ignored"));
+                    config.warnings.push(format!(
+                        "context_window = {val} — expected 200k, 1m, or a token count; ignored"
+                    ));
                 }
                 config.context_window = parsed;
             }
-            "max_tool_output" => {
-                match val.parse::<usize>() {
-                    Ok(size) => config.max_tool_output = size,
-                    Err(_) => config.warnings.push(format!("max_tool_output = {val} — not a number; using {}", config.max_tool_output)),
-                }
-            }
-            "bash_timeout" => {
-                match val.parse::<u64>() {
-                    Ok(t) if t >= 1 => config.bash_timeout = t,
-                    Ok(_) => config.warnings.push(format!("bash_timeout = {val} — below minimum (1s); using {}", config.bash_timeout)),
-                    Err(_) => config.warnings.push(format!("bash_timeout = {val} — not a number; using {}", config.bash_timeout)),
-                }
-            }
+            "max_tool_output" => match val.parse::<usize>() {
+                Ok(size) => config.max_tool_output = size,
+                Err(_) => config.warnings.push(format!(
+                    "max_tool_output = {val} — not a number; using {}",
+                    config.max_tool_output
+                )),
+            },
+            "bash_timeout" => match val.parse::<u64>() {
+                Ok(t) if t >= 1 => config.bash_timeout = t,
+                Ok(_) => config.warnings.push(format!(
+                    "bash_timeout = {val} — below minimum (1s); using {}",
+                    config.bash_timeout
+                )),
+                Err(_) => config.warnings.push(format!(
+                    "bash_timeout = {val} — not a number; using {}",
+                    config.bash_timeout
+                )),
+            },
             "bash_max_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
                     config.bash_max_timeout = timeout;
@@ -637,36 +706,32 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
-            "cache_ttl" => {
-                match CacheTtl::parse(val) {
-                    Some(ttl) => config.cache_ttl = ttl,
-                    None => config.warnings.push(format!(
-                        "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
-                    )),
-                }
-            }
-            "max_fps" => {
-                match val.parse::<u32>() {
-                    Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
-                    Ok(_) => config.warnings.push(format!(
-                        "max_fps = {val} — expected 1–1000; using {}", config.max_fps
-                    )),
-                    Err(_) => config.warnings.push(format!(
-                        "max_fps = {val} — not a number; using {}", config.max_fps
-                    )),
-                }
-            }
-            "scroll_lines" => {
-                match val.parse::<u16>() {
-                    Ok(n) if (1..=20).contains(&n) => config.scroll_lines = Some(n),
-                    Ok(_) => config.warnings.push(format!(
-                        "scroll_lines = {val} — expected 1–20; ignoring"
-                    )),
-                    Err(_) => config.warnings.push(format!(
-                        "scroll_lines = {val} — not a number; ignoring"
-                    )),
-                }
-            }
+            "cache_ttl" => match CacheTtl::parse(val) {
+                Some(ttl) => config.cache_ttl = ttl,
+                None => config.warnings.push(format!(
+                    "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                )),
+            },
+            "max_fps" => match val.parse::<u32>() {
+                Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
+                Ok(_) => config.warnings.push(format!(
+                    "max_fps = {val} — expected 1–1000; using {}",
+                    config.max_fps
+                )),
+                Err(_) => config.warnings.push(format!(
+                    "max_fps = {val} — not a number; using {}",
+                    config.max_fps
+                )),
+            },
+            "scroll_lines" => match val.parse::<u16>() {
+                Ok(n) if (1..=20).contains(&n) => config.scroll_lines = Some(n),
+                Ok(_) => config
+                    .warnings
+                    .push(format!("scroll_lines = {val} — expected 1–20; ignoring")),
+                Err(_) => config
+                    .warnings
+                    .push(format!("scroll_lines = {val} — not a number; ignoring")),
+            },
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
@@ -695,9 +760,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 } else if key.starts_with("events.") {
                     parse_events_config_key(&mut config.events, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
-                    config.provider_keys.insert(provider_key.to_string(), val.to_string());
+                    config
+                        .provider_keys
+                        .insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
-                    config.keybinds.insert(keybind_key.to_string(), val.to_string());
+                    config
+                        .keybinds
+                        .insert(keybind_key.to_string(), val.to_string());
                 } else if key.contains('.') {
                     // Dotted keys are namespaced (plugin/extension config, e.g.
                     // `knowledge.jawz_notes`). Plugins define their own keys —
@@ -705,8 +774,12 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 } else {
                     // Unknown top-level key — warn with a did-you-mean if close.
                     match did_you_mean(key) {
-                        Some(suggestion) => config.warnings.push(format!("unknown key '{key}' (did you mean '{suggestion}'?)")),
-                        None => config.warnings.push(format!("unknown key '{key}' — ignored")),
+                        Some(suggestion) => config.warnings.push(format!(
+                            "unknown key '{key}' (did you mean '{suggestion}'?)"
+                        )),
+                        None => config
+                            .warnings
+                            .push(format!("unknown key '{key}' — ignored")),
                     }
                 }
             }
@@ -728,8 +801,12 @@ pub fn read_config_value(key: &str) -> Option<String> {
     let content = std::fs::read_to_string(&path).ok()?;
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         if k.trim() == key.trim() {
             return Some(v.trim().to_string());
         }
@@ -748,25 +825,34 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
     let replacement = format!("{} = {}", key_trimmed, value);
 
     let mut found = false;
-    let mut new_lines: Vec<String> = existing.lines().map(|line| {
-        if found { return line.to_string(); }
-        let t = line.trim_start();
-        if t.starts_with('#') || t.is_empty() { return line.to_string(); }
-        if let Some((k, _)) = t.split_once('=') {
-            if k.trim() == key_trimmed {
-                found = true;
-                return replacement.clone();
+    let mut new_lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            if found {
+                return line.to_string();
             }
-        }
-        line.to_string()
-    }).collect();
+            let t = line.trim_start();
+            if t.starts_with('#') || t.is_empty() {
+                return line.to_string();
+            }
+            if let Some((k, _)) = t.split_once('=') {
+                if k.trim() == key_trimmed {
+                    found = true;
+                    return replacement.clone();
+                }
+            }
+            line.to_string()
+        })
+        .collect();
 
     if !found {
         new_lines.push(replacement);
     }
 
     let mut out = new_lines.join("\n");
-    if !out.ends_with('\n') { out.push('\n'); }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
 
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, out)?;
@@ -861,15 +947,73 @@ mod tests {
             let config = load_config();
             // Dotted (namespaced) keys must NOT warn — plugins own those.
             assert_eq!(config.warnings.len(), 3, "warnings: {:?}", config.warnings);
-            assert!(!config.warnings.iter().any(|w| w.contains("knowledge")), "{:?}", config.warnings);
-            assert!(config.warnings.iter().any(|w| w.contains("did you mean 'model'")), "{:?}", config.warnings);
-            assert!(config.warnings.iter().any(|w| w.contains("thinking")), "{:?}", config.warnings);
-            assert!(config.warnings.iter().any(|w| w.contains("below minimum")), "{:?}", config.warnings);
+            assert!(
+                !config.warnings.iter().any(|w| w.contains("knowledge")),
+                "{:?}",
+                config.warnings
+            );
+            assert!(
+                config
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("did you mean 'model'")),
+                "{:?}",
+                config.warnings
+            );
+            assert!(
+                config.warnings.iter().any(|w| w.contains("thinking")),
+                "{:?}",
+                config.warnings
+            );
+            assert!(
+                config.warnings.iter().any(|w| w.contains("below minimum")),
+                "{:?}",
+                config.warnings
+            );
             // Bad values fall back to defaults
             assert_eq!(config.bash_timeout, 30);
             assert_eq!(config.thinking_budget, None);
         });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn config_max_and_ultra_parse_to_named_level() {
+        use crate::core::reasoning::ReasoningLevel;
+        let cfg = load_config_from_str("thinking = max");
+        assert_eq!(cfg.thinking_level, Some(ReasoningLevel::Max));
+        // Max has no valid numeric budget — budget is None
+        assert_eq!(cfg.thinking_budget, None);
+
+        let cfg = load_config_from_str("thinking = ultra");
+        assert_eq!(cfg.thinking_level, Some(ReasoningLevel::Ultra));
+        assert_eq!(cfg.thinking_budget, None);
+    }
+
+    #[test]
+    fn config_legacy_levels_still_load() {
+        use crate::core::reasoning::ReasoningLevel;
+        for (s, expected_level, expected_budget) in [
+            ("low", ReasoningLevel::Low, Some(2048u32)),
+            ("medium", ReasoningLevel::Medium, Some(4096)),
+            ("high", ReasoningLevel::High, Some(16384)),
+            ("xhigh", ReasoningLevel::XHigh, Some(32768)),
+            ("adaptive", ReasoningLevel::Adaptive, Some(0)),
+        ] {
+            let cfg = load_config_from_str(&format!("thinking = {s}"));
+            assert_eq!(cfg.thinking_level, Some(expected_level), "level for {s}");
+            assert_eq!(cfg.thinking_budget, expected_budget, "budget for {s}");
+        }
+    }
+
+    #[test]
+    fn config_numeric_budget_still_loads() {
+        use crate::core::reasoning::ReasoningLevel;
+        let cfg = load_config_from_str("thinking = 8192");
+        // Numeric budget: no named level in the Named enum sense, buckets to High
+        assert_eq!(cfg.thinking_budget, Some(8192));
+        // Named level is derived from the budget
+        assert_eq!(cfg.thinking_level, Some(ReasoningLevel::High));
     }
 
     // ── cache_ttl parse table (spec §3.1) ──
@@ -919,7 +1063,11 @@ mod tests {
         with_home(&home, || {
             let config = load_config();
             assert_eq!(config.max_fps, 144);
-            assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+            assert!(
+                config.warnings.is_empty(),
+                "warnings: {:?}",
+                config.warnings
+            );
         });
 
         // Out-of-range (0) → default 60 + boot warning (never blocks boot).
@@ -929,7 +1077,8 @@ mod tests {
             assert_eq!(config.max_fps, 60);
             assert!(
                 config.warnings.iter().any(|w| w.contains("max_fps")),
-                "warnings: {:?}", config.warnings
+                "warnings: {:?}",
+                config.warnings
             );
         });
 
@@ -940,7 +1089,8 @@ mod tests {
             assert_eq!(config.max_fps, 60);
             assert!(
                 config.warnings.iter().any(|w| w.contains("max_fps")),
-                "warnings: {:?}", config.warnings
+                "warnings: {:?}",
+                config.warnings
             );
         });
 
@@ -950,7 +1100,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_cache_ttl_config_parse_and_garbage_warning() {
-        let home = std::env::temp_dir().join(format!("synaps-cachettl-test-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("synaps-cachettl-test-{}", std::process::id()));
         let dir = home.join(".synaps-cli");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -959,7 +1110,11 @@ mod tests {
         with_home(&home, || {
             let config = load_config();
             assert_eq!(config.cache_ttl, CacheTtl::Hybrid);
-            assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+            assert!(
+                config.warnings.is_empty(),
+                "warnings: {:?}",
+                config.warnings
+            );
         });
 
         // Garbage value → 5m default + boot warning (never blocks boot).
@@ -969,7 +1124,8 @@ mod tests {
             assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
             assert!(
                 config.warnings.iter().any(|w| w.contains("cache_ttl")),
-                "warnings: {:?}", config.warnings
+                "warnings: {:?}",
+                config.warnings
             );
         });
 
@@ -978,12 +1134,23 @@ mod tests {
 
     #[test]
     fn test_parse_thinking_budget() {
-        assert_eq!(parse_thinking_budget("low"), Some(2048));
-        assert_eq!(parse_thinking_budget("medium"), Some(4096));
-        assert_eq!(parse_thinking_budget("high"), Some(16384));
-        assert_eq!(parse_thinking_budget("xhigh"), Some(32768));
-        assert_eq!(parse_thinking_budget("8192"), Some(8192));
-        assert_eq!(parse_thinking_budget("invalid"), None);
+        use crate::core::reasoning::ThinkingSpec;
+        // ThinkingSpec::parse replaced parse_thinking_budget; verify budget values.
+        assert_eq!(ThinkingSpec::parse("low").unwrap().to_budget(), Some(2048));
+        assert_eq!(
+            ThinkingSpec::parse("medium").unwrap().to_budget(),
+            Some(4096)
+        );
+        assert_eq!(
+            ThinkingSpec::parse("high").unwrap().to_budget(),
+            Some(16384)
+        );
+        assert_eq!(
+            ThinkingSpec::parse("xhigh").unwrap().to_budget(),
+            Some(32768)
+        );
+        assert_eq!(ThinkingSpec::parse("8192").unwrap().to_budget(), Some(8192));
+        assert_eq!(ThinkingSpec::parse("invalid"), None);
     }
 
     #[test]
@@ -1040,11 +1207,15 @@ mod tests {
     fn test_load_config_bridge_keys() {
         let home = make_test_home("bridge-keys");
         let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "\
+        std::fs::write(
+            &cfg,
+            "\
 bridge.uds_path = /tmp/some/control.sock\n\
 bridge.heartbeat_mirror = true\n\
 bridge.heartbeat_timeout_ms = 750\n\
-").unwrap();
+",
+        )
+        .unwrap();
 
         with_home(&home, || {
             let config = load_config();
@@ -1096,20 +1267,27 @@ bridge.heartbeat_timeout_ms = 750\n\
     fn test_load_config_server_keys() {
         let home = make_test_home("server-keys");
         let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "\
+        std::fs::write(
+            &cfg,
+            "\
 server.allowed_origins = http://localhost:3000, http://localhost:5193\n\
 server.token = my-secret-token\n\
 server.auto_approve_confirms = true\n\
 server.max_message_size = 65536\n\
 context_window = 200k\n\
-").unwrap();
+",
+        )
+        .unwrap();
 
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.server.allowed_origins, vec![
-                "http://localhost:3000".to_string(),
-                "http://localhost:5193".to_string(),
-            ]);
+            assert_eq!(
+                config.server.allowed_origins,
+                vec![
+                    "http://localhost:3000".to_string(),
+                    "http://localhost:5193".to_string(),
+                ]
+            );
             assert_eq!(config.server.token, Some("my-secret-token".to_string()));
             assert!(config.server.auto_approve_confirms);
             // Explicit max_message_size takes precedence over context_window derivation
@@ -1262,7 +1440,8 @@ context_window = 200k\n\
     #[test]
     #[serial]
     fn test_load_config_disable_lists() {
-        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
+        let test_dir =
+            std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
         let _ = std::fs::create_dir_all(&test_dir);
         let config_path = test_dir.join("config");
 
@@ -1288,12 +1467,21 @@ disabled_skills = baz, plug:qual
 
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-disable-lists");
 
-        assert_eq!(config.disabled_plugins, vec!["foo".to_string(), "bar".to_string()]);
-        assert_eq!(config.favorite_models, vec![
-            "claude/claude-opus-4-7".to_string(),
-            "groq/llama-3.3-70b-versatile".to_string(),
-        ]);
-        assert_eq!(config.disabled_skills, vec!["baz".to_string(), "plug:qual".to_string()]);
+        assert_eq!(
+            config.disabled_plugins,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+        assert_eq!(
+            config.favorite_models,
+            vec![
+                "claude/claude-opus-4-7".to_string(),
+                "groq/llama-3.3-70b-versatile".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.disabled_skills,
+            vec!["baz".to_string(), "plug:qual".to_string()]
+        );
     }
 
     #[test]
@@ -1326,7 +1514,7 @@ disabled_skills = baz, plug:qual
         let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-new-keys/.synaps-cli");
         let _ = std::fs::create_dir_all(&test_dir);
         let config_path = test_dir.join("config");
-        
+
         let config_content = r#"
 # Test config with new keys
 model = claude-haiku
@@ -1338,23 +1526,23 @@ subagent_timeout = 120
 api_retries = 5
 "#;
         std::fs::write(&config_path, config_content).unwrap();
-        
+
         // Temporarily override the config path for this test
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/tmp/synaps-config-test-new-keys");
-        
+
         let config = load_config();
-        
+
         // Restore original HOME
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
             std::env::remove_var("HOME");
         }
-        
+
         // Cleanup
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-new-keys");
-        
+
         assert_eq!(config.model, Some("claude-haiku".to_string()));
         assert_eq!(config.thinking_budget, Some(4096)); // medium = 4096
         assert_eq!(config.max_tool_output, 50000);
@@ -1372,7 +1560,10 @@ api_retries = 5
     fn events_auto_turn_explicit_true_values() {
         for val in &["true", "TRUE", "1", "yes", "YES", "on", "ON"] {
             let cfg = load_config_from_str(&format!("events.auto_turn = {val}"));
-            assert!(cfg.events.auto_turn, "expected true for events.auto_turn = {val}");
+            assert!(
+                cfg.events.auto_turn,
+                "expected true for events.auto_turn = {val}"
+            );
         }
     }
 
@@ -1380,7 +1571,10 @@ api_retries = 5
     fn events_auto_turn_explicit_false_values() {
         for val in &["false", "FALSE", "0", "no", "NO", "off", "OFF"] {
             let cfg = load_config_from_str(&format!("events.auto_turn = {val}"));
-            assert!(!cfg.events.auto_turn, "expected false for events.auto_turn = {val}");
+            assert!(
+                !cfg.events.auto_turn,
+                "expected false for events.auto_turn = {val}"
+            );
         }
     }
 
@@ -1388,7 +1582,10 @@ api_retries = 5
     fn events_auto_turn_typo_fails_safe_false() {
         // Unrecognised value should fail safe to false (with a warning on stderr).
         let cfg = load_config_from_str("events.auto_turn = fales");
-        assert!(!cfg.events.auto_turn, "typo 'fales' must fail safe to false");
+        assert!(
+            !cfg.events.auto_turn,
+            "typo 'fales' must fail safe to false"
+        );
     }
 
     #[test]
@@ -1410,10 +1607,17 @@ api_retries = 5
         .unwrap();
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.auth.remote_endpoint.as_deref(), Some("https://jade.jade:8181"));
+            assert_eq!(
+                config.auth.remote_endpoint.as_deref(),
+                Some("https://jade.jade:8181")
+            );
             assert_eq!(config.auth.machine_token.as_deref(), Some("machine-abc"));
             // auth.* are namespaced -> must NOT warn as unknown keys
-            assert!(!config.warnings.iter().any(|w| w.contains("auth.")), "{:?}", config.warnings);
+            assert!(
+                !config.warnings.iter().any(|w| w.contains("auth.")),
+                "{:?}",
+                config.warnings
+            );
         });
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1437,7 +1641,10 @@ api_retries = 5
         };
         assert_eq!(
             auth.credential_source(),
-            crate::core::auth::CredentialSource::Remote { endpoint: "https://b".into(), machine_token: "m".into() }
+            crate::core::auth::CredentialSource::Remote {
+                endpoint: "https://b".into(),
+                machine_token: "m".into()
+            }
         );
     }
 
@@ -1455,7 +1662,10 @@ api_retries = 5
         std::env::remove_var("SYNAPS_MACHINE_TOKEN");
         assert_eq!(
             src,
-            crate::core::auth::CredentialSource::Remote { endpoint: "https://env-host".into(), machine_token: "env-tok".into() }
+            crate::core::auth::CredentialSource::Remote {
+                endpoint: "https://env-host".into(),
+                machine_token: "env-tok".into()
+            }
         );
     }
 }

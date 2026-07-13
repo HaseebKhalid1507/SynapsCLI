@@ -1,7 +1,7 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
-use serde_json::Value;
 
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
@@ -125,7 +125,9 @@ impl SubagentState {
 }
 
 impl Default for SubagentState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── SubagentDisplayRow ────────────────────────────────────────────────────────────
@@ -243,17 +245,29 @@ impl SubagentHandle {
 
     /// Current status snapshot.
     pub fn status(&self) -> SubagentStatus {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).status.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .status
+            .clone()
     }
 
     /// Partial output accumulated so far.
     pub fn partial_output(&self) -> String {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).partial_text.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .partial_text
+            .clone()
     }
 
     /// Snapshot of the tool log.
     pub fn tool_log(&self) -> Vec<String> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).tool_log.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .tool_log
+            .clone()
     }
 
     pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
@@ -299,7 +313,11 @@ impl SubagentHandle {
 
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).conversation_state.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .conversation_state
+            .clone()
     }
 
     /// Seconds since this handle was created.
@@ -326,7 +344,10 @@ impl SubagentHandle {
     pub fn cancel(&mut self) {
         // Flag FIRST so finalize_subagent can read it before the thread exits.
         // Use poison-safe write in case the thread panicked holding the lock.
-        self.state.write().unwrap_or_else(|p| p.into_inner()).cancel_requested = true;
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_requested = true;
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -350,13 +371,19 @@ impl SubagentHandle {
     /// Time elapsed since the subagent reached a terminal state.
     /// Returns `None` if still running or if `finished_at` has not been stamped yet.
     pub fn finished_elapsed(&self) -> Option<std::time::Duration> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).finished_at.map(|t| t.elapsed())
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .finished_at
+            .map(|t| t.elapsed())
     }
 
     /// Consume the handle and wait for the final result.
     pub async fn collect(mut self) -> Result<SubagentResult, String> {
         match self.result_rx.take() {
-            Some(rx) => rx.await.map_err(|_| "subagent result channel dropped".to_string()),
+            Some(rx) => rx
+                .await
+                .map_err(|_| "subagent result channel dropped".to_string()),
             None => Err("no result receiver — already collected or never set".to_string()),
         }
     }
@@ -456,14 +483,18 @@ impl SubagentRegistry {
     /// the finalizer path) are deferred — joining a live thread blocks the TUI
     /// loop. They will be reaped on the next cleanup pass once the thread exits.
     pub fn cleanup_finished_with_ttl(&mut self, ttl: std::time::Duration) {
-        let reap_ids: Vec<String> = self.handles.iter()
-            .filter(|(_, h)| h.is_finished()
+        let reap_ids: Vec<String> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| {
+                h.is_finished()
                 // Defer handles whose OS thread is still alive — joining a live
                 // thread would block the TUI event loop. Use map_or (stable 1.80+)
                 // rather than is_none_or (stable 1.82+).
                 && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
                 && (h.is_collected()
-                    || h.finished_elapsed().is_some_and(|d| d >= ttl)))
+                    || h.finished_elapsed().is_some_and(|d| d >= ttl))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in reap_ids {
@@ -521,7 +552,6 @@ impl SubagentStatus {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +570,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (_result_tx, result_rx) = oneshot::channel();
         // Parse numeric id from "sa_N" or use 0 as fallback for tests
-        let numeric_id: u64 = id.strip_prefix("sa_").and_then(|n| n.parse().ok()).unwrap_or(0);
+        let numeric_id: u64 = id
+            .strip_prefix("sa_")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         TestHandle {
             handle: SubagentHandle::new(
                 id.to_string(),
@@ -631,8 +664,17 @@ mod tests {
         let (_shutdown_tx, _) = oneshot::channel::<()>();
         let (_, result_rx) = oneshot::channel();
         let h = SubagentHandle::new(
-            "sa_1".into(), 1, "test".into(), "task".into(),
-            "model".into(), "prompt".into(), 300, state, None, None, Some(result_rx),
+            "sa_1".into(),
+            1,
+            "test".into(),
+            "task".into(),
+            "model".into(),
+            "prompt".into(),
+            300,
+            state,
+            None,
+            None,
+            Some(result_rx),
         );
         assert!(h.steer("msg").is_err());
     }
@@ -689,8 +731,14 @@ mod tests {
 
         reg.cleanup_finished();
 
-        assert!(reg.get("sa_1").is_none(), "collected finished handle must be reaped");
-        assert!(reg.get("sa_2").is_some(), "running handle must survive cleanup");
+        assert!(
+            reg.get("sa_1").is_none(),
+            "collected finished handle must be reaped"
+        );
+        assert!(
+            reg.get("sa_2").is_some(),
+            "running handle must survive cleanup"
+        );
     }
 
     // U1: finished, not collected, fresh → retained within TTL
@@ -702,7 +750,10 @@ mod tests {
 
         reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
 
-        assert!(reg.get("sa_1").is_some(), "finished-uncollected handle within TTL must be retained");
+        assert!(
+            reg.get("sa_1").is_some(),
+            "finished-uncollected handle within TTL must be retained"
+        );
     }
 
     // U2: finished + mark_collected → removed immediately
@@ -715,7 +766,10 @@ mod tests {
 
         reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
 
-        assert!(reg.get("sa_1").is_none(), "finished+collected handle must be reaped");
+        assert!(
+            reg.get("sa_1").is_none(),
+            "finished+collected handle must be reaped"
+        );
     }
 
     // U3: finished, not collected, but TTL=ZERO (expired) → removed
@@ -727,7 +781,10 @@ mod tests {
 
         reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
 
-        assert!(reg.get("sa_1").is_none(), "handle past TTL must be reaped even if uncollected");
+        assert!(
+            reg.get("sa_1").is_none(),
+            "handle past TTL must be reaped even if uncollected"
+        );
     }
 
     // U5-reaper: finished-status handle with a still-sleeping OS thread is deferred;
@@ -767,7 +824,10 @@ mod tests {
 
         // Second cleanup: thread is finished → handle must be reaped
         reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
-        assert!(reg.get("sa_live").is_none(), "handle must be reaped once OS thread exits");
+        assert!(
+            reg.get("sa_live").is_none(),
+            "handle must be reaped once OS thread exits"
+        );
     }
 
     // U4: running handles never touched by any reaper variant
@@ -794,7 +854,10 @@ mod tests {
         assert!(s.tool_log.is_empty());
         assert!(s.conversation_state.is_empty());
         assert!(s.finished_at.is_none());
-        assert!(!s.cancel_requested, "cancel_requested must default to false");
+        assert!(
+            !s.cancel_requested,
+            "cancel_requested must default to false"
+        );
     }
 
     #[test]
@@ -817,7 +880,10 @@ mod tests {
         h.cancel();
         {
             let s = h.state.read().unwrap();
-            assert!(s.cancel_requested, "cancel_requested must be true after cancel()");
+            assert!(
+                s.cancel_requested,
+                "cancel_requested must be true after cancel()"
+            );
         }
         // Second call is a no-op (shutdown_tx already taken)
         h.cancel();
@@ -897,8 +963,10 @@ mod tests {
             reg.register(h);
         }
         super::reap_finished(&registry);
-        assert!(registry.lock().unwrap().get("sa_r1").is_none(),
-            "reap_finished must reap collected+finished handle");
+        assert!(
+            registry.lock().unwrap().get("sa_r1").is_none(),
+            "reap_finished must reap collected+finished handle"
+        );
     }
 
     /// R2: reap_finished retains running handles — must not touch live work.
@@ -910,8 +978,10 @@ mod tests {
             reg.register(make_handle("sa_running"));
         }
         super::reap_finished(&registry);
-        assert!(registry.lock().unwrap().get("sa_running").is_some(),
-            "reap_finished must not touch running handles");
+        assert!(
+            registry.lock().unwrap().get("sa_running").is_some(),
+            "reap_finished must not touch running handles"
+        );
     }
 
     /// R3: reap_finished recovers from a poisoned lock without panicking.
@@ -936,7 +1006,8 @@ mod tests {
         super::reap_finished(&registry);
 
         // The handle must be reaped (cleanup ran despite poison).
-        let result = registry.lock()
+        let result = registry
+            .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get("sa_poison")
             .is_none();
@@ -962,26 +1033,38 @@ mod cancelled_wake_tests {
         {
             let mut s = state.write().unwrap();
             s.status = SubagentStatus::Completed; // thread set Completed before cancel flag noticed
-            s.cancel_requested = true;            // cancel() was called
+            s.cancel_requested = true; // cancel() was called
         }
         let queue = Arc::new(EventQueue::new(100));
 
         finalize_subagent(
             &state,
             Some(&queue),
-            "sa_v3", 42, "test-agent",
+            "sa_v3",
+            42,
+            "test-agent",
             std::time::Instant::now(),
             None,
         );
 
         // Queue must be empty — no wake event for cancelled subagents.
-        assert!(queue.is_empty(), "cancelled subagent must not publish a wake event");
+        assert!(
+            queue.is_empty(),
+            "cancelled subagent must not publish a wake event"
+        );
 
         // Status must have been re-labelled to Cancelled.
         let s = state.read().unwrap();
-        assert_eq!(s.status, SubagentStatus::Cancelled, "status must be Cancelled when cancel_requested");
+        assert_eq!(
+            s.status,
+            SubagentStatus::Cancelled,
+            "status must be Cancelled when cancel_requested"
+        );
 
         // finished_at must be stamped.
-        assert!(s.finished_at.is_some(), "finished_at must be stamped by finalizer");
+        assert!(
+            s.finished_at.is_some(),
+            "finished_at must be stamped by finalizer"
+        );
     }
 }

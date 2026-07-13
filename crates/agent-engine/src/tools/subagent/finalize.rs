@@ -5,10 +5,10 @@
 //! publishes a completion event to the parent runtime's EventQueue so an
 //! idle parent can wake and call `subagent_collect`.
 
-use std::sync::{Arc, RwLock};
-use crate::events::{Event, EventQueue};
 use crate::events::types::{EventContent, EventSource, Severity};
+use crate::events::{Event, EventQueue};
 use crate::runtime::subagent::{SubagentState, SubagentStatus};
+use std::sync::{Arc, RwLock};
 
 /// Kill-switch for rollback: set SYNAPS_DISABLE_SUBAGENT_WAKE=1|true|yes to suppress
 /// completion-event publication (state/reaper changes remain active).
@@ -28,12 +28,12 @@ pub fn build_completion_event(
     subagent_id: u64,
     agent_name: &str,
     status: &SubagentStatus,
-    result_preview: &str,   // caller pre-truncates to ≤300 chars
+    result_preview: &str, // caller pre-truncates to ≤300 chars
     duration_secs: f64,
     resumed_from: Option<&str>,
 ) -> Event {
-    use serde_json::json;
     use chrono::Utc;
+    use serde_json::json;
     use uuid::Uuid;
 
     let status_str = status.as_str();
@@ -133,9 +133,7 @@ pub fn finalize_subagent(
     }
 
     let Some(queue) = parent_queue else {
-        tracing::warn!(
-            "subagent {handle_id}: no parent event_queue — completion wake unavailable"
-        );
+        tracing::warn!("subagent {handle_id}: no parent event_queue — completion wake unavailable");
         return;
     };
 
@@ -150,9 +148,7 @@ pub fn finalize_subagent(
     );
 
     if let Err(e) = queue.push(ev.clone()) {
-        tracing::warn!(
-            "subagent {handle_id}: event queue full ({e}) — forcing priority push"
-        );
+        tracing::warn!("subagent {handle_id}: event queue full ({e}) — forcing priority push");
         queue.push_priority(ev); // control-plane: never dropped
     }
 }
@@ -178,7 +174,9 @@ mod tests {
     #[test]
     fn completion_event_schema() {
         let ev = build_completion_event(
-            "sa_7", 7, "researcher",
+            "sa_7",
+            7,
+            "researcher",
             &SubagentStatus::Completed,
             "analysis done",
             3.5,
@@ -194,7 +192,10 @@ mod tests {
         let text = &ev.content.text;
         assert!(text.contains("sa_7"), "text must contain handle_id");
         assert!(text.contains("completed"), "text must contain status");
-        assert!(text.contains("subagent_collect"), "text must be self-instructing");
+        assert!(
+            text.contains("subagent_collect"),
+            "text must be self-instructing"
+        );
 
         let data = ev.content.data.as_ref().unwrap();
         assert_eq!(data["handle_id"], "sa_7");
@@ -211,7 +212,9 @@ mod tests {
         finalize_subagent(
             &state,
             Some(&queue),
-            "sa_1", 1, "inline",
+            "sa_1",
+            1,
+            "inline",
             std::time::Instant::now(),
             None,
         );
@@ -235,15 +238,23 @@ mod tests {
         use crate::events::types::Severity as Sev;
         let queue = Arc::new(EventQueue::new(2));
         // Pre-fill with 2 Medium events
-        queue.push(Event::simple("x", "m1", Some(Sev::Medium))).unwrap();
-        queue.push(Event::simple("x", "m2", Some(Sev::Medium))).unwrap();
-        assert!(queue.push(Event::simple("x", "m3", Some(Sev::Medium))).is_err());
+        queue
+            .push(Event::simple("x", "m1", Some(Sev::Medium)))
+            .unwrap();
+        queue
+            .push(Event::simple("x", "m2", Some(Sev::Medium)))
+            .unwrap();
+        assert!(queue
+            .push(Event::simple("x", "m3", Some(Sev::Medium)))
+            .is_err());
 
         let state = make_state(SubagentStatus::Completed, "done");
         finalize_subagent(
             &state,
             Some(&queue),
-            "sa_8", 8, "worker",
+            "sa_8",
+            8,
+            "worker",
             std::time::Instant::now(),
             None,
         );
@@ -251,8 +262,10 @@ mod tests {
         // The completion event must be in the queue (priority-pushed to front)
         assert_eq!(queue.len(), 2, "capacity still 2 after eviction");
         let front = queue.pop().unwrap();
-        assert_eq!(front.content.content_type, "subagent_completion",
-            "completion event must be at front after priority push");
+        assert_eq!(
+            front.content.content_type, "subagent_completion",
+            "completion event must be at front after priority push"
+        );
     }
 
     // kill_switch_value_parsing: exhaustive unit test for wake_disabled_value()
@@ -260,19 +273,28 @@ mod tests {
     #[test]
     fn kill_switch_value_parsing() {
         // ON values
-        assert!(wake_disabled_value("1"),      "\"1\" must be recognized");
-        assert!(wake_disabled_value("true"),   "\"true\" must be recognized");
-        assert!(wake_disabled_value("TRUE"),   "\"TRUE\" must be recognized (case-insensitive)");
-        assert!(wake_disabled_value("yes"),    "\"yes\" must be recognized");
-        assert!(wake_disabled_value("Yes"),    "\"Yes\" must be recognized (case-insensitive)");
-        assert!(wake_disabled_value(" 1 "),    "\" 1 \" must be recognized (trimmed)");
+        assert!(wake_disabled_value("1"), "\"1\" must be recognized");
+        assert!(wake_disabled_value("true"), "\"true\" must be recognized");
+        assert!(
+            wake_disabled_value("TRUE"),
+            "\"TRUE\" must be recognized (case-insensitive)"
+        );
+        assert!(wake_disabled_value("yes"), "\"yes\" must be recognized");
+        assert!(
+            wake_disabled_value("Yes"),
+            "\"Yes\" must be recognized (case-insensitive)"
+        );
+        assert!(
+            wake_disabled_value(" 1 "),
+            "\" 1 \" must be recognized (trimmed)"
+        );
         // OFF values
-        assert!(!wake_disabled_value(""),      "empty string must be OFF");
-        assert!(!wake_disabled_value("0"),     "\"0\" must be OFF");
+        assert!(!wake_disabled_value(""), "empty string must be OFF");
+        assert!(!wake_disabled_value("0"), "\"0\" must be OFF");
         assert!(!wake_disabled_value("false"), "\"false\" must be OFF");
-        assert!(!wake_disabled_value("no"),    "\"no\" must be OFF");
-        assert!(!wake_disabled_value("2"),     "\"2\" must be OFF");
-        assert!(!wake_disabled_value("on"),    "\"on\" must be OFF");
+        assert!(!wake_disabled_value("no"), "\"no\" must be OFF");
+        assert!(!wake_disabled_value("2"), "\"2\" must be OFF");
+        assert!(!wake_disabled_value("on"), "\"on\" must be OFF");
     }
 
     // Positive-path: kill-switch OFF → event is published when finalize runs
@@ -285,16 +307,24 @@ mod tests {
         finalize_subagent(
             &state,
             Some(&queue),
-            "sa_9", 9, "silent",
+            "sa_9",
+            9,
+            "silent",
             std::time::Instant::now(),
             None,
         );
 
         // Event should be published (kill-switch is OFF in normal test runs)
-        assert!(!queue.is_empty(), "completion event must be published when kill-switch is off");
+        assert!(
+            !queue.is_empty(),
+            "completion event must be published when kill-switch is off"
+        );
         // And finished_at must be stamped
         let s = state.read().unwrap();
-        assert!(s.finished_at.is_some(), "finished_at must be stamped by finalizer");
+        assert!(
+            s.finished_at.is_some(),
+            "finished_at must be stamped by finalizer"
+        );
     }
 
     // U10 lives in events/format.rs tests (prompt-injection stripping) — see that file.
@@ -302,7 +332,9 @@ mod tests {
     #[test]
     fn preview_in_event_text() {
         let ev = build_completion_event(
-            "sa_10", 10, "analyst",
+            "sa_10",
+            10,
+            "analyst",
             &SubagentStatus::Completed,
             "clean preview text",
             1.0,
@@ -315,7 +347,9 @@ mod tests {
     #[test]
     fn failed_reason_in_event_data_and_text() {
         let ev = build_completion_event(
-            "sa_fail", 11, "bomber",
+            "sa_fail",
+            11,
+            "bomber",
             &SubagentStatus::Failed("boom".to_string()),
             "partial output",
             2.0,
@@ -323,7 +357,10 @@ mod tests {
         );
 
         let data = ev.content.data.as_ref().unwrap();
-        assert_eq!(data["error"], "boom", "data[\"error\"] must contain the failure reason");
+        assert_eq!(
+            data["error"], "boom",
+            "data[\"error\"] must contain the failure reason"
+        );
         assert_eq!(data["status"], "failed");
         assert!(
             ev.content.text.contains("boom"),

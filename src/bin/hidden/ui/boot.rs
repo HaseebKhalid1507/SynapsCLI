@@ -1,6 +1,6 @@
-use ratatui::prelude::*;
-use crate::app::App;
 use super::theme;
+use crate::app::App;
+use ratatui::prelude::*;
 
 const POST_LINES: &[&str] = &[
     "",
@@ -68,31 +68,51 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, &line) in POST_LINES.iter().enumerate().take(lines_to_show) {
         let ay = area.top() + i as u16 + 1;
-        if ay >= area.bottom() { break; }
+        if ay >= area.bottom() {
+            break;
+        }
 
         let color = if line.contains("OK") {
             theme::GREEN
         } else if line.contains("CONNECTION") {
             theme::CYAN
-        } else if line.contains("██") || line.contains("╔╝") || line.contains("═╝") || line.contains("B  L  E  R  S") {
+        } else if line.contains("██")
+            || line.contains("╔╝")
+            || line.contains("═╝")
+            || line.contains("B  L  E  R  S")
+        {
             #[allow(clippy::if_same_then_else)]
             theme::AMBER
-        } else if line.contains("═") || line.contains("║") || line.contains("╔") || line.contains("╚") {
+        } else if line.contains("═")
+            || line.contains("║")
+            || line.contains("╔")
+            || line.contains("╚")
+        {
             theme::AMBER_DIM
         } else if line.contains("────") {
             theme::DARK_GRAY
         } else if line.contains("Press any") {
             // Blink
-            if (app.frame / 30) % 2 == 0 { theme::GREEN } else { theme::BG }
+            if (app.frame / 30) % 2 == 0 {
+                theme::GREEN
+            } else {
+                theme::BG
+            }
         } else if line.contains("uplink") {
             // Animate the dots
             let dots = (elapsed_ms / 200) % 4;
-            let dot_str: String = ".".repeat(dots).chars().chain(std::iter::repeat(' ').take(3 - dots)).collect();
+            let dot_str: String = "."
+                .repeat(dots)
+                .chars()
+                .chain(std::iter::repeat(' ').take(3 - dots))
+                .collect();
             let animated = line.replace("...", &dot_str);
             // Draw manually with animation
             let mut cx = area.left();
             for ch in animated.chars() {
-                if cx >= area.right() { break; }
+                if cx >= area.right() {
+                    break;
+                }
                 buf[(cx, ay)].set_char(ch).set_fg(theme::GRAY);
                 cx += 1;
             }
@@ -104,7 +124,9 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
         // Draw the line
         let mut cx = area.left();
         for ch in line.chars() {
-            if cx >= area.right() { break; }
+            if cx >= area.right() {
+                break;
+            }
             buf[(cx, ay)].set_char(ch).set_fg(color);
             cx += 1;
         }
@@ -136,13 +158,19 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
     let noise_chars = ['░', '▒', '▓', '·', ':', '.', ' ', ' ', ' ', ' '];
     for y in (h.saturating_sub(3))..h {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() { continue; }
+        if ay >= area.bottom() {
+            continue;
+        }
         for x in 0..w {
             let ax = area.left() + x as u16;
-            if ax >= area.right() { continue; }
+            if ax >= area.right() {
+                continue;
+            }
             let cell = &buf[(ax, ay)];
             if cell.symbol() == " " {
-                let seed = (app.frame as usize).wrapping_mul(x + 1).wrapping_add(y * 37);
+                let seed = (app.frame as usize)
+                    .wrapping_mul(x + 1)
+                    .wrapping_add(y * 37);
                 let nch = noise_chars[seed % noise_chars.len()];
                 if nch != ' ' {
                     buf[(ax, ay)].set_char(nch).set_fg(Color::Rgb(20, 20, 25));

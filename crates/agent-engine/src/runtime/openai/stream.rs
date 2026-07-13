@@ -167,8 +167,13 @@ pub(crate) async fn call_codex_stream_inner(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    // Validate the requested level before any credential or network access.
+    use crate::runtime::openai::catalog::validate_codex_level;
+    validate_codex_level(&cfg.model, reasoning_level, None)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     // Every Codex credential, local or remote, crosses the broker boundary:
     // the broker vends an access token + expiry only (refresh tokens are
     // broker-owned), and this path never opens auth.json.
@@ -206,6 +211,15 @@ pub(crate) async fn call_codex_stream_inner(
         "include": ["reasoning.encrypted_content"],
         "text": { "verbosity": "medium" },
     });
+    // Emit exact reasoning.effort for the validated level.
+    // Off/Adaptive: omit the field entirely (model default).
+    use agent_core::reasoning::ReasoningLevel;
+    match reasoning_level {
+        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
+        level => {
+            body["reasoning"] = json!({ "effort": level.as_str() });
+        }
+    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
@@ -280,6 +294,60 @@ pub(crate) async fn call_codex_stream_inner(
         "role": "assistant",
         "content": content,
     }))
+}
+
+/// Pure body construction for Codex Responses-API requests.
+///
+/// Separated from the async function so it can be unit-tested without
+/// any credential access or network I/O.
+///
+/// # Arguments
+/// - : the Codex model id (already validated by the caller)
+/// - : reasoning level (must already be validated against model capability)
+/// - : pre-built input items (from )
+/// - : pre-built instructions string
+/// - : pre-built tool array
+/// - : optional temperature override
+/// - : optional max_output_tokens override
+// used in tests
+pub(crate) fn build_codex_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: serde_json::Value,
+    instructions: String,
+    tools: Vec<serde_json::Value>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> serde_json::Value {
+    use agent_core::reasoning::ReasoningLevel;
+    let mut body = json!({
+        "model": model,
+        "store": false,
+        "stream": true,
+        "instructions": instructions,
+        "input": input,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "include": ["reasoning.encrypted_content"],
+        "text": { "verbosity": "medium" },
+    });
+    // Off/Adaptive: omit reasoning field entirely (model default).
+    match level {
+        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
+        l => {
+            body["reasoning"] = json!({ "effort": l.as_str() });
+        }
+    }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+    }
+    if let Some(temp) = temperature {
+        body["temperature"] = json!(temp);
+    }
+    if let Some(max) = max_tokens {
+        body["max_output_tokens"] = json!(max);
+    }
+    body
 }
 
 const CODEX_AUTONOMOUS_LOOP_POLICY: &str = "\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]";
@@ -1259,5 +1327,254 @@ mod xai_tests {
         let fixture = serde_json::json!({"type":"response.output_text.delta","delta":"hello"});
         assert_eq!(fixture["type"], "response.output_text.delta");
         assert_eq!(fixture["delta"], "hello");
+    }
+}
+
+// ─── Codex wire body tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod codex_wire_tests {
+    use crate::runtime::openai::catalog::{codex_static_capability, validate_codex_level};
+    use agent_core::reasoning::ReasoningLevel;
+
+    /// Validate → emit exact reasoning.effort shape for known levels.
+    fn codex_effort_for(model_id: &str, level: ReasoningLevel) -> Result<String, String> {
+        validate_codex_level(model_id, level, None)?;
+        Ok(level.as_str().to_string())
+    }
+
+    #[test]
+    fn sol_emits_ultra_exact() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::Ultra).unwrap();
+        assert_eq!(effort, "ultra");
+    }
+
+    #[test]
+    fn sol_emits_max_exact() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::Max).unwrap();
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn sol_emits_xhigh_exact() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn luna_emits_max_exact() {
+        let effort = codex_effort_for("gpt-5.6-luna", ReasoningLevel::Max).unwrap();
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn luna_rejects_ultra_before_network() {
+        // Validation must fail before any credential/network access.
+        let err = codex_effort_for("gpt-5.6-luna", ReasoningLevel::Ultra).unwrap_err();
+        assert!(err.contains("ultra"), "{err}");
+        assert!(err.contains("gpt-5.6-luna"), "{err}");
+    }
+
+    #[test]
+    fn gpt55_emits_xhigh_exact() {
+        let effort = codex_effort_for("gpt-5.5", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn gpt55_rejects_max_before_network() {
+        assert!(codex_effort_for("gpt-5.5", ReasoningLevel::Max).is_err());
+        assert!(codex_effort_for("gpt-5.5", ReasoningLevel::Ultra).is_err());
+    }
+
+    #[test]
+    fn off_and_adaptive_omit_reasoning_field() {
+        // Off/Adaptive: build_codex_body must NOT emit a "reasoning" key.
+        use super::build_codex_body;
+        for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
+            let body = build_codex_body(
+                "gpt-5.6-sol",
+                level,
+                serde_json::json!([]),
+                "sys".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            assert!(
+                body.get("reasoning").is_none(),
+                "{level:?} must not emit reasoning field, body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_as_str_is_not_xhigh() {
+        assert_ne!(ReasoningLevel::Max.as_str(), ReasoningLevel::XHigh.as_str());
+        assert_eq!(ReasoningLevel::Max.as_str(), "max");
+    }
+
+    // ── Pure body construction tests (zero network) ──────────────────────────
+
+    #[test]
+    fn body_contains_reasoning_effort_for_ultra() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for Ultra");
+        assert_eq!(effort, "ultra");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_max() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.6-sol",
+            ReasoningLevel::Max,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for Max");
+        assert_eq!(effort, "max");
+        // max must NOT be xhigh (critical invariant)
+        assert_ne!(effort, "xhigh");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_xhigh() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.6-sol",
+            ReasoningLevel::XHigh,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for XHigh");
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_low_medium_high() {
+        use super::build_codex_body;
+        for (level, expected) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+        ] {
+            let body = build_codex_body(
+                "gpt-5.6-sol",
+                level,
+                serde_json::json!([]),
+                "sys".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            let effort = body
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{level:?} must emit reasoning.effort"));
+            assert_eq!(effort, expected, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn body_always_sets_model_and_stream_and_include() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.5",
+            ReasoningLevel::XHigh,
+            serde_json::json!([]),
+            "instructions".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            body.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let includes = body.get("include").expect("include must be present");
+        assert!(
+            includes.as_array().map_or(false, |a| {
+                a.iter()
+                    .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
+            }),
+            "include must contain reasoning.encrypted_content"
+        );
+        assert_eq!(
+            body.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn body_omits_temperature_and_max_tokens_when_none() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.6-sol",
+            ReasoningLevel::Medium,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn body_includes_temperature_and_max_tokens_when_some() {
+        use super::build_codex_body;
+        let body = build_codex_body(
+            "gpt-5.6-sol",
+            ReasoningLevel::High,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            Some(0.7),
+            Some(2048),
+        );
+        let temp = body
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap();
+        assert!((temp - 0.7f64).abs() < 0.01, "temperature={temp}");
+        assert_eq!(
+            body.get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048)
+        );
     }
 }

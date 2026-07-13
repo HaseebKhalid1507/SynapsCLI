@@ -25,10 +25,7 @@ pub const MODELS_PATH: &str = "/models";
 pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     use ReasoningLevel::*;
     let (supported, default_level): (&[ReasoningLevel], ReasoningLevel) = match model_id {
-        "gpt-5.6-sol" | "gpt-5.6-terra" => (
-            &[Low, Medium, High, XHigh, Max, Ultra],
-            High,
-        ),
+        "gpt-5.6-sol" | "gpt-5.6-terra" => (&[Low, Medium, High, XHigh, Max, Ultra], High),
         "gpt-5.6-luna" => (&[Low, Medium, High, XHigh, Max], High),
         "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex-spark" => {
             (&[Low, Medium, High, XHigh], Medium)
@@ -334,14 +331,23 @@ mod tests {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let m = models.iter().find(|m| m.id == "gpt-5.5").unwrap();
         assert!(m.codex_supports_level(ReasoningLevel::XHigh));
-        assert!(!m.codex_supports_level(ReasoningLevel::Max), "gpt-5.5 must NOT support max");
-        assert!(!m.codex_supports_level(ReasoningLevel::Ultra), "gpt-5.5 must NOT support ultra");
+        assert!(
+            !m.codex_supports_level(ReasoningLevel::Max),
+            "gpt-5.5 must NOT support max"
+        );
+        assert!(
+            !m.codex_supports_level(ReasoningLevel::Ultra),
+            "gpt-5.5 must NOT support ultra"
+        );
     }
 
     #[test]
     fn parse_fixture_spark_has_xhigh_not_max_or_ultra() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
-        let spark = models.iter().find(|m| m.id == "gpt-5.3-codex-spark").unwrap();
+        let spark = models
+            .iter()
+            .find(|m| m.id == "gpt-5.3-codex-spark")
+            .unwrap();
         assert!(spark.codex_supports_level(ReasoningLevel::XHigh));
         assert!(!spark.codex_supports_level(ReasoningLevel::Max));
         assert!(!spark.codex_supports_level(ReasoningLevel::Ultra));
@@ -387,7 +393,10 @@ mod tests {
             let cap = codex_static_capability(id).expect(id);
             match cap {
                 ReasoningSupport::CodexNamed { supported, .. } => {
-                    assert!(supported.contains(&ReasoningLevel::Ultra), "{id} needs ultra");
+                    assert!(
+                        supported.contains(&ReasoningLevel::Ultra),
+                        "{id} needs ultra"
+                    );
                     assert!(supported.contains(&ReasoningLevel::Max), "{id} needs max");
                 }
                 _ => panic!("expected CodexNamed for {id}"),
@@ -413,9 +422,18 @@ mod tests {
             let cap = codex_static_capability(id).expect(id);
             match cap {
                 ReasoningSupport::CodexNamed { supported, .. } => {
-                    assert!(supported.contains(&ReasoningLevel::XHigh), "{id} needs xhigh");
-                    assert!(!supported.contains(&ReasoningLevel::Max), "{id} must NOT have max");
-                    assert!(!supported.contains(&ReasoningLevel::Ultra), "{id} must NOT have ultra");
+                    assert!(
+                        supported.contains(&ReasoningLevel::XHigh),
+                        "{id} needs xhigh"
+                    );
+                    assert!(
+                        !supported.contains(&ReasoningLevel::Max),
+                        "{id} must NOT have max"
+                    );
+                    assert!(
+                        !supported.contains(&ReasoningLevel::Ultra),
+                        "{id} must NOT have ultra"
+                    );
                 }
                 _ => panic!(),
             }
@@ -464,8 +482,8 @@ mod tests {
             default_level: Some(ReasoningLevel::Low),
         };
         // Ultra is in the static table but the live model says otherwise.
-        let err = validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, Some(&live))
-            .unwrap_err();
+        let err =
+            validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, Some(&live)).unwrap_err();
         assert!(err.contains("ultra"));
         // Low is accepted.
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Low, Some(&live)).is_ok());

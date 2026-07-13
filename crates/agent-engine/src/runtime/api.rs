@@ -695,6 +695,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
@@ -709,6 +710,7 @@ impl ApiMethods {
             tools,
             system_prompt,
             thinking_budget,
+            reasoning_level,
             messages,
             tx,
             &CancellationToken::new(),
@@ -731,6 +733,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
@@ -840,6 +843,7 @@ impl ApiMethods {
             None,
             None,
             thinking_budget,
+            reasoning_level,
             cancel,
             &options.credential_source,
             &options.token_cache,
@@ -2954,6 +2958,7 @@ mod on401_tests {
             &tools,
             &None, // system prompt
             0,     // thinking_budget
+            agent_core::reasoning::ReasoningLevel::Adaptive,
             &messages,
             tx,
             0, // max_retries (surface errors fast)

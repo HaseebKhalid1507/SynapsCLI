@@ -39,3 +39,55 @@ fn limits_are_reserved_atomically_by_the_central_decision_point() {
     assert_eq!(denied.code, "concurrency_limit");
     assert!(!denied.network_attempted);
 }
+
+// ── Task 4: model-aware reasoning level validation ────────────────────────────
+
+#[cfg(test)]
+mod reasoning_validation {
+    use agent_core::reasoning::ReasoningLevel;
+    use agent_engine::runtime::openai::catalog::{
+        codex_static_capability, validate_codex_level, ReasoningSupport,
+    };
+
+    #[test]
+    fn sol_accepts_ultra_and_max() {
+        assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, None).is_ok());
+        assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Max, None).is_ok());
+        assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::XHigh, None).is_ok());
+    }
+
+    #[test]
+    fn luna_rejects_ultra() {
+        let err = validate_codex_level("gpt-5.6-luna", ReasoningLevel::Ultra, None).unwrap_err();
+        assert!(err.contains("ultra"), "{err}");
+        assert!(err.contains("gpt-5.6-luna"), "{err}");
+    }
+
+    #[test]
+    fn luna_accepts_max() {
+        assert!(validate_codex_level("gpt-5.6-luna", ReasoningLevel::Max, None).is_ok());
+    }
+
+    #[test]
+    fn gpt55_rejects_max_and_ultra() {
+        assert!(validate_codex_level("gpt-5.5", ReasoningLevel::Max, None).is_err());
+        assert!(validate_codex_level("gpt-5.5", ReasoningLevel::Ultra, None).is_err());
+        assert!(validate_codex_level("gpt-5.4", ReasoningLevel::Max, None).is_err());
+        assert!(validate_codex_level("gpt-5.4-mini", ReasoningLevel::Max, None).is_err());
+        assert!(validate_codex_level("gpt-5.3-codex-spark", ReasoningLevel::Max, None).is_err());
+    }
+
+    #[test]
+    fn gpt55_accepts_xhigh() {
+        assert!(validate_codex_level("gpt-5.5", ReasoningLevel::XHigh, None).is_ok());
+        assert!(validate_codex_level("gpt-5.4", ReasoningLevel::XHigh, None).is_ok());
+    }
+
+    #[test]
+    fn non_codex_model_has_no_capability_table() {
+        // Providers without authoritative metadata must not gain max/ultra
+        assert!(codex_static_capability("anthropic/claude-opus-4-7").is_none());
+        assert!(codex_static_capability("groq/llama-3.3-70b").is_none());
+        assert!(codex_static_capability("gpt-4o").is_none());
+    }
+}

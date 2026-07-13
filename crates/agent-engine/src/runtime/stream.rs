@@ -34,6 +34,7 @@ pub(super) struct StreamSession {
     pub(super) tools: Arc<RwLock<ToolRegistry>>,
     pub(super) system_prompt: Option<String>,
     pub(super) thinking_budget: u32,
+    pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
 
     // Channels
     pub(super) tx: mpsc::UnboundedSender<StreamEvent>,
@@ -89,6 +90,7 @@ impl StreamMethods {
             tools,
             system_prompt,
             thinking_budget,
+            reasoning_level: _reasoning_level,
             tx,
             cancel,
             mut steering_rx,
@@ -188,6 +190,7 @@ impl StreamMethods {
                 &tools_snapshot,
                 &injected_system,
                 thinking_budget,
+                session.reasoning_level,
                 &messages,
                 tx.clone(),
                 &cancel,

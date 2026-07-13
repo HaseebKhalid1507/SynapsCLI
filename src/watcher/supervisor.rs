@@ -1,8 +1,13 @@
 use super::*;
 
 /// Drop a completion event into ~/.synaps-cli/inbox/ for the event bus.
-pub(crate) fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
-    use synaps_cli::events::types::{Event, EventSource, EventContent, Severity};
+pub(crate) fn notify_inbox_completion(
+    agent_name: &str,
+    session_count: u64,
+    elapsed_secs: f64,
+    exit_code: i32,
+) {
+    use synaps_cli::events::types::{Event, EventContent, EventSource, Severity};
 
     let event = Event {
         id: uuid::Uuid::new_v4().to_string(),
@@ -15,9 +20,16 @@ pub(crate) fn notify_inbox_completion(agent_name: &str, session_count: u64, elap
         channel: None,
         sender: None,
         content: EventContent {
-            text: format!("Agent '{}' completed session #{} ({:.0}s, exit {})", agent_name, session_count, elapsed_secs, exit_code),
+            text: format!(
+                "Agent '{}' completed session #{} ({:.0}s, exit {})",
+                agent_name, session_count, elapsed_secs, exit_code
+            ),
             content_type: "agent_complete".to_string(),
-            severity: if exit_code == 0 { Some(Severity::Medium) } else { Some(Severity::High) },
+            severity: if exit_code == 0 {
+                Some(Severity::Medium)
+            } else {
+                Some(Severity::High)
+            },
             data: Some(serde_json::json!({
                 "agent": agent_name,
                 "session": session_count,
@@ -31,22 +43,39 @@ pub(crate) fn notify_inbox_completion(agent_name: &str, session_count: u64, elap
 
     let inbox_dir = synaps_cli::config::base_dir().join("inbox");
     let _ = std::fs::create_dir_all(&inbox_dir);
-    let filename = format!("watcher-{}-{}.json", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let filename = format!(
+        "watcher-{}-{}.json",
+        agent_name,
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
     let path = inbox_dir.join(&filename);
     if let Ok(body) = serde_json::to_string_pretty(&event) {
         let _ = std::fs::write(&path, body);
-        log(&format!("[{}] completion event dropped to inbox", agent_name));
+        log(&format!(
+            "[{}] completion event dropped to inbox",
+            agent_name
+        ));
     }
 }
 
 /// Spawn an agent worker process
-pub(crate) async fn spawn_agent(agent: &mut ManagedAgent, trigger_context: &str) -> Result<(), String> {
+pub(crate) async fn spawn_agent(
+    agent: &mut ManagedAgent,
+    trigger_context: &str,
+) -> Result<(), String> {
     let bin = agent_binary();
     if !bin.exists() {
-        return Err(format!("synaps-agent binary not found at {}", bin.display()));
+        return Err(format!(
+            "synaps-agent binary not found at {}",
+            bin.display()
+        ));
     }
 
-    log(&format!("[{}] spawning session #{}", agent.name, agent.session_count + 1));
+    log(&format!(
+        "[{}] spawning session #{}",
+        agent.name,
+        agent.session_count + 1
+    ));
 
     let child = tokio::process::Command::new(&bin)
         .arg("agent")
@@ -128,27 +157,41 @@ pub(crate) fn spawn_watch_task(
 
     tokio::spawn(async move {
         // Validate paths
-        let watch_paths: Vec<PathBuf> = trigger_config.paths.iter()
+        let watch_paths: Vec<PathBuf> = trigger_config
+            .paths
+            .iter()
             .map(|p| expand_watch_path(p))
             .collect();
 
         if watch_paths.is_empty() {
-            log(&format!("[{}] watch trigger has no paths configured — skipping", agent_name));
+            log(&format!(
+                "[{}] watch trigger has no paths configured — skipping",
+                agent_name
+            ));
             return;
         }
 
         // Validate that paths exist
         for p in &watch_paths {
             if !p.exists() {
-                log(&format!("[{}] creating watched directory: {}", agent_name, p.display()));
+                log(&format!(
+                    "[{}] creating watched directory: {}",
+                    agent_name,
+                    p.display()
+                ));
                 let _ = std::fs::create_dir_all(p);
             }
         }
 
-        log(&format!("[{}] watching {} path(s): {}",
+        log(&format!(
+            "[{}] watching {} path(s): {}",
             agent_name,
             watch_paths.len(),
-            watch_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            watch_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
 
         let patterns = trigger_config.patterns.clone();
@@ -158,22 +201,28 @@ pub(crate) fn spawn_watch_task(
         while running.load(std::sync::atomic::Ordering::Relaxed) {
             // Set up notify watcher with a crossbeam channel
             let (tx, rx) = std::sync::mpsc::channel();
-            let mut notify_watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
-                tx,
-                notify::Config::default(),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    log(&format!("[{}] failed to create file watcher: {}", agent_name, e));
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    continue;
-                }
-            };
+            let mut notify_watcher: notify::RecommendedWatcher =
+                match notify::RecommendedWatcher::new(tx, notify::Config::default()) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log(&format!(
+                            "[{}] failed to create file watcher: {}",
+                            agent_name, e
+                        ));
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+                };
 
             // Watch all configured paths
             for path in &watch_paths {
                 if let Err(e) = notify_watcher.watch(path, notify::RecursiveMode::Recursive) {
-                    log(&format!("[{}] failed to watch {}: {}", agent_name, path.display(), e));
+                    log(&format!(
+                        "[{}] failed to watch {}: {}",
+                        agent_name,
+                        path.display(),
+                        e
+                    ));
                 }
             }
 
@@ -230,7 +279,9 @@ pub(crate) fn spawn_watch_task(
 
                     changed
                 }
-            }).await.unwrap_or_default();
+            })
+            .await
+            .unwrap_or_default();
 
             // Drop the watcher to release inotify watches while agent runs
             drop(notify_watcher);
@@ -240,23 +291,34 @@ pub(crate) fn spawn_watch_task(
             }
 
             // Build trigger context with changed file paths
-            let paths_str: Vec<String> = changed_paths.iter()
+            let paths_str: Vec<String> = changed_paths
+                .iter()
                 .map(|p| p.display().to_string())
                 .collect();
             let trigger_context = format!("files changed:\n{}", paths_str.join("\n"));
 
-            log(&format!("[{}] triggered by {} file(s)", agent_name, paths_str.len()));
+            log(&format!(
+                "[{}] triggered by {} file(s)",
+                agent_name,
+                paths_str.len()
+            ));
 
             // Spawn the agent
             {
                 let mut agents_map = agents.lock().await;
                 if let Some(agent) = agents_map.get_mut(&agent_name) {
                     if agent.stopped {
-                        log(&format!("[{}] agent is stopped — ignoring trigger", agent_name));
+                        log(&format!(
+                            "[{}] agent is stopped — ignoring trigger",
+                            agent_name
+                        ));
                         continue;
                     }
                     if agent.is_running() {
-                        log(&format!("[{}] agent already running — ignoring trigger", agent_name));
+                        log(&format!(
+                            "[{}] agent already running — ignoring trigger",
+                            agent_name
+                        ));
                         continue;
                     }
                     if let Err(e) = spawn_agent(agent, &trigger_context).await {
@@ -269,26 +331,42 @@ pub(crate) fn spawn_watch_task(
             // Wait for agent to finish before watching again
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                if !running.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
 
                 let mut agents_map = agents.lock().await;
                 if let Some(agent) = agents_map.get_mut(&agent_name) {
                     if let Some(ref mut child) = agent.child {
                         match child.try_wait() {
                             Ok(Some(status)) => {
-                                let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                                let elapsed = agent
+                                    .last_start
+                                    .map(|s| s.elapsed().as_secs_f64())
+                                    .unwrap_or(0.0);
                                 agent.total_uptime_secs += elapsed;
                                 let code = status.code().unwrap_or(-1);
 
                                 if code == 0 {
-                                    log(&format!("[{}] session #{} completed cleanly ({:.0}s)", agent_name, agent.session_count, elapsed));
+                                    log(&format!(
+                                        "[{}] session #{} completed cleanly ({:.0}s)",
+                                        agent_name, agent.session_count, elapsed
+                                    ));
                                     agent.consecutive_crashes = 0;
                                     if agent.config.hooks.notify_inbox {
-                                        notify_inbox_completion(&agent_name, agent.session_count, elapsed, code);
+                                        notify_inbox_completion(
+                                            &agent_name,
+                                            agent.session_count,
+                                            elapsed,
+                                            code,
+                                        );
                                     }
                                 } else {
                                     agent.consecutive_crashes += 1;
-                                    log(&format!("[{}] session #{} crashed (code: {})", agent_name, agent.session_count, code));
+                                    log(&format!(
+                                        "[{}] session #{} crashed (code: {})",
+                                        agent_name, agent.session_count, code
+                                    ));
                                 }
 
                                 agent.child = None;
@@ -311,7 +389,8 @@ pub(crate) fn spawn_watch_task(
             // Small cooldown before re-watching
             let cooldown = {
                 let agents_map = agents.lock().await;
-                agents_map.get(&agent_name)
+                agents_map
+                    .get(&agent_name)
                     .map(|a| a.config.limits.cooldown_secs)
                     .unwrap_or(5)
             };
@@ -373,7 +452,10 @@ pub(crate) async fn run_supervisor() {
         for (name, config_path) in discover_agents() {
             match AgentConfig::load(&config_path) {
                 Ok(config) => {
-                    log(&format!("loaded agent: {} (trigger: {})", name, config.agent.trigger));
+                    log(&format!(
+                        "loaded agent: {} (trigger: {})",
+                        name, config.agent.trigger
+                    ));
                     agents_map.insert(name.clone(), ManagedAgent::new(name, config_path, config));
                 }
                 Err(e) => {
@@ -398,9 +480,8 @@ pub(crate) async fn run_supervisor() {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = running.clone();
     tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate()
-        ).expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = sigterm.recv() => {},
@@ -440,28 +521,46 @@ pub(crate) async fn run_supervisor() {
         {
             let mut agents_map = agents.lock().await;
             for (name, agent) in agents_map.iter_mut() {
-                if agent.stopped { continue; }
+                if agent.stopped {
+                    continue;
+                }
 
                 if let Some(ref mut child) = agent.child {
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                            let elapsed = agent
+                                .last_start
+                                .map(|s| s.elapsed().as_secs_f64())
+                                .unwrap_or(0.0);
                             agent.total_uptime_secs += elapsed;
                             let code = status.code().unwrap_or(-1);
 
                             if code == 0 {
-                                log(&format!("[{}] session #{} completed cleanly ({:.0}s)", name, agent.session_count, elapsed));
+                                log(&format!(
+                                    "[{}] session #{} completed cleanly ({:.0}s)",
+                                    name, agent.session_count, elapsed
+                                ));
                                 agent.consecutive_crashes = 0;
                                 if agent.config.hooks.notify_inbox {
-                                    notify_inbox_completion(&name, agent.session_count, elapsed, code);
+                                    notify_inbox_completion(
+                                        &name,
+                                        agent.session_count,
+                                        elapsed,
+                                        code,
+                                    );
                                 }
                             } else if code == 2 {
-                                log(&format!("[{}] daily cost limit reached — pausing until midnight", name));
+                                log(&format!(
+                                    "[{}] daily cost limit reached — pausing until midnight",
+                                    name
+                                ));
                                 agent.stopped = true;
                             } else {
                                 agent.consecutive_crashes += 1;
-                                log(&format!("[{}] session #{} crashed (code: {}, consecutive: {})",
-                                    name, agent.session_count, code, agent.consecutive_crashes));
+                                log(&format!(
+                                    "[{}] session #{} crashed (code: {}, consecutive: {})",
+                                    name, agent.session_count, code, agent.consecutive_crashes
+                                ));
                             }
 
                             agent.child = None;
@@ -469,12 +568,16 @@ pub(crate) async fn run_supervisor() {
 
                             if agent.config.agent.trigger == "always" {
                                 if agent.consecutive_crashes >= agent.config.limits.max_retries {
-                                    log(&format!("[{}] max retries ({}) exceeded — stopping", name, agent.config.limits.max_retries));
+                                    log(&format!(
+                                        "[{}] max retries ({}) exceeded — stopping",
+                                        name, agent.config.limits.max_retries
+                                    ));
                                     agent.stopped = true;
                                 } else {
                                     let backoff = if agent.consecutive_crashes > 0 {
                                         let base = agent.config.limits.cooldown_secs;
-                                        let factor = 2u64.pow(agent.consecutive_crashes.saturating_sub(1));
+                                        let factor =
+                                            2u64.pow(agent.consecutive_crashes.saturating_sub(1));
                                         (base * factor).min(300)
                                     } else {
                                         agent.config.limits.cooldown_secs
@@ -488,13 +591,20 @@ pub(crate) async fn run_supervisor() {
                                     tokio::spawn(async move {
                                         tokio::time::sleep(Duration::from_secs(backoff)).await;
 
-                                        if running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                        if running_clone.load(std::sync::atomic::Ordering::Relaxed)
+                                        {
                                             let mut agents_map = agents_clone.lock().await;
                                             if let Some(agent) = agents_map.get_mut(&agent_name) {
-                                                let ctx = if code == 0 { "automatic restart (always-on)" }
-                                                          else { "crash recovery restart" };
+                                                let ctx = if code == 0 {
+                                                    "automatic restart (always-on)"
+                                                } else {
+                                                    "crash recovery restart"
+                                                };
                                                 if let Err(e) = spawn_agent(agent, ctx).await {
-                                                    log(&format!("[{}] failed to restart: {}", agent_name, e));
+                                                    log(&format!(
+                                                        "[{}] failed to restart: {}",
+                                                        agent_name, e
+                                                    ));
                                                 }
                                             }
                                         }
@@ -524,7 +634,9 @@ pub(crate) async fn run_supervisor() {
                                         &agent_name,
                                         fresh,
                                         details,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         tracing::debug!(
                                             target: "watcher::bridge",
                                             agent = %agent_name,
@@ -578,14 +690,19 @@ pub(crate) async fn run_supervisor() {
 pub(crate) fn init_agent(name: &str) -> Result<(), String> {
     // Validate agent name
     validate_agent_name(name)?;
-    
+
     let dir = watcher_dir().join(name);
     if dir.exists() {
-        return Err(format!("Agent '{}' already exists at {}", name, dir.display()));
+        return Err(format!(
+            "Agent '{}' already exists at {}",
+            name,
+            dir.display()
+        ));
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
 
-    let config = format!(r#"[agent]
+    let config = format!(
+        r#"[agent]
 name = "{name}"
 model = "claude-sonnet-4-20250514"
 thinking = "medium"
@@ -615,7 +732,8 @@ Review your state, decide what to do, and get to work. When done, call watcher_e
 [heartbeat]
 interval_secs = 30
 stale_threshold_secs = 120
-"#);
+"#
+    );
 
     let soul = format!("# {name}\n\nYou are {name}, an autonomous agent.\n\nDescribe your purpose and personality here.\n");
 

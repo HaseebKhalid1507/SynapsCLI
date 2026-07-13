@@ -1,4 +1,4 @@
-use crate::games::blackjack::{Card, Rank, Deck};
+use crate::games::blackjack::{Card, Deck, Rank};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BaccaratPhase {
@@ -142,16 +142,20 @@ impl BaccaratGame {
             }
             (BaccaratBet::Tie, BaccaratOutcome::Tie) => (self.bet * 8) as i64, // 8:1
             // Tie returns bet for player/banker bets
-            (BaccaratBet::Player, BaccaratOutcome::Tie) |
-            (BaccaratBet::Banker, BaccaratOutcome::Tie) => 0,
+            (BaccaratBet::Player, BaccaratOutcome::Tie)
+            | (BaccaratBet::Banker, BaccaratOutcome::Tie) => 0,
             _ => -(self.bet as i64),
         };
 
         self.phase = BaccaratPhase::Result;
     }
 
-    pub fn player_total(&self) -> u8 { hand_total(&self.player_hand) }
-    pub fn banker_total(&self) -> u8 { hand_total(&self.banker_hand) }
+    pub fn player_total(&self) -> u8 {
+        hand_total(&self.player_hand)
+    }
+    pub fn banker_total(&self) -> u8 {
+        hand_total(&self.banker_hand)
+    }
 
     pub fn new_hand(&mut self) {
         self.phase = BaccaratPhase::Betting;

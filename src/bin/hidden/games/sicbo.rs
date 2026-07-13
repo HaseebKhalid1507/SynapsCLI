@@ -9,13 +9,13 @@ pub enum SicBoPhase {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SicBoBet {
-    Big,           // Total 11-17 (not triple), pays 1:1
-    Small,         // Total 4-10 (not triple), pays 1:1
-    Odd,           // Total is odd, pays 1:1
-    Even,          // Total is even, pays 1:1
-    Triple(u8),    // Specific triple (e.g., 1-1-1), pays 150:1
-    AnyTriple,     // Any triple, pays 24:1
-    Total(u8),     // Specific total (4-17), variable payout
+    Big,        // Total 11-17 (not triple), pays 1:1
+    Small,      // Total 4-10 (not triple), pays 1:1
+    Odd,        // Total is odd, pays 1:1
+    Even,       // Total is even, pays 1:1
+    Triple(u8), // Specific triple (e.g., 1-1-1), pays 150:1
+    AnyTriple,  // Any triple, pays 24:1
+    Total(u8),  // Specific total (4-17), variable payout
 }
 
 impl SicBoBet {
@@ -67,8 +67,10 @@ impl SicBoBet {
 }
 
 pub const BET_OPTIONS: &[SicBoBet] = &[
-    SicBoBet::Big, SicBoBet::Small,
-    SicBoBet::Odd, SicBoBet::Even,
+    SicBoBet::Big,
+    SicBoBet::Small,
+    SicBoBet::Odd,
+    SicBoBet::Even,
     SicBoBet::AnyTriple,
 ];
 
@@ -106,7 +108,11 @@ impl SicBoGame {
 
     pub fn roll(&mut self) {
         let mut rng = rand::rng();
-        self.dice = [rng.random_range(1..=6), rng.random_range(1..=6), rng.random_range(1..=6)];
+        self.dice = [
+            rng.random_range(1..=6),
+            rng.random_range(1..=6),
+            rng.random_range(1..=6),
+        ];
         self.phase = SicBoPhase::Rolling;
         self.phase_timer = 0;
     }
@@ -115,10 +121,22 @@ impl SicBoGame {
         self.phase_timer += 1;
         let mut rng = rand::rng();
 
-        let speed = if self.phase_timer < 20 { 2 } else if self.phase_timer < 40 { 4 } else if self.phase_timer < 55 { 8 } else { 0 };
+        let speed = if self.phase_timer < 20 {
+            2
+        } else if self.phase_timer < 40 {
+            4
+        } else if self.phase_timer < 55 {
+            8
+        } else {
+            0
+        };
 
         if speed > 0 && self.phase_timer % speed == 0 {
-            self.rolling_display = [rng.random_range(1..=6), rng.random_range(1..=6), rng.random_range(1..=6)];
+            self.rolling_display = [
+                rng.random_range(1..=6),
+                rng.random_range(1..=6),
+                rng.random_range(1..=6),
+            ];
         }
 
         if self.phase_timer >= 55 {

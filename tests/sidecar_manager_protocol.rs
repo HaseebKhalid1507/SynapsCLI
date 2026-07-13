@@ -14,7 +14,11 @@ fn locate_sidecar() -> PathBuf {
 #[tokio::test]
 async fn manager_drives_sidecar_insert_text_end_to_end() {
     let bin = locate_sidecar();
-    assert!(bin.is_file(), "mock sidecar fixture missing at {}", bin.display());
+    assert!(
+        bin.is_file(),
+        "mock sidecar fixture missing at {}",
+        bin.display()
+    );
 
     let mut manager = SidecarManager::spawn(
         &bin,

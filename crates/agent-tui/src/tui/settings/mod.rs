@@ -34,6 +34,33 @@ const BUILTIN_THEMES: &[&str] = &[
     "lavender",
 ];
 
+/// Compute the thinking level options for `model_runtime_id`.
+///
+/// For `openai-codex/<id>` models: return exact supported levels from the
+/// static capability table (or live catalog if provided).
+/// For all other providers: return the conservative legacy set.
+/// Providers without authoritative metadata NEVER gain max/ultra.
+pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
+    // Check if this is a Codex model by provider-qualified prefix only — no substring inference.
+    if let Some(model_id) = model.strip_prefix("openai-codex/") {
+        if let Some(agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
+            supported,
+            ..
+        }) = agent_engine::runtime::openai::catalog::codex_static_capability(model_id)
+        {
+            return supported.iter().map(|l| l.as_str().to_string()).collect();
+        }
+    }
+    // Legacy conservative set for all non-Codex providers.
+    vec![
+        "low".to_string(),
+        "medium".to_string(),
+        "high".to_string(),
+        "xhigh".to_string(),
+        "adaptive".to_string(),
+    ]
+}
+
 pub(crate) fn theme_options() -> Vec<String> {
     let mut opts: Vec<String> = BUILTIN_THEMES.iter().map(|s| s.to_string()).collect();
     if let Some(home) = std::env::var_os("HOME") {
@@ -94,6 +121,10 @@ pub(crate) struct RuntimeSnapshot {
     /// to hide the legacy global `Sidecar` page when a plugin has staked a
     /// claim with a `settings_category`.
     pub lifecycle_claims: Vec<synaps_cli::skills::registry::LifecycleClaim>,
+    /// Dynamic thinking level options for the active model.
+    /// For Codex models: the exact ordered supported levels from the catalog.
+    /// For all other models: the conservative legacy set.
+    pub thinking_options: Vec<String>,
 }
 
 impl RuntimeSnapshot {
@@ -161,6 +192,7 @@ impl RuntimeSnapshot {
             model_health,
             plugin_categories: registry.plugin_settings_categories(),
             lifecycle_claims: registry.lifecycle_claims(),
+            thinking_options: thinking_options_for_model(runtime.model()),
         }
     }
 }
@@ -362,6 +394,13 @@ mod wireup_tests {
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: claims,
+            thinking_options: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "adaptive".into(),
+            ],
         }
     }
 
@@ -452,5 +491,80 @@ mod wireup_tests {
                 "built-in category at idx {idx} mapped to the wrong settings"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod thinking_options_tests {
+    use super::thinking_options_for_model;
+
+    #[test]
+    fn sol_includes_ultra_and_max() {
+        let opts = thinking_options_for_model("openai-codex/gpt-5.6-sol");
+        assert!(
+            opts.contains(&"ultra".to_string()),
+            "sol must include ultra"
+        );
+        assert!(opts.contains(&"max".to_string()), "sol must include max");
+    }
+
+    #[test]
+    fn luna_includes_max_not_ultra() {
+        let opts = thinking_options_for_model("openai-codex/gpt-5.6-luna");
+        assert!(opts.contains(&"max".to_string()));
+        assert!(
+            !opts.contains(&"ultra".to_string()),
+            "luna must not include ultra"
+        );
+    }
+
+    #[test]
+    fn gpt55_does_not_include_max_or_ultra() {
+        for model in [
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.4",
+            "openai-codex/gpt-5.4-mini",
+            "openai-codex/gpt-5.3-codex-spark",
+        ] {
+            let opts = thinking_options_for_model(model);
+            assert!(
+                !opts.contains(&"max".to_string()),
+                "{model} must not include max"
+            );
+            assert!(
+                !opts.contains(&"ultra".to_string()),
+                "{model} must not include ultra"
+            );
+            assert!(
+                opts.contains(&"xhigh".to_string()),
+                "{model} must include xhigh"
+            );
+        }
+    }
+
+    #[test]
+    fn non_codex_provider_uses_conservative_set() {
+        for model in [
+            "claude-opus-4-7",
+            "groq/llama-3.3-70b",
+            "xai-auth/grok-3-mini",
+        ] {
+            let opts = thinking_options_for_model(model);
+            assert!(
+                !opts.contains(&"max".to_string()),
+                "{model} must not gain max"
+            );
+            assert!(
+                !opts.contains(&"ultra".to_string()),
+                "{model} must not gain ultra"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codex_model_uses_conservative_set() {
+        let opts = thinking_options_for_model("openai-codex/gpt-future-unknown");
+        assert!(!opts.contains(&"max".to_string()));
+        assert!(!opts.contains(&"ultra".to_string()));
     }
 }

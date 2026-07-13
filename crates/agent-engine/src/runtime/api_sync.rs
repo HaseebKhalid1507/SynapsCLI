@@ -40,6 +40,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
         max_retries: u32,
         options: &ApiOptions,
@@ -57,6 +58,7 @@ impl ApiMethods {
             None,
             None,
             thinking_budget,
+            reasoning_level,
             &tokio_util::sync::CancellationToken::new(),
             &options.credential_source,
             &options.token_cache,
@@ -302,6 +304,7 @@ impl ApiMethods {
         model: &str,
         system_prompt: &str,
         thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
         max_retries: u32,
     ) -> Result<String> {
@@ -318,6 +321,7 @@ impl ApiMethods {
             None,
             None,
             thinking_budget,
+            reasoning_level,
             &tokio_util::sync::CancellationToken::new(),
             // call_api_simple is an internal helper without ApiOptions; codex here
             // uses the Local credential. (Broker-routed codex goes via the stream path.)

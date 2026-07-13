@@ -81,7 +81,12 @@ impl ChatChild {
         // stdout is piped but we don't need to read it in these tests
         drop(child.stdout.take());
 
-        Ok(Self { child, stdin, stderr, _home: home })
+        Ok(Self {
+            child,
+            stdin,
+            stderr,
+            _home: home,
+        })
     }
 
     /// Read lines from stderr until `predicate` is satisfied or timeout.
@@ -97,10 +102,7 @@ impl ChatChild {
                 anyhow::bail!("timeout waiting for expected stderr line");
             }
             let mut line = String::new();
-            let n = tokio::time::timeout(
-                remaining,
-                self.stderr.read_line(&mut line),
-            ).await??;
+            let n = tokio::time::timeout(remaining, self.stderr.read_line(&mut line)).await??;
             if n == 0 {
                 anyhow::bail!("stderr closed before expected line appeared");
             }
@@ -134,7 +136,9 @@ async fn piped_status_then_quit() -> anyhow::Result<()> {
     let mut child = ChatChild::spawn(|_| {}).await?;
 
     // Wait for the banner so the process is ready to accept commands.
-    child.wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15)).await?;
+    child
+        .wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15))
+        .await?;
 
     // Send commands
     child.send("/status\n/quit\n").await?;
@@ -143,13 +147,22 @@ async fn piped_status_then_quit() -> anyhow::Result<()> {
     child
         .wait_stderr_line(|l| l.contains("model:"), Duration::from_secs(5))
         .await
-        .map_err(|_| anyhow::anyhow!("did not see 'model:' in stderr after /status — async stdin may be broken"))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "did not see 'model:' in stderr after /status — async stdin may be broken"
+            )
+        })?;
 
     // Must exit cleanly (code 0 or 1; just not hang)
-    let status = child.wait_exit(Duration::from_secs(5)).await
+    let status = child
+        .wait_exit(Duration::from_secs(5))
+        .await
         .map_err(|_| anyhow::anyhow!("/quit did not produce clean exit — process hung"))?;
     // exit code is 0 (clean) or any non-signal exit
-    assert!(status.code().is_some(), "process was killed by signal rather than exiting");
+    assert!(
+        status.code().is_some(),
+        "process was killed by signal rather than exiting"
+    );
 
     Ok(())
 }
@@ -181,7 +194,9 @@ async fn eof_exits_cleanly() -> anyhow::Result<()> {
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("process hung on EOF stdin — async stdin EOF handling broken"))??;
+    .map_err(|_| {
+        anyhow::anyhow!("process hung on EOF stdin — async stdin EOF handling broken")
+    })??;
 
     assert!(
         output.status.code().is_some(),
@@ -196,7 +211,9 @@ async fn eof_exits_cleanly() -> anyhow::Result<()> {
 #[tokio::test]
 async fn crlf_trimmed_correctly() -> anyhow::Result<()> {
     let mut child = ChatChild::spawn(|_| {}).await?;
-    child.wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15)).await?;
+    child
+        .wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15))
+        .await?;
 
     child.send("/status\r\n/quit\r\n").await?;
 
@@ -205,7 +222,9 @@ async fn crlf_trimmed_correctly() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("CRLF not trimmed — /status not executed"))?;
 
-    let status = child.wait_exit(Duration::from_secs(5)).await
+    let status = child
+        .wait_exit(Duration::from_secs(5))
+        .await
         .map_err(|_| anyhow::anyhow!("process hung after CRLF /quit"))?;
     assert!(status.code().is_some());
 
@@ -221,7 +240,7 @@ mod continuation_policy {
     use agent_engine::engine::reactor::{
         drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP,
     };
-    use agent_engine::events::{EventQueue, types::Severity};
+    use agent_engine::events::{types::Severity, EventQueue};
     use std::sync::Arc;
 
     fn user_msg(text: &str) -> agent_engine::SharedMessage {
@@ -233,8 +252,11 @@ mod continuation_policy {
     fn run_turn_under_cap() {
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "completion", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "completion",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("hello")];
         let mut pending: Vec<String> = Vec::new();
 
@@ -248,8 +270,11 @@ mod continuation_policy {
     fn parks_at_cap() {
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "completion", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "completion",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("hello")];
         let mut pending: Vec<String> = Vec::new();
 
@@ -265,8 +290,11 @@ mod continuation_policy {
         // After reset, first auto-turn fires again.
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "new-event", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "new-event",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("new user message after reset")];
         let mut pending: Vec<String> = Vec::new();
 

@@ -1,15 +1,15 @@
-use std::time::Duration;
-use crossterm::event::KeyEvent;
-use crate::save::SaveData;
+use crate::games::baccarat::{BaccaratBet, BaccaratGame, BaccaratPhase};
 use crate::games::blackjack::{BlackjackGame, GamePhase, Outcome};
-use crate::games::slots::{SlotsGame, SlotsPhase};
-use crate::games::roulette::{RouletteGame, RoulettePhase, BET_OPTIONS as ROULETTE_BETS};
-use crate::games::war::{WarGame, WarPhase};
-use crate::games::baccarat::{BaccaratGame, BaccaratPhase, BaccaratBet};
-use crate::games::video_poker::{VideoPokerGame, VideoPokerPhase};
+use crate::games::craps::{CrapsBet, CrapsGame, CrapsPhase};
 use crate::games::keno::{KenoGame, KenoPhase};
+use crate::games::roulette::{RouletteGame, RoulettePhase, BET_OPTIONS as ROULETTE_BETS};
 use crate::games::sicbo::{SicBoGame, SicBoPhase, BET_OPTIONS as SICBO_BETS};
-use crate::games::craps::{CrapsGame, CrapsPhase, CrapsBet};
+use crate::games::slots::{SlotsGame, SlotsPhase};
+use crate::games::video_poker::{VideoPokerGame, VideoPokerPhase};
+use crate::games::war::{WarGame, WarPhase};
+use crate::save::SaveData;
+use crossterm::event::KeyEvent;
+use std::time::Duration;
 
 /// All possible screens in the game.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,8 +92,10 @@ impl App {
             match &self.blackjack.phase {
                 GamePhase::Dealing => {
                     // Animate card dealing — reveal one card every 15 frames
-                    let target = self.blackjack.player_hand.len() + self.blackjack.dealer_hand.len();
-                    self.blackjack.visible_cards = (self.blackjack.phase_timer as usize / 15).min(target);
+                    let target =
+                        self.blackjack.player_hand.len() + self.blackjack.dealer_hand.len();
+                    self.blackjack.visible_cards =
+                        (self.blackjack.phase_timer as usize / 15).min(target);
                     if self.blackjack.visible_cards >= target {
                         self.blackjack.after_deal();
                     }
@@ -510,7 +512,10 @@ impl App {
         self.save.games_played += 1;
 
         // Check for blackjack
-        if matches!(self.blackjack.phase, GamePhase::Result(Outcome::PlayerBlackjack)) {
+        if matches!(
+            self.blackjack.phase,
+            GamePhase::Result(Outcome::PlayerBlackjack)
+        ) {
             self.save.blackjack.blackjacks += 1;
         }
 
@@ -521,14 +526,38 @@ impl App {
     fn enter_selected_game(&mut self) {
         match self.hub_selection {
             0 => self.enter_blackjack(),
-            1 => { self.slots.new_spin(); self.switch_screen(Screen::Slots); }
-            2 => { self.roulette.new_round(); self.switch_screen(Screen::Roulette); }
-            3 => { self.war.new_hand(); self.switch_screen(Screen::War); }
-            4 => { self.baccarat.new_hand(); self.switch_screen(Screen::Baccarat); }
-            5 => { self.video_poker.new_hand(); self.switch_screen(Screen::VideoPoker); }
-            6 => { self.keno.new_round(); self.switch_screen(Screen::Keno); }
-            7 => { self.sicbo.new_round(); self.switch_screen(Screen::SicBo); }
-            8 => { self.craps.new_round(); self.switch_screen(Screen::Craps); }
+            1 => {
+                self.slots.new_spin();
+                self.switch_screen(Screen::Slots);
+            }
+            2 => {
+                self.roulette.new_round();
+                self.switch_screen(Screen::Roulette);
+            }
+            3 => {
+                self.war.new_hand();
+                self.switch_screen(Screen::War);
+            }
+            4 => {
+                self.baccarat.new_hand();
+                self.switch_screen(Screen::Baccarat);
+            }
+            5 => {
+                self.video_poker.new_hand();
+                self.switch_screen(Screen::VideoPoker);
+            }
+            6 => {
+                self.keno.new_round();
+                self.switch_screen(Screen::Keno);
+            }
+            7 => {
+                self.sicbo.new_round();
+                self.switch_screen(Screen::SicBo);
+            }
+            8 => {
+                self.craps.new_round();
+                self.switch_screen(Screen::Craps);
+            }
             _ => {}
         }
     }
@@ -558,60 +587,58 @@ impl App {
 
         if is_betting {
             match key.code {
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    match game {
-                        "war" => self.war.bet_input.push(c),
-                        "baccarat" => self.baccarat.bet_input.push(c),
-                        _ => {}
+                KeyCode::Char(c) if c.is_ascii_digit() => match game {
+                    "war" => self.war.bet_input.push(c),
+                    "baccarat" => self.baccarat.bet_input.push(c),
+                    _ => {}
+                },
+                KeyCode::Backspace => match game {
+                    "war" => {
+                        self.war.bet_input.pop();
                     }
-                }
-                KeyCode::Backspace => {
-                    match game {
-                        "war" => { self.war.bet_input.pop(); },
-                        "baccarat" => { self.baccarat.bet_input.pop(); },
-                        _ => {}
+                    "baccarat" => {
+                        self.baccarat.bet_input.pop();
                     }
-                }
+                    _ => {}
+                },
                 KeyCode::Up | KeyCode::Down if game == "baccarat" => {
                     self.baccarat.cursor = match key.code {
                         KeyCode::Up => self.baccarat.cursor.saturating_sub(1),
                         _ => (self.baccarat.cursor + 1).min(2),
                     };
                 }
-                KeyCode::Enter => {
-                    match game {
-                        "war" => {
-                            if let Ok(bet) = self.war.bet_input.parse::<u64>() {
-                                if bet > 0 && bet <= self.tokens { self.war.deal(bet); }
+                KeyCode::Enter => match game {
+                    "war" => {
+                        if let Ok(bet) = self.war.bet_input.parse::<u64>() {
+                            if bet > 0 && bet <= self.tokens {
+                                self.war.deal(bet);
                             }
                         }
-                        "baccarat" => {
-                            if let Ok(bet) = self.baccarat.bet_input.parse::<u64>() {
-                                if bet > 0 && bet <= self.tokens {
-                                    let bt = match self.baccarat.cursor {
-                                        0 => BaccaratBet::Player,
-                                        1 => BaccaratBet::Banker,
-                                        _ => BaccaratBet::Tie,
-                                    };
-                                    self.baccarat.deal(bet, bt);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                }
+                    "baccarat" => {
+                        if let Ok(bet) = self.baccarat.bet_input.parse::<u64>() {
+                            if bet > 0 && bet <= self.tokens {
+                                let bt = match self.baccarat.cursor {
+                                    0 => BaccaratBet::Player,
+                                    1 => BaccaratBet::Banker,
+                                    _ => BaccaratBet::Tie,
+                                };
+                                self.baccarat.deal(bet, bt);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 KeyCode::Esc => self.switch_screen(Screen::Hub),
                 _ => {}
             }
         } else if is_result {
             match key.code {
-                KeyCode::Enter => {
-                    match game {
-                        "war" => self.war.new_hand(),
-                        "baccarat" => self.baccarat.new_hand(),
-                        _ => {}
-                    }
-                }
+                KeyCode::Enter => match game {
+                    "war" => self.war.new_hand(),
+                    "baccarat" => self.baccarat.new_hand(),
+                    _ => {}
+                },
                 KeyCode::Esc => self.switch_screen(Screen::Hub),
                 _ => {}
             }
@@ -623,19 +650,27 @@ impl App {
         match &self.video_poker.phase {
             VideoPokerPhase::Betting => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => self.video_poker.bet_input.push(c),
-                KeyCode::Backspace => { self.video_poker.bet_input.pop(); },
+                KeyCode::Backspace => {
+                    self.video_poker.bet_input.pop();
+                }
                 KeyCode::Enter => {
                     if let Ok(bet) = self.video_poker.bet_input.parse::<u64>() {
-                        if bet > 0 && bet <= self.tokens { self.video_poker.deal(bet); }
+                        if bet > 0 && bet <= self.tokens {
+                            self.video_poker.deal(bet);
+                        }
                     }
                 }
                 KeyCode::Esc => self.switch_screen(Screen::Hub),
                 _ => {}
             },
             VideoPokerPhase::Hold => match key.code {
-                KeyCode::Left => self.video_poker.cursor = self.video_poker.cursor.saturating_sub(1),
+                KeyCode::Left => {
+                    self.video_poker.cursor = self.video_poker.cursor.saturating_sub(1)
+                }
                 KeyCode::Right => self.video_poker.cursor = (self.video_poker.cursor + 1).min(4),
-                KeyCode::Char(' ') | KeyCode::Up => self.video_poker.toggle_hold(self.video_poker.cursor),
+                KeyCode::Char(' ') | KeyCode::Up => {
+                    self.video_poker.toggle_hold(self.video_poker.cursor)
+                }
                 KeyCode::Enter => {
                     self.video_poker.draw_cards();
                     self.apply_generic_payout(self.video_poker.last_payout);
@@ -656,17 +691,45 @@ impl App {
         use crossterm::event::KeyCode;
         match &self.keno.phase {
             KenoPhase::Picking => match key.code {
-                KeyCode::Left => self.keno.cursor = if self.keno.cursor <= 1 { 80 } else { self.keno.cursor - 1 },
-                KeyCode::Right => self.keno.cursor = if self.keno.cursor >= 80 { 1 } else { self.keno.cursor + 1 },
-                KeyCode::Up => self.keno.cursor = if self.keno.cursor <= 10 { self.keno.cursor + 70 } else { self.keno.cursor - 10 },
-                KeyCode::Down => self.keno.cursor = if self.keno.cursor > 70 { self.keno.cursor - 70 } else { self.keno.cursor + 10 },
+                KeyCode::Left => {
+                    self.keno.cursor = if self.keno.cursor <= 1 {
+                        80
+                    } else {
+                        self.keno.cursor - 1
+                    }
+                }
+                KeyCode::Right => {
+                    self.keno.cursor = if self.keno.cursor >= 80 {
+                        1
+                    } else {
+                        self.keno.cursor + 1
+                    }
+                }
+                KeyCode::Up => {
+                    self.keno.cursor = if self.keno.cursor <= 10 {
+                        self.keno.cursor + 70
+                    } else {
+                        self.keno.cursor - 10
+                    }
+                }
+                KeyCode::Down => {
+                    self.keno.cursor = if self.keno.cursor > 70 {
+                        self.keno.cursor - 70
+                    } else {
+                        self.keno.cursor + 10
+                    }
+                }
                 KeyCode::Char(' ') => self.keno.toggle_pick(self.keno.cursor),
                 KeyCode::Char(c) if c.is_ascii_digit() => self.keno.bet_input.push(c),
-                KeyCode::Backspace => { self.keno.bet_input.pop(); },
+                KeyCode::Backspace => {
+                    self.keno.bet_input.pop();
+                }
                 KeyCode::Enter => {
                     if !self.keno.picks.is_empty() {
                         if let Ok(bet) = self.keno.bet_input.parse::<u64>() {
-                            if bet > 0 && bet <= self.tokens { self.keno.start_draw(bet); }
+                            if bet > 0 && bet <= self.tokens {
+                                self.keno.start_draw(bet);
+                            }
                         }
                     }
                 }
@@ -688,9 +751,13 @@ impl App {
             match &self.sicbo.phase {
                 SicBoPhase::Betting => match key.code {
                     KeyCode::Up => self.sicbo.cursor = self.sicbo.cursor.saturating_sub(1),
-                    KeyCode::Down => self.sicbo.cursor = (self.sicbo.cursor + 1).min(SICBO_BETS.len() - 1),
+                    KeyCode::Down => {
+                        self.sicbo.cursor = (self.sicbo.cursor + 1).min(SICBO_BETS.len() - 1)
+                    }
                     KeyCode::Char(c) if c.is_ascii_digit() => self.sicbo.bet_input.push(c),
-                    KeyCode::Backspace => { self.sicbo.bet_input.pop(); },
+                    KeyCode::Backspace => {
+                        self.sicbo.bet_input.pop();
+                    }
                     KeyCode::Enter => {
                         if let Ok(amt) = self.sicbo.bet_input.parse::<u64>() {
                             if amt > 0 && self.sicbo.total_bet + amt <= self.tokens {
@@ -701,11 +768,16 @@ impl App {
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if !self.sicbo.bets.is_empty() { self.sicbo.roll(); }
+                        if !self.sicbo.bets.is_empty() {
+                            self.sicbo.roll();
+                        }
                     }
                     KeyCode::Esc => {
-                        if self.sicbo.bets.is_empty() { self.switch_screen(Screen::Hub); }
-                        else { self.sicbo.new_round(); }
+                        if self.sicbo.bets.is_empty() {
+                            self.switch_screen(Screen::Hub);
+                        } else {
+                            self.sicbo.new_round();
+                        }
                     }
                     _ => {}
                 },
@@ -726,7 +798,9 @@ impl App {
                 KeyCode::Up => self.craps.cursor = self.craps.cursor.saturating_sub(1),
                 KeyCode::Down => self.craps.cursor = (self.craps.cursor + 1).min(2),
                 KeyCode::Char(c) if c.is_ascii_digit() => self.craps.bet_input.push(c),
-                KeyCode::Backspace => { self.craps.bet_input.pop(); },
+                KeyCode::Backspace => {
+                    self.craps.bet_input.pop();
+                }
                 KeyCode::Enter => {
                     if let Ok(bet) = self.craps.bet_input.parse::<u64>() {
                         if bet > 0 && bet <= self.tokens {

@@ -152,7 +152,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
                 ) if *setting_key == def.key => {
                     format!("[{}_]", buffer)
                 }
-                (None, EditorKind::Cycler(_)) => {
+                (None, EditorKind::Cycler(_)) | (None, EditorKind::DynamicCycler) => {
                     format!("◀ {} ▶", current_value)
                 }
                 _ => current_value,

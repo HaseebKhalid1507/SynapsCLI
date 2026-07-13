@@ -58,9 +58,13 @@ pub(crate) fn visible_categories(
 
 pub(crate) enum EditorKind {
     Cycler(&'static [&'static str]),
+    /// Options computed at interaction time from the RuntimeSnapshot.
+    DynamicCycler,
     ModelPicker,
     ThemePicker,
-    Text { numeric: bool },
+    Text {
+        numeric: bool,
+    },
 }
 
 pub(crate) struct SettingDef {

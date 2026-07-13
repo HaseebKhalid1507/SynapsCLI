@@ -611,7 +611,9 @@ impl Runtime {
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
         // Sync named_level from budget so the two fields stay consistent.
-        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
+            budget,
+        ));
     }
 
     /// Set the named reasoning level. Updates `thinking_budget` from the level's
@@ -829,6 +831,7 @@ impl Runtime {
             self.compaction_model(),
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
+            self.reasoning_level(),
             &messages,
             self.api_retries,
         )
@@ -854,6 +857,7 @@ impl Runtime {
                 &*self.tools.read().await,
                 &system_prompt,
                 self.thinking_budget,
+                self.reasoning_level(),
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
@@ -1203,6 +1207,7 @@ impl Runtime {
         let tools = self.tools.clone();
         let system_prompt = self.effective_system_prompt().await;
         let thinking_budget = self.thinking_budget;
+        let reasoning_level = self.reasoning_level();
         let watcher_exit_path = self.watcher_exit_path.clone();
         let max_tool_output = self.max_tool_output;
         let bash_timeout = self.bash_timeout;
@@ -1241,6 +1246,7 @@ impl Runtime {
             tools,
             system_prompt,
             thinking_budget,
+            reasoning_level,
             tx: tx.clone(),
             cancel,
             steering_rx,

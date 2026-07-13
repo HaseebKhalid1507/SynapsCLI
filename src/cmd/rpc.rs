@@ -17,28 +17,28 @@
 //!   goes to the log file / stderr.
 
 use anyhow::Context;
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use futures::StreamExt;
 
-use synaps_cli::{
-    Runtime, Session, SessionEvent, StreamEvent,
-    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
-    core::rpc_dispatch::{
-        accumulate_usage, build_user_content, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES,
-    },
-    engine::setup::{self, EngineOpts},
-    engine::reactor::{
-        drain_event_queue, event_payload_from_drained,
-        wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP,
-        spawn_prompt_registration_check,
-    },
-};
 use synaps_cli::core::config::load_config;
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
+use synaps_cli::{
+    core::rpc_dispatch::{
+        accumulate_usage, build_tools_list_body, build_user_content, map_stream_event, parse_frame,
+        MAX_FRAME_BYTES,
+    },
+    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
+    engine::reactor::{
+        claim_auto_turn, drain_event_queue, event_payload_from_drained,
+        spawn_prompt_registration_check, wake_action, WakeAction, AUTO_TURN_CAP,
+    },
+    engine::setup::{self, EngineOpts},
+    Runtime, Session, SessionEvent, StreamEvent,
+};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
     let had_buffered = !to_inject.is_empty();
     for formatted in to_inject {
         st.api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted})
+            serde_json::json!({"role": "user", "content": formatted}),
         ));
     }
 
@@ -188,7 +188,11 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
         && had_buffered
         && st.events_auto_turn
         && st.consecutive_auto_turns < AUTO_TURN_CAP
-        && st.api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
+        && st
+            .api_messages
+            .last()
+            .map(|m| m["role"].as_str() == Some("user"))
+            .unwrap_or(false)
     {
         // Atomically claim the turn and reserve pending flag.
         if claim_auto_turn(&mut st.consecutive_auto_turns) {
@@ -317,11 +321,13 @@ async fn spawn_prompt(
                 continue;
             }
             match &ev {
-                StreamEvent::Session(se @ SessionEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    ..
-                }) => {
+                StreamEvent::Session(
+                    se @ SessionEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    },
+                ) => {
                     accumulate_usage(&mut usage_acc, se);
                     let mut st = state.lock().await;
                     st.total_input_tokens += input_tokens;
@@ -330,11 +336,19 @@ async fn spawn_prompt(
                 }
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
-                    let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
+                    let _ = wtx
+                        .send(RpcEvent::AgentEnd {
+                            usage: usage_acc.clone(),
+                        })
+                        .await;
                     // terminal_flush(allow_chain=true): Done path — eligible to
                     // reserve a post-flush auto-turn if conditions are met.
                     let post_flush_id = terminal_flush(&state, true).await;
-                    let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
+                    let resp_command = if pid.starts_with("auto:") {
+                        "auto_turn"
+                    } else {
+                        "prompt"
+                    };
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
@@ -361,9 +375,15 @@ async fn spawn_prompt(
                     // below would, and skip the noisy Error frame.
                     if cancel_check.is_cancelled() {
                         let _ = wtx
-                            .send(RpcEvent::AgentEnd { usage: usage_acc.clone() })
+                            .send(RpcEvent::AgentEnd {
+                                usage: usage_acc.clone(),
+                            })
                             .await;
-                        let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
+                        let resp_command = if pid.starts_with("auto:") {
+                            "auto_turn"
+                        } else {
+                            "prompt"
+                        };
                         let _ = wtx
                             .send(RpcEvent::Response {
                                 id: pid.clone(),
@@ -381,8 +401,16 @@ async fn spawn_prompt(
                             message: msg.clone(),
                         })
                         .await;
-                    let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
-                    let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
+                    let _ = wtx
+                        .send(RpcEvent::AgentEnd {
+                            usage: usage_acc.clone(),
+                        })
+                        .await;
+                    let resp_command = if pid.starts_with("auto:") {
+                        "auto_turn"
+                    } else {
+                        "prompt"
+                    };
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
@@ -410,7 +438,11 @@ async fn spawn_prompt(
         // orderly abort; otherwise it's a silent failure (provider drop, extension
         // crash, etc.) and the parent must be told.
         let cancelled = cancel_check.is_cancelled();
-        let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
+        let _ = wtx
+            .send(RpcEvent::AgentEnd {
+                usage: usage_acc.clone(),
+            })
+            .await;
         let body = if cancelled {
             serde_json::json!({ "ok": true, "cancelled": true })
         } else {
@@ -419,7 +451,11 @@ async fn spawn_prompt(
                 "error": "stream ended without Done"
             })
         };
-        let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
+        let resp_command = if pid.starts_with("auto:") {
+            "auto_turn"
+        } else {
+            "prompt"
+        };
         let _ = wtx
             .send(RpcEvent::Response {
                 id: pid.clone(),
@@ -442,11 +478,7 @@ async fn spawn_prompt(
         let mut st = state.lock().await;
         let is_auto = prompt_id.starts_with("auto:");
         let in_flight_live = st.in_flight.is_some();
-        if !spawn_prompt_registration_check(
-            is_auto,
-            &mut st.auto_turn_pending,
-            in_flight_live,
-        ) {
+        if !spawn_prompt_registration_check(is_auto, &mut st.auto_turn_pending, in_flight_live) {
             tracing::warn!(
                 prompt_id,
                 auto_turn_pending = st.auto_turn_pending,
@@ -462,7 +494,11 @@ async fn spawn_prompt(
             drop(handle);
             return;
         }
-        st.in_flight = Some(InFlight { prompt_id, cancel, handle });
+        st.in_flight = Some(InFlight {
+            prompt_id,
+            cancel,
+            handle,
+        });
         st.auto_turn_pending = false;
     }
 
@@ -502,8 +538,9 @@ async fn handle_prompt(
     {
         let mut st = state.lock().await;
         st.consecutive_auto_turns = 0;
-        st.api_messages
-            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
+        st.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": content}),
+        ));
     }
 
     // spawn_prompt snapshots messages, sets in_flight atomically (issue 1 fix),
@@ -584,8 +621,11 @@ async fn handle_new_session(
     let new_session_id = {
         let mut st = state.lock().await;
         st.save_session().await;
-        let new_sess =
-            Session::new(st.runtime.model(), st.runtime.thinking_level(), st.runtime.system_prompt());
+        let new_sess = Session::new(
+            st.runtime.model(),
+            st.runtime.thinking_level(),
+            st.runtime.system_prompt(),
+        );
         let sid = new_sess.id.clone();
         st.session = new_sess;
         st.api_messages.clear();
@@ -667,11 +707,7 @@ async fn handle_get_available_models(id: String, writer_tx: mpsc::Sender<RpcEven
 ///
 /// Cancels the in-flight stream (if any) via its `CancellationToken`, awaits
 /// the task so it can clean up `in_flight`, then always replies `{ ok: true }`.
-async fn handle_abort(
-    id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
+async fn handle_abort(id: String, state: Arc<Mutex<RpcState>>, writer_tx: mpsc::Sender<RpcEvent>) {
     let handle_opt = {
         let mut st = state.lock().await;
         // Clear auto_turn_pending so a reserved-but-not-started auto-turn is cancelled.
@@ -834,20 +870,17 @@ pub async fn run(
     //    registered. Bounded by a 2 s grace period — extension loading is
     //    best-effort, not a hard fail.
     let (loader_tx, mut loader_rx) = mpsc::unbounded_channel();
-    synaps_cli::extensions::loader::spawn_discover_and_load(
-        Arc::clone(&ext_manager),
-        loader_tx,
-    );
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        async {
-            while let Some(ev) = loader_rx.recv().await {
-                if matches!(ev, synaps_cli::extensions::loader::ExtensionLoaderEvent::Finished { .. }) {
-                    break;
-                }
+    synaps_cli::extensions::loader::spawn_discover_and_load(Arc::clone(&ext_manager), loader_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = loader_rx.recv().await {
+            if matches!(
+                ev,
+                synaps_cli::extensions::loader::ExtensionLoaderEvent::Finished { .. }
+            ) {
+                break;
             }
-        },
-    )
+        }
+    })
     .await;
     // Any straggler events after this point are simply dropped when the
     // receiver is dropped; the loader task will exit when its sender drops.
@@ -924,7 +957,11 @@ pub async fn run(
                     // for the drain call, then drop the split borrow before
                     // accessing st.consecutive_auto_turns / st.auto_turn_pending.
                     let drained = {
-                        let RpcState { ref mut api_messages, ref mut pending_events, .. } = *st;
+                        let RpcState {
+                            ref mut api_messages,
+                            ref mut pending_events,
+                            ..
+                        } = *st;
                         drain_event_queue(
                             &eq,
                             api_messages,
@@ -936,17 +973,21 @@ pub async fn run(
 
                     let frames: Vec<RpcEvent> = drained
                         .iter()
-                        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
+                        .map(|d| RpcEvent::Event {
+                            payload: Box::new(event_payload_from_drained(d)),
+                        })
                         .collect();
 
                     // Decide auto-turn: only when idle + enabled + wake says RunTurn.
                     let auto_id = if !busy && events_auto_turn {
-                        let action = wake_action(&drained, &st.api_messages, false, true, consecutive);
+                        let action =
+                            wake_action(&drained, &st.api_messages, false, true, consecutive);
                         if action == WakeAction::RunTurn {
                             // Atomically claim and reserve — one turn per batch.
                             if claim_auto_turn(&mut st.consecutive_auto_turns) {
                                 st.auto_turn_pending = true;
-                                let first_id = drained.first()
+                                let first_id = drained
+                                    .first()
                                     .map(|d| d.event.id.clone())
                                     .unwrap_or_else(|| "unknown".to_string());
                                 Some(format!("auto:{first_id}"))
@@ -966,7 +1007,9 @@ pub async fn run(
                 // Forward ALL Event frames through the writer channel.
                 for frame in frames {
                     if writer_d.send(frame).await.is_err() {
-                        tracing::warn!("rpc: event drainer: writer channel closed — exiting drainer");
+                        tracing::warn!(
+                            "rpc: event drainer: writer channel closed — exiting drainer"
+                        );
                         return;
                     }
                 }
@@ -1016,7 +1059,13 @@ pub async fn run(
                     }
                 }
                 tracing::debug!(auto_id, "rpc: auto-turn scheduler: calling spawn_prompt");
-                spawn_prompt(auto_id, Arc::clone(&state_s), writer_s.clone(), auto_turn_tx_s.clone()).await;
+                spawn_prompt(
+                    auto_id,
+                    Arc::clone(&state_s),
+                    writer_s.clone(),
+                    auto_turn_tx_s.clone(),
+                )
+                .await;
             }
         });
     }
@@ -1068,14 +1117,32 @@ pub async fn run(
                 tracing::debug!(?cmd, "received RpcCommand");
 
                 match cmd {
-                    RpcCommand::Prompt { id, message, attachments } => {
-                        handle_prompt(id, message, attachments, state.clone(), writer_tx.clone(), auto_turn_tx.clone())
-                            .await;
+                    RpcCommand::Prompt {
+                        id,
+                        message,
+                        attachments,
+                    } => {
+                        handle_prompt(
+                            id,
+                            message,
+                            attachments,
+                            state.clone(),
+                            writer_tx.clone(),
+                            auto_turn_tx.clone(),
+                        )
+                        .await;
                     }
                     RpcCommand::FollowUp { id, message } => {
                         // Same engine path as Prompt — no attachments.
-                        handle_prompt(id, message, Vec::new(), state.clone(), writer_tx.clone(), auto_turn_tx.clone())
-                            .await;
+                        handle_prompt(
+                            id,
+                            message,
+                            Vec::new(),
+                            state.clone(),
+                            writer_tx.clone(),
+                            auto_turn_tx.clone(),
+                        )
+                        .await;
                     }
                     RpcCommand::Compact { id } => {
                         handle_compact(id, state.clone(), writer_tx.clone()).await;

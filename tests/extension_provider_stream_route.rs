@@ -5,6 +5,7 @@ use std::sync::Arc;
 use synaps_cli::config;
 use synaps_cli::extensions::hooks::HookBus;
 use synaps_cli::extensions::manager::ExtensionManager;
+use synaps_cli::reasoning::ReasoningLevel;
 
 #[tokio::test(flavor = "current_thread")]
 async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
@@ -35,7 +36,11 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
     manager
         .write()
         .await
-        .load_with_cwd("stream-test", &manifest, Some(plugin_dir.path().to_path_buf()))
+        .load_with_cwd(
+            "stream-test",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
         .await
         .unwrap();
 
@@ -46,11 +51,14 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         &reqwest::Client::new(),
         &tools,
         &None,
-        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"hi"}]}))],
+        &[std::sync::Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+        )],
         &tx,
         None,
         None,
         0,
+        ReasoningLevel::Medium,
         &tokio_util::sync::CancellationToken::new(),
         &synaps_cli::auth::CredentialSource::Local,
         &synaps_cli::auth::TokenCache::new(),
@@ -66,7 +74,9 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
     drop(tx);
     let mut deltas: Vec<String> = Vec::new();
     while let Some(event) = rx.recv().await {
-        if let synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) = event {
+        if let synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) =
+            event
+        {
             deltas.push(text);
         }
     }

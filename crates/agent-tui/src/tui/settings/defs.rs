@@ -48,18 +48,13 @@ define_settings! {
         |runtime, _app, value| { runtime.set_model(value.to_string()); };
 
     thinking, "Thinking", Model,
-        EditorKind::Cycler(&["low", "medium", "high", "xhigh", "adaptive"]),
+        EditorKind::DynamicCycler,
         "Thinking depth — controls effort on adaptive models, budget on legacy.",
         |runtime, _app, value| {
-            let budget = match value {
-                "low" => 2048,
-                "medium" => 4096,
-                "high" => 16384,
-                "xhigh" => 32768,
-                "adaptive" => 0,
-                _ => return,
-            };
-            runtime.set_thinking_budget(budget);
+            use agent_core::reasoning::ReasoningLevel;
+            if let Some(level) = ReasoningLevel::parse(value) {
+                runtime.set_reasoning_level(level);
+            }
         };
 
     context_window, "Context window", Model,

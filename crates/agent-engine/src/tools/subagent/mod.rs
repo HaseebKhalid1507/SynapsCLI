@@ -1,21 +1,21 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
 pub mod collect;
+pub(crate) mod finalize;
 pub mod models;
 mod oneshot;
-pub(crate) mod finalize;
+pub mod resume;
 pub mod start;
 pub mod status;
 pub mod steer;
-pub mod resume;
 
 pub use collect::SubagentCollectTool;
 pub use models::SubagentModelsTool;
 pub use oneshot::SubagentTool;
+pub use resume::SubagentResumeTool;
 pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
-pub use resume::SubagentResumeTool;
 
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
 /// (which has already had `Runtime::new()` called), then **unconditionally
@@ -86,7 +86,8 @@ mod cache_ttl_policy_tests {
         };
 
         // Create a fresh runtime (as each subagent spawn does).
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Simulate a scenario where apply_config was called with a 1h parent
@@ -120,13 +121,18 @@ mod cache_ttl_policy_tests {
             ..Default::default()
         };
 
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Simulate the parent having configured Hybrid on this runtime.
         runtime.set_cache_ttl(CacheTtl::Hybrid);
 
-        assert_eq!(runtime.cache_ttl(), CacheTtl::Hybrid, "pre-condition: must be Hybrid");
+        assert_eq!(
+            runtime.cache_ttl(),
+            CacheTtl::Hybrid,
+            "pre-condition: must be Hybrid"
+        );
 
         apply_subagent_runtime_policy(&mut runtime, &parent_config);
 
@@ -141,11 +147,16 @@ mod cache_ttl_policy_tests {
     async fn subagent_policy_is_idempotent_when_parent_already_five_minutes() {
         let parent_config = crate::config::SynapsConfig::default(); // FiveMinutes by default
 
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Runtime::new() default is already FiveMinutes, but confirm it.
-        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes, "pre-condition: Runtime::new() must default to 5m");
+        assert_eq!(
+            runtime.cache_ttl(),
+            CacheTtl::FiveMinutes,
+            "pre-condition: Runtime::new() must default to 5m"
+        );
 
         apply_subagent_runtime_policy(&mut runtime, &parent_config);
 

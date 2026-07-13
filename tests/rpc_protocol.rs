@@ -10,8 +10,7 @@
 //!   * At least one golden-string test per category (exact byte-sequence check)
 
 use synaps_cli::core::rpc_protocol::{
-    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
-    RPC_PROTOCOL_VERSION,
+    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,8 +154,7 @@ mod rpc_command {
         };
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"prompt","id":"x","message":"hi","attachments":[]}"#,
+            got, r#"{"type":"prompt","id":"x","message":"hi","attachments":[]}"#,
             "RpcCommand::Prompt golden JSON mismatch"
         );
     }
@@ -166,8 +164,7 @@ mod rpc_command {
         let cmd = RpcCommand::Shutdown;
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"shutdown"}"#,
+            got, r#"{"type":"shutdown"}"#,
             "RpcCommand::Shutdown golden JSON mismatch"
         );
     }
@@ -180,8 +177,7 @@ mod rpc_command {
         };
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"set_model","id":"m1","model":"claude-sonnet-4-5"}"#,
+            got, r#"{"type":"set_model","id":"m1","model":"claude-sonnet-4-5"}"#,
             "RpcCommand::SetModel golden JSON mismatch"
         );
     }
@@ -199,7 +195,9 @@ mod rpc_event {
     #[test]
     fn message_update_round_trip() {
         let ev = RpcEvent::MessageUpdate {
-            event: AssistantEvent::TextDelta { delta: "hello".into() },
+            event: AssistantEvent::TextDelta {
+                delta: "hello".into(),
+            },
         };
         assert_eq!(round_trip_event(&ev), ev);
     }
@@ -314,8 +312,7 @@ mod rpc_event {
         };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"error","message":"bad"}"#,
+            got, r#"{"type":"error","message":"bad"}"#,
             "RpcEvent::Error (no id) golden JSON mismatch"
         );
     }
@@ -341,8 +338,7 @@ mod rpc_event {
         );
         // Full golden check.
         assert_eq!(
-            got,
-            r#"{"type":"response","id":"x","command":"get_messages","messages":[]}"#,
+            got, r#"{"type":"response","id":"x","command":"get_messages","messages":[]}"#,
             "RpcEvent::Response golden JSON mismatch"
         );
     }
@@ -380,13 +376,17 @@ mod assistant_event {
 
     #[test]
     fn text_delta_round_trip() {
-        let ev = AssistantEvent::TextDelta { delta: "chunk".into() };
+        let ev = AssistantEvent::TextDelta {
+            delta: "chunk".into(),
+        };
         assert_eq!(round_trip_assistant(&ev), ev);
     }
 
     #[test]
     fn thinking_delta_round_trip() {
-        let ev = AssistantEvent::ThinkingDelta { delta: "hmm".into() };
+        let ev = AssistantEvent::ThinkingDelta {
+            delta: "hmm".into(),
+        };
         assert_eq!(round_trip_assistant(&ev), ev);
     }
 
@@ -433,8 +433,7 @@ mod assistant_event {
         let ev = AssistantEvent::TextDelta { delta: "hi".into() };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"text_delta","delta":"hi"}"#,
+            got, r#"{"type":"text_delta","delta":"hi"}"#,
             "AssistantEvent::TextDelta golden JSON mismatch"
         );
     }
@@ -447,8 +446,7 @@ mod assistant_event {
         };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"toolcall_start","tool_id":"id1","tool_name":"bash"}"#,
+            got, r#"{"type":"toolcall_start","tool_id":"id1","tool_name":"bash"}"#,
             "AssistantEvent::ToolcallStart golden JSON mismatch"
         );
     }
