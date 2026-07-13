@@ -57,7 +57,7 @@ impl DelegationPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRole {
     Planner,
@@ -115,6 +115,7 @@ enum State {
 #[derive(Debug)]
 struct Worker {
     state: State,
+    role: WorkerRole,
     writes: WorkerWritePolicy,
     unchanged_polls: usize,
     steered: bool,
@@ -124,6 +125,7 @@ struct Worker {
 pub struct OrchestrationEvent {
     pub name: &'static str,
     pub worker_id: Option<String>,
+    pub worker_role: Option<WorkerRole>,
     pub reason_code: Option<&'static str>,
 }
 
@@ -177,6 +179,7 @@ impl WorkerRegistry {
         self.emit(OrchestrationEvent {
             name: "worker.dispatch_rolled_back",
             worker_id: Some(h.0.clone()),
+            worker_role: None,
             reason_code: Some("post_authorization_failure"),
         });
         Ok(())
@@ -207,18 +210,20 @@ impl WorkerRegistry {
     pub fn authorize_dispatch(
         &mut self,
         model: &QualifiedModelId,
-        _role: WorkerRole,
+        role: WorkerRole,
         writes: WorkerWritePolicy,
     ) -> Result<WorkerHandle, DispatchDenied> {
         self.emit(OrchestrationEvent {
             name: "worker.dispatch_requested",
             worker_id: None,
+            worker_role: None,
             reason_code: None,
         });
         if let Err(error) = self.validate_dispatch(model) {
             self.emit(OrchestrationEvent {
                 name: "worker.dispatch_denied",
                 worker_id: None,
+                worker_role: None,
                 reason_code: Some(error.code),
             });
             return Err(error);
@@ -229,6 +234,7 @@ impl WorkerRegistry {
             h.clone(),
             Worker {
                 state: State::Dispatched,
+                role,
                 writes,
                 unchanged_polls: 0,
                 steered: false,
@@ -238,6 +244,7 @@ impl WorkerRegistry {
         self.emit(OrchestrationEvent {
             name: "worker.dispatched",
             worker_id: Some(h.0.clone()),
+            worker_role: Some(role),
             reason_code: None,
         });
         Ok(h)
@@ -254,9 +261,11 @@ impl WorkerRegistry {
             return Err("invalid lifecycle transition");
         }
         w.state = to;
+        let role = w.role;
         self.emit(OrchestrationEvent {
             name: event,
             worker_id: Some(h.0.clone()),
+            worker_role: Some(role),
             reason_code: None,
         });
         Ok(())
@@ -279,6 +288,7 @@ impl WorkerRegistry {
         self.emit(OrchestrationEvent {
             name: "worker.polled",
             worker_id: Some(h.0.clone()),
+            worker_role: None,
             reason_code: None,
         });
         Ok(())
@@ -296,6 +306,7 @@ impl WorkerRegistry {
         self.emit(OrchestrationEvent {
             name: "worker.steered",
             worker_id: Some(h.0.clone()),
+            worker_role: None,
             reason_code: None,
         });
         Ok(())
