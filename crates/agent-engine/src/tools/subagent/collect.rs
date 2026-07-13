@@ -22,7 +22,11 @@ impl Tool for SubagentCollectTool {
     fn description(&self) -> &str {
         "Check if a reactive subagent is done and return its result. Non-blocking — \
          returns immediately. If still running, returns status and partial output. \
-         If finished, returns the full result. Call repeatedly to poll for completion."
+         If finished, returns the full result. Call repeatedly to poll for completion. \
+         After inspecting a finished result, call again with reconciled=true to attest \
+         reconciliation and clear the completion gate; reconciled defaults to false so \
+         inspection and attestation stay intentional (first terminal collect always \
+         collects; any terminal collect with reconciled=true reconciles, including repeats)."
     }
 
     fn parameters(&self) -> Value {
@@ -36,7 +40,7 @@ impl Tool for SubagentCollectTool {
                 "reconciled": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Confirm the collected result was inspected and reconciled with foreground work."
+                    "description": "After inspecting the collected result, set true to attest reconciliation with foreground work and unblock completion. Defaults to false; a later collect with reconciled=true still reconciles (idempotent)."
                 }
             },
             "required": ["handle_id"]
@@ -295,10 +299,22 @@ mod tests {
             .unwrap();
         let body1: serde_json::Value = serde_json::from_str(&result1).unwrap();
         assert_eq!(body1["collected"], false);
-        assert!(
-            matches!(orch.completion_gate(), CompletionGate::Blocked { .. }),
-            "first collect without reconcile must leave completion blocked"
-        );
+        match orch.completion_gate() {
+            CompletionGate::Blocked { workers } => {
+                assert_eq!(workers, vec!["sa_deferred".to_string()]);
+                assert!(
+                    workers.iter().all(|id| id.starts_with("sa_")),
+                    "blocked IDs must be subagent_collect handles, got {workers:?}"
+                );
+                assert!(
+                    workers.iter().all(|id| !id.starts_with("worker-")),
+                    "blocked IDs must never leak policy WorkerHandle, got {workers:?}"
+                );
+            }
+            other => panic!(
+                "first collect without reconcile must leave completion blocked, got {other:?}"
+            ),
+        }
 
         // Rebuild ctx so the same shared orch/registry participate on the
         // second call (create_tool_context would allocate a fresh baseline).

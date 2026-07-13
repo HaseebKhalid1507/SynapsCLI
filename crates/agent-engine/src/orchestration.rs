@@ -360,7 +360,40 @@ impl OrchestrationRuntime {
         inner.registry.reconcile(&h).map_err(str::to_string)
     }
     pub fn completion_gate(&self) -> CompletionGate {
-        self.inner.lock().unwrap().registry.completion_gate()
+        // Core WorkerRegistry reports internal policy IDs (`worker-N`). Map them
+        // back through the runtime handle table so tool-facing remediation can
+        // cite `sa_*` handles accepted by `subagent_collect`.
+        let inner = self.inner.lock().unwrap();
+        match inner.registry.completion_gate() {
+            CompletionGate::Allowed => CompletionGate::Allowed,
+            CompletionGate::Warning { workers } => CompletionGate::Warning {
+                workers: Self::map_policy_ids_to_runtime(&inner.handles, workers),
+            },
+            CompletionGate::Blocked { workers } => CompletionGate::Blocked {
+                workers: Self::map_policy_ids_to_runtime(&inner.handles, workers),
+            },
+        }
+    }
+
+    /// Map policy `WorkerHandle` IDs (`worker-N`) to runtime handles (`sa_*`).
+    /// Preserves the deterministic order of the policy gate's worker list.
+    fn map_policy_ids_to_runtime(
+        handles: &HashMap<String, agent_core::orchestration::WorkerHandle>,
+        policy_ids: Vec<String>,
+    ) -> Vec<String> {
+        let reverse: HashMap<&str, &str> = handles
+            .iter()
+            .map(|(runtime_handle, policy_handle)| (policy_handle.id(), runtime_handle.as_str()))
+            .collect();
+        policy_ids
+            .into_iter()
+            .map(|policy_id| {
+                reverse
+                    .get(policy_id.as_str())
+                    .map(|runtime| (*runtime).to_owned())
+                    .unwrap_or(policy_id)
+            })
+            .collect()
     }
     pub fn check_foreground_write(&self, path: &str) -> agent_core::orchestration::ScopeDecision {
         self.inner
@@ -504,5 +537,51 @@ mod tests {
         ));
         rt.reconcile("sa_2").unwrap();
         assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+    }
+
+    /// Completion remediation must cite tool-facing `sa_*` handles, never the
+    /// internal policy IDs (`worker-N`) that `WorkerRegistry` allocates.
+    #[test]
+    fn completion_gate_reports_runtime_handles_not_policy_ids() {
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            model("anthropic/foreground"),
+            [model("anthropic/worker")],
+            2,
+            2,
+        ));
+        rt.authorize("sa_alpha", "anthropic/worker").unwrap();
+        rt.authorize("sa_beta", "anthropic/worker").unwrap();
+
+        match rt.completion_gate() {
+            CompletionGate::Blocked { workers } => {
+                assert_eq!(
+                    workers,
+                    vec!["sa_alpha".to_string(), "sa_beta".to_string()],
+                    "blocked IDs must be runtime handles in deterministic policy order"
+                );
+                for id in &workers {
+                    assert!(
+                        id.starts_with("sa_"),
+                        "blocked id must be a subagent_collect handle, got {id}"
+                    );
+                    assert!(
+                        !id.starts_with("worker-"),
+                        "blocked id must never leak policy WorkerHandle, got {id}"
+                    );
+                }
+            }
+            other => panic!("expected Blocked with two sa_* handles, got {other:?}"),
+        }
+
+        // After one reconcile, only the remaining runtime handle is reported.
+        rt.terminal_and_collect("sa_alpha", WorkerTerminal::Completed)
+            .unwrap();
+        rt.reconcile("sa_alpha").unwrap();
+        match rt.completion_gate() {
+            CompletionGate::Blocked { workers } => {
+                assert_eq!(workers, vec!["sa_beta".to_string()]);
+            }
+            other => panic!("expected only sa_beta still blocked, got {other:?}"),
+        }
     }
 }

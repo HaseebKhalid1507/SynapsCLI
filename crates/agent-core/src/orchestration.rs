@@ -352,6 +352,13 @@ pub enum WorkerTerminal {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct WorkerHandle(String);
+impl WorkerHandle {
+    /// Stable policy-side identity (`worker-N`). Runtime layers map this back
+    /// to tool-facing handles (`sa_*`) for remediation messages.
+    pub fn id(&self) -> &str {
+        &self.0
+    }
+}
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompletionGate {
     Allowed,
