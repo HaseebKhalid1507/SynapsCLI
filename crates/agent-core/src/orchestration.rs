@@ -2,7 +2,7 @@ use crate::prompt::QualifiedModelId;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementMode {
     Off,
@@ -20,7 +20,8 @@ pub struct DelegationPolicy {
     pub max_total_workers: usize,
 }
 impl DelegationPolicy {
-    pub fn enforced(
+    pub fn new(
+        mode: EnforcementMode,
         foreground: QualifiedModelId,
         models: impl IntoIterator<Item = QualifiedModelId>,
         concurrent: usize,
@@ -32,13 +33,27 @@ impl DelegationPolicy {
             .map(|m| m.provider().to_owned())
             .collect();
         Self {
-            mode: EnforcementMode::Enforced,
+            mode,
             foreground,
             allowed_providers,
             allowed_models,
             max_concurrent_workers: concurrent,
             max_total_workers: total,
         }
+    }
+    pub fn enforced(
+        foreground: QualifiedModelId,
+        models: impl IntoIterator<Item = QualifiedModelId>,
+        concurrent: usize,
+        total: usize,
+    ) -> Self {
+        Self::new(
+            EnforcementMode::Enforced,
+            foreground,
+            models,
+            concurrent,
+            total,
+        )
     }
 }
 

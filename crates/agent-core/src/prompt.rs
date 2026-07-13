@@ -319,6 +319,21 @@ pub struct PromptManifest {
     adapters: Vec<String>,
     #[serde(default)]
     modules: Vec<ModuleDeclaration>,
+    #[serde(default)]
+    policies: ManifestPolicies,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPolicies {
+    delegation: Option<ManifestDelegationPolicy>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDelegationPolicy {
+    mode: crate::orchestration::EnforcementMode,
+    allowed_models: Vec<QualifiedModelId>,
+    max_concurrent_workers: usize,
+    max_total_workers: usize,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,7 +381,33 @@ impl PromptManifest {
                 )));
             }
         }
+        if let Some(policy) = &v.policies.delegation {
+            if policy.max_concurrent_workers == 0
+                || policy.max_total_workers == 0
+                || policy.max_concurrent_workers > policy.max_total_workers
+                || (policy.mode != crate::orchestration::EnforcementMode::Off
+                    && policy.allowed_models.is_empty())
+            {
+                return Err(PromptError::Invalid(
+                    "invalid delegation policy limits".into(),
+                ));
+            }
+        }
         Ok(v)
+    }
+    pub fn delegation_policy(
+        &self,
+        foreground: QualifiedModelId,
+    ) -> Result<Option<crate::orchestration::DelegationPolicy>, PromptError> {
+        Ok(self.policies.delegation.as_ref().map(|policy| {
+            crate::orchestration::DelegationPolicy::new(
+                policy.mode,
+                foreground,
+                policy.allowed_models.clone(),
+                policy.max_concurrent_workers,
+                policy.max_total_workers,
+            )
+        }))
     }
     pub fn registry(
         &self,

@@ -42,10 +42,18 @@ modules:
         .validate_references(["kernel.foreman", "adapter.openrouter"])
         .is_ok());
     assert!(PromptManifest::parse(&(yaml.to_owned() + "surprise: true\n")).is_err());
-    assert!(PromptManifest::parse(
-        "schema: synaps-prompt/1\nkernel: k\npolicies: { delegation: { mode: enforced } }\n"
+    let policy = PromptManifest::parse(
+        "schema: synaps-prompt/1\nkernel: k\npolicies:\n  delegation:\n    mode: enforced\n    allowed_models: [anthropic/claude-haiku]\n    max_concurrent_workers: 2\n    max_total_workers: 4\n"
     )
-    .is_err());
+    .unwrap()
+    .delegation_policy(QualifiedModelId::parse("anthropic/claude-sonnet").unwrap())
+    .unwrap()
+    .unwrap();
+    assert_eq!(policy.max_concurrent_workers, 2);
+    assert_eq!(policy.max_total_workers, 4);
+    assert!(PromptManifest::parse(
+        "schema: synaps-prompt/1\nkernel: k\npolicies: { delegation: { mode: enforced, allowed_models: [], max_concurrent_workers: 0, max_total_workers: 1 } }\n"
+    ).is_err());
     assert!(PromptManifest::parse("schema: synaps-prompt/1\nkernel: k\nmodules: [{id: x, version: v, source: user, priority: 1, selectors: {}, mutability: mutable_guidance, content: x, bogus: y}]\n").is_err());
 }
 
