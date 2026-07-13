@@ -48,7 +48,7 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Provider-qualified model override (for example anthropic/claude-sonnet-4-6)."
+                    "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."
                 },
                 "role": {
                     "type": "string",

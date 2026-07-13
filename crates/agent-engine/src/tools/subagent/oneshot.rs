@@ -33,7 +33,7 @@ impl Tool for SubagentTool {
                     "type": "string",
                     "description": "The task/prompt to send to the subagent."
                 },
-                "model": {"type": "string", "description": "Provider-qualified model override."},
+                "model": {"type": "string", "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."},
                 "role": {"type": "string", "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"]},
                 "write_policy": {
                     "oneOf": [

@@ -48,8 +48,8 @@ pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
-    SubagentCollectTool, SubagentResumeTool, SubagentStartTool, SubagentStatusTool,
-    SubagentSteerTool, SubagentTool,
+    SubagentCollectTool, SubagentModelsTool, SubagentResumeTool, SubagentStartTool,
+    SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
 pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;

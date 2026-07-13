@@ -42,6 +42,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
             Arc::new(crate::tools::subagent::SubagentTool),
+            Arc::new(crate::tools::subagent::models::SubagentModelsTool),
             Arc::new(crate::tools::subagent::start::SubagentStartTool),
             Arc::new(crate::tools::subagent::status::SubagentStatusTool),
             Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
@@ -488,8 +489,8 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Should have 11 tools including subagent + 3 shell tools
-        assert_eq!(registry.tools_schema().len(), 16);
+        // Includes the read-only session worker catalog operation.
+        assert_eq!(registry.tools_schema().len(), 17);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());
@@ -506,6 +507,7 @@ mod tests {
         assert!(registry.get("find").is_some());
         assert!(registry.get("ls").is_some());
         assert!(registry.get("subagent").is_some());
+        assert!(registry.get("subagent_models").is_some());
     }
 
     #[test]
