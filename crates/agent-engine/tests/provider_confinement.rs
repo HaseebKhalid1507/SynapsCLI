@@ -33,7 +33,7 @@ fn omitted_worker_model_inherits_foreground_and_all_explicit_requests_are_author
 #[test]
 fn limits_are_reserved_atomically_by_the_central_decision_point() {
     let foreground = model("openai-codex/gpt-5.6-sol");
-    let runtime = OrchestrationRuntime::baseline(foreground, 1, 2);
+    let runtime = OrchestrationRuntime::baseline(foreground, 1, 2).unwrap();
     runtime.resolve_and_authorize("sa_1", None).unwrap();
     let denied = runtime.resolve_and_authorize("sa_2", None).unwrap_err();
     assert_eq!(denied.code, "concurrency_limit");

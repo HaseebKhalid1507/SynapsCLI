@@ -111,7 +111,7 @@ impl CrossProviderGrant {
 pub enum DispatchFailureCode {
     InvalidQualifiedModel,
     CatalogModelUnknown,
-    CrossProviderGrantRequired,
+    ProviderNotAllowed,
     CrossProviderGrantExpired,
     ModelNotAllowed,
     ConcurrencyLimit,
@@ -123,7 +123,7 @@ impl DispatchFailureCode {
         match self {
             Self::InvalidQualifiedModel => "invalid_qualified_model",
             Self::CatalogModelUnknown => "catalog_model_unknown",
-            Self::CrossProviderGrantRequired => "cross_provider_grant_required",
+            Self::ProviderNotAllowed => "provider_not_allowed",
             Self::CrossProviderGrantExpired => "cross_provider_grant_expired",
             Self::ModelNotAllowed => "model_not_allowed",
             Self::ConcurrencyLimit => "concurrency_limit",
@@ -306,9 +306,7 @@ impl DelegationPolicy {
         {
             Err(DispatchDenied::new(DispatchFailureCode::ModelNotAllowed))
         } else {
-            Err(DispatchDenied::new(
-                DispatchFailureCode::CrossProviderGrantRequired,
-            ))
+            Err(DispatchDenied::new(DispatchFailureCode::ProviderNotAllowed))
         }
     }
     pub fn effective_choices(&self) -> &[QualifiedModelId] {
