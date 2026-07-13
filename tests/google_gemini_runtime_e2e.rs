@@ -10,8 +10,8 @@
 //! - Path-allowlist enforcement blocks non-reviewed same-host methods.
 
 use agent_core::auth::{
-    google_gemini::PROVIDER, save_provider_auth, LocalBroker, OAuthCredentials,
-    ProxyMethod, ProxyRequest,
+    google_gemini::PROVIDER, save_provider_auth, LocalBroker, OAuthCredentials, ProxyMethod,
+    ProxyRequest,
 };
 use agent_engine::runtime::google_gemini::{stream_gemini, ChatTurn, GeminiStreamEvent};
 use axum::{
@@ -45,14 +45,16 @@ async fn capture_streaming(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body_bytes = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap();
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let body = String::from_utf8(body_bytes.to_vec()).unwrap();
     seen.0.lock().unwrap().push((path, auth, body));
     // SSE frames — three text deltas, one tool call, and a finish reason.
     let sse = concat!(
         "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello \"}]}}]}}\n\n",
         "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]}}]}}\n\n",
-        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"count\",\"args\":{\"n\":3}}}]},\"finishReason\":\"STOP\"}]}}\n\n",
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"count\",\"args\":{\"n\":3}},\"thoughtSignature\":\"fixture-signature\"}]},\"finishReason\":\"STOP\"}]}}\n\n",
         "data: [DONE]\n\n",
     );
     Response::builder()
@@ -131,8 +133,12 @@ async fn broker_streams_gemini_generate_content_end_to_end() {
         Some("be brief".into()),
         &[
             ChatTurn::User { text: "hi".into() },
-            ChatTurn::Assistant { text: "hello".into() },
-            ChatTurn::User { text: "count to 3".into() },
+            ChatTurn::Assistant {
+                text: "hello".into(),
+            },
+            ChatTurn::User {
+                text: "count to 3".into(),
+            },
         ],
         &[],
         cancel,
@@ -148,17 +154,22 @@ async fn broker_streams_gemini_generate_content_end_to_end() {
     // Text deltas, tool call, then two Finish events (STOP + [DONE] sentinel).
     let mut text = String::new();
     let mut tool_names = Vec::new();
+    let mut tool_signatures = Vec::new();
     let mut finishes = 0;
     for ev in &events {
         match ev {
             GeminiStreamEvent::TextDelta(t) => text.push_str(t),
-            GeminiStreamEvent::ToolCall(c) => tool_names.push(c.name.clone()),
+            GeminiStreamEvent::ToolCall(c) => {
+                tool_names.push(c.name.clone());
+                tool_signatures.push(c.thought_signature.clone());
+            }
             GeminiStreamEvent::Finish { .. } => finishes += 1,
             GeminiStreamEvent::Ignored => {}
         }
     }
     assert_eq!(text, "Hello world");
     assert_eq!(tool_names, vec!["count".to_string()]);
+    assert_eq!(tool_signatures, vec![Some("fixture-signature".into())]);
     assert!(finishes >= 1);
 
     // Verify wire request: bearer used the broker-vended access token; path
@@ -173,8 +184,14 @@ async fn broker_streams_gemini_generate_content_end_to_end() {
     assert_eq!(body["model"], "gemini-2.5-pro");
     assert_eq!(body["project"], "proj-abc");
     assert_eq!(body["request"]["contents"][0]["role"], "user");
-    assert_eq!(body["request"]["contents"][2]["parts"][0]["text"], "count to 3");
-    assert_eq!(body["request"]["systemInstruction"]["parts"][0]["text"], "be brief");
+    assert_eq!(
+        body["request"]["contents"][2]["parts"][0]["text"],
+        "count to 3"
+    );
+    assert_eq!(
+        body["request"]["systemInstruction"]["parts"][0]["text"],
+        "be brief"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -197,7 +214,9 @@ async fn broker_refuses_redirect_from_pinned_cloudcode_pa_host() {
         "gemini-2.5-pro",
         None,
         None,
-        &[ChatTurn::User { text: "leak?".into() }],
+        &[ChatTurn::User {
+            text: "leak?".into(),
+        }],
         &[],
         CancellationToken::new(),
     )
@@ -248,13 +267,17 @@ async fn proxy_denies_non_allowlisted_cloudcode_pa_paths() {
             body: Some(serde_json::json!({})),
             stream: false,
         };
-        assert!(req.validate().is_err(), "{bad} must be denied by validate()");
+        assert!(
+            req.validate().is_err(),
+            "{bad} must be denied by validate()"
+        );
     }
 }
 
 #[tokio::test]
 async fn oversized_request_body_is_denied_before_egress() {
-    let big = serde_json::json!({ "junk": "x".repeat(agent_core::auth::MAX_PROXY_REQUEST_BYTES + 1) });
+    let big =
+        serde_json::json!({ "junk": "x".repeat(agent_core::auth::MAX_PROXY_REQUEST_BYTES + 1) });
     let req = ProxyRequest {
         provider: "google-gemini".into(),
         method: ProxyMethod::Post,

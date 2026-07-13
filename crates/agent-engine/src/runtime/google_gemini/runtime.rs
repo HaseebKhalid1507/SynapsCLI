@@ -167,7 +167,15 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
                                     .unwrap_or("")
                                     .to_string();
                                 let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                                turns.push(ChatTurn::ToolCall { name, args });
+                                let thought_signature = block
+                                    .get("thought_signature")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned);
+                                turns.push(ChatTurn::ToolCall {
+                                    name,
+                                    args,
+                                    thought_signature,
+                                });
                             }
                             // `thinking` and other unknown block types are not
                             // representable on the Gemini wire — drop.
@@ -268,12 +276,16 @@ pub(crate) async fn call_google_gemini_stream_inner(
                     tool_id: tool_id.clone(),
                     input: input.clone(),
                 }));
-                content_blocks.push(json!({
+                let mut tool_block = json!({
                     "type": "tool_use",
                     "id": tool_id,
                     "name": call.name,
                     "input": input,
-                }));
+                });
+                if let Some(signature) = call.thought_signature {
+                    tool_block["thought_signature"] = Value::String(signature);
+                }
+                content_blocks.push(tool_block);
             }
             Ok(GeminiStreamEvent::Finish { reason }) => {
                 if let Some(r) = reason {
@@ -490,6 +502,66 @@ mod tests {
         assert_eq!(text, "looking");
         assert!(saw_tool_start);
         assert!(saw_tool_use);
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_call_thought_signature_survives_shared_message_round_trip() {
+        let first_broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![chunk(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"printf ok\"}},\"thoughtSignature\":\"opaque-signature\"}]},\"finishReason\":\"TOOL_CALL\"}]}}\n",
+        )]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let first_messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role":"user","content":"run it"}))];
+        let first = call_google_gemini_stream_inner(
+            &cfg(),
+            &first_broker,
+            &[],
+            &None,
+            &first_messages,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Model the generic agent loop: retain the aggregated assistant content,
+        // append its ordinary tool result, then translate the next request.
+        let next_messages: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role":"user","content":"run it"})),
+            Arc::new(json!({"role":"assistant","content":first["content"].clone()})),
+            Arc::new(json!({"role":"user","content":[{
+                "type":"tool_result",
+                "tool_use_id":"gemini_call_1",
+                "content":"ok"
+            }]})),
+        ];
+        let second_stub = Arc::new(StubBroker::new(vec![chunk(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}}\n",
+        )]));
+        let seen = second_stub.seen.clone();
+        let second_broker: Arc<dyn CredentialBroker> = second_stub;
+        call_google_gemini_stream_inner(
+            &cfg(),
+            &second_broker,
+            &[],
+            &None,
+            &next_messages,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let request = seen.lock().unwrap().take().unwrap();
+        let body = request.body.unwrap();
+        let call_part = &body["request"]["contents"][1]["parts"][0];
+        assert_eq!(call_part["functionCall"]["name"], "bash");
+        assert_eq!(call_part["thoughtSignature"], "opaque-signature");
+        assert_eq!(body["request"]["contents"][2]["role"], "user");
+        assert_eq!(
+            body["request"]["contents"][2]["parts"][0]["functionResponse"]["response"],
+            json!({"output":"ok"})
+        );
     }
 
     #[test]

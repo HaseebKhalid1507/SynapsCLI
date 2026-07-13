@@ -37,6 +37,8 @@ pub enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -49,6 +51,8 @@ pub struct GeminiFunctionCall {
     pub name: String,
     #[serde(default)]
     pub args: serde_json::Value,
+    #[serde(skip)]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,6 +124,7 @@ pub enum ChatTurn {
     ToolCall {
         name: String,
         args: serde_json::Value,
+        thought_signature: Option<String>,
     },
     ToolResult {
         name: String,
@@ -154,13 +159,19 @@ pub fn translate_generate_content_request(
                 role: GeminiRoleName::Model,
                 parts: vec![GeminiPart::Text { text: text.clone() }],
             },
-            ChatTurn::ToolCall { name, args } => GeminiContent {
+            ChatTurn::ToolCall {
+                name,
+                args,
+                thought_signature,
+            } => GeminiContent {
                 role: GeminiRoleName::Model,
                 parts: vec![GeminiPart::FunctionCall {
                     function_call: GeminiFunctionCall {
                         name: name.clone(),
                         args: args.clone(),
+                        thought_signature: None,
                     },
+                    thought_signature: thought_signature.clone(),
                 }],
             },
             ChatTurn::ToolResult { name, result } => GeminiContent {
@@ -266,6 +277,8 @@ struct VertexPart {
     text: Option<String>,
     #[serde(default, rename = "functionCall")]
     function_call: Option<GeminiFunctionCall>,
+    #[serde(default, rename = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 /// Decode one inbound SSE `data:` line into runtime events. Empty/comment
@@ -307,7 +320,8 @@ pub fn from_stream_line(line: &str) -> Result<Vec<GeminiStreamEvent>, String> {
                         out.push(GeminiStreamEvent::TextDelta(text));
                     }
                 }
-                if let Some(call) = part.function_call {
+                if let Some(mut call) = part.function_call {
+                    call.thought_signature = part.thought_signature;
                     out.push(GeminiStreamEvent::ToolCall(call));
                 }
             }
@@ -385,6 +399,7 @@ mod tests {
                 ChatTurn::ToolCall {
                     name: "search".into(),
                     args: json!({"q": "rust"}),
+                    thought_signature: None,
                 },
                 ChatTurn::ToolResult {
                     name: "search".into(),
@@ -469,7 +484,8 @@ mod tests {
             vec![
                 GeminiStreamEvent::ToolCall(GeminiFunctionCall {
                     name: "search".into(),
-                    args: json!({"q":"rust"})
+                    args: json!({"q":"rust"}),
+                    thought_signature: None,
                 }),
                 GeminiStreamEvent::Finish {
                     reason: Some("STOP".into())
