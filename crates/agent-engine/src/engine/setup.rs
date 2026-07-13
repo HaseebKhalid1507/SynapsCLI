@@ -129,8 +129,16 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         let model = agent_core::prompt::QualifiedModelId::parse(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
-        let context = agent_core::prompt::SelectionContext::new(model, None)
+        let context = agent_core::prompt::SelectionContext::new(model.clone(), None)
             .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        if let Some(policy) = manifest
+            .delegation_policy(model)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?
+        {
+            runtime.install_orchestration(Arc::new(
+                crate::orchestration::OrchestrationRuntime::new(policy),
+            ));
+        }
         let user = opts
             .system
             .as_ref()
