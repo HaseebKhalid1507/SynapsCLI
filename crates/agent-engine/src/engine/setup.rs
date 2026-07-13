@@ -131,7 +131,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         let registry = manifest
             .registry(path.parent())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
-        let model = agent_core::prompt::QualifiedModelId::parse(runtime.model())
+        let model = crate::orchestration::canonical_foreground_identity(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         let context = agent_core::prompt::SelectionContext::new(model.clone(), None)
             .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
@@ -172,7 +172,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
     } else {
-        let foreground = agent_core::prompt::QualifiedModelId::parse(runtime.model())
+        let foreground = crate::orchestration::canonical_foreground_identity(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         runtime.install_orchestration(Arc::new(
             crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)

@@ -61,6 +61,22 @@ impl std::fmt::Display for DispatchDenial {
     }
 }
 impl std::error::Error for DispatchDenial {}
+
+/// Canonicalize a runtime foreground model string into its exact qualified
+/// identity. Legacy configs persist bare Anthropic IDs (e.g. `claude-fable-5`)
+/// which the runtime router still deliberately routes to `anthropic`; the
+/// canonical identity is derived from that single routing entry point — never
+/// from substring heuristics. Unroutable values fail closed.
+pub fn canonical_foreground_identity(raw: &str) -> Result<QualifiedModelId, String> {
+    if let Ok(model) = QualifiedModelId::parse(raw) {
+        return Ok(model);
+    }
+    let route = crate::runtime::openai::resolve_route(raw)
+        .ok_or_else(|| format!("foreground model is unresolved: {raw}"))?;
+    QualifiedModelId::parse(format!("{}/{}", route.provider, route.model))
+        .map_err(|e| e.to_string())
+}
+
 impl OrchestrationRuntime {
     /// Build a snapshot exclusively from runtime-owned routing/catalog descriptors.
     /// `manifest_references` are deliberately ignored here: manifests may narrow the
@@ -368,6 +384,37 @@ mod tests {
     fn model(s: &str) -> QualifiedModelId {
         QualifiedModelId::parse(s).unwrap()
     }
+    /// Regression: a legacy config (`model = claude-fable-5`, no provider
+    /// segment) must not brick startup. The router deliberately routes bare
+    /// Claude IDs to `anthropic`, so the baseline foreground identity must be
+    /// the router's canonical `anthropic/<id>` — not a startup Config error.
+    #[test]
+    fn legacy_bare_claude_foreground_canonicalizes_via_router() {
+        let id = canonical_foreground_identity("claude-fable-5").unwrap();
+        assert_eq!(id.as_str(), "anthropic/claude-fable-5");
+        // The canonical identity must satisfy the manifestless baseline.
+        OrchestrationRuntime::baseline(id, 8, 64).unwrap();
+    }
+
+    #[test]
+    fn qualified_foreground_identity_passes_through_unchanged() {
+        for raw in [
+            "openai-codex/gpt-5.6-sol",
+            "anthropic/claude-fable-5",
+            "openrouter/z-ai/glm-5.1",
+        ] {
+            assert_eq!(canonical_foreground_identity(raw).unwrap().as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn unroutable_foreground_identity_fails_closed() {
+        // Neither a valid qualified ID nor routable: empty model segment
+        // under an unknown provider prefix.
+        assert!(canonical_foreground_identity("foo/").is_err());
+        assert!(canonical_foreground_identity("").is_err());
+    }
+
     #[test]
     fn trusted_catalog_rejects_unresolved_foreground_and_ignores_manifest_candidates() {
         let unresolved = model("invented/foreground");

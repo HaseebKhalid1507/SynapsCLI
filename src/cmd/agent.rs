@@ -242,8 +242,8 @@ pub async fn run(config_path: String, trigger_context: String) {
         std::process::exit(1);
     });
     runtime.set_model(config.agent.model.clone());
-    let foreground =
-        agent_core::prompt::QualifiedModelId::parse(runtime.model()).unwrap_or_else(|e| {
+    let foreground = agent_engine::orchestration::canonical_foreground_identity(runtime.model())
+        .unwrap_or_else(|e| {
             log(
                 agent_name,
                 &format!("FATAL: invalid foreground model: {}", e),
