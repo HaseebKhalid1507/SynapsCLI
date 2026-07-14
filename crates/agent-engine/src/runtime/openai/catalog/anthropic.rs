@@ -178,6 +178,20 @@ pub enum AnthropicManifestErrorCode {
     EvidenceMissing,
 }
 
+impl AnthropicManifestErrorCode {
+    /// Stable diagnostic identifier. Typed const manifests cannot contain
+    /// unknown enum values, so diagnostics intentionally never echo raw input.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::MalformedQualifiedId => "malformed_qualified_id",
+            Self::DuplicateId => "duplicate_id",
+            Self::ContradictoryCapabilities => "contradictory_capabilities",
+            Self::EvidenceMissing => "evidence_missing",
+        }
+    }
+}
+
 impl AnthropicCapabilityManifest {
     pub fn validate(self) -> Result<(), AnthropicManifestErrorCode> {
         if self.schema_version != ANTHROPIC_MODE_MANIFEST_VERSION {
@@ -362,6 +376,93 @@ pub fn plan_anthropic_execution(
             AnthropicWorkflowPlan::None
         },
     })
+}
+
+#[cfg(test)]
+mod manifest_validation_tests {
+    use super::*;
+    const GOOD: AnthropicManifestRow = AnthropicManifestRow {
+        qualified_id: "anthropic/claude-fable-5",
+        max_supported: true,
+        xhigh_supported: true,
+        workflow_supported: true,
+        evidence: "exact evidence",
+    };
+    fn manifest(
+        version: u16,
+        rows: &'static [AnthropicManifestRow],
+    ) -> AnthropicCapabilityManifest {
+        AnthropicCapabilityManifest {
+            schema_version: version,
+            rows,
+        }
+    }
+    #[test]
+    fn dedicated_manifest_failures_and_exact_fable_success() {
+        assert_eq!(
+            manifest(2, &[GOOD]).validate(),
+            Err(AnthropicManifestErrorCode::UnsupportedVersion)
+        );
+        assert_eq!(
+            manifest(
+                1,
+                &[AnthropicManifestRow {
+                    qualified_id: "anthropic/fable/5",
+                    ..GOOD
+                }]
+            )
+            .validate(),
+            Err(AnthropicManifestErrorCode::MalformedQualifiedId)
+        );
+        assert_eq!(
+            manifest(1, &[GOOD, GOOD]).validate(),
+            Err(AnthropicManifestErrorCode::DuplicateId)
+        );
+        assert_eq!(
+            manifest(
+                1,
+                &[AnthropicManifestRow {
+                    xhigh_supported: false,
+                    ..GOOD
+                }]
+            )
+            .validate(),
+            Err(AnthropicManifestErrorCode::ContradictoryCapabilities)
+        );
+        assert_eq!(
+            manifest(
+                1,
+                &[AnthropicManifestRow {
+                    evidence: " ",
+                    ..GOOD
+                }]
+            )
+            .validate(),
+            Err(AnthropicManifestErrorCode::EvidenceMissing)
+        );
+        assert_eq!(manifest(1, &[GOOD]).validate(), Ok(()));
+        assert!(anthropic_mode_capabilities("anthropic/claude-fable-5").is_some());
+        assert!(anthropic_mode_capabilities("anthropic/claude-fable-5-near").is_none());
+    }
+    #[test]
+    fn stable_errors_are_input_free() {
+        assert_eq!(
+            [
+                AnthropicManifestErrorCode::UnsupportedVersion.as_str(),
+                AnthropicManifestErrorCode::MalformedQualifiedId.as_str(),
+                AnthropicManifestErrorCode::DuplicateId.as_str(),
+                AnthropicManifestErrorCode::ContradictoryCapabilities.as_str(),
+                AnthropicManifestErrorCode::EvidenceMissing.as_str()
+            ],
+            [
+                "unsupported_version",
+                "malformed_qualified_id",
+                "duplicate_id",
+                "contradictory_capabilities",
+                "evidence_missing"
+            ]
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

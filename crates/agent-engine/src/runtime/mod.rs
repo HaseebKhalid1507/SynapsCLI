@@ -805,14 +805,15 @@ impl Runtime {
                 .get(name)
                 .is_some_and(|tool| tool.extension_id().is_none())
         };
+        let readiness = self
+            .orchestration
+            .as_ref()
+            .and_then(|runtime| runtime.ultracode_readiness(&self.model).ok());
         let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
             orchestration_policy: self.orchestration.is_some(),
-            foreground_worker_authorized: self
-                .orchestration
-                .as_ref()
-                .is_some_and(|runtime| runtime.preflight(&self.model).is_ok()),
-            concurrent_limit: usize::from(self.orchestration.is_some()),
-            total_limit: usize::from(self.orchestration.is_some()),
+            foreground_worker_authorized: readiness.is_some(),
+            concurrent_limit: readiness.map_or(0, |limits| limits.0),
+            total_limit: readiness.map_or(0, |limits| limits.1),
             lifecycle_start: builtin("subagent_start"),
             lifecycle_status: builtin("subagent_status"),
             lifecycle_steer: builtin("subagent_steer"),
@@ -874,14 +875,15 @@ impl Runtime {
                     .get(name)
                     .is_some_and(|tool| tool.extension_id().is_none())
             };
+            let readiness = self
+                .orchestration
+                .as_ref()
+                .and_then(|runtime| runtime.ultracode_readiness(model).ok());
             let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
                 orchestration_policy: self.orchestration.is_some(),
-                foreground_worker_authorized: self
-                    .orchestration
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.preflight(model).is_ok()),
-                concurrent_limit: usize::from(self.orchestration.is_some()),
-                total_limit: usize::from(self.orchestration.is_some()),
+                foreground_worker_authorized: readiness.is_some(),
+                concurrent_limit: readiness.map_or(0, |limits| limits.0),
+                total_limit: readiness.map_or(0, |limits| limits.1),
                 lifecycle_start: builtin("subagent_start"),
                 lifecycle_status: builtin("subagent_status"),
                 lifecycle_steer: builtin("subagent_steer"),

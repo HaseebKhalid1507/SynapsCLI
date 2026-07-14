@@ -151,6 +151,27 @@ impl OrchestrationRuntime {
             .map_err(|e| format!("delegation denied: {}", e.code()))
     }
 
+    /// Read-only UltraCode authorization snapshot. The exact foreground identity,
+    /// policy authorization, and configured limits are checked under one lock; no
+    /// worker reservation or lifecycle state is created.
+    pub fn ultracode_readiness(&self, model: &str) -> Result<(usize, usize), String> {
+        let model = QualifiedModelId::parse(model)
+            .map_err(|_| "delegation denied: invalid qualified model".to_string())?;
+        let inner = self.inner.lock().unwrap();
+        if inner.registry.foreground_model() != &model {
+            return Err("delegation denied: model is not exact foreground".into());
+        }
+        inner
+            .registry
+            .validate_dispatch(&model)
+            .map_err(|e| format!("delegation denied: {}", e.code()))?;
+        let policy = inner.registry.policy();
+        if policy.max_concurrent_workers == 0 || policy.max_total_workers == 0 {
+            return Err("delegation denied: invalid worker limits".into());
+        }
+        Ok((policy.max_concurrent_workers, policy.max_total_workers))
+    }
+
     /// Single parse/resolve/catalog/policy/limits decision point used by every
     /// public spawn path. No credential or provider object is reachable here.
     pub fn resolve_and_authorize(
