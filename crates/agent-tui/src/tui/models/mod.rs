@@ -323,8 +323,12 @@ fn remove_favorite_compat(id: &str) {
 
 /// Providers whose main-section seeds should be replaced by live catalog rows
 /// when the Models modal opens (logged-in OAuth discovery).
+///
+/// `openai-codex` is intentionally absent: its picker rows are hardcoded to
+/// the seven source-controlled OAuth slugs (`codex_static_catalog_models`)
+/// and must never be replaced by live `/models` results.
 pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
-    &["anthropic", "openai-codex"]
+    &["anthropic"]
 }
 
 /// Apply a live catalog result to both expanded state and main-section overrides.
@@ -651,18 +655,24 @@ fn provider_model_selections(
             .collect();
     }
 
-    if let Some(live) = catalog_overrides.get(provider.key) {
-        if !live.is_empty() {
-            return live
-                .iter()
-                .enumerate()
-                .map(|(order, (id, label))| ModelSelectionItem {
-                    id: id.clone(),
-                    label: label.clone(),
-                    tier: provider_model_tier(provider.key, id).to_string(),
-                    order,
-                })
-                .collect();
+    // OpenAI Codex OAuth picker rows are HARDCODED to the seven
+    // source-controlled slugs (`codex_static_catalog_models`). Live catalog
+    // overrides — however they got injected — must never replace them. This
+    // single choke point covers both /models and /settings (shared sections).
+    if provider.key != "openai-codex" {
+        if let Some(live) = catalog_overrides.get(provider.key) {
+            if !live.is_empty() {
+                return live
+                    .iter()
+                    .enumerate()
+                    .map(|(order, (id, label))| ModelSelectionItem {
+                        id: id.clone(),
+                        label: label.clone(),
+                        tier: provider_model_tier(provider.key, id).to_string(),
+                        order,
+                    })
+                    .collect();
+            }
         }
     }
 
@@ -1269,6 +1279,8 @@ mod tests {
 
     /// Live catalog overrides (the /models live-list behavior) must flow
     /// through to the shared picker rows so /settings sees the same data.
+    /// Uses Anthropic — the only provider with live picker discovery;
+    /// openai-codex rows are hardcoded (see the static-slug tests below).
     #[test]
     fn picker_rows_include_live_catalog_overrides() {
         let state = ModelsModalState {
@@ -1279,24 +1291,26 @@ mod tests {
             favorites: BTreeSet::new(),
             expanded: None,
             provider_catalog_overrides: std::collections::BTreeMap::from([(
-                "openai-codex".to_string(),
-                vec![("gpt-live-1".to_string(), "Live One".to_string())],
+                "anthropic".to_string(),
+                vec![("claude-live-1".to_string(), "Live One".to_string())],
             )]),
         };
         let sections = build_sections_from_parts(
             "m",
             &state,
             &ProviderAvailability::default(),
-            &BTreeSet::from(["openai-codex"]),
+            &BTreeSet::from(["anthropic"]),
         );
         let rows = picker_rows_from_sections(&sections, &Default::default());
         assert!(
-            rows.iter().any(|(_, v)| v == "openai-codex/gpt-live-1"),
+            rows.iter().any(|(_, v)| v == "anthropic/claude-live-1"),
             "live catalog override rows must appear with exact runtime ids: {rows:?}"
         );
         assert!(
-            !rows.iter().any(|(_, v)| v == "openai-codex/gpt-5.6-sol"),
-            "static seeds are replaced by live overrides"
+            !rows
+                .iter()
+                .any(|(_, v)| v.starts_with("anthropic/") && v != "anthropic/claude-live-1"),
+            "static seeds are replaced by live overrides: {rows:?}"
         );
     }
 
@@ -1628,20 +1642,20 @@ mod tests {
     }
 
     #[test]
-    fn openai_codex_live_override_models_have_exact_tier_labels() {
+    fn openai_codex_tier_labels_stay_exact_even_when_override_is_injected() {
         let provider = dev_model_providers()
             .into_iter()
             .find(|provider| provider.key == "openai-codex")
             .expect("OpenAI Codex provider");
-        let live = vec![
-            ("gpt-5.6-sol".to_string(), "GPT-5.6 Sol".to_string()),
-            ("gpt-5.6-terra".to_string(), "GPT-5.6 Terra".to_string()),
-            ("gpt-5.6-luna".to_string(), "GPT-5.6 Luna".to_string()),
-            ("gpt-5.5".to_string(), "GPT-5.5".to_string()),
-        ];
+        // An injected override is ignored — selections come from static seeds.
+        let live = vec![("gpt-live-1".to_string(), "Live One".to_string())];
         let overrides = std::collections::BTreeMap::from([("openai-codex".to_string(), live)]);
         let selections =
             provider_model_selections(&provider, &ProviderAvailability::default(), &overrides);
+        assert!(
+            !selections.iter().any(|model| model.id == "gpt-live-1"),
+            "injected override rows must not appear"
+        );
         let tier = |id: &str| {
             selections
                 .iter()
@@ -1856,7 +1870,9 @@ mod tests {
             expanded: None,
             provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
-        // Stale static seeds would include gpt-5.5 etc; live list returns different IDs.
+        // A live openai-codex list may still be applied to state (expanded
+        // view / capability metadata), but it must never replace the
+        // hardcoded picker rows.
         apply_model_list_result(
             &mut state,
             "openai-codex",
@@ -1880,7 +1896,7 @@ mod tests {
         );
 
         let sections = build_sections_from_parts(
-            "openai-codex/gpt-5.3-codex",
+            "openai-codex/gpt-5.5",
             &state,
             &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic", "openai-codex"]),
@@ -1890,11 +1906,20 @@ mod tests {
             .find(|s| s.provider_key == "openai-codex")
             .expect("codex section");
         let codex_ids: Vec<_> = codex.entries.iter().map(|e| e.id.as_str()).collect();
+        // Hardcoded OAuth slugs win over the live list.
         assert_eq!(
             codex_ids,
-            vec!["openai-codex/gpt-5.3-codex", "openai-codex/o3"]
+            vec![
+                "openai-codex/gpt-5.6-sol",
+                "openai-codex/gpt-5.6-terra",
+                "openai-codex/gpt-5.6-luna",
+                "openai-codex/gpt-5.5",
+                "openai-codex/gpt-5.4",
+                "openai-codex/gpt-5.4-mini",
+                "openai-codex/gpt-5.3-codex-spark",
+            ]
         );
-        assert!(!codex_ids.iter().any(|id| *id == "openai-codex/gpt-5.5"));
+        assert!(!codex_ids.iter().any(|id| *id == "openai-codex/o3"));
 
         let anthropic = sections
             .iter()
@@ -1974,5 +1999,93 @@ mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
         assert!(state.provider_catalog_overrides.contains_key("anthropic"));
+    }
+
+    /// (a) Auto refresh must exclude openai-codex (its picker rows are
+    /// hardcoded OAuth slugs) while retaining live Anthropic discovery.
+    #[test]
+    fn auto_refresh_excludes_openai_codex_but_retains_anthropic() {
+        let providers = auto_refresh_catalog_providers();
+        assert!(
+            providers.contains(&"anthropic"),
+            "anthropic live discovery must be preserved: {providers:?}"
+        );
+        assert!(
+            !providers.contains(&"openai-codex"),
+            "openai-codex picker rows are hardcoded — no auto catalog refresh: {providers:?}"
+        );
+    }
+
+    /// (b) Even if an openai-codex catalog override is injected (e.g. stale
+    /// cache or live /models fetch), it must NOT replace the static picker
+    /// rows — in the /models sections nor in the shared /settings picker rows.
+    #[test]
+    fn injected_openai_codex_override_cannot_replace_static_picker_rows() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::from([(
+                "openai-codex".to_string(),
+                vec![("gpt-live-1".to_string(), "Live One".to_string())],
+            )]),
+        };
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        assert!(
+            !codex.entries.iter().any(|e| e.id.contains("gpt-live-1")),
+            "injected override must not surface in /models sections"
+        );
+        // /settings shares the same sections → same guarantee via picker rows.
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert!(
+            !rows.iter().any(|(_, v)| v == "openai-codex/gpt-live-1"),
+            "injected override must not surface in /settings picker rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, v)| v == "openai-codex/gpt-5.6-sol"),
+            "static OAuth slugs must remain: {rows:?}"
+        );
+    }
+
+    /// (c) The openai-codex picker rows are exactly the seven source-controlled
+    /// OAuth slugs, in catalog order — regardless of any injected override.
+    #[test]
+    fn openai_codex_picker_rows_are_exactly_the_seven_static_oauth_slugs() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        let overrides = std::collections::BTreeMap::from([(
+            "openai-codex".to_string(),
+            vec![("gpt-live-1".to_string(), "Live One".to_string())],
+        )]);
+        let selections =
+            provider_model_selections(&provider, &ProviderAvailability::default(), &overrides);
+        let ids: Vec<_> = selections.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ],
+            "openai-codex picker rows must be exactly the seven hardcoded OAuth slugs, in order"
+        );
     }
 }
