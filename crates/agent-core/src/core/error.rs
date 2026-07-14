@@ -90,6 +90,56 @@ pub fn humanize_network_error(e: &reqwest::Error) -> String {
     }
 }
 
+/// Render an error's full cause chain (`Display` of every level, `: `-joined).
+///
+/// `format!("{e}")` on a `reqwest::Error` prints only the top level — e.g.
+/// `error sending request for url (…)` — and silently drops the source that
+/// says *why* (`operation timed out`, `dns error`, `connection refused`, …).
+/// That cost a real postmortem hours; always surface the chain.
+pub fn error_chain_string(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let cause_str = cause.to_string();
+        // Some wrappers already embed their source's Display; skip duplicates.
+        if !msg.contains(&cause_str) {
+            msg.push_str(": ");
+            msg.push_str(&cause_str);
+        }
+        source = cause.source();
+    }
+    msg
+}
+
+/// Host-aware variant of [`humanize_network_error`] for non-Anthropic
+/// providers (OpenAI Codex, Groq, local OpenAI-compat endpoints, …).
+///
+/// Unlike the Anthropic-specific helper this derives the host from the
+/// failing request's URL and preserves the underlying cause chain, so
+/// `chatgpt.com` failures are never misattributed and the *reason*
+/// (timeout vs connect vs mid-stream drop) survives into the UI.
+pub fn humanize_provider_network_error(e: &reqwest::Error) -> String {
+    let host = e
+        .url()
+        .and_then(|u| u.host_str())
+        .map(String::from)
+        .unwrap_or_else(|| "the provider endpoint".to_string());
+    let chain = error_chain_string(e);
+    if e.is_timeout() {
+        format!(
+            "Request to {host} timed out — usually transient; check your connection and try again. [{chain}]"
+        )
+    } else if e.is_connect() {
+        format!(
+            "Could not reach {host} (connection failed). Check your network, DNS, or proxy settings. [{chain}]"
+        )
+    } else if e.is_body() || e.is_decode() {
+        format!("Connection to {host} lost mid-response — usually transient; try again. [{chain}]")
+    } else {
+        format!("Network error talking to {host}: {chain}")
+    }
+}
+
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[cfg(test)]
@@ -162,6 +212,96 @@ mod tests {
         // After truncation at 198 bytes (the last safe boundary before 200), we get
         // 198 'a's — confirm no garbled bytes leaked through
         assert!(!msg.contains('\u{FFFD}'), "replacement char leaked: {msg}");
+    }
+
+    // ── error_chain_string: full cause chain, not just the top Display ──────
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    #[derive(Debug)]
+    struct Inner;
+
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error sending request for url (https://example.com/x)")
+        }
+    }
+    impl std::fmt::Display for Inner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "operation timed out")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    impl std::error::Error for Inner {}
+
+    #[test]
+    fn error_chain_string_joins_all_sources() {
+        let msg = error_chain_string(&Outer(Inner));
+        assert!(
+            msg.contains("error sending request") && msg.contains("operation timed out"),
+            "chain must include top-level AND source: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_chain_string_single_level_has_no_separator_suffix() {
+        let msg = error_chain_string(&Inner);
+        assert_eq!(msg, "operation timed out");
+    }
+
+    // ── humanize_provider_network_error: host-aware transport messaging ─────
+
+    /// Listener that accepts connections but never responds → client-side
+    /// timeout while awaiting response headers (the incident failure mode).
+    #[tokio::test]
+    async fn humanize_provider_timeout_names_host_and_says_transient() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Keep the listener alive but never accept/respond.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .post(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("must time out");
+        drop(listener);
+        assert!(err.is_timeout(), "precondition: {err:?}");
+        let msg = humanize_provider_network_error(&err);
+        assert!(msg.contains("127.0.0.1"), "must name the host: {msg}");
+        assert!(msg.contains("timed out"), "must say timed out: {msg}");
+        assert!(msg.contains("transient"), "must flag transience: {msg}");
+        assert!(
+            !msg.contains("api.anthropic.com"),
+            "must not claim the Anthropic host: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn humanize_provider_connect_error_names_host() {
+        // Bind then drop → guaranteed-refused port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let err = client
+            .post(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("must fail to connect");
+        assert!(err.is_connect(), "precondition: {err:?}");
+        let msg = humanize_provider_network_error(&err);
+        assert!(msg.contains("127.0.0.1"), "must name the host: {msg}");
+        assert!(
+            msg.contains("Could not reach"),
+            "must describe connection failure: {msg}"
+        );
     }
 
     #[test]
