@@ -193,7 +193,9 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_effort_high",
             model: adaptive,
             thinking_budget: 16384, // "high" → output_config.effort present
-            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            // Runtime invariant: budget 16384 always pairs with named High
+            // (from_legacy_budget sync). The named level drives effort now.
+            reasoning_level: agent_core::reasoning::ReasoningLevel::High,
             ttl: CacheTtl::FiveMinutes,
             tools: two_tools(),
             system_prompt: None,
@@ -249,7 +251,9 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_tools_1h",
             model: adaptive,
             thinking_budget: 16384,
-            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            // Runtime invariant: budget 16384 always pairs with named High
+            // (from_legacy_budget sync). The named level drives effort now.
+            reasoning_level: agent_core::reasoning::ReasoningLevel::High,
             ttl: CacheTtl::OneHour,
             tools: two_tools(),
             system_prompt: None,
@@ -262,7 +266,9 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_sync_system_5m",
             model: adaptive,
             thinking_budget: 16384,
-            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            // Runtime invariant: budget 16384 always pairs with named High
+            // (from_legacy_budget sync). The named level drives effort now.
+            reasoning_level: agent_core::reasoning::ReasoningLevel::High,
             ttl: CacheTtl::FiveMinutes,
             tools: vec![],
             system_prompt: Some("You review Rust code.".to_string()),

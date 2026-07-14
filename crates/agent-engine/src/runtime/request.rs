@@ -79,9 +79,24 @@ impl<'a> RequestBody<'a> {
             Some(json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" }))
         };
         let output_config = if adaptive && reasoning_level != ReasoningLevel::Off {
-            let level = crate::core::models::thinking_level_for_budget(thinking_budget);
-            crate::core::models::effort_for_thinking_level(level)
-                .map(|effort| json!({ "effort": effort }))
+            match reasoning_level {
+                // Adaptive: model decides — omit output_config.effort.
+                ReasoningLevel::Adaptive => None,
+                // The NAMED level is authoritative for the exact effort value.
+                ReasoningLevel::Low
+                | ReasoningLevel::Medium
+                | ReasoningLevel::High
+                | ReasoningLevel::XHigh => Some(json!({ "effort": reasoning_level.as_str() })),
+                // Max/Ultra are rejected upstream for Anthropic models; if a
+                // stale value leaks here, fall back to the legacy
+                // budget-derived mapping rather than inventing an unsupported
+                // named effort on the wire.
+                _ => {
+                    let level = crate::core::models::thinking_level_for_budget(thinking_budget);
+                    crate::core::models::effort_for_thinking_level(level)
+                        .map(|effort| json!({ "effort": effort }))
+                }
+            }
         } else {
             None
         };
@@ -267,5 +282,85 @@ mod beta_header_tests {
             ApiMethods::build_beta_header("api_key", &options, MODEL).as_deref(),
             Some("context-1m-2025-08-07,extended-cache-ttl-2025-04-11"),
         );
+    }
+}
+
+#[cfg(test)]
+mod anthropic_reasoning_body_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    const ADAPTIVE_MODEL: &str = "claude-opus-4-7";
+    const FIXED_MODEL: &str = "claude-sonnet-4-6";
+
+    fn body_json(model: &str, thinking_budget: u32, level: ReasoningLevel) -> serde_json::Value {
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let body = RequestBody::new(
+            model,
+            &messages,
+            &[],
+            &None,
+            "api_key",
+            thinking_budget,
+            level,
+            CacheTtl::FiveMinutes,
+            false,
+        );
+        serde_json::to_value(&body).expect("serialize")
+    }
+
+    #[test]
+    fn off_omits_thinking_and_output_config_on_both_shapes() {
+        for model in [ADAPTIVE_MODEL, FIXED_MODEL] {
+            let v = body_json(model, 4096, ReasoningLevel::Off);
+            assert!(v.get("thinking").is_none(), "{model}");
+            assert!(v.get("output_config").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn adaptive_level_uses_adaptive_wire_and_omits_effort() {
+        let v = body_json(ADAPTIVE_MODEL, 0, ReasoningLevel::Adaptive);
+        assert_eq!(
+            v["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(
+            v.get("output_config").is_none(),
+            "Adaptive must omit output_config.effort (model decides)"
+        );
+    }
+
+    /// The NAMED level is authoritative for effort — not the legacy budget.
+    #[test]
+    fn named_level_drives_exact_effort_on_adaptive_models() {
+        for (level, effort) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+            (ReasoningLevel::XHigh, "xhigh"),
+        ] {
+            // Deliberately mismatched legacy budget (4096 = medium tier):
+            // effort must come from the named level, never the budget bucket.
+            let v = body_json(ADAPTIVE_MODEL, 4096, level);
+            assert_eq!(v["output_config"], json!({"effort": effort}), "{level}");
+            assert_eq!(
+                v["thinking"],
+                json!({"type": "adaptive", "display": "summarized"})
+            );
+        }
+    }
+
+    /// Fixed-budget models keep enabled+budget_tokens exactly and must never
+    /// receive named effort values (no output_config at all).
+    #[test]
+    fn fixed_budget_models_keep_exact_budget_and_never_get_effort() {
+        let v = body_json(FIXED_MODEL, 8192, ReasoningLevel::High);
+        assert_eq!(
+            v["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8192, "display": "summarized"})
+        );
+        assert!(v.get("output_config").is_none());
     }
 }

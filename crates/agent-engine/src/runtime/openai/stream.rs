@@ -1240,7 +1240,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
     messages: &[crate::SharedMessage],
     tx: &mpsc::UnboundedSender<StreamEvent>,
     max_tokens: Option<u32>,
-    thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, names) = translate::tools_to_oai(tools_schema);
@@ -1256,25 +1256,22 @@ pub(crate) async fn call_xai_responses_stream_inner(
             })
         })
         .collect();
-    let mut body = serde_json::Map::new();
-    body.insert("model".into(), json!(cfg.model));
-    body.insert("input".into(), serde_json::to_value(input)?);
-    body.insert("stream".into(), json!(true));
-    if !tools.is_empty() {
-        body.insert("tools".into(), serde_json::to_value(tools)?);
-    }
-    if let Some(max) = max_tokens {
-        body.insert("max_output_tokens".into(), json!(max));
-    }
-    if thinking_budget > 0 {
-        body.insert("reasoning".into(), json!({"effort":"high"}));
-    }
+    // Pure, validated body construction — rejects unsupported reasoning
+    // combinations BEFORE any broker credential access or network I/O.
+    let body = build_xai_body(
+        &cfg.model,
+        reasoning_level,
+        serde_json::to_value(input)?,
+        tools,
+        max_tokens,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let mut stream = broker
         .proxy_stream(crate::auth::ProxyRequest {
             provider: "xai-auth".into(),
             method: crate::auth::ProxyMethod::Post,
             path: "/responses".into(),
-            body: Some(Value::Object(body)),
+            body: Some(body),
             stream: true,
         })
         .await?;
@@ -1304,13 +1301,152 @@ pub(crate) async fn call_xai_responses_stream_inner(
     Ok(json!({"role":"assistant","content":content}))
 }
 
+/// Pure, validated body construction for the xAI Responses API.
+///
+/// Enforces the exact-model reasoning matrix from
+/// `docs/anthropic-xai-reasoning-modes-spec.md` BEFORE any credential or
+/// network access, via the shared per-provider validator:
+/// - `Off` is rejected (never silently omitted) on models whose reasoning
+///   cannot be disabled; on the non-reasoning model it is trivially omission.
+/// - `Adaptive` omits the `reasoning` field → documented provider default.
+/// - Named levels are emitted as exact `reasoning:{effort:"..."}` only when
+///   the exact model id documents them; otherwise `Err` (fail closed).
+pub(crate) fn build_xai_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: Value,
+    tools: Vec<Value>,
+    max_tokens: Option<u32>,
+) -> Result<Value, String> {
+    use agent_core::reasoning::ReasoningLevel;
+    crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+        &format!("xai-auth/{model}"),
+        level,
+    )?;
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("input".into(), input);
+    body.insert("stream".into(), json!(true));
+    if !tools.is_empty() {
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(max) = max_tokens {
+        body.insert("max_output_tokens".into(), json!(max));
+    }
+    match level {
+        // Off (validated: only reachable where reasoning is absent/disableable)
+        // and Adaptive: omit `reasoning` — provider default applies.
+        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
+        l => {
+            body.insert("reasoning".into(), json!({ "effort": l.as_str() }));
+        }
+    }
+    Ok(Value::Object(body))
+}
+
 #[cfg(test)]
 mod xai_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
     #[test]
     fn xai_fixture_is_public_responses_shape() {
         let fixture = serde_json::json!({"type":"response.output_text.delta","delta":"hello"});
         assert_eq!(fixture["type"], "response.output_text.delta");
         assert_eq!(fixture["delta"], "hello");
+    }
+
+    fn body_for(model: &str, level: ReasoningLevel) -> Result<Value, String> {
+        build_xai_body(model, level, json!([]), Vec::new(), Some(1024))
+    }
+
+    // ── Exact Responses wire (spec: anthropic-xai-reasoning-modes) ───────────
+
+    #[test]
+    fn grok45_emits_exact_documented_efforts() {
+        for (level, effort) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+        ] {
+            let body = body_for("grok-4.5", level).expect("supported effort");
+            assert_eq!(body["reasoning"], json!({"effort": effort}), "{level}");
+            assert_eq!(body["model"], "grok-4.5");
+            assert_eq!(body["stream"], json!(true));
+            assert_eq!(body["max_output_tokens"], json!(1024));
+        }
+    }
+
+    #[test]
+    fn adaptive_omits_reasoning_field_provider_default() {
+        for model in [
+            "grok-4.5",
+            "grok-4.5-latest",
+            "grok-4.3",
+            "grok-4.20-0309-non-reasoning",
+        ] {
+            let body = body_for(model, ReasoningLevel::Adaptive).expect("adaptive is omission");
+            assert!(body.get("reasoning").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn off_is_rejected_pre_network_when_reasoning_cannot_be_disabled() {
+        for model in [
+            "grok-4.5",
+            "grok-4.5-latest",
+            "grok-4.20-multi-agent-0309",
+            "grok-4.3",
+        ] {
+            let err = body_for(model, ReasoningLevel::Off).unwrap_err();
+            assert!(err.contains(model), "{model}: {err}");
+        }
+        // Non-reasoning model: Off is trivially satisfied by omission.
+        let body = body_for("grok-4.20-0309-non-reasoning", ReasoningLevel::Off).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn unsupported_named_efforts_are_rejected_pre_network() {
+        // 4.5 has no documented xhigh; max/ultra never exist on xAI.
+        for level in [
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(body_for("grok-4.5", level).is_err(), "{level}");
+        }
+        // Intrinsic-reasoning models have no documented effort control.
+        assert!(body_for("grok-4.3", ReasoningLevel::Medium).is_err());
+        // Non-reasoning models reject named reasoning outright.
+        assert!(body_for("grok-4.20-0309-non-reasoning", ReasoningLevel::Medium).is_err());
+        // Unknown exact ids fail closed.
+        assert!(body_for("grok-9000", ReasoningLevel::Medium).is_err());
+    }
+
+    #[test]
+    fn multi_agent_xhigh_is_exact_agent_count_control() {
+        let body = body_for("grok-4.20-multi-agent-0309", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort": "xhigh"}));
+    }
+
+    #[test]
+    fn responses_wire_shape_tools_flat_and_no_chat_completions_fields() {
+        let tools = vec![json!({
+            "type": "function",
+            "name": "get_weather",
+            "description": "d",
+            "parameters": {"type": "object"}
+        })];
+        let body =
+            build_xai_body("grok-4.5", ReasoningLevel::High, json!([]), tools, None).unwrap();
+        // Responses API: flat tool objects + `input`, never chat-completions
+        // `messages`/nested function wrappers.
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert!(body["tools"][0].get("function").is_none());
+        assert!(body.get("input").is_some());
+        assert!(body.get("messages").is_none());
+        assert!(body.get("max_output_tokens").is_none());
     }
 }
 

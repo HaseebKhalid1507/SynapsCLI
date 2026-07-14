@@ -454,7 +454,7 @@ pub async fn try_route(
                 messages,
                 tx,
                 max_tokens,
-                thinking_budget,
+                reasoning_level,
                 cancel,
             )
             .await,
