@@ -34,6 +34,8 @@ pub enum ReasoningLevel {
     Max,
     /// Ultra — highest intensity, only a subset of Codex models supports this.
     Ultra,
+    /// Anthropic-only logical xhigh plus standing workflow mode.
+    UltraCode,
 }
 
 impl ReasoningLevel {
@@ -50,6 +52,7 @@ impl ReasoningLevel {
             "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
             "max" => Some(Self::Max),
             "ultra" => Some(Self::Ultra),
+            "ultracode" => Some(Self::UltraCode),
             _ => None,
         }
     }
@@ -68,6 +71,7 @@ impl ReasoningLevel {
             Self::XHigh => "xhigh",
             Self::Max => "max",
             Self::Ultra => "ultra",
+            Self::UltraCode => "ultracode",
         }
     }
 
@@ -81,7 +85,7 @@ impl ReasoningLevel {
             Self::Medium => Some(4096),
             Self::High => Some(16384),
             Self::XHigh => Some(32768),
-            Self::Max | Self::Ultra => None,
+            Self::Max | Self::Ultra | Self::UltraCode => None,
         }
     }
 
@@ -101,7 +105,12 @@ impl ReasoningLevel {
 
     /// All levels that are strictly above XHigh (require Codex-specific support).
     pub fn requires_codex_support(self) -> bool {
-        matches!(self, Self::Max | Self::Ultra)
+        matches!(self, Self::Ultra)
+    }
+
+    /// Whether this level requires exact Anthropic mode capability evidence.
+    pub fn requires_anthropic_support(self) -> bool {
+        matches!(self, Self::Max | Self::UltraCode)
     }
 }
 
@@ -168,6 +177,19 @@ impl ThinkingSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ultracode_is_a_distinct_canonical_non_numeric_level() {
+        let level = ReasoningLevel::parse("ultracode").expect("canonical ultracode");
+        assert_eq!(level, ReasoningLevel::UltraCode);
+        assert_eq!(level.to_string(), "ultracode");
+        assert_ne!(level, ReasoningLevel::Ultra);
+        assert_ne!(level, ReasoningLevel::Max);
+        assert_ne!(level, ReasoningLevel::XHigh);
+        assert_eq!(level.to_legacy_budget(), None);
+        assert!(!level.requires_codex_support());
+        assert!(level.requires_anthropic_support());
+    }
 
     // ── Parse / round-trip ────────────────────────────────────────────────────
 
@@ -321,9 +343,10 @@ mod tests {
     // ── requires_codex_support ────────────────────────────────────────────────
 
     #[test]
-    fn only_max_and_ultra_require_codex_support() {
-        assert!(ReasoningLevel::Max.requires_codex_support());
+    fn only_ultra_requires_categorically_codex_support() {
+        assert!(!ReasoningLevel::Max.requires_codex_support());
         assert!(ReasoningLevel::Ultra.requires_codex_support());
+        assert!(!ReasoningLevel::UltraCode.requires_codex_support());
         assert!(!ReasoningLevel::XHigh.requires_codex_support());
         assert!(!ReasoningLevel::High.requires_codex_support());
         assert!(!ReasoningLevel::Adaptive.requires_codex_support());

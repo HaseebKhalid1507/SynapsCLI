@@ -29,6 +29,10 @@ git diff --check
 git status --short
 ```
 
+## Exact positive evidence amendment
+
+`anthropic/claude-fable-5` is the sole exact positive. Authoritative Claude Code 2.1.207 binary `/home/jr/.local/share/claude/versions/2.1.207`, SHA-256 `85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83`, and matching schema `/home/jr/.vscode/extensions/anthropic.claude-code-2.1.207-linux-x64/claude-code-settings.schema.json` prove supported effort `max`, UltraCode as xhigh plus workflows, and Fable 5 flags `max_effort` plus `xhigh_effort`; its live picker shows Max and UltraCode. This citation copies no binaries or secrets and grants no family/near-match capability.
+
 ## Tasks
 
 ### 1. Evidence-locked manifest and logical type

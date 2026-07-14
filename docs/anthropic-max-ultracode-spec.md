@@ -27,6 +27,10 @@ Assumptions:
 - The local Claude Code pane is read-only semantic evidence. It must not edit,
   generate, or apply implementation code.
 
+## Evidence and exact positive citation
+
+The exact production positive is `anthropic/claude-fable-5`. The local authoritative Claude Code 2.1.207 binary at `/home/jr/.local/share/claude/versions/2.1.207` (SHA-256 `85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83`) and matching settings schema at `/home/jr/.vscode/extensions/anthropic.claude-code-2.1.207-linux-x64/claude-code-settings.schema.json` prove that `max` is supported effort, UltraCode is xhigh plus workflows, and Fable 5 advertises `max_effort` plus `xhigh_effort`; the live Fable picker displays both Max and UltraCode. These paths and digest are citations only; no binary, credentials, or secrets are source-controlled. No neighboring or family model inherits this evidence.
+
 ## Evidence and explicit evidence gap
 
 The local Claude Code behavior establishes the requested **semantic mapping**:
@@ -48,14 +52,13 @@ Checked-in evidence inspected at this base:
   low/medium/high/xhigh for adaptive Anthropic models and no named effort for
   fixed-budget models.
 
-**Gap:** none of that checked-in evidence positively associates any exact model
-ID with Anthropic `max` or Synaps `ultracode`. Name recency, family, adaptive
-support, context size, `KNOWN_MODELS` membership, and support for `xhigh` are
-not evidence for either new capability. Therefore this increment must initially
-have **no model-specific positive IDs** unless implementation work adds a
-reviewable evidence citation alongside each exact manifest row. Tests may use
-explicit synthetic fixture IDs. Production must not enable Max/Ultracode for
-`claude-opus-4-7`, `claude-fable-5`, or any other ID merely by inference.
+**Resolved gap:** the authoritative 2.1.207 evidence cited above positively
+associates exact `anthropic/claude-fable-5` with Anthropic `max` and Synaps
+`ultracode`. Name recency, family, adaptive support, context size,
+`KNOWN_MODELS` membership, and support for `xhigh` remain insufficient evidence
+for any other model. Every future positive requires a reviewable adjacent
+citation. Production must not enable Max/Ultracode for `claude-opus-4-7`, a
+Fable near-match, or any other ID by inference.
 
 ## Exact semantics
 

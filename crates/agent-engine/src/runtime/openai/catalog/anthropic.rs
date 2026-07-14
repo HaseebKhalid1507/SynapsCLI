@@ -4,6 +4,54 @@ use serde::Deserialize;
 pub(super) const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 pub(super) const ANTHROPIC_MODELS_PAGE_LIMIT: usize = 100;
 
+/// Exact, evidence-backed Anthropic logical-mode capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicModeCapabilities {
+    pub max_supported: bool,
+    pub xhigh_supported: bool,
+    pub workflow_supported: bool,
+}
+
+impl AnthropicModeCapabilities {
+    pub const fn none() -> Self {
+        Self {
+            max_supported: false,
+            xhigh_supported: false,
+            workflow_supported: false,
+        }
+    }
+
+    pub const fn ultracode_supported(self) -> bool {
+        self.xhigh_supported && self.workflow_supported
+    }
+
+    /// Generic live effort metadata can only preserve or revoke special modes.
+    pub const fn narrow_with_live_effort(mut self, supported: Option<bool>) -> Self {
+        if matches!(supported, Some(false)) {
+            self.max_supported = false;
+            self.xhigh_supported = false;
+            self.workflow_supported = false;
+        }
+        self
+    }
+}
+
+/// Look up exact qualified identities only. No family or substring inference.
+pub fn anthropic_mode_capabilities(qualified_model: &str) -> Option<AnthropicModeCapabilities> {
+    match qualified_model {
+        // Evidence: Claude Code 2.1.207 binary SHA-256
+        // 85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83
+        // and its matching settings schema advertise Fable 5 max_effort and
+        // xhigh_effort; the live picker displays Max and UltraCode.
+        "anthropic/claude-fable-5" => Some(AnthropicModeCapabilities {
+            max_supported: true,
+            xhigh_supported: true,
+            workflow_supported: true,
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicCatalogPage {
     pub models: Vec<CatalogModel>,
@@ -139,6 +187,40 @@ pub fn merge_catalog_pages(pages: Vec<Vec<CatalogModel>>) -> Vec<CatalogModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_fable_mode_capabilities_are_evidence_locked() {
+        let caps = anthropic_mode_capabilities("anthropic/claude-fable-5")
+            .expect("exact qualified Fable 5 row");
+        assert!(caps.max_supported);
+        assert!(caps.xhigh_supported);
+        assert!(caps.workflow_supported);
+        assert!(caps.ultracode_supported());
+
+        for denied in [
+            "anthropic/claude-fable-5-preview",
+            "anthropic/claude-opus-4-7",
+            "openai/claude-fable-5",
+            "claude-fable-5",
+            "anthropic/fable-5",
+        ] {
+            assert_eq!(anthropic_mode_capabilities(denied), None, "{denied}");
+        }
+    }
+
+    #[test]
+    fn generic_live_effort_cannot_invent_special_modes_and_can_revoke() {
+        let static_caps = anthropic_mode_capabilities("anthropic/claude-fable-5").unwrap();
+        assert_eq!(static_caps.narrow_with_live_effort(Some(true)), static_caps);
+        let revoked = static_caps.narrow_with_live_effort(Some(false));
+        assert!(!revoked.max_supported);
+        assert!(!revoked.ultracode_supported());
+
+        assert_eq!(
+            AnthropicModeCapabilities::none().narrow_with_live_effort(Some(true)),
+            AnthropicModeCapabilities::none()
+        );
+    }
 
     // ── Exact static fallback descriptors (spec: anthropic-xai-reasoning-modes) ──
 

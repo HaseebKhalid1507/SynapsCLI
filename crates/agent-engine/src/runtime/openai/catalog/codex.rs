@@ -567,6 +567,8 @@ pub fn plan_codex_execution(
         ReasoningLevel::High => Some(CodexWireEffort::High),
         ReasoningLevel::XHigh => Some(CodexWireEffort::XHigh),
         ReasoningLevel::Max | ReasoningLevel::Ultra => Some(CodexWireEffort::Max),
+        // Anthropic-only logical mode; Codex validation rejects it before lowering.
+        ReasoningLevel::UltraCode => None,
     };
     let multi_agent_mode = if request_role == CodexRequestRole::Foreground
         && multi_agent_version == Some(CodexMultiAgentVersion::V2)
