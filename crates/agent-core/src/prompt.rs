@@ -101,17 +101,37 @@ impl ModelFamilyId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    XHigh,
+    Max,
+    UltraCode,
+}
+
 #[derive(Clone, Debug)]
 pub struct SelectionContext {
     model: QualifiedModelId,
     family: Option<ModelFamilyId>,
+    workflow_mode: Option<WorkflowMode>,
 }
 impl SelectionContext {
     pub fn new(
         model: QualifiedModelId,
         family: Option<ModelFamilyId>,
     ) -> Result<Self, PromptError> {
-        Ok(Self { model, family })
+        Ok(Self {
+            model,
+            family,
+            workflow_mode: None,
+        })
+    }
+    pub fn with_workflow_mode(mut self, mode: Option<WorkflowMode>) -> Self {
+        self.workflow_mode = mode;
+        self
+    }
+    pub fn workflow_mode(&self) -> Option<WorkflowMode> {
+        self.workflow_mode
     }
     pub fn model(&self) -> &QualifiedModelId {
         &self.model
@@ -127,6 +147,7 @@ pub struct PromptSelectors {
     provider: Option<String>,
     family: Option<ModelFamilyId>,
     exact: Option<QualifiedModelId>,
+    workflow_mode: Option<WorkflowMode>,
 }
 impl PromptSelectors {
     pub fn provider(v: impl Into<String>) -> Result<Self, PromptError> {
@@ -165,7 +186,20 @@ impl PromptSelectors {
             provider: Some(provider),
             exact: Some(exact),
             family: None,
+            workflow_mode: None,
         })
+    }
+    pub fn provider_exact_workflow(
+        provider: impl Into<String>,
+        exact: QualifiedModelId,
+        workflow_mode: WorkflowMode,
+    ) -> Result<Self, PromptError> {
+        let mut selectors = Self::provider_and_exact(provider, exact)?;
+        selectors.workflow_mode = Some(workflow_mode);
+        Ok(selectors)
+    }
+    pub fn workflow_mode(&self) -> Option<WorkflowMode> {
+        self.workflow_mode
     }
     fn validate(&self) -> Result<(), PromptError> {
         if let Some(p) = &self.provider {
@@ -200,6 +234,9 @@ impl PromptSelectors {
                 .as_ref()
                 .map_or(true, |f| c.family.as_ref() == Some(f))
             && self.exact.as_ref().map_or(true, |e| e == &c.model)
+            && self
+                .workflow_mode
+                .map_or(true, |mode| c.workflow_mode == Some(mode))
     }
 }
 
@@ -731,23 +768,43 @@ pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule 
 /// worker is still running.
 const CODEX_SUBAGENT_SUPERVISION: &str =
     include_str!("builtin_prompts/codex_subagent_supervision.md");
+const ANTHROPIC_ULTRACODE_WORKFLOW: &str =
+    include_str!("builtin_prompts/anthropic_ultracode_workflow.md");
 
 /// Builtin orchestration prompt adapters, shipped in source. Selection is
 /// typed: each adapter carries exact [`PromptSelectors`] (today a single
 /// `provider = openai-codex` module), so matching is provider-atom equality
 /// — never substring or inferred-family matching.
 pub fn builtin_orchestration_adapters() -> Vec<PromptModule> {
-    vec![PromptModule::new(
-        PromptModuleId::parse("builtin.codex.subagent-supervision")
-            .expect("builtin module id is valid"),
-        "1.0.0",
-        PromptModuleSource::Builtin,
-        10,
-        PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
-        ModuleMutability::MutableGuidance,
-        CODEX_SUBAGENT_SUPERVISION.trim_end(),
-    )
-    .expect("builtin doctrine is within size limit")]
+    vec![
+        PromptModule::new(
+            PromptModuleId::parse("builtin.codex.subagent-supervision")
+                .expect("builtin module id is valid"),
+            "1.0.0",
+            PromptModuleSource::Builtin,
+            10,
+            PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
+            ModuleMutability::MutableGuidance,
+            CODEX_SUBAGENT_SUPERVISION.trim_end(),
+        )
+        .expect("builtin doctrine is within size limit"),
+        PromptModule::new(
+            PromptModuleId::parse("builtin.anthropic.ultracode-workflow")
+                .expect("builtin module id is valid"),
+            "1.0.0",
+            PromptModuleSource::Builtin,
+            20,
+            PromptSelectors::provider_exact_workflow(
+                "anthropic",
+                QualifiedModelId::parse("anthropic/claude-fable-5").expect("valid exact model"),
+                WorkflowMode::UltraCode,
+            )
+            .expect("builtin selector is valid"),
+            ModuleMutability::MutableGuidance,
+            ANTHROPIC_ULTRACODE_WORKFLOW.trim_end(),
+        )
+        .expect("builtin doctrine is within size limit"),
+    ]
 }
 
 /// Compose `base` with every builtin orchestration adapter matching

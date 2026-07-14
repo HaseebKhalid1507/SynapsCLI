@@ -475,24 +475,27 @@ impl Runtime {
         if self.effective_prompt.is_some() {
             return self.system_prompt.clone();
         }
-        if self.model == "anthropic/claude-fable-5"
-            && self.reasoning_level() == agent_core::reasoning::ReasoningLevel::UltraCode
-            && self.codex_request_role()
-                == crate::runtime::openai::catalog::ExecutionRole::Foreground
-        {
-            return Some(format!(
-                "{}\n\n{}",
-                self.system_prompt.as_deref().unwrap_or_default(),
-                crate::runtime::openai::catalog::ANTHROPIC_ULTRACODE_WORKFLOW
-            ));
-        }
         if self.tools.read().await.get("subagent_start").is_none() {
             return self.system_prompt.clone();
         }
         let Ok(model) = crate::orchestration::canonical_foreground_identity(&self.model) else {
             return self.system_prompt.clone();
         };
-        let Ok(context) = agent_core::prompt::SelectionContext::new(model, None) else {
+        let workflow_mode = match self.reasoning_level() {
+            agent_core::reasoning::ReasoningLevel::UltraCode => {
+                Some(agent_core::prompt::WorkflowMode::UltraCode)
+            }
+            agent_core::reasoning::ReasoningLevel::Max => {
+                Some(agent_core::prompt::WorkflowMode::Max)
+            }
+            agent_core::reasoning::ReasoningLevel::XHigh => {
+                Some(agent_core::prompt::WorkflowMode::XHigh)
+            }
+            _ => None,
+        };
+        let Ok(context) = agent_core::prompt::SelectionContext::new(model, None)
+            .map(|context| context.with_workflow_mode(workflow_mode))
+        else {
             return self.system_prompt.clone();
         };
         agent_core::prompt::compose_orchestration_prompt(self.system_prompt.as_deref(), &context)
