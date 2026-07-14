@@ -422,10 +422,13 @@ pub async fn run(
         synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
             std::sync::Arc::clone(&ext_mgr_shared),
         );
+    // Stop the signal-listener thread (signal-hook handle, not a JoinHandle).
     shutdown_signal_task.close();
 
+    // Shut down background tasks (inbox watcher, socket, session registry)
     background.shutdown();
 
+    // ── Render-thread teardown ───────────────────────────────────────────────
     //
     // The render thread owns the Terminal.  We send it a Teardown command and
     // wait for the ack within the combined SAVE + HOOKS budget already spent
