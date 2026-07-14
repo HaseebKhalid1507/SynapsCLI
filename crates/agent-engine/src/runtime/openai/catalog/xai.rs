@@ -73,6 +73,55 @@ pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
     XAI_TEXT_MODELS.iter().find(|model| model.id == id)
 }
 
+// ─── Exact-id reasoning capability (spec: anthropic-xai-reasoning-modes) ─────
+
+/// Documented reasoning capability for an exact xAI model id.
+///
+/// Evidence: official xAI docs. `grok-4.5`/`grok-4.5-latest` support
+/// low/medium/high effort, default high, and reasoning cannot be disabled.
+/// `grok-4.20-multi-agent-0309` supports low/medium/high/xhigh where effort
+/// controls agent count. No other exact id has documented effort support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XaiReasoningCapability {
+    /// Documented named-effort control (`reasoning:{effort:"..."}` on the
+    /// Responses wire).
+    Effort {
+        supported: &'static [agent_core::reasoning::ReasoningLevel],
+        default_level: Option<agent_core::reasoning::ReasoningLevel>,
+        /// Whether reasoning can be disabled. `false` → `Off` must be
+        /// rejected, never silently omitted/downgraded.
+        can_disable: bool,
+    },
+    /// Reasoning is intrinsic; no documented effort control or disable switch.
+    IntrinsicReasoning,
+    /// Model does not reason; named reasoning levels must be rejected.
+    NonReasoning,
+}
+
+/// Exact-id capability lookup — never substring-based. Unknown ids return
+/// `None` and fail closed at validation time.
+pub fn xai_static_capability(model_id: &str) -> Option<XaiReasoningCapability> {
+    use agent_core::reasoning::ReasoningLevel::*;
+    match model_id {
+        "grok-4.5" | "grok-4.5-latest" => Some(XaiReasoningCapability::Effort {
+            supported: &[Low, Medium, High],
+            default_level: Some(High),
+            can_disable: false,
+        }),
+        "grok-4.20-multi-agent-0309" => Some(XaiReasoningCapability::Effort {
+            supported: &[Low, Medium, High, XHigh],
+            // Effort controls agent count; no documented default level.
+            default_level: None,
+            can_disable: false,
+        }),
+        "grok-4.3" | "grok-4.3-latest" | "grok-latest" | "grok-4.20-0309-reasoning" => {
+            Some(XaiReasoningCapability::IntrinsicReasoning)
+        }
+        "grok-4.20-0309-non-reasoning" => Some(XaiReasoningCapability::NonReasoning),
+        _ => None,
+    }
+}
+
 pub fn xai_static_catalog_models() -> Vec<CatalogModel> {
     XAI_TEXT_MODELS
         .iter()
@@ -138,6 +187,81 @@ mod tests {
                 "grok-4.5-latest",
             ]
         );
+    }
+
+    // ── Exact-id reasoning capability table (spec: anthropic-xai-reasoning-modes) ──
+
+    #[test]
+    fn grok_45_family_effort_capability_is_exact() {
+        use agent_core::reasoning::ReasoningLevel::*;
+        for id in ["grok-4.5", "grok-4.5-latest"] {
+            match xai_static_capability(id) {
+                Some(XaiReasoningCapability::Effort {
+                    supported,
+                    default_level,
+                    can_disable,
+                }) => {
+                    assert_eq!(supported, &[Low, Medium, High], "{id}");
+                    assert_eq!(default_level, Some(High), "{id}");
+                    assert!(!can_disable, "{id}: reasoning cannot be disabled");
+                }
+                other => panic!("{id}: expected Effort capability, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn multi_agent_supports_xhigh_but_45_does_not() {
+        use agent_core::reasoning::ReasoningLevel::*;
+        match xai_static_capability("grok-4.20-multi-agent-0309") {
+            Some(XaiReasoningCapability::Effort {
+                supported,
+                default_level,
+                can_disable,
+            }) => {
+                assert_eq!(supported, &[Low, Medium, High, XHigh]);
+                assert_eq!(default_level, None, "no documented default");
+                assert!(!can_disable);
+            }
+            other => panic!("expected Effort capability, got {other:?}"),
+        }
+        // 4.5 has no documented xhigh — must not appear in its set.
+        if let Some(XaiReasoningCapability::Effort { supported, .. }) =
+            xai_static_capability("grok-4.5")
+        {
+            assert!(!supported.contains(&XHigh));
+        }
+    }
+
+    #[test]
+    fn intrinsic_reasoning_models_have_no_named_effort() {
+        for id in [
+            "grok-4.3",
+            "grok-4.3-latest",
+            "grok-latest",
+            "grok-4.20-0309-reasoning",
+        ] {
+            assert_eq!(
+                xai_static_capability(id),
+                Some(XaiReasoningCapability::IntrinsicReasoning),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_reasoning_model_is_marked_non_reasoning() {
+        assert_eq!(
+            xai_static_capability("grok-4.20-0309-non-reasoning"),
+            Some(XaiReasoningCapability::NonReasoning)
+        );
+    }
+
+    #[test]
+    fn unknown_exact_ids_fail_closed() {
+        for id in ["grok-5", "grok-4.50", "grok-4.5x", "", "gpt-5.5"] {
+            assert_eq!(xai_static_capability(id), None, "{id}");
+        }
     }
 
     #[test]

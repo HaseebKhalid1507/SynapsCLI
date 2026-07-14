@@ -48,9 +48,7 @@ pub fn has_provider(provider_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::openai::catalog::{
-        CatalogProviderKind, CatalogSource, ReasoningSupport,
-    };
+    use crate::runtime::openai::catalog::{CatalogProviderKind, CatalogSource, ReasoningSupport};
     use agent_core::reasoning::ReasoningLevel;
 
     fn make_model(runtime_id: &str) -> CatalogModel {
@@ -87,8 +85,10 @@ mod tests {
         let cached = get("openai-codex/gpt-5.6-sol").unwrap();
         match cached.reasoning {
             ReasoningSupport::CodexNamed { supported, .. } => {
-                assert!(!supported.contains(&ReasoningLevel::Ultra),
-                    "live cache must override static — Ultra should be absent");
+                assert!(
+                    !supported.contains(&ReasoningLevel::Ultra),
+                    "live cache must override static — Ultra should be absent"
+                );
                 assert!(supported.contains(&ReasoningLevel::Low));
             }
             other => panic!("expected CodexNamed, got {other:?}"),

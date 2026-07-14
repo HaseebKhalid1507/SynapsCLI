@@ -41,13 +41,13 @@ mod openrouter;
 mod xai;
 
 pub use anthropic::{
-    anthropic_models_url, merge_catalog_pages, parse_anthropic_catalog_models,
-    parse_anthropic_catalog_page, AnthropicCatalogPage,
+    anthropic_models_url, anthropic_static_capability, merge_catalog_pages,
+    parse_anthropic_catalog_models, parse_anthropic_catalog_page, AnthropicCatalogPage,
 };
 pub use codex::{
-    codex_models_path, codex_models_url, codex_static_catalog_models,
-    codex_static_capability, parse_codex_catalog_models, validate_codex_level,
-    PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
+    codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
+    parse_codex_catalog_models, validate_codex_level, PROVIDER_KEY as CODEX_PROVIDER_KEY,
+    PROVIDER_NAME as CODEX_PROVIDER_NAME,
 };
 pub use generic::parse_generic_catalog_models;
 pub use github_copilot::{
@@ -67,7 +67,10 @@ pub use google_gemini::{
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
-pub use xai::{xai_model, xai_static_catalog_models, XaiModelDescriptor, XAI_TEXT_MODELS};
+pub use xai::{
+    xai_model, xai_static_capability, xai_static_catalog_models, XaiModelDescriptor,
+    XaiReasoningCapability, XAI_TEXT_MODELS,
+};
 
 // ─── Modality ────────────────────────────────────────────────────────────────
 

@@ -356,14 +356,23 @@ mod tests {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let m = models.iter().find(|m| m.id == "gpt-5.5").unwrap();
         assert!(m.codex_supports_level(ReasoningLevel::XHigh));
-        assert!(!m.codex_supports_level(ReasoningLevel::Max), "gpt-5.5 must NOT support max");
-        assert!(!m.codex_supports_level(ReasoningLevel::Ultra), "gpt-5.5 must NOT support ultra");
+        assert!(
+            !m.codex_supports_level(ReasoningLevel::Max),
+            "gpt-5.5 must NOT support max"
+        );
+        assert!(
+            !m.codex_supports_level(ReasoningLevel::Ultra),
+            "gpt-5.5 must NOT support ultra"
+        );
     }
 
     #[test]
     fn parse_fixture_spark_has_xhigh_not_max_or_ultra() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
-        let spark = models.iter().find(|m| m.id == "gpt-5.3-codex-spark").unwrap();
+        let spark = models
+            .iter()
+            .find(|m| m.id == "gpt-5.3-codex-spark")
+            .unwrap();
         assert!(spark.codex_supports_level(ReasoningLevel::XHigh));
         assert!(!spark.codex_supports_level(ReasoningLevel::Max));
         assert!(!spark.codex_supports_level(ReasoningLevel::Ultra));
@@ -373,19 +382,38 @@ mod tests {
     fn parse_fixture_default_levels_match_observed_cache() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let get = |id: &str| {
-            models.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("missing {id}"))
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
         };
         let default_of = |id: &str| match &get(id).reasoning {
             ReasoningSupport::CodexNamed { default_level, .. } => *default_level,
             other => panic!("{id}: expected CodexNamed, got {other:?}"),
         };
-        assert_eq!(default_of("gpt-5.6-sol"),        Some(ReasoningLevel::Low),    "sol");
-        assert_eq!(default_of("gpt-5.6-terra"),      Some(ReasoningLevel::Medium), "terra");
-        assert_eq!(default_of("gpt-5.6-luna"),       Some(ReasoningLevel::Medium), "luna");
-        assert_eq!(default_of("gpt-5.5"),            Some(ReasoningLevel::Medium), "5.5");
-        assert_eq!(default_of("gpt-5.4"),            Some(ReasoningLevel::Medium), "5.4");
-        assert_eq!(default_of("gpt-5.4-mini"),       Some(ReasoningLevel::Medium), "5.4-mini");
-        assert_eq!(default_of("gpt-5.3-codex-spark"),Some(ReasoningLevel::High),   "spark");
+        assert_eq!(default_of("gpt-5.6-sol"), Some(ReasoningLevel::Low), "sol");
+        assert_eq!(
+            default_of("gpt-5.6-terra"),
+            Some(ReasoningLevel::Medium),
+            "terra"
+        );
+        assert_eq!(
+            default_of("gpt-5.6-luna"),
+            Some(ReasoningLevel::Medium),
+            "luna"
+        );
+        assert_eq!(default_of("gpt-5.5"), Some(ReasoningLevel::Medium), "5.5");
+        assert_eq!(default_of("gpt-5.4"), Some(ReasoningLevel::Medium), "5.4");
+        assert_eq!(
+            default_of("gpt-5.4-mini"),
+            Some(ReasoningLevel::Medium),
+            "5.4-mini"
+        );
+        assert_eq!(
+            default_of("gpt-5.3-codex-spark"),
+            Some(ReasoningLevel::High),
+            "spark"
+        );
     }
 
     #[test]
@@ -414,10 +442,20 @@ mod tests {
     fn static_sol_has_ultra_and_default_low() {
         let cap = codex_static_capability("gpt-5.6-sol").expect("sol");
         match cap {
-            ReasoningSupport::CodexNamed { supported, default_level } => {
-                assert!(supported.contains(&ReasoningLevel::Ultra), "sol needs ultra");
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+            } => {
+                assert!(
+                    supported.contains(&ReasoningLevel::Ultra),
+                    "sol needs ultra"
+                );
                 assert!(supported.contains(&ReasoningLevel::Max), "sol needs max");
-                assert_eq!(default_level, Some(ReasoningLevel::Low), "sol default is Low");
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::Low),
+                    "sol default is Low"
+                );
             }
             _ => panic!("expected CodexNamed"),
         }
@@ -427,10 +465,20 @@ mod tests {
     fn static_terra_has_ultra_and_default_medium() {
         let cap = codex_static_capability("gpt-5.6-terra").expect("terra");
         match cap {
-            ReasoningSupport::CodexNamed { supported, default_level } => {
-                assert!(supported.contains(&ReasoningLevel::Ultra), "terra needs ultra");
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+            } => {
+                assert!(
+                    supported.contains(&ReasoningLevel::Ultra),
+                    "terra needs ultra"
+                );
                 assert!(supported.contains(&ReasoningLevel::Max), "terra needs max");
-                assert_eq!(default_level, Some(ReasoningLevel::Medium), "terra default is Medium");
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::Medium),
+                    "terra default is Medium"
+                );
             }
             _ => panic!("expected CodexNamed"),
         }
@@ -440,10 +488,17 @@ mod tests {
     fn static_luna_has_max_not_ultra_and_default_medium() {
         let cap = codex_static_capability("gpt-5.6-luna").unwrap();
         match cap {
-            ReasoningSupport::CodexNamed { supported, default_level } => {
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+            } => {
                 assert!(supported.contains(&ReasoningLevel::Max));
                 assert!(!supported.contains(&ReasoningLevel::Ultra));
-                assert_eq!(default_level, Some(ReasoningLevel::Medium), "luna default is Medium");
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::Medium),
+                    "luna default is Medium"
+                );
             }
             _ => panic!(),
         }
@@ -454,11 +509,27 @@ mod tests {
         for id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] {
             let cap = codex_static_capability(id).expect(id);
             match cap {
-                ReasoningSupport::CodexNamed { supported, default_level } => {
-                    assert!(supported.contains(&ReasoningLevel::XHigh), "{id} needs xhigh");
-                    assert!(!supported.contains(&ReasoningLevel::Max), "{id} must NOT have max");
-                    assert!(!supported.contains(&ReasoningLevel::Ultra), "{id} must NOT have ultra");
-                    assert_eq!(default_level, Some(ReasoningLevel::Medium), "{id} default is Medium");
+                ReasoningSupport::CodexNamed {
+                    supported,
+                    default_level,
+                } => {
+                    assert!(
+                        supported.contains(&ReasoningLevel::XHigh),
+                        "{id} needs xhigh"
+                    );
+                    assert!(
+                        !supported.contains(&ReasoningLevel::Max),
+                        "{id} must NOT have max"
+                    );
+                    assert!(
+                        !supported.contains(&ReasoningLevel::Ultra),
+                        "{id} must NOT have ultra"
+                    );
+                    assert_eq!(
+                        default_level,
+                        Some(ReasoningLevel::Medium),
+                        "{id} default is Medium"
+                    );
                 }
                 _ => panic!(),
             }
@@ -469,11 +540,18 @@ mod tests {
     fn static_spark_default_high() {
         let cap = codex_static_capability("gpt-5.3-codex-spark").unwrap();
         match cap {
-            ReasoningSupport::CodexNamed { supported, default_level } => {
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+            } => {
                 assert!(supported.contains(&ReasoningLevel::XHigh));
                 assert!(!supported.contains(&ReasoningLevel::Max));
                 assert!(!supported.contains(&ReasoningLevel::Ultra));
-                assert_eq!(default_level, Some(ReasoningLevel::High), "spark default is High");
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::High),
+                    "spark default is High"
+                );
             }
             _ => panic!(),
         }
@@ -527,8 +605,8 @@ mod tests {
             default_level: Some(ReasoningLevel::Low),
         };
         // Ultra is in the static table but the live model says otherwise.
-        let err = validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, Some(&live))
-            .unwrap_err();
+        let err =
+            validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, Some(&live)).unwrap_err();
         assert!(err.contains("ultra"));
         // Low is accepted.
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Low, Some(&live)).is_ok());
@@ -544,8 +622,7 @@ mod tests {
         let qualified = format!("openai-codex/{unique_id}");
 
         // Insert a live cache entry that supports only Low+Medium (no Ultra).
-        let mut live =
-            CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, unique_id).unwrap();
+        let mut live = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, unique_id).unwrap();
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
@@ -556,7 +633,10 @@ mod tests {
         // Confirm it's in the cache.
         let cached = super::super::capability_cache::get(&qualified)
             .expect("model must be in cache after insert");
-        assert!(matches!(cached.reasoning, ReasoningSupport::CodexNamed { .. }));
+        assert!(matches!(
+            cached.reasoning,
+            ReasoningSupport::CodexNamed { .. }
+        ));
 
         // validate_codex_level with catalog_model=None must use the cache and
         // reject Ultra (which the static sol table would have allowed).
