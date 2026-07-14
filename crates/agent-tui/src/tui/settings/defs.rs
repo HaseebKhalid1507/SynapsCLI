@@ -67,6 +67,11 @@ define_settings! {
             }
         };
 
+    reasoning_type, "Reasoning", Model,
+        EditorKind::Display,
+        "How the active model expresses reasoning depth (derived from exact model capabilities; read-only).",
+        |_runtime, _app, _value| { /* display-only: no editor emits Apply for this key */ Ok(()) };
+
     context_window, "Context window", Model,
         EditorKind::Cycler(&["200k", "1m", "auto"]),
         "Override context window limit (auto = model default).",

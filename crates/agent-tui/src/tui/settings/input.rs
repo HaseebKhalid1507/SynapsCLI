@@ -682,6 +682,7 @@ mod tests {
                 "adaptive".into(),
             ],
             catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: "budget (legacy)".into(),
         }
     }
 
@@ -872,6 +873,43 @@ mod tests {
                 }
             }
             other => panic!("expected model Picker edit mode, got {:?}", other.is_some()),
+        }
+    }
+
+    // ---- Slice B: dynamic reasoning type row (display-only) --------------
+
+    /// The Model category exposes a display-only "Reasoning" row whose value
+    /// comes straight from the snapshot (recomputed per event from the exact
+    /// active model). It must not open an editor or emit Apply.
+    #[test]
+    fn reasoning_type_row_is_display_only() {
+        let mut s = snap();
+        s.reasoning_type = "effort".into();
+        let mut state = SettingsState::new();
+        state.set_focus(Focus::Right);
+        let idx = state
+            .current_settings(&s)
+            .iter()
+            .position(|d| d.key == "reasoning_type")
+            .expect("reasoning_type row must exist in the Model category");
+        state.setting_idx = idx;
+        let def = state.current_setting(&s).unwrap();
+        assert!(matches!(def.editor, EditorKind::Display));
+        assert_eq!(current_value_for(def, &s), "effort");
+
+        // Enter must not open any editor.
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
+        assert!(matches!(out, InputOutcome::None));
+        assert!(state.edit_mode.is_none());
+
+        // Left/Right must not cycle/apply anything.
+        for code in [KeyCode::Left, KeyCode::Right] {
+            let out = handle_event(&mut state, KeyEvent::new(code, KeyModifiers::NONE), &s);
+            assert!(matches!(out, InputOutcome::None));
         }
     }
 

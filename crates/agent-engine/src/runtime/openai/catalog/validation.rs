@@ -165,6 +165,35 @@ pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
     None
 }
 
+/// Human-readable reasoning *type* for the settings UI, derived from the
+/// same exact capability sources as `thinking_options_for_model` (capability
+/// cache first, then exact static descriptors). Never claims a verified type
+/// for providers without authoritative metadata.
+pub fn reasoning_type_for_model(model: &str) -> &'static str {
+    if model.strip_prefix("openai-codex/").is_some() {
+        // Codex always expresses reasoning as named effort on the wire.
+        return "effort (named)";
+    }
+    if let Some(model_id) = model.strip_prefix("xai-auth/") {
+        return match xai_static_capability(model_id) {
+            Some(XaiReasoningCapability::Effort { .. }) => "effort",
+            Some(XaiReasoningCapability::IntrinsicReasoning) => "intrinsic",
+            Some(XaiReasoningCapability::NonReasoning) => "none",
+            None => "unknown",
+        };
+    }
+    if let Some(model_id) = anthropic_model_id(model) {
+        return match anthropic_capability(model_id) {
+            Some(ReasoningSupport::AnthropicAdaptive { adaptive: true }) => "adaptive",
+            Some(ReasoningSupport::None) => "none",
+            // Explicit non-adaptive metadata or no metadata: the legacy
+            // enabled+budget_tokens request shape.
+            _ => "budget (legacy)",
+        };
+    }
+    "unverified"
+}
+
 /// Dynamic thinking options for the settings UI, derived from exact
 /// catalog/static capabilities for the provider-qualified model id.
 pub fn thinking_options_for_model(model: &str) -> Vec<String> {
@@ -407,6 +436,70 @@ mod tests {
         assert_eq!(
             thinking_options_for_model("xai-auth/grok-9000"),
             vec!["adaptive"]
+        );
+    }
+
+    // ── Reasoning type derivation (settings display) ─────────────────────────
+
+    #[test]
+    fn reasoning_type_derives_from_exact_capabilities() {
+        // Codex: named effort levels on the wire.
+        assert_eq!(
+            reasoning_type_for_model("openai-codex/gpt-5.6-sol"),
+            "effort (named)"
+        );
+        assert_eq!(
+            reasoning_type_for_model("openai-codex/gpt-unknown-future"),
+            "effort (named)"
+        );
+        // xAI: documented effort control / intrinsic / non-reasoning.
+        assert_eq!(reasoning_type_for_model("xai-auth/grok-4.5"), "effort");
+        assert_eq!(reasoning_type_for_model("xai-auth/grok-4.3"), "intrinsic");
+        assert_eq!(
+            reasoning_type_for_model("xai-auth/grok-4.20-0309-non-reasoning"),
+            "none"
+        );
+        assert_eq!(reasoning_type_for_model("xai-auth/grok-9000"), "unknown");
+        // Anthropic: adaptive effort vs legacy numeric budget.
+        assert_eq!(
+            reasoning_type_for_model("anthropic/claude-opus-4-7"),
+            "adaptive"
+        );
+        assert_eq!(
+            reasoning_type_for_model("anthropic/claude-sonnet-4-6"),
+            "budget (legacy)"
+        );
+        assert_eq!(
+            reasoning_type_for_model("claude-sonnet-4-6"),
+            "budget (legacy)"
+        );
+        // No authoritative metadata: legacy budget path, honestly labelled.
+        assert_eq!(
+            reasoning_type_for_model("anthropic/claude-future-x"),
+            "budget (legacy)"
+        );
+        // Other providers without exact metadata never claim a verified type.
+        assert_eq!(
+            reasoning_type_for_model("groq/llama-3.3-70b-versatile"),
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn reasoning_type_none_for_live_no_thinking_anthropic_evidence() {
+        let mut m = super::super::CatalogModel::new(
+            "anthropic",
+            "Anthropic",
+            "claude-test-reasoning-type-nothink",
+        )
+        .unwrap();
+        m.provider_kind = super::super::CatalogProviderKind::Anthropic;
+        m.reasoning = ReasoningSupport::None;
+        m.source = super::super::CatalogSource::Live;
+        capability_cache::insert(m);
+        assert_eq!(
+            reasoning_type_for_model("anthropic/claude-test-reasoning-type-nothink"),
+            "none"
         );
     }
 

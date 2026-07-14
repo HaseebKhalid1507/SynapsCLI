@@ -46,6 +46,13 @@ pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
     agent_engine::runtime::openai::catalog::validation::thinking_options_for_model(model)
 }
 
+/// Human-readable reasoning type for `model_runtime_id` — shared engine
+/// derivation (`catalog::validation::reasoning_type_for_model`), same exact
+/// capability sources as `thinking_options_for_model`.
+pub(crate) fn reasoning_type_for_model(model: &str) -> &'static str {
+    agent_engine::runtime::openai::catalog::validation::reasoning_type_for_model(model)
+}
+
 pub(crate) fn theme_options() -> Vec<String> {
     let mut opts: Vec<String> = BUILTIN_THEMES.iter().map(|s| s.to_string()).collect();
     if let Some(home) = std::env::var_os("HOME") {
@@ -115,6 +122,8 @@ pub(crate) struct RuntimeSnapshot {
     /// the shared model picker so /settings shows live catalogs too.
     pub catalog_overrides:
         std::collections::BTreeMap<String, crate::tui::models::ProviderCatalogOverride>,
+    /// Derived reasoning type for the active model (display-only row).
+    pub reasoning_type: String,
 }
 
 impl RuntimeSnapshot {
@@ -184,6 +193,7 @@ impl RuntimeSnapshot {
             lifecycle_claims: registry.lifecycle_claims(),
             thinking_options: thinking_options_for_model(runtime.model()),
             catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: reasoning_type_for_model(runtime.model()).to_string(),
         }
     }
 }
@@ -396,6 +406,7 @@ mod wireup_tests {
                 "adaptive".into(),
             ],
             catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: "budget (legacy)".into(),
         }
     }
 
@@ -492,6 +503,54 @@ mod wireup_tests {
 #[cfg(test)]
 mod thinking_options_tests {
     use super::thinking_options_for_model;
+
+    // ---- Slice B: reasoning type + effort recompute on model change ------
+
+    /// Settings derivations key on the runtime's EXACT active model: after a
+    /// model change through the checked dispatch path, both the reasoning
+    /// type and the effort option set recompute for the new model. (The
+    /// snapshot is rebuilt from the runtime on every key event, so these
+    /// derivations ARE the recompute path.)
+    #[test]
+    fn reasoning_type_and_effort_options_recompute_on_model_change() {
+        let mut rt = synaps_cli::Runtime::new_headless();
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
+
+        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.5", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(super::reasoning_type_for_model(rt.model()), "effort");
+        assert_eq!(
+            thinking_options_for_model(rt.model()),
+            vec!["adaptive", "low", "medium", "high"]
+        );
+
+        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.3", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(super::reasoning_type_for_model(rt.model()), "intrinsic");
+        assert_eq!(thinking_options_for_model(rt.model()), vec!["adaptive"]);
+
+        super::defs::apply_setting_dispatch(
+            "model",
+            "openai-codex/gpt-5.6-sol",
+            &mut rt,
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(super::reasoning_type_for_model(rt.model()), "effort (named)");
+        assert!(thinking_options_for_model(rt.model()).contains(&"ultra".to_string()));
+    }
+
+    /// The snapshot built from a runtime must carry the derived reasoning
+    /// type for the active model (shown by the display-only settings row).
+    #[test]
+    fn snapshot_carries_reasoning_type_for_active_model() {
+        let mut rt = synaps_cli::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.3".to_string());
+        let registry = synaps_cli::skills::registry::CommandRegistry::new(&[], Vec::new());
+        let snap = super::RuntimeSnapshot::from_runtime(&rt, &registry);
+        assert_eq!(snap.reasoning_type, "intrinsic");
+        assert_eq!(snap.thinking_options, vec!["adaptive"]);
+    }
 
     #[test]
     fn sol_includes_off_adaptive_and_ultra_max() {

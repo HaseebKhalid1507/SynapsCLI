@@ -60,6 +60,8 @@ pub(crate) enum EditorKind {
     Cycler(&'static [&'static str]),
     /// Options computed at interaction time from the RuntimeSnapshot.
     DynamicCycler,
+    /// Read-only derived value — never editable, never persisted.
+    Display,
     ModelPicker,
     ThemePicker,
     Text {
