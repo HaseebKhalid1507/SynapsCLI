@@ -19,6 +19,9 @@
 use super::helpers::{cache_control_value, HelperMethods, MarkerSite};
 use crate::core::config::CacheTtl;
 use crate::SharedMessage;
+use agent_core::prompt::{
+    compose_orchestration_prompt, QualifiedModelId, SelectionContext, WorkflowMode,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -502,9 +505,19 @@ fn golden_gate_body_bytes_identical() {
 fn anthropic_special_modes_wire_goldens() {
     use crate::runtime::openai::catalog::{
         plan_anthropic_execution, AnthropicPlanPrerequisites, ExecutionRole,
-        ANTHROPIC_ULTRACODE_WORKFLOW,
     };
     use agent_core::reasoning::ReasoningLevel;
+
+    fn contains_logical_mode(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => object
+                .iter()
+                .any(|(key, value)| key == "ultracode" || contains_logical_mode(value)),
+            Value::Array(values) => values.iter().any(contains_logical_mode),
+            Value::String(value) => value == "ultracode",
+            _ => false,
+        }
+    }
 
     let messages = plain_history();
     let tools = two_tools();
@@ -522,9 +535,14 @@ fn anthropic_special_modes_wire_goldens() {
                 None,
             )
             .expect("exact Fable plan must authorize");
-            let system_prompt = workflow
-                .then(|| format!("base system\n\n{ANTHROPIC_ULTRACODE_WORKFLOW}"))
-                .or_else(|| Some("base system".to_owned()));
+            let workflow_mode = workflow.then_some(WorkflowMode::UltraCode);
+            let context = SelectionContext::new(
+                QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+                None,
+            )
+            .unwrap()
+            .with_workflow_mode(workflow_mode);
+            let system_prompt = compose_orchestration_prompt(Some("base system"), &context);
             let body = super::request::RequestBody::new(
                 "claude-fable-5",
                 &messages,
@@ -542,11 +560,15 @@ fn anthropic_special_modes_wire_goldens() {
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["output_config"]["effort"], expected_effort);
             assert!(
-                !wire.contains(r#"\"ultracode\""#),
-                "logical mode leaked as a serialized value: {wire}"
+                !contains_logical_mode(&value),
+                "logical mode leaked as a JSON key or string value: {wire}"
             );
-            let doctrine_count = wire.matches("anthropic-ultracode-workflow").count();
-            assert_eq!(doctrine_count, if workflow { 2 } else { 0 }); // opening + closing tag
+            let opening_count = wire.matches("<anthropic-ultracode-workflow>").count();
+            let closing_count = wire.matches("</anthropic-ultracode-workflow>").count();
+            assert_eq!(
+                (opening_count, closing_count),
+                if workflow { (1, 1) } else { (0, 0) }
+            );
             assert_eq!(
                 value.get("stream").and_then(Value::as_bool),
                 stream.then_some(true)

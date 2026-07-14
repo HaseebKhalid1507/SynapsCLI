@@ -46,7 +46,7 @@ pub use anthropic::{
     merge_catalog_pages, parse_anthropic_catalog_models, parse_anthropic_catalog_page,
     plan_anthropic_execution, AnthropicCatalogPage, AnthropicExecutionMode, AnthropicExecutionPlan,
     AnthropicPlanError, AnthropicPlanErrorCode, AnthropicPlanPrerequisites, AnthropicWireEffort,
-    AnthropicWorkflowPlan, ANTHROPIC_ULTRACODE_WORKFLOW,
+    AnthropicWorkflowPlan,
 };
 pub use codex::{
     codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,

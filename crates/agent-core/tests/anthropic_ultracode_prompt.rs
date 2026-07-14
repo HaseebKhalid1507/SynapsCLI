@@ -33,8 +33,11 @@ fn exact_anthropic_ultracode_selects_once_and_only_for_typed_mode() {
     )
     .unwrap();
     assert_eq!(
-        positive.matches("<anthropic-ultracode-workflow>").count(),
-        1
+        (
+            positive.matches("<anthropic-ultracode-workflow>").count(),
+            positive.matches("</anthropic-ultracode-workflow>").count(),
+        ),
+        (1, 1)
     );
 
     for (model, mode) in [
