@@ -1083,6 +1083,24 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.command == "/help find"));
     }
 
+    // Slice C: /effort discovery — command registry + searchable help entry.
+    #[test]
+    fn effort_is_a_builtin_command_with_help_entry() {
+        assert!(
+            crate::skills::BUILTIN_COMMANDS.contains(&"effort"),
+            "/effort must be a registered built-in for autocomplete + streaming gating"
+        );
+        let entries = builtin_entries();
+        let effort = entries
+            .iter()
+            .find(|entry| entry.command == "/effort")
+            .expect("/effort must have a builtin help entry");
+        assert!(
+            effort.keywords.iter().any(|k| k.contains("reasoning")),
+            "help entry should be discoverable via reasoning keywords"
+        );
+    }
+
     #[test]
     fn wrap_help_text_wraps_words_to_width_and_preserves_indent() {
         let lines = wrap_help_text("  summary text should wrap neatly", 18);

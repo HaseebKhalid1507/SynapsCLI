@@ -721,6 +721,7 @@ pub(crate) fn build_render_model(
         plugins,
         models,
         help_find,
+        effort: inputs.effort.clone(),
         secret_prompt,
         // P7.8: stack-order snapshot driving the modal draw loop below.
         modal_order: inputs.modal_stack.iter_bottom_up().collect(),
@@ -1594,6 +1595,11 @@ pub(crate) fn render_frame_into(
             super::focus::PaneId::HelpFind => {
                 if let Some(mut state) = model.help_find.clone() {
                     super::help_find::render(frame, frame.area(), &mut state);
+                }
+            }
+            super::focus::PaneId::Effort => {
+                if let Some(ref state) = model.effort {
+                    super::effort::render(frame, frame.area(), state);
                 }
             }
             super::focus::PaneId::SecretPrompt => {

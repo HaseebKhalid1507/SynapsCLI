@@ -24,6 +24,10 @@ pub(super) enum InputAction {
     SettingsApply(&'static str, String),
     /// Models modal requested switching to a runtime model id.
     ModelsApply(String),
+    /// Effort lightbox requested applying a reasoning level (string form).
+    /// The dispatch arm re-checks streaming + exact-model validity
+    /// (`effort::apply_guard`) before any mutation/persist.
+    EffortApply(String),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
@@ -75,6 +79,7 @@ pub(super) fn handle_event(
             handle_event_inner(event, app, streaming, registry, keybinds, scroll_lines)
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
+        super::focus::PaneId::Effort => route_effort(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
         super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
@@ -473,6 +478,36 @@ fn route_help_find(event: Event, app: &mut App) -> InputAction {
                 InputAction::None
             }
             super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+        };
+    }
+    InputAction::None
+}
+
+/// Stack-routed pane handler for the `/effort` lightbox.
+///
+/// Outcome translation mirrors `route_models`: `Close` → clear field + pop
+/// (cancel — nothing applied); `Apply` → clear field + pop, then defer the
+/// guarded apply to the async loop (`InputAction::EffortApply`); `None` →
+/// consumed. The modal closes on BOTH paths, so the race-safe apply decision
+/// lives entirely in the dispatch guard.
+fn route_effort(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Effort ⇒ effort is Some.
+    let Some(state) = &mut app.effort else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::effort::handle_event(state, key) {
+            super::effort::InputOutcome::Close => {
+                app.effort = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::effort::InputOutcome::Apply(level) => {
+                app.effort = None;
+                app.modal_stack.pop();
+                InputAction::EffortApply(level)
+            }
+            super::effort::InputOutcome::None => InputAction::None,
         };
     }
     InputAction::None

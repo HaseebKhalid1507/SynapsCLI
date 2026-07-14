@@ -46,6 +46,8 @@ pub(crate) enum PaneId {
     Chat,
     /// `/help find` lightbox (`app.rs:89`). Single search field; no Focus enum.
     HelpFind,
+    /// `/effort` lightbox — valid effort levels for the active exact model.
+    Effort,
     /// `/model` / `/models` modal (`app.rs:87`). The expanded-models lightbox
     /// stays INTERNAL to Models (`models/mod.rs:191`).
     Models,
@@ -395,6 +397,16 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.help_find.is_some()
     );
 
+    // Effort lightbox membership must exactly mirror `app.effort`.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::Effort),
+        app.effort.is_some(),
+        "stack sync: modal_stack.contains(Effort)={} but effort.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::Effort),
+        app.effort.is_some()
+    );
+
     // P7.5: Models membership on the stack must exactly mirror `app.models`.
     debug_assert_eq!(
         app.modal_stack.contains(PaneId::Models),
@@ -469,6 +481,7 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
             matches!(
                 pane,
                 PaneId::HelpFind
+                    | PaneId::Effort
                     | PaneId::Models
                     | PaneId::Plugins
                     | PaneId::Settings
@@ -476,7 +489,7 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
                     | PaneId::SecretPrompt
             ),
             "stack sync (P7.8): unexpected pane {pane:?} found on the ModalStack \
-             — only HelpFind, Models, Plugins, Settings, PluginEditor and \
+             — only HelpFind, Effort, Models, Plugins, Settings, PluginEditor and \
              SecretPrompt are valid stack members"
         );
     }

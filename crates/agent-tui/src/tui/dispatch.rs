@@ -239,6 +239,25 @@ pub(crate) async fn handle_input_action(
                     focus::debug_assert_stack_sync(app);
                     spawn_auto_catalog_refreshes(app, runtime);
                 }
+                CommandAction::OpenEffort => {
+                    // Defense in depth: the streaming-input path already
+                    // refuses /effort while streaming; this guard covers any
+                    // future action source. Never open mid-stream.
+                    if app.streaming || stream.is_some() {
+                        app.push_msg(ChatMessage::System(
+                            "/effort can't run while streaming — press Esc to cancel first"
+                                .to_string(),
+                        ));
+                    } else {
+                        app.effort = Some(effort::EffortModalState::new(
+                            runtime.model(),
+                            runtime.thinking_level(),
+                        ));
+                        app.modal_stack.push(focus::PaneId::Effort);
+                        #[cfg(debug_assertions)]
+                        focus::debug_assert_stack_sync(app);
+                    }
+                }
                 CommandAction::OpenSettings => {
                     app.settings = Some(settings::SettingsState::new());
                     // P7.7: mirror the `= Some(..)` open with a stack
@@ -1291,6 +1310,7 @@ pub(crate) async fn handle_input_action(
                     }
                     CommandAction::StartStream => {}
                     CommandAction::OpenModels => {}
+                    CommandAction::OpenEffort => {}
                     CommandAction::OpenSettings => {}
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
@@ -1336,6 +1356,29 @@ pub(crate) async fn handle_input_action(
                 "model set to: {} {}",
                 applied, status
             )));
+        }
+        InputAction::EffortApply(value) => {
+            // Race-safe apply gate: a stream may have started between the
+            // lightbox opening and this apply (queued-message auto-starts).
+            // Reject without ANY state/config mutation; otherwise reuse the
+            // existing checked mutation + persistence path (identical to
+            // /thinking: set_reasoning_level_checked → persist → session).
+            match effort::apply_guard(app.streaming || stream.is_some(), &value, runtime.model()) {
+                Ok(level) => match runtime.set_reasoning_level_checked(level) {
+                    Ok(()) => {
+                        let canonical = level.as_str();
+                        app.session.thinking_level = canonical.to_string();
+                        let status =
+                            synaps_cli::engine::commands::persist_to_config("thinking", canonical);
+                        app.push_msg(ChatMessage::System(format!(
+                            "effort set to: {} {}",
+                            canonical, status
+                        )));
+                    }
+                    Err(e) => app.push_msg(ChatMessage::Error(e)),
+                },
+                Err(e) => app.push_msg(ChatMessage::Error(e)),
+            }
         }
         InputAction::ModelsExpandProvider(provider_key) => {
             if provider_key.contains(':') {

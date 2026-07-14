@@ -63,6 +63,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "models",
     "system",
     "thinking",
+    "effort",
     "sessions",
     "resume",
     "saveas",

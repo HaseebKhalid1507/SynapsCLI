@@ -445,6 +445,7 @@ impl TestHarness {
         match self.app.modal_stack.top() {
             PaneId::Chat => "chat",
             PaneId::HelpFind => "help-find",
+            PaneId::Effort => "effort",
             PaneId::Models => "models",
             PaneId::Plugins => "plugins",
             PaneId::Settings => "settings",
@@ -619,6 +620,13 @@ impl TestHarness {
         self.app.toasts.visible().count()
     }
 
+    /// Force the app's streaming flag — lets scenarios exercise the
+    /// streaming-input command refusal path without a live engine stream.
+    pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {
+        self.app.streaming = streaming;
+        self
+    }
+
     // ── Bounded async slash drive (P6.3) ─────────────────────────────────────
 
     /// Execute every slash command recorded since the last drive through the
@@ -688,6 +696,18 @@ impl TestHarness {
                 ));
                 self.app.modal_stack.push(super::focus::PaneId::HelpFind);
             }
+            CommandAction::OpenEffort => {
+                // Mirrors the dispatch OpenEffort arm (idle path — the
+                // harness has no live stream; streaming refusal is exercised
+                // via the streaming-input route).
+                if !self.app.streaming {
+                    self.app.effort = Some(super::effort::EffortModalState::new(
+                        self.runtime.model(),
+                        self.runtime.thinking_level(),
+                    ));
+                    self.app.modal_stack.push(super::focus::PaneId::Effort);
+                }
+            }
             CommandAction::OpenModels => {
                 self.app.models = Some(super::models::ModelsModalState::new());
                 self.app.modal_stack.push(super::focus::PaneId::Models);
@@ -753,6 +773,7 @@ impl TestHarness {
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
+            InputAction::EffortApply(level) => format!("effort-apply:{level}"),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),

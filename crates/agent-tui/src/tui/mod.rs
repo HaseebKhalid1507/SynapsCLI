@@ -6,6 +6,7 @@ mod clock;
 mod commands;
 mod dispatch;
 mod draw;
+mod effort;
 mod focus;
 mod gamba;
 mod help_find;

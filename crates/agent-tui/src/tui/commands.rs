@@ -43,6 +43,8 @@ pub(super) enum CommandAction {
     LaunchGamba,
     /// Open the /model(s) router modal.
     OpenModels,
+    /// Open the /effort lightbox (valid levels for the active exact model).
+    OpenEffort,
     /// Open the /settings modal.
     OpenSettings,
     /// Open the /plugins modal.
@@ -364,6 +366,15 @@ pub(super) async fn handle_command(
     // NOTE: this intercept runs BEFORE the match below — any arm there for a
     // command the engine claims (model/thinking with args, compact, quit) is
     // unreachable for the intercepted case.
+    // `/effort <level>` is the SAME checked mutation + persistence path as
+    // `/thinking <level>` — normalize before the engine intercept so the
+    // engine's validation (set_reasoning_level_checked, numeric legacy
+    // budgets included) and the ThinkingChanged persist arm below apply.
+    let cmd = if cmd == "effort" && !arg.is_empty() {
+        "thinking"
+    } else {
+        cmd
+    };
     if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
         use synaps_cli::engine::commands::{
             persist_to_config, thinking_config_value, CommandResult,
@@ -445,6 +456,11 @@ pub(super) async fn handle_command(
             // Non-empty args are intercepted by handle_engine_command above
             // (set + persist); only the empty-arg picker case reaches here.
             return CommandAction::OpenModels;
+        }
+        "effort" => {
+            // Non-empty args were normalized to the engine "thinking" path
+            // above; only the empty-arg lightbox case reaches here.
+            return CommandAction::OpenEffort;
         }
         "system" => {
             if arg.is_empty() {
@@ -554,9 +570,9 @@ pub(super) async fn handle_command(
                         runtime.set_model(session.model.clone());
                         // Restore the session's named reasoning level so
                         // max/ultra/off are not lost on resume.
-                        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(
-                            &session.thinking_level,
-                        ) {
+                        if let Some(level) =
+                            agent_core::reasoning::ReasoningLevel::parse(&session.thinking_level)
+                        {
                             runtime.set_reasoning_level(level);
                         } else if let Some(budget) =
                             synaps_cli::models::budget_for_thinking_level(&session.thinking_level)

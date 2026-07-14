@@ -95,6 +95,8 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// Active /effort lightbox state (Some while /effort is open).
+    pub(crate) effort: Option<super::effort::EffortModalState>,
     /// P7 modal-routing stack (finished, P7.8). The single source of input
     /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
     /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
@@ -256,6 +258,7 @@ impl App {
             plugins: None,
             models: None,
             help_find: None,
+            effort: None,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
             // P7.8: folded off the `run()` local; production wires the mpsc

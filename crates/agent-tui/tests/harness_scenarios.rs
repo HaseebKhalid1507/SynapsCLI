@@ -1860,3 +1860,74 @@ fn compound_stream_resize_modal() {
         "120x40 replay must render exactly 40 rows"
     );
 }
+
+// ── /effort lightbox (settings-effort feature) ───────────────────────────────
+
+/// `/effort` opens the effort lightbox as a true modal-stack member; Esc
+/// cancels it without applying anything (session thinking level untouched).
+#[test]
+fn effort_command_opens_lightbox_and_esc_cancels() {
+    let mut h = TestHarness::boot();
+    h.run_slash_command("effort", "");
+    assert_eq!(
+        h.top_pane_name(),
+        "effort",
+        "/effort must open the effort lightbox pane"
+    );
+    assert_eq!(h.modal_stack_depth(), 1);
+
+    // The rendered frame shows only valid levels + the hint line.
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Effort"),
+        "lightbox title must render:\n{frame}"
+    );
+
+    // Esc cancels: pane popped, back to chat, nothing applied.
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(h.top_pane_name(), "chat");
+    assert_eq!(h.modal_stack_depth(), 0);
+}
+
+/// While streaming, `/effort` (typed like a user would) is refused as a
+/// non-streaming-safe command: it must NOT open the lightbox.
+#[test]
+fn effort_does_not_open_while_streaming() {
+    let mut h = TestHarness::boot();
+    h.set_streaming(true);
+    h.type_str("/effort");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = h.take_actions();
+    assert!(
+        actions.iter().any(|a| a.starts_with("streaming-input:")),
+        "typed /effort while streaming must route to the streaming-input \
+         refusal path, not a slash execution: {actions:?}"
+    );
+    assert_eq!(
+        h.top_pane_name(),
+        "chat",
+        "/effort must not open a modal while streaming"
+    );
+}
+
+/// Enter in the lightbox closes the modal and emits the guarded apply action
+/// (`effort-apply:<level>`); the actual mutation is deferred to the dispatch
+/// arm, which re-runs `effort::apply_guard` race-safely.
+#[test]
+fn effort_enter_closes_modal_and_emits_guarded_apply_action() {
+    let mut h = TestHarness::boot();
+    h.run_slash_command("effort", "");
+    assert_eq!(h.top_pane_name(), "effort");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        h.top_pane_name(),
+        "chat",
+        "Enter must pop the effort lightbox"
+    );
+    assert_eq!(h.modal_stack_depth(), 0);
+    let actions = h.take_actions();
+    assert!(
+        actions.iter().any(|a| a.starts_with("effort-apply:")),
+        "Enter must emit the deferred guarded apply action: {actions:?}"
+    );
+}

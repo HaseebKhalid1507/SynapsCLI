@@ -85,6 +85,8 @@ pub(crate) struct RenderModel {
     /// `&mut HelpFindState`; `visible_height` is pre-computed on the main side
     /// before snapshotting so the modal's scroll window is authoritative.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// Snapshot of the /effort lightbox state.
+    pub(crate) effort: Option<super::effort::EffortModalState>,
 
     // ── Secret prompt modal ───────────────────────────────────────────────────
     pub(crate) secret_prompt: Option<SecretPromptSnap>,
