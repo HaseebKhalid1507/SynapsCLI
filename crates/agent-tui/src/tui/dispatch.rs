@@ -224,7 +224,11 @@ pub(crate) async fn handle_input_action(
                     *event_reader = Some(EventStream::new());
                 }
                 CommandAction::OpenModels => {
-                    app.models = Some(models::ModelsModalState::new());
+                    let mut models_state = models::ModelsModalState::new();
+                    // Seed with the app-level live catalog cache so previously
+                    // fetched lists render instantly while refreshes run.
+                    models_state.provider_catalog_overrides = app.catalog_overrides.clone();
+                    app.models = Some(models_state);
                     // P7.5: mirror the `= Some(..)` open with a
                     // stack push (§6). GATE-1 note B: models
                     // opens on this async arm, so assert sync
@@ -244,6 +248,9 @@ pub(crate) async fn handle_input_action(
                     app.modal_stack.push(focus::PaneId::Settings);
                     #[cfg(debug_assertions)]
                     focus::debug_assert_stack_sync(app);
+                    // Same live-catalog refresh the /models modal runs: the
+                    // settings model picker feeds off app.catalog_overrides.
+                    spawn_auto_catalog_refreshes(app, runtime);
                 }
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();

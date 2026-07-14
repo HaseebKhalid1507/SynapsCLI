@@ -120,6 +120,11 @@ pub(crate) struct App {
     /// Cached model ping results: "provider/model" -> (status, latency_ms).
     pub(crate) model_health:
         std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// App-level live catalog overrides (provider → (bare id, label) rows).
+    /// Updated whenever a live model-list result arrives, so both the /models
+    /// modal and the /settings model picker share one catalog cache.
+    pub(crate) catalog_overrides:
+        std::collections::BTreeMap<String, super::models::ProviderCatalogOverride>,
     /// Print ping results to chat as they arrive (set by /ping command).
     pub(crate) ping_print: bool,
     pub(crate) ping_pending: usize,
@@ -260,6 +265,7 @@ impl App {
             pending_events: Vec::new(),
             consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
+            catalog_overrides: std::collections::BTreeMap::new(),
             ping_print: false,
             ping_pending: 0,
             ping_tx: ping_tx_init,

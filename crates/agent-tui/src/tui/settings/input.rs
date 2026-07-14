@@ -355,47 +355,32 @@ pub(crate) fn handle_event(
                     }
                     EditorKind::ModelPicker => {
                         state.row_error = None;
-                        // Anthropic models
-                        let mut opts: Vec<String> = vec!["── Anthropic ──".to_string()];
-                        opts.extend(
-                            synaps_cli::models::KNOWN_MODELS
-                                .iter()
-                                .map(|(id, desc)| format!("  anthropic/{}  — {}", id, desc)),
+                        // Shared row source with the /models modal: same
+                        // section builder, availability/login data, and live
+                        // catalog overrides — exact provider-qualified values.
+                        let rows = crate::tui::models::settings_model_picker_rows(
+                            &snap.model,
+                            &snap.catalog_overrides,
+                            &snap.model_health,
                         );
-
-                        // Provider models (only for configured providers)
-                        let registry = synaps_cli::runtime::openai::registry::providers();
-                        for spec in registry {
-                            let configured = snap
-                                .provider_key_status
-                                .get(spec.key)
-                                .is_some_and(|status| status.is_configured());
-                            if !configured {
-                                continue;
-                            }
-                            opts.push(format!("── {} ──", spec.name));
-                            for (id, label, tier) in spec.models {
-                                let full = format!("{}/{}", spec.key, id);
-                                let health = snap
-                                    .model_health
-                                    .get(&full)
-                                    .map(|(s, ms)| {
-                                        format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms))
-                                    })
-                                    .unwrap_or_default();
-                                opts.push(format!("  {}{}  — {} [{}]", health, full, label, tier));
-                            }
+                        let mut opts: Vec<String> = Vec::with_capacity(rows.len() + 1);
+                        let mut values: Vec<String> = Vec::with_capacity(rows.len() + 1);
+                        for (display, value) in rows {
+                            opts.push(display);
+                            values.push(value);
                         }
                         opts.push("Custom…".to_string());
+                        values.push(String::new());
 
                         let current = current_value_for(def, snap);
-                        let cursor = opts
+                        let cursor = values
                             .iter()
-                            .position(|o| o.trim_start().starts_with(&current))
+                            .position(|v| !v.is_empty() && *v == current)
                             .unwrap_or(0);
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: def.key,
                             options: opts,
+                            values,
                             cursor,
                         });
                     }
@@ -406,6 +391,7 @@ pub(crate) fn handle_event(
                         state.original_theme_name = Some(snap.theme_name.clone());
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: "theme",
+                            values: opts.clone(),
                             options: opts,
                             cursor,
                         });
@@ -457,6 +443,7 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
         ActiveEditor::Picker {
             setting_key,
             options,
+            values,
             cursor,
         } => {
             match key.code {
@@ -506,29 +493,13 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         });
                         return InputOutcome::None;
                     }
-                    let raw = selection.split("  —").next().unwrap_or(&selection).trim();
-                    // Strip health prefix (e.g. "✅  79ms  groq/..." or "✅  1304ms  nvidia/...")
-                    // Find the model ID by looking for known provider prefixes or "claude-"
-                    let value = if let Some(pos) = raw.find('/') {
-                        // A provider-qualified ID takes precedence over model-family
-                        // substrings (e.g. github-copilot/claude-fable-5).
-                        let before = &raw[..pos];
-                        let key_start = before
-                            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                            .map(|i| {
-                                i + before[i..]
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.len_utf8())
-                                    .unwrap_or(1)
-                            })
-                            .unwrap_or(0);
-                        raw[key_start..].to_string()
-                    } else if let Some(pos) = raw.find("claude-") {
-                        raw[pos..].to_string()
-                    } else {
-                        raw.to_string()
-                    };
+                    // Exact-value application: the parallel `values` column
+                    // carries the provider-qualified id verbatim — no display
+                    // string parsing. Empty value = non-selectable row.
+                    let value = values.get(*cursor).cloned().unwrap_or_default();
+                    if value.is_empty() {
+                        return InputOutcome::None;
+                    }
                     let key = *setting_key;
                     if key == "theme" {
                         state.original_theme_name = None;
@@ -670,20 +641,6 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     }
 }
 
-fn fmt_latency(status: synaps_cli::runtime::openai::ping::PingStatus, ms: u64) -> String {
-    use synaps_cli::runtime::openai::ping::PingStatus;
-    match status {
-        PingStatus::Online => {
-            if ms >= 1000 {
-                format!("{:.1}s", ms as f64 / 1000.0)
-            } else {
-                format!("{}ms", ms)
-            }
-        }
-        other => other.label().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +681,7 @@ mod tests {
                 "xhigh".into(),
                 "adaptive".into(),
             ],
+            catalog_overrides: std::collections::BTreeMap::new(),
         }
     }
 
@@ -815,6 +773,7 @@ mod tests {
         state.edit_mode = Some(ActiveEditor::Picker {
             setting_key: "model",
             options: vec!["  anthropic/claude-sonnet-4-6  — Claude Sonnet".to_string()],
+            values: vec!["anthropic/claude-sonnet-4-6".to_string()],
             cursor: 0,
         });
         assert!(matches!(
@@ -829,12 +788,91 @@ mod tests {
         state.edit_mode = Some(ActiveEditor::Picker {
             setting_key: "model",
             options: vec!["  github-copilot/claude-sonnet-4.6  — Claude Sonnet".to_string()],
+            values: vec!["github-copilot/claude-sonnet-4.6".to_string()],
             cursor: 0,
         });
         assert!(matches!(
             handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputOutcome::Apply { key: "model", value } if value == "github-copilot/claude-sonnet-4.6"
         ));
+    }
+
+    // ---- Slice A: settings model picker reuses /models section data ------
+
+    /// Enter must apply the EXACT provider-qualified value carried in the
+    /// parallel `values` column — no display-string parsing.
+    #[test]
+    fn model_picker_enter_emits_exact_value_from_values_column() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  ✅  79ms  confusing claude-like display text".to_string()],
+            values: vec!["openai-codex/gpt-5.6-sol".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "openai-codex/gpt-5.6-sol"
+        ));
+    }
+
+    /// Header rows carry an empty value and must never apply.
+    #[test]
+    fn model_picker_enter_on_header_row_is_noop() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["── OpenAI Codex ──".to_string()],
+            values: vec![String::new()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputOutcome::None
+        ));
+    }
+
+    /// Enter on the Model row must open a picker whose rows come from the
+    /// shared /models section builder: parallel display/value columns of the
+    /// same length, with the trailing "Custom…" escape hatch preserved.
+    #[test]
+    fn enter_on_model_row_builds_picker_from_shared_sections() {
+        let mut state = SettingsState::new();
+        state.set_focus(Focus::Right);
+        state.setting_idx = 0; // "model" is the first Model-category setting
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
+        assert!(matches!(out, InputOutcome::None));
+        match &state.edit_mode {
+            Some(ActiveEditor::Picker {
+                setting_key,
+                options,
+                values,
+                ..
+            }) => {
+                assert_eq!(*setting_key, "model");
+                assert_eq!(
+                    options.len(),
+                    values.len(),
+                    "display and value columns must stay parallel"
+                );
+                assert_eq!(options.last().unwrap(), "Custom…");
+                // Every non-header, non-custom row must carry a non-empty
+                // exact value; headers carry the empty string.
+                for (display, value) in options.iter().zip(values.iter()) {
+                    if display.starts_with("──") {
+                        assert!(value.is_empty(), "header row must have empty value");
+                    }
+                }
+            }
+            other => panic!("expected model Picker edit mode, got {:?}", other.is_some()),
+        }
     }
 
     // ---- Path B Phase 4 — plugin-declared category wiring ----------------

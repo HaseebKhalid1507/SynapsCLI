@@ -81,9 +81,7 @@ fn handle_widget_event(
             t = t.accent(theme::THEME.load().ext_token(&ext_id, "accent"));
             app.toasts.upsert(t)
         }
-        WidgetEvent::Dismiss { id } => {
-            app.toasts.dismiss(&format!("widget:{}", id))
-        }
+        WidgetEvent::Dismiss { id } => app.toasts.dismiss(&format!("widget:{}", id)),
     }
 }
 
@@ -330,8 +328,7 @@ mod migration_tests {
             let dir = tempfile::TempDir::new().expect("tempdir");
             let old = std::env::var("SYNAPS_BASE_DIR").ok();
             synaps_cli::config::set_base_dir_for_tests(dir.path().to_path_buf());
-            std::fs::write(dir.path().join("config"), initial_config)
-                .expect("write test config");
+            std::fs::write(dir.path().join("config"), initial_config).expect("write test config");
             Self { _dir: dir, old }
         }
 
@@ -345,7 +342,7 @@ mod migration_tests {
         fn drop(&mut self) {
             match &self.old {
                 Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
-                None    => std::env::remove_var("SYNAPS_BASE_DIR"),
+                None => std::env::remove_var("SYNAPS_BASE_DIR"),
             }
         }
     }
@@ -395,7 +392,11 @@ mod migration_tests {
         let v = synaps_cli::config::read_config_value(
             "plugins.sample-sidecar.capture._lifecycle_toggle_key",
         );
-        assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
+        assert_eq!(
+            v.as_deref(),
+            Some("F12"),
+            "must not overwrite a user-set value"
+        );
     }
 
     #[test]
@@ -451,10 +452,8 @@ mod migration_tests {
             Some("C-V")
         );
         assert_eq!(
-            synaps_cli::config::read_config_value(
-                "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
-            )
-            .as_deref(),
+            synaps_cli::config::read_config_value("plugins.ocr-plugin.ocr._lifecycle_toggle_key")
+                .as_deref(),
             Some("C-V")
         );
     }
@@ -496,7 +495,6 @@ mod display_name_helper_tests {
     }
 }
 
-
 // ── P12.3: select! arm handlers — pure code-motion from the run() loop.
 // Each fn is the verbatim arm body; the select! arms are now a routing
 // table. The animation-tick GUARD expression stays inline at the call
@@ -507,44 +505,66 @@ pub(crate) fn handle_ping_arm(
     app: &mut App,
     result: Option<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
 ) {
-                match result {
-                    Some((key, status, ms)) => {
-                        if app.ping_print {
-                            let detail = match status {
-                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
-                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
-                            };
-                            app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
-                            app.ping_pending = app.ping_pending.saturating_sub(1);
-                            if app.ping_pending == 0 {
-                                app.ping_print = false;
-                            }
-                        }
-                        app.model_health.insert(key, (status, ms));
-                        app.request_redraw();
+    match result {
+        Some((key, status, ms)) => {
+            if app.ping_print {
+                let detail = match status {
+                    synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
+                    synaps_cli::runtime::openai::ping::PingStatus::RateLimited => {
+                        "429 rate limited".to_string()
                     }
-                    None => {
-                        // All ping tasks done (tx dropped) — stop printing
-                        app.ping_print = false;
+                    synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => {
+                        "401 unauthorized".to_string()
                     }
+                    synaps_cli::runtime::openai::ping::PingStatus::NotFound => {
+                        "404 not found".to_string()
+                    }
+                    synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
+                    synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
+                };
+                app.push_msg(ChatMessage::System(format!(
+                    "  {} {:<50} — {}",
+                    status.icon(),
+                    key,
+                    detail
+                )));
+                app.ping_pending = app.ping_pending.saturating_sub(1);
+                if app.ping_pending == 0 {
+                    app.ping_print = false;
                 }
+            }
+            app.model_health.insert(key, (status, ms));
+            app.request_redraw();
+        }
+        None => {
+            // All ping tasks done (tx dropped) — stop printing
+            app.ping_print = false;
+        }
+    }
 }
 
 /// Expanded model-list arm: async provider model enumeration returned.
 pub(crate) fn handle_model_list_arm(
     app: &mut App,
-    result: Option<(String, std::result::Result<Vec<models::ExpandedModelEntry>, String>)>,
+    result: Option<(
+        String,
+        std::result::Result<Vec<models::ExpandedModelEntry>, String>,
+    )>,
 ) {
-                if let Some((provider_key, models_result)) = result {
-                    if let Some(state) = app.models.as_mut() {
-                        models::apply_model_list_result(state, &provider_key, models_result);
-                    }
-                    app.request_redraw();
-                }
+    if let Some((provider_key, models_result)) = result {
+        // App-level catalog cache: shared by the /models modal and
+        // the /settings model picker (live/static reuse).
+        if let Ok(models_list) = &models_result {
+            let rows = models::catalog_override_rows(&provider_key, models_list);
+            if !rows.is_empty() {
+                app.catalog_overrides.insert(provider_key.clone(), rows);
+            }
+        }
+        if let Some(state) = app.models.as_mut() {
+            models::apply_model_list_result(state, &provider_key, models_result);
+        }
+        app.request_redraw();
+    }
 }
 
 /// Async extension-loader progress arm.
@@ -570,14 +590,14 @@ pub(crate) fn handle_widget_arm(
     app: &mut App,
     widget_event: synaps_cli::extensions::widgets::ExtensionWidgetEvent,
 ) {
-                // Only redraw when the widget's VISIBLE content actually changed.
-                // Plugins (d20/jawz-widget/synaps-tasks) re-send unchanged widgets
-                // on a poll loop; redrawing on every one pinned the render loop at
-                // ~30% CPU at idle (#119). The dirty-check in upsert/dismiss makes an
-                // idle session genuinely idle.
-                if handle_widget_event(app, widget_event) {
-                    app.request_redraw();
-                }
+    // Only redraw when the widget's VISIBLE content actually changed.
+    // Plugins (d20/jawz-widget/synaps-tasks) re-send unchanged widgets
+    // on a poll loop; redrawing on every one pinned the render loop at
+    // ~30% CPU at idle (#119). The dirty-check in upsert/dismiss makes an
+    // idle session genuinely idle.
+    if handle_widget_event(app, widget_event) {
+        app.request_redraw();
+    }
 }
 
 /// Animation/spinner tick arm body (~60fps when active). The GUARD that
@@ -602,181 +622,207 @@ pub(crate) async fn handle_animation_tick(
     exit_fx_sent: bool,
     last_subagent_reconcile: &mut Option<std::time::Instant>,
 ) -> bool {
-                // Active animations/effects always need a redraw each tick.
-                // messages.is_empty() = idle logo screen — its color gradient
-                // is time-based and needs ticking too (S206 regression: the
-                // dirty-flag loop froze it until first keystroke).
-                // Update local effect-sent flags from the render thread's done signals.
-                if *boot_fx_sent && boot_done.load(Ordering::Acquire) {
-                    *boot_fx_sent = false;
-                }
-                if exit_fx_sent || *boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.is_empty() || !app.subagents.is_empty() {
-                    app.request_redraw();
-                }
-                app.secret_prompts.poll_requests(secret_prompt_rx);
-                // P7.8: activation/deactivation happen OUTSIDE any input event
-                // (async queue + auto-chaining); reconcile the stack to the
-                // queue's is_active() so SecretPrompt is pushed/popped (§5).
-                input::reconcile_secret_prompt(app);
-                // Throttled subagent reconcile (~1s cadence) — keeps the mutex off
-                // the 60fps path while still updating timers and catching idle-finish.
-                if !app.subagents.is_empty() {
-                    let now = std::time::Instant::now();
-                    let should_reconcile = last_subagent_reconcile
-                        .map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
-                    if should_reconcile {
-                        let rows = runtime.subagent_registry()
-                            .lock().unwrap_or_else(|p| p.into_inner())
-                            .display_rows();
-                        super::stream_handler::reconcile_subagents(
-                            &mut app.subagents, &rows, now,
-                        );
-                        *last_subagent_reconcile = Some(now);
-                        app.request_redraw();
+    // Active animations/effects always need a redraw each tick.
+    // messages.is_empty() = idle logo screen — its color gradient
+    // is time-based and needs ticking too (S206 regression: the
+    // dirty-flag loop froze it until first keystroke).
+    // Update local effect-sent flags from the render thread's done signals.
+    if *boot_fx_sent && boot_done.load(Ordering::Acquire) {
+        *boot_fx_sent = false;
+    }
+    if exit_fx_sent
+        || *boot_fx_sent
+        || app.streaming
+        || app.logo_build_t.is_some()
+        || app.logo_dismiss_t.is_some()
+        || app.gamba_child.is_some()
+        || app.transcript.is_empty()
+        || !app.subagents.is_empty()
+    {
+        app.request_redraw();
+    }
+    app.secret_prompts.poll_requests(secret_prompt_rx);
+    // P7.8: activation/deactivation happen OUTSIDE any input event
+    // (async queue + auto-chaining); reconcile the stack to the
+    // queue's is_active() so SecretPrompt is pushed/popped (§5).
+    input::reconcile_secret_prompt(app);
+    // Throttled subagent reconcile (~1s cadence) — keeps the mutex off
+    // the 60fps path while still updating timers and catching idle-finish.
+    if !app.subagents.is_empty() {
+        let now = std::time::Instant::now();
+        let should_reconcile =
+            last_subagent_reconcile.map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
+        if should_reconcile {
+            let rows = runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .display_rows();
+            super::stream_handler::reconcile_subagents(&mut app.subagents, &rows, now);
+            *last_subagent_reconcile = Some(now);
+            app.request_redraw();
+        }
+    }
+    if app.toasts.tick() {
+        app.invalidate();
+    }
+    // Tick the in-flight plugin install spinner and reap the
+    // background clone task once it finishes.
+    let mut install_did_work = false;
+    let mut install_finished = false;
+    if let Some(plugins_state) = app.plugins.as_mut() {
+        if plugins_state.is_install_active() {
+            plugins_state.tick_install_spinner();
+            install_did_work = true;
+            if plugins_state.install_ready_to_reap() {
+                install_finished = true;
+            }
+        }
+    }
+    if install_finished {
+        if let Some(plugins_state) = app.plugins.as_mut() {
+            super::plugins::actions::complete_pending_install_clone(
+                plugins_state,
+                registry,
+                config,
+            )
+            .await;
+        }
+    }
+    if install_did_work || install_finished {
+        app.invalidate();
+    }
+    let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
+    if message_animation_needs_clear
+        && crossterm::terminal::size().is_ok_and(|(w, h)| w > 0 && h > 0)
+    {
+        render_handle.send_clear();
+    }
+    if let Some(ref mut t) = app.logo_build_t {
+        *t += 0.025;
+        if *t >= 1.0 {
+            app.logo_build_t = None;
+        }
+        app.request_redraw();
+    }
+    if let Some(ref mut t) = app.logo_dismiss_t {
+        *t += 0.04;
+        if *t >= 1.0 {
+            app.logo_dismiss_t = None;
+        }
+        app.request_redraw();
+    }
+    if app.advance_animations() {
+        // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
+        // active tool animation). Mark just the last slot dirty instead of
+        // full invalidation — O(1) instead of O(n) per frame.
+        app.invalidate_last();
+    }
+    if let Some(msg) = app.check_gamba_exited() {
+        // check_gamba_exited() already called restore_terminal();
+        // resume the render thread now that we own the terminal again.
+        render_handle.resume();
+        app.push_msg(ChatMessage::System(msg));
+        app.invalidate(); // invalidate already sets needs_redraw
+    }
+    // Poll background compaction task
+    if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
+        let handle = app.compact_task.take().unwrap();
+        let msg_count = app.api_messages.len();
+        match handle.await {
+            Ok(Ok(summary)) => {
+                let old_id = app.session.id.clone();
+                // Find chains pointing at the old head before we swap
+                let chains_to_advance =
+                    synaps_cli::chain::find_all_chains_by_head(&old_id).unwrap_or_default();
+                let new_session = Session::new_from_compaction(&app.session, summary.clone());
+                let new_id = new_session.id.clone();
+                // Save new session FIRST — if we crash after this but before
+                // saving old, the new session still exists and chain is intact
+                app.session = new_session;
+                app.api_messages = app.session.api_messages.clone();
+                app.total_input_tokens = 0;
+                app.total_output_tokens = 0;
+                app.session_cost = 0.0;
+                let msgs = app.api_messages.clone();
+                rebuild_display_messages(&msgs, app);
+                app.save_session().await;
+                // Load old session fresh from disk and update its forward link
+                match synaps_cli::core::session::Session::load(&old_id) {
+                    Ok(mut old_session) => {
+                        old_session.compacted_into = Some(new_id.clone());
+                        // Clear name from old session — it transferred to the new one
+                        old_session.name = None;
+                        old_session.save().await.ok();
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to update old session {}: {}", old_id, e);
                     }
                 }
-                if app.toasts.tick() {
-                    app.invalidate();
-                }
-                // Tick the in-flight plugin install spinner and reap the
-                // background clone task once it finishes.
-                let mut install_did_work = false;
-                let mut install_finished = false;
-                if let Some(plugins_state) = app.plugins.as_mut() {
-                    if plugins_state.is_install_active() {
-                        plugins_state.tick_install_spinner();
-                        install_did_work = true;
-                        if plugins_state.install_ready_to_reap() {
-                            install_finished = true;
-                        }
-                    }
-                }
-                if install_finished {
-                    if let Some(plugins_state) = app.plugins.as_mut() {
-                        super::plugins::actions::complete_pending_install_clone(
-                            plugins_state, registry, config,
-                        ).await;
-                    }
-                }
-                if install_did_work || install_finished {
-                    app.invalidate();
-                }
-                let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
-                if message_animation_needs_clear
-                    && crossterm::terminal::size().is_ok_and(|(w, h)| w > 0 && h > 0) {
-                        render_handle.send_clear();
-                    }
-                if let Some(ref mut t) = app.logo_build_t {
-                    *t += 0.025;
-                    if *t >= 1.0 { app.logo_build_t = None; }
-                    app.request_redraw();
-                }
-                if let Some(ref mut t) = app.logo_dismiss_t {
-                    *t += 0.04;
-                    if *t >= 1.0 { app.logo_dismiss_t = None; }
-                    app.request_redraw();
-                }
-                if app.advance_animations() {
-                    // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-                    // active tool animation). Mark just the last slot dirty instead of
-                    // full invalidation — O(1) instead of O(n) per frame.
-                    app.invalidate_last();
-                }
-                if let Some(msg) = app.check_gamba_exited() {
-                    // check_gamba_exited() already called restore_terminal();
-                    // resume the render thread now that we own the terminal again.
-                    render_handle.resume();
-                    app.push_msg(ChatMessage::System(msg));
-                    app.invalidate(); // invalidate already sets needs_redraw
-                }
-                // Poll background compaction task
-                if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
-                    let handle = app.compact_task.take().unwrap();
-                    let msg_count = app.api_messages.len();
-                    match handle.await {
-                        Ok(Ok(summary)) => {
-                            let old_id = app.session.id.clone();
-                            // Find chains pointing at the old head before we swap
-                            let chains_to_advance = synaps_cli::chain::find_all_chains_by_head(&old_id)
-                                .unwrap_or_default();
-                            let new_session = Session::new_from_compaction(&app.session, summary.clone());
-                            let new_id = new_session.id.clone();
-                            // Save new session FIRST — if we crash after this but before
-                            // saving old, the new session still exists and chain is intact
-                            app.session = new_session;
-                            app.api_messages = app.session.api_messages.clone();
-                            app.total_input_tokens = 0;
-                            app.total_output_tokens = 0;
-                            app.session_cost = 0.0;
-                            let msgs = app.api_messages.clone();
-                            rebuild_display_messages(&msgs, app);
-                            app.save_session().await;
-                            // Load old session fresh from disk and update its forward link
-                            match synaps_cli::core::session::Session::load(&old_id) {
-                                Ok(mut old_session) => {
-                                    old_session.compacted_into = Some(new_id.clone());
-                                    // Clear name from old session — it transferred to the new one
-                                    old_session.name = None;
-                                    old_session.save().await.ok();
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to update old session {}: {}", old_id, e);
-                                }
-                            }
-                            let compaction_event = synaps_cli::extensions::hooks::events::HookEvent::on_compaction(
-                                &old_id,
-                                &new_id,
-                                &summary,
-                                msg_count,
-                                serde_json::json!({"source": "manual"}),
-                            );
-                            let _ = runtime.hook_bus().emit(&compaction_event).await;
+                let compaction_event =
+                    synaps_cli::extensions::hooks::events::HookEvent::on_compaction(
+                        &old_id,
+                        &new_id,
+                        &summary,
+                        msg_count,
+                        serde_json::json!({"source": "manual"}),
+                    );
+                let _ = runtime.hook_bus().emit(&compaction_event).await;
 
-                            // Advance any named chains that pointed at the old head
-                            for ch in &chains_to_advance {
-                                match synaps_cli::chain::save_chain(&ch.name, &new_id) {
-                                    Ok(()) => {
-                                        app.push_msg(ChatMessage::System(format!(
-                                            "chain '{}' advanced: {} → {}",
-                                            ch.name, old_id, new_id
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        app.push_msg(ChatMessage::Error(format!(
-                                            "failed to advance chain '{}': {}", ch.name, e
-                                        )));
-                                    }
-                                }
-                            }
-                            // Flush any events that arrived during compaction
-                            for formatted in app.pending_events.drain(..) {
-                                app.api_messages.push(std::sync::Arc::new(serde_json::json!({
-                                    "role": "user",
-                                    "content": formatted
-                                })));
-                            }
-                            if let Some(queued) = app.queued_message.take() {
-                                app.api_messages.push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": queued})));
-                                app.push_msg(ChatMessage::System(format!("queued message restored: {}", queued)));
-                            }
+                // Advance any named chains that pointed at the old head
+                for ch in &chains_to_advance {
+                    match synaps_cli::chain::save_chain(&ch.name, &new_id) {
+                        Ok(()) => {
                             app.push_msg(ChatMessage::System(format!(
-                                "✓ compacted {} messages → new session {} (from {})",
-                                msg_count, new_id, old_id
+                                "chain '{}' advanced: {} → {}",
+                                ch.name, old_id, new_id
                             )));
                         }
-                        Ok(Err(e)) => {
-                            app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
-                        }
                         Err(e) => {
-                            app.push_msg(ChatMessage::Error(format!("compaction task panicked: {}", e)));
+                            app.push_msg(ChatMessage::Error(format!(
+                                "failed to advance chain '{}': {}",
+                                ch.name, e
+                            )));
                         }
                     }
-                    app.status_text = None;
-                    app.invalidate();
                 }
-                if exit_done.load(Ordering::Acquire) {
-                    return true;
+                // Flush any events that arrived during compaction
+                for formatted in app.pending_events.drain(..) {
+                    app.api_messages
+                        .push(std::sync::Arc::new(serde_json::json!({
+                            "role": "user",
+                            "content": formatted
+                        })));
                 }
-                false
+                if let Some(queued) = app.queued_message.take() {
+                    app.api_messages.push(std::sync::Arc::new(
+                        serde_json::json!({"role": "user", "content": queued}),
+                    ));
+                    app.push_msg(ChatMessage::System(format!(
+                        "queued message restored: {}",
+                        queued
+                    )));
+                }
+                app.push_msg(ChatMessage::System(format!(
+                    "✓ compacted {} messages → new session {} (from {})",
+                    msg_count, new_id, old_id
+                )));
+            }
+            Ok(Err(e)) => {
+                app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
+            }
+            Err(e) => {
+                app.push_msg(ChatMessage::Error(format!(
+                    "compaction task panicked: {}",
+                    e
+                )));
+            }
+        }
+        app.status_text = None;
+        app.invalidate();
+    }
+    if exit_done.load(Ordering::Acquire) {
+        return true;
+    }
+    false
 }
-

@@ -347,29 +347,112 @@ pub(crate) fn apply_model_list_result(
     );
 
     if let Ok(models) = result {
-        // Strip provider prefix to store bare model ids for section building,
-        // but keep labels. Entries already use provider-qualified runtime ids.
-        let prefix = format!("{provider_key}/");
-        let override_rows: ProviderCatalogOverride = models
-            .into_iter()
-            .filter_map(|model| {
-                let bare = model
-                    .id
-                    .strip_prefix(&prefix)
-                    .unwrap_or(model.id.as_str())
-                    .to_string();
-                if bare.trim().is_empty() {
-                    return None;
-                }
-                Some((bare, model.label))
-            })
-            .collect();
+        let override_rows = catalog_override_rows(provider_key, &models);
         if !override_rows.is_empty() {
             state
                 .provider_catalog_overrides
                 .insert(provider_key.to_string(), override_rows);
         }
     }
+}
+
+/// Convert live catalog entries into main-section override rows.
+///
+/// Strips the provider prefix to store bare model ids for section building,
+/// but keeps labels. Entries already use provider-qualified runtime ids.
+/// Shared by the /models modal and the app-level catalog cache that feeds
+/// the /settings model picker.
+pub(crate) fn catalog_override_rows(
+    provider_key: &str,
+    models: &[ExpandedModelEntry],
+) -> ProviderCatalogOverride {
+    let prefix = format!("{provider_key}/");
+    models
+        .iter()
+        .filter_map(|model| {
+            let bare = model
+                .id
+                .strip_prefix(&prefix)
+                .unwrap_or(model.id.as_str())
+                .to_string();
+            if bare.trim().is_empty() {
+                return None;
+            }
+            Some((bare, model.label.clone()))
+        })
+        .collect()
+}
+
+/// Format a ping latency/status cell for model rows (shared with /settings).
+pub(crate) fn fmt_latency(
+    status: synaps_cli::runtime::openai::ping::PingStatus,
+    ms: u64,
+) -> String {
+    use synaps_cli::runtime::openai::ping::PingStatus;
+    match status {
+        PingStatus::Online => {
+            if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{}ms", ms)
+            }
+        }
+        other => other.label().to_string(),
+    }
+}
+
+/// Flatten model sections into parallel (display, value) picker rows.
+///
+/// One header row per provider section (empty value — never selectable),
+/// then one row per model whose value is the EXACT provider-qualified
+/// runtime id of the entry. Ping health renders as a display-only prefix.
+/// This is the single row source for the /settings model picker, so
+/// /settings and /models can never drift apart on available models.
+pub(crate) fn picker_rows_from_sections(
+    sections: &[ModelSection],
+    model_health: &std::collections::HashMap<
+        String,
+        (synaps_cli::runtime::openai::ping::PingStatus, u64),
+    >,
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for section in sections {
+        rows.push((format!("── {} ──", section.provider_name), String::new()));
+        for entry in &section.entries {
+            let health = model_health
+                .get(&entry.id)
+                .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
+                .unwrap_or_default();
+            let tier = if entry.tier.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", entry.tier)
+            };
+            rows.push((
+                format!("  {}{}  — {}{}", health, entry.id, entry.label, tier),
+                entry.id.clone(),
+            ));
+        }
+    }
+    rows
+}
+
+/// Build the /settings model-picker rows from the same data the /models
+/// modal renders: dev provider sections, broker availability/login state,
+/// and any live catalog overrides fetched so far (`app.catalog_overrides`).
+pub(crate) fn settings_model_picker_rows(
+    current_model: &str,
+    catalog_overrides: &std::collections::BTreeMap<String, ProviderCatalogOverride>,
+    model_health: &std::collections::HashMap<
+        String,
+        (synaps_cli::runtime::openai::ping::PingStatus, u64),
+    >,
+) -> Vec<(String, String)> {
+    let mut state = ModelsModalState::new();
+    state.view = ModelsView::All;
+    state.search.clear();
+    state.provider_catalog_overrides = catalog_overrides.clone();
+    picker_rows_from_sections(&build_sections(current_model, &state), model_health)
 }
 
 pub(crate) fn build_sections(current_model: &str, state: &ModelsModalState) -> Vec<ModelSection> {
@@ -1147,6 +1230,106 @@ fn render_expanded_lightbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Slice A: shared picker rows for /settings model picker ----------
+
+    /// `picker_rows_from_sections` is the shared display/value row builder
+    /// consumed by the /settings model picker: one header row per provider
+    /// (empty value) followed by exact provider-qualified model values.
+    #[test]
+    fn picker_rows_from_sections_yields_headers_and_exact_ids() {
+        let sections = vec![ModelSection {
+            provider_key: "openai-codex".to_string(),
+            provider_name: "OpenAI Codex".to_string(),
+            configured: true,
+            entries: vec![ModelEntry {
+                id: "openai-codex/gpt-5.6-sol".to_string(),
+                display_id: "gpt-5.6-sol".to_string(),
+                label: "Sol".to_string(),
+                tier: "S+".to_string(),
+                provider_key: "openai-codex".to_string(),
+                provider_name: "OpenAI Codex".to_string(),
+                favorite_id: "openai-codex/gpt-5.6-sol".to_string(),
+                configured: true,
+                is_current: false,
+                is_favorite: false,
+                order: 0,
+            }],
+        }];
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert_eq!(rows[0].0, "── OpenAI Codex ──");
+        assert!(rows[0].1.is_empty(), "header row carries no value");
+        assert!(
+            rows[1].0.contains("gpt-5.6-sol") && rows[1].0.contains("Sol"),
+            "model row display shows id and label: {}",
+            rows[1].0
+        );
+        assert_eq!(rows[1].1, "openai-codex/gpt-5.6-sol");
+    }
+
+    /// Live catalog overrides (the /models live-list behavior) must flow
+    /// through to the shared picker rows so /settings sees the same data.
+    #[test]
+    fn picker_rows_include_live_catalog_overrides() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::from([(
+                "openai-codex".to_string(),
+                vec![("gpt-live-1".to_string(), "Live One".to_string())],
+            )]),
+        };
+        let sections = build_sections_from_parts(
+            "m",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["openai-codex"]),
+        );
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert!(
+            rows.iter().any(|(_, v)| v == "openai-codex/gpt-live-1"),
+            "live catalog override rows must appear with exact runtime ids: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, v)| v == "openai-codex/gpt-5.6-sol"),
+            "static seeds are replaced by live overrides"
+        );
+    }
+
+    /// Ping health results render as a prefix on the display column only —
+    /// the value column stays the bare exact id.
+    #[test]
+    fn picker_rows_health_prefix_never_leaks_into_value() {
+        let sections = vec![ModelSection {
+            provider_key: "groq".to_string(),
+            provider_name: "Groq".to_string(),
+            configured: true,
+            entries: vec![ModelEntry {
+                id: "groq/llama-3.3-70b-versatile".to_string(),
+                display_id: "llama-3.3-70b-versatile".to_string(),
+                label: "Llama".to_string(),
+                tier: "A".to_string(),
+                provider_key: "groq".to_string(),
+                provider_name: "Groq".to_string(),
+                favorite_id: "groq/llama-3.3-70b-versatile".to_string(),
+                configured: true,
+                is_current: false,
+                is_favorite: false,
+                order: 0,
+            }],
+        }];
+        let health = std::collections::HashMap::from([(
+            "groq/llama-3.3-70b-versatile".to_string(),
+            (synaps_cli::runtime::openai::ping::PingStatus::Online, 79u64),
+        )]);
+        let rows = picker_rows_from_sections(&sections, &health);
+        assert!(rows[1].0.contains("79ms"), "display: {}", rows[1].0);
+        assert_eq!(rows[1].1, "groq/llama-3.3-70b-versatile");
+    }
 
     #[test]
     fn expanded_entry_metadata_label_joins_badges() {

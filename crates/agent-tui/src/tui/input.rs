@@ -627,11 +627,12 @@ fn route_settings(
             return InputAction::None;
         }
         if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(
+            let mut snap = super::settings::RuntimeSnapshot::from_runtime_with_health(
                 runtime,
                 registry,
                 app.model_health.clone(),
             );
+            snap.catalog_overrides = app.catalog_overrides.clone();
             match super::settings::handle_event(state, key, &snap) {
                 super::settings::InputOutcome::Close => {
                     app.settings = None;

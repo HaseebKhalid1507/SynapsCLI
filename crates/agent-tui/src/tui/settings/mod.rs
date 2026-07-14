@@ -110,6 +110,11 @@ pub(crate) struct RuntimeSnapshot {
     /// For Codex models: the exact ordered supported levels from the catalog.
     /// For all other models: the conservative legacy set.
     pub thinking_options: Vec<String>,
+    /// App-level live catalog overrides (provider → (bare id, label) rows),
+    /// fetched by the same auto-refresh path the /models modal uses. Feeds
+    /// the shared model picker so /settings shows live catalogs too.
+    pub catalog_overrides:
+        std::collections::BTreeMap<String, crate::tui::models::ProviderCatalogOverride>,
 }
 
 impl RuntimeSnapshot {
@@ -178,6 +183,7 @@ impl RuntimeSnapshot {
             plugin_categories: registry.plugin_settings_categories(),
             lifecycle_claims: registry.lifecycle_claims(),
             thinking_options: thinking_options_for_model(runtime.model()),
+            catalog_overrides: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -199,6 +205,9 @@ pub(super) enum ActiveEditor {
     Picker {
         setting_key: &'static str,
         options: Vec<String>,
+        /// Parallel exact-value column: `values[i]` is applied verbatim when
+        /// row `i` is selected. Empty string = non-selectable (header) row.
+        values: Vec<String>,
         cursor: usize,
     },
     CustomModel {
@@ -386,6 +395,7 @@ mod wireup_tests {
                 "xhigh".into(),
                 "adaptive".into(),
             ],
+            catalog_overrides: std::collections::BTreeMap::new(),
         }
     }
 
