@@ -702,6 +702,15 @@ impl Runtime {
         };
         let model = self.model.as_str();
         if let Some(model_id) = model.strip_prefix("openai-codex/") {
+            // These client modes omit the provider effort field.
+            if matches!(
+                level,
+                agent_core::reasoning::ReasoningLevel::Off
+                    | agent_core::reasoning::ReasoningLevel::Adaptive
+            ) {
+                self.set_reasoning_level_explicit(level);
+                return Ok(());
+            }
             let supported: Option<Vec<agent_core::reasoning::ReasoningLevel>> =
                 capability_cache::get(model)
                     .and_then(|m| match m.reasoning {
@@ -722,6 +731,11 @@ impl Runtime {
                     ));
                 }
             }
+        } else if level.requires_codex_support() {
+            return Err(format!(
+                "reasoning level '{}' requires authoritative exact-model capability metadata; {} has none",
+                level, model
+            ));
         }
         self.set_reasoning_level_explicit(level);
         Ok(())
@@ -1816,6 +1830,15 @@ mod set_reasoning_level_checked_tests {
         rt
     }
 
+    #[test]
+    fn checked_accepts_client_omission_modes_for_codex() {
+        for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
+            let mut rt = codex_runtime("gpt-5.6-sol");
+            rt.set_reasoning_level_checked(level).unwrap();
+            assert_eq!(rt.reasoning_level(), level);
+        }
+    }
+
     /// luna does not support Ultra; checked must reject and leave level unchanged.
     #[test]
     fn checked_rejects_ultra_for_luna_no_mutation() {
@@ -1848,13 +1871,15 @@ mod set_reasoning_level_checked_tests {
         assert_eq!(rt.reasoning_level(), ReasoningLevel::Ultra);
     }
 
-    /// Non-Codex provider — checked accepts any level (no capability table enforced).
+    /// Providers without exact metadata must not gain Max/Ultra.
     #[test]
-    fn checked_accepts_any_level_for_non_codex() {
+    fn checked_rejects_extended_levels_without_metadata() {
         let mut rt = Runtime::new_headless();
         rt.set_model("claude-opus-4-7".to_string());
-        rt.set_reasoning_level_checked(ReasoningLevel::Ultra)
-            .expect("non-Codex must accept any level");
-        assert_eq!(rt.reasoning_level(), ReasoningLevel::Ultra);
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+            assert!(rt.set_reasoning_level_checked(level).is_err());
+            assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+        }
     }
 }

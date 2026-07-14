@@ -1318,7 +1318,7 @@ mod xai_tests {
 
 #[cfg(test)]
 mod codex_wire_tests {
-    use crate::runtime::openai::catalog::{codex_static_capability, validate_codex_level};
+    use crate::runtime::openai::catalog::validate_codex_level;
     use agent_core::reasoning::ReasoningLevel;
 
     /// Validate → emit exact reasoning.effort shape for known levels.

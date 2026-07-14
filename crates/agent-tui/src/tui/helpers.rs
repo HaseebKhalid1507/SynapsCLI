@@ -47,6 +47,14 @@ pub(super) fn apply_setting(
         return;
     }
 
+    // Keep the embedded session in sync with settings changes so resume sees
+    // the exact active provider/model reasoning selection.
+    if key == "thinking" {
+        app.session.thinking_level = value.to_string();
+    } else if key == "model" {
+        app.session.model = runtime.model().to_string();
+    }
+
     // `skills` is internal — not persisted via write_config_value.
     if key == "skills" {
         return;

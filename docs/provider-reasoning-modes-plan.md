@@ -1,7 +1,7 @@
 # Provider reasoning modes implementation plan
 
-**Branch:** `feat/provider-reasoning-modes`  
-**Worktree:** `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-provider-reasoning-modes`  
+**Branch:** `feat/provider-reasoning-modes`
+**Worktree:** `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-provider-reasoning-modes`
 **Convergence:** informed; threshold 0.8; axis weights correctness 0.35, architecture/types 0.25, security 0.15, tests 0.15, readability/performance 0.10; max fix iterations 2; max total calls 10.
 
 ## Dependency graph
@@ -24,7 +24,7 @@ Typed named level + compatibility mapping
 
 **Verification:** focused core/config/command tests and `cargo check -p synaps-core`.
 
-**Files likely touched:** core reasoning/models/config and engine command parsing.  
+**Files likely touched:** core reasoning/models/config and engine command parsing.
 **Scope:** M.
 
 ## Task 2: Exact Codex capability metadata
@@ -38,7 +38,7 @@ Typed named level + compatibility mapping
 
 **Verification:** fixture parser tests and catalog integration tests.
 
-**Files likely touched:** catalog domain type, Codex parser/fixture.  
+**Files likely touched:** catalog domain type, Codex parser/fixture.
 **Scope:** M.
 
 ## Checkpoint 1
@@ -58,7 +58,7 @@ Typed named level + compatibility mapping
 
 **Verification:** config, runtime, session, resume, and existing Anthropic golden tests.
 
-**Files likely touched:** runtime state, config type/parser, session/resume integration.  
+**Files likely touched:** runtime state, config type/parser, session/resume integration.
 **Scope:** M.
 
 ## Task 4: Model-aware command and settings behavior
@@ -73,7 +73,7 @@ Typed named level + compatibility mapping
 
 **Verification:** command tests and headless TUI settings tests.
 
-**Files likely touched:** engine commands/runtime validation and TUI settings schema/input/snapshot.  
+**Files likely touched:** engine commands/runtime validation and TUI settings schema/input/snapshot.
 **Scope:** M.
 
 ## Checkpoint 2
@@ -94,7 +94,7 @@ Typed named level + compatibility mapping
 
 **Verification:** extracted pure body-builder tests plus zero-network rejection harness.
 
-**Files likely touched:** OpenAI route dispatch and Codex stream/body builder.  
+**Files likely touched:** OpenAI route dispatch and Codex stream/body builder.
 **Scope:** M.
 
 ## Task 6: Automated aggregate harness and review
@@ -109,7 +109,7 @@ Typed named level + compatibility mapping
 
 **Verification:** commands from the spec; no human interaction required.
 
-**Dependencies:** Tasks 1–5.  
+**Dependencies:** Tasks 1–5.
 **Scope:** S.
 
 ## Checkpoint 3

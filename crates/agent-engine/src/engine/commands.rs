@@ -10,7 +10,7 @@ use agent_core::reasoning::ReasoningLevel;
 pub enum ThinkingSpec {
     /// A named canonical level (off/adaptive/low/medium/high/xhigh/max/ultra).
     Named(ReasoningLevel),
-    /// A custom numeric budget (e.g. `/thinking 8192`).  
+    /// A custom numeric budget (e.g. `/thinking 8192`).
     /// `level` is the nearest named level for display; `budget` is the exact value.
     Custom { level: ReasoningLevel, budget: u32 },
 }
@@ -410,13 +410,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_level_non_codex_always_ok() {
+    fn validate_level_non_codex_rejects_ultra() {
         for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7", "groq/llama-3"] {
             let mut rt = crate::Runtime::new_headless();
             rt.set_model(model.to_string());
             assert!(
-                rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_ok(),
-                "non-Codex {model} should pass validation"
+                rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_err(),
+                "non-Codex {model} must not gain ultra without exact metadata"
             );
         }
     }

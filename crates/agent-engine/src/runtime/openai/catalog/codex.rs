@@ -207,6 +207,10 @@ pub fn validate_codex_level(
     level: ReasoningLevel,
     catalog_model: Option<&CatalogModel>,
 ) -> Result<(), String> {
+    // Off/Adaptive omit the provider field; catalogs list concrete efforts only.
+    if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
+        return Ok(());
+    }
     // 1. Explicit CatalogModel argument takes top priority.
     if let Some(model) = catalog_model {
         if let Some(levels) = model.codex_supported_levels() {
@@ -487,6 +491,12 @@ mod tests {
     #[test]
     fn validate_sol_ultra_ok() {
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, None).is_ok());
+    }
+
+    #[test]
+    fn validate_sol_client_omission_modes_ok() {
+        assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Off, None).is_ok());
+        assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Adaptive, None).is_ok());
     }
 
     #[test]

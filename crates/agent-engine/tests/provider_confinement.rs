@@ -45,9 +45,7 @@ fn limits_are_reserved_atomically_by_the_central_decision_point() {
 #[cfg(test)]
 mod reasoning_validation {
     use agent_core::reasoning::ReasoningLevel;
-    use agent_engine::runtime::openai::catalog::{
-        codex_static_capability, validate_codex_level, ReasoningSupport,
-    };
+    use agent_engine::runtime::openai::catalog::{codex_static_capability, validate_codex_level};
 
     #[test]
     fn sol_accepts_ultra_and_max() {
@@ -93,4 +91,3 @@ mod reasoning_validation {
 }
 
 // ── set_reasoning_level_checked — no mutation on Err ────────────────────────
-

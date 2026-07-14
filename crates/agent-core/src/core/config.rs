@@ -576,9 +576,15 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "thinking" => {
                 use crate::core::reasoning::ThinkingSpec;
                 match ThinkingSpec::parse(val) {
-                    Some(spec) => {
-                        config.thinking_level = Some(spec.to_level());
-                        config.thinking_budget = spec.to_budget();
+                    Some(ThinkingSpec::Named(level)) => {
+                        config.thinking_level = Some(level);
+                        config.thinking_budget = level.to_legacy_budget();
+                    }
+                    Some(ThinkingSpec::Budget(budget)) => {
+                        // Preserve exact legacy budgets; do not make the derived
+                        // bucket authoritative over the user's token count.
+                        config.thinking_level = None;
+                        config.thinking_budget = Some(budget);
                     }
                     None => {
                         config.warnings.push(format!("thinking = {val} — expected off|adaptive|low|medium|high|xhigh|max|ultra or a token count; thinking disabled"));
@@ -982,6 +988,9 @@ mod tests {
         assert_eq!(ThinkingSpec::parse("high").unwrap().to_budget(), Some(16384));
         assert_eq!(ThinkingSpec::parse("xhigh").unwrap().to_budget(), Some(32768));
         assert_eq!(ThinkingSpec::parse("8192").unwrap().to_budget(), Some(8192));
+        let config = load_config_from_str("thinking = 8192\n");
+        assert_eq!(config.thinking_level, None);
+        assert_eq!(config.thinking_budget, Some(8192));
         assert_eq!(ThinkingSpec::parse("invalid"), None);
     }
 

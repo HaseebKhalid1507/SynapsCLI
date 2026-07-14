@@ -207,9 +207,11 @@ pub async fn run(
                         match result {
                             CommandResult::Quit => break,
                             CommandResult::ModelChanged { model } => {
+                                conv.session.model = runtime.model().to_string();
                                 eprintln!("model → {}", model);
                             }
                             CommandResult::ThinkingChanged { spec } => {
+                                conv.session.thinking_level = spec.config_value();
                                 eprintln!("thinking → {}", spec.level());
                             }
                             CommandResult::Compact { custom_instructions } => {
