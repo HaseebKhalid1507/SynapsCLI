@@ -497,3 +497,80 @@ fn golden_gate_body_bytes_identical() {
         );
     }
 }
+
+#[test]
+fn anthropic_special_modes_wire_goldens() {
+    use crate::runtime::openai::catalog::{
+        plan_anthropic_execution, AnthropicPlanPrerequisites, ExecutionRole,
+        ANTHROPIC_ULTRACODE_WORKFLOW,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+
+    let messages = plain_history();
+    let tools = two_tools();
+    for stream in [true, false] {
+        for (level, expected_effort, workflow) in [
+            (ReasoningLevel::Max, "max", false),
+            (ReasoningLevel::UltraCode, "xhigh", true),
+            (ReasoningLevel::XHigh, "xhigh", false),
+        ] {
+            let plan = plan_anthropic_execution(
+                "anthropic/claude-fable-5",
+                level,
+                ExecutionRole::Foreground,
+                AnthropicPlanPrerequisites::installed(),
+                None,
+            )
+            .expect("exact Fable plan must authorize");
+            let system_prompt = workflow
+                .then(|| format!("base system\n\n{ANTHROPIC_ULTRACODE_WORKFLOW}"))
+                .or_else(|| Some("base system".to_owned()));
+            let body = super::request::RequestBody::new(
+                "claude-fable-5",
+                &messages,
+                &tools,
+                &system_prompt,
+                "api_key",
+                16_384,
+                level,
+                Some(&plan),
+                CacheTtl::FiveMinutes,
+                stream,
+            );
+            let bytes = serde_json::to_vec(&body).unwrap();
+            let wire = std::str::from_utf8(&bytes).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["output_config"]["effort"], expected_effort);
+            assert!(
+                !wire.contains(r#"\"ultracode\""#),
+                "logical mode leaked as a serialized value: {wire}"
+            );
+            let doctrine_count = wire.matches("anthropic-ultracode-workflow").count();
+            assert_eq!(doctrine_count, if workflow { 2 } else { 0 }); // opening + closing tag
+            assert_eq!(
+                value.get("stream").and_then(Value::as_bool),
+                stream.then_some(true)
+            );
+
+            let ordered = [
+                "\"max_tokens\"",
+                "\"messages\"",
+                "\"model\"",
+                "\"output_config\"",
+            ];
+            let mut cursor = 0;
+            for key in ordered {
+                let pos = wire[cursor..].find(key).unwrap();
+                cursor += pos + key.len();
+            }
+            if stream {
+                let pos = wire[cursor..].find("\"stream\"").unwrap();
+                cursor += pos + 8;
+            }
+            for key in ["\"system\"", "\"thinking\"", "\"tools\""] {
+                let pos = wire[cursor..].find(key).unwrap();
+                cursor += pos + key.len();
+            }
+        }
+    }
+}
