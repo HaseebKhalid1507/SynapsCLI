@@ -287,6 +287,33 @@ pub struct Runtime {
     token_cache: crate::auth::TokenCache,
 }
 
+/// Idle timeout for the runtime HTTP client: how long a request may go
+/// without receiving *any* bytes (headers or body chunks) before it is
+/// killed. Resets on every received chunk, so healthy long-running streams
+/// are never interrupted.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Build the runtime's shared HTTP client.
+///
+/// Timeout design (incident: session 20260714-025948-3dab):
+/// * `connect_timeout(10s)` — connection-establishment ceiling.
+/// * `read_timeout` — **idle** detector; resets after each successful read
+///   (reqwest `ReadTimeoutBody`). A hung request surfaces in seconds
+///   instead of minutes, while an actively-streaming turn can run
+///   indefinitely.
+/// * Deliberately **no** total `.timeout(…)`: that was a wall-clock
+///   deadline that kept ticking while bytes flowed, killing any healthy
+///   stream longer than 300s and taking 300s to notice a dead connection.
+///   Turn-level lifecycle is owned by cancellation tokens, not the client.
+fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .build()
+}
+
 impl Runtime {
     pub async fn new() -> Result<Self> {
         // Runtime construction is credential-blind. Credentials are acquired
@@ -295,12 +322,7 @@ impl Runtime {
         let (auth_token, auth_type, refresh_token, token_expires) =
             (String::new(), "oauth".to_string(), None, Some(0));
 
-        let client = Client::builder()
-            .tls_built_in_webpki_certs(true)
-            .tls_built_in_native_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
+        let client = build_http_client(HTTP_READ_TIMEOUT)
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
         let session_manager = {
@@ -371,12 +393,7 @@ impl Runtime {
     /// which is the correct behavior for a harness that only drives the UI.
     #[cfg(any(test, feature = "testing"))]
     pub fn new_headless() -> Self {
-        let client = Client::builder()
-            .tls_built_in_webpki_certs(true)
-            .tls_built_in_native_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
+        let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
 
         let session_manager = {
@@ -1930,5 +1947,138 @@ mod set_reasoning_level_checked_tests {
             ReasoningLevel::Low,
             "explicit level must not be overwritten by the model default"
         );
+    }
+}
+
+#[cfg(test)]
+mod http_client_timeout_tests {
+    //! Regression tests for the runtime HTTP client's timeout semantics.
+    //!
+    //! The client used to set `.timeout(300s)` — a **total wall-clock
+    //! deadline** that keeps ticking even while a streaming response is
+    //! actively delivering bytes (reqwest `TotalTimeoutBody` never resets).
+    //! Two failure modes: a dead connection took a full 5 minutes to
+    //! surface (incident: session 20260714-025948-3dab), and any healthy
+    //! stream longer than 300s was killed mid-flight. The fix is an
+    //! idle-based `read_timeout` that resets on every received chunk.
+    //!
+    //! Servers here are raw TCP writing chunked HTTP/1.1 — full control
+    //! over inter-chunk delays with no framework buffering in the way.
+
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+
+    fn chunk(data: &str) -> Vec<u8> {
+        format!("{:x}\r\n{}\r\n", data.len(), data).into_bytes()
+    }
+
+    /// Spawn a raw server: writes headers, then `n_chunks` chunks spaced
+    /// `gap` apart, then (optionally) the terminating chunk.
+    async fn spawn_chunked_server(n_chunks: usize, gap: Duration, terminate: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head (we don't care about its contents).
+            let mut buf = [0u8; 4096];
+            use tokio::io::AsyncReadExt;
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(CHUNKED_HEAD).await.unwrap();
+            for i in 0..n_chunks {
+                sock.write_all(&chunk(&format!("data {i}\n"))).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(gap).await;
+            }
+            if terminate {
+                sock.write_all(b"0\r\n\r\n").await.unwrap();
+            } else {
+                // Stall forever (until the client gives up and drops us).
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        format!("http://{addr}/stream")
+    }
+
+    async fn drain(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = client.get(url).send().await?;
+        let mut stream = resp.bytes_stream();
+        let mut total = 0usize;
+        while let Some(c) = stream.next().await {
+            total += c?.len();
+        }
+        Ok(total)
+    }
+
+    /// A healthy stream that keeps delivering bytes must NOT be killed,
+    /// even when its total duration exceeds the read timeout — received
+    /// data resets the idle clock. (This is the property the old total
+    /// deadline violated at 300s.)
+    #[tokio::test]
+    async fn active_stream_outliving_read_timeout_survives() {
+        // 15 chunks × 100ms ≈ 1.5s total, read_timeout = 400ms.
+        let url = spawn_chunked_server(15, Duration::from_millis(100), true).await;
+        let client = super::build_http_client(Duration::from_millis(400))
+            .expect("client builds");
+        let total = drain(&client, &url)
+            .await
+            .expect("active stream must never be killed by the idle timeout");
+        assert!(total > 0);
+    }
+
+    /// A stream that stalls (bytes stop arriving) must be killed within
+    /// the read timeout — not after a 300s total deadline.
+    #[tokio::test]
+    async fn stalled_stream_is_killed_by_read_timeout() {
+        // 2 quick chunks then permanent stall, read_timeout = 300ms.
+        let url = spawn_chunked_server(2, Duration::from_millis(10), false).await;
+        let client = super::build_http_client(Duration::from_millis(300))
+            .expect("client builds");
+        let start = std::time::Instant::now();
+        let err = drain(&client, &url)
+            .await
+            .expect_err("stalled stream must be detected");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "stall must be detected promptly, took {:?}",
+            start.elapsed()
+        );
+        let msg = crate::core::error::error_chain_string(err.as_ref());
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "must be a timeout error: {msg}"
+        );
+    }
+
+    /// A server that accepts but never sends response headers must be
+    /// killed by the read timeout too (the incident's failure mode —
+    /// previously took the full 300s total deadline to surface).
+    #[tokio::test]
+    async fn hung_headers_are_killed_by_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = super::build_http_client(Duration::from_millis(300))
+            .expect("client builds");
+        let start = std::time::Instant::now();
+        let err = client
+            .get(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("hung request must be detected");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hung headers must be detected promptly, took {:?}",
+            start.elapsed()
+        );
+        assert!(err.is_timeout(), "must be a timeout: {err:?}");
     }
 }
