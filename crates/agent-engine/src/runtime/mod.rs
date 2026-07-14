@@ -766,26 +766,67 @@ impl Runtime {
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
         let level = self.reasoning_level();
-        if model.starts_with("openai-codex/") {
-            let plan = crate::runtime::openai::catalog::plan_codex_execution(
+        if model.starts_with("anthropic/")
+            && matches!(
+                level,
+                agent_core::reasoning::ReasoningLevel::Max
+                    | agent_core::reasoning::ReasoningLevel::UltraCode
+                    | agent_core::reasoning::ReasoningLevel::Ultra
+            )
+        {
+            let tools = self.tools.read().await;
+            let required = ["subagent_start", "subagent_status", "subagent_collect"];
+            let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
+                orchestration_policy: self.orchestration.is_some(),
+                builtin_lifecycle_tools: required.iter().all(|name| {
+                    tools
+                        .get(name)
+                        .is_some_and(|tool| tool.extension_id().is_none())
+                }),
+            };
+            drop(tools);
+            let result = crate::runtime::openai::catalog::plan_anthropic_execution(
                 model,
                 level,
                 role,
-                None,
-            )
-            .map_err(|error| {
-                tracing::debug!(
-                    event = "codex_mode_plan",
-                    qualified_model = %model,
-                    requested_level = %level,
-                    runtime_role = role.as_str(),
-                    decision = "deny",
-                    deny_code = error.code().as_str(),
-                    network_attempted = false,
-                    "Codex request preflight denied"
-                );
-                RuntimeError::Config(error.to_string())
-            })?;
+                prerequisites,
+                crate::runtime::openai::catalog::capability_cache::get(model).and_then(|entry| {
+                    match entry.reasoning {
+                        crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                            adaptive,
+                        } => Some(adaptive),
+                        crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                        _ => None,
+                    }
+                }),
+            );
+            match result {
+                Ok(plan) => {
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), execution_mode = ?plan.mode, wire_effort = plan.wire_effort.map_or("omitted", |effort| effort.as_str()), workflow = ?plan.workflow, network_attempted = false);
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), decision = "deny", deny_code = error.code().as_str(), network_attempted = false);
+                    return Err(RuntimeError::Config(error.to_string()));
+                }
+            }
+        }
+        if model.starts_with("openai-codex/") {
+            let plan =
+                crate::runtime::openai::catalog::plan_codex_execution(model, level, role, None)
+                    .map_err(|error| {
+                        tracing::debug!(
+                            event = "codex_mode_plan",
+                            qualified_model = %model,
+                            requested_level = %level,
+                            runtime_role = role.as_str(),
+                            decision = "deny",
+                            deny_code = error.code().as_str(),
+                            network_attempted = false,
+                            "Codex request preflight denied"
+                        );
+                        RuntimeError::Config(error.to_string())
+                    })?;
 
             if plan.automatic_delegation() {
                 if self.orchestration.is_none() {
@@ -2157,7 +2198,7 @@ mod codex_execution_preflight_tests {
             .await
             .expect_err("non-Codex Ultra must fail closed");
         assert!(
-            error.to_string().contains("authoritative exact-model"),
+            error.to_string().contains("unsupported_reasoning_level"),
             "{error}"
         );
     }
@@ -2204,7 +2245,8 @@ mod http_client_timeout_tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+    const CHUNKED_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
 
     fn chunk(data: &str) -> Vec<u8> {
         format!("{:x}\r\n{}\r\n", data.len(), data).into_bytes()
@@ -2223,7 +2265,9 @@ mod http_client_timeout_tests {
             let _ = sock.read(&mut buf).await;
             sock.write_all(CHUNKED_HEAD).await.unwrap();
             for i in 0..n_chunks {
-                sock.write_all(&chunk(&format!("data {i}\n"))).await.unwrap();
+                sock.write_all(&chunk(&format!("data {i}\n")))
+                    .await
+                    .unwrap();
                 sock.flush().await.unwrap();
                 tokio::time::sleep(gap).await;
             }
@@ -2258,8 +2302,7 @@ mod http_client_timeout_tests {
     async fn active_stream_outliving_read_timeout_survives() {
         // 15 chunks × 100ms ≈ 1.5s total, read_timeout = 400ms.
         let url = spawn_chunked_server(15, Duration::from_millis(100), true).await;
-        let client = super::build_http_client(Duration::from_millis(400))
-            .expect("client builds");
+        let client = super::build_http_client(Duration::from_millis(400)).expect("client builds");
         let total = drain(&client, &url)
             .await
             .expect("active stream must never be killed by the idle timeout");
@@ -2272,8 +2315,7 @@ mod http_client_timeout_tests {
     async fn stalled_stream_is_killed_by_read_timeout() {
         // 2 quick chunks then permanent stall, read_timeout = 300ms.
         let url = spawn_chunked_server(2, Duration::from_millis(10), false).await;
-        let client = super::build_http_client(Duration::from_millis(300))
-            .expect("client builds");
+        let client = super::build_http_client(Duration::from_millis(300)).expect("client builds");
         let start = std::time::Instant::now();
         let err = drain(&client, &url)
             .await
@@ -2301,8 +2343,7 @@ mod http_client_timeout_tests {
             let (_sock, _) = listener.accept().await.unwrap();
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
-        let client = super::build_http_client(Duration::from_millis(300))
-            .expect("client builds");
+        let client = super::build_http_client(Duration::from_millis(300)).expect("client builds");
         let start = std::time::Instant::now();
         let err = client
             .get(format!("http://{addr}/codex/responses"))

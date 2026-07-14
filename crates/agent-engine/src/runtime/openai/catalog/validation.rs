@@ -11,8 +11,9 @@
 use agent_core::reasoning::ReasoningLevel;
 
 use super::{
-    anthropic_static_capability, capability_cache, codex_static_capability, plan_codex_execution,
-    xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
+    anthropic_static_capability, capability_cache, codex_static_capability,
+    plan_anthropic_execution, plan_codex_execution, xai_static_capability,
+    AnthropicPlanPrerequisites, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
     ReasoningSupport, XaiReasoningCapability,
 };
 
@@ -139,7 +140,30 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
         };
     }
     if let Some(model_id) = anthropic_model_id(model) {
-        if level.requires_codex_support() {
+        if model.starts_with("anthropic/")
+            && matches!(
+                level,
+                ReasoningLevel::Max | ReasoningLevel::UltraCode | ReasoningLevel::Ultra
+            )
+        {
+            return plan_anthropic_execution(
+                model,
+                level,
+                CodexRequestRole::Foreground,
+                AnthropicPlanPrerequisites::installed(),
+                capability_cache::get(model).and_then(|entry| match entry.reasoning {
+                    ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
+                    ReasoningSupport::None => Some(false),
+                    _ => None,
+                }),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        }
+        if matches!(
+            level,
+            ReasoningLevel::Max | ReasoningLevel::Ultra | ReasoningLevel::UltraCode
+        ) {
             return Err(format!(
                 "reasoning level '{level}' requires authoritative exact-model capability metadata; {model} has none"
             ));
@@ -410,7 +434,7 @@ mod tests {
                     "{model} {level}"
                 );
             }
-            for level in [Max, Ultra] {
+            for level in [Max, Ultra, UltraCode] {
                 assert!(
                     validate_reasoning_mutation(model, level).is_err(),
                     "{model} {level}"

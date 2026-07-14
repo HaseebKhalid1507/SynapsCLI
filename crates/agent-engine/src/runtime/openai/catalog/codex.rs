@@ -291,14 +291,14 @@ impl CodexMultiAgentMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodexRequestRole {
+pub enum ExecutionRole {
     #[default]
     Foreground,
     Worker,
     Internal,
 }
 
-impl CodexRequestRole {
+impl ExecutionRole {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Foreground => "foreground",
@@ -307,6 +307,9 @@ impl CodexRequestRole {
         }
     }
 }
+
+/// Backward-compatible name; request role semantics are provider-neutral.
+pub type CodexRequestRole = ExecutionRole;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexCapabilitySource {

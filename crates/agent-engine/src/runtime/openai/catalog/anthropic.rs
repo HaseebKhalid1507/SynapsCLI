@@ -1,5 +1,102 @@
 use super::*;
+use agent_core::reasoning::ReasoningLevel;
 use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicExecutionMode {
+    Standard,
+    Max,
+    UltraCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicWireEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl AnthropicWireEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicWorkflowPlan {
+    None,
+    Standing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicPlanPrerequisites {
+    pub orchestration_policy: bool,
+    pub builtin_lifecycle_tools: bool,
+}
+
+impl AnthropicPlanPrerequisites {
+    pub const fn installed() -> Self {
+        Self {
+            orchestration_policy: true,
+            builtin_lifecycle_tools: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicPlanErrorCode {
+    InvalidProviderIdentity,
+    CapabilityMetadataMissing,
+    UnsupportedReasoningLevel,
+    UltraCodeRequiresForeground,
+    UltraCodeRequiresOrchestration,
+    UltraCodeRequiresLifecycleTools,
+}
+
+impl AnthropicPlanErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidProviderIdentity => "invalid_provider_identity",
+            Self::CapabilityMetadataMissing => "capability_metadata_missing",
+            Self::UnsupportedReasoningLevel => "unsupported_reasoning_level",
+            Self::UltraCodeRequiresForeground => "ultracode_requires_foreground",
+            Self::UltraCodeRequiresOrchestration => "ultracode_requires_orchestration",
+            Self::UltraCodeRequiresLifecycleTools => "ultracode_requires_lifecycle_tools",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicPlanError(AnthropicPlanErrorCode);
+impl AnthropicPlanError {
+    pub const fn code(&self) -> AnthropicPlanErrorCode {
+        self.0
+    }
+}
+impl std::fmt::Display for AnthropicPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for AnthropicPlanError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicExecutionPlan {
+    pub qualified_model: String,
+    pub requested_level: ReasoningLevel,
+    pub role: ExecutionRole,
+    pub mode: AnthropicExecutionMode,
+    pub wire_effort: Option<AnthropicWireEffort>,
+    pub workflow: AnthropicWorkflowPlan,
+}
 
 pub(super) const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 pub(super) const ANTHROPIC_MODELS_PAGE_LIMIT: usize = 100;
@@ -50,6 +147,91 @@ pub fn anthropic_mode_capabilities(qualified_model: &str) -> Option<AnthropicMod
         }),
         _ => None,
     }
+}
+
+pub fn plan_anthropic_execution(
+    qualified_model: &str,
+    requested_level: ReasoningLevel,
+    role: ExecutionRole,
+    prerequisites: AnthropicPlanPrerequisites,
+    live_effort_supported: Option<bool>,
+) -> Result<AnthropicExecutionPlan, AnthropicPlanError> {
+    let Some(id) = qualified_model.strip_prefix("anthropic/") else {
+        return Err(AnthropicPlanError(
+            AnthropicPlanErrorCode::InvalidProviderIdentity,
+        ));
+    };
+    if id.is_empty() || id.contains('/') {
+        return Err(AnthropicPlanError(
+            AnthropicPlanErrorCode::InvalidProviderIdentity,
+        ));
+    }
+    if requested_level == ReasoningLevel::Ultra {
+        return Err(AnthropicPlanError(
+            AnthropicPlanErrorCode::UnsupportedReasoningLevel,
+        ));
+    }
+    let capabilities = anthropic_mode_capabilities(qualified_model)
+        .map(|caps| caps.narrow_with_live_effort(live_effort_supported));
+    if matches!(
+        requested_level,
+        ReasoningLevel::Max | ReasoningLevel::UltraCode
+    ) && capabilities.is_none()
+    {
+        return Err(AnthropicPlanError(
+            AnthropicPlanErrorCode::CapabilityMetadataMissing,
+        ));
+    }
+    if match requested_level {
+        ReasoningLevel::Max => !capabilities.is_some_and(|caps| caps.max_supported),
+        ReasoningLevel::UltraCode => !capabilities.is_some_and(|caps| caps.ultracode_supported()),
+        _ => false,
+    } {
+        return Err(AnthropicPlanError(
+            AnthropicPlanErrorCode::UnsupportedReasoningLevel,
+        ));
+    }
+    if requested_level == ReasoningLevel::UltraCode {
+        if role != ExecutionRole::Foreground {
+            return Err(AnthropicPlanError(
+                AnthropicPlanErrorCode::UltraCodeRequiresForeground,
+            ));
+        }
+        if !prerequisites.orchestration_policy {
+            return Err(AnthropicPlanError(
+                AnthropicPlanErrorCode::UltraCodeRequiresOrchestration,
+            ));
+        }
+        if !prerequisites.builtin_lifecycle_tools {
+            return Err(AnthropicPlanError(
+                AnthropicPlanErrorCode::UltraCodeRequiresLifecycleTools,
+            ));
+        }
+    }
+    let wire_effort = match requested_level {
+        ReasoningLevel::Low => Some(AnthropicWireEffort::Low),
+        ReasoningLevel::Medium => Some(AnthropicWireEffort::Medium),
+        ReasoningLevel::High => Some(AnthropicWireEffort::High),
+        ReasoningLevel::XHigh | ReasoningLevel::UltraCode => Some(AnthropicWireEffort::XHigh),
+        ReasoningLevel::Max => Some(AnthropicWireEffort::Max),
+        _ => None,
+    };
+    Ok(AnthropicExecutionPlan {
+        qualified_model: qualified_model.to_owned(),
+        requested_level,
+        role,
+        mode: match requested_level {
+            ReasoningLevel::Max => AnthropicExecutionMode::Max,
+            ReasoningLevel::UltraCode => AnthropicExecutionMode::UltraCode,
+            _ => AnthropicExecutionMode::Standard,
+        },
+        wire_effort,
+        workflow: if requested_level == ReasoningLevel::UltraCode {
+            AnthropicWorkflowPlan::Standing
+        } else {
+            AnthropicWorkflowPlan::None
+        },
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +401,141 @@ mod tests {
         assert_eq!(
             AnthropicModeCapabilities::none().narrow_with_live_effort(Some(true)),
             AnthropicModeCapabilities::none()
+        );
+    }
+
+    #[test]
+    fn typed_planner_maps_exact_modes_and_fails_closed() {
+        let prerequisites = AnthropicPlanPrerequisites::installed();
+        let plan = plan_anthropic_execution(
+            "anthropic/claude-fable-5",
+            ReasoningLevel::UltraCode,
+            ExecutionRole::Foreground,
+            prerequisites,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.mode, AnthropicExecutionMode::UltraCode);
+        assert_eq!(plan.wire_effort, Some(AnthropicWireEffort::XHigh));
+        assert_eq!(plan.workflow, AnthropicWorkflowPlan::Standing);
+
+        for (level, wire, mode) in [
+            (
+                ReasoningLevel::Max,
+                AnthropicWireEffort::Max,
+                AnthropicExecutionMode::Max,
+            ),
+            (
+                ReasoningLevel::XHigh,
+                AnthropicWireEffort::XHigh,
+                AnthropicExecutionMode::Standard,
+            ),
+        ] {
+            let plan = plan_anthropic_execution(
+                "anthropic/claude-fable-5",
+                level,
+                ExecutionRole::Foreground,
+                prerequisites,
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.mode, mode);
+            assert_eq!(plan.wire_effort, Some(wire));
+            assert_eq!(plan.workflow, AnthropicWorkflowPlan::None);
+        }
+
+        for (model, level, role, prerequisites, code) in [
+            (
+                "openai-codex/claude-fable-5",
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Foreground,
+                prerequisites,
+                AnthropicPlanErrorCode::InvalidProviderIdentity,
+            ),
+            (
+                "anthropic/claude-fable-5-preview",
+                ReasoningLevel::Max,
+                ExecutionRole::Foreground,
+                prerequisites,
+                AnthropicPlanErrorCode::CapabilityMetadataMissing,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                ReasoningLevel::Ultra,
+                ExecutionRole::Foreground,
+                prerequisites,
+                AnthropicPlanErrorCode::UnsupportedReasoningLevel,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Worker,
+                prerequisites,
+                AnthropicPlanErrorCode::UltraCodeRequiresForeground,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Internal,
+                prerequisites,
+                AnthropicPlanErrorCode::UltraCodeRequiresForeground,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Foreground,
+                AnthropicPlanPrerequisites {
+                    orchestration_policy: false,
+                    builtin_lifecycle_tools: true,
+                },
+                AnthropicPlanErrorCode::UltraCodeRequiresOrchestration,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Foreground,
+                AnthropicPlanPrerequisites {
+                    orchestration_policy: true,
+                    builtin_lifecycle_tools: false,
+                },
+                AnthropicPlanErrorCode::UltraCodeRequiresLifecycleTools,
+            ),
+        ] {
+            assert_eq!(
+                plan_anthropic_execution(model, level, role, prerequisites, None)
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn live_false_revokes_but_live_true_does_not_invent() {
+        let installed = AnthropicPlanPrerequisites::installed();
+        assert_eq!(
+            plan_anthropic_execution(
+                "anthropic/unknown",
+                ReasoningLevel::Max,
+                ExecutionRole::Foreground,
+                installed,
+                Some(true)
+            )
+            .unwrap_err()
+            .code(),
+            AnthropicPlanErrorCode::CapabilityMetadataMissing
+        );
+        assert_eq!(
+            plan_anthropic_execution(
+                "anthropic/claude-fable-5",
+                ReasoningLevel::Max,
+                ExecutionRole::Foreground,
+                installed,
+                Some(false)
+            )
+            .unwrap_err()
+            .code(),
+            AnthropicPlanErrorCode::UnsupportedReasoningLevel
         );
     }
 
