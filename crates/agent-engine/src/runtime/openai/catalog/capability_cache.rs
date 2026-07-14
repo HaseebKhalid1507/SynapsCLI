@@ -20,12 +20,31 @@ pub fn insert(model: CatalogModel) {
     }
 }
 
-/// Bulk-populate from a parsed live catalog slice.
+/// Bulk-populate from an incremental parsed catalog slice.
 pub fn populate(models: &[CatalogModel]) {
     if let Ok(mut map) = cache().lock() {
         for m in models {
             map.insert(m.runtime_id(), m.clone());
         }
+    }
+}
+
+/// Atomically replace one provider's complete catalog snapshot.
+///
+/// Rows for other providers are preserved. Models whose provider identity does
+/// not match `provider_key` are ignored rather than crossing provider scopes.
+pub fn replace_provider(provider_key: &str, models: &[CatalogModel]) {
+    let prefix = format!("{provider_key}/");
+    let replacements: Vec<_> = models
+        .iter()
+        .filter(|model| model.provider_key == provider_key)
+        .cloned()
+        .map(|model| (model.runtime_id(), model))
+        .collect();
+
+    if let Ok(mut map) = cache().lock() {
+        map.retain(|runtime_id, _| !runtime_id.starts_with(&prefix));
+        map.extend(replacements);
     }
 }
 

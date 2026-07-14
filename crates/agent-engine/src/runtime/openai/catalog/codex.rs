@@ -230,9 +230,6 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
             Some(m)
         })
         .collect();
-    // Populate the process-local capability cache so validation paths
-    // (commands, settings) see live data without re-parsing.
-    super::capability_cache::populate(&models);
     Ok(models)
 }
 

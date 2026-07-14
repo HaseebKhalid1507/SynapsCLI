@@ -531,7 +531,10 @@ impl ModelCatalogProvider for CodexCatalogProvider {
             let path = codex_models_path(env!("CARGO_PKG_VERSION"));
             match broker_proxy_catalog_body("openai-codex", &path).await {
                 Ok(body) => {
-                    parse_codex_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
+                    let models = parse_codex_catalog_models(&body)
+                        .map_err(|e| format!("parse failed: {e}"))?;
+                    capability_cache::replace_provider(self.provider_key(), &models);
+                    Ok(models)
                 }
                 Err(err) => {
                     if is_missing_credential_catalog_error(&err) {
