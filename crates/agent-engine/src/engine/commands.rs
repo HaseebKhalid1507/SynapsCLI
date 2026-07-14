@@ -139,37 +139,6 @@ pub fn parse_command(input: &str) -> Option<(&str, &str)> {
     Some((cmd, arg))
 }
 
-/// Validate that `level` is permissible for the runtime's current model.
-/// Returns `Err(user-facing message)` if the level is unsupported.
-/// Currently enforced for Codex models; all other models accept any level.
-fn validate_level_for_model(level: ReasoningLevel, model: &str) -> Result<(), String> {
-    use crate::runtime::openai::catalog::{capability_cache, codex_static_capability,
-        ReasoningSupport};
-    let Some(model_id) = model.strip_prefix("openai-codex/") else {
-        return Ok(());
-    };
-    // Live cache takes priority; static fallback second.
-    let supported: Option<Vec<ReasoningLevel>> =
-        capability_cache::get(model).and_then(|m| match m.reasoning {
-            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-            _ => None,
-        })
-        .or_else(|| match codex_static_capability(model_id)? {
-            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-            _ => None,
-        });
-    let Some(supported) = supported else { return Ok(()); };
-    if supported.contains(&level) {
-        Ok(())
-    } else {
-        Err(format!(
-            "reasoning level '{}' is not supported by {}; supported: [{}]",
-            level, model,
-            supported.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
-        ))
-    }
-}
-
 /// Process commands that are pure engine logic — no TUI state needed.
 /// Returns None if the command needs TUI-level handling.
 pub fn handle_engine_command(
@@ -182,10 +151,11 @@ pub fn handle_engine_command(
         CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
         CommandResult::ThinkingChanged { level, .. } => {
             // Validate against model capabilities BEFORE mutating runtime.
-            if let Err(msg) = validate_level_for_model(*level, runtime.model()) {
+            // set_reasoning_level_checked performs cache→static lookup and
+            // leaves state unchanged on Err — no duplicate logic needed here.
+            if let Err(msg) = runtime.set_reasoning_level_checked(*level) {
                 return Some(CommandResult::Error(msg));
             }
-            runtime.set_reasoning_level(*level);
         }
         _ => {}
     }
@@ -364,29 +334,30 @@ mod tests {
 
     #[test]
     fn validate_level_codex_sol_accepts_ultra() {
-        assert!(validate_level_for_model(
-            ReasoningLevel::Ultra,
-            "openai-codex/gpt-5.6-sol"
-        )
-        .is_ok());
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("openai-codex/gpt-5.6-sol".to_string());
+        assert!(rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_ok());
     }
 
     #[test]
     fn validate_level_codex_luna_rejects_ultra_leaves_state_unchanged() {
-        let err = validate_level_for_model(
-            ReasoningLevel::Ultra,
-            "openai-codex/gpt-5.6-luna",
-        )
-        .unwrap_err();
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("openai-codex/gpt-5.6-luna".to_string());
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        let err = rt.set_reasoning_level_checked(ReasoningLevel::Ultra).unwrap_err();
         assert!(err.contains("ultra"));
         assert!(err.contains("gpt-5.6-luna"));
+        // State must be unchanged after rejection.
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
     }
 
     #[test]
     fn validate_level_non_codex_always_ok() {
         for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7", "groq/llama-3"] {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_model(model.to_string());
             assert!(
-                validate_level_for_model(ReasoningLevel::Ultra, model).is_ok(),
+                rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_ok(),
                 "non-Codex {model} should pass validation"
             );
         }

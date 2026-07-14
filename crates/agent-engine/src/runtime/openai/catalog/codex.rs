@@ -207,7 +207,7 @@ pub fn validate_codex_level(
     level: ReasoningLevel,
     catalog_model: Option<&CatalogModel>,
 ) -> Result<(), String> {
-    // Try live catalog first.
+    // 1. Explicit CatalogModel argument takes top priority.
     if let Some(model) = catalog_model {
         if let Some(levels) = model.codex_supported_levels() {
             if levels.contains(&level) {
@@ -224,7 +224,25 @@ pub fn validate_codex_level(
             ));
         }
     }
-    // Fall back to static table.
+    // 2. Process-local capability cache (populated from live Codex catalog parse).
+    let qualified = format!("openai-codex/{model_id}");
+    if let Some(cached) = super::capability_cache::get(&qualified) {
+        if let Some(levels) = cached.codex_supported_levels() {
+            if levels.contains(&level) {
+                return Ok(());
+            }
+            return Err(format!(
+                "reasoning level '{level}' is not supported by openai-codex/{model_id}; \
+                 supported: [{}]",
+                levels
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    // 3. Static fallback table.
     match codex_static_capability(model_id) {
         Some(ReasoningSupport::CodexNamed { supported, .. }) => {
             if supported.contains(&level) {
@@ -504,6 +522,46 @@ mod tests {
         assert!(err.contains("ultra"));
         // Low is accepted.
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Low, Some(&live)).is_ok());
+    }
+
+    /// Verify that `validate_codex_level(..., None)` consults the process-local
+    /// capability cache (gap 1): a narrower live entry must override the static
+    /// table even when no explicit catalog_model argument is supplied.
+    #[test]
+    fn validate_cache_narrows_sol_rejects_ultra_without_catalog_arg() {
+        // Use a unique model slug to avoid cross-test pollution from the shared cache.
+        let unique_id = "gpt-5.6-sol-cache-test-ultra";
+        let qualified = format!("openai-codex/{unique_id}");
+
+        // Insert a live cache entry that supports only Low+Medium (no Ultra).
+        let mut live =
+            CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, unique_id).unwrap();
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::CodexNamed {
+            supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
+            default_level: Some(ReasoningLevel::Low),
+        };
+        super::super::capability_cache::insert(live);
+
+        // Confirm it's in the cache.
+        let cached = super::super::capability_cache::get(&qualified)
+            .expect("model must be in cache after insert");
+        assert!(matches!(cached.reasoning, ReasoningSupport::CodexNamed { .. }));
+
+        // validate_codex_level with catalog_model=None must use the cache and
+        // reject Ultra (which the static sol table would have allowed).
+        let err = validate_codex_level(unique_id, ReasoningLevel::Ultra, None)
+            .expect_err("cache should narrow Ultra rejection");
+        assert!(
+            err.contains("ultra"),
+            "error must name the rejected level; got: {err}"
+        );
+
+        // Low is still accepted via the cache.
+        assert!(
+            validate_codex_level(unique_id, ReasoningLevel::Low, None).is_ok(),
+            "Low must still pass via cache"
+        );
     }
 
     // ── Existing catalog tests ────────────────────────────────────────────────

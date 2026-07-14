@@ -647,6 +647,43 @@ impl Runtime {
         // Max/Ultra: do NOT overwrite thinking_budget with u32::MAX.
     }
 
+    /// Validate `level` against the current model's capability metadata (cache
+    /// then static), then apply it. Returns `Err(user-facing message)` and
+    /// leaves runtime state unchanged if the level is unsupported.
+    pub fn set_reasoning_level_checked(
+        &mut self,
+        level: agent_core::reasoning::ReasoningLevel,
+    ) -> std::result::Result<(), String> {
+        use crate::runtime::openai::catalog::{
+            capability_cache, codex_static_capability, ReasoningSupport,
+        };
+        let model = self.model.as_str();
+        if let Some(model_id) = model.strip_prefix("openai-codex/") {
+            let supported: Option<Vec<agent_core::reasoning::ReasoningLevel>> =
+                capability_cache::get(model)
+                    .and_then(|m| match m.reasoning {
+                        ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+                        _ => None,
+                    })
+                    .or_else(|| match codex_static_capability(model_id)? {
+                        ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+                        _ => None,
+                    });
+            if let Some(ref levels) = supported {
+                if !levels.contains(&level) {
+                    return Err(format!(
+                        "reasoning level '{}' is not supported by {}; supported: [{}]",
+                        level,
+                        model,
+                        levels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+        }
+        self.set_reasoning_level(level);
+        Ok(())
+    }
+
     /// Named reasoning level. Authoritative for Codex; derived from budget for Anthropic.
     pub fn reasoning_level(&self) -> agent_core::reasoning::ReasoningLevel {
         self.named_level.unwrap_or_else(|| {
@@ -1721,5 +1758,60 @@ mod effective_prompt_tests {
             runtime.effective_system_prompt().await.as_deref(),
             Some("BASE.")
         );
+    }
+}
+
+#[cfg(test)]
+mod set_reasoning_level_checked_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn codex_runtime(model_id: &str) -> Runtime {
+        let mut rt = Runtime::new_headless();
+        rt.set_model(format!("openai-codex/{model_id}"));
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        rt
+    }
+
+    /// luna does not support Ultra; checked must reject and leave level unchanged.
+    #[test]
+    fn checked_rejects_ultra_for_luna_no_mutation() {
+        let mut rt = codex_runtime("gpt-5.6-luna");
+        let before = rt.reasoning_level();
+        let err = rt.set_reasoning_level_checked(ReasoningLevel::Ultra).unwrap_err();
+        assert!(err.contains("ultra"), "error must name the rejected level; got: {err}");
+        assert_eq!(
+            rt.reasoning_level(), before,
+            "runtime must not be mutated when validation fails"
+        );
+    }
+
+    /// gpt-5.5 does not support Max; checked must reject and not mutate.
+    #[test]
+    fn checked_rejects_max_for_gpt55_no_mutation() {
+        let mut rt = codex_runtime("gpt-5.5");
+        rt.set_reasoning_level(ReasoningLevel::Medium);
+        let err = rt.set_reasoning_level_checked(ReasoningLevel::Max).unwrap_err();
+        assert!(err.contains("max"), "error must name the rejected level; got: {err}");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Medium);
+    }
+
+    /// sol supports Ultra; checked must accept and mutate.
+    #[test]
+    fn checked_accepts_ultra_for_sol_and_mutates() {
+        let mut rt = codex_runtime("gpt-5.6-sol");
+        rt.set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .expect("sol must accept ultra");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Ultra);
+    }
+
+    /// Non-Codex provider — checked accepts any level (no capability table enforced).
+    #[test]
+    fn checked_accepts_any_level_for_non_codex() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("claude-opus-4-7".to_string());
+        rt.set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .expect("non-Codex must accept any level");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Ultra);
     }
 }

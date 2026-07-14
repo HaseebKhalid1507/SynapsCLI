@@ -91,3 +91,6 @@ mod reasoning_validation {
         assert!(codex_static_capability("gpt-4o").is_none());
     }
 }
+
+// ── set_reasoning_level_checked — no mutation on Err ────────────────────────
+

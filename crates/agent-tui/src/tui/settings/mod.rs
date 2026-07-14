@@ -36,28 +36,48 @@ const BUILTIN_THEMES: &[&str] = &[
 
 /// Compute the thinking level options for `model_runtime_id`.
 ///
-/// For `openai-codex/<id>` models: return exact supported levels from the
-/// static capability table (or live catalog if provided).
-/// For all other providers: return the conservative legacy set.
+/// For `openai-codex/<id>` models: query the process-local capability cache
+/// first (populated from the live catalog), then fall back to the static table;
+/// prepend "off" and "adaptive" as client-side options, then supported levels.
+/// For all other providers: return the conservative set including off/adaptive.
 /// Providers without authoritative metadata NEVER gain max/ultra.
 pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
     // Check if this is a Codex model by provider-qualified prefix only — no substring inference.
-    if let Some(model_id) = model.strip_prefix("openai-codex/") {
-        if let Some(agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
-            supported,
-            ..
-        }) = agent_engine::runtime::openai::catalog::codex_static_capability(model_id)
-        {
-            return supported.iter().map(|l| l.as_str().to_string()).collect();
+    if model.starts_with("openai-codex/") {
+        // Live capability cache takes priority over static table.
+        let supported: Option<Vec<agent_core::reasoning::ReasoningLevel>> =
+            agent_engine::runtime::openai::catalog::capability_cache::get(model)
+                .and_then(|m| match m.reasoning {
+                    agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
+                        supported, ..
+                    } => Some(supported),
+                    _ => None,
+                })
+                .or_else(|| {
+                    let model_id = model.strip_prefix("openai-codex/")?;
+                    match agent_engine::runtime::openai::catalog::codex_static_capability(model_id)? {
+                        agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
+                            supported, ..
+                        } => Some(supported),
+                        _ => None,
+                    }
+                });
+        if let Some(levels) = supported {
+            // "off" = client omission (disable thinking); "adaptive" = model-default omission.
+            let mut opts = vec!["off".to_string(), "adaptive".to_string()];
+            opts.extend(levels.iter().map(|l| l.as_str().to_string()));
+            return opts;
         }
     }
-    // Legacy conservative set for all non-Codex providers.
+    // Conservative set for all non-Codex providers (and unknown Codex models).
+    // Includes "off" (client omission) and "adaptive" (model-default omission).
     vec![
+        "off".to_string(),
+        "adaptive".to_string(),
         "low".to_string(),
         "medium".to_string(),
         "high".to_string(),
         "xhigh".to_string(),
-        "adaptive".to_string(),
     ]
 }
 
@@ -499,18 +519,19 @@ mod thinking_options_tests {
     use super::thinking_options_for_model;
 
     #[test]
-    fn sol_includes_ultra_and_max() {
+    fn sol_includes_off_adaptive_and_ultra_max() {
         let opts = thinking_options_for_model("openai-codex/gpt-5.6-sol");
-        assert!(
-            opts.contains(&"ultra".to_string()),
-            "sol must include ultra"
-        );
-        assert!(opts.contains(&"max".to_string()), "sol must include max");
+        assert_eq!(opts[0], "off",      "off must be first");
+        assert_eq!(opts[1], "adaptive", "adaptive must be second");
+        assert!(opts.contains(&"ultra".to_string()), "sol must include ultra");
+        assert!(opts.contains(&"max".to_string()),   "sol must include max");
     }
 
     #[test]
-    fn luna_includes_max_not_ultra() {
+    fn luna_includes_off_adaptive_and_max_not_ultra() {
         let opts = thinking_options_for_model("openai-codex/gpt-5.6-luna");
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
         assert!(opts.contains(&"max".to_string()));
         assert!(
             !opts.contains(&"ultra".to_string()),
@@ -519,7 +540,7 @@ mod thinking_options_tests {
     }
 
     #[test]
-    fn gpt55_does_not_include_max_or_ultra() {
+    fn gpt55_includes_off_adaptive_and_xhigh_not_max_ultra() {
         for model in [
             "openai-codex/gpt-5.5",
             "openai-codex/gpt-5.4",
@@ -527,6 +548,8 @@ mod thinking_options_tests {
             "openai-codex/gpt-5.3-codex-spark",
         ] {
             let opts = thinking_options_for_model(model);
+            assert_eq!(opts[0], "off",      "{model}: off must be first");
+            assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
             assert!(
                 !opts.contains(&"max".to_string()),
                 "{model} must not include max"
@@ -543,13 +566,15 @@ mod thinking_options_tests {
     }
 
     #[test]
-    fn non_codex_provider_uses_conservative_set() {
+    fn non_codex_provider_includes_off_adaptive_not_max_ultra() {
         for model in [
             "claude-opus-4-7",
             "groq/llama-3.3-70b",
             "xai-auth/grok-3-mini",
         ] {
             let opts = thinking_options_for_model(model);
+            assert_eq!(opts[0], "off",      "{model}: off must be first");
+            assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
             assert!(
                 !opts.contains(&"max".to_string()),
                 "{model} must not gain max"
@@ -562,9 +587,51 @@ mod thinking_options_tests {
     }
 
     #[test]
-    fn unknown_codex_model_uses_conservative_set() {
+    fn unknown_codex_model_falls_back_to_conservative_with_off_adaptive() {
         let opts = thinking_options_for_model("openai-codex/gpt-future-unknown");
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
         assert!(!opts.contains(&"max".to_string()));
         assert!(!opts.contains(&"ultra".to_string()));
+    }
+
+    /// Gap 2: cache-narrower override — live entry with only Low+Medium must
+    /// suppress Ultra in the TUI options even when static sol has Ultra.
+    #[test]
+    fn cache_narrower_than_static_suppresses_ultra_in_tui_options() {
+        use agent_engine::runtime::openai::catalog::{
+            capability_cache, CatalogProviderKind, CatalogSource, ReasoningSupport,
+        };
+        use agent_core::reasoning::ReasoningLevel;
+
+        // Unique slug to avoid polluting other tests via the shared cache.
+        let unique_id = "gpt-5.6-sol-tui-cache-test";
+        let qualified = format!("openai-codex/{unique_id}");
+
+        // Insert a live cache entry that supports only Low+Medium.
+        let mut live = agent_engine::runtime::openai::catalog::CatalogModel::new(
+            "openai-codex", "OpenAI Codex", unique_id,
+        ).unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::CodexNamed {
+            supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
+            default_level: Some(ReasoningLevel::Low),
+        };
+        capability_cache::insert(live);
+
+        let opts = thinking_options_for_model(&qualified);
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
+        assert!(
+            !opts.contains(&"ultra".to_string()),
+            "cache narrower: ultra must be suppressed"
+        );
+        assert!(
+            !opts.contains(&"max".to_string()),
+            "cache narrower: max must be suppressed"
+        );
+        assert!(opts.contains(&"low".to_string()));
+        assert!(opts.contains(&"medium".to_string()));
     }
 }

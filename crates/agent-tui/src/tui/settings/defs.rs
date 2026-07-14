@@ -53,7 +53,11 @@ define_settings! {
         |runtime, _app, value| {
             use agent_core::reasoning::ReasoningLevel;
             if let Some(level) = ReasoningLevel::parse(value) {
-                runtime.set_reasoning_level(level);
+                // Validate against capability cache/static before mutating.
+                // On Err: log the rejection; do NOT mutate runtime state.
+                if let Err(msg) = runtime.set_reasoning_level_checked(level) {
+                    tracing::warn!("thinking setting rejected: {msg}");
+                }
             }
         };
 
