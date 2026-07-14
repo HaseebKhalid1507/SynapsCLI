@@ -39,7 +39,13 @@ pub(super) fn apply_setting(
     runtime: &mut synaps_cli::Runtime,
 ) {
     // Runtime mutation (generated from settings/defs.rs).
-    settings::defs::apply_setting_dispatch(key, value, runtime, app);
+    // On Err: set row_error and do NOT write to config — the value was rejected.
+    if let Err(msg) = settings::defs::apply_setting_dispatch(key, value, runtime, app) {
+        if let Some(st) = app.settings.as_mut() {
+            st.row_error = Some((key.to_string(), msg));
+        }
+        return;
+    }
 
     // `skills` is internal — not persisted via write_config_value.
     if key == "skills" {

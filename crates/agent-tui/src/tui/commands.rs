@@ -366,7 +366,7 @@ pub(super) async fn handle_command(
     // unreachable for the intercepted case.
     if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
         use synaps_cli::engine::commands::{
-            persist_to_config, thinking_config_value, CommandResult,
+            persist_to_config, thinking_config_value, CommandResult, ThinkingSpec,
         };
         return match result {
             CommandResult::Quit => CommandAction::Quit,
@@ -381,12 +381,12 @@ pub(super) async fn handle_command(
                 )));
                 CommandAction::None
             }
-            CommandResult::ThinkingChanged { level, budget } => {
-                app.session.thinking_level = level.as_str().to_string();
-                let status = persist_to_config("thinking", &thinking_config_value(level, budget));
+            CommandResult::ThinkingChanged { spec } => {
+                app.session.thinking_level = spec.level().as_str().to_string();
+                let status = persist_to_config("thinking", &thinking_config_value(spec));
                 app.push_msg(ChatMessage::System(format!(
                     "thinking set to: {} {}",
-                    level,
+                    spec.level(),
                     status,
                 )));
                 CommandAction::None

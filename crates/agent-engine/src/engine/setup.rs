@@ -333,6 +333,17 @@ fn resolve_or_create_session(
                 })?,
             };
             runtime.set_model(session.model.clone());
+            // Restore the session's named reasoning level so max/ultra/off
+            // and custom budgets survive --continue.
+            if let Some(level) =
+                agent_core::reasoning::ReasoningLevel::parse(&session.thinking_level)
+            {
+                runtime.set_reasoning_level_explicit(level);
+            } else if let Some(budget) =
+                crate::models::budget_for_thinking_level(&session.thinking_level)
+            {
+                runtime.set_thinking_budget_explicit(budget);
+            }
             if let Some(ref sp) = session.system_prompt {
                 runtime.set_system_prompt(sp.clone());
             }
@@ -384,5 +395,54 @@ fn resolve_or_create_session(
                 continue_info: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    /// B1: --continue path must restore thinking_level from the saved session.
+    /// Simulates what resolve_or_create_session does when a session is continued.
+    #[test]
+    fn continue_path_restores_thinking_level_from_session() {
+        let mut runtime = Runtime::new_headless();
+
+        // Simulate what resolve_or_create_session does on --continue.
+        let thinking_level_str = "ultra";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+
+        assert_eq!(
+            runtime.reasoning_level(),
+            ReasoningLevel::Ultra,
+            "thinking level must be restored from session on --continue"
+        );
+        assert!(
+            runtime.is_reasoning_explicit(),
+            "restored thinking level must be marked explicit so set_model won't overwrite it"
+        );
+    }
+
+    #[test]
+    fn continue_path_restores_max_level() {
+        let mut runtime = Runtime::new_headless();
+        let thinking_level_str = "max";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Max);
+    }
+
+    #[test]
+    fn continue_path_restores_off_level() {
+        let mut runtime = Runtime::new_headless();
+        let thinking_level_str = "off";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
     }
 }

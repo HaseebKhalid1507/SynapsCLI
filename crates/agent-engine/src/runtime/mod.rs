@@ -224,6 +224,11 @@ pub struct Runtime {
     /// When set, overrides what `thinking_level()` returns. For legacy
     /// Anthropic models this is derived from `thinking_budget` at read time.
     named_level: Option<agent_core::reasoning::ReasoningLevel>,
+    /// True when the user has explicitly chosen a reasoning level (via command
+    /// or config). False for derived/default values applied by set_model or
+    /// session restore. Controls whether set_model overwrites the level with
+    /// the new model's default.
+    explicit_reasoning: bool,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
     /// `models::context_window_for_model`. Lets users cap context at e.g.
@@ -324,6 +329,7 @@ impl Runtime {
             prompt_reload_source: None,
             thinking_budget: 4096,
             named_level: None,
+            explicit_reasoning: false,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -394,6 +400,7 @@ impl Runtime {
             prompt_reload_source: None,
             thinking_budget: 4096,
             named_level: None,
+            explicit_reasoning: false,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -578,9 +585,11 @@ impl Runtime {
             .unwrap_or(trimmed);
         self.model = cleaned.to_owned();
         // For Codex models: apply the model's default reasoning level from
-        // capability metadata unless the caller has already set an explicit
-        // named level (named_level is Some).
-        if self.named_level.is_none() {
+        // capability metadata unless the user has explicitly chosen a level
+        // (explicit_reasoning is true — set via command, config, or explicit
+        // session restore). Derived/default levels (named_level only, no
+        // explicit flag) are overwritten by the new model's default.
+        if !self.explicit_reasoning {
             if let Some(model_id) = cleaned.strip_prefix("openai-codex/") {
                 use crate::runtime::openai::catalog::{
                     capability_cache, codex_static_capability, ReasoningSupport,
@@ -634,17 +643,51 @@ impl Runtime {
         self.thinking_budget = budget;
         // Sync named_level from budget so the two fields stay consistent.
         self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+        // Config/restore path — not an explicit user choice.
+        self.explicit_reasoning = false;
     }
 
-    /// Set the named reasoning level. Updates `thinking_budget` from the level's
-    /// canonical budget when one exists; for Max/Ultra (no numeric budget),
-    /// leaves `thinking_budget` at its current value so legacy paths don't break.
+    /// Set the named reasoning level (config/restore path). Updates
+    /// `thinking_budget` from the level's canonical budget when one exists;
+    /// for Max/Ultra (no numeric budget), leaves `thinking_budget` unchanged.
+    /// Marks `explicit_reasoning = false` — use `set_reasoning_level_explicit`
+    /// for user commands and settings.
     pub fn set_reasoning_level(&mut self, level: agent_core::reasoning::ReasoningLevel) {
         self.named_level = Some(level);
         if let Some(budget) = level.to_legacy_budget() {
             self.thinking_budget = budget;
         }
         // Max/Ultra: do NOT overwrite thinking_budget with u32::MAX.
+        self.explicit_reasoning = false;
+    }
+
+    /// Set the named reasoning level as an **explicit user choice** (slash
+    /// commands, settings panel). Identical to `set_reasoning_level` but sets
+    /// `explicit_reasoning = true` so that a subsequent `set_model` call does
+    /// not overwrite the level with the new model's default.
+    pub fn set_reasoning_level_explicit(&mut self, level: agent_core::reasoning::ReasoningLevel) {
+        self.set_reasoning_level(level);
+        self.explicit_reasoning = true;
+    }
+
+    /// Set a custom numeric thinking budget as an **explicit user choice**
+    /// (e.g. `/thinking 8192`). Retains the exact budget in `thinking_budget`
+    /// while syncing `named_level` to the nearest named level for display.
+    /// Sets `explicit_reasoning = true`.
+    pub fn set_thinking_budget_explicit(&mut self, budget: u32) {
+        self.thinking_budget = budget;
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+        self.explicit_reasoning = true;
+    }
+
+    /// Expose the `explicit_reasoning` provenance flag (test/introspection).
+    pub fn is_reasoning_explicit(&self) -> bool {
+        self.explicit_reasoning
+    }
+
+    /// Raw thinking budget value (for testing and legacy request building).
+    pub fn thinking_budget_raw(&self) -> u32 {
+        self.thinking_budget
     }
 
     /// Validate `level` against the current model's capability metadata (cache
@@ -680,11 +723,9 @@ impl Runtime {
                 }
             }
         }
-        self.set_reasoning_level(level);
+        self.set_reasoning_level_explicit(level);
         Ok(())
     }
-
-    /// Named reasoning level. Authoritative for Codex; derived from budget for Anthropic.
     pub fn reasoning_level(&self) -> agent_core::reasoning::ReasoningLevel {
         self.named_level.unwrap_or_else(|| {
             agent_core::reasoning::ReasoningLevel::from_legacy_budget(self.thinking_budget)
@@ -718,10 +759,11 @@ impl Runtime {
             self.set_model(model.clone());
         }
         // Named level takes priority over raw budget.
+        // Config-specified thinking is an explicit user choice — preserve across model switches.
         if let Some(level) = config.thinking_level {
-            self.set_reasoning_level(level);
+            self.set_reasoning_level_explicit(level);
         } else if let Some(budget) = config.thinking_budget {
-            self.set_thinking_budget(budget);
+            self.set_thinking_budget_explicit(budget);
         }
         self.context_window_override = config.context_window;
         self.compaction_model = config.compaction_model.clone();
@@ -1350,6 +1392,7 @@ impl Clone for Runtime {
             prompt_reload_source: self.prompt_reload_source.clone(),
             thinking_budget: self.thinking_budget,
             named_level: self.named_level,
+            explicit_reasoning: self.explicit_reasoning,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),

@@ -1192,9 +1192,9 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                     message: format!("model set to: {model}"),
                 });
             }
-            CommandResult::ThinkingChanged { level, .. } => {
+            CommandResult::ThinkingChanged { spec } => {
                 let _ = broadcast.send(ServerMessage::System {
-                    message: format!("thinking set to: {level}"),
+                    message: format!("thinking set to: {}", spec.level()),
                 });
             }
             CommandResult::Quit => {

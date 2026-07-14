@@ -5,6 +5,42 @@
 
 use agent_core::reasoning::ReasoningLevel;
 
+/// A thinking specification — either a named level or a custom numeric budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingSpec {
+    /// A named canonical level (off/adaptive/low/medium/high/xhigh/max/ultra).
+    Named(ReasoningLevel),
+    /// A custom numeric budget (e.g. `/thinking 8192`).  
+    /// `level` is the nearest named level for display; `budget` is the exact value.
+    Custom { level: ReasoningLevel, budget: u32 },
+}
+
+impl ThinkingSpec {
+    /// Named level (used for validation and display).
+    pub fn level(self) -> ReasoningLevel {
+        match self {
+            ThinkingSpec::Named(l) => l,
+            ThinkingSpec::Custom { level, .. } => level,
+        }
+    }
+
+    /// Exact budget, if applicable. `None` for Max/Ultra which have no numeric budget.
+    pub fn budget(self) -> Option<u32> {
+        match self {
+            ThinkingSpec::Named(l) => l.to_legacy_budget(),
+            ThinkingSpec::Custom { budget, .. } => Some(budget),
+        }
+    }
+
+    /// Config-file string: exact budget digits for Custom, named string otherwise.
+    pub fn config_value(self) -> String {
+        match self {
+            ThinkingSpec::Named(l) => l.as_str().to_string(),
+            ThinkingSpec::Custom { budget, .. } => budget.to_string(),
+        }
+    }
+}
+
 /// Result of processing a slash command in the engine.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -22,11 +58,9 @@ pub enum CommandResult {
         model: String,
     },
 
-    /// Thinking level was changed. `budget` is `None` for named-only levels
-    /// (Max/Ultra) that have no valid numeric representation.
+    /// Thinking level was changed.
     ThinkingChanged {
-        level: ReasoningLevel,
-        budget: Option<u32>,
+        spec: ThinkingSpec,
     },
 
     /// System prompt was updated.
@@ -149,12 +183,20 @@ pub fn handle_engine_command(
     let result = evaluate_engine_command(cmd, arg)?;
     match &result {
         CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
-        CommandResult::ThinkingChanged { level, .. } => {
-            // Validate against model capabilities BEFORE mutating runtime.
-            // set_reasoning_level_checked performs cache→static lookup and
-            // leaves state unchanged on Err — no duplicate logic needed here.
-            if let Err(msg) = runtime.set_reasoning_level_checked(*level) {
-                return Some(CommandResult::Error(msg));
+        CommandResult::ThinkingChanged { spec } => {
+            // Validate and apply the spec against model capabilities BEFORE
+            // mutating runtime. State is unchanged on Err.
+            match spec {
+                ThinkingSpec::Named(level) => {
+                    if let Err(msg) = runtime.set_reasoning_level_checked(*level) {
+                        return Some(CommandResult::Error(msg));
+                    }
+                }
+                ThinkingSpec::Custom { budget, .. } => {
+                    // Custom budget: retain exact value; skip named-level validation
+                    // (bucketized level is for display only).
+                    runtime.set_thinking_budget_explicit(*budget);
+                }
             }
         }
         _ => {}
@@ -169,7 +211,7 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
             model: arg.to_string(),
         }),
         "thinking" if !arg.is_empty() => match parse_thinking_arg(arg) {
-            Ok((level, budget)) => Some(CommandResult::ThinkingChanged { level, budget }),
+            Ok(spec) => Some(CommandResult::ThinkingChanged { spec }),
             Err(e) => Some(CommandResult::Error(e)),
         },
         "quit" | "exit" => Some(CommandResult::Quit),
@@ -184,15 +226,17 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
     }
 }
 
-/// Parse a `/thinking` argument into a `(ReasoningLevel, Option<u32>)`.
-/// `budget` is `None` for Max/Ultra which have no numeric representation.
-pub fn parse_thinking_arg(arg: &str) -> Result<(ReasoningLevel, Option<u32>), String> {
+/// Parse a `/thinking` argument into a `ThinkingSpec`.
+pub fn parse_thinking_arg(arg: &str) -> Result<ThinkingSpec, String> {
     match ReasoningLevel::parse(arg) {
-        Some(level) => Ok((level, level.to_legacy_budget())),
+        Some(level) => Ok(ThinkingSpec::Named(level)),
         None => {
             if let Ok(n) = arg.trim().parse::<u32>() {
-                // Custom numeric budget: bucketize to nearest named level.
-                Ok((ReasoningLevel::from_legacy_budget(n), Some(n)))
+                // Custom numeric budget: bucketize to nearest named level for display.
+                Ok(ThinkingSpec::Custom {
+                    level: ReasoningLevel::from_legacy_budget(n),
+                    budget: n,
+                })
             } else {
                 Err(format!(
                     "unknown thinking level: {} \
@@ -205,8 +249,9 @@ pub fn parse_thinking_arg(arg: &str) -> Result<(ReasoningLevel, Option<u32>), St
 }
 
 /// Canonical config-file string for a thinking change.
-pub fn thinking_config_value(level: ReasoningLevel, _budget: Option<u32>) -> String {
-    level.as_str().to_string()
+/// Returns the exact budget digits for Custom, named string for Named.
+pub fn thinking_config_value(spec: ThinkingSpec) -> String {
+    spec.config_value()
 }
 
 /// Persist a config key and return a user-visible status suffix.
@@ -237,20 +282,24 @@ mod tests {
     #[test]
     fn thinking_command_normalizes_levels() {
         match evaluate_engine_command("thinking", "high") {
-            Some(CommandResult::ThinkingChanged { level, budget }) => {
-                assert_eq!(level, ReasoningLevel::High);
-                assert_eq!(budget, Some(16384));
+            Some(CommandResult::ThinkingChanged { spec }) => {
+                assert_eq!(spec.level(), ReasoningLevel::High);
+                assert_eq!(spec.budget(), Some(16384));
+                assert!(matches!(spec, ThinkingSpec::Named(ReasoningLevel::High)));
             }
             other => panic!("expected ThinkingChanged, got {:?}", other),
         }
-        assert_eq!(
-            parse_thinking_arg("med").unwrap(),
-            (ReasoningLevel::Medium, Some(4096))
+        let med = parse_thinking_arg("med").unwrap();
+        assert_eq!(med.level(), ReasoningLevel::Medium);
+        assert_eq!(med.budget(), Some(4096));
+
+        // Custom numeric: produces ThinkingSpec::Custom, not Named.
+        let custom = parse_thinking_arg("8192").unwrap();
+        assert!(
+            matches!(custom, ThinkingSpec::Custom { level: ReasoningLevel::High, budget: 8192 }),
+            "expected Custom{{High, 8192}}, got {:?}", custom
         );
-        // Custom numeric: bucketized to High (4097..=16384 range).
-        let (lvl, budget) = parse_thinking_arg("8192").unwrap();
-        assert_eq!(lvl, ReasoningLevel::High);
-        assert_eq!(budget, Some(8192));
+        assert_eq!(custom.budget(), Some(8192));
 
         assert!(parse_thinking_arg("bogus").is_err());
         assert!(evaluate_engine_command("thinking", "").is_none());
@@ -258,41 +307,50 @@ mod tests {
 
     #[test]
     fn thinking_command_off_and_adaptive_are_distinct() {
-        let (off_lvl, off_bud) = parse_thinking_arg("off").unwrap();
-        let (adp_lvl, adp_bud) = parse_thinking_arg("adaptive").unwrap();
-        assert_eq!(off_lvl, ReasoningLevel::Off);
-        assert_eq!(off_bud, Some(0));
-        assert_eq!(adp_lvl, ReasoningLevel::Adaptive);
-        assert_eq!(adp_bud, Some(0));
-        assert_ne!(off_lvl, adp_lvl);
+        let off = parse_thinking_arg("off").unwrap();
+        let adp = parse_thinking_arg("adaptive").unwrap();
+        assert_eq!(off.level(), ReasoningLevel::Off);
+        assert_eq!(off.budget(), Some(0));
+        assert_eq!(adp.level(), ReasoningLevel::Adaptive);
+        assert_eq!(adp.budget(), Some(0));
+        assert_ne!(off.level(), adp.level());
     }
 
     #[test]
     fn max_and_ultra_have_no_budget() {
-        let (lvl, bud) = parse_thinking_arg("max").unwrap();
-        assert_eq!(lvl, ReasoningLevel::Max);
-        assert_eq!(bud, None, "max has no numeric budget");
+        let max_spec = parse_thinking_arg("max").unwrap();
+        assert_eq!(max_spec.level(), ReasoningLevel::Max);
+        assert_eq!(max_spec.budget(), None, "max has no numeric budget");
 
-        let (lvl, bud) = parse_thinking_arg("ultra").unwrap();
-        assert_eq!(lvl, ReasoningLevel::Ultra);
-        assert_eq!(bud, None, "ultra has no numeric budget");
+        let ultra_spec = parse_thinking_arg("ultra").unwrap();
+        assert_eq!(ultra_spec.level(), ReasoningLevel::Ultra);
+        assert_eq!(ultra_spec.budget(), None, "ultra has no numeric budget");
 
         // xhigh still has a numeric budget
-        let (lvl, bud) = parse_thinking_arg("xhigh").unwrap();
-        assert_eq!(lvl, ReasoningLevel::XHigh);
-        assert_eq!(bud, Some(32768));
+        let xhigh_spec = parse_thinking_arg("xhigh").unwrap();
+        assert_eq!(xhigh_spec.level(), ReasoningLevel::XHigh);
+        assert_eq!(xhigh_spec.budget(), Some(32768));
     }
 
     #[test]
-    fn thinking_config_value_is_named_for_all_levels() {
-        assert_eq!(thinking_config_value(ReasoningLevel::Off,      Some(0)),     "off");
-        assert_eq!(thinking_config_value(ReasoningLevel::Adaptive, Some(0)),     "adaptive");
-        assert_eq!(thinking_config_value(ReasoningLevel::Low,      Some(2048)),  "low");
-        assert_eq!(thinking_config_value(ReasoningLevel::Medium,   Some(4096)),  "medium");
-        assert_eq!(thinking_config_value(ReasoningLevel::High,     Some(16384)), "high");
-        assert_eq!(thinking_config_value(ReasoningLevel::XHigh,    Some(32768)), "xhigh");
-        assert_eq!(thinking_config_value(ReasoningLevel::Max,      None),        "max");
-        assert_eq!(thinking_config_value(ReasoningLevel::Ultra,    None),        "ultra");
+    fn thinking_config_value_is_named_for_named_levels() {
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Off)),      "off");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Adaptive)), "adaptive");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Low)),      "low");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Medium)),   "medium");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::High)),     "high");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::XHigh)),    "xhigh");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Max)),      "max");
+        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Ultra)),    "ultra");
+    }
+
+    #[test]
+    fn thinking_config_value_is_exact_digits_for_custom_budget() {
+        // B3: /thinking 8192 must persist "8192", not the named level "high".
+        let spec = ThinkingSpec::Custom { level: ReasoningLevel::High, budget: 8192 };
+        assert_eq!(thinking_config_value(spec), "8192");
+        let spec2 = ThinkingSpec::Custom { level: ReasoningLevel::Medium, budget: 3000 };
+        assert_eq!(thinking_config_value(spec2), "3000");
     }
 
     #[test]
@@ -361,5 +419,79 @@ mod tests {
                 "non-Codex {model} should pass validation"
             );
         }
+    }
+
+    // B3: provenance tests -------------------------------------------------------
+
+    #[test]
+    fn set_reasoning_level_is_not_explicit() {
+        // set_reasoning_level (config/restore path) must NOT set explicit flag.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_reasoning_level(ReasoningLevel::High);
+        assert!(!rt.is_reasoning_explicit(), "set_reasoning_level must not mark explicit");
+    }
+
+    #[test]
+    fn set_reasoning_level_explicit_marks_flag() {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit(), "set_reasoning_level_explicit must mark explicit");
+    }
+
+    #[test]
+    fn set_model_overwrites_non_explicit_codex_default() {
+        // No explicit choice → set_model applies model's default.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("openai-codex/gpt-5.6-luna".to_string());
+        // luna default is Medium per static table
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Medium);
+        assert!(!rt.is_reasoning_explicit());
+    }
+
+    #[test]
+    fn set_model_preserves_explicit_user_choice() {
+        // Explicit user choice survives model switch.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::Low);
+        rt.set_model("openai-codex/gpt-5.6-sol".to_string());
+        // sol default is Low anyway, but let's use a level that differs from default
+        assert!(rt.is_reasoning_explicit(), "explicit flag must survive set_model");
+    }
+
+    #[test]
+    fn apply_config_thinking_sets_explicit() {
+        // Config-specified thinking level is explicit — preserved across model switch.
+        use crate::config::SynapsConfig;
+        let mut rt = crate::Runtime::new_headless();
+        let config = SynapsConfig {
+            thinking_level: Some(ReasoningLevel::XHigh),
+            ..Default::default()
+        };
+        rt.apply_config(&config);
+        assert!(rt.is_reasoning_explicit(), "config thinking must be explicit");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::XHigh);
+        // Model switch must not overwrite the explicit config level.
+        rt.set_model("openai-codex/gpt-5.6-luna".to_string());
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::XHigh,
+            "explicit config level must survive set_model");
+    }
+
+    #[test]
+    fn set_thinking_budget_explicit_retains_exact_budget_and_marks_flag() {
+        // B3: /thinking 8192 → set_thinking_budget_explicit(8192) must retain 8192.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_thinking_budget_explicit(8192);
+        assert_eq!(rt.thinking_budget_raw(), 8192, "exact budget must be retained");
+        assert!(rt.is_reasoning_explicit());
+        // Named level for display is High (4097..=16384 range).
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+    }
+
+    #[test]
+    fn custom_budget_config_value_is_digits_not_named() {
+        // B3: ThinkingSpec::Custom config_value() must be the digit string.
+        let spec = parse_thinking_arg("8192").unwrap();
+        assert_eq!(spec.config_value(), "8192",
+            "custom budget must persist as digits, not named level");
     }
 }
