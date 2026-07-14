@@ -67,7 +67,7 @@ impl ApiMethods {
         {
             drop(tx);
             while rx.recv().await.is_some() {}
-            return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
+            return result.map_err(crate::runtime::openai::net::provider_error_to_runtime);
         }
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
@@ -334,7 +334,7 @@ impl ApiMethods {
             drop(tx);
             while rx.recv().await.is_some() {}
             let response =
-                result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+                result.map_err(crate::runtime::openai::net::provider_error_to_runtime)?;
             return Ok(Self::concat_response_text(&response));
         }
         let model = model.strip_prefix("anthropic/").unwrap_or(model);

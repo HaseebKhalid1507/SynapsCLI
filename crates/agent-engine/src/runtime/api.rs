@@ -850,7 +850,9 @@ impl ApiMethods {
         )
         .await
         {
-            return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
+            // Classify honestly: transport blips are API failures, not
+            // config problems (incident: session 20260714-025948-3dab).
+            return result.map_err(crate::runtime::openai::net::provider_error_to_runtime);
         }
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.

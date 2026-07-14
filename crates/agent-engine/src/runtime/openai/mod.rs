@@ -5,6 +5,7 @@
 //! OpenAI `chat/completions` SSE wire.
 
 pub mod catalog;
+pub mod net;
 pub mod ping;
 pub mod reasoning;
 pub mod registry;
