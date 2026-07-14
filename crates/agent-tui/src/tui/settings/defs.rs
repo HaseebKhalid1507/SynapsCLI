@@ -198,7 +198,8 @@ mod tests {
         let result = apply_setting_dispatch("thinking", "ultra", &mut rt, &mut app);
         assert!(result.is_err(), "ultra must be rejected for luna");
         assert_eq!(
-            rt.reasoning_level(), before,
+            rt.reasoning_level(),
+            before,
             "runtime must not be mutated when dispatch returns Err"
         );
     }
@@ -215,6 +216,40 @@ mod tests {
             rt.reasoning_level(),
             agent_core::reasoning::ReasoningLevel::Ultra,
             "runtime must be updated when dispatch returns Ok"
+        );
+    }
+
+    #[test]
+    fn thinking_dispatch_rejects_off_on_xai_45_no_mutation_or_persist() {
+        let mut rt = synaps_cli::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        // Documented model default applied on switch.
+        assert_eq!(
+            rt.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::High
+        );
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
+
+        // Off must be rejected (reasoning cannot be disabled), never omitted.
+        let result = apply_setting_dispatch("thinking", "off", &mut rt, &mut app);
+        assert!(result.is_err(), "off must be rejected for grok-4.5");
+        assert_eq!(
+            rt.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::High
+        );
+
+        // xhigh is not documented for grok-4.5 either.
+        assert!(apply_setting_dispatch("thinking", "xhigh", &mut rt, &mut app).is_err());
+        assert_eq!(
+            rt.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::High
+        );
+
+        // A documented effort is accepted.
+        assert!(apply_setting_dispatch("thinking", "low", &mut rt, &mut app).is_ok());
+        assert_eq!(
+            rt.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::Low
         );
     }
 

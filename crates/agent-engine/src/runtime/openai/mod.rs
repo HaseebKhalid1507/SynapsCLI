@@ -649,6 +649,69 @@ mod tests {
         );
     }
 
+    /// Headless harness (no live credentials): rejected xAI reasoning
+    /// combinations must fail BEFORE any credential or network access on the
+    /// Responses path. The Remote credential source points at a closed
+    /// loopback port — if validation ran after broker access this would
+    /// surface a connection error instead of the capability message.
+    #[tokio::test]
+    async fn xai_off_is_rejected_pre_network_through_try_route() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let source = crate::auth::CredentialSource::Remote {
+            endpoint: "http://127.0.0.1:1".into(),
+            machine_token: "not-a-real-token".into(),
+        };
+        let cache = crate::auth::TokenCache::new();
+        let tools_schema: std::sync::Arc<Vec<serde_json::Value>> = std::sync::Arc::new(Vec::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user",
+            "content": "hi"
+        }))];
+
+        for (level, needle) in [
+            (
+                agent_core::reasoning::ReasoningLevel::Off,
+                "cannot be disabled",
+            ),
+            (
+                agent_core::reasoning::ReasoningLevel::XHigh,
+                "not supported",
+            ),
+            (
+                agent_core::reasoning::ReasoningLevel::Ultra,
+                "not supported",
+            ),
+        ] {
+            let result = try_route(
+                "xai-auth/grok-4.5",
+                &client,
+                &tools_schema,
+                &None,
+                &messages,
+                &tx,
+                None,
+                None,
+                0,
+                level,
+                &cancel,
+                &source,
+                &cache,
+            )
+            .await
+            .expect("xai-auth must route through try_route");
+            let err = result.expect_err("rejected level must error");
+            assert!(
+                err.to_string().contains(needle),
+                "{level}: pre-network capability rejection expected, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn set_extension_manager_for_routing_overwrites_previous_manager() {
         clear_extension_manager_for_routing();

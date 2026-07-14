@@ -62,7 +62,9 @@ pub(crate) enum EditorKind {
     DynamicCycler,
     ModelPicker,
     ThemePicker,
-    Text { numeric: bool },
+    Text {
+        numeric: bool,
+    },
 }
 
 pub(crate) struct SettingDef {

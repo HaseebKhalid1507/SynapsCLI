@@ -36,49 +36,14 @@ const BUILTIN_THEMES: &[&str] = &[
 
 /// Compute the thinking level options for `model_runtime_id`.
 ///
-/// For `openai-codex/<id>` models: query the process-local capability cache
-/// first (populated from the live catalog), then fall back to the static table;
-/// prepend "off" and "adaptive" as client-side options, then supported levels.
-/// For all other providers: return the conservative set including off/adaptive.
-/// Providers without authoritative metadata NEVER gain max/ultra.
+/// Delegates to the shared engine derivation
+/// (`catalog::validation::thinking_options_for_model`): exact capability
+/// cache (live catalog) first, then exact static descriptor tables, for
+/// `openai-codex/<id>`, `anthropic/<id>` (and bare `claude-*`), and
+/// `xai-auth/<id>`. Providers without authoritative metadata keep the
+/// conservative set and NEVER gain max/ultra. No substring inference.
 pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
-    // Check if this is a Codex model by provider-qualified prefix only — no substring inference.
-    if model.starts_with("openai-codex/") {
-        // Live capability cache takes priority over static table.
-        let supported: Option<Vec<agent_core::reasoning::ReasoningLevel>> =
-            agent_engine::runtime::openai::catalog::capability_cache::get(model)
-                .and_then(|m| match m.reasoning {
-                    agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
-                        supported, ..
-                    } => Some(supported),
-                    _ => None,
-                })
-                .or_else(|| {
-                    let model_id = model.strip_prefix("openai-codex/")?;
-                    match agent_engine::runtime::openai::catalog::codex_static_capability(model_id)? {
-                        agent_engine::runtime::openai::catalog::ReasoningSupport::CodexNamed {
-                            supported, ..
-                        } => Some(supported),
-                        _ => None,
-                    }
-                });
-        if let Some(levels) = supported {
-            // "off" = client omission (disable thinking); "adaptive" = model-default omission.
-            let mut opts = vec!["off".to_string(), "adaptive".to_string()];
-            opts.extend(levels.iter().map(|l| l.as_str().to_string()));
-            return opts;
-        }
-    }
-    // Conservative set for all non-Codex providers (and unknown Codex models).
-    // Includes "off" (client omission) and "adaptive" (model-default omission).
-    vec![
-        "off".to_string(),
-        "adaptive".to_string(),
-        "low".to_string(),
-        "medium".to_string(),
-        "high".to_string(),
-        "xhigh".to_string(),
-    ]
+    agent_engine::runtime::openai::catalog::validation::thinking_options_for_model(model)
 }
 
 pub(crate) fn theme_options() -> Vec<String> {
@@ -521,10 +486,13 @@ mod thinking_options_tests {
     #[test]
     fn sol_includes_off_adaptive_and_ultra_max() {
         let opts = thinking_options_for_model("openai-codex/gpt-5.6-sol");
-        assert_eq!(opts[0], "off",      "off must be first");
+        assert_eq!(opts[0], "off", "off must be first");
         assert_eq!(opts[1], "adaptive", "adaptive must be second");
-        assert!(opts.contains(&"ultra".to_string()), "sol must include ultra");
-        assert!(opts.contains(&"max".to_string()),   "sol must include max");
+        assert!(
+            opts.contains(&"ultra".to_string()),
+            "sol must include ultra"
+        );
+        assert!(opts.contains(&"max".to_string()), "sol must include max");
     }
 
     #[test]
@@ -548,7 +516,7 @@ mod thinking_options_tests {
             "openai-codex/gpt-5.3-codex-spark",
         ] {
             let opts = thinking_options_for_model(model);
-            assert_eq!(opts[0], "off",      "{model}: off must be first");
+            assert_eq!(opts[0], "off", "{model}: off must be first");
             assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
             assert!(
                 !opts.contains(&"max".to_string()),
@@ -567,13 +535,12 @@ mod thinking_options_tests {
 
     #[test]
     fn non_codex_provider_includes_off_adaptive_not_max_ultra() {
-        for model in [
-            "claude-opus-4-7",
-            "groq/llama-3.3-70b",
-            "xai-auth/grok-3-mini",
-        ] {
+        // Unknown xAI ids now fail closed (see
+        // xai_options_derive_from_exact_static_capabilities); providers
+        // without exact metadata keep the conservative set.
+        for model in ["claude-opus-4-7", "groq/llama-3.3-70b"] {
             let opts = thinking_options_for_model(model);
-            assert_eq!(opts[0], "off",      "{model}: off must be first");
+            assert_eq!(opts[0], "off", "{model}: off must be first");
             assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
             assert!(
                 !opts.contains(&"max".to_string()),
@@ -595,14 +562,79 @@ mod thinking_options_tests {
         assert!(!opts.contains(&"ultra".to_string()));
     }
 
+    // ── Dynamic options for anthropic/<id> and xai-auth/<id> (spec:
+    //     anthropic-xai-reasoning-modes) ──
+
+    #[test]
+    fn xai_options_derive_from_exact_static_capabilities() {
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.5"),
+            vec!["adaptive", "low", "medium", "high"],
+            "grok-4.5: documented low/medium/high, cannot be disabled → no off, no xhigh"
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-multi-agent-0309"),
+            vec!["adaptive", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.3"),
+            vec!["adaptive"],
+            "no documented effort control → provider default only"
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-0309-non-reasoning"),
+            vec!["off", "adaptive"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-unknown-id"),
+            vec!["adaptive"],
+            "unknown exact xAI id must fail closed"
+        );
+    }
+
+    #[test]
+    fn anthropic_options_derive_from_capabilities_and_never_gain_max_ultra() {
+        for model in ["anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6"] {
+            let opts = thinking_options_for_model(model);
+            assert_eq!(
+                opts,
+                vec!["off", "adaptive", "low", "medium", "high", "xhigh"],
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_live_no_thinking_narrows_options() {
+        use agent_engine::runtime::openai::catalog::{
+            capability_cache, CatalogProviderKind, CatalogSource, ReasoningSupport,
+        };
+        let unique_id = "claude-test-tui-nothink";
+        let mut live = agent_engine::runtime::openai::catalog::CatalogModel::new(
+            "anthropic",
+            "Anthropic",
+            unique_id,
+        )
+        .unwrap();
+        live.provider_kind = CatalogProviderKind::Anthropic;
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::None;
+        capability_cache::insert(live);
+        assert_eq!(
+            thinking_options_for_model(&format!("anthropic/{unique_id}")),
+            vec!["off", "adaptive"],
+            "explicit no-thinking evidence must narrow the options"
+        );
+    }
+
     /// Gap 2: cache-narrower override — live entry with only Low+Medium must
     /// suppress Ultra in the TUI options even when static sol has Ultra.
     #[test]
     fn cache_narrower_than_static_suppresses_ultra_in_tui_options() {
+        use agent_core::reasoning::ReasoningLevel;
         use agent_engine::runtime::openai::catalog::{
             capability_cache, CatalogProviderKind, CatalogSource, ReasoningSupport,
         };
-        use agent_core::reasoning::ReasoningLevel;
 
         // Unique slug to avoid polluting other tests via the shared cache.
         let unique_id = "gpt-5.6-sol-tui-cache-test";
@@ -610,8 +642,11 @@ mod thinking_options_tests {
 
         // Insert a live cache entry that supports only Low+Medium.
         let mut live = agent_engine::runtime::openai::catalog::CatalogModel::new(
-            "openai-codex", "OpenAI Codex", unique_id,
-        ).unwrap();
+            "openai-codex",
+            "OpenAI Codex",
+            unique_id,
+        )
+        .unwrap();
         live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
