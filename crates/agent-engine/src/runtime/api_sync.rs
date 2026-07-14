@@ -72,27 +72,41 @@ impl ApiMethods {
             return result.map_err(crate::runtime::openai::net::provider_error_to_runtime);
         }
         let qualified_model = model;
-        let execution_plan = crate::runtime::openai::catalog::plan_anthropic_execution(
-            qualified_model,
-            reasoning_level,
-            options.codex_request_role,
-            crate::runtime::openai::catalog::AnthropicPlanPrerequisites::installed(),
-            crate::runtime::openai::catalog::capability_cache::get(qualified_model).and_then(
-                |entry| match entry.reasoning {
-                    crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
-                        adaptive,
-                    } => Some(adaptive),
-                    crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
-                    _ => None,
-                },
-            ),
-        )
-        .map_err(|error| {
-            RuntimeError::Config(format!(
-                "Anthropic execution plan rejected: {}",
-                error.code().as_str()
-            ))
-        })?;
+        let execution_plan = options
+            .anthropic_execution_plan
+            .as_ref()
+            .filter(|plan| {
+                plan.qualified_model == qualified_model
+                    && plan.requested_level == reasoning_level
+                    && plan.role == options.codex_request_role
+            })
+            .cloned()
+            .or_else(|| {
+                (!matches!(
+                    reasoning_level,
+                    agent_core::reasoning::ReasoningLevel::Max
+                        | agent_core::reasoning::ReasoningLevel::UltraCode
+                ))
+                .then(|| {
+                    crate::runtime::openai::catalog::plan_anthropic_execution(
+                        qualified_model,
+                        reasoning_level,
+                        options.codex_request_role,
+                        crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
+                            orchestration_policy: false,
+                            builtin_lifecycle_tools: false,
+                        },
+                        None,
+                    )
+                    .ok()
+                })
+                .flatten()
+            })
+            .ok_or_else(|| {
+                RuntimeError::Config(
+                    "Anthropic special mode transport requires an authorized execution plan".into(),
+                )
+            })?;
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         // Read auth state

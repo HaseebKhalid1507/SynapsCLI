@@ -727,6 +727,32 @@ impl Runtime {
             &self.model,
             level,
         )?;
+        if self.model.starts_with("anthropic/")
+            && level == agent_core::reasoning::ReasoningLevel::UltraCode
+        {
+            if self.codex_request_role()
+                != crate::runtime::openai::catalog::ExecutionRole::Foreground
+            {
+                return Err("ultracode_requires_foreground".into());
+            }
+            if self.effective_prompt.is_some() {
+                return Err("typed_prompt_manifest_blocks_required_doctrine".into());
+            }
+            if self.orchestration.is_none() {
+                return Err("ultracode_requires_orchestration".into());
+            }
+            let tools = self.tools.try_read().map_err(|_| {
+                "ultracode prerequisite state is busy; refusing mutation".to_string()
+            })?;
+            let required = ["subagent_start", "subagent_status", "subagent_collect"];
+            if !required.iter().all(|name| {
+                tools
+                    .get(name)
+                    .is_some_and(|tool| tool.extension_id().is_none())
+            }) {
+                return Err("ultracode_requires_lifecycle_tools".into());
+            }
+        }
         self.set_reasoning_level_explicit(level);
         Ok(())
     }
@@ -762,6 +788,41 @@ impl Runtime {
 
     pub(crate) fn codex_request_role(&self) -> crate::runtime::openai::catalog::CodexRequestRole {
         self.codex_request_role
+    }
+
+    async fn authorized_anthropic_plan(
+        &self,
+    ) -> Result<Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>> {
+        if !self.model.starts_with("anthropic/") {
+            return Ok(None);
+        }
+        let tools = self.tools.read().await;
+        let required = ["subagent_start", "subagent_status", "subagent_collect"];
+        let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
+            orchestration_policy: self.orchestration.is_some(),
+            builtin_lifecycle_tools: required.iter().all(|name| {
+                tools
+                    .get(name)
+                    .is_some_and(|tool| tool.extension_id().is_none())
+            }),
+        };
+        crate::runtime::openai::catalog::plan_anthropic_execution(
+            &self.model,
+            self.reasoning_level(),
+            self.codex_request_role(),
+            prerequisites,
+            crate::runtime::openai::catalog::capability_cache::get(&self.model).and_then(|entry| {
+                match entry.reasoning {
+                    crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                        adaptive,
+                    } => Some(adaptive),
+                    crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                    _ => None,
+                }
+            }),
+        )
+        .map(Some)
+        .map_err(|error| RuntimeError::Config(error.to_string()))
     }
 
     /// Validate exact-model reasoning and Ultra orchestration prerequisites
@@ -1127,6 +1188,7 @@ impl Runtime {
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
         self.validate_request_preflight().await?;
+        let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         // Refresh OAuth token if expired only after capability preflight.
         self.refresh_if_needed().await?;
 
@@ -1154,6 +1216,7 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
+                    anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                 },
             )
@@ -1483,6 +1546,15 @@ impl Runtime {
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
 
+        let anthropic_execution_plan = match self.authorized_anthropic_plan().await {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+                return Box::pin(UnboundedReceiverStream::new(rx));
+            }
+        };
+
         // Refresh OAuth token if expired after capability preflight.
         if let Err(e) = self.refresh_if_needed().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
@@ -1525,6 +1597,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
         };
 

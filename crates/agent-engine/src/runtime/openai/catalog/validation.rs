@@ -11,18 +11,9 @@
 use agent_core::reasoning::ReasoningLevel;
 
 use super::{
-    anthropic_static_capability, capability_cache, codex_static_capability,
-    plan_anthropic_execution, plan_codex_execution, xai_static_capability,
-    AnthropicPlanPrerequisites, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
+    anthropic_static_capability, capability_cache, codex_static_capability, plan_codex_execution,
+    xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
     ReasoningSupport, XaiReasoningCapability,
-};
-
-/// Mutation validation is synchronous and therefore cannot establish that the
-/// runtime's async orchestration/tool prerequisites are actually installed.
-/// UltraCode must be revalidated by request/TUI apply with real prerequisites.
-const UNVERIFIED_ANTHROPIC_PREREQUISITES: AnthropicPlanPrerequisites = AnthropicPlanPrerequisites {
-    orchestration_policy: false,
-    builtin_lifecycle_tools: false,
 };
 
 /// Conservative option set for providers without authoritative exact-model
@@ -149,29 +140,29 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
     }
     if let Some(model_id) = anthropic_model_id(model) {
         if model.starts_with("anthropic/")
-            && matches!(
-                level,
-                ReasoningLevel::Max | ReasoningLevel::UltraCode | ReasoningLevel::Ultra
-            )
+            && matches!(level, ReasoningLevel::Max | ReasoningLevel::UltraCode)
         {
-            return plan_anthropic_execution(
-                model,
-                level,
-                CodexRequestRole::Foreground,
-                UNVERIFIED_ANTHROPIC_PREREQUISITES,
-                capability_cache::get(model).and_then(|entry| match entry.reasoning {
-                    ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
-                    ReasoningSupport::None => Some(false),
-                    _ => None,
-                }),
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string());
+            let capabilities = super::anthropic_mode_capabilities(model).map(|caps| {
+                caps.narrow_with_live_effort(capability_cache::get(model).and_then(|entry| {
+                    match entry.reasoning {
+                        ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
+                        ReasoningSupport::None => Some(false),
+                        _ => None,
+                    }
+                }))
+            });
+            let supported = match level {
+                ReasoningLevel::Max => capabilities.is_some_and(|caps| caps.max_supported),
+                ReasoningLevel::UltraCode => {
+                    capabilities.is_some_and(|caps| caps.ultracode_supported())
+                }
+                _ => unreachable!(),
+            };
+            return supported
+                .then_some(())
+                .ok_or_else(|| format!("reasoning level '{level}' is not supported by {model}"));
         }
-        if matches!(
-            level,
-            ReasoningLevel::Max | ReasoningLevel::Ultra | ReasoningLevel::UltraCode
-        ) {
+        if level == ReasoningLevel::Ultra {
             return Err(format!(
                 "reasoning level '{level}' requires authoritative exact-model capability metadata; {model} has none"
             ));
