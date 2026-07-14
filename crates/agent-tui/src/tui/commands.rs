@@ -570,9 +570,9 @@ pub(super) async fn handle_command(
                         runtime.set_model(session.model.clone());
                         // Restore the session's named reasoning level so
                         // max/ultra/off are not lost on resume.
-                        if let Some(level) =
-                            agent_core::reasoning::ReasoningLevel::parse(&session.thinking_level)
-                        {
+                        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(
+                            &session.thinking_level,
+                        ) {
                             runtime.set_reasoning_level(level);
                         } else if let Some(budget) =
                             synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
