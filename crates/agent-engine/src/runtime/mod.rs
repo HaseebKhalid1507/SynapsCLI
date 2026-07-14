@@ -475,6 +475,17 @@ impl Runtime {
         if self.effective_prompt.is_some() {
             return self.system_prompt.clone();
         }
+        if self.model == "anthropic/claude-fable-5"
+            && self.reasoning_level() == agent_core::reasoning::ReasoningLevel::UltraCode
+            && self.codex_request_role()
+                == crate::runtime::openai::catalog::ExecutionRole::Foreground
+        {
+            return Some(format!(
+                "{}\n\n{}",
+                self.system_prompt.as_deref().unwrap_or_default(),
+                crate::runtime::openai::catalog::ANTHROPIC_ULTRACODE_WORKFLOW
+            ));
+        }
         if self.tools.read().await.get("subagent_start").is_none() {
             return self.system_prompt.clone();
         }
@@ -766,6 +777,15 @@ impl Runtime {
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
         let level = self.reasoning_level();
+        if model.starts_with("anthropic/")
+            && level == agent_core::reasoning::ReasoningLevel::UltraCode
+            && self.effective_prompt.is_some()
+        {
+            return Err(RuntimeError::Config(
+                "Anthropic execution plan rejected: typed_prompt_manifest_blocks_required_doctrine"
+                    .into(),
+            ));
+        }
         if model.starts_with("anthropic/")
             && matches!(
                 level,
@@ -1909,6 +1929,16 @@ mod effective_prompt_tests {
         runtime.set_model(model.to_string());
         runtime.set_system_prompt(base.to_string());
         runtime
+    }
+
+    #[tokio::test]
+    async fn anthropic_foreground_ultracode_composes_standing_doctrine_once() {
+        let mut runtime = headless("anthropic/claude-fable-5", "BASE.");
+        runtime.named_level = Some(agent_core::reasoning::ReasoningLevel::UltraCode);
+        let prompt = runtime.effective_system_prompt().await.expect("doctrine");
+        assert_eq!(prompt.matches("<anthropic-ultracode-workflow>").count(), 1);
+        assert!(prompt.contains("subagent_start"));
+        assert!(prompt.contains("subagent_resume"));
     }
 
     #[tokio::test]
