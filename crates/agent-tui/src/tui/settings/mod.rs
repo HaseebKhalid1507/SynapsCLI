@@ -529,14 +529,12 @@ mod thinking_options_tests {
         assert_eq!(super::reasoning_type_for_model(rt.model()), "intrinsic");
         assert_eq!(thinking_options_for_model(rt.model()), vec!["adaptive"]);
 
-        super::defs::apply_setting_dispatch(
-            "model",
-            "openai-codex/gpt-5.6-sol",
-            &mut rt,
-            &mut app,
-        )
-        .unwrap();
-        assert_eq!(super::reasoning_type_for_model(rt.model()), "effort (named)");
+        super::defs::apply_setting_dispatch("model", "openai-codex/gpt-5.6-sol", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(
+            super::reasoning_type_for_model(rt.model()),
+            "effort (named)"
+        );
         assert!(thinking_options_for_model(rt.model()).contains(&"ultra".to_string()));
     }
 
@@ -662,7 +660,7 @@ mod thinking_options_tests {
     }
 
     #[test]
-    fn anthropic_options_derive_from_capabilities_and_never_gain_max_ultra() {
+    fn ordinary_anthropic_options_remain_conservative() {
         for model in ["anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6"] {
             let opts = thinking_options_for_model(model);
             assert_eq!(

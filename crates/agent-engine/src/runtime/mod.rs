@@ -2098,6 +2098,86 @@ mod set_reasoning_level_checked_tests {
         rt
     }
 
+    fn provisioned_fable_runtime() -> Runtime {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("anthropic/claude-fable-5".into());
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-fable-5").unwrap();
+        let orchestration =
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap();
+        rt.install_orchestration(Arc::new(orchestration));
+        rt
+    }
+
+    fn install_typed_manifest(rt: &mut Runtime) {
+        let module = agent_core::prompt::PromptModule::new(
+            agent_core::prompt::PromptModuleId::parse("kernel.test").unwrap(),
+            "1.0.0",
+            agent_core::prompt::PromptModuleSource::User,
+            0,
+            agent_core::prompt::PromptSelectors::default(),
+            agent_core::prompt::ModuleMutability::MutableGuidance,
+            "KERNEL.",
+        )
+        .unwrap();
+        let context = agent_core::prompt::SelectionContext::new(
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+            None,
+        )
+        .unwrap();
+        rt.apply_prompt_stack(agent_core::prompt::PromptStack::new(vec![module], context).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn provisioned_fable_accepts_max_and_ultracode() {
+        for level in [ReasoningLevel::Max, ReasoningLevel::UltraCode] {
+            let mut rt = provisioned_fable_runtime();
+            rt.set_reasoning_level_checked(level).unwrap();
+            assert_eq!(rt.reasoning_level(), level);
+        }
+    }
+
+    #[test]
+    fn fable_ultracode_prerequisites_fail_without_mutation() {
+        let mut missing_orchestration = Runtime::new_headless();
+        missing_orchestration.set_model("anthropic/claude-fable-5".into());
+        missing_orchestration.set_reasoning_level(ReasoningLevel::Low);
+        assert!(missing_orchestration
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(missing_orchestration.reasoning_level(), ReasoningLevel::Low);
+
+        let mut missing_tools = provisioned_fable_runtime();
+        missing_tools.set_tools(ToolRegistry::without_subagent());
+        assert!(missing_tools
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(missing_tools.reasoning_level(), ReasoningLevel::Low);
+
+        let mut worker = provisioned_fable_runtime();
+        worker.set_codex_request_role(crate::runtime::openai::catalog::ExecutionRole::Worker);
+        assert!(worker
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(worker.reasoning_level(), ReasoningLevel::Low);
+
+        let mut internal = provisioned_fable_runtime();
+        internal.set_codex_request_role(crate::runtime::openai::catalog::ExecutionRole::Internal);
+        assert!(internal
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(internal.reasoning_level(), ReasoningLevel::Low);
+
+        let mut manifest = provisioned_fable_runtime();
+        install_typed_manifest(&mut manifest);
+        assert!(manifest
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(manifest.reasoning_level(), ReasoningLevel::Low);
+    }
+
     #[test]
     fn checked_accepts_client_omission_modes_for_codex() {
         for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
@@ -2156,7 +2236,7 @@ mod set_reasoning_level_checked_tests {
         let mut rt = Runtime::new_headless();
         rt.set_model("claude-opus-4-7".to_string());
         rt.set_reasoning_level(ReasoningLevel::Low);
-        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+        for level in [ReasoningLevel::Ultra] {
             assert!(rt.set_reasoning_level_checked(level).is_err());
             assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
         }
@@ -2168,7 +2248,7 @@ mod set_reasoning_level_checked_tests {
     fn checked_rejects_max_ultra_for_unknown_codex_model() {
         let mut rt = codex_runtime("gpt-unknown-future");
         rt.set_reasoning_level(ReasoningLevel::Low);
-        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+        for level in [ReasoningLevel::Ultra] {
             let err = rt.set_reasoning_level_checked(level).unwrap_err();
             assert!(err.contains("no capability metadata"), "{err}");
             assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);

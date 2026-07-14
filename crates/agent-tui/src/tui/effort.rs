@@ -129,7 +129,12 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &EffortModalState) {
             Style::default().fg(theme.claude_text)
         };
         let marker = if selected { "▸ " } else { "  " };
-        lines.push(Line::from(Span::styled(format!("{marker}{opt}"), style)));
+        let label = if opt == "ultracode" {
+            "ultracode — xhigh + workflows"
+        } else {
+            opt
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
     }
     lines.push(Line::from(Span::styled(
         "  ↑/↓ move · Enter apply · Esc cancel",
@@ -165,10 +170,22 @@ mod tests {
         let grok = EffortModalState::new("xai-auth/grok-4.3", "adaptive");
         assert_eq!(grok.options, vec!["adaptive"]);
 
-        // Non-codex models must never be offered max/ultra.
-        let opus = EffortModalState::new("anthropic/claude-opus-4-7", "medium");
-        assert!(!opus.options.contains(&"max".to_string()));
-        assert!(!opus.options.contains(&"ultra".to_string()));
+        // Fable exposes the exact Anthropic logical modes, without Codex ultra.
+        let fable = EffortModalState::new("anthropic/claude-fable-5", "medium");
+        assert_eq!(
+            fable.options,
+            [
+                "off",
+                "adaptive",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode"
+            ]
+        );
+        assert!(!fable.options.contains(&"ultra".to_string()));
     }
 
     #[test]

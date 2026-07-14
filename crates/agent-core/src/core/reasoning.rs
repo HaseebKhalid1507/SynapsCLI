@@ -206,6 +206,7 @@ mod tests {
             ("xhigh", ReasoningLevel::XHigh),
             ("max", ReasoningLevel::Max),
             ("ultra", ReasoningLevel::Ultra),
+            ("ultracode", ReasoningLevel::UltraCode),
         ] {
             assert_eq!(
                 ReasoningLevel::parse(s),
@@ -243,6 +244,7 @@ mod tests {
             ReasoningLevel::XHigh,
             ReasoningLevel::Max,
             ReasoningLevel::Ultra,
+            ReasoningLevel::UltraCode,
         ] {
             let s = level.as_str();
             assert_eq!(

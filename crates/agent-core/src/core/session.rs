@@ -872,4 +872,23 @@ mod tests {
         s.clear_name();
         assert_eq!(s.name, None);
     }
+
+    #[test]
+    fn ultracode_serialization_and_compaction_roundtrip_is_distinct() {
+        let original = Session::new("anthropic/claude-fable-5", "ultracode", None);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.thinking_level, "ultracode");
+        for other in ["ultra", "max", "xhigh"] {
+            assert_ne!(restored.thinking_level, other);
+        }
+        let compacted = Session::new_from_compaction(&restored, "summary".into());
+        let resumed: Session =
+            serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
+        assert_eq!(resumed.thinking_level, "ultracode");
+        assert_eq!(
+            resumed.parent_session.as_deref(),
+            Some(original.id.as_str())
+        );
+    }
 }
