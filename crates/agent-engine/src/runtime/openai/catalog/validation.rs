@@ -49,8 +49,12 @@ fn codex_supported_levels(model: &str, model_id: &str) -> Option<Vec<ReasoningLe
 }
 
 fn anthropic_capability(model_id: &str) -> Option<ReasoningSupport> {
+    // A live catalog entry whose payload carried no capability evidence
+    // (`Unknown`) must not shadow the exact-id static table — absence of
+    // live metadata is not evidence against static knowledge.
     capability_cache::get(&format!("anthropic/{model_id}"))
         .map(|m| m.reasoning)
+        .filter(|r| !matches!(r, ReasoningSupport::Unknown))
         .or_else(|| anthropic_static_capability(model_id))
 }
 
@@ -482,6 +486,22 @@ mod tests {
         assert_eq!(
             reasoning_type_for_model("groq/llama-3.3-70b-versatile"),
             "unverified"
+        );
+    }
+
+    /// Regression: a live catalog entry parsed WITHOUT capability metadata
+    /// (`ReasoningSupport::Unknown`, e.g. from pagination payloads) must not
+    /// shadow the exact-id static table.
+    #[test]
+    fn cached_unknown_reasoning_does_not_shadow_static_capability() {
+        let mut m =
+            super::super::CatalogModel::new("anthropic", "Anthropic", "claude-opus-4-7").unwrap();
+        m.reasoning = crate::runtime::openai::catalog::ReasoningSupport::Unknown;
+        capability_cache::insert(m);
+        assert_eq!(
+            reasoning_type_for_model("anthropic/claude-opus-4-7"),
+            "adaptive",
+            "cached Unknown must fall through to the static adaptive entry"
         );
     }
 
