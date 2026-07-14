@@ -800,14 +800,24 @@ impl Runtime {
             return Ok(None);
         }
         let tools = self.tools.read().await;
-        let required = ["subagent_start", "subagent_status", "subagent_collect"];
+        let builtin = |name: &str| {
+            tools
+                .get(name)
+                .is_some_and(|tool| tool.extension_id().is_none())
+        };
         let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
             orchestration_policy: self.orchestration.is_some(),
-            builtin_lifecycle_tools: required.iter().all(|name| {
-                tools
-                    .get(name)
-                    .is_some_and(|tool| tool.extension_id().is_none())
-            }),
+            foreground_worker_authorized: self
+                .orchestration
+                .as_ref()
+                .is_some_and(|runtime| runtime.preflight(&self.model).is_ok()),
+            concurrent_limit: usize::from(self.orchestration.is_some()),
+            total_limit: usize::from(self.orchestration.is_some()),
+            lifecycle_start: builtin("subagent_start"),
+            lifecycle_status: builtin("subagent_status"),
+            lifecycle_steer: builtin("subagent_steer"),
+            lifecycle_collect: builtin("subagent_collect"),
+            lifecycle_resume: builtin("subagent_resume"),
         };
         crate::runtime::openai::catalog::plan_anthropic_execution(
             &self.model,
@@ -859,14 +869,24 @@ impl Runtime {
             )
         {
             let tools = self.tools.read().await;
-            let required = ["subagent_start", "subagent_status", "subagent_collect"];
+            let builtin = |name: &str| {
+                tools
+                    .get(name)
+                    .is_some_and(|tool| tool.extension_id().is_none())
+            };
             let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
                 orchestration_policy: self.orchestration.is_some(),
-                builtin_lifecycle_tools: required.iter().all(|name| {
-                    tools
-                        .get(name)
-                        .is_some_and(|tool| tool.extension_id().is_none())
-                }),
+                foreground_worker_authorized: self
+                    .orchestration
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.preflight(model).is_ok()),
+                concurrent_limit: usize::from(self.orchestration.is_some()),
+                total_limit: usize::from(self.orchestration.is_some()),
+                lifecycle_start: builtin("subagent_start"),
+                lifecycle_status: builtin("subagent_status"),
+                lifecycle_steer: builtin("subagent_steer"),
+                lifecycle_collect: builtin("subagent_collect"),
+                lifecycle_resume: builtin("subagent_resume"),
             };
             drop(tools);
             let result = crate::runtime::openai::catalog::plan_anthropic_execution(
@@ -886,11 +906,11 @@ impl Runtime {
             );
             match result {
                 Ok(plan) => {
-                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), execution_mode = ?plan.mode, wire_effort = plan.wire_effort.map_or("omitted", |effort| effort.as_str()), workflow = ?plan.workflow, network_attempted = false);
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), execution_mode = ?plan.mode, wire_effort = plan.wire_effort.map_or("omitted", |effort| effort.as_str()), workflow = ?plan.workflow, credentials_attempted = false, network_attempted = false);
                     return Ok(());
                 }
                 Err(error) => {
-                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), decision = "deny", deny_code = error.code().as_str(), network_attempted = false);
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), decision = "deny", deny_code = error.code().as_str(), credentials_attempted = false, network_attempted = false);
                     return Err(RuntimeError::Config(error.to_string()));
                 }
             }

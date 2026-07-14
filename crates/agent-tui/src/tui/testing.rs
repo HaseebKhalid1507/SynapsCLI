@@ -773,7 +773,10 @@ impl TestHarness {
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
-            InputAction::EffortApply(level) => format!("effort-apply:{level}"),
+            InputAction::EffortApply(apply) => format!(
+                "effort-apply:{}:{}:{}",
+                apply.model, apply.generation, apply.value
+            ),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),

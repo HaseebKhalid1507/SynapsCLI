@@ -39,14 +39,28 @@ pub enum AnthropicWorkflowPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnthropicPlanPrerequisites {
     pub orchestration_policy: bool,
-    pub builtin_lifecycle_tools: bool,
+    pub foreground_worker_authorized: bool,
+    pub concurrent_limit: usize,
+    pub total_limit: usize,
+    pub lifecycle_start: bool,
+    pub lifecycle_status: bool,
+    pub lifecycle_steer: bool,
+    pub lifecycle_collect: bool,
+    pub lifecycle_resume: bool,
 }
 
 impl AnthropicPlanPrerequisites {
     pub const fn installed() -> Self {
         Self {
             orchestration_policy: true,
-            builtin_lifecycle_tools: true,
+            foreground_worker_authorized: true,
+            concurrent_limit: 1,
+            total_limit: 1,
+            lifecycle_start: true,
+            lifecycle_status: true,
+            lifecycle_steer: true,
+            lifecycle_collect: true,
+            lifecycle_resume: true,
         }
     }
 }
@@ -59,6 +73,8 @@ pub enum AnthropicPlanErrorCode {
     UltraCodeRequiresForeground,
     UltraCodeRequiresOrchestration,
     UltraCodeRequiresLifecycleTools,
+    UltraCodeRequiresWorkerAuthorization,
+    UltraCodeRequiresLimits,
 }
 
 impl AnthropicPlanErrorCode {
@@ -70,6 +86,8 @@ impl AnthropicPlanErrorCode {
             Self::UltraCodeRequiresForeground => "ultracode_requires_foreground",
             Self::UltraCodeRequiresOrchestration => "ultracode_requires_orchestration",
             Self::UltraCodeRequiresLifecycleTools => "ultracode_requires_lifecycle_tools",
+            Self::UltraCodeRequiresWorkerAuthorization => "ultracode_requires_worker_authorization",
+            Self::UltraCodeRequiresLimits => "ultracode_requires_limits",
         }
     }
 }
@@ -133,20 +151,85 @@ impl AnthropicModeCapabilities {
     }
 }
 
-/// Look up exact qualified identities only. No family or substring inference.
-pub fn anthropic_mode_capabilities(qualified_model: &str) -> Option<AnthropicModeCapabilities> {
-    match qualified_model {
-        // Evidence: Claude Code 2.1.207 binary SHA-256
-        // 85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83
-        // and its matching settings schema advertise Fable 5 max_effort and
-        // xhigh_effort; the live picker displays Max and UltraCode.
-        "anthropic/claude-fable-5" => Some(AnthropicModeCapabilities {
-            max_supported: true,
-            xhigh_supported: true,
-            workflow_supported: true,
-        }),
-        _ => None,
+/// Source-controlled schema for exact Anthropic logical-mode authority.
+const ANTHROPIC_MODE_MANIFEST_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicManifestRow {
+    pub qualified_id: &'static str,
+    pub max_supported: bool,
+    pub xhigh_supported: bool,
+    pub workflow_supported: bool,
+    pub evidence: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicCapabilityManifest {
+    pub schema_version: u16,
+    pub rows: &'static [AnthropicManifestRow],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicManifestErrorCode {
+    UnsupportedVersion,
+    MalformedQualifiedId,
+    DuplicateId,
+    ContradictoryCapabilities,
+    EvidenceMissing,
+}
+
+impl AnthropicCapabilityManifest {
+    pub fn validate(self) -> Result<(), AnthropicManifestErrorCode> {
+        if self.schema_version != ANTHROPIC_MODE_MANIFEST_VERSION {
+            return Err(AnthropicManifestErrorCode::UnsupportedVersion);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for row in self.rows {
+            let Some(id) = row.qualified_id.strip_prefix("anthropic/") else {
+                return Err(AnthropicManifestErrorCode::MalformedQualifiedId);
+            };
+            if id.is_empty() || id.contains('/') {
+                return Err(AnthropicManifestErrorCode::MalformedQualifiedId);
+            }
+            if !ids.insert(row.qualified_id) {
+                return Err(AnthropicManifestErrorCode::DuplicateId);
+            }
+            if row.workflow_supported && !row.xhigh_supported {
+                return Err(AnthropicManifestErrorCode::ContradictoryCapabilities);
+            }
+            if (row.max_supported || row.workflow_supported) && row.evidence.trim().is_empty() {
+                return Err(AnthropicManifestErrorCode::EvidenceMissing);
+            }
+        }
+        Ok(())
     }
+}
+
+const ANTHROPIC_MODE_ROWS: &[AnthropicManifestRow] = &[AnthropicManifestRow {
+    qualified_id: "anthropic/claude-fable-5",
+    max_supported: true,
+    xhigh_supported: true,
+    workflow_supported: true,
+    evidence: "Claude Code 2.1.207; sha256:85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83",
+}];
+const ANTHROPIC_MODE_MANIFEST: AnthropicCapabilityManifest = AnthropicCapabilityManifest {
+    schema_version: ANTHROPIC_MODE_MANIFEST_VERSION,
+    rows: ANTHROPIC_MODE_ROWS,
+};
+
+/// Look up exact qualified identities only. The complete manifest is validated
+/// before each decision; malformed source authority therefore fails closed.
+pub fn anthropic_mode_capabilities(qualified_model: &str) -> Option<AnthropicModeCapabilities> {
+    ANTHROPIC_MODE_MANIFEST.validate().ok()?;
+    let row = ANTHROPIC_MODE_MANIFEST
+        .rows
+        .iter()
+        .find(|row| row.qualified_id == qualified_model)?;
+    Some(AnthropicModeCapabilities {
+        max_supported: row.max_supported,
+        xhigh_supported: row.xhigh_supported,
+        workflow_supported: row.workflow_supported,
+    })
 }
 
 pub fn plan_standard_anthropic_transport(
@@ -154,7 +237,10 @@ pub fn plan_standard_anthropic_transport(
     requested_level: ReasoningLevel,
     role: ExecutionRole,
 ) -> Option<AnthropicExecutionPlan> {
-    if matches!(requested_level, ReasoningLevel::Max | ReasoningLevel::UltraCode) {
+    if matches!(
+        requested_level,
+        ReasoningLevel::Max | ReasoningLevel::UltraCode
+    ) {
         return None;
     }
     let wire_effort = match requested_level {
@@ -227,7 +313,26 @@ pub fn plan_anthropic_execution(
                 AnthropicPlanErrorCode::UltraCodeRequiresOrchestration,
             ));
         }
-        if !prerequisites.builtin_lifecycle_tools {
+        if !prerequisites.foreground_worker_authorized {
+            return Err(AnthropicPlanError(
+                AnthropicPlanErrorCode::UltraCodeRequiresWorkerAuthorization,
+            ));
+        }
+        if prerequisites.concurrent_limit == 0 || prerequisites.total_limit == 0 {
+            return Err(AnthropicPlanError(
+                AnthropicPlanErrorCode::UltraCodeRequiresLimits,
+            ));
+        }
+        if ![
+            prerequisites.lifecycle_start,
+            prerequisites.lifecycle_status,
+            prerequisites.lifecycle_steer,
+            prerequisites.lifecycle_collect,
+            prerequisites.lifecycle_resume,
+        ]
+        .into_iter()
+        .all(|present| present)
+        {
             return Err(AnthropicPlanError(
                 AnthropicPlanErrorCode::UltraCodeRequiresLifecycleTools,
             ));
@@ -406,8 +511,9 @@ mod tests {
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
             ] {
-                let plan = plan_standard_anthropic_transport(model, level, ExecutionRole::Foreground)
-                    .expect("ordinary transport plan");
+                let plan =
+                    plan_standard_anthropic_transport(model, level, ExecutionRole::Foreground)
+                        .expect("ordinary transport plan");
                 assert_eq!(plan.mode, AnthropicExecutionMode::Standard);
                 assert_eq!(plan.qualified_model, model);
             }
@@ -542,7 +648,7 @@ mod tests {
                 ExecutionRole::Foreground,
                 AnthropicPlanPrerequisites {
                     orchestration_policy: false,
-                    builtin_lifecycle_tools: true,
+                    ..AnthropicPlanPrerequisites::installed()
                 },
                 AnthropicPlanErrorCode::UltraCodeRequiresOrchestration,
             ),
@@ -551,8 +657,8 @@ mod tests {
                 ReasoningLevel::UltraCode,
                 ExecutionRole::Foreground,
                 AnthropicPlanPrerequisites {
-                    orchestration_policy: true,
-                    builtin_lifecycle_tools: false,
+                    lifecycle_start: false,
+                    ..AnthropicPlanPrerequisites::installed()
                 },
                 AnthropicPlanErrorCode::UltraCodeRequiresLifecycleTools,
             ),

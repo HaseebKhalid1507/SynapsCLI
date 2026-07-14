@@ -1357,7 +1357,17 @@ pub(crate) async fn handle_input_action(
                 applied, status
             )));
         }
-        InputAction::EffortApply(value) => {
+        InputAction::EffortApply(apply) => {
+            // Reject a selection derived from a different exact model or from
+            // an older capability snapshot before mutation or persistence.
+            if runtime.model() != apply.model
+                || agent_engine::runtime::openai::catalog::capability_cache::generation()
+                    != apply.generation
+            {
+                app.push_msg(ChatMessage::Error("stale_effort_selection".into()));
+                return ControlFlow::Continue(());
+            }
+            let value = apply.value;
             // Race-safe apply gate: a stream may have started between the
             // lightbox opening and this apply (queued-message auto-starts).
             // Reject without ANY state/config mutation; otherwise reuse the

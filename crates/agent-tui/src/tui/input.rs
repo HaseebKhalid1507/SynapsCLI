@@ -27,7 +27,7 @@ pub(super) enum InputAction {
     /// Effort lightbox requested applying a reasoning level (string form).
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
-    EffortApply(String),
+    EffortApply(super::effort::EffortApply),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop

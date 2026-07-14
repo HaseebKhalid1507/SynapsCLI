@@ -7,25 +7,43 @@ use std::sync::{Mutex, OnceLock};
 
 use super::CatalogModel;
 
-static CACHE: OnceLock<Mutex<HashMap<String, CatalogModel>>> = OnceLock::new();
+static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<HashMap<String, CatalogModel>> {
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct Cache {
+    models: HashMap<String, CatalogModel>,
+    generation: u64,
+}
+
+fn cache() -> &'static Mutex<Cache> {
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+fn advance(cache: &mut Cache) {
+    cache.generation = cache.generation.saturating_add(1);
+}
+
+/// Current monotonic catalog generation. Every successful cache mutation
+/// advances it, allowing UI snapshots to reject stale capability decisions.
+pub fn generation() -> u64 {
+    cache().lock().map(|cache| cache.generation).unwrap_or(0)
 }
 
 /// Insert or overwrite an entry keyed by `model.runtime_id()`.
 pub fn insert(model: CatalogModel) {
-    if let Ok(mut map) = cache().lock() {
-        map.insert(model.runtime_id(), model);
+    if let Ok(mut cache) = cache().lock() {
+        cache.models.insert(model.runtime_id(), model);
+        advance(&mut cache);
     }
 }
 
 /// Bulk-populate from an incremental parsed catalog slice.
 pub fn populate(models: &[CatalogModel]) {
-    if let Ok(mut map) = cache().lock() {
+    if let Ok(mut cache) = cache().lock() {
         for m in models {
-            map.insert(m.runtime_id(), m.clone());
+            cache.models.insert(m.runtime_id(), m.clone());
         }
+        advance(&mut cache);
     }
 }
 
@@ -42,15 +60,18 @@ pub fn replace_provider(provider_key: &str, models: &[CatalogModel]) {
         .map(|model| (model.runtime_id(), model))
         .collect();
 
-    if let Ok(mut map) = cache().lock() {
-        map.retain(|runtime_id, _| !runtime_id.starts_with(&prefix));
-        map.extend(replacements);
+    if let Ok(mut cache) = cache().lock() {
+        cache
+            .models
+            .retain(|runtime_id, _| !runtime_id.starts_with(&prefix));
+        cache.models.extend(replacements);
+        advance(&mut cache);
     }
 }
 
 /// Look up by provider-qualified id (e.g. `"openai-codex/gpt-5.6-sol"`).
 pub fn get(runtime_id: &str) -> Option<CatalogModel> {
-    cache().lock().ok()?.get(runtime_id).cloned()
+    cache().lock().ok()?.models.get(runtime_id).cloned()
 }
 
 /// True if the cache has any entries for the given provider prefix.
@@ -60,7 +81,7 @@ pub fn has_provider(provider_key: &str) -> bool {
     cache()
         .lock()
         .ok()
-        .map(|m| m.keys().any(|k| k.starts_with(&prefix)))
+        .map(|m| m.models.keys().any(|k| k.starts_with(&prefix)))
         .unwrap_or(false)
 }
 

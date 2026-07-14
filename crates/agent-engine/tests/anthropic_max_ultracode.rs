@@ -93,7 +93,7 @@ fn special_modes_fail_closed_for_every_authority_near_miss() {
             ExecutionRole::Foreground,
             AnthropicPlanPrerequisites {
                 orchestration_policy: false,
-                builtin_lifecycle_tools: true,
+                ..installed()
             },
             None,
             AnthropicPlanErrorCode::UltraCodeRequiresOrchestration,
@@ -102,8 +102,8 @@ fn special_modes_fail_closed_for_every_authority_near_miss() {
             FABLE,
             ExecutionRole::Foreground,
             AnthropicPlanPrerequisites {
-                orchestration_policy: true,
-                builtin_lifecycle_tools: false,
+                lifecycle_start: false,
+                ..installed()
             },
             None,
             AnthropicPlanErrorCode::UltraCodeRequiresLifecycleTools,

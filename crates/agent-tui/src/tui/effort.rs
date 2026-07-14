@@ -24,11 +24,20 @@ use agent_core::reasoning::ReasoningLevel;
 use super::lightbox::lightbox_safe_area;
 use super::theme::THEME;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EffortApply {
+    pub model: String,
+    pub generation: u64,
+    pub value: String,
+}
+
 /// State of the `/effort` lightbox.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffortModalState {
     /// Exact provider-qualified model the options were derived for.
     pub model: String,
+    /// Capability snapshot used to derive the options.
+    pub generation: u64,
     /// Valid effort levels for `model`, in derivation order.
     pub options: Vec<String>,
     pub cursor: usize,
@@ -40,7 +49,7 @@ pub(crate) enum InputOutcome {
     /// Close without applying (Esc / q).
     Close,
     /// Apply the selected level string.
-    Apply(String),
+    Apply(EffortApply),
     None,
 }
 
@@ -52,6 +61,7 @@ impl EffortModalState {
         let cursor = options.iter().position(|o| o == current_level).unwrap_or(0);
         Self {
             model: model.to_string(),
+            generation: agent_engine::runtime::openai::catalog::capability_cache::generation(),
             options,
             cursor,
         }
@@ -77,7 +87,11 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         KeyCode::Enter => match state.options.get(state.cursor) {
-            Some(level) => InputOutcome::Apply(level.clone()),
+            Some(level) => InputOutcome::Apply(EffortApply {
+                model: state.model.clone(),
+                generation: state.generation,
+                value: level.clone(),
+            }),
             None => InputOutcome::None,
         },
         _ => InputOutcome::None,
@@ -204,7 +218,11 @@ mod tests {
         let mut state = EffortModalState::new("anthropic/claude-opus-4-7", "medium");
         assert_eq!(
             handle_event(&mut state, key(KeyCode::Enter)),
-            InputOutcome::Apply("medium".to_string())
+            InputOutcome::Apply(EffortApply {
+                model: "anthropic/claude-opus-4-7".into(),
+                generation: state.generation,
+                value: "medium".into(),
+            })
         );
         assert_eq!(
             handle_event(&mut state, key(KeyCode::Esc)),
