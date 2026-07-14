@@ -38,6 +38,7 @@ mod google_gemini;
 mod groq;
 mod nvidia;
 mod openrouter;
+pub mod validation;
 mod xai;
 
 pub use anthropic::{

@@ -584,28 +584,16 @@ impl Runtime {
             })
             .unwrap_or(trimmed);
         self.model = cleaned.to_owned();
-        // For Codex models: apply the model's default reasoning level from
-        // capability metadata unless the user has explicitly chosen a level
-        // (explicit_reasoning is true — set via command, config, or explicit
-        // session restore). Derived/default levels (named_level only, no
-        // explicit flag) are overwritten by the new model's default.
+        // Apply the new model's default reasoning level from exact capability
+        // metadata (Codex catalog default, xAI documented default/Adaptive)
+        // unless the user has explicitly chosen a level (explicit_reasoning is
+        // true — set via command, config, or explicit session restore).
+        // Derived/default levels are overwritten by the new model's default.
         if !self.explicit_reasoning {
-            if let Some(model_id) = cleaned.strip_prefix("openai-codex/") {
-                use crate::runtime::openai::catalog::{
-                    capability_cache, codex_static_capability, ReasoningSupport,
-                };
-                let default_level =
-                    capability_cache::get(cleaned).and_then(|m| match m.reasoning {
-                        ReasoningSupport::CodexNamed { default_level, .. } => default_level,
-                        _ => None,
-                    })
-                    .or_else(|| match codex_static_capability(model_id)? {
-                        ReasoningSupport::CodexNamed { default_level, .. } => default_level,
-                        _ => None,
-                    });
-                if let Some(level) = default_level {
-                    self.set_reasoning_level(level);
-                }
+            if let Some(level) =
+                crate::runtime::openai::catalog::validation::default_level_for_model(cleaned)
+            {
+                self.set_reasoning_level(level);
             }
         }
     }
@@ -642,7 +630,9 @@ impl Runtime {
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
         // Sync named_level from budget so the two fields stay consistent.
-        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
+            budget,
+        ));
         // Config/restore path — not an explicit user choice.
         self.explicit_reasoning = false;
     }
@@ -676,7 +666,9 @@ impl Runtime {
     /// Sets `explicit_reasoning = true`.
     pub fn set_thinking_budget_explicit(&mut self, budget: u32) {
         self.thinking_budget = budget;
-        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget));
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
+            budget,
+        ));
         self.explicit_reasoning = true;
     }
 
@@ -690,53 +682,18 @@ impl Runtime {
         self.thinking_budget
     }
 
-    /// Validate `level` against the current model's capability metadata (cache
-    /// then static), then apply it. Returns `Err(user-facing message)` and
-    /// leaves runtime state unchanged if the level is unsupported.
+    /// Validate `level` against the current model's capability metadata via
+    /// the shared per-provider validator (cache then exact static tables),
+    /// then apply it. Returns `Err(user-facing message)` and leaves runtime
+    /// state unchanged if the level is unsupported.
     pub fn set_reasoning_level_checked(
         &mut self,
         level: agent_core::reasoning::ReasoningLevel,
     ) -> std::result::Result<(), String> {
-        use crate::runtime::openai::catalog::{
-            capability_cache, codex_static_capability, ReasoningSupport,
-        };
-        let model = self.model.as_str();
-        if let Some(model_id) = model.strip_prefix("openai-codex/") {
-            // These client modes omit the provider effort field.
-            if matches!(
-                level,
-                agent_core::reasoning::ReasoningLevel::Off
-                    | agent_core::reasoning::ReasoningLevel::Adaptive
-            ) {
-                self.set_reasoning_level_explicit(level);
-                return Ok(());
-            }
-            let supported: Option<Vec<agent_core::reasoning::ReasoningLevel>> =
-                capability_cache::get(model)
-                    .and_then(|m| match m.reasoning {
-                        ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-                        _ => None,
-                    })
-                    .or_else(|| match codex_static_capability(model_id)? {
-                        ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-                        _ => None,
-                    });
-            if let Some(ref levels) = supported {
-                if !levels.contains(&level) {
-                    return Err(format!(
-                        "reasoning level '{}' is not supported by {}; supported: [{}]",
-                        level,
-                        model,
-                        levels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-            }
-        } else if level.requires_codex_support() {
-            return Err(format!(
-                "reasoning level '{}' requires authoritative exact-model capability metadata; {} has none",
-                level, model
-            ));
-        }
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+            &self.model,
+            level,
+        )?;
         self.set_reasoning_level_explicit(level);
         Ok(())
     }
@@ -1844,10 +1801,16 @@ mod set_reasoning_level_checked_tests {
     fn checked_rejects_ultra_for_luna_no_mutation() {
         let mut rt = codex_runtime("gpt-5.6-luna");
         let before = rt.reasoning_level();
-        let err = rt.set_reasoning_level_checked(ReasoningLevel::Ultra).unwrap_err();
-        assert!(err.contains("ultra"), "error must name the rejected level; got: {err}");
+        let err = rt
+            .set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .unwrap_err();
+        assert!(
+            err.contains("ultra"),
+            "error must name the rejected level; got: {err}"
+        );
         assert_eq!(
-            rt.reasoning_level(), before,
+            rt.reasoning_level(),
+            before,
             "runtime must not be mutated when validation fails"
         );
     }
@@ -1857,8 +1820,13 @@ mod set_reasoning_level_checked_tests {
     fn checked_rejects_max_for_gpt55_no_mutation() {
         let mut rt = codex_runtime("gpt-5.5");
         rt.set_reasoning_level(ReasoningLevel::Medium);
-        let err = rt.set_reasoning_level_checked(ReasoningLevel::Max).unwrap_err();
-        assert!(err.contains("max"), "error must name the rejected level; got: {err}");
+        let err = rt
+            .set_reasoning_level_checked(ReasoningLevel::Max)
+            .unwrap_err();
+        assert!(
+            err.contains("max"),
+            "error must name the rejected level; got: {err}"
+        );
         assert_eq!(rt.reasoning_level(), ReasoningLevel::Medium);
     }
 
@@ -1881,5 +1849,69 @@ mod set_reasoning_level_checked_tests {
             assert!(rt.set_reasoning_level_checked(level).is_err());
             assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
         }
+    }
+
+    /// Gap fix: unknown Codex ids (no cache, no static metadata) must reject
+    /// the extended Max/Ultra modes at mutation time, fail closed.
+    #[test]
+    fn checked_rejects_max_ultra_for_unknown_codex_model() {
+        let mut rt = codex_runtime("gpt-unknown-future");
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+            let err = rt.set_reasoning_level_checked(level).unwrap_err();
+            assert!(err.contains("no capability metadata"), "{err}");
+            assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+        }
+    }
+
+    /// xAI: Off is rejected (not silently omitted) on models whose reasoning
+    /// cannot be disabled; unsupported named efforts are rejected exactly.
+    #[test]
+    fn checked_enforces_xai_capability_matrix_no_mutation_on_err() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        // Model default (not explicit) applied on switch: documented high.
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        for level in [
+            ReasoningLevel::Off,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Ultra,
+        ] {
+            let before = rt.reasoning_level();
+            assert!(rt.set_reasoning_level_checked(level).is_err(), "{level}");
+            assert_eq!(rt.reasoning_level(), before);
+        }
+        rt.set_reasoning_level_checked(ReasoningLevel::Low)
+            .expect("grok-4.5 supports low");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+    }
+
+    /// xAI models without documented effort control reject explicit named
+    /// levels; model switch applies the Adaptive provider-default.
+    #[test]
+    fn checked_rejects_named_on_intrinsic_xai_model_and_defaults_adaptive() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.3".to_string());
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Adaptive);
+        assert!(rt
+            .set_reasoning_level_checked(ReasoningLevel::Medium)
+            .is_err());
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Adaptive);
+        rt.set_reasoning_level_checked(ReasoningLevel::Adaptive)
+            .unwrap();
+    }
+
+    /// Explicit user choice survives an xAI model switch (no default overwrite).
+    #[test]
+    fn explicit_level_survives_xai_model_switch() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        rt.set_reasoning_level_checked(ReasoningLevel::Low).unwrap();
+        rt.set_model("xai-auth/grok-4.5-latest".to_string());
+        assert_eq!(
+            rt.reasoning_level(),
+            ReasoningLevel::Low,
+            "explicit level must not be overwritten by the model default"
+        );
     }
 }

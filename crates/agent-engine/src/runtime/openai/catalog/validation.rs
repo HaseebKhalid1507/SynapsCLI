@@ -1,0 +1,438 @@
+//! Shared mutation-time reasoning validation and dynamic option derivation.
+//!
+//! Single source of truth for "may this provider-qualified model accept this
+//! `ReasoningLevel`?" — used by `Runtime::set_reasoning_level_checked` (slash
+//! commands, settings) and by dynamic TUI option derivation. Capability data
+//! comes from the process-local capability cache (live catalogs) first, then
+//! the exact static descriptor tables. No model-name substring inference:
+//! dispatch keys on the provider-qualified id prefix only (bare `claude-*`
+//! ids are Anthropic routing parity with `resolve_route`).
+
+use agent_core::reasoning::ReasoningLevel;
+
+use super::{
+    anthropic_static_capability, capability_cache, codex_static_capability, xai_static_capability,
+    ReasoningSupport, XaiReasoningCapability,
+};
+
+/// Conservative option set for providers without authoritative exact-model
+/// metadata. Never includes max/ultra.
+const CONSERVATIVE_OPTIONS: &[&str] = &["off", "adaptive", "low", "medium", "high", "xhigh"];
+
+fn anthropic_model_id(model: &str) -> Option<&str> {
+    model
+        .strip_prefix("anthropic/")
+        .or_else(|| model.starts_with("claude-").then_some(model))
+}
+
+fn unsupported_msg(level: ReasoningLevel, model: &str, supported: &[ReasoningLevel]) -> String {
+    format!(
+        "reasoning level '{level}' is not supported by {model}; supported: [{}]",
+        supported
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn codex_supported_levels(model: &str, model_id: &str) -> Option<Vec<ReasoningLevel>> {
+    capability_cache::get(model)
+        .and_then(|m| match m.reasoning {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        })
+        .or_else(|| match codex_static_capability(model_id)? {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        })
+}
+
+fn anthropic_capability(model_id: &str) -> Option<ReasoningSupport> {
+    capability_cache::get(&format!("anthropic/{model_id}"))
+        .map(|m| m.reasoning)
+        .or_else(|| anthropic_static_capability(model_id))
+}
+
+/// Validate `level` for the provider-qualified `model` at mutation time
+/// (command/settings). `Err` carries a user-facing message; callers must not
+/// mutate state or persist config on `Err`.
+pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result<(), String> {
+    if let Some(model_id) = model.strip_prefix("openai-codex/") {
+        // Off/Adaptive omit the provider effort field on the Codex wire.
+        if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
+            return Ok(());
+        }
+        return match codex_supported_levels(model, model_id) {
+            Some(levels) if levels.contains(&level) => Ok(()),
+            Some(levels) => Err(unsupported_msg(level, model, &levels)),
+            // Unknown Codex model: metadata absence never authorizes the
+            // extended max/ultra modes (fail closed).
+            None if level.requires_codex_support() => Err(format!(
+                "no capability metadata for {model}; cannot authorize level '{level}'"
+            )),
+            None => Ok(()),
+        };
+    }
+    if let Some(model_id) = model.strip_prefix("xai-auth/") {
+        // Adaptive = provider default (omit `reasoning`) — always expressible.
+        if level == ReasoningLevel::Adaptive {
+            return Ok(());
+        }
+        return match xai_static_capability(model_id) {
+            Some(XaiReasoningCapability::Effort {
+                supported,
+                can_disable,
+                ..
+            }) => match level {
+                ReasoningLevel::Off if can_disable => Ok(()),
+                ReasoningLevel::Off => Err(format!(
+                    "reasoning cannot be disabled on {model}; use adaptive or a supported effort"
+                )),
+                l if supported.contains(&l) => Ok(()),
+                l => Err(unsupported_msg(l, model, supported)),
+            },
+            Some(XaiReasoningCapability::IntrinsicReasoning) => match level {
+                ReasoningLevel::Off => Err(format!(
+                    "{model} has no documented way to disable reasoning; use adaptive"
+                )),
+                l => Err(format!(
+                    "{model} has no documented effort control; level '{l}' cannot be sent — use adaptive"
+                )),
+            },
+            Some(XaiReasoningCapability::NonReasoning) => match level {
+                ReasoningLevel::Off => Ok(()),
+                l => Err(format!(
+                    "{model} is a non-reasoning model; level '{l}' is not supported"
+                )),
+            },
+            None => Err(format!(
+                "no capability metadata for {model}; cannot authorize level '{level}'"
+            )),
+        };
+    }
+    if let Some(model_id) = anthropic_model_id(model) {
+        if level.requires_codex_support() {
+            return Err(format!(
+                "reasoning level '{level}' requires authoritative exact-model capability metadata; {model} has none"
+            ));
+        }
+        // Live catalog evidence that thinking is unsupported fails closed for
+        // named levels; Off/Adaptive stay expressible (field omission).
+        if matches!(anthropic_capability(model_id), Some(ReasoningSupport::None))
+            && !matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive)
+        {
+            return Err(format!(
+                "{model} does not support extended thinking; level '{level}' is not available"
+            ));
+        }
+        return Ok(());
+    }
+    // Other providers: only the Codex-extended modes are gated.
+    if level.requires_codex_support() {
+        return Err(format!(
+            "reasoning level '{level}' requires authoritative exact-model capability metadata; {model} has none"
+        ));
+    }
+    Ok(())
+}
+
+/// Model-default reasoning level applied on model switch when the user has
+/// not explicitly chosen a level. `None` = leave the current level untouched.
+pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
+    if let Some(model_id) = model.strip_prefix("openai-codex/") {
+        return capability_cache::get(model)
+            .and_then(|m| match m.reasoning {
+                ReasoningSupport::CodexNamed { default_level, .. } => default_level,
+                _ => None,
+            })
+            .or_else(|| match codex_static_capability(model_id)? {
+                ReasoningSupport::CodexNamed { default_level, .. } => default_level,
+                _ => None,
+            });
+    }
+    if let Some(model_id) = model.strip_prefix("xai-auth/") {
+        return Some(match xai_static_capability(model_id) {
+            Some(XaiReasoningCapability::Effort {
+                default_level: Some(level),
+                ..
+            }) => level,
+            // No documented default / no effort control / unknown id →
+            // provider default via field omission.
+            _ => ReasoningLevel::Adaptive,
+        });
+    }
+    None
+}
+
+/// Dynamic thinking options for the settings UI, derived from exact
+/// catalog/static capabilities for the provider-qualified model id.
+pub fn thinking_options_for_model(model: &str) -> Vec<String> {
+    let owned = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if let Some(model_id) = model.strip_prefix("openai-codex/") {
+        if let Some(levels) = codex_supported_levels(model, model_id) {
+            let mut opts = vec!["off".to_string(), "adaptive".to_string()];
+            opts.extend(levels.iter().map(|l| l.as_str().to_string()));
+            return opts;
+        }
+        return owned(CONSERVATIVE_OPTIONS);
+    }
+    if let Some(model_id) = model.strip_prefix("xai-auth/") {
+        return match xai_static_capability(model_id) {
+            Some(XaiReasoningCapability::Effort {
+                supported,
+                can_disable,
+                ..
+            }) => {
+                let mut opts = Vec::new();
+                if can_disable {
+                    opts.push("off".to_string());
+                }
+                opts.push("adaptive".to_string());
+                opts.extend(supported.iter().map(|l| l.as_str().to_string()));
+                opts
+            }
+            Some(XaiReasoningCapability::NonReasoning) => owned(&["off", "adaptive"]),
+            // Intrinsic reasoning without effort control, or unknown id:
+            // only the provider default is expressible.
+            _ => owned(&["adaptive"]),
+        };
+    }
+    if let Some(model_id) = anthropic_model_id(model) {
+        return match anthropic_capability(model_id) {
+            // Thinking-capable (adaptive effort or legacy budget tiers).
+            Some(ReasoningSupport::AnthropicAdaptive { .. }) => owned(CONSERVATIVE_OPTIONS),
+            // Explicit evidence of no thinking support.
+            Some(ReasoningSupport::None) => owned(&["off", "adaptive"]),
+            _ => owned(CONSERVATIVE_OPTIONS),
+        };
+    }
+    owned(CONSERVATIVE_OPTIONS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ReasoningLevel::*;
+
+    // ── xAI mutation matrix ──────────────────────────────────────────────────
+
+    #[test]
+    fn xai_45_accepts_exact_efforts_and_rejects_off_xhigh_max_ultra() {
+        for model in ["xai-auth/grok-4.5", "xai-auth/grok-4.5-latest"] {
+            for level in [Adaptive, Low, Medium, High] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_ok(),
+                    "{model} {level}"
+                );
+            }
+            for level in [Off, XHigh, Max, Ultra] {
+                let err = validate_reasoning_mutation(model, level).unwrap_err();
+                assert!(err.contains(model), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn xai_multi_agent_accepts_xhigh_but_not_off() {
+        let model = "xai-auth/grok-4.20-multi-agent-0309";
+        for level in [Adaptive, Low, Medium, High, XHigh] {
+            assert!(validate_reasoning_mutation(model, level).is_ok(), "{level}");
+        }
+        for level in [Off, Max, Ultra] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_err(),
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_intrinsic_reasoning_rejects_named_and_off_accepts_adaptive() {
+        for id in [
+            "grok-4.3",
+            "grok-4.3-latest",
+            "grok-latest",
+            "grok-4.20-0309-reasoning",
+        ] {
+            let model = format!("xai-auth/{id}");
+            assert!(validate_reasoning_mutation(&model, Adaptive).is_ok());
+            for level in [Off, Low, Medium, High, XHigh, Max, Ultra] {
+                assert!(
+                    validate_reasoning_mutation(&model, level).is_err(),
+                    "{model} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xai_non_reasoning_rejects_named_accepts_off_adaptive() {
+        let model = "xai-auth/grok-4.20-0309-non-reasoning";
+        assert!(validate_reasoning_mutation(model, Off).is_ok());
+        assert!(validate_reasoning_mutation(model, Adaptive).is_ok());
+        for level in [Low, Medium, High, XHigh, Max, Ultra] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_err(),
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_unknown_id_fails_closed_except_adaptive() {
+        let model = "xai-auth/grok-9000";
+        assert!(validate_reasoning_mutation(model, Adaptive).is_ok());
+        for level in [Off, Low, Medium, High, XHigh, Max, Ultra] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_err(),
+                "{level}"
+            );
+        }
+    }
+
+    // ── Codex gap fix ────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_codex_model_rejects_max_and_ultra_at_mutation_time() {
+        for level in [Max, Ultra] {
+            let err =
+                validate_reasoning_mutation("openai-codex/gpt-unknown-future", level).unwrap_err();
+            assert!(err.contains("no capability metadata"), "{err}");
+        }
+        // Non-extended named levels remain permissive without metadata.
+        for level in [Off, Adaptive, Low, Medium, High, XHigh] {
+            assert!(
+                validate_reasoning_mutation("openai-codex/gpt-unknown-future", level).is_ok(),
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_codex_model_membership_still_enforced() {
+        assert!(validate_reasoning_mutation("openai-codex/gpt-5.6-sol", Ultra).is_ok());
+        assert!(validate_reasoning_mutation("openai-codex/gpt-5.5", Ultra).is_err());
+    }
+
+    // ── Anthropic ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_accepts_budget_expressible_levels_and_rejects_extended() {
+        for model in ["anthropic/claude-opus-4-7", "claude-sonnet-4-6"] {
+            for level in [Off, Adaptive, Low, Medium, High, XHigh] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_ok(),
+                    "{model} {level}"
+                );
+            }
+            for level in [Max, Ultra] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_err(),
+                    "{model} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_live_no_thinking_evidence_rejects_named() {
+        let mut m = super::super::CatalogModel::new(
+            "anthropic",
+            "Anthropic",
+            "claude-test-validation-nothink",
+        )
+        .unwrap();
+        m.provider_kind = super::super::CatalogProviderKind::Anthropic;
+        m.reasoning = ReasoningSupport::None;
+        m.source = super::super::CatalogSource::Live;
+        capability_cache::insert(m);
+        let model = "anthropic/claude-test-validation-nothink";
+        for level in [Off, Adaptive] {
+            assert!(validate_reasoning_mutation(model, level).is_ok(), "{level}");
+        }
+        for level in [Low, Medium, High, XHigh] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_err(),
+                "{level}"
+            );
+        }
+    }
+
+    // ── Defaults ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_levels_come_from_exact_descriptors() {
+        assert_eq!(default_level_for_model("xai-auth/grok-4.5"), Some(High));
+        assert_eq!(
+            default_level_for_model("xai-auth/grok-4.5-latest"),
+            Some(High)
+        );
+        assert_eq!(
+            default_level_for_model("xai-auth/grok-4.20-multi-agent-0309"),
+            Some(Adaptive)
+        );
+        assert_eq!(default_level_for_model("xai-auth/grok-4.3"), Some(Adaptive));
+        assert_eq!(
+            default_level_for_model("xai-auth/grok-4.20-0309-non-reasoning"),
+            Some(Adaptive)
+        );
+        assert_eq!(default_level_for_model("anthropic/claude-opus-4-7"), None);
+        assert_eq!(
+            default_level_for_model("openai-codex/gpt-5.3-codex-spark"),
+            Some(High)
+        );
+    }
+
+    // ── Dynamic options ──────────────────────────────────────────────────────
+
+    #[test]
+    fn xai_options_derive_from_exact_capabilities() {
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.5"),
+            vec!["adaptive", "low", "medium", "high"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-multi-agent-0309"),
+            vec!["adaptive", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.3"),
+            vec!["adaptive"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-0309-non-reasoning"),
+            vec!["off", "adaptive"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-9000"),
+            vec!["adaptive"]
+        );
+    }
+
+    #[test]
+    fn anthropic_options_derive_from_capabilities() {
+        assert_eq!(
+            thinking_options_for_model("anthropic/claude-opus-4-7"),
+            vec!["off", "adaptive", "low", "medium", "high", "xhigh"]
+        );
+        // Fixed-budget models keep the budget-tier set.
+        assert_eq!(
+            thinking_options_for_model("claude-sonnet-4-6"),
+            vec!["off", "adaptive", "low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn options_never_advertise_max_ultra_off_codex() {
+        for model in [
+            "anthropic/claude-opus-4-7",
+            "xai-auth/grok-4.5",
+            "groq/llama-3.3-70b-versatile",
+        ] {
+            let opts = thinking_options_for_model(model);
+            assert!(!opts.contains(&"max".to_string()), "{model}");
+            assert!(!opts.contains(&"ultra".to_string()), "{model}");
+        }
+    }
+}

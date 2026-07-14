@@ -267,7 +267,12 @@ pub fn validate_codex_level(
             "no capability metadata for openai-codex/{model_id}; \
              cannot authorize level '{level}'"
         )),
-        _ => unreachable!(),
+        // Non-CodexNamed capability shapes carry no named-level evidence:
+        // fail closed rather than assume support.
+        Some(_) => Err(format!(
+            "no named-level capability metadata for openai-codex/{model_id}; \
+             cannot authorize level '{level}'"
+        )),
     }
 }
 
