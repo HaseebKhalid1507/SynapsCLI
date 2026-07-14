@@ -6,6 +6,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
+      "multi_agent_version": "v2",
       "priority": 1,
       "supported_reasoning_levels": [
         {"effort": "low"},
@@ -23,6 +24,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
+      "multi_agent_version": "v2",
       "priority": 2,
       "supported_reasoning_levels": [
         {"effort": "low"},
@@ -40,6 +42,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
+      "multi_agent_version": "v1",
       "priority": 3,
       "supported_reasoning_levels": [
         {"effort": "low"},

@@ -311,6 +311,14 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
+fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) {
+    if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(thinking_level) {
+        runtime.set_reasoning_level_explicit(level);
+    } else if let Some(budget) = synaps_cli::models::budget_for_thinking_level(thinking_level) {
+        runtime.set_thinking_budget_explicit(budget);
+    }
+}
+
 /// Handle a slash command when NOT streaming.
 pub(super) async fn handle_command(
     cmd: &str,
@@ -568,17 +576,9 @@ pub(super) async fn handle_command(
                 match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
-                        // Restore the session's named reasoning level so
-                        // max/ultra/off are not lost on resume.
-                        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(
-                            &session.thinking_level,
-                        ) {
-                            runtime.set_reasoning_level(level);
-                        } else if let Some(budget) =
-                            synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
-                        {
-                            runtime.set_thinking_budget(budget);
-                        }
+                        // A resumed session owns its saved choice. Preserve that
+                        // explicit provenance across later model switches.
+                        restore_session_reasoning(runtime, &session.thinking_level);
                         if let Some(ref sp) = session.system_prompt {
                             runtime.set_system_prompt(sp.clone());
                         }
@@ -1182,7 +1182,7 @@ mod tests {
     use super::{
         build_stats_receipt, edit_distance, execute_command_action,
         execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix,
-        CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction,
+        restore_session_reasoning, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction,
     };
     use crate::tui::app::ChatMessage;
     use async_trait::async_trait;
@@ -2069,5 +2069,25 @@ mod tests {
         assert!(receipt.contains("saved:"), "missing savings line");
         assert!(receipt.contains("5m:"), "missing 5m split");
         assert!(receipt.contains("1h:"), "missing 1h split");
+    }
+
+    #[tokio::test]
+    async fn resume_restores_ultra_with_explicit_provenance() {
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_model("openai-codex/gpt-5.6-sol".to_string());
+
+        restore_session_reasoning(&mut runtime, "ultra");
+
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::Ultra
+        );
+        assert!(runtime.is_reasoning_explicit());
+        runtime.set_model("openai-codex/gpt-5.6-terra".to_string());
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::Ultra,
+            "restored explicit Ultra must survive model switches"
+        );
     }
 }

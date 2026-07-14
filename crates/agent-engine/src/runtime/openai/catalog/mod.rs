@@ -47,7 +47,9 @@ pub use anthropic::{
 };
 pub use codex::{
     codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
-    parse_codex_catalog_models, validate_codex_level, PROVIDER_KEY as CODEX_PROVIDER_KEY,
+    parse_codex_catalog_models, plan_codex_execution, validate_codex_level, CodexCapabilitySource,
+    CodexExecutionMode, CodexExecutionPlan, CodexMultiAgentMode, CodexPlanError,
+    CodexPlanErrorCode, CodexRequestRole, CodexWireEffort, PROVIDER_KEY as CODEX_PROVIDER_KEY,
     PROVIDER_NAME as CODEX_PROVIDER_NAME,
 };
 pub use generic::parse_generic_catalog_models;
@@ -125,6 +127,27 @@ impl PricingSummary {
 
 // ─── ReasoningSupport ─────────────────────────────────────────────────────────
 
+/// Multi-agent protocol version advertised by the exact OpenAI Codex model.
+///
+/// Unknown server strings are retained only as this sanitized sentinel; raw
+/// catalog values never enter diagnostics or authorization decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexMultiAgentVersion {
+    V1,
+    V2,
+    Unknown,
+}
+
+impl CodexMultiAgentVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Normalized reasoning/thinking capability for a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReasoningSupport {
@@ -152,6 +175,8 @@ pub enum ReasoningSupport {
         supported: Vec<agent_core::reasoning::ReasoningLevel>,
         /// Default level from catalog's `default_reasoning_level`, if present.
         default_level: Option<agent_core::reasoning::ReasoningLevel>,
+        /// Exact model's collaboration protocol. Ultra requires V2.
+        multi_agent_version: Option<CodexMultiAgentVersion>,
     },
     /// Not yet classified.
     Unknown,
@@ -255,6 +280,18 @@ impl CatalogModel {
     pub fn codex_supported_levels(&self) -> Option<&[agent_core::reasoning::ReasoningLevel]> {
         match &self.reasoning {
             ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        }
+    }
+
+    /// Exact Codex collaboration protocol, if the authoritative capability
+    /// record advertised one.
+    pub fn codex_multi_agent_version(&self) -> Option<CodexMultiAgentVersion> {
+        match &self.reasoning {
+            ReasoningSupport::CodexNamed {
+                multi_agent_version,
+                ..
+            } => *multi_agent_version,
             _ => None,
         }
     }

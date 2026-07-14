@@ -24,17 +24,34 @@ pub const MODELS_PATH: &str = "/models";
 /// Used when live catalog data is unavailable.
 pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     use ReasoningLevel::*;
-    let (supported, default_level): (&[ReasoningLevel], ReasoningLevel) = match model_id {
-        "gpt-5.6-sol" => (&[Low, Medium, High, XHigh, Max, Ultra], Low),
-        "gpt-5.6-terra" => (&[Low, Medium, High, XHigh, Max, Ultra], Medium),
-        "gpt-5.6-luna" => (&[Low, Medium, High, XHigh, Max], Medium),
-        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" => (&[Low, Medium, High, XHigh], Medium),
-        "gpt-5.3-codex-spark" => (&[Low, Medium, High, XHigh], High),
+    let (supported, default_level, multi_agent_version): (
+        &[ReasoningLevel],
+        ReasoningLevel,
+        Option<CodexMultiAgentVersion>,
+    ) = match model_id {
+        "gpt-5.6-sol" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Low,
+            Some(CodexMultiAgentVersion::V2),
+        ),
+        "gpt-5.6-terra" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Medium,
+            Some(CodexMultiAgentVersion::V2),
+        ),
+        "gpt-5.6-luna" => (
+            &[Low, Medium, High, XHigh, Max],
+            Medium,
+            Some(CodexMultiAgentVersion::V1),
+        ),
+        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" => (&[Low, Medium, High, XHigh], Medium, None),
+        "gpt-5.3-codex-spark" => (&[Low, Medium, High, XHigh], High, None),
         _ => return None,
     };
     Some(ReasoningSupport::CodexNamed {
         supported: supported.to_vec(),
         default_level: Some(default_level),
+        multi_agent_version,
     })
 }
 
@@ -97,9 +114,11 @@ struct CodexModelItem {
     context_window: Option<u64>,
     /// Live catalog reasoning metadata.
     #[serde(default)]
-    supported_reasoning_levels: Vec<CodexReasoningLevelItem>,
+    supported_reasoning_levels: Option<Vec<CodexReasoningLevelItem>>,
     #[serde(default)]
     default_reasoning_level: Option<String>,
+    #[serde(default)]
+    multi_agent_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,20 +166,43 @@ fn parse_default_level(s: Option<&str>) -> Option<ReasoningLevel> {
     s.and_then(ReasoningLevel::parse)
 }
 
+fn parse_multi_agent_version(s: Option<&str>) -> Option<CodexMultiAgentVersion> {
+    s.map(|version| match version {
+        "v1" => CodexMultiAgentVersion::V1,
+        "v2" => CodexMultiAgentVersion::V2,
+        _ => CodexMultiAgentVersion::Unknown,
+    })
+}
+
 /// Build a `ReasoningSupport` for a parsed Codex model item.
 /// Falls back to static capability data when the live response omits the fields.
 fn codex_reasoning_support(item: &CodexModelItem) -> ReasoningSupport {
-    let supported = parse_reasoning_levels(&item.supported_reasoning_levels);
     let default_level = parse_default_level(item.default_reasoning_level.as_deref());
+    let multi_agent_version = parse_multi_agent_version(item.multi_agent_version.as_deref());
 
-    if !supported.is_empty() {
+    if let Some(items) = item.supported_reasoning_levels.as_deref() {
         return ReasoningSupport::CodexNamed {
-            supported,
+            supported: parse_reasoning_levels(items),
             default_level,
+            multi_agent_version,
         };
     }
-    // Live response didn't include reasoning levels — fall back to static.
-    codex_static_capability(&item.slug).unwrap_or(ReasoningSupport::Unknown)
+    // A live row may omit reasoning levels, so retain the existing static
+    // level fallback. Never backfill the live row's collaboration version:
+    // missing live V2 evidence must not authorize Ultra.
+    match codex_static_capability(&item.slug) {
+        Some(ReasoningSupport::CodexNamed {
+            supported,
+            default_level: static_default,
+            ..
+        }) => ReasoningSupport::CodexNamed {
+            supported,
+            default_level: default_level.or(static_default),
+            multi_agent_version,
+        },
+        Some(other) => other,
+        None => ReasoningSupport::Unknown,
+    }
 }
 
 // ─── Parser ───────────────────────────────────────────────────────────────────
@@ -194,6 +236,365 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
     Ok(models)
 }
 
+// ─── Typed request planning ───────────────────────────────────────────────────
+
+/// Reasoning values accepted by the Codex Responses request wire.
+/// Logical Ultra is deliberately absent and must be lowered by the planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexWireEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl CodexWireEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexExecutionMode {
+    Standard,
+    Max,
+    Ultra,
+}
+
+impl CodexExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexMultiAgentMode {
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+impl CodexMultiAgentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitRequestOnly => "explicit_request_only",
+            Self::Proactive => "proactive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexRequestRole {
+    #[default]
+    Foreground,
+    Worker,
+    Internal,
+}
+
+impl CodexRequestRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Worker => "worker",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexCapabilitySource {
+    Live,
+    Static,
+}
+
+impl CodexCapabilitySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Static => "static",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexPlanErrorCode {
+    InvalidProviderIdentity,
+    CapabilityMetadataMissing,
+    UnsupportedReasoningLevel,
+    UltraRequiresMultiAgentV2,
+}
+
+impl CodexPlanErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidProviderIdentity => "invalid_provider_identity",
+            Self::CapabilityMetadataMissing => "capability_metadata_missing",
+            Self::UnsupportedReasoningLevel => "unsupported_reasoning_level",
+            Self::UltraRequiresMultiAgentV2 => "ultra_requires_multi_agent_v2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPlanError {
+    code: CodexPlanErrorCode,
+    message: String,
+}
+
+impl CodexPlanError {
+    fn new(code: CodexPlanErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> CodexPlanErrorCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for CodexPlanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodexPlanError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexExecutionPlan {
+    pub qualified_model: String,
+    pub selected_level: ReasoningLevel,
+    pub mode: CodexExecutionMode,
+    pub wire_effort: Option<CodexWireEffort>,
+    pub multi_agent_version: Option<CodexMultiAgentVersion>,
+    pub multi_agent_mode: Option<CodexMultiAgentMode>,
+    pub request_role: CodexRequestRole,
+    pub capability_source: Option<CodexCapabilitySource>,
+}
+
+impl CodexExecutionPlan {
+    pub fn automatic_delegation(&self) -> bool {
+        self.multi_agent_mode == Some(CodexMultiAgentMode::Proactive)
+    }
+
+    pub fn wire_effort_label(&self) -> &'static str {
+        self.wire_effort.map_or("omitted", CodexWireEffort::as_str)
+    }
+
+    pub fn multi_agent_version_label(&self) -> &'static str {
+        self.multi_agent_version
+            .map_or("missing", CodexMultiAgentVersion::as_str)
+    }
+
+    pub fn multi_agent_mode_label(&self) -> &'static str {
+        self.multi_agent_mode
+            .map_or("disabled", CodexMultiAgentMode::as_str)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodexCapabilitySnapshot {
+    supported: Vec<ReasoningLevel>,
+    multi_agent_version: Option<CodexMultiAgentVersion>,
+    source: CodexCapabilitySource,
+}
+
+fn snapshot_from_model(
+    model: &CatalogModel,
+    source: CodexCapabilitySource,
+) -> Option<CodexCapabilitySnapshot> {
+    match &model.reasoning {
+        ReasoningSupport::CodexNamed {
+            supported,
+            multi_agent_version,
+            ..
+        } => Some(CodexCapabilitySnapshot {
+            supported: supported.clone(),
+            multi_agent_version: *multi_agent_version,
+            source,
+        }),
+        _ => None,
+    }
+}
+
+fn authoritative_source(
+    model: &CatalogModel,
+    qualified_model: &str,
+) -> Result<CodexCapabilitySource, CodexPlanError> {
+    match model.source {
+        CatalogSource::Live => Ok(CodexCapabilitySource::Live),
+        CatalogSource::StaticFallback => Ok(CodexCapabilitySource::Static),
+        CatalogSource::StaticWithLive | CatalogSource::Inferred => Err(CodexPlanError::new(
+            CodexPlanErrorCode::CapabilityMetadataMissing,
+            format!(
+                "authoritative exact-model capability metadata is unavailable for {qualified_model}"
+            ),
+        )),
+    }
+}
+
+fn authoritative_capability(
+    qualified_model: &str,
+    model_id: &str,
+    catalog_model: Option<&CatalogModel>,
+) -> Result<Option<CodexCapabilitySnapshot>, CodexPlanError> {
+    if let Some(model) = catalog_model {
+        if model.runtime_id() != qualified_model
+            || model.provider_kind != CatalogProviderKind::OpenAiCodex
+        {
+            return Err(CodexPlanError::new(
+                CodexPlanErrorCode::InvalidProviderIdentity,
+                format!("catalog identity does not match exact Codex model {qualified_model}"),
+            ));
+        }
+        let source = authoritative_source(model, qualified_model)?;
+        return Ok(snapshot_from_model(model, source));
+    }
+
+    // A present live row is authoritative even when it lacks usable Codex
+    // metadata. Never mix that absence with a static V2 fallback.
+    if let Some(model) = super::capability_cache::get(qualified_model) {
+        if model.runtime_id() != qualified_model
+            || model.provider_kind != CatalogProviderKind::OpenAiCodex
+        {
+            return Err(CodexPlanError::new(
+                CodexPlanErrorCode::InvalidProviderIdentity,
+                format!(
+                    "cached catalog identity does not match exact Codex model {qualified_model}"
+                ),
+            ));
+        }
+        let source = authoritative_source(&model, qualified_model)?;
+        return Ok(snapshot_from_model(&model, source));
+    }
+
+    Ok(match codex_static_capability(model_id) {
+        Some(ReasoningSupport::CodexNamed {
+            supported,
+            multi_agent_version,
+            ..
+        }) => Some(CodexCapabilitySnapshot {
+            supported,
+            multi_agent_version,
+            source: CodexCapabilitySource::Static,
+        }),
+        _ => None,
+    })
+}
+
+/// Derive the exact Codex request contract from provider-qualified identity,
+/// logical selection, authoritative capability metadata, and runtime role.
+pub fn plan_codex_execution(
+    qualified_model: &str,
+    selected_level: ReasoningLevel,
+    request_role: CodexRequestRole,
+    catalog_model: Option<&CatalogModel>,
+) -> Result<CodexExecutionPlan, CodexPlanError> {
+    let Some(model_id) = qualified_model.strip_prefix("openai-codex/") else {
+        return Err(CodexPlanError::new(
+            CodexPlanErrorCode::InvalidProviderIdentity,
+            format!("{qualified_model} is not an exact openai-codex identity"),
+        ));
+    };
+    if model_id.is_empty() || model_id.contains('/') {
+        return Err(CodexPlanError::new(
+            CodexPlanErrorCode::InvalidProviderIdentity,
+            format!("{qualified_model} is not an exact openai-codex identity"),
+        ));
+    }
+
+    let capability = authoritative_capability(qualified_model, model_id, catalog_model)?;
+    if !matches!(
+        selected_level,
+        ReasoningLevel::Off | ReasoningLevel::Adaptive
+    ) {
+        let Some(capability) = capability.as_ref() else {
+            return Err(CodexPlanError::new(
+                CodexPlanErrorCode::CapabilityMetadataMissing,
+                format!(
+                    "no capability metadata for {qualified_model}; cannot authorize level '{selected_level}'"
+                ),
+            ));
+        };
+        if !capability.supported.contains(&selected_level) {
+            return Err(CodexPlanError::new(
+                CodexPlanErrorCode::UnsupportedReasoningLevel,
+                format!(
+                    "reasoning level '{selected_level}' is not supported by {qualified_model}; supported: [{}]",
+                    capability
+                        .supported
+                        .iter()
+                        .map(|level| level.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+    }
+
+    let multi_agent_version = capability
+        .as_ref()
+        .and_then(|capability| capability.multi_agent_version);
+    if selected_level == ReasoningLevel::Ultra
+        && multi_agent_version != Some(CodexMultiAgentVersion::V2)
+    {
+        return Err(CodexPlanError::new(
+            CodexPlanErrorCode::UltraRequiresMultiAgentV2,
+            format!(
+                "reasoning level 'ultra' requires multi-agent v2 capability for {qualified_model}"
+            ),
+        ));
+    }
+
+    let mode = match selected_level {
+        ReasoningLevel::Max => CodexExecutionMode::Max,
+        ReasoningLevel::Ultra => CodexExecutionMode::Ultra,
+        _ => CodexExecutionMode::Standard,
+    };
+    let wire_effort = match selected_level {
+        ReasoningLevel::Off | ReasoningLevel::Adaptive => None,
+        ReasoningLevel::Low => Some(CodexWireEffort::Low),
+        ReasoningLevel::Medium => Some(CodexWireEffort::Medium),
+        ReasoningLevel::High => Some(CodexWireEffort::High),
+        ReasoningLevel::XHigh => Some(CodexWireEffort::XHigh),
+        ReasoningLevel::Max | ReasoningLevel::Ultra => Some(CodexWireEffort::Max),
+    };
+    let multi_agent_mode = if request_role == CodexRequestRole::Foreground
+        && multi_agent_version == Some(CodexMultiAgentVersion::V2)
+    {
+        Some(if selected_level == ReasoningLevel::Ultra {
+            CodexMultiAgentMode::Proactive
+        } else {
+            CodexMultiAgentMode::ExplicitRequestOnly
+        })
+    } else {
+        None
+    };
+
+    Ok(CodexExecutionPlan {
+        qualified_model: qualified_model.to_string(),
+        selected_level,
+        mode,
+        wire_effort,
+        multi_agent_version,
+        multi_agent_mode,
+        request_role,
+        capability_source: capability.map(|capability| capability.source),
+    })
+}
+
 // ─── Capability validation helper ─────────────────────────────────────────────
 
 /// Validate that the given `level` is supported by the Codex model identified
@@ -207,73 +608,15 @@ pub fn validate_codex_level(
     level: ReasoningLevel,
     catalog_model: Option<&CatalogModel>,
 ) -> Result<(), String> {
-    // Off/Adaptive omit the provider field; catalogs list concrete efforts only.
-    if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
-        return Ok(());
-    }
-    // 1. Explicit CatalogModel argument takes top priority.
-    if let Some(model) = catalog_model {
-        if let Some(levels) = model.codex_supported_levels() {
-            if levels.contains(&level) {
-                return Ok(());
-            }
-            return Err(format!(
-                "reasoning level '{level}' is not supported by openai-codex/{model_id}; \
-                 supported: [{}]",
-                levels
-                    .iter()
-                    .map(|l| l.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-    // 2. Process-local capability cache (populated from live Codex catalog parse).
     let qualified = format!("openai-codex/{model_id}");
-    if let Some(cached) = super::capability_cache::get(&qualified) {
-        if let Some(levels) = cached.codex_supported_levels() {
-            if levels.contains(&level) {
-                return Ok(());
-            }
-            return Err(format!(
-                "reasoning level '{level}' is not supported by openai-codex/{model_id}; \
-                 supported: [{}]",
-                levels
-                    .iter()
-                    .map(|l| l.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-    // 3. Static fallback table.
-    match codex_static_capability(model_id) {
-        Some(ReasoningSupport::CodexNamed { supported, .. }) => {
-            if supported.contains(&level) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "reasoning level '{level}' is not supported by openai-codex/{model_id}; \
-                     supported: [{}]",
-                    supported
-                        .iter()
-                        .map(|l| l.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            }
-        }
-        None => Err(format!(
-            "no capability metadata for openai-codex/{model_id}; \
-             cannot authorize level '{level}'"
-        )),
-        // Non-CodexNamed capability shapes carry no named-level evidence:
-        // fail closed rather than assume support.
-        Some(_) => Err(format!(
-            "no named-level capability metadata for openai-codex/{model_id}; \
-             cannot authorize level '{level}'"
-        )),
-    }
+    plan_codex_execution(
+        &qualified,
+        level,
+        CodexRequestRole::Foreground,
+        catalog_model,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -321,6 +664,195 @@ mod tests {
         let gpt55 = models.iter().find(|m| m.id == "gpt-5.5").unwrap();
         assert_eq!(gpt55.label.as_deref(), Some("GPT-5.5"));
         assert_eq!(gpt55.context_tokens, Some(272_000));
+    }
+
+    #[test]
+    fn execution_plan_fixture_preserves_multi_agent_versions() {
+        let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
+        let version = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(CatalogModel::codex_multi_agent_version)
+        };
+        assert_eq!(version("gpt-5.6-sol"), Some(CodexMultiAgentVersion::V2));
+        assert_eq!(version("gpt-5.6-terra"), Some(CodexMultiAgentVersion::V2));
+        assert_eq!(version("gpt-5.6-luna"), Some(CodexMultiAgentVersion::V1));
+        assert_eq!(version("gpt-5.5"), None);
+    }
+
+    #[test]
+    fn execution_plan_maps_max_ultra_and_xhigh_exactly() {
+        let max = plan_codex_execution(
+            "openai-codex/gpt-5.6-sol",
+            ReasoningLevel::Max,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("Sol Max plan");
+        assert_eq!(max.mode, CodexExecutionMode::Max);
+        assert_eq!(max.wire_effort, Some(CodexWireEffort::Max));
+        assert_eq!(
+            max.multi_agent_mode,
+            Some(CodexMultiAgentMode::ExplicitRequestOnly)
+        );
+
+        let ultra = plan_codex_execution(
+            "openai-codex/gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("Sol Ultra plan");
+        assert_eq!(ultra.mode, CodexExecutionMode::Ultra);
+        assert_eq!(ultra.wire_effort, Some(CodexWireEffort::Max));
+        assert_eq!(ultra.multi_agent_mode, Some(CodexMultiAgentMode::Proactive));
+
+        let xhigh = plan_codex_execution(
+            "openai-codex/gpt-5.6-sol",
+            ReasoningLevel::XHigh,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("Sol XHigh plan");
+        assert_eq!(xhigh.mode, CodexExecutionMode::Standard);
+        assert_eq!(xhigh.wire_effort, Some(CodexWireEffort::XHigh));
+        assert_eq!(
+            xhigh.multi_agent_mode,
+            Some(CodexMultiAgentMode::ExplicitRequestOnly)
+        );
+    }
+
+    #[test]
+    fn execution_plan_luna_max_uses_max_without_v2_context() {
+        let plan = plan_codex_execution(
+            "openai-codex/gpt-5.6-luna",
+            ReasoningLevel::Max,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("Luna Max plan");
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::Max));
+        assert_eq!(plan.multi_agent_version, Some(CodexMultiAgentVersion::V1));
+        assert_eq!(plan.multi_agent_mode, None);
+    }
+
+    #[test]
+    fn execution_plan_worker_ultra_never_enables_proactive_mode() {
+        let plan = plan_codex_execution(
+            "openai-codex/gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Worker,
+            None,
+        )
+        .expect("worker Ultra plan");
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::Max));
+        assert_eq!(plan.multi_agent_mode, None);
+        assert!(!plan.automatic_delegation());
+    }
+
+    #[test]
+    fn execution_plan_ultra_requires_live_v2_without_static_backfill() {
+        for (slug, version_field) in [
+            ("gpt-ultra-live-missing", ""),
+            ("gpt-ultra-live-v1", r#", "multi_agent_version": "v1""#),
+            ("gpt-ultra-live-unknown", r#", "multi_agent_version": "v3""#),
+        ] {
+            let body = format!(
+                r#"{{"models":[{{
+                    "slug":"{slug}",
+                    "visibility":"list",
+                    "supported_reasoning_levels":[{{"effort":"max"}},{{"effort":"ultra"}}]
+                    {version_field}
+                }}]}}"#
+            );
+            let models = parse_codex_catalog_models(&body).expect("parse live row");
+            let error = plan_codex_execution(
+                &format!("openai-codex/{slug}"),
+                ReasoningLevel::Ultra,
+                CodexRequestRole::Foreground,
+                Some(&models[0]),
+            )
+            .expect_err("live missing/v1/unknown version must deny Ultra");
+            assert_eq!(error.code(), CodexPlanErrorCode::UltraRequiresMultiAgentV2);
+        }
+    }
+
+    #[test]
+    fn execution_plan_rejects_wrong_provider_identity() {
+        let error = plan_codex_execution(
+            "openrouter/gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect_err("wrong provider must fail closed");
+        assert_eq!(error.code(), CodexPlanErrorCode::InvalidProviderIdentity);
+    }
+
+    #[test]
+    fn execution_plan_rejects_wrong_provider_kind_in_cache() {
+        let id = "gpt-cached-provider-kind-spoof";
+        let qualified = format!("openai-codex/{id}");
+        let mut spoofed = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, id).unwrap();
+        spoofed.reasoning = ReasoningSupport::CodexNamed {
+            supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
+            default_level: Some(ReasoningLevel::Max),
+            multi_agent_version: Some(CodexMultiAgentVersion::V2),
+        };
+        super::super::capability_cache::insert(spoofed);
+
+        let error = plan_codex_execution(
+            &qualified,
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect_err("cache rows must preserve the exact Codex provider kind");
+        assert_eq!(error.code(), CodexPlanErrorCode::InvalidProviderIdentity);
+    }
+
+    #[test]
+    fn execution_plan_rejects_inferred_capability_provenance() {
+        fn inferred_model(id: &str) -> CatalogModel {
+            let mut model = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, id).unwrap();
+            model.provider_kind = CatalogProviderKind::OpenAiCodex;
+            model.source = CatalogSource::Inferred;
+            model.reasoning = ReasoningSupport::CodexNamed {
+                supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
+                default_level: Some(ReasoningLevel::Max),
+                multi_agent_version: Some(CodexMultiAgentVersion::V2),
+            };
+            model
+        }
+
+        let explicit_id = "gpt-inferred-explicit-provenance";
+        let explicit = inferred_model(explicit_id);
+        let explicit_error = plan_codex_execution(
+            &format!("openai-codex/{explicit_id}"),
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            Some(&explicit),
+        )
+        .expect_err("inferred explicit metadata must never authorize Ultra");
+        assert_eq!(
+            explicit_error.code(),
+            CodexPlanErrorCode::CapabilityMetadataMissing
+        );
+
+        let cached_id = "gpt-inferred-cached-provenance";
+        super::super::capability_cache::insert(inferred_model(cached_id));
+        let cached_error = plan_codex_execution(
+            &format!("openai-codex/{cached_id}"),
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect_err("inferred cached metadata must never authorize Ultra");
+        assert_eq!(
+            cached_error.code(),
+            CodexPlanErrorCode::CapabilityMetadataMissing
+        );
     }
 
     // ── Reasoning level parsing from fixture ──────────────────────────────────
@@ -441,6 +973,32 @@ mod tests {
         assert!(!m.codex_supports_level(ReasoningLevel::Max));
     }
 
+    #[test]
+    fn live_known_model_with_only_unknown_efforts_does_not_borrow_static_ultra() {
+        let item: CodexModelItem = serde_json::from_str(
+            r#"{
+            "slug": "gpt-5.6-sol",
+            "visibility": "list",
+            "supported_reasoning_levels": [{"effort": "future-effort"}],
+            "multi_agent_version": "v2"
+        }"#,
+        )
+        .expect("parse live Sol row");
+        let mut model = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, &item.slug).unwrap();
+        model.provider_kind = CatalogProviderKind::OpenAiCodex;
+        model.source = CatalogSource::Live;
+        model.reasoning = codex_reasoning_support(&item);
+
+        let error = plan_codex_execution(
+            "openai-codex/gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            Some(&model),
+        )
+        .expect_err("an explicit unknown live effort list must fail closed");
+        assert_eq!(error.code(), CodexPlanErrorCode::UnsupportedReasoningLevel);
+    }
+
     // ── Static capability table ───────────────────────────────────────────────
 
     #[test]
@@ -450,6 +1008,7 @@ mod tests {
             ReasoningSupport::CodexNamed {
                 supported,
                 default_level,
+                ..
             } => {
                 assert!(
                     supported.contains(&ReasoningLevel::Ultra),
@@ -473,6 +1032,7 @@ mod tests {
             ReasoningSupport::CodexNamed {
                 supported,
                 default_level,
+                ..
             } => {
                 assert!(
                     supported.contains(&ReasoningLevel::Ultra),
@@ -496,6 +1056,7 @@ mod tests {
             ReasoningSupport::CodexNamed {
                 supported,
                 default_level,
+                ..
             } => {
                 assert!(supported.contains(&ReasoningLevel::Max));
                 assert!(!supported.contains(&ReasoningLevel::Ultra));
@@ -517,6 +1078,7 @@ mod tests {
                 ReasoningSupport::CodexNamed {
                     supported,
                     default_level,
+                    ..
                 } => {
                     assert!(
                         supported.contains(&ReasoningLevel::XHigh),
@@ -548,6 +1110,7 @@ mod tests {
             ReasoningSupport::CodexNamed {
                 supported,
                 default_level,
+                ..
             } => {
                 assert!(supported.contains(&ReasoningLevel::XHigh));
                 assert!(!supported.contains(&ReasoningLevel::Max));
@@ -605,9 +1168,11 @@ mod tests {
     fn validate_live_catalog_overrides_static() {
         // Build a live catalog model that supports ONLY low+medium (fewer than static).
         let mut live = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, "gpt-5.6-sol").unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
         };
         // Ultra is in the static table but the live model says otherwise.
         let err =
@@ -615,6 +1180,23 @@ mod tests {
         assert!(err.contains("ultra"));
         // Low is accepted.
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Low, Some(&live)).is_ok());
+    }
+
+    #[test]
+    fn validate_live_ultra_requires_v2_even_when_listed() {
+        let mut live = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, "gpt-ultra-no-v2").unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::CodexNamed {
+            supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
+            default_level: Some(ReasoningLevel::Max),
+            multi_agent_version: None,
+        };
+
+        assert!(validate_codex_level("gpt-ultra-no-v2", ReasoningLevel::Max, Some(&live)).is_ok());
+        let err = validate_codex_level("gpt-ultra-no-v2", ReasoningLevel::Ultra, Some(&live))
+            .expect_err("Ultra must require exact v2 capability");
+        assert!(err.contains("multi-agent v2"), "{err}");
     }
 
     /// Verify that `validate_codex_level(..., None)` consults the process-local
@@ -628,10 +1210,12 @@ mod tests {
 
         // Insert a live cache entry that supports only Low+Medium (no Ultra).
         let mut live = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, unique_id).unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
         };
         super::super::capability_cache::insert(live);
 

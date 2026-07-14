@@ -721,6 +721,7 @@ mod thinking_options_tests {
         live.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
         };
         capability_cache::insert(live);
 

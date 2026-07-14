@@ -37,7 +37,7 @@ pub enum ReasoningLevel {
 }
 
 impl ReasoningLevel {
-    /// Parse a level from its canonical wire/config string.
+    /// Parse a level from its canonical logical/config string.
     ///
     /// Returns `None` for unknown strings; callers must not silently fallback.
     pub fn parse(s: &str) -> Option<Self> {
@@ -54,7 +54,10 @@ impl ReasoningLevel {
         }
     }
 
-    /// The canonical string representation, used on the wire and in config.
+    /// The canonical logical/config representation.
+    ///
+    /// Provider request planners own wire conversion. In particular, Codex
+    /// logical Ultra is serialized as wire effort `max` plus proactive mode.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -70,7 +73,7 @@ impl ReasoningLevel {
 
     /// Convert to the legacy Anthropic token budget used by the enabled+budget_tokens
     /// request shape. Returns `None` for levels that have no meaningful numeric
-    /// mapping (Max, Ultra — these are only valid on Codex and use named effort values).
+    /// mapping (Max and Ultra are Codex execution modes, not numeric budgets).
     pub fn to_legacy_budget(self) -> Option<u32> {
         match self {
             Self::Off | Self::Adaptive => Some(0),

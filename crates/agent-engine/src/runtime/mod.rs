@@ -229,6 +229,9 @@ pub struct Runtime {
     /// session restore. Controls whether set_model overwrites the level with
     /// the new model's default.
     explicit_reasoning: bool,
+    /// Foreground by default; central subagent construction marks Worker so
+    /// logical Ultra can never recursively activate proactive orchestration.
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
     /// `models::context_window_for_model`. Lets users cap context at e.g.
@@ -352,6 +355,7 @@ impl Runtime {
             thinking_budget: 4096,
             named_level: None,
             explicit_reasoning: false,
+            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -418,6 +422,7 @@ impl Runtime {
             thinking_budget: 4096,
             named_level: None,
             explicit_reasoning: false,
+            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
@@ -737,6 +742,111 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn set_codex_request_role(
+        &mut self,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) {
+        self.codex_request_role = role;
+    }
+
+    pub(crate) fn codex_request_role(&self) -> crate::runtime::openai::catalog::CodexRequestRole {
+        self.codex_request_role
+    }
+
+    /// Validate exact-model reasoning and Ultra orchestration prerequisites
+    /// before refresh, broker access, or provider network work.
+    async fn validate_request_preflight(&self) -> Result<()> {
+        self.validate_request_preflight_for(&self.model, self.codex_request_role)
+            .await
+    }
+
+    async fn validate_request_preflight_for(
+        &self,
+        model: &str,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) -> Result<()> {
+        let level = self.reasoning_level();
+        if model.starts_with("openai-codex/") {
+            let plan = crate::runtime::openai::catalog::plan_codex_execution(
+                model,
+                level,
+                role,
+                None,
+            )
+            .map_err(|error| {
+                tracing::debug!(
+                    event = "codex_mode_plan",
+                    qualified_model = %model,
+                    requested_level = %level,
+                    runtime_role = role.as_str(),
+                    decision = "deny",
+                    deny_code = error.code().as_str(),
+                    network_attempted = false,
+                    "Codex request preflight denied"
+                );
+                RuntimeError::Config(error.to_string())
+            })?;
+
+            if plan.automatic_delegation() {
+                if self.orchestration.is_none() {
+                    tracing::debug!(
+                        event = "codex_mode_plan",
+                        qualified_model = %model,
+                        requested_level = %level,
+                        runtime_role = role.as_str(),
+                        decision = "deny",
+                        deny_code = "ultra_requires_orchestration",
+                        network_attempted = false,
+                        "Codex request preflight denied"
+                    );
+                    return Err(RuntimeError::Config(
+                        "Ultra requires an installed orchestration policy".to_string(),
+                    ));
+                }
+
+                let tools = self.tools.read().await;
+                let required = ["subagent_start", "subagent_status", "subagent_collect"];
+                let tools_ready = required.iter().all(|name| {
+                    tools
+                        .get(name)
+                        .is_some_and(|tool| tool.extension_id().is_none())
+                });
+                if !tools_ready {
+                    tracing::debug!(
+                        event = "codex_mode_plan",
+                        qualified_model = %model,
+                        requested_level = %level,
+                        runtime_role = role.as_str(),
+                        decision = "deny",
+                        deny_code = "ultra_requires_subagent_tools",
+                        network_attempted = false,
+                        "Codex request preflight denied"
+                    );
+                    return Err(RuntimeError::Config(
+                        "Ultra requires built-in subagent_start, subagent_status, and subagent_collect tools"
+                            .to_string(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(model, level)
+            .map_err(|error| {
+                tracing::debug!(
+                    event = "codex_mode_plan",
+                    qualified_model = %model,
+                    requested_level = %level,
+                    runtime_role = role.as_str(),
+                    decision = "deny",
+                    deny_code = "unsupported_reasoning_level",
+                    network_attempted = false,
+                    "request preflight denied"
+                );
+                RuntimeError::Config(error)
+            })
+    }
+
     pub fn set_compaction_model(&mut self, model: Option<String>) {
         self.compaction_model = model;
     }
@@ -905,9 +1015,13 @@ impl Runtime {
 
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
+        self.refresh_if_needed_for_model(&self.model).await
+    }
+
+    async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {
         // Non-Anthropic models resolve their own provider auth in the OpenAI
         // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
-        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+        if !crate::runtime::auth::model_is_anthropic(model) {
             return Ok(());
         }
         AuthMethods::refresh_if_needed(
@@ -925,14 +1039,20 @@ impl Runtime {
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
     pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
-        self.refresh_if_needed().await?;
+        let model = self.compaction_model();
+        self.validate_request_preflight_for(
+            model,
+            crate::runtime::openai::catalog::CodexRequestRole::Internal,
+        )
+        .await?;
+        self.refresh_if_needed_for_model(model).await?;
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
 
         ApiMethods::call_api_simple(
             &self.auth,
             &self.client,
-            self.compaction_model(),
+            model,
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
             self.reasoning_level(),
@@ -945,7 +1065,8 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
-        // Refresh OAuth token if expired
+        self.validate_request_preflight().await?;
+        // Refresh OAuth token if expired only after capability preflight.
         self.refresh_if_needed().await?;
 
         let mut messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(
@@ -972,6 +1093,7 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
+                    codex_request_role: self.codex_request_role(),
                 },
             )
             .await?;
@@ -1294,7 +1416,13 @@ impl Runtime {
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Refresh OAuth token if expired before starting the stream.
+        if let Err(error) = self.validate_request_preflight().await {
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+            return Box::pin(UnboundedReceiverStream::new(rx));
+        }
+
+        // Refresh OAuth token if expired after capability preflight.
         if let Err(e) = self.refresh_if_needed().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
@@ -1336,6 +1464,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            codex_request_role: self.codex_request_role(),
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -1398,6 +1527,7 @@ impl Clone for Runtime {
             thinking_budget: self.thinking_budget,
             named_level: self.named_level,
             explicit_reasoning: self.explicit_reasoning,
+            codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),
@@ -1946,6 +2076,111 @@ mod set_reasoning_level_checked_tests {
             rt.reasoning_level(),
             ReasoningLevel::Low,
             "explicit level must not be overwritten by the model default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod codex_execution_preflight_tests {
+    use super::*;
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use agent_core::prompt::QualifiedModelId;
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn ultra_runtime() -> Runtime {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model("openai-codex/gpt-5.6-sol".to_string());
+        runtime.set_reasoning_level_explicit(ReasoningLevel::Ultra);
+        runtime
+    }
+
+    fn install_baseline(runtime: &mut Runtime) {
+        let foreground =
+            QualifiedModelId::parse("openai-codex/gpt-5.6-sol").expect("qualified model");
+        let orchestration = crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8)
+            .expect("baseline orchestration");
+        runtime.install_orchestration(Arc::new(orchestration));
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_requires_orchestration() {
+        let runtime = ultra_runtime();
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("Ultra without orchestration must fail closed");
+        assert!(error.to_string().contains("orchestration"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_requires_actionable_subagent_tools() {
+        let mut runtime = ultra_runtime();
+        install_baseline(&mut runtime);
+        runtime.set_tools(ToolRegistry::without_subagent());
+
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("Ultra without subagent tools must fail closed");
+        assert!(error.to_string().contains("subagent"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_accepts_exact_model_policy_and_tools() {
+        let mut runtime = ultra_runtime();
+        install_baseline(&mut runtime);
+        runtime
+            .validate_request_preflight()
+            .await
+            .expect("fully provisioned Ultra must pass preflight");
+    }
+
+    #[tokio::test]
+    async fn worker_ultra_preflight_never_requires_or_enables_orchestration() {
+        let mut runtime = ultra_runtime();
+        runtime.set_codex_request_role(CodexRequestRole::Worker);
+        runtime.set_tools(ToolRegistry::without_subagent());
+        runtime
+            .validate_request_preflight()
+            .await
+            .expect("worker Ultra is underlying max without proactive orchestration");
+        assert_eq!(runtime.codex_request_role(), CodexRequestRole::Worker);
+    }
+
+    #[tokio::test]
+    async fn non_codex_ultra_preflight_fails_before_provider_work() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model("anthropic/claude-opus-4-7".to_string());
+        runtime.set_reasoning_level_explicit(ReasoningLevel::Ultra);
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("non-Codex Ultra must fail closed");
+        assert!(
+            error.to_string().contains("authoritative exact-model"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_preflight_validates_target_before_credentials() {
+        let mut runtime = ultra_runtime();
+        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        {
+            let mut auth = runtime.auth.write().await;
+            auth.auth_token.clear();
+            auth.auth_type = "none".to_string();
+            auth.refresh_token = None;
+            auth.token_expires = None;
+        }
+
+        let error = runtime
+            .compact_call(Vec::new())
+            .await
+            .expect_err("Codex Ultra cannot silently cross into Anthropic compaction");
+        assert!(
+            error.to_string().contains("authoritative exact-model"),
+            "preflight must reject the target before auth access: {error}"
         );
     }
 }

@@ -187,6 +187,7 @@ pub async fn try_route(
     source: &crate::auth::CredentialSource,
     cache: &crate::auth::TokenCache,
     max_retries: u32,
+    codex_request_role: catalog::CodexRequestRole,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
@@ -473,6 +474,7 @@ pub async fn try_route(
                 temperature,
                 max_tokens,
                 reasoning_level,
+                codex_request_role,
                 cancel,
                 max_retries,
             )
@@ -642,6 +644,7 @@ mod tests {
             &source,
             &cache,
             0,
+            catalog::CodexRequestRole::Foreground,
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -706,6 +709,7 @@ mod tests {
                 &source,
                 &cache,
                 0,
+                catalog::CodexRequestRole::Foreground,
             )
             .await
             .expect("xai-auth must route through try_route");

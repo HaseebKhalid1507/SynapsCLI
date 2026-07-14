@@ -59,6 +59,7 @@ mod tests {
         m.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
         };
         m
     }
@@ -73,16 +74,18 @@ mod tests {
     }
 
     #[test]
-    fn live_cache_narrower_than_static_is_authoritative() {
-        // gpt-5.6-sol static supports Ultra; we insert a live entry with only Low+Medium.
-        let mut live = CatalogModel::new("openai-codex", "OpenAI Codex", "gpt-5.6-sol").unwrap();
+    fn live_cache_preserves_narrow_capability() {
+        let mut live =
+            CatalogModel::new("openai-codex", "OpenAI Codex", "gpt-cache-narrow").unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
         };
         insert(live);
-        let cached = get("openai-codex/gpt-5.6-sol").unwrap();
+        let cached = get("openai-codex/gpt-cache-narrow").unwrap();
         match cached.reasoning {
             ReasoningSupport::CodexNamed { supported, .. } => {
                 assert!(

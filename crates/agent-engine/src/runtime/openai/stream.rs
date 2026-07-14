@@ -238,13 +238,61 @@ pub(crate) async fn call_codex_stream_inner(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    // Validate the requested level before any credential or network access.
-    use crate::runtime::openai::catalog::validate_codex_level;
-    validate_codex_level(&cfg.model, reasoning_level, None)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    // Build the exact provider-qualified plan before any credential or network
+    // access. Logical Ultra is lowered here, never in the generic level enum.
+    use crate::runtime::openai::catalog::plan_codex_execution;
+    let qualified_model = format!("{}/{}", cfg.provider, cfg.model);
+    let plan =
+        match plan_codex_execution(&qualified_model, reasoning_level, codex_request_role, None) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::debug!(
+                    event = "codex_mode_plan",
+                    qualified_model = %qualified_model,
+                    requested_level = %reasoning_level,
+                    runtime_role = codex_request_role.as_str(),
+                    decision = "deny",
+                    deny_code = error.code().as_str(),
+                    network_attempted = false,
+                    "Codex execution plan denied"
+                );
+                return Err(Box::new(error));
+            }
+        };
+    if plan.automatic_delegation() && !codex_has_required_delegation_tools(tools_schema) {
+        tracing::debug!(
+            event = "codex_mode_plan",
+            qualified_model = %qualified_model,
+            requested_level = %reasoning_level,
+            runtime_role = codex_request_role.as_str(),
+            decision = "deny",
+            deny_code = "ultra_requires_subagent_tools",
+            network_attempted = false,
+            "Codex execution plan denied"
+        );
+        return Err(
+            "Ultra requires subagent_start, subagent_status, and subagent_collect tools".into(),
+        );
+    }
+    tracing::debug!(
+        event = "codex_mode_plan",
+        qualified_model = %plan.qualified_model,
+        requested_level = %plan.selected_level,
+        execution_mode = plan.mode.as_str(),
+        wire_effort = plan.wire_effort_label(),
+        capability_source = plan.capability_source.map_or("none", |source| source.as_str()),
+        multi_agent_version = plan.multi_agent_version_label(),
+        runtime_role = plan.request_role.as_str(),
+        multi_agent_mode = plan.multi_agent_mode_label(),
+        automatic_delegation = plan.automatic_delegation(),
+        decision = "allow",
+        network_attempted = false,
+        "Codex execution plan allowed"
+    );
     // Every Codex credential, local or remote, crosses the broker boundary:
     // the broker vends an access token + expiry only (refresh tokens are
     // broker-owned), and this path never opens auth.json.
@@ -274,10 +322,12 @@ pub(crate) async fn call_codex_stream_inner(
     // Use the shared pure helper so production and unit tests exercise identical
     // body construction — no duplication between call_codex_stream_inner and tests.
     let instructions = codex_instructions(system_prompt);
-    let input = serde_json::Value::Array(codex_input_messages(oai_messages));
+    let mut input_items = codex_input_messages(oai_messages);
+    insert_codex_multi_agent_mode(&mut input_items, &plan);
+    let input = serde_json::Value::Array(input_items);
     let body = build_codex_body(
         &cfg.model,
-        reasoning_level,
+        &plan,
         input,
         instructions,
         tools,
@@ -368,14 +418,13 @@ pub(crate) async fn call_codex_stream_inner(
 // used in tests
 pub(crate) fn build_codex_body(
     model: &str,
-    level: agent_core::reasoning::ReasoningLevel,
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
     input: serde_json::Value,
     instructions: String,
     tools: Vec<serde_json::Value>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 ) -> serde_json::Value {
-    use agent_core::reasoning::ReasoningLevel;
     let mut body = json!({
         "model": model,
         "store": false,
@@ -387,12 +436,8 @@ pub(crate) fn build_codex_body(
         "include": ["reasoning.encrypted_content"],
         "text": { "verbosity": "medium" },
     });
-    // Off/Adaptive: omit reasoning field entirely (model default).
-    match level {
-        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
-        l => {
-            body["reasoning"] = json!({ "effort": l.as_str() });
-        }
+    if let Some(effort) = plan.wire_effort {
+        body["reasoning"] = json!({ "effort": effort.as_str() });
     }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
@@ -404,6 +449,64 @@ pub(crate) fn build_codex_body(
         body["max_output_tokens"] = json!(max);
     }
     body
+}
+
+const CODEX_MULTI_AGENT_MODE_OPEN: &str = "<multi_agent_mode>";
+const CODEX_MULTI_AGENT_MODE_CLOSE: &str = "</multi_agent_mode>";
+const CODEX_EXPLICIT_REQUEST_ONLY_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const CODEX_PROACTIVE_MULTI_AGENT_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
+
+fn codex_multi_agent_mode_item(
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
+) -> Option<Value> {
+    use crate::runtime::openai::catalog::CodexMultiAgentMode;
+    let body = match plan.multi_agent_mode? {
+        CodexMultiAgentMode::ExplicitRequestOnly => CODEX_EXPLICIT_REQUEST_ONLY_TEXT,
+        CodexMultiAgentMode::Proactive => CODEX_PROACTIVE_MULTI_AGENT_TEXT,
+    };
+    Some(json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": format!("{CODEX_MULTI_AGENT_MODE_OPEN}{body}{CODEX_MULTI_AGENT_MODE_CLOSE}"),
+        }],
+    }))
+}
+
+fn is_codex_multi_agent_mode_item(item: &Value) -> bool {
+    item.pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.trim_start().starts_with(CODEX_MULTI_AGENT_MODE_OPEN)
+                && text.trim_end().ends_with(CODEX_MULTI_AGENT_MODE_CLOSE)
+        })
+}
+
+fn insert_codex_multi_agent_mode(
+    input: &mut Vec<Value>,
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
+) {
+    input.retain(|item| !is_codex_multi_agent_mode_item(item));
+    let Some(item) = codex_multi_agent_mode_item(plan) else {
+        return;
+    };
+    let index = input
+        .iter()
+        .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(input.len());
+    input.insert(index, item);
+}
+
+fn codex_has_required_delegation_tools(tools_schema: &[Value]) -> bool {
+    ["subagent_start", "subagent_status", "subagent_collect"]
+        .into_iter()
+        .all(|required| {
+            tools_schema.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some(required)
+                    || tool.pointer("/function/name").and_then(Value::as_str) == Some(required)
+            })
+        })
 }
 
 const CODEX_AUTONOMOUS_LOOP_POLICY: &str = "\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]";
@@ -1201,7 +1304,6 @@ mod codex_decoder_tests {
     }
 }
 
-
 #[cfg(test)]
 mod broker_stream_tests {
     //! Broker-boundary streaming tests: the OpenAI-compatible stream path is
@@ -1527,19 +1629,57 @@ mod xai_tests {
 
 #[cfg(test)]
 mod codex_wire_tests {
-    use crate::runtime::openai::catalog::validate_codex_level;
+    use crate::runtime::openai::catalog::{
+        plan_codex_execution, CodexMultiAgentMode, CodexRequestRole,
+    };
     use agent_core::reasoning::ReasoningLevel;
+
+    fn plan(
+        level: ReasoningLevel,
+        role: CodexRequestRole,
+    ) -> crate::runtime::openai::catalog::CodexExecutionPlan {
+        plan_codex_execution("openai-codex/gpt-5.6-sol", level, role, None)
+            .expect("Sol request plan")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn body_for_level(
+        model: &str,
+        level: ReasoningLevel,
+        input: serde_json::Value,
+        instructions: String,
+        tools: Vec<serde_json::Value>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> serde_json::Value {
+        let qualified = format!("openai-codex/{model}");
+        let plan = plan_codex_execution(&qualified, level, CodexRequestRole::Foreground, None)
+            .expect("request plan");
+        super::build_codex_body(
+            model,
+            &plan,
+            input,
+            instructions,
+            tools,
+            temperature,
+            max_tokens,
+        )
+    }
 
     /// Validate → emit exact reasoning.effort shape for known levels.
     fn codex_effort_for(model_id: &str, level: ReasoningLevel) -> Result<String, String> {
-        validate_codex_level(model_id, level, None)?;
-        Ok(level.as_str().to_string())
+        let qualified = format!("openai-codex/{model_id}");
+        let plan = plan_codex_execution(&qualified, level, CodexRequestRole::Foreground, None)
+            .map_err(|error| error.to_string())?;
+        plan.wire_effort
+            .map(|effort| effort.as_str().to_string())
+            .ok_or_else(|| "reasoning effort omitted".to_string())
     }
 
     #[test]
-    fn sol_emits_ultra_exact() {
+    fn sol_lowers_ultra_to_max_for_requests() {
         let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::Ultra).unwrap();
-        assert_eq!(effort, "ultra");
+        assert_eq!(effort, "max");
     }
 
     #[test]
@@ -1583,9 +1723,8 @@ mod codex_wire_tests {
     #[test]
     fn off_and_adaptive_omit_reasoning_field() {
         // Off/Adaptive: build_codex_body must NOT emit a "reasoning" key.
-        use super::build_codex_body;
         for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
-            let body = build_codex_body(
+            let body = body_for_level(
                 "gpt-5.6-sol",
                 level,
                 serde_json::json!([]),
@@ -1607,12 +1746,89 @@ mod codex_wire_tests {
         assert_eq!(ReasoningLevel::Max.as_str(), "max");
     }
 
+    #[test]
+    fn ultra_mode_context_is_exact_proactive_developer_item() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        assert_eq!(plan.multi_agent_mode, Some(CodexMultiAgentMode::Proactive));
+        let item = super::codex_multi_agent_mode_item(&plan).expect("Ultra context item");
+        assert_eq!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("message")
+        );
+        assert_eq!(
+            item.get("role").and_then(serde_json::Value::as_str),
+            Some("developer")
+        );
+        assert_eq!(
+            item.pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some(concat!(
+                "<multi_agent_mode>",
+                "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.",
+                "</multi_agent_mode>"
+            ))
+        );
+    }
+
+    #[test]
+    fn max_and_xhigh_mode_context_is_exact_explicit_only_item() {
+        for level in [ReasoningLevel::Max, ReasoningLevel::XHigh] {
+            let plan = plan(level, CodexRequestRole::Foreground);
+            assert_eq!(
+                plan.multi_agent_mode,
+                Some(CodexMultiAgentMode::ExplicitRequestOnly)
+            );
+            let item = super::codex_multi_agent_mode_item(&plan).expect("v2 context item");
+            assert_eq!(
+                item.pointer("/content/0/text")
+                    .and_then(serde_json::Value::as_str),
+                Some(concat!(
+                    "<multi_agent_mode>",
+                    "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
+                    "</multi_agent_mode>"
+                )),
+                "{level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_context_is_inserted_once_before_final_user_item() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        let mut input = vec![
+            serde_json::json!({"role":"user","content":"first"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+            serde_json::json!({"role":"user","content":"current"}),
+        ];
+        super::insert_codex_multi_agent_mode(&mut input, &plan);
+        let mode_positions = input
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.pointer("/content/0/text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.starts_with("<multi_agent_mode>"))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(mode_positions, vec![2]);
+        assert_eq!(
+            input[3].get("content").and_then(serde_json::Value::as_str),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn worker_ultra_has_no_mode_context_item() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Worker);
+        assert!(super::codex_multi_agent_mode_item(&plan).is_none());
+    }
+
     // ── Pure body construction tests (zero network) ──────────────────────────
 
     #[test]
-    fn body_contains_reasoning_effort_for_ultra() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+    fn body_lowers_ultra_reasoning_effort_to_max() {
+        let body = body_for_level(
             "gpt-5.6-sol",
             ReasoningLevel::Ultra,
             serde_json::json!([]),
@@ -1626,13 +1842,12 @@ mod codex_wire_tests {
             .and_then(|r| r.get("effort"))
             .and_then(serde_json::Value::as_str)
             .expect("reasoning.effort must be present for Ultra");
-        assert_eq!(effort, "ultra");
+        assert_eq!(effort, "max");
     }
 
     #[test]
     fn body_contains_reasoning_effort_for_max() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+        let body = body_for_level(
             "gpt-5.6-sol",
             ReasoningLevel::Max,
             serde_json::json!([]),
@@ -1653,8 +1868,7 @@ mod codex_wire_tests {
 
     #[test]
     fn body_contains_reasoning_effort_for_xhigh() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+        let body = body_for_level(
             "gpt-5.6-sol",
             ReasoningLevel::XHigh,
             serde_json::json!([]),
@@ -1673,13 +1887,12 @@ mod codex_wire_tests {
 
     #[test]
     fn body_contains_reasoning_effort_for_low_medium_high() {
-        use super::build_codex_body;
         for (level, expected) in [
             (ReasoningLevel::Low, "low"),
             (ReasoningLevel::Medium, "medium"),
             (ReasoningLevel::High, "high"),
         ] {
-            let body = build_codex_body(
+            let body = body_for_level(
                 "gpt-5.6-sol",
                 level,
                 serde_json::json!([]),
@@ -1699,8 +1912,7 @@ mod codex_wire_tests {
 
     #[test]
     fn body_always_sets_model_and_stream_and_include() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+        let body = body_for_level(
             "gpt-5.5",
             ReasoningLevel::XHigh,
             serde_json::json!([]),
@@ -1733,8 +1945,7 @@ mod codex_wire_tests {
 
     #[test]
     fn body_omits_temperature_and_max_tokens_when_none() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+        let body = body_for_level(
             "gpt-5.6-sol",
             ReasoningLevel::Medium,
             serde_json::json!([]),
@@ -1749,8 +1960,7 @@ mod codex_wire_tests {
 
     #[test]
     fn body_includes_temperature_and_max_tokens_when_some() {
-        use super::build_codex_body;
-        let body = build_codex_body(
+        let body = body_for_level(
             "gpt-5.6-sol",
             ReasoningLevel::High,
             serde_json::json!([]),
@@ -1784,14 +1994,12 @@ mod send_retry_tests {
     //! JWT-shaped token carrying the ChatGPT account-id claim.
 
     use super::*;
-    use agent_core::auth::{AccessToken, BrokerError, ProxyByteStream, ProxyRequest, ProxyResponse};
-    use async_trait::async_trait;
-    use axum::{
-        http::StatusCode,
-        response::IntoResponse,
-        routing::post as axum_post,
-        Router,
+    use agent_core::auth::{
+        AccessToken, BrokerError, ProxyByteStream, ProxyRequest, ProxyResponse,
     };
+    use agent_core::reasoning::ReasoningLevel;
+    use async_trait::async_trait;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post as axum_post, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1843,6 +2051,42 @@ mod send_retry_tests {
         async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
             Err(BrokerError::Denied("not implemented in stub".into()))
         }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    struct DenyingCountingBroker {
+        access_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for DenyingCountingBroker {
+        async fn access_token(
+            &self,
+            _provider: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            self.access_calls.fetch_add(1, Ordering::SeqCst);
+            Err(BrokerError::Denied(
+                "credential access must not occur".into(),
+            ))
+        }
+
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
+        async fn proxy_stream(
+            &self,
+            _request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
         async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
             Ok(vec![])
         }
@@ -1911,6 +2155,7 @@ mod send_retry_tests {
             None,
             None,
             agent_core::reasoning::ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             max_retries,
         )
@@ -1918,12 +2163,94 @@ mod send_retry_tests {
     }
 
     #[tokio::test]
+    async fn direct_ultra_tool_guard_precedes_broker_access() {
+        let access_calls = Arc::new(AtomicUsize::new(0));
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(DenyingCountingBroker {
+            access_calls: Arc::clone(&access_calls),
+        });
+        let cfg = ProviderConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::Ultra,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+        )
+        .await
+        .expect_err("foreground Ultra without delegation tools must fail closed");
+
+        assert!(error.to_string().contains("subagent_start"), "{error}");
+        assert_eq!(
+            access_calls.load(Ordering::SeqCst),
+            0,
+            "preflight denial must happen before broker credential access"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_codex_path_rejects_provider_identity_before_broker_access() {
+        let access_calls = Arc::new(AtomicUsize::new(0));
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(DenyingCountingBroker {
+            access_calls: Arc::clone(&access_calls),
+        });
+        let cfg = ProviderConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openrouter".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+        )
+        .await
+        .expect_err("the Codex seam must validate provider-qualified identity");
+
+        assert!(error.to_string().contains("openrouter"), "{error}");
+        assert_eq!(
+            access_calls.load(Ordering::SeqCst),
+            0,
+            "provider identity denial must precede broker credential access"
+        );
+    }
+
+    #[tokio::test]
     async fn codex_retries_transient_500_then_succeeds() {
         let (base_url, counter) = spawn_mock_codex(1, StatusCode::INTERNAL_SERVER_ERROR).await;
-        let result = run_codex(&base_url, 2).await.expect(
-            "one transient 500 with retries available must not abort the turn",
+        let result = run_codex(&base_url, 2)
+            .await
+            .expect("one transient 500 with retries available must not abort the turn");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expected exactly one retry"
         );
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "expected exactly one retry");
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert_eq!(text, "hello");
     }
@@ -1967,7 +2294,11 @@ mod send_retry_tests {
         let (base_url, counter) =
             spawn_mock_codex(usize::MAX, StatusCode::SERVICE_UNAVAILABLE).await;
         let err = run_codex(&base_url, 1).await.expect_err("must fail");
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "initial attempt + 1 retry"
+        );
         assert!(err.to_string().starts_with("codex request failed: 503"));
     }
 }

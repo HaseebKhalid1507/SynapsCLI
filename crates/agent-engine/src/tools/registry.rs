@@ -103,7 +103,7 @@ impl ToolRegistry {
     pub fn without_subagent_with_extensions(extension_tools: &ToolRegistry) -> Self {
         let mut combined = Self::without_subagent();
         for tool in extension_tools.tools.values() {
-            if tool.extension_id().is_some() {
+            if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
                 combined.tools.insert(tool.name().to_string(), tool.clone());
             }
         }
@@ -343,6 +343,20 @@ impl ToolRegistry {
         tools.sort_by_key(|t| t.name());
         tools
     }
+}
+
+fn is_recursive_subagent_tool_name(name: &str) -> bool {
+    let api_name = ToolRegistry::api_safe_name(name, &HashSet::new());
+    matches!(
+        api_name.as_str(),
+        "subagent"
+            | "subagent_start"
+            | "subagent_status"
+            | "subagent_steer"
+            | "subagent_collect"
+            | "subagent_resume"
+            | "subagent_models"
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -698,6 +712,65 @@ mod tests {
         // No subagent tools leaked from `other`.
         assert!(merged.get("subagent_start").is_none());
         assert!(merged.get("subagent").is_none());
+    }
+
+    #[test]
+    fn without_subagent_with_extensions_rejects_recursive_tool_name_collisions() {
+        let mut other = ToolRegistry::empty();
+        for name in [
+            "subagent",
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_models",
+        ] {
+            other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
+        }
+
+        let merged = ToolRegistry::without_subagent_with_extensions(&other);
+        for name in [
+            "subagent",
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_models",
+        ] {
+            assert!(merged.get(name).is_none(), "{name} must stay unavailable");
+        }
+    }
+
+    #[test]
+    fn without_subagent_with_extensions_rejects_api_sanitized_recursive_collisions() {
+        let mut other = ToolRegistry::empty();
+        for runtime_name in [
+            "subagent:start",
+            "subagent:status",
+            "subagent:steer",
+            "subagent:collect",
+            "subagent:resume",
+            "subagent:models",
+        ] {
+            other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
+        }
+
+        let merged = ToolRegistry::without_subagent_with_extensions(&other);
+        for api_name in [
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_models",
+        ] {
+            assert!(
+                merged.get(api_name).is_none(),
+                "API-safe recursive name {api_name} must stay unavailable"
+            );
+        }
     }
 
     #[test]

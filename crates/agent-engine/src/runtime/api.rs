@@ -682,6 +682,9 @@ pub struct ApiOptions {
     /// Set by tests to point at a local mock server without touching env vars.
     #[doc(hidden)]
     pub anthropic_base_url: Option<String>,
+    /// Foreground/worker/internal Codex request role. Workers never receive
+    /// proactive Ultra context even if their logical level is Ultra.
+    pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
 }
 
 pub(super) struct ApiMethods;
@@ -848,6 +851,7 @@ impl ApiMethods {
             &options.credential_source,
             &options.token_cache,
             max_retries,
+            options.codex_request_role,
         )
         .await
         {

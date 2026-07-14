@@ -11,7 +11,8 @@
 use agent_core::reasoning::ReasoningLevel;
 
 use super::{
-    anthropic_static_capability, capability_cache, codex_static_capability, xai_static_capability,
+    anthropic_static_capability, capability_cache, codex_static_capability, plan_codex_execution,
+    xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
     ReasoningSupport, XaiReasoningCapability,
 };
 
@@ -36,16 +37,33 @@ fn unsupported_msg(level: ReasoningLevel, model: &str, supported: &[ReasoningLev
     )
 }
 
+fn codex_reasoning_capability(model: &str, model_id: &str) -> Option<ReasoningSupport> {
+    // A live exact row is authoritative as a whole. In particular, never
+    // borrow static v2 evidence when that live row omitted or contradicted it.
+    if let Some(model) = capability_cache::get(model) {
+        if model.provider_kind != CatalogProviderKind::OpenAiCodex {
+            return None;
+        }
+        return matches!(model.reasoning, ReasoningSupport::CodexNamed { .. })
+            .then_some(model.reasoning);
+    }
+    codex_static_capability(model_id)
+}
+
 fn codex_supported_levels(model: &str, model_id: &str) -> Option<Vec<ReasoningLevel>> {
-    capability_cache::get(model)
-        .and_then(|m| match m.reasoning {
-            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-            _ => None,
-        })
-        .or_else(|| match codex_static_capability(model_id)? {
-            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
-            _ => None,
-        })
+    match codex_reasoning_capability(model, model_id)? {
+        ReasoningSupport::CodexNamed {
+            mut supported,
+            multi_agent_version,
+            ..
+        } => {
+            if multi_agent_version != Some(CodexMultiAgentVersion::V2) {
+                supported.retain(|level| *level != ReasoningLevel::Ultra);
+            }
+            Some(supported)
+        }
+        _ => None,
+    }
 }
 
 fn anthropic_capability(model_id: &str) -> Option<ReasoningSupport> {
@@ -66,6 +84,11 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
         // Off/Adaptive omit the provider effort field on the Codex wire.
         if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
             return Ok(());
+        }
+        if level == ReasoningLevel::Ultra {
+            return plan_codex_execution(model, level, CodexRequestRole::Foreground, None)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
         }
         return match codex_supported_levels(model, model_id) {
             Some(levels) if levels.contains(&level) => Ok(()),
@@ -145,15 +168,10 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
 /// not explicitly chosen a level. `None` = leave the current level untouched.
 pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
-        return capability_cache::get(model)
-            .and_then(|m| match m.reasoning {
-                ReasoningSupport::CodexNamed { default_level, .. } => default_level,
-                _ => None,
-            })
-            .or_else(|| match codex_static_capability(model_id)? {
-                ReasoningSupport::CodexNamed { default_level, .. } => default_level,
-                _ => None,
-            });
+        return match codex_reasoning_capability(model, model_id)? {
+            ReasoningSupport::CodexNamed { default_level, .. } => default_level,
+            _ => None,
+        };
     }
     if let Some(model_id) = model.strip_prefix("xai-auth/") {
         return Some(match xai_static_capability(model_id) {
@@ -346,6 +364,39 @@ mod tests {
     fn known_codex_model_membership_still_enforced() {
         assert!(validate_reasoning_mutation("openai-codex/gpt-5.6-sol", Ultra).is_ok());
         assert!(validate_reasoning_mutation("openai-codex/gpt-5.5", Ultra).is_err());
+    }
+
+    #[test]
+    fn live_codex_ultra_requires_v2_at_mutation_and_in_options() {
+        use super::super::{
+            CatalogModel, CatalogProviderKind, CatalogSource, CodexMultiAgentVersion,
+        };
+
+        for (suffix, version) in [("missing", None), ("v1", Some(CodexMultiAgentVersion::V1))] {
+            let id = format!("gpt-ultra-validation-{suffix}");
+            let qualified = format!("openai-codex/{id}");
+            let mut live = CatalogModel::new("openai-codex", "OpenAI Codex", &id).unwrap();
+            live.provider_kind = CatalogProviderKind::OpenAiCodex;
+            live.source = CatalogSource::Live;
+            live.reasoning = ReasoningSupport::CodexNamed {
+                supported: vec![Low, Medium, High, XHigh, Max, Ultra],
+                default_level: Some(High),
+                multi_agent_version: version,
+            };
+            capability_cache::insert(live);
+
+            assert!(
+                validate_reasoning_mutation(&qualified, Max).is_ok(),
+                "Max does not require v2: {qualified}"
+            );
+            let err = validate_reasoning_mutation(&qualified, Ultra)
+                .expect_err("Ultra must fail closed without exact v2 evidence");
+            assert!(err.contains("multi-agent v2"), "{err}");
+
+            let options = thinking_options_for_model(&qualified);
+            assert!(options.contains(&"max".to_string()), "{options:?}");
+            assert!(!options.contains(&"ultra".to_string()), "{options:?}");
+        }
     }
 
     // ── Anthropic ────────────────────────────────────────────────────────────

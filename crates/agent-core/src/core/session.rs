@@ -663,6 +663,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_ultra_round_trips_and_compaction_preserves_logical_mode() {
+        let parent = Session::new("openai-codex/gpt-5.6-sol", "ultra", None);
+        let encoded = serde_json::to_string(&parent).expect("serialize Ultra session");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&encoded).expect("inspect persisted session");
+        assert_eq!(persisted["thinking_level"], "ultra");
+        let restored: Session = serde_json::from_str(&encoded).expect("restore Ultra session");
+        assert_eq!(restored.model, "openai-codex/gpt-5.6-sol");
+        assert_eq!(restored.thinking_level, "ultra");
+
+        let compacted = Session::new_from_compaction(&restored, "summary".to_string());
+        assert_eq!(compacted.model, restored.model);
+        assert_eq!(compacted.thinking_level, "ultra");
+        assert_eq!(
+            compacted.parent_session.as_deref(),
+            Some(restored.id.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_max_round_trips_without_becoming_ultra_or_xhigh() {
+        let session = Session::new("openai-codex/gpt-5.6-luna", "max", None);
+        let encoded = serde_json::to_string(&session).expect("serialize Max session");
+        let restored: Session = serde_json::from_str(&encoded).expect("restore Max session");
+        assert_eq!(restored.thinking_level, "max");
+        assert_ne!(restored.thinking_level, "ultra");
+        assert_ne!(restored.thinking_level, "xhigh");
+    }
+
+    #[test]
     fn test_session_serialization_preserves_all_fields() {
         let mut session = Session::new(
             "claude-3-opus",
