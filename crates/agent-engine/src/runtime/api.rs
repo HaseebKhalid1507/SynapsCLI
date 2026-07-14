@@ -847,6 +847,7 @@ impl ApiMethods {
             cancel,
             &options.credential_source,
             &options.token_cache,
+            max_retries,
         )
         .await
         {

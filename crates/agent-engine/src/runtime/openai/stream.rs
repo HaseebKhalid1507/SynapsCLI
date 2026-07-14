@@ -11,6 +11,76 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+/// Send a provider streaming request, retrying transient failures.
+///
+/// Parity fix: the Anthropic path retries transient errors with backoff
+/// (`call_api_stream_inner`) but the provider routes were single-shot — one
+/// transport blip against e.g. `chatgpt.com` aborted an entire autonomous
+/// turn (incident: session 20260714-025948-3dab). Attempt *n* sleeps
+/// 1s·2^(n−1), mirroring the Anthropic budget semantics.
+///
+/// Retryable: transport-level send failures (timeout / connect / request)
+/// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
+/// and localhost connection refusals (Ollama/LM Studio not running — a
+/// setup problem, not a blip) fail fast. Backoff sleeps are cancel-aware.
+async fn send_with_retries(
+    label: &str,
+    url: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let mut attempt: u32 = 0;
+    loop {
+        let retry_delay = |attempt: u32| {
+            std::time::Duration::from_millis(1000 * 2u64.pow(attempt.saturating_sub(1)))
+        };
+        match build().send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) => {
+                let status = resp.status();
+                let retryable =
+                    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
+                let text = resp.text().await.unwrap_or_default();
+                if !retryable || attempt >= max_retries {
+                    return Err(format!("{label} request failed: {status}: {text}").into());
+                }
+                attempt += 1;
+                let delay = retry_delay(attempt);
+                tracing::warn!(
+                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}: {}",
+                    crate::truncate_str(&text, 200)
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                }
+            }
+            Err(e) => {
+                let localhost_refusal = e.is_connect() && url.contains("localhost");
+                let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                if localhost_refusal || !transient || attempt >= max_retries {
+                    tracing::warn!(
+                        "{label} request failed (no retry): {}",
+                        crate::core::error::error_chain_string(&e)
+                    );
+                    return Err(e.into());
+                }
+                attempt += 1;
+                let delay = retry_delay(attempt);
+                tracing::warn!(
+                    "{label} transport retry {attempt}/{max_retries} after {delay:?}: {}",
+                    crate::core::error::error_chain_string(&e)
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                }
+            }
+        }
+    }
+}
+
 /// Run a single streaming request against an OpenAI-compatible endpoint.
 ///
 /// Returns the final assistant response as an Anthropic-shaped content Value
@@ -169,6 +239,7 @@ pub(crate) async fn call_codex_stream_inner(
     max_tokens: Option<u32>,
     reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Validate the requested level before any credential or network access.
     use crate::runtime::openai::catalog::validate_codex_level;
@@ -222,23 +293,24 @@ pub(crate) async fn call_codex_stream_inner(
     );
     tracing::debug!(url=%url, model=%cfg.model, "codex stream request");
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(&access)
-        .header("chatgpt-account-id", account_id)
-        .header("originator", "synaps")
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("codex request failed: {status}: {text}").into());
-    }
+    let resp = send_with_retries(
+        "codex",
+        &url,
+        || {
+            client
+                .post(&url)
+                .bearer_auth(&access)
+                .header("chatgpt-account-id", account_id.as_str())
+                .header("originator", "synaps")
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+        },
+        cancel,
+        max_retries,
+    )
+    .await?;
 
     let mut accumulated_text = String::new();
     let mut parser = CodexSseDecoder::default();
@@ -1129,6 +1201,7 @@ mod codex_decoder_tests {
     }
 }
 
+
 #[cfg(test)]
 mod broker_stream_tests {
     //! Broker-boundary streaming tests: the OpenAI-compatible stream path is
@@ -1696,5 +1769,205 @@ mod codex_wire_tests {
                 .and_then(serde_json::Value::as_u64),
             Some(2048)
         );
+    }
+}
+
+#[cfg(test)]
+mod send_retry_tests {
+    //! Regression tests for transient-failure retry on the codex send path
+    //! (incident: session 20260714-025948-3dab — a single transport failure
+    //! against chatgpt.com aborted a whole autonomous turn because the codex
+    //! route was single-shot while the Anthropic route retried).
+    //!
+    //! Mirrors the `on401_tests` mock-server pattern in `runtime/api.rs`.
+    //! Credentials cross the broker boundary: a stub broker vends a
+    //! JWT-shaped token carrying the ChatGPT account-id claim.
+
+    use super::*;
+    use agent_core::auth::{AccessToken, BrokerError, ProxyByteStream, ProxyRequest, ProxyResponse};
+    use async_trait::async_trait;
+    use axum::{
+        http::StatusCode,
+        response::IntoResponse,
+        routing::post as axum_post,
+        Router,
+    };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::mpsc;
+
+    /// Minimal Responses-API SSE success body: one text delta + completed.
+    const CODEX_SSE_SUCCESS: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// JWT-shaped token whose payload carries the ChatGPT account-id claim
+    /// `extract_codex_account_id` looks for. Signature is irrelevant — the
+    /// mock server never validates it.
+    fn fake_codex_token() -> String {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_test" }
+        });
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(payload.to_string()))
+    }
+
+    /// Stub broker that vends the fake codex token. Everything else is
+    /// unreachable in these tests and fails closed.
+    struct TokenOnlyBroker;
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for TokenOnlyBroker {
+        async fn access_token(
+            &self,
+            _p: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            Ok(AccessToken {
+                token: fake_codex_token(),
+                expires: u64::MAX,
+            })
+        }
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn proxy_stream(
+            &self,
+            _request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Spawn a mock Codex endpoint. First `fail_count` POSTs → `fail_status`;
+    /// subsequent → SSE success. Returns (base_url, call_counter).
+    async fn spawn_mock_codex(
+        fail_count: usize,
+        fail_status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_count {
+                        (
+                            fail_status,
+                            [("content-type", "application/json")],
+                            "{\"error\":{\"message\":\"transient upstream sadness\"}}".to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            CODEX_SSE_SUCCESS.to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter)
+    }
+
+    async fn run_codex(
+        base_url: &str,
+        max_retries: u32,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = ProviderConfig {
+            base_url: base_url.to_string(),
+            // The incident model — validated against the static catalog ladder.
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        let client = reqwest::Client::new();
+        let broker: std::sync::Arc<dyn crate::auth::CredentialBroker> =
+            std::sync::Arc::new(TokenOnlyBroker);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        call_codex_stream_inner(
+            &cfg,
+            &client,
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            agent_core::reasoning::ReasoningLevel::Medium,
+            &tokio_util::sync::CancellationToken::new(),
+            max_retries,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn codex_retries_transient_500_then_succeeds() {
+        let (base_url, counter) = spawn_mock_codex(1, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let result = run_codex(&base_url, 2).await.expect(
+            "one transient 500 with retries available must not abort the turn",
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "expected exactly one retry");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn codex_retries_429_then_succeeds() {
+        let (base_url, counter) = spawn_mock_codex(1, StatusCode::TOO_MANY_REQUESTS).await;
+        run_codex(&base_url, 2)
+            .await
+            .expect("429 is transient — must retry");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_zero_retries_fails_fast_with_status_error() {
+        let (base_url, counter) =
+            spawn_mock_codex(usize::MAX, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "no retries budgeted");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 500"),
+            "status must survive for classification: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_retry_client_errors() {
+        let (base_url, counter) = spawn_mock_codex(usize::MAX, StatusCode::BAD_REQUEST).await;
+        let err = run_codex(&base_url, 3).await.expect_err("must fail");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "400 is deterministic — retrying it never helps"
+        );
+        assert!(err.to_string().starts_with("codex request failed: 400"));
+    }
+
+    #[tokio::test]
+    async fn codex_exhausted_retries_reports_last_status() {
+        let (base_url, counter) =
+            spawn_mock_codex(usize::MAX, StatusCode::SERVICE_UNAVAILABLE).await;
+        let err = run_codex(&base_url, 1).await.expect_err("must fail");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        assert!(err.to_string().starts_with("codex request failed: 503"));
     }
 }

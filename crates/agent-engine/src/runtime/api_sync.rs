@@ -62,6 +62,7 @@ impl ApiMethods {
             &tokio_util::sync::CancellationToken::new(),
             &options.credential_source,
             &options.token_cache,
+            max_retries,
         )
         .await
         {
@@ -328,6 +329,7 @@ impl ApiMethods {
             // uses the Local credential. (Broker-routed codex goes via the stream path.)
             &crate::auth::CredentialSource::Local,
             &crate::auth::TokenCache::new(),
+            max_retries,
         )
         .await
         {

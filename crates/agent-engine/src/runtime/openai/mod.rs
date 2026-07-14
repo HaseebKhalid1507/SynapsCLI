@@ -186,6 +186,7 @@ pub async fn try_route(
     cancel: &tokio_util::sync::CancellationToken,
     source: &crate::auth::CredentialSource,
     cache: &crate::auth::TokenCache,
+    max_retries: u32,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
@@ -473,6 +474,7 @@ pub async fn try_route(
                 max_tokens,
                 reasoning_level,
                 cancel,
+                max_retries,
             )
             .await,
         ),
@@ -639,6 +641,7 @@ mod tests {
             &cancel,
             &source,
             &cache,
+            0,
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -702,6 +705,7 @@ mod tests {
                 &cancel,
                 &source,
                 &cache,
+                0,
             )
             .await
             .expect("xai-auth must route through try_route");
