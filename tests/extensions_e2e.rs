@@ -691,6 +691,8 @@ async fn extension_provider_complete_routes_to_process() {
         &tokio_util::sync::CancellationToken::new(),
         &synaps_cli::auth::CredentialSource::Local,
         &synaps_cli::auth::TokenCache::new(),
+        3,
+        synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
     ).await.expect("extension route").unwrap();
 
     assert_eq!(result["content"][0]["text"], "echo:hello");
@@ -771,6 +773,8 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         &tokio_util::sync::CancellationToken::new(),
         &synaps_cli::auth::CredentialSource::Local,
         &synaps_cli::auth::TokenCache::new(),
+        3,
+        synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
     )
     .await
     .expect("route returned Some");
@@ -839,6 +843,8 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         &tokio_util::sync::CancellationToken::new(),
         &synaps_cli::auth::CredentialSource::Local,
         &synaps_cli::auth::TokenCache::new(),
+        3,
+        synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
     ).await.expect("extension route").unwrap();
 
     assert_eq!(result["content"][0]["text"], "final:from-provider");
@@ -1225,6 +1231,8 @@ async fn audit_log_records_disabled_route() {
         &tokio_util::sync::CancellationToken::new(),
         &synaps_cli::auth::CredentialSource::Local,
         &synaps_cli::auth::TokenCache::new(),
+        3,
+        synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
     )
     .await
     .expect("route returned Some");
