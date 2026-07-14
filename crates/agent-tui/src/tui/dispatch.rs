@@ -1381,6 +1381,14 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::ModelsExpandProvider(provider_key) => {
+            if provider_key == "openai-codex" {
+                // Source-controlled provider: never fetch a live catalog.
+                // Resolve through the same canonicalizing result path.
+                let _ = app
+                    .model_list_tx
+                    .send((provider_key, Ok(models::codex_static_expanded_entries())));
+                return ControlFlow::Continue(());
+            }
             if provider_key.contains(':') {
                 let tx = app.model_list_tx.clone();
                 let manager = synaps_cli::runtime::openai::extension_manager_for_routing();

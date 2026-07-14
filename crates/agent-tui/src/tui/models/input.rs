@@ -58,14 +58,11 @@ pub(crate) fn handle_event(
         }
         KeyCode::Char('e') => {
             if let Some(provider) = selected_provider(&sections, state) {
-                state.expanded = Some(ExpandedModelsState {
-                    provider_key: provider.provider_key.clone(),
-                    provider_name: provider.provider_name.clone(),
-                    cursor: 0,
-                    search: String::new(),
-                    load_state: ExpandedLoadState::Loading,
-                });
-                return InputOutcome::ExpandProvider(provider.provider_key.clone());
+                let (provider_key, provider_name) = (
+                    provider.provider_key.clone(),
+                    provider.provider_name.clone(),
+                );
+                return open_expanded_provider(state, provider_key, provider_name);
             }
             InputOutcome::None
         }
@@ -114,6 +111,33 @@ pub(crate) fn handle_event(
         }
         _ => InputOutcome::None,
     }
+}
+
+/// Open the expanded provider browser for `provider_key` (the 'e' key).
+///
+/// Source-controlled providers (openai-codex) resolve immediately to their
+/// static entries — no `ExpandProvider` action is emitted, so no network
+/// catalog fetch is ever initiated. All other providers (Anthropic included)
+/// enter `Loading` and request an async live catalog fetch as before.
+pub(crate) fn open_expanded_provider(
+    state: &mut ModelsModalState,
+    provider_key: String,
+    provider_name: String,
+) -> InputOutcome {
+    state.expanded = Some(ExpandedModelsState {
+        provider_key: provider_key.clone(),
+        provider_name,
+        cursor: 0,
+        search: String::new(),
+        load_state: ExpandedLoadState::Loading,
+    });
+    if provider_key == "openai-codex" {
+        // Canonicalization resolves this to the seven static OAuth entries
+        // (and marks favorites) — same central invariant as live results.
+        super::apply_model_list_result(state, &provider_key, Ok(Vec::new()));
+        return InputOutcome::None;
+    }
+    InputOutcome::ExpandProvider(provider_key)
 }
 
 fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOutcome {
@@ -228,6 +252,59 @@ mod tests {
                 "github-copilot"
             );
         }
+    }
+
+    #[test]
+    fn expanding_openai_codex_bypasses_network_and_shows_seven_static_rows() {
+        let mut state = ModelsModalState::new();
+        let outcome = open_expanded_provider(
+            &mut state,
+            "openai-codex".to_string(),
+            "OpenAI Codex".to_string(),
+        );
+        // No ExpandProvider action → no catalog fetch is ever initiated.
+        assert_eq!(
+            outcome,
+            InputOutcome::None,
+            "openai-codex expansion must not request a live catalog fetch"
+        );
+        let expanded = state.expanded.expect("expanded state");
+        assert_eq!(expanded.provider_key, "openai-codex");
+        match expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "openai-codex/gpt-5.6-sol",
+                        "openai-codex/gpt-5.6-terra",
+                        "openai-codex/gpt-5.6-luna",
+                        "openai-codex/gpt-5.5",
+                        "openai-codex/gpt-5.4",
+                        "openai-codex/gpt-5.4-mini",
+                        "openai-codex/gpt-5.3-codex-spark",
+                    ],
+                    "expanded rows must be exactly the seven static OAuth models, in order"
+                );
+            }
+            other => panic!("expected static Ready rows without fetching, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expanding_anthropic_still_requests_live_catalog() {
+        let mut state = ModelsModalState::new();
+        let outcome = open_expanded_provider(
+            &mut state,
+            "anthropic".to_string(),
+            "Anthropic".to_string(),
+        );
+        assert_eq!(
+            outcome,
+            InputOutcome::ExpandProvider("anthropic".to_string())
+        );
+        let expanded = state.expanded.expect("expanded state");
+        assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
     }
 
     #[test]

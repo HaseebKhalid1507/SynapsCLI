@@ -331,15 +331,57 @@ pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
     &["anthropic"]
 }
 
+/// Providers whose model lists are source-controlled: any live/injected
+/// catalog result is canonicalized to the static entries before it can touch
+/// ANY /models surface (main sections, /settings picker, expanded browser).
+const SOURCE_CONTROLLED_PROVIDER: &str = "openai-codex";
+
+/// The seven static OpenAI Codex OAuth models as expanded-browser entries,
+/// provider-qualified, in catalog order (`codex_static_catalog_models`).
+pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
+    synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
+        .into_iter()
+        .map(|model| {
+            let mut metadata = vec!["static".to_string()];
+            if model.codex_supported_levels().is_some() {
+                metadata.push("thinking".to_string());
+            }
+            ExpandedModelEntry::with_metadata(
+                model.runtime_id(),
+                model.display_label().to_string(),
+                false,
+                metadata,
+            )
+        })
+        .collect()
+}
+
+/// Central invariant: canonicalize a model-list result before it reaches any
+/// state. For `openai-codex` the result is ALWAYS the seven static OAuth
+/// entries — live rows, injected rows, and fetch errors alike are replaced.
+/// All other providers (Anthropic included) pass through unchanged.
+pub(crate) fn canonicalize_model_list_result(
+    provider_key: &str,
+    result: Result<Vec<ExpandedModelEntry>, String>,
+) -> Result<Vec<ExpandedModelEntry>, String> {
+    if provider_key == SOURCE_CONTROLLED_PROVIDER {
+        return Ok(codex_static_expanded_entries());
+    }
+    result
+}
+
 /// Apply a live catalog result to both expanded state and main-section overrides.
 ///
 /// On success, main sections for the provider switch from static seeds to the
 /// returned provider-qualified IDs. Errors leave static seeds in place.
+/// Results are canonicalized first (`canonicalize_model_list_result`), so no
+/// live openai-codex row can reach either surface through this choke point.
 pub(crate) fn apply_model_list_result(
     state: &mut ModelsModalState,
     provider_key: &str,
     result: Result<Vec<ExpandedModelEntry>, String>,
 ) {
+    let result = canonicalize_model_list_result(provider_key, result);
     // Always update expanded view when it matches this provider.
     set_expanded_models(
         state,
@@ -370,6 +412,11 @@ pub(crate) fn catalog_override_rows(
     provider_key: &str,
     models: &[ExpandedModelEntry],
 ) -> ProviderCatalogOverride {
+    if provider_key == SOURCE_CONTROLLED_PROVIDER {
+        // openai-codex sections/pickers are hardcoded to the seven static
+        // OAuth slugs — override rows must never exist for it.
+        return Vec::new();
+    }
     let prefix = format!("{provider_key}/");
     models
         .iter()
@@ -2086,6 +2133,122 @@ mod tests {
                 "gpt-5.3-codex-spark",
             ],
             "openai-codex picker rows must be exactly the seven hardcoded OAuth slugs, in order"
+        );
+    }
+
+    fn codex_static_qualified_ids() -> Vec<&'static str> {
+        vec![
+            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-terra",
+            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.4",
+            "openai-codex/gpt-5.4-mini",
+            "openai-codex/gpt-5.3-codex-spark",
+        ]
+    }
+
+    fn expanded_codex_state(load_state: ExpandedLoadState) -> ModelsModalState {
+        ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: Some(ExpandedModelsState {
+                provider_key: "openai-codex".into(),
+                provider_name: "OpenAI Codex".into(),
+                cursor: 0,
+                search: String::new(),
+                load_state,
+            }),
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// (d) Central invariant: a live/injected openai-codex list result must
+    /// not affect main-section overrides NOR the expanded 'e' browser rows.
+    /// Expanded OpenAI rows are exactly the seven static OAuth models, in
+    /// catalog order — dynamic IDs never appear anywhere in /models.
+    #[test]
+    fn injected_openai_codex_result_cannot_affect_overrides_or_expanded_rows() {
+        let mut state = expanded_codex_state(ExpandedLoadState::Loading);
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Ok(vec![
+                ExpandedModelEntry::new("openai-codex/o3".into(), "o3".into(), false),
+                ExpandedModelEntry::new(
+                    "openai-codex/gpt-6-alpha".into(),
+                    "GPT-6 Alpha".into(),
+                    false,
+                ),
+            ]),
+        );
+
+        assert!(
+            !state.provider_catalog_overrides.contains_key("openai-codex"),
+            "live openai-codex rows must never populate main-section overrides: {:?}",
+            state.provider_catalog_overrides
+        );
+        let expanded = state.expanded.as_ref().expect("expanded state");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    codex_static_qualified_ids(),
+                    "expanded OpenAI Codex rows must be exactly the seven static OAuth slugs"
+                );
+            }
+            other => panic!("expected static Ready rows, got {other:?}"),
+        }
+    }
+
+    /// (e) A failed live fetch for openai-codex also resolves to the static
+    /// seven — the expanded browser is source-controlled, never an error/
+    /// loading surface for this provider.
+    #[test]
+    fn openai_codex_expanded_error_result_falls_back_to_static_rows() {
+        let mut state = expanded_codex_state(ExpandedLoadState::Loading);
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Err("model list failed: HTTP 500".into()),
+        );
+        let expanded = state.expanded.as_ref().expect("expanded state");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, codex_static_qualified_ids());
+            }
+            other => panic!("expected static Ready rows, got {other:?}"),
+        }
+    }
+
+    /// (f) The shared override-row builder (also feeds the app-level catalog
+    /// cache behind /settings) must never emit live openai-codex rows, while
+    /// Anthropic stays dynamic.
+    #[test]
+    fn catalog_override_rows_never_emit_live_openai_codex_rows() {
+        let live = vec![ExpandedModelEntry::new(
+            "openai-codex/o3".into(),
+            "o3".into(),
+            false,
+        )];
+        assert!(
+            catalog_override_rows("openai-codex", &live).is_empty(),
+            "openai-codex override rows must be empty (static slugs are hardcoded)"
+        );
+        let anthropic = vec![ExpandedModelEntry::new(
+            "anthropic/claude-sonnet-4-7".into(),
+            "Sonnet 4.7".into(),
+            false,
+        )];
+        assert_eq!(
+            catalog_override_rows("anthropic", &anthropic),
+            vec![("claude-sonnet-4-7".to_string(), "Sonnet 4.7".to_string())],
+            "anthropic dynamic override rows must keep working"
         );
     }
 }
