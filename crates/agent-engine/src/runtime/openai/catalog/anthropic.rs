@@ -173,6 +173,46 @@ mod tests {
         }
     }
 
+    /// Drift guard: the exact static capability table and the legacy
+    /// substring wire-shape classifier (`model_supports_adaptive_thinking`,
+    /// explicitly deferred — see spec) must agree on the adaptive/fixed wire
+    /// shape for EVERY source-controlled descriptor. If either side changes,
+    /// this test forces reconciling the other.
+    #[test]
+    fn static_table_and_wire_shape_classifier_agree_for_known_models() {
+        use agent_core::models::{model_supports_adaptive_thinking, KNOWN_MODELS};
+        for (id, _label) in KNOWN_MODELS {
+            let expected = ReasoningSupport::AnthropicAdaptive {
+                adaptive: model_supports_adaptive_thinking(id),
+            };
+            assert_eq!(
+                anthropic_static_capability(id),
+                Some(expected),
+                "static table and wire-shape classifier disagree for {id}"
+            );
+        }
+        // Near-miss ids: the substring classifier may infer a wire shape, but
+        // the exact static table must stay fail-closed (None) — do NOT broaden
+        // it to substring inference.
+        for (id, classifier_infers_adaptive) in [
+            ("claude-opus-4-7-preview", true),
+            ("claude-fable-5-latest", true),
+            ("claude-sonnet-4-6-legacy", false),
+        ] {
+            assert_eq!(
+                anthropic_static_capability(id),
+                None,
+                "near-miss {id} must fail closed in the static table"
+            );
+            // Documented divergence: classifier substring-infers on near-miss.
+            assert_eq!(
+                agent_core::models::model_supports_adaptive_thinking(id),
+                classifier_infers_adaptive,
+                "classifier expectation drifted for {id}"
+            );
+        }
+    }
+
     #[test]
     fn live_parse_maps_explicit_unsupported_thinking_to_none() {
         let body = r#"{

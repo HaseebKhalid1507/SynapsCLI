@@ -67,6 +67,12 @@ Additional rules:
   (`output_config` is only ever emitted on adaptive-effort models).
 - Legacy numeric budgets (`/thinking 8192`, config `thinking_budget`) remain
   exact for Anthropic fixed-budget request construction.
+- Numeric `/thinking <N>` is validated at mutation time like named levels:
+  the budget's derived level (`from_legacy_budget`, never Max/Ultra) runs
+  through the same exact-model validator before mutating/persisting. Rejected
+  budgets leave state unchanged — never silently downgraded (e.g.
+  `/thinking 8192` is rejected on `xai-auth/grok-4.3`, maps to High and is
+  accepted on `xai-auth/grok-4.5`; exact budgets are preserved on Anthropic).
 - Unknown model / provider metadata fails closed for extended and
   provider-specific modes (Codex Max/Ultra on unknown Codex ids included).
 - Provider-qualified identity (`anthropic/<id>`, `xai-auth/<id>`,

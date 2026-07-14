@@ -193,9 +193,12 @@ pub fn handle_engine_command(
                     }
                 }
                 ThinkingSpec::Custom { budget, .. } => {
-                    // Custom budget: retain exact value; skip named-level validation
-                    // (bucketized level is for display only).
-                    runtime.set_thinking_budget_explicit(*budget);
+                    // Custom budget: validate the derived level against the
+                    // exact-model capability tables BEFORE mutating; on Ok the
+                    // exact budget is retained (Anthropic wire uses it as-is).
+                    if let Err(msg) = runtime.set_thinking_budget_checked(*budget) {
+                        return Some(CommandResult::Error(msg));
+                    }
                 }
             }
         }
@@ -485,6 +488,97 @@ mod tests {
         assert!(rt.is_reasoning_explicit());
         // Named level for display is High (4097..=16384 range).
         assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+    }
+
+    // ── Numeric `/thinking <N>` mutation-time validation (review corrective) ──
+
+    #[test]
+    fn custom_budget_rejected_on_xai_intrinsic_reasoning_leaves_state_unchanged() {
+        // /thinking 8192 derives High; grok-4.3 has no effort control → reject
+        // immediately, no mutation, no silent downgrade.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.3".to_string());
+        let before_budget = rt.thinking_budget_raw();
+        let before_level = rt.reasoning_level();
+        let before_explicit = rt.is_reasoning_explicit();
+        match handle_engine_command("thinking", "8192", &mut rt) {
+            Some(CommandResult::Error(msg)) => {
+                assert!(
+                    msg.contains("xai-auth/grok-4.3"),
+                    "message names model: {msg}"
+                )
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+        assert_eq!(
+            rt.thinking_budget_raw(),
+            before_budget,
+            "budget must be unchanged"
+        );
+        assert_eq!(
+            rt.reasoning_level(),
+            before_level,
+            "level must be unchanged"
+        );
+        assert_eq!(
+            rt.is_reasoning_explicit(),
+            before_explicit,
+            "provenance unchanged"
+        );
+    }
+
+    #[test]
+    fn custom_budget_rejected_on_xai_non_reasoning_model() {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.20-0309-non-reasoning".to_string());
+        let before_budget = rt.thinking_budget_raw();
+        match handle_engine_command("thinking", "8192", &mut rt) {
+            Some(CommandResult::Error(msg)) => {
+                assert!(msg.contains("non-reasoning"), "{msg}")
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+        assert_eq!(
+            rt.thinking_budget_raw(),
+            before_budget,
+            "state must be unchanged"
+        );
+    }
+
+    #[test]
+    fn custom_budget_maps_to_high_and_is_accepted_on_xai_45() {
+        // 8192 → High, which grok-4.5 supports exactly → accepted.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        match handle_engine_command("thinking", "8192", &mut rt) {
+            Some(CommandResult::ThinkingChanged { spec }) => {
+                assert_eq!(spec.level(), ReasoningLevel::High);
+                assert_eq!(spec.budget(), Some(8192));
+            }
+            other => panic!("expected ThinkingChanged, got {:?}", other),
+        }
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit());
+    }
+
+    #[test]
+    fn custom_budget_preserved_exactly_on_anthropic_fixed_budget_model() {
+        // Anthropic compatibility: numeric budgets stay exact (never bucketized
+        // away) and are accepted on fixed-budget thinking models.
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("claude-sonnet-4-6".to_string());
+        match handle_engine_command("thinking", "8192", &mut rt) {
+            Some(CommandResult::ThinkingChanged { spec }) => {
+                assert_eq!(spec.config_value(), "8192", "persists exact digits");
+            }
+            other => panic!("expected ThinkingChanged, got {:?}", other),
+        }
+        assert_eq!(
+            rt.thinking_budget_raw(),
+            8192,
+            "exact budget must be retained"
+        );
+        assert!(rt.is_reasoning_explicit());
     }
 
     #[test]

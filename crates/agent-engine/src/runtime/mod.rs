@@ -697,6 +697,23 @@ impl Runtime {
         self.set_reasoning_level_explicit(level);
         Ok(())
     }
+
+    /// Validate then apply a custom numeric thinking budget (`/thinking <N>`).
+    /// The budget's derived `ReasoningLevel` runs through the same exact-model
+    /// mutation validator as named levels (Anthropic fixed-budget models pass:
+    /// derived levels never exceed XHigh and thinking-capable descriptors
+    /// accept them). On `Ok` the exact budget is retained — never downgraded
+    /// to a named-level canonical budget. On `Err` state is unchanged.
+    pub fn set_thinking_budget_checked(&mut self, budget: u32) -> std::result::Result<(), String> {
+        let level = agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget);
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+            &self.model,
+            level,
+        )?;
+        self.set_thinking_budget_explicit(budget);
+        Ok(())
+    }
+
     pub fn reasoning_level(&self) -> agent_core::reasoning::ReasoningLevel {
         self.named_level.unwrap_or_else(|| {
             agent_core::reasoning::ReasoningLevel::from_legacy_budget(self.thinking_budget)

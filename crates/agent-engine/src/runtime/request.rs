@@ -90,8 +90,14 @@ impl<'a> RequestBody<'a> {
                 // Max/Ultra are rejected upstream for Anthropic models; if a
                 // stale value leaks here, fall back to the legacy
                 // budget-derived mapping rather than inventing an unsupported
-                // named effort on the wire.
+                // named effort on the wire. Loud in debug builds — this is a
+                // validation-layer bug, not a valid wire state.
                 _ => {
+                    debug_assert!(
+                        !reasoning_level.requires_codex_support(),
+                        "reasoning level '{reasoning_level}' must be rejected upstream \
+                         before reaching the Anthropic request body for {model}"
+                    );
                     let level = crate::core::models::thinking_level_for_budget(thinking_budget);
                     crate::core::models::effort_for_thinking_level(level)
                         .map(|effort| json!({ "effort": effort }))
@@ -317,6 +323,16 @@ mod anthropic_reasoning_body_tests {
             assert!(v.get("thinking").is_none(), "{model}");
             assert!(v.get("output_config").is_none(), "{model}");
         }
+    }
+
+    /// Max/Ultra must be rejected upstream by mutation validation; reaching
+    /// the Anthropic RequestBody with one is a logic error — surfaced loudly
+    /// in debug builds (release keeps the safe legacy-budget fallback).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "rejected upstream")]
+    fn max_level_reaching_anthropic_adaptive_body_panics_in_debug() {
+        let _ = body_json(ADAPTIVE_MODEL, 16384, ReasoningLevel::Max);
     }
 
     #[test]
