@@ -149,6 +149,31 @@ pub fn anthropic_mode_capabilities(qualified_model: &str) -> Option<AnthropicMod
     }
 }
 
+pub fn plan_standard_anthropic_transport(
+    model: &str,
+    requested_level: ReasoningLevel,
+    role: ExecutionRole,
+) -> Option<AnthropicExecutionPlan> {
+    if matches!(requested_level, ReasoningLevel::Max | ReasoningLevel::UltraCode) {
+        return None;
+    }
+    let wire_effort = match requested_level {
+        ReasoningLevel::Low => Some(AnthropicWireEffort::Low),
+        ReasoningLevel::Medium => Some(AnthropicWireEffort::Medium),
+        ReasoningLevel::High => Some(AnthropicWireEffort::High),
+        ReasoningLevel::XHigh => Some(AnthropicWireEffort::XHigh),
+        _ => None,
+    };
+    Some(AnthropicExecutionPlan {
+        qualified_model: model.to_owned(),
+        requested_level,
+        role,
+        mode: AnthropicExecutionMode::Standard,
+        wire_effort,
+        workflow: AnthropicWorkflowPlan::None,
+    })
+}
+
 pub fn plan_anthropic_execution(
     qualified_model: &str,
     requested_level: ReasoningLevel,
@@ -369,6 +394,37 @@ pub fn merge_catalog_pages(pages: Vec<Vec<CatalogModel>>) -> Vec<CatalogModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_transport_accepts_bare_or_unknown_models_but_special_modes_require_authority() {
+        for model in ["claude-haiku-4-5", "anthropic/unknown-model"] {
+            for level in [
+                ReasoningLevel::Off,
+                ReasoningLevel::Adaptive,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+            ] {
+                let plan = plan_standard_anthropic_transport(model, level, ExecutionRole::Foreground)
+                    .expect("ordinary transport plan");
+                assert_eq!(plan.mode, AnthropicExecutionMode::Standard);
+                assert_eq!(plan.qualified_model, model);
+            }
+            assert!(plan_standard_anthropic_transport(
+                model,
+                ReasoningLevel::Max,
+                ExecutionRole::Foreground
+            )
+            .is_none());
+            assert!(plan_standard_anthropic_transport(
+                model,
+                ReasoningLevel::UltraCode,
+                ExecutionRole::Foreground
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn exact_fable_mode_capabilities_are_evidence_locked() {

@@ -82,25 +82,11 @@ impl ApiMethods {
             })
             .cloned()
             .or_else(|| {
-                (!matches!(
+                crate::runtime::openai::catalog::plan_standard_anthropic_transport(
+                    qualified_model,
                     reasoning_level,
-                    agent_core::reasoning::ReasoningLevel::Max
-                        | agent_core::reasoning::ReasoningLevel::UltraCode
-                ))
-                .then(|| {
-                    crate::runtime::openai::catalog::plan_anthropic_execution(
-                        qualified_model,
-                        reasoning_level,
-                        options.codex_request_role,
-                        crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
-                            orchestration_policy: false,
-                            builtin_lifecycle_tools: false,
-                        },
-                        None,
-                    )
-                    .ok()
-                })
-                .flatten()
+                    options.codex_request_role,
+                )
             })
             .ok_or_else(|| {
                 RuntimeError::Config(

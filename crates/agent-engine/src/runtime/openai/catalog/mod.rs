@@ -44,7 +44,8 @@ mod xai;
 pub use anthropic::{
     anthropic_mode_capabilities, anthropic_models_url, anthropic_static_capability,
     merge_catalog_pages, parse_anthropic_catalog_models, parse_anthropic_catalog_page,
-    plan_anthropic_execution, AnthropicCatalogPage, AnthropicExecutionMode, AnthropicExecutionPlan,
+    plan_anthropic_execution, plan_standard_anthropic_transport, AnthropicCatalogPage,
+    AnthropicExecutionMode, AnthropicExecutionPlan,
     AnthropicPlanError, AnthropicPlanErrorCode, AnthropicPlanPrerequisites, AnthropicWireEffort,
     AnthropicWorkflowPlan,
 };
