@@ -178,6 +178,7 @@ pub enum AnthropicManifestErrorCode {
     EvidenceMissing,
 }
 
+#[cfg(test)]
 impl AnthropicManifestErrorCode {
     /// Stable diagnostic identifier. Typed const manifests cannot contain
     /// unknown enum values, so diagnostics intentionally never echo raw input.
