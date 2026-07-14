@@ -209,8 +209,8 @@ pub async fn run(
                             CommandResult::ModelChanged { model } => {
                                 eprintln!("model → {}", model);
                             }
-                            CommandResult::ThinkingChanged { level, budget } => {
-                                eprintln!("thinking → {} ({})", level, budget);
+                            CommandResult::ThinkingChanged { level, .. } => {
+                                eprintln!("thinking → {}", level);
                             }
                             CommandResult::Compact { custom_instructions } => {
                                 eprintln!("compacting...");

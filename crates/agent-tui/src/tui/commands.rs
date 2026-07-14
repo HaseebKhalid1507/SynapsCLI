@@ -382,11 +382,12 @@ pub(super) async fn handle_command(
                 CommandAction::None
             }
             CommandResult::ThinkingChanged { level, budget } => {
-                app.session.thinking_level = level.clone();
-                let status = persist_to_config("thinking", &thinking_config_value(&level, budget));
+                app.session.thinking_level = level.as_str().to_string();
+                let status = persist_to_config("thinking", &thinking_config_value(level, budget));
                 app.push_msg(ChatMessage::System(format!(
-                    "thinking set to: {} ({}) {}",
-                    level, budget, status
+                    "thinking set to: {} {}",
+                    level,
+                    status,
                 )));
                 CommandAction::None
             }
@@ -551,10 +552,13 @@ pub(super) async fn handle_command(
                 match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
-                        // Restore the session's thinking level alongside model
-                        // and system prompt (it's serialized round-trip, was
-                        // just never re-applied).
-                        if let Some(budget) =
+                        // Restore the session's named reasoning level so
+                        // max/ultra/off are not lost on resume.
+                        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(
+                            &session.thinking_level,
+                        ) {
+                            runtime.set_reasoning_level(level);
+                        } else if let Some(budget) =
                             synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
                         {
                             runtime.set_thinking_budget(budget);

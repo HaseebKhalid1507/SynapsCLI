@@ -112,6 +112,7 @@ impl ApiMethods {
             system_prompt,
             &auth_type,
             thinking_budget,
+            reasoning_level,
             options.cache_ttl,
             false,
         );

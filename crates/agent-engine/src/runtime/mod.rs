@@ -577,6 +577,28 @@ impl Runtime {
             })
             .unwrap_or(trimmed);
         self.model = cleaned.to_owned();
+        // For Codex models: apply the model's default reasoning level from
+        // capability metadata unless the caller has already set an explicit
+        // named level (named_level is Some).
+        if self.named_level.is_none() {
+            if let Some(model_id) = cleaned.strip_prefix("openai-codex/") {
+                use crate::runtime::openai::catalog::{
+                    capability_cache, codex_static_capability, ReasoningSupport,
+                };
+                let default_level =
+                    capability_cache::get(cleaned).and_then(|m| match m.reasoning {
+                        ReasoningSupport::CodexNamed { default_level, .. } => default_level,
+                        _ => None,
+                    })
+                    .or_else(|| match codex_static_capability(model_id)? {
+                        ReasoningSupport::CodexNamed { default_level, .. } => default_level,
+                        _ => None,
+                    });
+                if let Some(level) = default_level {
+                    self.set_reasoning_level(level);
+                }
+            }
+        }
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {

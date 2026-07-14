@@ -173,7 +173,7 @@ fn codex_reasoning_support(item: &CodexModelItem) -> ReasoningSupport {
 /// "default_reasoning_level": "...", ... }, ... ] }`.
 pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde_json::Error> {
     let resp: CodexModelsResponse = serde_json::from_str(body)?;
-    let models = resp
+    let models: Vec<CatalogModel> = resp
         .models
         .into_iter()
         .filter(|item| codex_model_is_selectable(item.visibility.as_deref(), item.supported_in_api))
@@ -188,6 +188,9 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
             Some(m)
         })
         .collect();
+    // Populate the process-local capability cache so validation paths
+    // (commands, settings) see live data without re-parsing.
+    super::capability_cache::populate(&models);
     Ok(models)
 }
 

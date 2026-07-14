@@ -33,15 +33,15 @@ struct Scenario {
     name: &'static str,
     model: &'static str,
     thinking_budget: u32,
+    /// Explicit reasoning level. Defaults to `Adaptive` for legacy scenarios
+    /// so byte-identity with pre-Off-semantics fixtures is preserved.
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
     ttl: CacheTtl,
     tools: Vec<Value>,
     system_prompt: Option<String>,
     auth_type: &'static str,
     messages: Vec<SharedMessage>,
-    /// true = streaming body (`"stream":true`), false = sync body (no key).
     stream: bool,
-    /// Scenario embeds `get_identity()` (oauth system blocks) — file compare
-    /// is only valid when the default identity is in effect.
     identity_sensitive: bool,
 }
 
@@ -102,6 +102,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "plain_no_tools_5m",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: vec![],
             system_prompt: None,
@@ -114,6 +115,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "tools_5m",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: two_tools(),
             system_prompt: None,
@@ -126,6 +128,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "tools_1h",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::OneHour,
             tools: two_tools(),
             system_prompt: None,
@@ -138,6 +141,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "tools_hybrid",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::Hybrid,
             tools: two_tools(),
             system_prompt: None,
@@ -150,6 +154,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "system_api_key_5m",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: two_tools(),
             system_prompt: Some("You are a terse assistant.".into()),
@@ -162,6 +167,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "system_oauth_hybrid",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::Hybrid,
             tools: two_tools(),
             system_prompt: Some("You are a terse assistant.".into()),
@@ -174,6 +180,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_no_effort",
             model: adaptive,
             thinking_budget: 0, // "adaptive" sentinel → no output_config
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: two_tools(),
             system_prompt: None,
@@ -186,6 +193,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_effort_high",
             model: adaptive,
             thinking_budget: 16384, // "high" → output_config.effort present
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: two_tools(),
             system_prompt: None,
@@ -198,6 +206,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "legacy_adaptive_fallback",
             model: legacy,
             thinking_budget: 0, // sentinel leaks into legacy path → 16384 fallback
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: vec![],
             system_prompt: None,
@@ -210,6 +219,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "sync_no_stream_1h",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::OneHour,
             tools: two_tools(),
             system_prompt: Some("You are a terse assistant.".into()),
@@ -222,6 +232,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "empty_history_no_tools_5m",
             model: legacy,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: vec![],
             system_prompt: None,
@@ -238,6 +249,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_tools_1h",
             model: adaptive,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::OneHour,
             tools: two_tools(),
             system_prompt: None,
@@ -250,12 +262,27 @@ fn scenarios() -> Vec<Scenario> {
             name: "adaptive_sync_system_5m",
             model: adaptive,
             thinking_budget: 16384,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
             ttl: CacheTtl::FiveMinutes,
             tools: vec![],
             system_prompt: Some("You review Rust code.".to_string()),
             auth_type: "api_key",
             messages: plain_history(),
             stream: false,
+            identity_sensitive: false,
+        },
+        // Off semantics: thinking field omitted entirely.
+        Scenario {
+            name: "off_legacy_no_thinking_field",
+            model: legacy,
+            thinking_budget: 0,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Off,
+            ttl: CacheTtl::FiveMinutes,
+            tools: vec![],
+            system_prompt: None,
+            auth_type: "api_key",
+            messages: plain_history(),
+            stream: true,
             identity_sensitive: false,
         },
     ]
@@ -275,29 +302,37 @@ fn scenarios() -> Vec<Scenario> {
 /// the old Vec-era code accidentally inserted `"content": null` on assistant
 /// messages lacking a content key via IndexMut; the Arc port does not).
 fn old_body_bytes(s: &Scenario) -> Vec<u8> {
+    use agent_core::reasoning::ReasoningLevel;
     let mut cleaned_messages = s.messages.to_vec();
     HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
     HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, s.ttl);
 
     let thinking_level = crate::core::models::thinking_level_for_budget(s.thinking_budget);
 
-    let mut body = json!({
-        "model": s.model,
-        "max_tokens": HelperMethods::max_tokens_for_model(s.model),
-        "messages": cleaned_messages,
-        "tools": &s.tools,
-        "stream": true,
-        "thinking": if crate::core::models::model_supports_adaptive_thinking(s.model) {
-            json!({ "type": "adaptive", "display": "summarized" })
-        } else {
-            let budget = if s.thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { s.thinking_budget };
-            json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-                "display": "summarized"
-            })
-        }
-    });
+    let mut body = if s.reasoning_level == ReasoningLevel::Off {
+        // Off: omit thinking field entirely.
+        json!({
+            "model": s.model,
+            "max_tokens": HelperMethods::max_tokens_for_model(s.model),
+            "messages": cleaned_messages,
+            "tools": &s.tools,
+            "stream": true,
+        })
+    } else {
+        json!({
+            "model": s.model,
+            "max_tokens": HelperMethods::max_tokens_for_model(s.model),
+            "messages": cleaned_messages,
+            "tools": &s.tools,
+            "stream": true,
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(s.model) {
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                let budget = if s.thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { s.thinking_budget };
+                json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" })
+            }
+        })
+    };
 
     // Sync transport (api_sync::call_api) never had a "stream" key — removing
     // from a BTreeMap-backed Value is byte-identical to never inserting it.
@@ -305,7 +340,9 @@ fn old_body_bytes(s: &Scenario) -> Vec<u8> {
         body.as_object_mut().unwrap().remove("stream");
     }
 
-    if crate::core::models::model_supports_adaptive_thinking(s.model) {
+    if crate::core::models::model_supports_adaptive_thinking(s.model)
+        && s.reasoning_level != agent_core::reasoning::ReasoningLevel::Off
+    {
         if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
             body["output_config"] = json!({"effort": effort});
         }
@@ -338,6 +375,7 @@ fn new_body_bytes(s: &Scenario) -> (Vec<u8>, bool, bool) {
         &s.system_prompt,
         s.auth_type,
         s.thinking_budget,
+        s.reasoning_level,
         s.ttl,
         s.stream,
     );

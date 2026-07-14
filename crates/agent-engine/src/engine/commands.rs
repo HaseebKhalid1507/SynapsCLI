@@ -3,6 +3,8 @@
 //! The engine processes a command and returns a `CommandResult`.
 //! Renderers (TUI, headless) decide how to display the result.
 
+use agent_core::reasoning::ReasoningLevel;
+
 /// Result of processing a slash command in the engine.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -20,10 +22,11 @@ pub enum CommandResult {
         model: String,
     },
 
-    /// Thinking budget was changed.
+    /// Thinking level was changed. `budget` is `None` for named-only levels
+    /// (Max/Ultra) that have no valid numeric representation.
     ThinkingChanged {
-        level: String,
-        budget: u32,
+        level: ReasoningLevel,
+        budget: Option<u32>,
     },
 
     /// System prompt was updated.
@@ -136,43 +139,62 @@ pub fn parse_command(input: &str) -> Option<(&str, &str)> {
     Some((cmd, arg))
 }
 
+/// Validate that `level` is permissible for the runtime's current model.
+/// Returns `Err(user-facing message)` if the level is unsupported.
+/// Currently enforced for Codex models; all other models accept any level.
+fn validate_level_for_model(level: ReasoningLevel, model: &str) -> Result<(), String> {
+    use crate::runtime::openai::catalog::{capability_cache, codex_static_capability,
+        ReasoningSupport};
+    let Some(model_id) = model.strip_prefix("openai-codex/") else {
+        return Ok(());
+    };
+    // Live cache takes priority; static fallback second.
+    let supported: Option<Vec<ReasoningLevel>> =
+        capability_cache::get(model).and_then(|m| match m.reasoning {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        })
+        .or_else(|| match codex_static_capability(model_id)? {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        });
+    let Some(supported) = supported else { return Ok(()); };
+    if supported.contains(&level) {
+        Ok(())
+    } else {
+        Err(format!(
+            "reasoning level '{}' is not supported by {}; supported: [{}]",
+            level, model,
+            supported.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
 /// Process commands that are pure engine logic — no TUI state needed.
 /// Returns None if the command needs TUI-level handling.
-///
-/// NOTE: this runs BEFORE any renderer-level command arms (the TUI calls it
-/// first and returns early on Some — see tui/commands.rs). Renderer arms for
-/// commands handled here are unreachable for the matched cases.
 pub fn handle_engine_command(
     cmd: &str,
     arg: &str,
     runtime: &mut crate::Runtime,
 ) -> Option<CommandResult> {
     let result = evaluate_engine_command(cmd, arg)?;
-    // Apply the runtime side effects of the (purely computed) result.
     match &result {
         CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
-        CommandResult::ThinkingChanged { level, budget } => {
-            // Named levels (max/ultra) use u32::MAX as a sentinel — do not
-            // write that sentinel to the budget field; let the runtime derive
-            // budget from the named level.
-            if let Some(parsed) = agent_core::reasoning::ReasoningLevel::parse(level) {
-                runtime.set_reasoning_level(parsed);
-            } else {
-                // Numeric custom budget path.
-                runtime.set_thinking_budget(*budget);
+        CommandResult::ThinkingChanged { level, .. } => {
+            // Validate against model capabilities BEFORE mutating runtime.
+            if let Err(msg) = validate_level_for_model(*level, runtime.model()) {
+                return Some(CommandResult::Error(msg));
             }
+            runtime.set_reasoning_level(*level);
         }
         _ => {}
     }
     Some(result)
 }
 
-/// Pure command → result mapping (no runtime mutation). Split out of
-/// `handle_engine_command` so dispatch can be unit-tested without a Runtime.
+/// Pure command → result mapping (no runtime mutation).
 pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
     match cmd {
-        // `models` is the TUI alias — intercept it identically so the
-        // non-empty-arg path has a single owner.
         "model" | "models" if !arg.is_empty() => Some(CommandResult::ModelChanged {
             model: arg.to_string(),
         }),
@@ -188,28 +210,23 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
                 Some(arg.to_string())
             },
         }),
-        _ => None, // Not an engine-level command — delegate to renderer
+        _ => None,
     }
 }
 
-/// Parse a `/thinking` argument into a canonical (level, budget) pair.
-///
-/// Named levels `max` and `ultra` set `budget = None`-sentinel (`u32::MAX`)
-/// to signal "named only, no numeric budget". Callers receiving
-/// `ThinkingChanged` must check `level` first.
-pub fn parse_thinking_arg(arg: &str) -> Result<(String, u32), String> {
-    use agent_core::reasoning::ReasoningLevel;
+/// Parse a `/thinking` argument into a `(ReasoningLevel, Option<u32>)`.
+/// `budget` is `None` for Max/Ultra which have no numeric representation.
+pub fn parse_thinking_arg(arg: &str) -> Result<(ReasoningLevel, Option<u32>), String> {
     match ReasoningLevel::parse(arg) {
-        Some(level) => {
-            let budget = level.to_legacy_budget().unwrap_or(u32::MAX);
-            Ok((level.as_str().to_string(), budget))
-        }
+        Some(level) => Ok((level, level.to_legacy_budget())),
         None => {
             if let Ok(n) = arg.trim().parse::<u32>() {
-                Ok((format!("custom({})", n), n))
+                // Custom numeric budget: bucketize to nearest named level.
+                Ok((ReasoningLevel::from_legacy_budget(n), Some(n)))
             } else {
                 Err(format!(
-                    "unknown thinking level: {} (use off/adaptive/low/medium/high/xhigh/max/ultra or a number)",
+                    "unknown thinking level: {} \
+                     (use off/adaptive/low/medium/high/xhigh/max/ultra or a number)",
                     arg
                 ))
             }
@@ -217,20 +234,12 @@ pub fn parse_thinking_arg(arg: &str) -> Result<(String, u32), String> {
     }
 }
 
-/// Config-file value for a thinking change: the canonical level name when it
-/// is one config.rs can parse back, otherwise the raw budget number (which
-/// `parse_thinking_budget` also accepts; 0 is the adaptive sentinel).
-pub fn thinking_config_value(level: &str, budget: u32) -> String {
-    match level {
-        "off" | "adaptive" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
-            level.to_string()
-        }
-        _ => budget.to_string(),
-    }
+/// Canonical config-file string for a thinking change.
+pub fn thinking_config_value(level: ReasoningLevel, _budget: Option<u32>) -> String {
+    level.as_str().to_string()
 }
 
-/// Persist a config key and return an honest, user-visible status suffix —
-/// never claims "(saved to config)" unless the write actually succeeded.
+/// Persist a config key and return a user-visible status suffix.
 pub fn persist_to_config(key: &str, value: &str) -> String {
     match crate::config::write_config_value(key, value) {
         Ok(()) => "(saved to config)".to_string(),
@@ -248,12 +257,10 @@ mod tests {
             Some(CommandResult::ModelChanged { model }) => assert_eq!(model, "claude-sonnet-4-6"),
             other => panic!("expected ModelChanged, got {:?}", other),
         }
-        // `models` alias intercepts identically
         assert!(matches!(
             evaluate_engine_command("models", "claude-opus-4-6"),
             Some(CommandResult::ModelChanged { .. })
         ));
-        // empty arg falls through to the renderer (model picker)
         assert!(evaluate_engine_command("model", "").is_none());
     }
 
@@ -261,63 +268,75 @@ mod tests {
     fn thinking_command_normalizes_levels() {
         match evaluate_engine_command("thinking", "high") {
             Some(CommandResult::ThinkingChanged { level, budget }) => {
-                assert_eq!(level, "high");
-                assert_eq!(budget, 16384);
+                assert_eq!(level, ReasoningLevel::High);
+                assert_eq!(budget, Some(16384));
             }
             other => panic!("expected ThinkingChanged, got {:?}", other),
         }
         assert_eq!(
             parse_thinking_arg("med").unwrap(),
-            ("medium".to_string(), 4096)
+            (ReasoningLevel::Medium, Some(4096))
         );
-        assert_eq!(
-            parse_thinking_arg("8192").unwrap(),
-            ("custom(8192)".to_string(), 8192)
-        );
+        // Custom numeric: bucketized to High (4097..=16384 range).
+        let (lvl, budget) = parse_thinking_arg("8192").unwrap();
+        assert_eq!(lvl, ReasoningLevel::High);
+        assert_eq!(budget, Some(8192));
+
         assert!(parse_thinking_arg("bogus").is_err());
         assert!(evaluate_engine_command("thinking", "").is_none());
     }
 
     #[test]
+    fn thinking_command_off_and_adaptive_are_distinct() {
+        let (off_lvl, off_bud) = parse_thinking_arg("off").unwrap();
+        let (adp_lvl, adp_bud) = parse_thinking_arg("adaptive").unwrap();
+        assert_eq!(off_lvl, ReasoningLevel::Off);
+        assert_eq!(off_bud, Some(0));
+        assert_eq!(adp_lvl, ReasoningLevel::Adaptive);
+        assert_eq!(adp_bud, Some(0));
+        assert_ne!(off_lvl, adp_lvl);
+    }
+
+    #[test]
+    fn max_and_ultra_have_no_budget() {
+        let (lvl, bud) = parse_thinking_arg("max").unwrap();
+        assert_eq!(lvl, ReasoningLevel::Max);
+        assert_eq!(bud, None, "max has no numeric budget");
+
+        let (lvl, bud) = parse_thinking_arg("ultra").unwrap();
+        assert_eq!(lvl, ReasoningLevel::Ultra);
+        assert_eq!(bud, None, "ultra has no numeric budget");
+
+        // xhigh still has a numeric budget
+        let (lvl, bud) = parse_thinking_arg("xhigh").unwrap();
+        assert_eq!(lvl, ReasoningLevel::XHigh);
+        assert_eq!(bud, Some(32768));
+    }
+
+    #[test]
+    fn thinking_config_value_is_named_for_all_levels() {
+        assert_eq!(thinking_config_value(ReasoningLevel::Off,      Some(0)),     "off");
+        assert_eq!(thinking_config_value(ReasoningLevel::Adaptive, Some(0)),     "adaptive");
+        assert_eq!(thinking_config_value(ReasoningLevel::Low,      Some(2048)),  "low");
+        assert_eq!(thinking_config_value(ReasoningLevel::Medium,   Some(4096)),  "medium");
+        assert_eq!(thinking_config_value(ReasoningLevel::High,     Some(16384)), "high");
+        assert_eq!(thinking_config_value(ReasoningLevel::XHigh,    Some(32768)), "xhigh");
+        assert_eq!(thinking_config_value(ReasoningLevel::Max,      None),        "max");
+        assert_eq!(thinking_config_value(ReasoningLevel::Ultra,    None),        "ultra");
+    }
+
+    #[test]
     fn compact_carries_custom_instructions() {
         match evaluate_engine_command("compact", "focus on auth") {
-            Some(CommandResult::Compact {
-                custom_instructions,
-            }) => {
+            Some(CommandResult::Compact { custom_instructions }) => {
                 assert_eq!(custom_instructions.as_deref(), Some("focus on auth"));
             }
             other => panic!("expected Compact, got {:?}", other),
         }
         assert!(matches!(
             evaluate_engine_command("compact", ""),
-            Some(CommandResult::Compact {
-                custom_instructions: None
-            })
+            Some(CommandResult::Compact { custom_instructions: None })
         ));
-    }
-
-    #[test]
-    fn thinking_config_value_is_parseable() {
-        assert_eq!(thinking_config_value("medium", 4096), "medium");
-        assert_eq!(thinking_config_value("adaptive", 0), "adaptive");
-        assert_eq!(thinking_config_value("off", 0), "off");
-        assert_eq!(thinking_config_value("custom(8192)", 8192), "8192");
-        // max/ultra must persist as their exact names
-        assert_eq!(thinking_config_value("max", u32::MAX), "max");
-        assert_eq!(thinking_config_value("ultra", u32::MAX), "ultra");
-    }
-
-    #[test]
-    fn max_and_ultra_are_preserved_not_aliased_to_xhigh() {
-        let (level, budget) = parse_thinking_arg("max").unwrap();
-        assert_eq!(level, "max");
-        assert_eq!(budget, u32::MAX, "max sentinel is u32::MAX");
-        let (level, budget) = parse_thinking_arg("ultra").unwrap();
-        assert_eq!(level, "ultra");
-        assert_eq!(budget, u32::MAX);
-        let (level, budget) = parse_thinking_arg("xhigh").unwrap();
-        assert_eq!(level, "xhigh");
-        assert_eq!(budget, 32768);
     }
 
     #[test]
@@ -341,5 +360,35 @@ mod tests {
         let contents = std::fs::read_to_string(home.join(".synaps-cli/config")).unwrap();
         assert!(contents.contains("model = claude-sonnet-4-6"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn validate_level_codex_sol_accepts_ultra() {
+        assert!(validate_level_for_model(
+            ReasoningLevel::Ultra,
+            "openai-codex/gpt-5.6-sol"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_level_codex_luna_rejects_ultra_leaves_state_unchanged() {
+        let err = validate_level_for_model(
+            ReasoningLevel::Ultra,
+            "openai-codex/gpt-5.6-luna",
+        )
+        .unwrap_err();
+        assert!(err.contains("ultra"));
+        assert!(err.contains("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn validate_level_non_codex_always_ok() {
+        for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7", "groq/llama-3"] {
+            assert!(
+                validate_level_for_model(ReasoningLevel::Ultra, model).is_ok(),
+                "non-Codex {model} should pass validation"
+            );
+        }
     }
 }

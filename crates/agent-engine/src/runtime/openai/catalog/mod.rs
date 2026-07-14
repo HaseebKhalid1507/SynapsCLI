@@ -30,6 +30,7 @@ pub const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTHROPIC_MODELS_MAX_PAGES: usize = 20;
 
 mod anthropic;
+pub mod capability_cache;
 mod codex;
 mod generic;
 mod github_copilot;

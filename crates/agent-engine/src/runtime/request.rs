@@ -41,7 +41,8 @@ pub(super) struct RequestBody<'a> {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<Value>,
-    thinking: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
     tools: MarkedTools<'a>,
 }
 
@@ -58,25 +59,26 @@ impl<'a> RequestBody<'a> {
         system_prompt: &Option<String>,
         auth_type: &str,
         thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
         ttl: CacheTtl,
         stream: bool,
     ) -> Self {
+        use agent_core::reasoning::ReasoningLevel;
         let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
-        let thinking = if adaptive {
-            json!({ "type": "adaptive", "display": "summarized" })
+        let thinking = if reasoning_level == ReasoningLevel::Off {
+            // Off: omit the thinking field entirely (safest; no unsupported wire shape).
+            None
+        } else if adaptive {
+            Some(json!({ "type": "adaptive", "display": "summarized" }))
         } else {
-            // Legacy path requires budget_tokens >= 1024 (Anthropic enforced).
-            // "adaptive" sentinel (0) on a legacy model falls back to "high".
             let budget = if thinking_budget == 0 {
                 crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
             } else {
                 thinking_budget
             };
-            json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" })
+            Some(json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" }))
         };
-        // Adaptive models: control thinking depth via effort (GA, no beta).
-        // "adaptive" level = omit output_config entirely (model decides).
-        let output_config = if adaptive {
+        let output_config = if adaptive && reasoning_level != ReasoningLevel::Off {
             let level = crate::core::models::thinking_level_for_budget(thinking_budget);
             crate::core::models::effort_for_thinking_level(level)
                 .map(|effort| json!({ "effort": effort }))
