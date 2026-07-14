@@ -77,7 +77,15 @@ impl ApiMethods {
             reasoning_level,
             options.codex_request_role,
             crate::runtime::openai::catalog::AnthropicPlanPrerequisites::installed(),
-            None,
+            crate::runtime::openai::catalog::capability_cache::get(qualified_model).and_then(
+                |entry| match entry.reasoning {
+                    crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                        adaptive,
+                    } => Some(adaptive),
+                    crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                    _ => None,
+                },
+            ),
         )
         .map_err(|error| {
             RuntimeError::Config(format!(

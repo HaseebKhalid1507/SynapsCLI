@@ -17,6 +17,14 @@ use super::{
     ReasoningSupport, XaiReasoningCapability,
 };
 
+/// Mutation validation is synchronous and therefore cannot establish that the
+/// runtime's async orchestration/tool prerequisites are actually installed.
+/// UltraCode must be revalidated by request/TUI apply with real prerequisites.
+const UNVERIFIED_ANTHROPIC_PREREQUISITES: AnthropicPlanPrerequisites = AnthropicPlanPrerequisites {
+    orchestration_policy: false,
+    builtin_lifecycle_tools: false,
+};
+
 /// Conservative option set for providers without authoritative exact-model
 /// metadata. Never includes max/ultra.
 const CONSERVATIVE_OPTIONS: &[&str] = &["off", "adaptive", "low", "medium", "high", "xhigh"];
@@ -150,7 +158,7 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
                 model,
                 level,
                 CodexRequestRole::Foreground,
-                AnthropicPlanPrerequisites::installed(),
+                UNVERIFIED_ANTHROPIC_PREREQUISITES,
                 capability_cache::get(model).and_then(|entry| match entry.reasoning {
                     ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
                     ReasoningSupport::None => Some(false),
@@ -274,11 +282,39 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
         };
     }
     if let Some(model_id) = anthropic_model_id(model) {
+        let live = model
+            .starts_with("anthropic/")
+            .then(|| capability_cache::get(model))
+            .flatten()
+            .map(|entry| entry.reasoning);
+        let specials_authorized = super::anthropic_mode_capabilities(model).is_some()
+            && !matches!(live, Some(ReasoningSupport::None));
         return match anthropic_capability(model_id) {
-            // Thinking-capable (adaptive effort or legacy budget tiers).
+            // Thinking-capable (adaptive effort or legacy budget tiers). Generic
+            // live true preserves exact static authority but cannot invent it.
+            Some(ReasoningSupport::AnthropicAdaptive { .. }) if specials_authorized => owned(&[
+                "off",
+                "adaptive",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode",
+            ]),
             Some(ReasoningSupport::AnthropicAdaptive { .. }) => owned(CONSERVATIVE_OPTIONS),
-            // Explicit evidence of no thinking support.
+            // Explicit live false revokes both special modes.
             Some(ReasoningSupport::None) => owned(&["off", "adaptive"]),
+            _ if specials_authorized => owned(&[
+                "off",
+                "adaptive",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode",
+            ]),
             _ => owned(CONSERVATIVE_OPTIONS),
         };
     }
@@ -289,6 +325,24 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use ReasoningLevel::*;
+
+    #[test]
+    fn fable_options_expose_distinct_special_modes() {
+        let model = "anthropic/claude-fable-5";
+        assert_eq!(
+            thinking_options_for_model(model),
+            [
+                "off",
+                "adaptive",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode"
+            ]
+        );
+    }
 
     // ── xAI mutation matrix ──────────────────────────────────────────────────
 

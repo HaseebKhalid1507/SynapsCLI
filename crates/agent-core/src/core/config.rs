@@ -587,7 +587,7 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                         config.thinking_budget = Some(budget);
                     }
                     None => {
-                        config.warnings.push(format!("thinking = {val} — expected off|adaptive|low|medium|high|xhigh|max|ultra or a token count; thinking disabled"));
+                        config.warnings.push(format!("thinking = {val} — expected off|adaptive|low|medium|high|xhigh|max|ultra|ultracode or a token count; thinking disabled"));
                     }
                 }
             }
