@@ -60,6 +60,7 @@ impl<'a> RequestBody<'a> {
         auth_type: &str,
         thinking_budget: u32,
         reasoning_level: agent_core::reasoning::ReasoningLevel,
+        execution_plan: Option<&crate::runtime::openai::catalog::AnthropicExecutionPlan>,
         ttl: CacheTtl,
         stream: bool,
     ) -> Self {
@@ -79,28 +80,38 @@ impl<'a> RequestBody<'a> {
             Some(json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" }))
         };
         let output_config = if adaptive && reasoning_level != ReasoningLevel::Off {
-            match reasoning_level {
-                // Adaptive: model decides — omit output_config.effort.
-                ReasoningLevel::Adaptive => None,
-                // The NAMED level is authoritative for the exact effort value.
-                ReasoningLevel::Low
-                | ReasoningLevel::Medium
-                | ReasoningLevel::High
-                | ReasoningLevel::XHigh => Some(json!({ "effort": reasoning_level.as_str() })),
-                // Max/Ultra are rejected upstream for Anthropic models; if a
-                // stale value leaks here, fall back to the legacy
-                // budget-derived mapping rather than inventing an unsupported
-                // named effort on the wire. Loud in debug builds — this is a
-                // validation-layer bug, not a valid wire state.
-                _ => {
-                    debug_assert!(
-                        !reasoning_level.requires_codex_support(),
-                        "reasoning level '{reasoning_level}' must be rejected upstream \
+            if let Some(plan) = execution_plan {
+                plan.wire_effort
+                    .map(|effort| json!({ "effort": effort.as_str() }))
+            } else {
+                match reasoning_level {
+                    // Adaptive: model decides — omit output_config.effort.
+                    ReasoningLevel::Adaptive => None,
+                    // The NAMED level is authoritative for the exact effort value.
+                    ReasoningLevel::Low
+                    | ReasoningLevel::Medium
+                    | ReasoningLevel::High
+                    | ReasoningLevel::XHigh => Some(json!({ "effort": reasoning_level.as_str() })),
+                    // Max/Ultra are rejected upstream for Anthropic models; if a
+                    // stale value leaks here, fall back to the legacy
+                    // budget-derived mapping rather than inventing an unsupported
+                    // named effort on the wire. Loud in debug builds — this is a
+                    // validation-layer bug, not a valid wire state.
+                    _ => {
+                        debug_assert!(
+                            !matches!(
+                                reasoning_level,
+                                ReasoningLevel::Max
+                                    | ReasoningLevel::Ultra
+                                    | ReasoningLevel::UltraCode
+                            ),
+                            "reasoning level '{reasoning_level}' must be rejected upstream \
                          before reaching the Anthropic request body for {model}"
-                    );
-                    let level = crate::core::models::thinking_level_for_budget(thinking_budget);
-                    crate::core::models::effort_for_thinking_level(level)
-                        .map(|effort| json!({ "effort": effort }))
+                        );
+                        let level = crate::core::models::thinking_level_for_budget(thinking_budget);
+                        crate::core::models::effort_for_thinking_level(level)
+                            .map(|effort| json!({ "effort": effort }))
+                    }
                 }
             }
         } else {
@@ -300,6 +311,15 @@ mod anthropic_reasoning_body_tests {
     const FIXED_MODEL: &str = "claude-sonnet-4-6";
 
     fn body_json(model: &str, thinking_budget: u32, level: ReasoningLevel) -> serde_json::Value {
+        body_json_with_plan(model, thinking_budget, level, None)
+    }
+
+    fn body_json_with_plan(
+        model: &str,
+        thinking_budget: u32,
+        level: ReasoningLevel,
+        plan: Option<&crate::runtime::openai::catalog::AnthropicExecutionPlan>,
+    ) -> serde_json::Value {
         let messages: Vec<crate::SharedMessage> =
             vec![Arc::new(json!({"role": "user", "content": "hi"}))];
         let body = RequestBody::new(
@@ -310,6 +330,7 @@ mod anthropic_reasoning_body_tests {
             "api_key",
             thinking_budget,
             level,
+            plan,
             CacheTtl::FiveMinutes,
             false,
         );
@@ -365,6 +386,31 @@ mod anthropic_reasoning_body_tests {
                 v["thinking"],
                 json!({"type": "adaptive", "display": "summarized"})
             );
+        }
+    }
+
+    #[test]
+    fn typed_special_plans_drive_exact_effort_without_logical_wire_leak() {
+        use crate::runtime::openai::catalog::{
+            plan_anthropic_execution, AnthropicPlanPrerequisites, ExecutionRole,
+        };
+        for (level, effort) in [
+            (ReasoningLevel::Max, "max"),
+            (ReasoningLevel::UltraCode, "xhigh"),
+            (ReasoningLevel::XHigh, "xhigh"),
+        ] {
+            let plan = plan_anthropic_execution(
+                "anthropic/claude-fable-5",
+                level,
+                ExecutionRole::Foreground,
+                AnthropicPlanPrerequisites::installed(),
+                None,
+            )
+            .unwrap();
+            let value = body_json_with_plan(ADAPTIVE_MODEL, 0, level, Some(&plan));
+            assert_eq!(value["output_config"], json!({"effort": effort}));
+            assert_eq!(value["thinking"]["type"], "adaptive");
+            assert!(!serde_json::to_string(&value).unwrap().contains("ultracode"));
         }
     }
 

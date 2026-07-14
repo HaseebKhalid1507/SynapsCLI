@@ -861,6 +861,28 @@ impl ApiMethods {
         }
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.
+        let qualified_model = model;
+        let execution_plan = crate::runtime::openai::catalog::plan_anthropic_execution(
+            qualified_model,
+            reasoning_level,
+            options.codex_request_role,
+            crate::runtime::openai::catalog::AnthropicPlanPrerequisites::installed(),
+            crate::runtime::openai::catalog::capability_cache::get(qualified_model).and_then(
+                |entry| match entry.reasoning {
+                    crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                        adaptive,
+                    } => Some(adaptive),
+                    crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                    _ => None,
+                },
+            ),
+        )
+        .map_err(|error| {
+            RuntimeError::Config(format!(
+                "Anthropic execution plan rejected: {}",
+                error.code().as_str()
+            ))
+        })?;
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         // Read auth state for this API call
@@ -901,6 +923,7 @@ impl ApiMethods {
             &auth_type,
             thinking_budget,
             reasoning_level,
+            Some(&execution_plan),
             options.cache_ttl,
             true,
         );

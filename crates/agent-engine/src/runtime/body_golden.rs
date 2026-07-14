@@ -382,6 +382,7 @@ fn new_body_bytes(s: &Scenario) -> (Vec<u8>, bool, bool) {
         s.auth_type,
         s.thinking_budget,
         s.reasoning_level,
+        None,
         s.ttl,
         s.stream,
     );
