@@ -55,39 +55,39 @@ pub fn set_base_dir_for_tests(path: PathBuf) {
 /// Resolves a path for reading. Checks the profile folder first, then falls back to the default folder.
 pub fn resolve_read_path(filename: &str) -> PathBuf {
     let base = base_dir();
-
+    
     if let Some(profile) = get_profile() {
         let profile_path = base.join(&profile).join(filename);
         if profile_path.exists() {
             return profile_path;
         }
     }
-
+    
     base.join(filename)
 }
 
 /// Resolves a path for reading with an extended arbitrary path tree.
 pub fn resolve_read_path_extended(path: &str) -> PathBuf {
     let base = base_dir();
-
+    
     if let Some(profile) = get_profile() {
         let profile_path = base.join(&profile).join(path);
         if profile_path.exists() {
             return profile_path;
         }
     }
-
+    
     base.join(path)
 }
 
 /// Resolves a path for writing. Unconditionally writes to the profile folder if a profile is active.
 pub fn resolve_write_path(filename: &str) -> PathBuf {
     let mut base = base_dir();
-
+    
     if let Some(profile) = get_profile() {
         base.push(profile);
     }
-
+    
     let _ = std::fs::create_dir_all(&base);
     base.join(filename)
 }
@@ -544,11 +544,11 @@ pub fn load_config_from_str(content: &str) -> SynapsConfig {
 pub fn load_config() -> SynapsConfig {
     let path = resolve_read_path("config");
     let mut config = SynapsConfig::default();
-
+    
     let Ok(content) = std::fs::read_to_string(&path) else {
         return config;
     };
-
+    
     apply_config_content(&mut config, &content);
 
     // Publish provider keys to the process-wide cache for the API router.
@@ -1334,7 +1334,7 @@ disabled_skills = baz, plug:qual
         let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-new-keys/.synaps-cli");
         let _ = std::fs::create_dir_all(&test_dir);
         let config_path = test_dir.join("config");
-
+        
         let config_content = r#"
 # Test config with new keys
 model = claude-haiku
@@ -1346,23 +1346,23 @@ subagent_timeout = 120
 api_retries = 5
 "#;
         std::fs::write(&config_path, config_content).unwrap();
-
+        
         // Temporarily override the config path for this test
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/tmp/synaps-config-test-new-keys");
-
+        
         let config = load_config();
-
+        
         // Restore original HOME
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
             std::env::remove_var("HOME");
         }
-
+        
         // Cleanup
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-new-keys");
-
+        
         assert_eq!(config.model, Some("claude-haiku".to_string()));
         assert_eq!(config.thinking_budget, Some(4096)); // medium = 4096
         assert_eq!(config.max_tool_output, 50000);

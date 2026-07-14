@@ -2236,7 +2236,7 @@ mod set_reasoning_level_checked_tests {
         let mut rt = Runtime::new_headless();
         rt.set_model("claude-opus-4-7".to_string());
         rt.set_reasoning_level(ReasoningLevel::Low);
-        for level in [ReasoningLevel::Ultra] {
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
             assert!(rt.set_reasoning_level_checked(level).is_err());
             assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
         }
@@ -2248,7 +2248,7 @@ mod set_reasoning_level_checked_tests {
     fn checked_rejects_max_ultra_for_unknown_codex_model() {
         let mut rt = codex_runtime("gpt-unknown-future");
         rt.set_reasoning_level(ReasoningLevel::Low);
-        for level in [ReasoningLevel::Ultra] {
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
             let err = rt.set_reasoning_level_checked(level).unwrap_err();
             assert!(err.contains("no capability metadata"), "{err}");
             assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);

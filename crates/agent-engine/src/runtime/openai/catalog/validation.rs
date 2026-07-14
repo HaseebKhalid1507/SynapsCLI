@@ -85,7 +85,7 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
         if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
             return Ok(());
         }
-        if level == ReasoningLevel::Ultra {
+        if matches!(level, ReasoningLevel::Max | ReasoningLevel::Ultra) {
             return plan_codex_execution(model, level, CodexRequestRole::Foreground, None)
                 .map(|_| ())
                 .map_err(|error| error.to_string());
@@ -139,10 +139,14 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
         };
     }
     if let Some(model_id) = anthropic_model_id(model) {
-        if model.starts_with("anthropic/")
-            && matches!(level, ReasoningLevel::Max | ReasoningLevel::UltraCode)
-        {
-            let capabilities = super::anthropic_mode_capabilities(model).map(|caps| {
+        if matches!(level, ReasoningLevel::Max | ReasoningLevel::UltraCode) {
+            // Max/UltraCode require an exact qualified Anthropic capability row;
+            // bare/unknown Anthropic identities must fail closed.
+            let capabilities = model
+                .starts_with("anthropic/")
+                .then(|| super::anthropic_mode_capabilities(model))
+                .flatten()
+                .map(|caps| {
                 caps.narrow_with_live_effort(capability_cache::get(model).and_then(|entry| {
                     match entry.reasoning {
                         ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
