@@ -15,7 +15,7 @@
         {"effort": "max"},
         {"effort": "ultra"}
       ],
-      "default_reasoning_level": "high"
+      "default_reasoning_level": "low"
     },
     {
       "slug": "gpt-5.6-terra",
@@ -32,7 +32,7 @@
         {"effort": "max"},
         {"effort": "ultra"}
       ],
-      "default_reasoning_level": "high"
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "gpt-5.6-luna",
@@ -48,7 +48,7 @@
         {"effort": "xhigh"},
         {"effort": "max"}
       ],
-      "default_reasoning_level": "high"
+      "default_reasoning_level": "medium"
     },
     {
       "slug": "gpt-5.5",
@@ -108,7 +108,7 @@
         {"effort": "high"},
         {"effort": "xhigh"}
       ],
-      "default_reasoning_level": "medium"
+      "default_reasoning_level": "high"
     },
     {
       "slug": "codex-auto-review",

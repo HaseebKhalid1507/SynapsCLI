@@ -13,6 +13,7 @@ pub use agent_tui::{tui, toast};
 extern crate self as synaps_cli;
 
 // Re-export core modules at crate root for backward compatibility
+pub use core::reasoning;
 pub use core::config;
 pub use core::session;
 pub use core::auth;
