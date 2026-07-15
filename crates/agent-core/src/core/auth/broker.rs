@@ -273,20 +273,20 @@ impl ProxyRequest {
         // Per-provider endpoint allowlist: a signed proxy request can only
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
-        if !(self.provider == "xai-auth" && self.path == "/responses"
+        let oauth_path_allowed = self.provider == "xai-auth" && self.path == "/responses"
             || self.provider == "github-copilot"
                 && matches!(
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
-                ))
-            && !(self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path))
-            && !(self.provider == "openai-codex"
+                )
+            || self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
+            || self.provider == "openai-codex"
                 && self.method == ProxyMethod::Get
-                && is_allowed_openai_codex_path(&self.path))
-            && !(self.provider == "anthropic"
+                && is_allowed_openai_codex_path(&self.path)
+            || self.provider == "anthropic"
                 && self.method == ProxyMethod::Get
-                && is_allowed_anthropic_path(&self.path))
-            && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
+                && is_allowed_anthropic_path(&self.path);
+        if !oauth_path_allowed && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
         {
             return Err(BrokerError::Denied(format!(
                 "proxy path '{}' is not in the provider's endpoint allowlist",
