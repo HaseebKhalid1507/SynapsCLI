@@ -1,13 +1,13 @@
 //! Zero-network Google Gemini OAuth harness.
 //!
-//! Exercises `login_with` end-to-end against a loopback OAuth token endpoint
+//! Exercises `login_with_registration` end-to-end against a loopback OAuth token endpoint
 //! and a driver "browser" that completes the loopback callback. No production
 //! Google host is contacted at any point.
 
 use agent_core::auth::google_gemini::{
-    build_authorize_url, credentials_from_token_response, login_with, parse_pasted_callback,
-    redirect_uri, refresh_with_endpoint, GeminiAuthError, CALLBACK_HOST, CALLBACK_PATH,
-    CLIENT_ID, CLIENT_SECRET, PROVIDER,
+    build_authorize_url, credentials_from_token_response, login_with_registration,
+    parse_pasted_callback, redirect_uri, refresh_with_registration, GeminiAuthError,
+    GeminiRegistration, CALLBACK_HOST, CALLBACK_PATH, PROVIDER,
 };
 use axum::{
     extract::State,
@@ -82,6 +82,13 @@ fn free_loopback_port() -> u16 {
 
 // ── E2E: full login flow ─────────────────────────────────────────────────────
 
+const TEST_CLIENT_ID: &str = "synaps-google-desktop-client.example";
+const TEST_CLIENT_VALUE: &str = "public-installed-app-value";
+
+fn test_registration() -> GeminiRegistration {
+    GeminiRegistration::test(TEST_CLIENT_ID, Some(TEST_CLIENT_VALUE)).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn login_completes_via_loopback_and_stores_atomically() {
@@ -99,10 +106,11 @@ async fn login_completes_via_loopback_and_stores_atomically() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", home.path());
 
-    let creds = login_with(
+    let creds = login_with_registration(
         port,
         &token_url,
         /* allow_http_token_endpoint = */ true,
+        test_registration(),
         |auth_url| {
             let url = url::Url::parse(auth_url).unwrap();
             let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -110,7 +118,7 @@ async fn login_completes_via_loopback_and_stores_atomically() {
             let redirect_uri = q.get("redirect_uri").cloned().unwrap();
             // Complete the callback like a real browser would.
 
-tokio::spawn(async move {
+            tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let cb = format!("{redirect_uri}?code=abc123&state={state}");
                 let _ = reqwest::Client::new().get(&cb).send().await;
@@ -130,12 +138,21 @@ tokio::spawn(async move {
     let forms = seen.0.lock().unwrap().clone();
     assert_eq!(forms.len(), 1);
     let f = &forms[0];
-    assert_eq!(f.get("grant_type").map(String::as_str), Some("authorization_code"));
+    assert_eq!(
+        f.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
     assert_eq!(f.get("code").map(String::as_str), Some("abc123"));
-    assert_eq!(f.get("client_id").map(String::as_str), Some(CLIENT_ID));
-    // Installed-app secret is required for the token exchange but never logged.
-    assert_eq!(f.get("client_secret").map(String::as_str), Some(CLIENT_SECRET));
-    assert!(f.get("code_verifier").map(|v| !v.is_empty()).unwrap_or(false));
+    assert_eq!(f.get("client_id").map(String::as_str), Some(TEST_CLIENT_ID));
+    // Optional installed-app client value is configured, sent, and never logged.
+    assert_eq!(
+        f.get("client_secret").map(String::as_str),
+        Some(TEST_CLIENT_VALUE)
+    );
+    assert!(f
+        .get("code_verifier")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false));
     assert_eq!(
         f.get("redirect_uri").map(String::as_str),
         Some(redirect_uri(port).as_str())
@@ -164,13 +181,13 @@ async fn login_surfaces_token_error_without_leaking_secrets() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", home.path());
 
-    let err = login_with(port, &token_url, true, |auth_url| {
+    let err = login_with_registration(port, &token_url, true, test_registration(), |auth_url| {
         let url = url::Url::parse(auth_url).unwrap();
         let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
         let state = q["state"].clone();
         let redirect_uri = q["redirect_uri"].clone();
 
-tokio::spawn(async move {
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let cb = format!("{redirect_uri}?code=abc&state={state}");
             let _ = reqwest::Client::new().get(&cb).send().await;
@@ -183,7 +200,7 @@ tokio::spawn(async move {
     assert!(err.contains("google-gemini"));
     assert!(err.contains("400"));
     // No client secret, no code, no state.
-    assert!(!err.contains(CLIENT_SECRET));
+    assert!(!err.contains(TEST_CLIENT_VALUE));
     assert!(!err.contains("abc"));
 }
 
@@ -199,26 +216,41 @@ async fn refresh_grant_carries_forward_previous_refresh_token() {
     .await;
 
     let client = reqwest::Client::new();
-    let refreshed = refresh_with_endpoint(&client, &token_url, true, "old-refresh")
-        .await
-        .expect("refresh with omitted refresh_token must carry the old one");
+    let registration = test_registration();
+    let refreshed =
+        refresh_with_registration(&client, &token_url, true, &registration, "old-refresh")
+            .await
+            .expect("refresh with omitted refresh_token must carry the old one");
     assert_eq!(refreshed.access, "new-access");
     assert_eq!(refreshed.refresh, "old-refresh");
 
     // Verify wire form used the refresh grant.
     let form = seen.0.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(form.get("grant_type").map(String::as_str), Some("refresh_token"));
-    assert_eq!(form.get("refresh_token").map(String::as_str), Some("old-refresh"));
-    assert_eq!(form.get("client_id").map(String::as_str), Some(CLIENT_ID));
-    assert_eq!(form.get("client_secret").map(String::as_str), Some(CLIENT_SECRET));
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("refresh_token")
+    );
+    assert_eq!(
+        form.get("refresh_token").map(String::as_str),
+        Some("old-refresh")
+    );
+    assert_eq!(
+        form.get("client_id").map(String::as_str),
+        Some(TEST_CLIENT_ID)
+    );
+    assert_eq!(
+        form.get("client_secret").map(String::as_str),
+        Some(TEST_CLIENT_VALUE)
+    );
 }
 
 // ── Structural sanity: pure helpers still hold under harness compile ─────────
 
 #[test]
 fn pure_helpers_are_reachable_from_harness() {
-    let url = build_authorize_url("cc", "st", 45289);
-    assert!(url.contains(CLIENT_ID));
+    let registration = test_registration();
+    let url = build_authorize_url(&registration, "cc", "st", 45289);
+    assert!(url.contains(TEST_CLIENT_ID));
     // Scopes are percent-encoded in the query string; check the tail token.
     assert!(url.contains("cloud-platform"));
     assert!(url.contains("state=st"));

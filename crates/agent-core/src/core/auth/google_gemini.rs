@@ -49,16 +49,14 @@ pub const SCOPES: &str = concat!(
     " https://www.googleapis.com/auth/userinfo.profile",
 );
 
-/// OAuth installed-app client id observed in the official Gemini CLI source
-/// (`packages/core/src/code_assist/oauth2.ts`). Per Google's own installed-app
-/// documentation the paired "secret" is not a true secret; we still send it
-/// verbatim to the token endpoint but never expose it outside this module.
-pub const CLIENT_ID: &str =
-    "redacted-google-desktop-client.invalid";
+/// Environment variable containing the Synaps-owned Google Desktop OAuth
+/// client registration used for Gemini Code Assist.
+pub const CLIENT_ID_ENV: &str = "SYNAPS_GOOGLE_GEMINI_CLIENT_ID";
 
-/// See CLIENT_ID note: not a confidential secret in the RFC 6749 sense — it is
-/// an installed-app "secret" that the Gemini CLI publishes in its source.
-pub const CLIENT_SECRET: &str = "redacted-public-client-value";
+/// Optional installed-app client value paired with `CLIENT_ID_ENV`. Desktop
+/// registrations are public clients; this value is configuration, not a
+/// confidential secret, but it still must not be logged or committed here.
+pub const CLIENT_SECRET_ENV: &str = "SYNAPS_GOOGLE_GEMINI_CLIENT_SECRET";
 
 /// Loopback callback host; RFC 8252 § 7.3 mandates a literal IP for installed
 /// apps. Google explicitly rejects `localhost` for some client types.
@@ -87,10 +85,12 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
 /// Interactive login against the production Google OAuth endpoints.
 pub async fn login() -> Result<OAuthCredentials, String> {
-    login_with(
+    let registration = GeminiRegistration::production()?;
+    login_with_registration(
         CALLBACK_PORT,
         TOKEN_URL,
         /* allow_http_token_endpoint = */ false,
+        registration,
         |auth_url| {
             eprintln!(
                 "\n\x1b[1mOpening browser for Google Gemini (Code Assist) sign-in...\x1b[0m\n"
@@ -106,6 +106,69 @@ pub async fn login() -> Result<OAuthCredentials, String> {
     .await
 }
 
+pub struct GeminiRegistration {
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+impl std::fmt::Debug for GeminiRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiRegistration")
+            .field("client_id", &"[configured]")
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[configured]"),
+            )
+            .finish()
+    }
+}
+
+impl GeminiRegistration {
+    pub fn production() -> Result<Self, String> {
+        let client_id = std::env::var(CLIENT_ID_ENV).unwrap_or_default();
+        let client_secret = std::env::var(CLIENT_SECRET_ENV).ok();
+        Self::validated(client_id, client_secret)
+    }
+
+    #[doc(hidden)]
+    pub fn test(client_id: &str, client_secret: Option<&str>) -> Result<Self, String> {
+        Self::validated(client_id.to_owned(), client_secret.map(str::to_owned))
+    }
+
+    fn validated(client_id: String, client_secret: Option<String>) -> Result<Self, String> {
+        let client_id = client_id.trim().to_owned();
+        if client_id.is_empty() {
+            return Err(format!(
+                "registration_required: configure {CLIENT_ID_ENV} with a Synaps-owned Google Desktop OAuth client ID"
+            ));
+        }
+        if client_id.len() > 512 || client_id.chars().any(char::is_control) {
+            return Err("google-gemini: invalid OAuth client registration".into());
+        }
+        let client_secret = client_secret
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if client_secret
+            .as_ref()
+            .is_some_and(|value| value.len() > 512 || value.chars().any(char::is_control))
+        {
+            return Err("google-gemini: invalid OAuth client registration".into());
+        }
+        Ok(Self {
+            client_id,
+            client_secret,
+        })
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn client_secret(&self) -> Option<&str> {
+        self.client_secret.as_deref()
+    }
+}
+
 /// Interactive login with injectable seams — pinned to production URLs by
 /// default; a test harness may override the token endpoint (and set
 /// `allow_http_token_endpoint = true`) to talk to a loopback OAuth fake.
@@ -113,10 +176,11 @@ pub async fn login() -> Result<OAuthCredentials, String> {
 /// The `browser` closure is invoked with the full authorization URL. In
 /// production it opens the user's browser; in tests it drives the loopback
 /// callback directly. Returning `Err` cancels the flow immediately.
-pub async fn login_with<F>(
+pub async fn login_with_registration<F>(
     port: u16,
     token_endpoint: &str,
     allow_http_token_endpoint: bool,
+    registration: GeminiRegistration,
     browser: F,
 ) -> Result<OAuthCredentials, String>
 where
@@ -145,7 +209,7 @@ where
         .await
         .map_err(|e| format!("google-gemini: callback server failed: {e}"))?;
 
-    let auth_url = build_authorize_url(&challenge, &state, port);
+    let auth_url = build_authorize_url(&registration, &challenge, &state, port);
     if let Err(e) = browser(&auth_url) {
         handle.shutdown().await;
         return Err(format!("google-gemini: browser step failed: {e}"));
@@ -175,14 +239,16 @@ where
     }
 
     let redirect = redirect_uri(port);
-    let form = [
+    let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", callback.code.as_str()),
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", registration.client_id()),
         ("code_verifier", verifier.as_str()),
         ("redirect_uri", redirect.as_str()),
     ];
+    if let Some(client_secret) = registration.client_secret() {
+        form.push(("client_secret", client_secret));
+    }
     let creds = token_post(
         &Client::new(),
         token_endpoint,
@@ -208,26 +274,40 @@ async fn wait_for_callback(
 
 /// Refresh grant against the production Google token endpoint.
 pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
-    refresh_with_endpoint(client, TOKEN_URL, /* allow_http = */ false, refresh).await
+    if refresh.trim().is_empty() {
+        return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
+    }
+    let registration = GeminiRegistration::production()?;
+    refresh_with_registration(
+        client,
+        TOKEN_URL,
+        /* allow_http = */ false,
+        &registration,
+        refresh,
+    )
+    .await
 }
 
 /// Refresh grant with an overridable token endpoint. Public for zero-network
 /// harness use only — production callers must go through `refresh_token`.
-pub async fn refresh_with_endpoint(
+pub async fn refresh_with_registration(
     client: &Client,
     token_endpoint: &str,
     allow_http_token_endpoint: bool,
+    registration: &GeminiRegistration,
     refresh: &str,
 ) -> Result<OAuthCredentials, String> {
     if refresh.trim().is_empty() {
         return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
     }
-    let form = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+    let mut form = vec![
+        ("client_id", registration.client_id()),
         ("refresh_token", refresh),
         ("grant_type", "refresh_token"),
     ];
+    if let Some(client_secret) = registration.client_secret() {
+        form.push(("client_secret", client_secret));
+    }
     token_post(
         client,
         token_endpoint,
@@ -299,10 +379,15 @@ pub fn redirect_uri(port: u16) -> String {
 
 /// Build a Google installed-app authorization URL with PKCE (S256), offline
 /// access, and forced consent so a refresh token is always issued.
-pub fn build_authorize_url(challenge: &str, state: &str, port: u16) -> String {
+pub fn build_authorize_url(
+    registration: &GeminiRegistration,
+    challenge: &str,
+    state: &str,
+    port: u16,
+) -> String {
     let mut url = Url::parse(AUTHORIZE_URL).expect("AUTHORIZE_URL is a valid URL");
     url.query_pairs_mut()
-        .append_pair("client_id", CLIENT_ID)
+        .append_pair("client_id", registration.client_id())
         .append_pair("redirect_uri", &redirect_uri(port))
         .append_pair("response_type", "code")
         .append_pair("scope", SCOPES)
@@ -492,20 +577,33 @@ mod tests {
     #[tokio::test]
     async fn refresh_rejects_empty_refresh_without_network() {
         let err = refresh_token(&Client::new(), "").await.unwrap_err();
-        // Must fail before any network call and never leak secrets/inputs.
+        // Must fail before registration lookup or any network call.
         assert!(err.contains("empty refresh token"));
-        assert!(!err.contains(CLIENT_SECRET));
+    }
+
+    #[test]
+    fn production_registration_fails_closed_without_client_id() {
+        std::env::remove_var(CLIENT_ID_ENV);
+        std::env::remove_var(CLIENT_SECRET_ENV);
+        let err = GeminiRegistration::production().unwrap_err();
+        assert!(err.contains("registration_required"));
+        assert!(err.contains(CLIENT_ID_ENV));
     }
 
     #[test]
     fn authorize_url_has_required_installed_app_pkce_params() {
-        let url_str = build_authorize_url("challenge-123", "state-abc", 45289);
+        let registration = GeminiRegistration::test(
+            "synaps-google-desktop-client.example",
+            Some("public-client-value"),
+        )
+        .unwrap();
+        let url_str = build_authorize_url(&registration, "challenge-123", "state-abc", 45289);
         let url = Url::parse(&url_str).unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("accounts.google.com"));
         assert_eq!(url.path(), "/o/oauth2/v2/auth");
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(q["client_id"], CLIENT_ID);
+        assert_eq!(q["client_id"], registration.client_id());
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["redirect_uri"], "http://127.0.0.1:45289/oauth2callback");
         assert_eq!(q["code_challenge"], "challenge-123");
@@ -670,8 +768,7 @@ mod tests {
         ] {
             let msg = err.clone().into_secret_safe();
             assert!(msg.starts_with("google-gemini:"), "{msg}");
-            assert!(!msg.contains(CLIENT_SECRET));
-            assert!(!msg.contains(CLIENT_ID));
+            assert!(!msg.contains("configured-client-value"));
         }
     }
 }

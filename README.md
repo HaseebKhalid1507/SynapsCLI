@@ -82,7 +82,7 @@ synaps login --provider claude
 synaps login --provider openai-codex
 synaps login --provider xai-auth
 synaps login --provider github-copilot
-synaps login --provider google-gemini
+synaps login --provider google-gemini  # requires a Synaps-owned Google Desktop OAuth client registration
 
 # Cloud identity; credentials remain broker-owned
 synaps login --provider azure-openai

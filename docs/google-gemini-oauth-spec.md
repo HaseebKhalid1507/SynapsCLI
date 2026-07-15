@@ -8,7 +8,7 @@ Add `google-gemini` as a typed OAuth provider to `synaps login`, backed by Googl
 ## Assumptions
 1. “Google in the same vein” means Google account OAuth for Gemini CLI / Gemini Code Assist, not merely another Gemini API-key alias.
 2. Synaps may reference the Apache-2.0 `google-gemini/gemini-cli` implementation and public Google OAuth documentation, but will implement the protocol independently in Rust.
-3. The Gemini CLI OAuth client registration and `cloudcode-pa.googleapis.com/v1internal` protocol are product-client/community-observed integration surfaces and will be marked experimental unless Google documents them as stable third-party APIs.
+3. Synaps requires its own Google Desktop OAuth registration via `SYNAPS_GOOGLE_GEMINI_CLIENT_ID` (and optional public-client value via `SYNAPS_GOOGLE_GEMINI_CLIENT_SECRET`); it does not embed or borrow another product's registration. The `cloudcode-pa.googleapis.com/v1internal` protocol remains a product-client/community-observed integration surface and is marked experimental unless Google documents it as a stable third-party API.
 4. Both free managed-project onboarding and existing Standard/Enterprise project accounts must fail safely; unattended tests use fixtures and never perform real onboarding.
 
 ## Commands
@@ -28,6 +28,7 @@ Add `google-gemini` as a typed OAuth provider to `synaps login`, backed by Googl
 - Canonical provider: `google-gemini`; parsing aliases are migration-only.
 - Authorization: `https://accounts.google.com/o/oauth2/v2/auth`, authorization code + PKCE, loopback callback, exact state validation.
 - Token endpoint: `https://oauth2.googleapis.com/token`; scopes: cloud-platform, userinfo.email, userinfo.profile; offline access and consent semantics required for refresh issuance.
+- Production login fails closed until `SYNAPS_GOOGLE_GEMINI_CLIENT_ID` names a Synaps-owned Google Desktop OAuth registration. `SYNAPS_GOOGLE_GEMINI_CLIENT_SECRET` is accepted only as an optional installed-app public-client value and is never logged.
 - Broker stores refresh/access tokens atomically. Remote `/token` may return access token + expiry only, never refresh token or client credentials.
 - Code Assist host pinned to `https://cloudcode-pa.googleapis.com`; only reviewed `v1internal` methods are allowed.
 - Setup resolves project/tier through bounded `loadCodeAssist`/onboarding operations. Validation links are displayed but never automatically followed by the broker.
@@ -53,4 +54,4 @@ Strict red-before-green. Unit tests cover URL/state/token parsing, refresh, path
 - Log tokens, vend refresh tokens, read `auth.json` in runtime/TUI, accept caller URLs, embed a true confidential secret, silently fall back to API-key environment variables, or claim the Code Assist internal API is stable/public.
 
 ## Success criteria
-A user can run `synaps login --provider google-gemini`, complete Google authorization, see account-available Gemini models, and stream text/tool calls through a broker-only route. All zero-network harnesses pass and malformed/redirected/oversized/unknown requests fail closed.
+A user can run `synaps login --provider google-gemini`, receive an explicit registration prerequisite until a Synaps-owned Google Desktop OAuth client is configured, then complete Google authorization, see account-available Gemini models, and stream text/tool calls through a broker-only route. All zero-network harnesses pass and malformed/redirected/oversized/unknown requests fail closed.
