@@ -198,6 +198,26 @@ impl DelegationPolicy {
             total,
         )
     }
+    /// Secure manifestless baseline: every source-controlled worker-eligible
+    /// descriptor for the foreground provider is allowed. Other providers still
+    /// require explicit cross-provider grants.
+    pub fn provider_baseline(
+        foreground: QualifiedModelId,
+        catalog: CatalogSnapshot,
+        same_provider_models: impl IntoIterator<Item = QualifiedModelId>,
+        concurrent: usize,
+        total: usize,
+    ) -> Result<Self, &'static str> {
+        Self::build(
+            EnforcementMode::Enforced,
+            foreground,
+            catalog,
+            same_provider_models.into_iter().collect(),
+            Vec::new(),
+            concurrent,
+            total,
+        )
+    }
     pub fn with_grants(
         foreground: QualifiedModelId,
         catalog: CatalogSnapshot,

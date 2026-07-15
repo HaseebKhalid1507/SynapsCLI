@@ -1347,16 +1347,18 @@ pub(crate) async fn handle_input_action(
                 app.queued_message = Some(input);
             }
         }
-        InputAction::ModelsApply(model) => {
-            runtime.set_model(model.clone());
-            let applied = runtime.model().to_string();
-            let status = synaps_cli::engine::commands::persist_to_config("model", &applied);
-            app.session.model = applied.clone();
-            app.push_msg(ChatMessage::System(format!(
-                "model set to: {} {}",
-                applied, status
-            )));
-        }
+        InputAction::ModelsApply(model) => match runtime.try_set_model(model.clone()) {
+            Ok(()) => {
+                let applied = runtime.model().to_string();
+                let status = synaps_cli::engine::commands::persist_to_config("model", &applied);
+                app.session.model = applied.clone();
+                app.push_msg(ChatMessage::System(format!(
+                    "model set to: {} {}",
+                    applied, status
+                )));
+            }
+            Err(error) => app.push_msg(ChatMessage::Error(error)),
+        },
         InputAction::EffortApply(apply) => {
             // Reject a selection derived from a different exact model or from
             // an older capability snapshot before mutation or persistence.

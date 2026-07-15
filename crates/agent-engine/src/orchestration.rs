@@ -77,6 +77,31 @@ pub fn canonical_foreground_identity(raw: &str) -> Result<QualifiedModelId, Stri
         .map_err(|e| e.to_string())
 }
 
+/// Exact source-controlled OpenRouter worker stack. These identities are
+/// trusted local descriptors (not live catalog results or historical logs).
+const OPENROUTER_WORKER_MODELS: &[&str] = &[
+    "openrouter/deepseek/deepseek-v4-pro",
+    "openrouter/moonshotai/kimi-k2.7-code",
+    "openrouter/z-ai/glm-5.2",
+];
+
+/// Exact manifestless worker choices for a foreground provider.
+fn manifestless_worker_choices(foreground: &QualifiedModelId) -> Vec<QualifiedModelId> {
+    let source = if foreground.provider() == "openrouter" {
+        OPENROUTER_WORKER_MODELS
+    } else {
+        &[]
+    };
+    let mut choices: Vec<_> = source
+        .iter()
+        .filter_map(|value| QualifiedModelId::parse(*value).ok())
+        .collect();
+    choices.push(foreground.clone());
+    choices.sort();
+    choices.dedup();
+    choices
+}
+
 impl OrchestrationRuntime {
     /// Build a snapshot exclusively from runtime-owned routing/catalog descriptors.
     /// `manifest_references` are deliberately ignored here: manifests may narrow the
@@ -108,6 +133,15 @@ impl OrchestrationRuntime {
                 worker_eligible: true,
             })
             .collect();
+        entries.extend(
+            manifestless_worker_choices(foreground)
+                .into_iter()
+                .map(|model| CatalogEntry {
+                    model,
+                    available: true,
+                    worker_eligible: true,
+                }),
+        );
         // `resolve_route` is itself a trusted local provider descriptor. This is
         // independent of manifest content and permits configured generic/Anthropic
         // foreground routes whose live catalogs are not fetched during startup.
@@ -126,9 +160,10 @@ impl OrchestrationRuntime {
         concurrent: usize,
         total: usize,
     ) -> Result<Self, &'static str> {
+        let choices = manifestless_worker_choices(&foreground);
         let catalog = Self::trusted_catalog(&foreground, std::iter::empty())?;
-        Ok(Self::new(DelegationPolicy::baseline(
-            foreground, catalog, concurrent, total,
+        Ok(Self::new(DelegationPolicy::provider_baseline(
+            foreground, catalog, choices, concurrent, total,
         )?))
     }
 
@@ -469,6 +504,52 @@ mod tests {
         assert_eq!(id.as_str(), "anthropic/claude-fable-5");
         // The canonical identity must satisfy the manifestless baseline.
         OrchestrationRuntime::baseline(id, 8, 64).unwrap();
+    }
+
+    #[test]
+    fn baseline_openrouter_catalog_authorizes_exact_chinese_worker_stack() {
+        let deepseek = model("openrouter/deepseek/deepseek-v4-pro");
+        let glm = model("openrouter/z-ai/glm-5.2");
+        let kimi = model("openrouter/moonshotai/kimi-k2.7-code");
+        let rt = OrchestrationRuntime::baseline(deepseek.clone(), 3, 8).unwrap();
+
+        assert_eq!(
+            rt.effective_choices(),
+            vec![
+                deepseek.as_str().to_owned(),
+                kimi.as_str().to_owned(),
+                glm.as_str().to_owned(),
+            ]
+        );
+        assert_eq!(
+            rt.resolve_and_authorize("sa_glm", Some(glm.as_str()))
+                .unwrap()
+                .model,
+            glm
+        );
+        assert_eq!(
+            rt.resolve_and_authorize("sa_kimi", Some(kimi.as_str()))
+                .unwrap()
+                .model,
+            kimi
+        );
+    }
+
+    #[test]
+    fn manifestless_non_openrouter_baseline_remains_foreground_only() {
+        let foreground = model("anthropic/claude-fable-5");
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 3, 8).unwrap();
+        assert_eq!(rt.effective_choices(), vec![foreground.as_str().to_owned()]);
+        let denied = rt
+            .resolve_and_authorize(
+                "sa_openrouter",
+                Some("openrouter/moonshotai/kimi-k2.7-code"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            denied.code,
+            "provider_not_allowed" | "catalog_model_unknown"
+        ));
     }
 
     #[test]

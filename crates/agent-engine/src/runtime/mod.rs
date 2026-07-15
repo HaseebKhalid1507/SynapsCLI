@@ -599,6 +599,14 @@ impl Runtime {
     }
 
     pub fn set_model(&mut self, model: String) {
+        let _ = self.try_set_model(model);
+    }
+
+    /// Apply a model change while preserving orchestration lifecycle invariants.
+    /// Returns an error instead of mutating either model or policy when active
+    /// workers still require collection/reconciliation or when the replacement
+    /// foreground cannot produce a trusted manifestless policy snapshot.
+    pub fn try_set_model(&mut self, model: String) -> std::result::Result<(), String> {
         // Older model pickers passed the rendered health row back here, e.g.
         // `✅  339ms  groq/llama-3.3-70b`. Remove that exact decoration shape,
         // rather than searching inside the ID: provider-qualified IDs may
@@ -619,7 +627,39 @@ impl Runtime {
                 None
             })
             .unwrap_or(trimmed);
+        // Manifestless orchestration snapshots are tied to the exact foreground
+        // identity. Refuse the model mutation while a policy worker remains
+        // unreconciled; replacing its registry would erase the completion-gate
+        // remediation path, while changing only the runtime model would create a
+        // stale authorization snapshot.
+        if self.prompt_reload_source.is_none()
+            && self
+                .orchestration
+                .as_ref()
+                .is_some_and(|current| !current.unreconciled_runtime_handles().is_empty())
+        {
+            return Err("model change blocked: workers require collection/reconciliation".into());
+        }
+        let orchestration_replacement = if self.prompt_reload_source.is_none()
+            && self.orchestration.is_some()
+        {
+            let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
+                .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
+            Some(Arc::new(
+                crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64).map_err(
+                    |_| "model change blocked: trusted worker catalog unavailable".to_string(),
+                )?,
+            ))
+        } else {
+            None
+        };
         self.model = cleaned.to_owned();
+        // Replace the manifestless policy atomically after a safe model change so
+        // inheritance and exact same-provider choices follow the new foreground.
+        // Typed manifest policies are immutable and are not rewritten here.
+        if let Some(replacement) = orchestration_replacement {
+            self.orchestration = Some(replacement);
+        }
         // Apply the new model's default reasoning level from exact capability
         // metadata (Codex catalog default, xAI documented default/Adaptive)
         // unless the user has explicitly chosen a level (explicit_reasoning is
@@ -632,6 +672,7 @@ impl Runtime {
                 self.set_reasoning_level(level);
             }
         }
+        Ok(())
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
@@ -1778,6 +1819,84 @@ mod tests {
                 .unwrap()
                 .delegation_policy_digest,
             digest
+        );
+    }
+
+    #[test]
+    fn set_model_replaces_manifestless_orchestration_foreground_snapshot() {
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        ));
+
+        runtime.set_model("openrouter/deepseek/deepseek-v4-pro".to_owned());
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(
+            orchestration.foreground_model(),
+            "openrouter/deepseek/deepseek-v4-pro"
+        );
+        assert!(orchestration
+            .effective_choices()
+            .contains(&"openrouter/moonshotai/kimi-k2.7-code".to_owned()));
+        assert!(orchestration
+            .resolve_and_authorize("sa_kimi", Some("openrouter/moonshotai/kimi-k2.7-code"))
+            .is_ok());
+    }
+
+    #[test]
+    fn set_model_refuses_to_orphan_unreconciled_policy_workers() {
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        );
+        orchestration
+            .resolve_and_authorize("sa_active", None)
+            .unwrap();
+        runtime.install_orchestration(orchestration.clone());
+        runtime.model = "openrouter/z-ai/glm-5.2".to_owned();
+
+        let error = runtime
+            .try_set_model("openrouter/deepseek/deepseek-v4-pro".to_owned())
+            .unwrap_err();
+
+        assert!(error.contains("collection/reconciliation"));
+        assert_eq!(runtime.model(), "openrouter/z-ai/glm-5.2");
+        assert!(std::sync::Arc::ptr_eq(
+            runtime.orchestration().unwrap(),
+            &orchestration
+        ));
+        assert!(orchestration.is_unreconciled("sa_active"));
+    }
+
+    #[test]
+    fn set_model_keeps_active_typed_manifest_orchestration_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("prompt.yaml");
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let mut runtime = Runtime::new_headless();
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm.clone(), 3, 8).unwrap(),
+        );
+        runtime.install_orchestration(orchestration.clone());
+        runtime.retain_prompt_reload_source(
+            manifest_path,
+            agent_core::prompt::SelectionContext::new(glm, None).unwrap(),
+            None,
+            None,
+        );
+
+        runtime.set_model("openrouter/deepseek/deepseek-v4-pro".to_owned());
+
+        assert!(std::sync::Arc::ptr_eq(
+            runtime.orchestration().unwrap(),
+            &orchestration
+        ));
+        assert_eq!(
+            runtime.orchestration().unwrap().foreground_model(),
+            "openrouter/z-ai/glm-5.2"
         );
     }
 
