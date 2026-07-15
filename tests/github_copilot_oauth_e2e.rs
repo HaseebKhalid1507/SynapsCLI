@@ -85,10 +85,13 @@ enum Scripted {
     Ok(String),
     Status(u16, String),
 }
+type SeenPost = (String, Vec<(String, String)>);
+type SeenGet = (String, String, Vec<(String, String)>);
+
 #[derive(Default)]
 struct FakeHttp {
-    posts: Mutex<Vec<(String, Vec<(String, String)>)>>,
-    gets: Mutex<Vec<(String, String, Vec<(String, String)>)>>,
+    posts: Mutex<Vec<SeenPost>>,
+    gets: Mutex<Vec<SeenGet>>,
     post_q: Mutex<Vec<Scripted>>,
     get_q: Mutex<Vec<Scripted>>,
 }
