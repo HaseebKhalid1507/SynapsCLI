@@ -117,7 +117,8 @@ fn selectable_helper_matches_expected_set_and_excludes_only_unsupported_rows() {
     let got: HashSet<_> = selectable.iter().map(|e| e.id.as_str().to_string()).collect();
     let want: HashSet<_> = expected()
         .into_iter()
-        .filter_map(|(id, (sel, _))| sel.then(|| id.to_string()))
+        .filter(|(_, (selectable, _))| *selectable)
+        .map(|(id, _)| id.to_string())
         .collect();
     assert_eq!(got, want);
     // Opt-in rows with reviewed endpoints remain visible, while unsupported rows do not.
