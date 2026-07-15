@@ -549,10 +549,11 @@ pub(crate) fn reap_finished_with_ttl(
     orchestration: Option<&crate::orchestration::OrchestrationRuntime>,
     ttl: std::time::Duration,
 ) {
+    let retained = orchestration
+        .map(|runtime| runtime.unreconciled_runtime_handles())
+        .unwrap_or_default();
     let cleanup = |guard: &mut SubagentRegistry| {
-        guard.cleanup_finished_with_ttl_and_retention(ttl, |id| {
-            orchestration.is_some_and(|runtime| runtime.is_unreconciled(id))
-        });
+        guard.cleanup_finished_with_ttl_and_retention(ttl, |id| retained.contains(id));
     };
     match registry.lock() {
         Ok(mut guard) => cleanup(&mut guard),

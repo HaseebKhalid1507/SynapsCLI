@@ -413,6 +413,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collected_handle_reaped_then_degraded_reconcile_clears_gate() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (registry, orch, ctx) = make_orch_ctx("sa_collected_expired", "result text");
+        tool.execute(
+            json!({"handle_id": "sa_collected_expired", "reconciled": false}),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            orch.completion_gate(),
+            CompletionGate::Blocked { .. }
+        ));
+
+        crate::runtime::subagent::reap_finished_with_ttl(
+            &registry,
+            Some(orch.as_ref()),
+            std::time::Duration::ZERO,
+        );
+        assert!(registry
+            .lock()
+            .unwrap()
+            .get("sa_collected_expired")
+            .is_none());
+
+        let mut ctx2 = create_tool_context();
+        ctx2.capabilities.subagent_registry = Some(registry);
+        ctx2.capabilities.orchestration = Some(orch.clone());
+        let response = tool
+            .execute(
+                json!({"handle_id": "sa_collected_expired", "reconciled": true}),
+                ctx2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            "expired"
+        );
+        assert_eq!(orch.completion_gate(), CompletionGate::Allowed);
+    }
+
+    #[tokio::test]
     async fn missing_mapped_handle_has_degraded_collect_not_404() {
         use agent_core::orchestration::CompletionGate;
 

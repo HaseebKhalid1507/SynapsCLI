@@ -4,7 +4,7 @@ use agent_core::orchestration::{
 };
 use agent_core::prompt::QualifiedModelId;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Session-scoped runtime enforcement shared by every subagent tool path.
@@ -380,18 +380,25 @@ impl OrchestrationRuntime {
             .ok_or_else(|| "unknown worker".to_string())?;
         inner.registry.reconcile(&h).map_err(str::to_string)
     }
+    /// Snapshot runtime handle IDs still named by the completion gate. Taking this
+    /// snapshot before locking the subagent registry avoids cross-registry lock order.
+    pub fn unreconciled_runtime_handles(&self) -> HashSet<String> {
+        let inner = self.inner.lock().unwrap();
+        let workers = match inner.registry.completion_gate() {
+            CompletionGate::Allowed => return HashSet::new(),
+            CompletionGate::Warning { workers } | CompletionGate::Blocked { workers } => workers,
+        };
+        inner
+            .handles
+            .iter()
+            .filter(|(_, handle)| workers.iter().any(|id| id == handle.id()))
+            .map(|(runtime_id, _)| runtime_id.clone())
+            .collect()
+    }
+
     /// Whether a runtime handle is still named by the policy completion gate.
     pub fn is_unreconciled(&self, runtime_handle: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
-        let Some(handle) = inner.handles.get(runtime_handle) else {
-            return false;
-        };
-        match inner.registry.completion_gate() {
-            CompletionGate::Allowed => false,
-            CompletionGate::Warning { workers } | CompletionGate::Blocked { workers } => {
-                workers.iter().any(|id| id == handle.id())
-            }
-        }
+        self.unreconciled_runtime_handles().contains(runtime_handle)
     }
 
     pub fn completion_gate(&self) -> CompletionGate {
