@@ -273,8 +273,8 @@ impl ProxyRequest {
         // Per-provider endpoint allowlist: a signed proxy request can only
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
-        if !(self.provider == "xai-auth" && self.path == "/responses")
-            && !(self.provider == "github-copilot"
+        if !(self.provider == "xai-auth" && self.path == "/responses"
+            || self.provider == "github-copilot"
                 && matches!(
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"

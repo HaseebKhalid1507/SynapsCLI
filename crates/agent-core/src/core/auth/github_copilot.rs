@@ -693,10 +693,12 @@ where
 
 // ── Full login (injectable) ──────────────────────────────────────────────────
 
+pub type UserCodeHook<'a> = &'a dyn Fn(&str, &str);
+
 pub struct LoginHooks<'a, B> {
     pub browser: &'a B,
     /// When set, the user_code + verification_uri are written here (tests / TUI).
-    pub on_user_code: Option<&'a dyn Fn(&str, &str)>,
+    pub on_user_code: Option<UserCodeHook<'a>>,
 }
 
 /// Device start → user prompt → poll → mint → atomic persist.

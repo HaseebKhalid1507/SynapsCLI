@@ -430,12 +430,8 @@ impl AwsHttpApi {
         }
     }
 }
-fn aws_json_error(status: reqwest::StatusCode) -> AwsError {
-    if status.is_success() {
-        AwsError::Upstream
-    } else {
-        AwsError::Upstream
-    }
+fn aws_json_error(_status: reqwest::StatusCode) -> AwsError {
+    AwsError::Upstream
 }
 #[async_trait]
 impl AwsApi for AwsHttpApi {

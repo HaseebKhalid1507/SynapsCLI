@@ -16,7 +16,7 @@ use std::fmt;
 /// A named reasoning / thinking depth level.
 ///
 /// Ordering is from least to most intensive; `Off` < `Adaptive` < `Low` < … < `Ultra`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReasoningLevel {
     /// No reasoning / thinking output.
     Off,
@@ -25,6 +25,7 @@ pub enum ReasoningLevel {
     /// Low reasoning budget.
     Low,
     /// Medium reasoning budget.
+    #[default]
     Medium,
     /// High reasoning budget.
     High,
@@ -117,12 +118,6 @@ impl ReasoningLevel {
 impl fmt::Display for ReasoningLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl Default for ReasoningLevel {
-    fn default() -> Self {
-        Self::Medium
     }
 }
 
