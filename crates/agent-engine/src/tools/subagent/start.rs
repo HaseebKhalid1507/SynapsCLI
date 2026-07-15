@@ -465,7 +465,9 @@ impl Tool for SubagentStartTool {
         {
             let thread = {
                 let mut reg = registry.lock().unwrap();
-                reg.get_mut(&handle_id).map(|handle| handle.cancel());
+                if let Some(handle) = reg.get_mut(&handle_id) {
+                    handle.cancel();
+                }
                 reg.remove(&handle_id)
             };
             if let Some(handle) = thread {

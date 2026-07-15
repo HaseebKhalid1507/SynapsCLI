@@ -324,6 +324,7 @@ impl ApiMethods {
     /// Uses a caller-supplied system prompt (replaces the runtime's) and forces
     /// "low" effort on adaptive models — summarization doesn't benefit from
     /// heavy reasoning budgets.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_api_simple(
         auth: &Arc<RwLock<AuthState>>,
         client: &Client,
