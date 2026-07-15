@@ -325,6 +325,28 @@ impl SubagentHandle {
         self.started_at.elapsed().as_secs_f64()
     }
 
+    /// Release execution-only resources after a worker has expired while
+    /// retaining bounded terminal identity/output for collection and reconciliation.
+    fn make_tombstone(&mut self) {
+        debug_assert!(self.is_finished());
+        self.steer_tx.take();
+        self.shutdown_tx.take();
+        self.result_rx.take();
+        if let Some(thread) = self.thread_handle.take() {
+            let _ = thread.join();
+        }
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        if state.partial_text.len() > TOMBSTONE_OUTPUT_MAX_BYTES {
+            let mut start = state.partial_text.len() - TOMBSTONE_OUTPUT_MAX_BYTES;
+            while !state.partial_text.is_char_boundary(start) {
+                start += 1;
+            }
+            state.partial_text.drain(..start);
+        }
+        state.tool_log.clear();
+        state.conversation_state.clear();
+    }
+
     /// Send a steering message into the running subagent.
     pub fn steer(&self, message: &str) -> Result<(), String> {
         match &self.steer_tx {
@@ -368,9 +390,13 @@ impl SubagentHandle {
         self.collected
     }
 
-    /// Whether terminal transport and resumable context have been discarded.
+    /// Whether execution transports and resumable context have been discarded.
     pub fn is_tombstone(&self) -> bool {
-        self.is_finished() && self.shutdown_tx.is_none() && self.result_rx.is_none()
+        self.is_finished()
+            && self.steer_tx.is_none()
+            && self.shutdown_tx.is_none()
+            && self.result_rx.is_none()
+            && self.thread_handle.is_none()
     }
 
     /// Time elapsed since the subagent reached a terminal state.
@@ -432,26 +458,12 @@ impl SubagentRegistry {
         self.handles.remove(id)
     }
 
-    /// Consume only transport resources while retaining terminal diagnostics and
-    /// output under normal session retention.
+    /// Drop finished execution transports and resumable context while retaining
+    /// bounded terminal diagnostics and output under normal session retention.
     pub fn release_finished_resources(&mut self, id: &str) {
         if let Some(handle) = self.handles.get_mut(id) {
             if handle.is_finished() {
-                handle.shutdown_tx.take();
-                handle.result_rx.take();
-                if let Some(thread) = handle.thread_handle.take() {
-                    let _ = thread.join();
-                }
-                let mut state = handle.state.write().unwrap_or_else(|p| p.into_inner());
-                if state.partial_text.len() > TOMBSTONE_OUTPUT_MAX_BYTES {
-                    let mut start = state.partial_text.len() - TOMBSTONE_OUTPUT_MAX_BYTES;
-                    while !state.partial_text.is_char_boundary(start) {
-                        start += 1;
-                    }
-                    state.partial_text.drain(..start);
-                }
-                state.tool_log.clear();
-                state.conversation_state.clear();
+                handle.make_tombstone();
             }
         }
     }
@@ -499,6 +511,8 @@ impl SubagentRegistry {
     /// Additionally, handles whose OS thread is still running (e.g. still in
     /// the finalizer path) are deferred — joining a live thread blocks the TUI
     /// loop. They will be reaped on the next cleanup pass once the thread exits.
+    /// Orchestration-required expired handles become bounded tombstones instead
+    /// of being removed; a later collect/reconcile makes them normally reapable.
     pub fn cleanup_finished_with_ttl(&mut self, ttl: std::time::Duration) {
         self.cleanup_finished_with_ttl_and_retention(ttl, |_| false);
     }

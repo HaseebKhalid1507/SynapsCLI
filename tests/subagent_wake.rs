@@ -536,7 +536,7 @@ fn c2_reap_finished_engine_seam_headless() {
         reg.register(make_h("sa_c2_running", Arc::clone(&running_state)));
     }
 
-    reap_finished(&registry);
+    reap_finished(&registry, None);
 
     let reg = registry.lock().unwrap();
     assert!(reg.get("sa_c2_done").is_none(), "collected+finished handle must be reaped by engine seam");
@@ -557,7 +557,7 @@ fn c2_reap_finished_poison_safe() {
         panic!("poison");
     });
     // Must not panic
-    reap_finished(&registry);
+    reap_finished(&registry, None);
 }
 
 // ── C3: agent idle_should_wait reactive wait ──────────────────────────────────
