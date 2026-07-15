@@ -1,7 +1,7 @@
 # Cloud OAuth Providers — Implementation Specification
 
-Status: **implementation-ready specification; deployment blocked on named feasibility gates**  
-Branch: `feat/cloud-oauth-providers`  
+Status: **implementation-ready specification; deployment blocked on named feasibility gates**
+Branch: `feat/cloud-oauth-providers`
 Scope: Microsoft Azure OpenAI, AWS Bedrock, and Google Vertex AI. No product code is changed by this document.
 
 ## 1. Objective and non-goals

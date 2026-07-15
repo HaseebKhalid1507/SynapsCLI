@@ -1,8 +1,8 @@
 # Modular System-Prompt Injection and Foreman Orchestration Specification
 
-**Status:** Draft  
-**Schema target:** `synaps-prompt/1`  
-**Product:** SynapsCLI  
+**Status:** Draft
+**Schema target:** `synaps-prompt/1`
+**Product:** SynapsCLI
 **Primary objective:** Replace monolithic, manually concatenated system prompts with typed, modular, observable prompt composition backed by runtime-enforced orchestration policy.
 
 ## 1. Motivation

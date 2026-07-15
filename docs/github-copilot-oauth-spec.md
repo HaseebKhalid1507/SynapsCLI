@@ -1,7 +1,7 @@
 # GitHub Copilot OAuth for `synaps login`
 
-Status: **research / design scaffold for lead review** — branch `feat/github-copilot-oauth`  
-Worktree: `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-github-copilot-oauth`  
+Status: **research / design scaffold for lead review** — branch `feat/github-copilot-oauth`
+Worktree: `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-github-copilot-oauth`
 Phase: **spec only** — no product-code changes in this phase.
 
 Add GitHub Copilot as a first-class OAuth provider alongside Anthropic, OpenAI
@@ -744,47 +744,47 @@ cargo clippy --all-targets -- --deny warnings
 
 ### Official
 
-1. Authenticating GitHub Copilot CLI —  
+1. Authenticating GitHub Copilot CLI —
    <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli>
-2. Troubleshooting Copilot CLI authentication —  
+2. Troubleshooting Copilot CLI authentication —
    <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/troubleshoot-copilot-cli-auth>
-3. Authorizing OAuth apps (device flow + web flow) —  
+3. Authorizing OAuth apps (device flow + web flow) —
    <https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps>
-4. Scopes for OAuth apps —  
+4. Scopes for OAuth apps —
    <https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps>
-5. Copilot allowlist reference —  
+5. Copilot allowlist reference —
    <https://docs.github.com/en/copilot/reference/copilot-allowlist-reference>
-6. Copilot SDK authentication —  
+6. Copilot SDK authentication —
    <https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate>
-7. GitHub Terms for Additional Products and Features (Copilot section) —  
+7. GitHub Terms for Additional Products and Features (Copilot section) —
    <https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features>
-8. GitHub Terms of Service §J AI Features —  
+8. GitHub Terms of Service §J AI Features —
    <https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#j-ai-features-training-and-your-data>
-9. RFC 8628 Device Authorization Grant —  
+9. RFC 8628 Device Authorization Grant —
    <https://datatracker.ietf.org/doc/html/rfc8628>
 
 ### Community / secondary (protocol reconstruction only)
 
-10. agent-zero GitHub Copilot OAuth provider —  
+10. agent-zero GitHub Copilot OAuth provider —
     <https://github.com/agent0ai/agent-zero> (`plugins/_oauth/helpers/providers/github_copilot.py`)
-11. llm-liberty GitHub Copilot notes —  
+11. llm-liberty GitHub Copilot notes —
     <https://github.com/BodhiSearch/llm-liberty/blob/main/docs/github-copilot.md>
-12. copilot-to-api README / guides —  
+12. copilot-to-api README / guides —
     <https://github.com/Alorse/copilot-to-api>
-13. Device flow example citing VS Code client id —  
+13. Device flow example citing VS Code client id —
     <https://github.com/estruyf/github-copilot-usage-tauri/blob/main/device_flow_example.md>
-14. Community discussion on `copilot_internal` third-party use —  
+14. Community discussion on `copilot_internal` third-party use —
     <https://github.com/orgs/community/discussions/178117>
 
 ### In-repo architecture references
 
-15. `docs/grok-xai-oauth-spec.md` — sibling OAuth provider spec pattern  
-16. `docs/decisions/credential-broker-checkpoint-1.md` — broker vending policy  
-17. `crates/agent-core/src/core/auth/provider.rs` — typed OAuth registry  
-18. `crates/agent-core/src/core/auth/broker.rs` — access-token vs proxy boundary  
-19. `crates/agent-engine/src/runtime/openai/mod.rs` — `resolve_route` / `AuthPolicy`  
-20. `src/cmd/login.rs` — login provider list from registry  
-21. `src/cmd/auth_broker.rs` — remote `/token` allowlist via registry strategy  
+15. `docs/grok-xai-oauth-spec.md` — sibling OAuth provider spec pattern
+16. `docs/decisions/credential-broker-checkpoint-1.md` — broker vending policy
+17. `crates/agent-core/src/core/auth/provider.rs` — typed OAuth registry
+18. `crates/agent-core/src/core/auth/broker.rs` — access-token vs proxy boundary
+19. `crates/agent-engine/src/runtime/openai/mod.rs` — `resolve_route` / `AuthPolicy`
+20. `src/cmd/login.rs` — login provider list from registry
+21. `src/cmd/auth_broker.rs` — remote `/token` allowlist via registry strategy
 
 ---
 

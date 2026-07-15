@@ -109,7 +109,7 @@ async fn login_completes_via_loopback_and_stores_atomically() {
             let state = q.get("state").cloned().unwrap();
             let redirect_uri = q.get("redirect_uri").cloned().unwrap();
             // Complete the callback like a real browser would.
-            
+
 tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let cb = format!("{redirect_uri}?code=abc123&state={state}");
@@ -169,7 +169,7 @@ async fn login_surfaces_token_error_without_leaking_secrets() {
         let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
         let state = q["state"].clone();
         let redirect_uri = q["redirect_uri"].clone();
-        
+
 tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let cb = format!("{redirect_uri}?code=abc&state={state}");

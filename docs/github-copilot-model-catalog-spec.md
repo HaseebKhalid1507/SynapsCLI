@@ -1,7 +1,7 @@
 # GitHub Copilot model catalog (C2 catalog only)
 
-Status: **implementation target for C2 catalog slice** — branch `feat/github-copilot-oauth`  
-Worktree: `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-github-copilot-oauth`  
+Status: **implementation target for C2 catalog slice** — branch `feat/github-copilot-oauth`
+Worktree: `/home/jr/Projects/Maha-Media/.worktrees/SynapsCLI-github-copilot-oauth`
 Scope: **model discovery / catalog registration only**. No chat/completions routing,
 no runtime inference headers beyond the catalog GET, no policy enablement posts.
 
@@ -44,9 +44,9 @@ no runtime inference headers beyond the catalog GET, no policy enablement posts.
 
 ### Official high-value display names currently listed (V)
 
-OpenAI: GPT-5.3-Codex, GPT-5.4, GPT-5.4 mini, GPT-5.5, GPT-5.6 Luna/Sol/Terra, GPT-5 mini  
-Anthropic: Claude Sonnet 4.6 / 5, Claude Opus 4.7 / 4.8 (+ fast mode preview), Claude Fable 5, Claude Haiku 4.5  
-Google: Gemini 3.1 Pro, Gemini 3.5 Flash, Gemini 3 Flash, Gemini 2.5 Pro  
+OpenAI: GPT-5.3-Codex, GPT-5.4, GPT-5.4 mini, GPT-5.5, GPT-5.6 Luna/Sol/Terra, GPT-5 mini
+Anthropic: Claude Sonnet 4.6 / 5, Claude Opus 4.7 / 4.8 (+ fast mode preview), Claude Fable 5, Claude Haiku 4.5
+Google: Gemini 3.1 Pro, Gemini 3.5 Flash, Gemini 3 Flash, Gemini 2.5 Pro
 
 ### Official retirement / exclude list (V)
 
@@ -181,18 +181,18 @@ wire IDs established by live discovery/fixtures, not guessed display-name slugs.
 
 Fallback set (ordered):
 
-1. `gpt-5.3-codex` — GPT-5.3-Codex  
-2. `gpt-5.4` — GPT-5.4  
-3. `gpt-5.5` — GPT-5.5  
-4. `gpt-5.6-luna` — GPT-5.6 Luna  
-5. `gpt-5.6-terra` — GPT-5.6 Terra  
-6. `claude-sonnet-4.6` — Claude Sonnet 4.6  
-7. `claude-sonnet-5` — Claude Sonnet 5  
-8. `claude-opus-4.7` — Claude Opus 4.7  
-9. `claude-opus-4.8` — Claude Opus 4.8  
-10. `claude-fable-5` — Claude Fable 5  
-11. `gemini-3.1-pro-preview` — Gemini 3.1 Pro  
-12. `gemini-3.5-flash` — Gemini 3.5 Flash  
+1. `gpt-5.3-codex` — GPT-5.3-Codex
+2. `gpt-5.4` — GPT-5.4
+3. `gpt-5.5` — GPT-5.5
+4. `gpt-5.6-luna` — GPT-5.6 Luna
+5. `gpt-5.6-terra` — GPT-5.6 Terra
+6. `claude-sonnet-4.6` — Claude Sonnet 4.6
+7. `claude-sonnet-5` — Claude Sonnet 5
+8. `claude-opus-4.7` — Claude Opus 4.7
+9. `claude-opus-4.8` — Claude Opus 4.8
+10. `claude-fable-5` — Claude Fable 5
+11. `gemini-3.1-pro-preview` — Gemini 3.1 Pro
+12. `gemini-3.5-flash` — Gemini 3.5 Flash
 
 Excluded from fallback despite official docs: `gpt-5.6-sol` (not on this
 account’s live list), Auto (not a wire id).
@@ -208,20 +208,20 @@ account’s live list), Auto (not a wire id).
 
 ### Non-goals (this slice)
 
-- `POST /chat/completions` or `/responses` routing  
-- Model policy enable (`POST /models/{id}/policy`)  
-- Enterprise/business host derivation  
-- GitHub Models marketplace catalog (`models.github.ai`) — different product  
+- `POST /chat/completions` or `/responses` routing
+- Model policy enable (`POST /models/{id}/policy`)
+- Enterprise/business host derivation
+- GitHub Models marketplace catalog (`models.github.ai`) — different product
 
 ---
 
 ## Testing strategy
 
-- Unit: parse fixture JSON; static descriptor ids; filter non-chat.  
+- Unit: parse fixture JSON; static descriptor ids; filter non-chat.
 - Broker: `github-copilot` allowlisted for `/models` only; other OAuth providers
-  still denied; `/chat/completions` still denied for Copilot in this slice.  
-- Zero-network e2e harness for parser + static fallback registration.  
-- TUI: logged-in `github-copilot` section shows static fallback immediately.  
+  still denied; `/chat/completions` still denied for Copilot in this slice.
+- Zero-network e2e harness for parser + static fallback registration.
+- TUI: logged-in `github-copilot` section shows static fallback immediately.
 - RED before GREEN for each behavior.
 
 ---
@@ -230,19 +230,19 @@ account’s live list), Auto (not a wire id).
 
 **Always**
 
-- Prefer broker-proxied live discovery when credentials exist.  
-- Never vend/log GitHub user token or session token.  
-- Pin host/path/headers; bound network; fail closed.  
+- Prefer broker-proxied live discovery when credentials exist.
+- Never vend/log GitHub user token or session token.
+- Pin host/path/headers; bound network; fail closed.
 - Seed only fixture/live-established wire IDs.
 
 **Ask first**
 
-- Expanding broker allowlist to chat/inference paths.  
-- Enterprise host support.  
+- Expanding broker allowlist to chat/inference paths.
+- Enterprise host support.
 - Policy-enable automation.
 
 **Never**
 
-- Guess wire ids from display names.  
-- Ship retired models as curated defaults.  
+- Guess wire ids from display names.
+- Ship retired models as curated defaults.
 - Use GitHub Models catalog as a substitute for Copilot discovery.

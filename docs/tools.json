@@ -305,7 +305,7 @@
     }
   },
   {
-    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion.",
+    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion. After inspecting a finished result, call again with reconciled=true to attest reconciliation and clear the completion gate; reconciled defaults to false so inspection and attestation stay intentional (first terminal collect always collects; any terminal collect with reconciled=true reconciles, including repeats).",
     "name": "subagent_collect",
     "parameters": {
       "properties": {
@@ -315,7 +315,7 @@
         },
         "reconciled": {
           "default": false,
-          "description": "Confirm the collected result was inspected and reconciled with foreground work.",
+          "description": "After inspecting the collected result, set true to attest reconciliation with foreground work and unblock completion. Defaults to false; a later collect with reconciled=true still reconciles (idempotent).",
           "type": "boolean"
         }
       },
