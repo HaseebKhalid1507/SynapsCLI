@@ -1613,6 +1613,7 @@ impl Runtime {
         // Extra Arc clone for the reaper hook — session takes ownership of the
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
+        let reaper_orchestration = self.orchestration.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -1664,7 +1665,10 @@ impl Runtime {
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.
-            crate::runtime::subagent::reap_finished(&reaper_registry);
+            crate::runtime::subagent::reap_finished(
+                &reaper_registry,
+                reaper_orchestration.as_deref(),
+            );
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 

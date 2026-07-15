@@ -10,15 +10,24 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
 use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
-use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
+use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
+use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
 
 pub struct SubagentResumeTool;
 
+fn expired_context_error(handle_id: &str) -> RuntimeError {
+    RuntimeError::Tool(format!(
+        "Subagent '{}' has expired resumable context; call subagent_collect with reconciled=true to reconcile its retained tombstone.",
+        handle_id
+    ))
+}
+
 #[async_trait::async_trait]
 impl Tool for SubagentResumeTool {
-    fn name(&self) -> &str { "subagent_resume" }
+    fn name(&self) -> &str {
+        "subagent_resume"
+    }
 
     fn description(&self) -> &str {
         "Resume a finished or timed-out reactive subagent with new instructions. \
@@ -47,26 +56,29 @@ impl Tool for SubagentResumeTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let prior_handle_id = params["handle_id"].as_str()
+        let prior_handle_id = params["handle_id"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let instructions = params["instructions"].as_str()
+        let instructions = params["instructions"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'instructions' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
+        })?;
 
         // Extract prior state under the lock, release immediately.
         let (agent_name, model, prior_context, prior_system_prompt, prior_timeout) = {
             let reg = registry.lock().unwrap();
-            let handle = reg.get(&prior_handle_id)
-                .ok_or_else(|| RuntimeError::Tool(
-                    format!("No subagent found with handle_id '{}'", prior_handle_id)
-                ))?;
+            let handle = reg.get(&prior_handle_id).ok_or_else(|| {
+                RuntimeError::Tool(format!(
+                    "No subagent found with handle_id '{}'",
+                    prior_handle_id
+                ))
+            })?;
 
             if handle.status() == SubagentStatus::Running {
                 return Err(RuntimeError::Tool(format!(
@@ -74,6 +86,9 @@ impl Tool for SubagentResumeTool {
                      or wait until it finishes.",
                     prior_handle_id
                 )));
+            }
+            if handle.is_tombstone() {
+                return Err(expired_context_error(&prior_handle_id));
             }
 
             let prior = {
@@ -85,7 +100,13 @@ impl Tool for SubagentResumeTool {
                 }
             };
 
-            (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
+            (
+                handle.agent_name.clone(),
+                handle.model.clone(),
+                prior,
+                handle.system_prompt.clone(),
+                handle.timeout_secs,
+            )
         };
 
         // The inherited prior model is still re-authorized as an explicit exact
@@ -118,7 +139,10 @@ impl Tool for SubagentResumeTool {
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
-            label, handle_id, prior_handle_id, model
+            label,
+            handle_id,
+            prior_handle_id,
+            model
         );
 
         let state = Arc::new(RwLock::new(SubagentState::new()));
@@ -423,7 +447,8 @@ impl Tool for SubagentResumeTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Resumed subagent thread panicked: {}", msg);
-                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status =
+                    SubagentStatus::Failed(format!("panic: {}", msg));
             }
 
             // ── Terminal finalizer — exactly once, outside catch_unwind ────────
@@ -464,6 +489,20 @@ impl Tool for SubagentResumeTool {
             "resumed_from": prior_handle_id,
             "agent_name":   label,
             "status":       "running"
-        }).to_string())
+        })
+        .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tombstone_resume_reports_expired_context_distinctly() {
+        let error = expired_context_error("sa_expired").to_string();
+        assert!(error.contains("expired resumable context"));
+        assert!(error.contains("subagent_collect"));
+        assert!(!error.contains("No subagent found"));
     }
 }

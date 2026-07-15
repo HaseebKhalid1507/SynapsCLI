@@ -380,6 +380,20 @@ impl OrchestrationRuntime {
             .ok_or_else(|| "unknown worker".to_string())?;
         inner.registry.reconcile(&h).map_err(str::to_string)
     }
+    /// Whether a runtime handle is still named by the policy completion gate.
+    pub fn is_unreconciled(&self, runtime_handle: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(handle) = inner.handles.get(runtime_handle) else {
+            return false;
+        };
+        match inner.registry.completion_gate() {
+            CompletionGate::Allowed => false,
+            CompletionGate::Warning { workers } | CompletionGate::Blocked { workers } => {
+                workers.iter().any(|id| id == handle.id())
+            }
+        }
+    }
+
     pub fn completion_gate(&self) -> CompletionGate {
         // Core WorkerRegistry reports internal policy IDs (`worker-N`). Map them
         // back through the runtime handle table so tool-facing remediation can

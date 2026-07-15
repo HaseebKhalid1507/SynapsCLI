@@ -58,15 +58,36 @@ impl Tool for SubagentCollectTool {
         })?;
 
         let mut reg = registry.lock().unwrap();
-        let handle = reg.get_mut(&handle_id).ok_or_else(|| {
-            RuntimeError::Tool(format!(
-                "No subagent found with handle_id '{}'. \
-                     Finished handles are retained for {} minutes after completion \
-                     and then garbage-collected.",
+        let Some(handle) = reg.get_mut(&handle_id) else {
+            drop(reg);
+            if let Some(orchestration) = &ctx.capabilities.orchestration {
+                if orchestration.is_unreconciled(&handle_id) {
+                    orchestration
+                        .terminal_and_collect(
+                            &handle_id,
+                            agent_core::orchestration::WorkerTerminal::Failed,
+                        )
+                        .map_err(RuntimeError::Tool)?;
+                    if params["reconciled"].as_bool().unwrap_or(false) {
+                        orchestration
+                            .reconcile(&handle_id)
+                            .map_err(RuntimeError::Tool)?;
+                    }
+                    return Ok(json!({
+                        "handle_id": handle_id,
+                        "status": "expired",
+                        "note": "Subagent output expired; orchestration lifecycle remains recoverable.",
+                        "collected": false
+                    })
+                    .to_string());
+                }
+            }
+            return Err(RuntimeError::Tool(format!(
+                "No subagent found with handle_id '{}'. Finished handles are retained for {} minutes after completion and then garbage-collected.",
                 handle_id,
                 crate::runtime::subagent::FINISHED_HANDLE_TTL.as_secs() / 60
-            ))
-        })?;
+            )));
+        };
 
         let status = handle.status();
         let output: String = handle.partial_output();
@@ -360,6 +381,51 @@ mod tests {
             CompletionGate::Allowed,
             "first collect with reconciled=true must allow completion"
         );
+    }
+
+    #[tokio::test]
+    async fn forced_expiry_remains_collectible_and_clears_gate() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (registry, orch, ctx) = make_orch_ctx("sa_expired", &"result".repeat(10_000));
+        crate::runtime::subagent::reap_finished_with_ttl(
+            &registry,
+            Some(orch.as_ref()),
+            std::time::Duration::ZERO,
+        );
+        assert!(registry
+            .lock()
+            .unwrap()
+            .get("sa_expired")
+            .unwrap()
+            .is_tombstone());
+
+        let result = tool
+            .execute(json!({"handle_id": "sa_expired", "reconciled": true}), ctx)
+            .await
+            .unwrap();
+        assert_ne!(
+            serde_json::from_str::<Value>(&result).unwrap()["status"],
+            "expired"
+        );
+        assert_eq!(orch.completion_gate(), CompletionGate::Allowed);
+    }
+
+    #[tokio::test]
+    async fn missing_mapped_handle_has_degraded_collect_not_404() {
+        use agent_core::orchestration::CompletionGate;
+
+        let tool = SubagentCollectTool;
+        let (registry, orch, ctx) = make_orch_ctx("sa_missing", "lost");
+        registry.lock().unwrap().remove("sa_missing");
+        let result = tool
+            .execute(json!({"handle_id": "sa_missing", "reconciled": true}), ctx)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(body["status"], "expired");
+        assert_eq!(orch.completion_gate(), CompletionGate::Allowed);
     }
 
     // (c) repeated collect with reconciled=true remains read-many idempotent.
