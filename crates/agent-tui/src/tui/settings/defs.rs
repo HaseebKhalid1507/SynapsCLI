@@ -60,7 +60,6 @@ define_settings! {
                 // Validate against capability cache/static before mutating.
                 // On Err: return the error so apply_setting can skip config write.
                 runtime.set_reasoning_level_checked(level)
-                    .map_err(|msg| msg)
             } else {
                 // Unknown string — ignore silently (cycler only emits valid strings).
                 Ok(())
