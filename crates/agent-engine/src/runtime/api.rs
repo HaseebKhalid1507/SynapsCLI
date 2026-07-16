@@ -102,6 +102,9 @@ struct ParseState {
 /// auth/permission) is terminal — retrying a context-overflow never helps.
 #[derive(Debug, Clone)]
 struct StreamError {
+    /// Anthropic wire error type, retained separately from display text so
+    /// retry policy never depends on parsing a human-facing message.
+    error_type: Option<String>,
     /// Human-facing, actionable message (already names the error type + body).
     message: String,
     /// True for transient classes that a backoff retry can clear.
@@ -125,7 +128,7 @@ enum StreamOutcome {
     /// A valid turn — hand the assistant content envelope back to the caller.
     Done(Value),
     /// A transient in-stream error — caller should back off and re-send.
-    Retry(String),
+    Retry(StreamError),
     /// A terminal failure — surface as a visible `Err`, never a silent stop.
     Fail(String),
     /// The model set stop_reason=refusal — discard all partial content and
@@ -550,7 +553,11 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     raw = %truncate_at_char_boundary(raw, 400),
                     "SSE error event: {message}"
                 );
-                state.stream_error = Some(StreamError { message, retryable });
+                state.stream_error = Some(StreamError {
+                    error_type: Some(kind.to_string()),
+                    message,
+                    retryable,
+                });
             }
         }
         AnthropicEvent::Unknown => {
@@ -618,6 +625,22 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
 ///     made the agent silently stop mid-flow.
 ///   * Otherwise → `Done` with the assistant content envelope. A cancelled
 ///     stream legitimately yields empty content, so it passes through.
+const OAUTH_OVERLOAD_RETRIES: u32 = 10;
+const OAUTH_OVERLOAD_BASE_DELAY_MS: u64 = 500;
+const GENERIC_STREAM_BASE_DELAY_MS: u64 = 1000;
+
+fn stream_retry_policy(
+    auth_type: &str,
+    error_type: Option<&str>,
+    configured_retries: u32,
+) -> (u32, u64) {
+    if auth_type == "oauth" && error_type == Some("overloaded_error") {
+        (OAUTH_OVERLOAD_RETRIES, OAUTH_OVERLOAD_BASE_DELAY_MS)
+    } else {
+        (configured_retries, GENERIC_STREAM_BASE_DELAY_MS)
+    }
+}
+
 fn classify_stream_outcome(
     stream_error: Option<StreamError>,
     content: Vec<Value>,
@@ -632,7 +655,7 @@ fn classify_stream_outcome(
             return StreamOutcome::Done(json!({ "content": content }));
         }
         return if e.retryable {
-            StreamOutcome::Retry(e.message)
+            StreamOutcome::Retry(e)
         } else {
             StreamOutcome::Fail(e.message)
         };
@@ -963,23 +986,25 @@ impl ApiMethods {
             .into();
 
         // ═══ UNIFIED RETRY (task #130) ════════════════════════════════════════
-        // ONE budget governs every transient failure — whether it surfaces as an
-        // HTTP status (429 / 5xx, pre-stream), a transport drop, OR an in-stream
-        // `error` event (overloaded_error / api_error / rate_limit_error,
-        // mid-stream under a 200). They are the same class of problem: "re-send
-        // the identical request after backoff." Sharing these counters across the
-        // send phase AND the stream phase is what stops the budget from
-        // multiplying (the two-loop smell) — a request that flaps between an HTTP
-        // 5xx and an in-stream error draws down a SINGLE `max_retries` budget.
+        // ONE generic budget governs transient failures whether they surface as
+        // an HTTP status (5xx, pre-stream), a transport drop, or an in-stream
+        // `api_error` / `rate_limit_error` under a 200 response. Sharing this
+        // counter across send and stream phases stops the budget from multiplying
+        // (the two-loop smell). The two service-specific exceptions below are
+        // 429 rate limits and Anthropic OAuth overload frames.
         //
         // 429 (rate-limit) keeps its own higher budget: OAuth windows can last
         // minutes, so we honour the reset headers rather than dying after a few
-        // tries. Other transients (HTTP 5xx + in-stream errors) share `max_retries`.
+        // tries. Other transients (HTTP 5xx + in-stream api/rate-limit errors)
+        // share `max_retries`. Anthropic OAuth `overloaded_error` frames use a
+        // separate Claude-compatible persistent budget (10 retries), because
+        // these 200/SSE overload responses carry no retry headers.
         const MAX_429_RETRIES: u32 = 8;
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
         let mut non_429_attempts: u32 = 0; // shared server-error budget
+        let mut overload_attempts: u32 = 0; // Claude-compatible persistent overload budget
         let mut refusal_attempts: u32 = 0; // refusal-retry budget (separate from error budget)
         let mut attempt: u32 = 0; // total attempts (for backoff calc)
 
@@ -1229,6 +1254,7 @@ impl ApiMethods {
                     Err(e) => {
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
+                            error_type: None,
                             message: crate::core::error::humanize_network_error(&e),
                             retryable: true,
                         });
@@ -1318,31 +1344,51 @@ impl ApiMethods {
             ) {
                 StreamOutcome::Done(v) => return Ok(v),
                 StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
-                StreamOutcome::Retry(msg) => {
-                    // Transient in-stream error (overloaded_error / api_error /
-                    // rate_limit_error). Draws from the SAME shared server-error
-                    // budget as HTTP 5xx — one unified retry policy, no budget
-                    // multiplication across the send and stream phases.
-                    if non_429_attempts >= max_retries || cancel.is_cancelled() {
+                StreamOutcome::Retry(stream_error) => {
+                    let msg = stream_error.message;
+                    // Anthropic OAuth overloads need the same persistent retry
+                    // posture as Claude Code (10 retries), not the generic
+                    // three-attempt server-error budget. Other transient stream
+                    // failures continue to use the configured shared budget.
+                    let is_overloaded =
+                        stream_error.error_type.as_deref() == Some("overloaded_error");
+                    let (retry_budget, base_delay_ms) = stream_retry_policy(
+                        &auth_type,
+                        stream_error.error_type.as_deref(),
+                        max_retries,
+                    );
+                    let retries_used = if auth_type == "oauth" && is_overloaded {
+                        overload_attempts
+                    } else {
+                        non_429_attempts
+                    };
+                    if retries_used >= retry_budget || cancel.is_cancelled() {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         return Err(RuntimeError::ApiStatus(msg));
                     }
-                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.min(6)));
-                    non_429_attempts += 1;
+                    let retry_index = retries_used.saturating_add(1);
+                    let delay = Duration::from_millis(
+                        base_delay_ms * 2u64.pow(retry_index.saturating_sub(1).min(6)),
+                    );
+                    if auth_type == "oauth" && is_overloaded {
+                        overload_attempts += 1;
+                    } else {
+                        non_429_attempts += 1;
+                    }
                     attempt += 1;
                     last_err = msg.clone();
                     last_status = None;
                     tracing::warn!(
                         "in-stream API error, retrying {}/{} after {:?}: {}",
-                        non_429_attempts,
-                        max_retries,
+                        retry_index,
+                        retry_budget,
                         delay,
                         msg
                     );
                     let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
                         "⏳ API stream error — retrying ({}/{})…",
-                        non_429_attempts, max_retries
+                        retry_index, retry_budget
                     ))));
                     tokio::time::sleep(delay).await;
                     if cancel.is_cancelled() {
@@ -1468,6 +1514,30 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    #[test]
+    fn anthropic_oauth_overload_uses_claude_code_retry_posture() {
+        assert_eq!(
+            stream_retry_policy("oauth", Some("overloaded_error"), 3),
+            (10, 500)
+        );
+    }
+
+    #[test]
+    fn api_key_overload_keeps_configured_retry_posture() {
+        assert_eq!(
+            stream_retry_policy("api_key", Some("overloaded_error"), 3),
+            (3, 1000)
+        );
+    }
+
+    #[test]
+    fn oauth_non_overload_keeps_configured_retry_posture() {
+        assert_eq!(
+            stream_retry_policy("oauth", Some("api_error"), 3),
+            (3, 1000)
+        );
     }
 
     #[test]
@@ -2249,6 +2319,7 @@ mod tests {
     fn outcome_retries_on_transient_error_event() {
         let r = classify_stream_outcome(
             Some(StreamError {
+                error_type: None,
                 message: "overloaded".to_string(),
                 retryable: true,
             }),
@@ -2267,6 +2338,7 @@ mod tests {
     fn outcome_fails_on_terminal_error_event() {
         let r = classify_stream_outcome(
             Some(StreamError {
+                error_type: None,
                 message: "request_too_large".to_string(),
                 retryable: false,
             }),
@@ -2307,6 +2379,7 @@ mod tests {
         // A cancel during a retryable error must ALSO downgrade to Done.
         let r2 = classify_stream_outcome(
             Some(StreamError {
+                error_type: None,
                 message: "overloaded".to_string(),
                 retryable: true,
             }),
@@ -2349,6 +2422,7 @@ mod tests {
         let content = vec![json!({"type":"text","text":"partial"})];
         let r = classify_stream_outcome(
             Some(StreamError {
+                error_type: None,
                 message: "boom".to_string(),
                 retryable: false,
             }),
