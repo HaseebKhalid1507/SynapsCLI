@@ -13,9 +13,16 @@ pub struct SessionRegistration {
     pub started_at: DateTime<Utc>,
 }
 
-/// Returns `~/.synaps-cli/run/`, creating it (mode 0700) if it doesn't exist.
+/// Returns the session runtime directory, creating it mode 0700 if needed.
+///
+/// `SYNAPS_RUNTIME_DIR` deliberately controls only ephemeral Unix sockets and
+/// registration files. Persistent state and plugin discovery remain rooted at
+/// `SYNAPS_BASE_DIR`; this avoids the 108-byte `sun_path` limit when the base
+/// directory is an EFS session path.
 pub fn registry_dir() -> PathBuf {
-    let dir = base_dir().join("run");
+    let dir = std::env::var_os("SYNAPS_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| base_dir().join("run"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("registry: failed to create run dir {:?}: {}", dir, e);
     }
@@ -44,8 +51,12 @@ pub fn sanitize_session_id(raw: &str) -> String {
 /// Sockets live in the registry dir (~/.synaps-cli/run/) which is user-owned
 /// and mode 0700, avoiding /tmp symlink squatting and TOCTOU races.
 pub fn socket_path_for_session(session_id: &str) -> String {
+    socket_path_in_dir(&registry_dir(), session_id)
+}
+
+fn socket_path_in_dir(dir: &std::path::Path, session_id: &str) -> String {
     let safe_id = sanitize_session_id(session_id);
-    registry_dir().join(format!("{}.sock", safe_id))
+    dir.join(format!("{}.sock", safe_id))
         .to_string_lossy()
         .into_owned()
 }
@@ -328,6 +339,25 @@ mod tests {
         // Sockets now live in the registry dir, not /tmp
         assert!(path.ends_with("/run/20240101-120000-ab12.sock"), "got: {}", path);
         assert!(!path.contains("/tmp/"), "socket should not be in /tmp");
+    }
+
+    // Regression: an EFS-backed SYNAPS_BASE_DIR can exceed Linux's 108-byte
+    // sockaddr_un.sun_path limit. Runtime sockets must be independently rooted.
+    #[test]
+    fn short_runtime_dirs_keep_long_session_socket_bindable_and_isolated() {
+        use std::os::unix::net::UnixListener;
+        let long_session = "s".repeat(80);
+        // These model deterministic per-UID runtime roots created by guest-agent.
+        let path_a = socket_path_in_dir(std::path::Path::new("/tmp/a"), &long_session);
+        let path_b = socket_path_in_dir(std::path::Path::new("/tmp/b"), &long_session);
+        assert!(path_a.len() < 108, "Unix socket path too long: {path_a}");
+        assert_ne!(path_a, path_b, "per-user runtime roots must isolate same session ids");
+
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a"); let b = root.path().join("b");
+        std::fs::create_dir_all(&a).unwrap(); std::fs::create_dir_all(&b).unwrap();
+        let _a = UnixListener::bind(socket_path_in_dir(&a, &long_session)).unwrap();
+        let _b = UnixListener::bind(socket_path_in_dir(&b, &long_session)).unwrap();
     }
 
     #[cfg(unix)]
