@@ -764,8 +764,8 @@ pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule 
 }
 
 /// Subagent supervision doctrine for OpenAI Codex models: keep a polling
-/// loop open over dispatched workers and never end the turn while any
-/// worker is still running.
+/// loop open until every dispatched worker reaches terminal status, then
+/// collect each terminal handle with reconciliation before ending the turn.
 const CODEX_SUBAGENT_SUPERVISION: &str =
     include_str!("builtin_prompts/codex_subagent_supervision.md");
 const ANTHROPIC_ULTRACODE_WORKFLOW: &str =
@@ -780,7 +780,7 @@ pub fn builtin_orchestration_adapters() -> Vec<PromptModule> {
         PromptModule::new(
             PromptModuleId::parse("builtin.codex.subagent-supervision")
                 .expect("builtin module id is valid"),
-            "1.0.0",
+            "1.0.1",
             PromptModuleSource::Builtin,
             10,
             PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
