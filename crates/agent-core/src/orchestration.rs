@@ -59,6 +59,18 @@ impl CatalogSnapshot {
             .get(model)
             .is_some_and(|entry| entry.available && entry.worker_eligible)
     }
+    /// Admits one additional exact identity as an available worker-eligible
+    /// descriptor, recomputing the snapshot id/digest. Used for explicit
+    /// mid-session user grants; an existing entry is upgraded to eligible.
+    pub fn with_model(&self, model: QualifiedModelId) -> Self {
+        let mut entries: Vec<CatalogEntry> = self.entries.values().cloned().collect();
+        entries.push(CatalogEntry {
+            model,
+            available: true,
+            worker_eligible: true,
+        });
+        Self::from_entries(entries)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -332,6 +344,38 @@ impl DelegationPolicy {
     pub fn effective_choices(&self) -> &[QualifiedModelId] {
         &self.effective_choices
     }
+    /// Honors an explicit user trust grant issued after session start. Trusted
+    /// models were never meant to be pinned at session load: the exact identity
+    /// joins the catalog and either the same-provider allowlist or a fresh
+    /// non-expiring session cross-provider grant. Session grants are inserted
+    /// ahead of pinned grants so a stale expiring grant for the same identity
+    /// can never shadow the user's explicit decision. Worker lifecycle state
+    /// and concurrency limits are untouched.
+    pub fn grant_worker_model(&mut self, model: QualifiedModelId) -> Result<(), &'static str> {
+        if !self.catalog.contains(&model) {
+            self.catalog = self.catalog.with_model(model.clone());
+        }
+        if model.provider() == self.foreground.provider() {
+            self.allowed_models.insert(model.clone());
+        } else if !self.grants.iter().any(|grant| {
+            grant.to_provider == model.provider()
+                && grant.allowed_models.contains(&model)
+                && grant.expires_at_unix.is_none()
+        }) {
+            let grant = CrossProviderGrant::new(
+                format!("session-user-grant-{}", model.as_str()),
+                self.foreground.provider().to_owned(),
+                model.provider().to_owned(),
+                [model.clone()],
+            )?;
+            self.grants.insert(0, grant);
+        }
+        if !self.effective_choices.contains(&model) {
+            self.effective_choices.push(model);
+            self.effective_choices.sort();
+        }
+        Ok(())
+    }
     pub fn foreground_model(&self) -> &QualifiedModelId {
         &self.foreground
     }
@@ -455,6 +499,19 @@ impl WorkerRegistry {
     }
     pub fn policy(&self) -> &DelegationPolicy {
         &self.policy
+    }
+    /// Applies an explicit mid-session user trust grant for one exact worker
+    /// model. Existing worker lifecycle state and limits are unchanged; the
+    /// grant is visible to the next dispatch decision.
+    pub fn grant_worker_model(&mut self, model: QualifiedModelId) -> Result<(), &'static str> {
+        self.policy.grant_worker_model(model)?;
+        self.emit(OrchestrationEvent {
+            name: "worker.model_granted",
+            worker_id: None,
+            worker_role: None,
+            reason_code: Some("user_session_grant"),
+        });
+        Ok(())
     }
     pub fn total_dispatched(&self) -> usize {
         self.total

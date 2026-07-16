@@ -546,6 +546,14 @@ fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> I
                 InputAction::ModelsApply(model)
             }
             super::models::InputOutcome::None => InputAction::None,
+            super::models::InputOutcome::Trusted(model) => {
+                // Explicit user trust action: extend the live delegation policy
+                // so subagent dispatch honors the grant this session. The
+                // config favorite is already persisted; a policy refusal (e.g.
+                // malformed ID) must not break the picker interaction.
+                let _ = runtime.grant_worker_model(&model);
+                InputAction::None
+            }
             super::models::InputOutcome::ExpandProvider(provider) => {
                 InputAction::ModelsExpandProvider(provider)
             }

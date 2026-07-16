@@ -598,6 +598,17 @@ impl Runtime {
         self.orchestration.as_ref()
     }
 
+    /// Extends the live session delegation policy with one explicitly
+    /// user-trusted worker model (e.g. favorited mid-session in the models
+    /// picker). Mid-session trust grants were always meant to be honored;
+    /// the policy snapshot is not pinned against user decisions.
+    pub fn grant_worker_model(&self, model: &str) -> std::result::Result<(), String> {
+        self.orchestration
+            .as_ref()
+            .ok_or_else(|| "delegation policy unavailable".to_string())?
+            .grant_worker_model(model)
+    }
+
     pub fn set_model(&mut self, model: String) {
         let _ = self.try_set_model(model);
     }
