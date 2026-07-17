@@ -48,8 +48,10 @@ pub fn sanitize_session_id(raw: &str) -> String {
 }
 
 /// Returns the Unix domain socket path for a session.
-/// Sockets live in the registry dir (~/.synaps-cli/run/) which is user-owned
-/// and mode 0700, avoiding /tmp symlink squatting and TOCTOU races.
+/// Sockets live in the registry dir — `$SYNAPS_RUNTIME_DIR` when set (e.g.
+/// `/run/user/<uid>/synaps`), otherwise `$SYNAPS_BASE_DIR/run` (default
+/// `~/.synaps-cli/run/`) — which is user-owned and mode 0700, avoiding /tmp
+/// symlink squatting and TOCTOU races.
 pub fn socket_path_for_session(session_id: &str) -> String {
     socket_path_in_dir(&registry_dir(), session_id)
 }
@@ -343,6 +345,7 @@ mod tests {
 
     // Regression: an EFS-backed SYNAPS_BASE_DIR can exceed Linux's 108-byte
     // sockaddr_un.sun_path limit. Runtime sockets must be independently rooted.
+    #[cfg(unix)]
     #[test]
     fn short_runtime_dirs_keep_long_session_socket_bindable_and_isolated() {
         use std::os::unix::net::UnixListener;
@@ -353,11 +356,20 @@ mod tests {
         assert!(path_a.len() < 108, "Unix socket path too long: {path_a}");
         assert_ne!(path_a, path_b, "per-user runtime roots must isolate same session ids");
 
-        let root = tempfile::tempdir().unwrap();
-        let a = root.path().join("a"); let b = root.path().join("b");
-        std::fs::create_dir_all(&a).unwrap(); std::fs::create_dir_all(&b).unwrap();
+        // Bind under SHORT, /tmp-rooted dirs. The whole point is short socket
+        // paths; some platforms' tempdir() (e.g. macOS /var/folders/...) is long
+        // enough to blow the sun_path limit and flake this exact assertion, so we
+        // control the root length explicitly. Two sibling dirs model two per-uid
+        // runtime roots.
+        let pid = std::process::id();
+        let a = std::path::PathBuf::from(format!("/tmp/sa{pid}"));
+        let b = std::path::PathBuf::from(format!("/tmp/sb{pid}"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
         let _a = UnixListener::bind(socket_path_in_dir(&a, &long_session)).unwrap();
         let _b = UnixListener::bind(socket_path_in_dir(&b, &long_session)).unwrap();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[cfg(unix)]
