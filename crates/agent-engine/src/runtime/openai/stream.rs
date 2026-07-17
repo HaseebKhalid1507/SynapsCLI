@@ -433,20 +433,6 @@ pub(crate) async fn call_codex_stream_inner(
     }))
 }
 
-/// Pure body construction for Codex Responses-API requests.
-///
-/// Separated from the async function so it can be unit-tested without
-/// any credential access or network I/O.
-///
-/// # Arguments
-/// - `model`: the Codex model id (already validated by the caller)
-/// - `level`: reasoning level (must already be validated against model capability)
-/// - `input`: pre-built input items (from `codex_input_messages`)
-/// - `instructions`: pre-built instructions string (from `codex_instructions`)
-/// - `tools`: pre-built tool array
-/// - `temperature`: optional temperature override
-/// - `max_tokens`: optional max_output_tokens override
-// used in tests
 /// Stable prompt-cache routing key for this conversation.
 ///
 /// The Codex backend routes prefix-cache lookups by `prompt_cache_key`
@@ -468,6 +454,22 @@ pub(crate) fn codex_prompt_cache_key(instructions: &str, first_item: Option<&Val
     format!("synaps-{:x}", hasher.finalize())
 }
 
+/// Pure body construction for Codex Responses-API requests.
+///
+/// Separated from the async function so it can be unit-tested without
+/// any credential access or network I/O.
+///
+/// # Arguments
+/// - `model`: the Codex model id (already validated by the caller)
+/// - `plan`: reasoning plan (must already be validated against model capability)
+/// - `input`: pre-built input items (from `codex_input_messages`)
+/// - `instructions`: pre-built instructions string (from `codex_instructions`)
+/// - `tools`: pre-built tool array
+/// - `temperature`: optional temperature override
+/// - `max_tokens`: optional max_output_tokens override
+/// - `prompt_cache_key`: pre-computed routing key; computed on the
+///   pre-insertion input head by the caller, so it cannot be derived here
+#[allow(clippy::too_many_arguments)] // pure builder mirroring the wire body; grouping would obscure the 1:1 field mapping
 pub(crate) fn build_codex_body(
     model: &str,
     plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
