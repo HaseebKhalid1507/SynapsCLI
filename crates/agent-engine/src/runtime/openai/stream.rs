@@ -11,13 +11,43 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+/// Persistent retry posture for the Codex transport, mirroring the Anthropic
+/// OAuth overload budget (`OAUTH_OVERLOAD_RETRIES` in `runtime/api.rs`).
+///
+/// chatgpt.com edge turbulence — 503 upstream connect errors, Cloudflare
+/// 520s, raw TCP connect/read timeouts (incident: 2026-07-16 log bursts at
+/// 14:19, 18:52, 20:21, 20:27, 20:55, 21:47) — clears on its own within a
+/// burst; a three-attempt budget risks aborting an autonomous turn mid-burst.
+pub(crate) const CODEX_PERSISTENT_RETRIES: u32 = 10;
+
+/// Exponential-backoff exponent cap shared with the Anthropic stream retry
+/// path (`stream_retry_policy`): delay = base·2^min(n−1, CAP). Without the
+/// cap a 10-deep budget would sleep 1s·2⁹ = 512s on its final attempt.
+const RETRY_BACKOFF_EXP_CAP: u32 = 6;
+
+/// Effective Codex transport retry budget: the persistent floor, unless the
+/// user configured something even larger. Pure — decided at the dispatch
+/// seam (`try_route`), never inside `send_with_retries`, so tests can still
+/// inject exact budgets.
+pub(crate) fn codex_retry_budget(configured_retries: u32) -> u32 {
+    configured_retries.max(CODEX_PERSISTENT_RETRIES)
+}
+
+/// Backoff for retry attempt *n* (1-based): 1s·2^(n−1), capped at 64s.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        1000 * 2u64.pow(attempt.saturating_sub(1).min(RETRY_BACKOFF_EXP_CAP)),
+    )
+}
+
 /// Send a provider streaming request, retrying transient failures.
 ///
 /// Parity fix: the Anthropic path retries transient errors with backoff
 /// (`call_api_stream_inner`) but the provider routes were single-shot — one
 /// transport blip against e.g. `chatgpt.com` aborted an entire autonomous
 /// turn (incident: session 20260714-025948-3dab). Attempt *n* sleeps
-/// 1s·2^(n−1), mirroring the Anthropic budget semantics.
+/// 1s·2^(n−1) capped at 2^`RETRY_BACKOFF_EXP_CAP`, mirroring the Anthropic
+/// budget semantics.
 ///
 /// Retryable: transport-level send failures (timeout / connect / request)
 /// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
@@ -32,9 +62,6 @@ async fn send_with_retries(
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempt: u32 = 0;
     loop {
-        let retry_delay = |attempt: u32| {
-            std::time::Duration::from_millis(1000 * 2u64.pow(attempt.saturating_sub(1)))
-        };
         match build().send().await {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
@@ -2300,5 +2327,33 @@ mod send_retry_tests {
             "initial attempt + 1 retry"
         );
         assert!(err.to_string().starts_with("codex request failed: 503"));
+    }
+
+    /// The dispatch seam lifts the generic three-attempt budget to the
+    /// persistent posture adopted for Anthropic OAuth overloads (10 retries)
+    /// — incident: 2026-07-16 chatgpt.com 503/520/timeout bursts.
+    #[test]
+    fn codex_retry_budget_lifts_configured_default_to_persistent_floor() {
+        assert_eq!(codex_retry_budget(3), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(0), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(10), 10);
+    }
+
+    /// A user who explicitly configured an even larger budget keeps it —
+    /// the floor only ever raises, never lowers.
+    #[test]
+    fn codex_retry_budget_honors_larger_user_configuration() {
+        assert_eq!(codex_retry_budget(15), 15);
+    }
+
+    /// Backoff doubles per attempt but caps at 2^6 — a 10-deep budget must
+    /// never sleep 512s on its final attempt.
+    #[test]
+    fn retry_delay_is_exponential_with_a_capped_tail() {
+        assert_eq!(retry_delay(1).as_secs(), 1);
+        assert_eq!(retry_delay(2).as_secs(), 2);
+        assert_eq!(retry_delay(4).as_secs(), 8);
+        assert_eq!(retry_delay(7).as_secs(), 64);
+        assert_eq!(retry_delay(10).as_secs(), 64);
     }
 }

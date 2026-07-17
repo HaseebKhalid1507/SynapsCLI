@@ -476,7 +476,10 @@ pub async fn try_route(
                 reasoning_level,
                 codex_request_role,
                 cancel,
-                max_retries,
+                // Codex transport rides out chatgpt.com edge bursts with the
+                // same persistent posture as Anthropic OAuth overloads (10
+                // retries), not the generic three-attempt budget.
+                stream::codex_retry_budget(max_retries),
             )
             .await,
         ),
