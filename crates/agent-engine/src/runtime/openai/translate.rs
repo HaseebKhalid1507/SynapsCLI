@@ -376,15 +376,21 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
             prompt_tokens,
             completion_tokens,
             cached_tokens,
-        } => Some(StreamEvent::Session(SessionEvent::Usage {
-            input_tokens: *prompt_tokens as u64,
-            output_tokens: *completion_tokens as u64,
-            cache_read_input_tokens: *cached_tokens as u64,
-            cache_creation_input_tokens: 0,
-            cache_creation_5m: None,
-            cache_creation_1h: None,
-            model: None,
-        })),
+        } => {
+            // prompt_tokens INCLUDES the cached slice (OpenAI semantics);
+            // downstream accounting sums input + cache_read (Anthropic
+            // semantics), so subtract to avoid double-counting the hits.
+            let cached = (*cached_tokens).min(*prompt_tokens) as u64;
+            Some(StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: *prompt_tokens as u64 - cached,
+                output_tokens: *completion_tokens as u64,
+                cache_read_input_tokens: cached,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }))
+        }
         OaiEvent::Warning(s) => {
             tracing::warn!("openai stream warning: {}", s);
             None
