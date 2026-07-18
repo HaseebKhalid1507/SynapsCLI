@@ -51,3 +51,6 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
 
 pub mod orchestration;
 pub mod prompt;
+pub mod text;
+
+pub use text::BoundedText;

@@ -18,7 +18,7 @@ pub use agent_core::{
     auth, chain, config, error, logging, models, protocol, session, watcher_types,
 };
 pub use agent_core::{core, memory, pricing};
-pub use agent_core::{epoch_millis, truncate_str};
+pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 
 // ── engine-internal top-level re-exports ──────────────────────────────────────
 // These mirror what root lib.rs was exporting; they let intra-engine code use

@@ -270,16 +270,19 @@ impl HelperMethods {
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
-    pub(crate) fn truncate_tool_result(result: &str, max_chars: usize) -> String {
-        if result.len() <= max_chars {
-            return result.to_string();
+    ///
+    /// `max_bytes` is a BYTE budget enforced at a UTF-8 char boundary via the
+    /// shared [`agent_core::BoundedText`] helper (T2; the legacy code applied
+    /// a char budget, so multibyte output could exceed the byte cap). Marker
+    /// format intentionally changed from "total chars" to "total bytes".
+    pub(crate) fn truncate_tool_result(result: &str, max_bytes: usize) -> String {
+        let bounded = agent_core::BoundedText::new(result, max_bytes);
+        if !bounded.truncated {
+            return bounded.text;
         }
-        let truncated: String = result.chars().take(max_chars).collect();
         format!(
-            "{}\n\n[truncated — {} total chars, showing first {}]",
-            truncated,
-            result.len(),
-            max_chars
+            "{}\n\n[truncated — {} total bytes, showing first {}]",
+            bounded.text, bounded.original_bytes, bounded.retained_bytes
         )
     }
 

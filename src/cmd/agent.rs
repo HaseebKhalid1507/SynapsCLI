@@ -460,7 +460,10 @@ pub async fn run(config_path: String, trigger_context: String) {
                 StreamEvent::Llm(LlmEvent::Text(text)) => {
                     // Log significant text output
                     if text.len() > 100 {
-                        log(agent_name, &format!("output: {}...", &text[..100]));
+                        log(
+                            agent_name,
+                            &format!("output: {}...", synaps_cli::truncate_str(&text, 100)),
+                        );
                         write_log(
                             &session_log_path,
                             &json!({

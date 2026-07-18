@@ -78,12 +78,11 @@ impl Tool for GrepTool {
             Ok("No matches found.".to_string())
         } else {
             let result = stdout.to_string();
-            if result.len() > ctx.limits.max_tool_buffer {
-                let truncated: String = result.chars().take(ctx.limits.max_tool_buffer).collect();
+            let bounded = agent_core::BoundedText::new(&result, ctx.limits.max_tool_buffer);
+            if bounded.truncated {
                 Ok(format!(
                     "{}\n\n... (output truncated, {} total bytes)",
-                    truncated,
-                    result.len()
+                    bounded.text, bounded.original_bytes
                 ))
             } else {
                 Ok(result)

@@ -42,8 +42,8 @@ pub use tokio_util::sync::CancellationToken;
 /// Re-export epoch_millis from agent-core (moved there for the leaf crate split).
 pub use agent_core::epoch_millis;
 
-/// Re-export truncate_str from agent-core.
-pub use agent_core::truncate_str;
+/// Re-export truncate_str + BoundedText from agent-core.
+pub use agent_core::{truncate_str, BoundedText};
 
 /// Flush stdout, ignoring errors (pipe closed, etc.)
 #[inline]

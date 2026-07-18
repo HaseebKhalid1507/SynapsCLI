@@ -277,11 +277,7 @@ impl Tool for BashTool {
                         let delta = if msg.len() <= remaining {
                             msg.clone()
                         } else {
-                            let mut end = remaining;
-                            while end > 0 && !msg.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            msg[..end].to_string()
+                            crate::truncate_str(&msg, remaining).to_string()
                         };
                         streamed_bytes += delta.len();
                         if !delta.is_empty() {

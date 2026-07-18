@@ -12,16 +12,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// Truncate to at most `max` bytes without slicing mid-UTF-8-codepoint.
-/// Used for forensic logging of unknown event lines.
+/// Used for forensic logging of unknown event lines. Thin alias over the
+/// shared `agent_core::truncate_str` helper (T2 unification).
 fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    crate::truncate_str(s, max)
 }
 
 /// Trace the outgoing Anthropic request. Metadata only — raw payload content

@@ -2243,7 +2243,7 @@ mod tests {
         assert!(truncated.starts_with(&"x".repeat(30000)));
 
         // Should contain truncation notice with total char count
-        assert!(truncated.contains("[truncated — 30001 total chars, showing first 30000]"));
+        assert!(truncated.contains("[truncated — 30001 total bytes, showing first 30000]"));
 
         // Should be longer than max (due to notice)
         assert!(truncated.len() > 30000);
@@ -2252,14 +2252,34 @@ mod tests {
         let very_long = "a".repeat(50000);
         let truncated_very_long = HelperMethods::truncate_tool_result(&very_long, default_max);
         assert!(
-            truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]")
+            truncated_very_long.contains("[truncated — 50000 total bytes, showing first 30000]")
         );
         assert!(truncated_very_long.starts_with(&"a".repeat(30000)));
 
         // Test with custom limit
         let custom_truncated = HelperMethods::truncate_tool_result(&very_long, 100);
         assert!(custom_truncated.starts_with(&"a".repeat(100)));
-        assert!(custom_truncated.contains("[truncated — 50000 total chars, showing first 100]"));
+        assert!(custom_truncated.contains("[truncated — 50000 total bytes, showing first 100]"));
+    }
+
+    /// T2 red→green: `truncate_tool_result` must enforce a BYTE budget on
+    /// multibyte input (legacy code used `chars().take(n)` — a char budget —
+    /// so 100 two-byte chars under a 50-byte budget kept 100 bytes).
+    #[test]
+    fn truncate_tool_result_enforces_byte_budget() {
+        let multibyte = "é".repeat(100); // 200 bytes, 100 chars
+        let out = HelperMethods::truncate_tool_result(&multibyte, 50);
+        let body = out.split("\n\n[truncated").next().unwrap();
+        assert!(
+            body.len() <= 50,
+            "retained body must fit the byte budget (got {} bytes)",
+            body.len()
+        );
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+        assert!(
+            out.contains("total bytes"),
+            "marker must report byte counts, got: {out}"
+        );
     }
 
     #[test]
