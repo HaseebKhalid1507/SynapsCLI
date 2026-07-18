@@ -18,8 +18,10 @@
 //! - **Correctness firewall:** nothing in this module can fail a request.
 //!   Key I/O failure degrades the record (digest-bearing sections omitted)
 //!   and bumps a metadata-only counter + one warning; it never propagates.
-//! - **No persistence here:** the bounded background writer is Task 11. The
-//!   default sink is a no-op; tests install [`CollectingTraceSink`].
+//! - **No persistence here:** persistence lives in the Task 11 bounded
+//!   background writer (`runtime::telemetry::writer`); production installs
+//!   its `WriterTraceSink` when telemetry is Basic/Full. The default sink
+//!   is a no-op; tests install [`CollectingTraceSink`].
 //!
 //! No hidden global mutable state: all shared state (lazy key cell,
 //! counters, sequence) lives inside the [`TraceContext`] handle the caller
@@ -53,8 +55,10 @@ pub trait TraceSink: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Default production sink until the Task 11 bounded writer lands: accepts
-/// and discards. `enabled() == false` lets transports skip all trace work.
+/// Disabled sink: accepts and discards. `enabled() == false` lets
+/// transports skip all trace work. Production installs the Task 11
+/// writer-backed sink (`runtime::telemetry::WriterTraceSink`) instead when
+/// the telemetry level warrants persistence.
 #[derive(Debug, Default)]
 pub struct NoopTraceSink;
 

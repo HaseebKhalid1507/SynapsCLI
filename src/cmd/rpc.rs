@@ -1142,6 +1142,30 @@ pub async fn run(
 
                         state.lock().await.save_session().await;
 
+                        // Bounded observability flush (Task 11) — before
+                        // `process::exit`, which bypasses all destructors.
+                        // In-flight streams already drained above, so the
+                        // shared writer is safe to close. `off` → `None`
+                        // no-op; "flushed" = OS file buffers, no fsync; a
+                        // timeout logs metadata-only stats and shutdown
+                        // proceeds regardless.
+                        if let Some(outcome) = state
+                            .lock()
+                            .await
+                            .runtime
+                            .shutdown_observability_async(
+                                synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+                            )
+                            .await
+                        {
+                            if !outcome.is_flushed() {
+                                tracing::warn!(
+                                    stats = ?outcome.stats(),
+                                    "observability flush timed out — detached worker keeps draining"
+                                );
+                            }
+                        }
+
                         // Signal background tasks (inbox watcher, session
                         // socket listener) to stop. The `BackgroundTasks`
                         // value is dropped at function exit, which aborts
@@ -1172,6 +1196,27 @@ pub async fn run(
                     }
                 }
             }
+        }
+    }
+
+    // Reached via `break` (stdin EOF or read error) — the only graceful
+    // return path that does not `process::exit`. Same bounded observability
+    // flush as the Shutdown frame: `off` → `None` no-op; idempotent, so a
+    // future refactor routing Shutdown through here double-flushes safely.
+    if let Some(outcome) = state
+        .lock()
+        .await
+        .runtime
+        .shutdown_observability_async(
+            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+        )
+        .await
+    {
+        if !outcome.is_flushed() {
+            tracing::warn!(
+                stats = ?outcome.stats(),
+                "observability flush timed out — detached worker keeps draining"
+            );
         }
     }
 

@@ -589,3 +589,50 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
     assert_eq!(wire.byte_len, received[0].len() as u64);
     assert_eq!(wire.digest, expected_wire_digest(&h.key_path, &received[0]));
 }
+
+// ─── Task 11: slow persistence must not delay the model turn ────────────────
+
+/// Loopback request through a `TraceContext` whose sink is the production
+/// bounded writer (`WriterTraceSink`) configured pathologically slow
+/// (500 ms/job, capacity 1). The model turn must complete at transport
+/// speed; queue overflow is counted, never propagated. (Spec §6.5.)
+#[tokio::test]
+async fn slow_writer_sink_does_not_delay_model_turn() {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions, WriterTraceSink};
+
+    let (url, _bodies, hits) = spawn_stub(vec![]).await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(tmp.path().join("synaps/api-log.jsonl")),
+        trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+        capacity: 1,
+        write_delay: Some(Duration::from_millis(500)),
+        ..WriterOptions::default()
+    });
+    // Pre-fill the queue so this request's records hit a saturated writer.
+    for _ in 0..4 {
+        writer.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord::default());
+    }
+    let options = ApiOptions {
+        anthropic_base_url: Some(url),
+        trace: TraceContext::with_sink(Arc::new(WriterTraceSink::new(writer.clone())))
+            .with_key_path(tmp.path().join("trace").join("digest.key")),
+        ..Default::default()
+    };
+
+    let start = std::time::Instant::now();
+    drive_stream(&options, 0, &CancellationToken::new())
+        .await
+        .expect("stream must succeed at transport speed");
+    let elapsed = start.elapsed();
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "a saturated 500ms/job writer must not delay the turn: {elapsed:?}"
+    );
+    // Bounded shutdown even while the worker is mid-sleep.
+    let out = writer.shutdown(Duration::from_millis(100));
+    assert!(!out.is_flushed());
+    assert!(out.stats().dropped > 0, "overflow was counted, not blocked");
+}

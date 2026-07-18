@@ -428,6 +428,29 @@ pub async fn run(
         }
     }
 
+    // STEP 3: Bounded observability flush — after axum's graceful drain
+    // (no request handler is still producing records) and after hooks.
+    // Task 11: telemetry `off` → no writer → `None`, a true no-op.
+    // "Flushed" means appended into OS file buffers (no fsync). A timeout
+    // prints metadata-only stats and teardown continues — trace loss never
+    // fails a clean shutdown.
+    {
+        let runtime = state.runtime.lock().await;
+        match runtime
+            .shutdown_observability_async(
+                synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+            )
+            .await
+        {
+            Some(outcome) if outcome.is_flushed() => eprintln!("  ✓ observability flushed"),
+            Some(outcome) => eprintln!(
+                "  ⚠ observability flush timed out — detached worker keeps draining ({:?})",
+                outcome.stats()
+            ),
+            None => {} // telemetry off — nothing to flush
+        }
+    }
+
     state.background.shutdown();
 
     Ok(())

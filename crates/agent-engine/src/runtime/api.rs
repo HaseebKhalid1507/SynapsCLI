@@ -768,8 +768,13 @@ pub struct ApiOptions {
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     /// Trace emission seam (Task 8). Default is a disabled context (no-op
     /// sink, zero request-path work); tests install a collecting sink and
-    /// the Task 11 writer will install the production sink here.
+    /// production installs the Task 11 writer-backed sink via the Runtime.
     pub trace: crate::runtime::trace::TraceContext,
+    /// Bounded background writer for legacy telemetry records (Task 11).
+    /// `None` (default) drops records; production sets the Runtime's shared
+    /// session writer whenever the telemetry level is Basic/Full. Enqueue
+    /// only — never synchronous file I/O on the request path.
+    pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1516,7 +1521,12 @@ impl ApiMethods {
                         breakpoints,
                     },
                 };
-                telemetry::write_record(&record);
+                // Non-blocking enqueue onto the session's bounded writer
+                // (Task 11): overflow or a broken log path is counted by
+                // the writer and can never delay or fail the request.
+                if let Some(writer) = options.telemetry.as_ref() {
+                    writer.enqueue_telemetry(record);
+                }
             }
 
             match classify_stream_outcome(

@@ -497,6 +497,29 @@ pub async fn run(
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
     boot.background.shutdown();
+
+    // Bounded observability flush (Task 11): stop intake on the session's
+    // telemetry/trace writer and drain it before the process exits. Runs
+    // after session save + hooks, and BEFORE the success/failure branch
+    // below so the fatal-failure return path flushes too. Telemetry `off`
+    // → no writer → `None`, a true no-op. "Flushed" means appended into OS
+    // file buffers (no fsync — best-effort diagnostic logs). A timeout
+    // logs metadata-only stats and continues; trace loss never changes the
+    // exit outcome.
+    if let Some(outcome) = runtime
+        .shutdown_observability_async(
+            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+        )
+        .await
+    {
+        if !outcome.is_flushed() {
+            tracing::warn!(
+                stats = ?outcome.stats(),
+                "observability flush timed out — detached worker keeps draining"
+            );
+        }
+    }
+
     eprintln!("session saved: {} (${:.4})", &conv.session.id[..8], conv.session_cost);
 
     // Criterion: headless `synaps chat` exits nonzero on an unrecovered

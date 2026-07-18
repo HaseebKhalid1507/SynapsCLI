@@ -857,9 +857,18 @@ mod workers {
             "memory namespace file"
         );
 
-        // Telemetry write (public API; best-effort — file must still exist).
-        agent_engine::runtime::telemetry::write_record(
-            &agent_engine::runtime::telemetry::TelemetryRecord::default(),
+        // Telemetry write (public API; best-effort — Task 11 bounded
+        // writer: enqueue then bounded flush replaces the old synchronous
+        // write, same on-disk contract).
+        let writer = agent_engine::runtime::telemetry::TelemetryWriter::new(
+            agent_engine::runtime::telemetry::WriterOptions::default(),
+        );
+        writer.enqueue_telemetry(agent_engine::runtime::telemetry::TelemetryRecord::default());
+        assert!(
+            writer
+                .shutdown(std::time::Duration::from_secs(10))
+                .is_flushed(),
+            "telemetry writer must flush within the bound"
         );
         let telemetry = home.join(".cache/synaps/api-log.jsonl");
         assert!(telemetry.exists(), "telemetry record was not written");

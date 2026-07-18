@@ -259,6 +259,17 @@ pub struct Runtime {
     refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Session-shared bounded observability writer (Task 11, spec §6.5).
+    /// `Some` iff `telemetry_level` is Basic/Full. Cloned runtimes
+    /// (subagents) share the same handle — one worker per session, never
+    /// per request. Dropping the last handle detaches the worker (it drains
+    /// and exits on its own), so `Drop` can never hang.
+    telemetry_writer: Option<crate::runtime::telemetry::TelemetryWriter>,
+    /// Trace context handed to every `ApiOptions` site. Enabled (writer
+    /// sink) iff `telemetry_writer` is `Some`; otherwise the no-op sink.
+    /// Shared across clones so all requests of the session carry the same
+    /// session-scoped context IDs.
+    trace_ctx: trace::TraceContext,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
@@ -392,6 +403,8 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_writer: None,
+            trace_ctx: trace::TraceContext::disabled(),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -460,6 +473,8 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_writer: None,
+            trace_ctx: trace::TraceContext::disabled(),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1128,6 +1143,7 @@ impl Runtime {
         self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.trusted_worker_models = config
@@ -1251,6 +1267,99 @@ impl Runtime {
 
     pub fn set_telemetry_level(&mut self, level: crate::runtime::telemetry::TelemetryLevel) {
         self.telemetry_level = level;
+        self.sync_observability();
+    }
+
+    /// Reconcile the shared observability writer + trace sink with the
+    /// telemetry level (Task 11 config rule, documented until Task 12 adds
+    /// explicit trace config/UI): `basic`/`full` enables BOTH legacy
+    /// telemetry persistence and metadata-only trace persistence through
+    /// one bounded session writer; `off` disables both. The trace schema is
+    /// structurally metadata-only, so this never persists raw content.
+    fn sync_observability(&mut self) {
+        if self.telemetry_level.enabled() {
+            if self.telemetry_writer.is_none() {
+                let writer = crate::runtime::telemetry::TelemetryWriter::new(
+                    crate::runtime::telemetry::WriterOptions::default(),
+                );
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                self.telemetry_writer = Some(writer);
+            }
+        } else {
+            // Dropping this handle detaches the worker: it drains whatever
+            // is queued and exits on its own — never a hang. In-flight
+            // requests holding a cloned handle keep enqueueing harmlessly.
+            self.telemetry_writer = None;
+            self.trace_ctx = trace::TraceContext::disabled();
+        }
+    }
+
+    /// The session trace context handed to every request (cheap clone).
+    pub fn trace_context(&self) -> trace::TraceContext {
+        self.trace_ctx.clone()
+    }
+
+    /// The shared observability writer, when telemetry is enabled.
+    pub fn telemetry_writer(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
+        self.telemetry_writer.clone()
+    }
+
+    /// Bounded shutdown flush of the observability writer: stop intake,
+    /// drain until `timeout`, return typed stats (`None` when telemetry is
+    /// off). Sync and bounded — safe from shutdown paths that cannot await;
+    /// async callers should use [`Self::shutdown_observability_async`].
+    ///
+    /// Semantics (Task 11):
+    /// - telemetry `off` → no writer exists → `None`, a true no-op;
+    /// - "flushed" means every queued record was appended into OS file
+    ///   buffers (`write(2)` returned) — deliberately no `fsync`, these are
+    ///   best-effort diagnostic logs;
+    /// - on timeout the worker stays detached and keeps draining in the
+    ///   background; the caller logs metadata-only stats and continues —
+    ///   trace loss must never fail or abort a clean exit.
+    pub fn shutdown_observability(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        self.telemetry_writer.as_ref().map(|w| w.shutdown(timeout))
+    }
+
+    /// Async epilogue helper for every clean process/runtime exit path that
+    /// owns a `Runtime` (headless chat, TUI teardown, autonomous agent,
+    /// RPC/server graceful shutdown): clones the writer handle and runs the
+    /// bounded [`Self::shutdown_observability`] on the blocking pool, so an
+    /// executor thread is never parked. Same `None`/no-fsync/timeout
+    /// semantics as the sync variant. Idempotent — a second call finds the
+    /// intake already closed and returns immediately.
+    ///
+    /// Note: the writer is shared across `Runtime` clones (subagents). Call
+    /// this only from the session owner's exit epilogue, after in-flight
+    /// work has drained — cloned runtimes still serving requests would see
+    /// their subsequent records counted as drops.
+    pub async fn shutdown_observability_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        match self.telemetry_writer.clone() {
+            Some(writer) => Some(writer.shutdown_async(timeout).await),
+            None => None,
+        }
+    }
+
+    /// Test seam: install a custom writer (e.g. temp paths, artificial
+    /// write delay) as the session observability sink, exactly as
+    /// `sync_observability` would for a production writer.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn install_observability_for_tests(
+        &mut self,
+        writer: crate::runtime::telemetry::TelemetryWriter,
+    ) {
+        self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+            crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+        ));
+        self.telemetry_writer = Some(writer);
     }
 
     pub fn cache_diagnostics(&self) -> bool {
@@ -1326,10 +1435,14 @@ impl Runtime {
             self.reasoning_level(),
             &messages,
             self.api_retries,
-            // Default options: preserves this path's historical beta gating
-            // and endpoint; the trace seam stays disabled until the Task 11
-            // writer installs a production sink.
-            &api::ApiOptions::default(),
+            // Default options preserve this path's historical beta gating
+            // and endpoint; only the session observability seams are wired
+            // (Task 11) so compaction requests trace/persist like any other.
+            &api::ApiOptions {
+                trace: self.trace_ctx.clone(),
+                telemetry: self.telemetry_writer.clone(),
+                ..api::ApiOptions::default()
+            },
         )
         .await
     }
@@ -1368,7 +1481,8 @@ impl Runtime {
                     anthropic_base_url: None,
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
-                    trace: trace::TraceContext::disabled(),
+                    trace: self.trace_ctx.clone(),
+                    telemetry: self.telemetry_writer.clone(),
                 },
             )
             .await?;
@@ -1761,7 +1875,8 @@ impl Runtime {
             anthropic_base_url: None,
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
-            trace: trace::TraceContext::disabled(),
+            trace: self.trace_ctx.clone(),
+            telemetry: self.telemetry_writer.clone(),
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -1844,6 +1959,11 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
+            // Shared session observability: clones (subagents) enqueue into
+            // the SAME bounded writer and trace context — one worker and one
+            // set of session-scoped context IDs per session.
+            telemetry_writer: self.telemetry_writer.clone(),
+            trace_ctx: self.trace_ctx.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
             // Subagents are their own session — fresh latches so a downgrade
@@ -1868,6 +1988,119 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 11 config rule (documented until Task 12 adds explicit trace
+    /// config): telemetry `basic`/`full` enables the shared session writer
+    /// sink — legacy telemetry AND metadata-only trace persistence; `off`
+    /// disables both (trace context reverts to the no-op sink).
+    #[test]
+    fn telemetry_level_gates_shared_observability_sink() {
+        let mut rt = Runtime::new_headless();
+        assert!(!rt.trace_context().enabled(), "off by default");
+        assert!(rt.telemetry_writer().is_none());
+
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Basic);
+        assert!(rt.trace_context().enabled(), "basic enables the trace sink");
+        assert!(rt.telemetry_writer().is_some());
+
+        // Same level again: the writer/session context is not recreated.
+        let ctx_before = format!("{:?}", rt.trace_context());
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Full);
+        assert_eq!(format!("{:?}", rt.trace_context()), ctx_before);
+
+        // Clones (subagents) share the same writer sink + session context.
+        let clone = rt.clone();
+        assert!(clone.trace_context().enabled());
+        assert_eq!(format!("{:?}", clone.trace_context()), ctx_before);
+        assert!(clone.telemetry_writer().is_some());
+
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off);
+        assert!(!rt.trace_context().enabled(), "off disables both");
+        assert!(rt.telemetry_writer().is_none());
+        assert!(rt
+            .shutdown_observability(std::time::Duration::ZERO)
+            .is_none());
+    }
+
+    /// Owner-epilogue contract (Task 11): with telemetry Off the async
+    /// flush is a `None` no-op and idempotent; with a writer installed, a
+    /// chat-like epilogue (final record queued, then bounded flush) must
+    /// persist the record; and a slow writer must return within the budget
+    /// (TimedOut) instead of blocking exit.
+    #[tokio::test]
+    async fn shutdown_observability_async_epilogue_contract() {
+        // Off → None, twice (idempotent no-op, no writer ever created).
+        let rt = Runtime::new_headless();
+        let budget = crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT;
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
+
+        // Chat-like shutdown: the final queued record is persisted.
+        let tmp = tempfile::tempdir().unwrap();
+        let telemetry_path = tmp.path().join("synaps/api-log.jsonl");
+        let mut rt = Runtime::new_headless();
+        let writer = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(telemetry_path.clone()),
+                trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+                ..Default::default()
+            },
+        );
+        rt.install_observability_for_tests(writer.clone());
+        writer.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord {
+            ts: 7,
+            model: "claude-sonnet-4-6".to_string(),
+            ..Default::default()
+        });
+        let outcome = rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("writer installed");
+        assert!(outcome.is_flushed());
+        assert_eq!(outcome.stats().written, 1);
+        assert_eq!(
+            std::fs::read_to_string(&telemetry_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "queued final record must be on disk after the epilogue flush"
+        );
+        // Idempotent second call: intake already closed, still Flushed.
+        assert!(rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("writer still installed")
+            .is_flushed());
+
+        // Slow writer: the epilogue returns within its bounded budget.
+        let mut rt = Runtime::new_headless();
+        let slow = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(tmp.path().join("slow/api-log.jsonl")),
+                trace_path: Some(tmp.path().join("slow/request-trace.jsonl")),
+                write_delay: Some(std::time::Duration::from_millis(300)),
+                ..Default::default()
+            },
+        );
+        rt.install_observability_for_tests(slow.clone());
+        for _ in 0..10 {
+            slow.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord::default());
+        }
+        let start = std::time::Instant::now();
+        let outcome = rt
+            .shutdown_observability_async(std::time::Duration::from_millis(200))
+            .await
+            .expect("writer installed");
+        assert!(!outcome.is_flushed(), "10×300ms cannot drain in 200ms");
+        // Generous ceiling (no timing fragility): well under the 3s a full
+        // drain would need, proving the deadline was honored.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(1500),
+            "bounded epilogue must not block exit: {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn reload_rejects_policy_change_without_partial_apply() {

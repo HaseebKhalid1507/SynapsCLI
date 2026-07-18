@@ -373,8 +373,8 @@ pub async fn run(
                     budget_secs = signals::SAVE_TIMEOUT_SECS,
                     "session save timed out — data may be incomplete"
                 );
-                lifecycle::emergency_teardown_terminal();
-                std::process::exit(1);
+                // Task 11: bounded observability flush precedes the emergency exit.
+                lifecycle::emergency_flush_and_exit(&runtime).await;
             }
         }
 
@@ -413,6 +413,9 @@ pub async fn run(
             }
         }
 
+        // STEP 3 (Task 11): bounded observability flush after save + hooks —
+        // Off/no-fsync/timeout semantics on lifecycle::flush_observability.
+        lifecycle::flush_observability(&runtime).await;
         tracing::debug!("clean teardown completed");
     }
 

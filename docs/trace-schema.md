@@ -131,3 +131,24 @@ the preceding failed attempt was already recorded.
   length ≠ 32 treated as corrupt, and atomic `link(2)` publish so concurrent
   first-time creation converges on one key. The key and digest preimages are
   never logged.
+
+## Persistence & shutdown flush (Task 11)
+
+- **Toggle semantics (until Task 12 adds explicit trace config/UI):** the
+  `telemetry` config key gates BOTH record kinds through one bounded session
+  writer. `basic`/`full` enables legacy telemetry persistence
+  (`~/.cache/synaps/api-log.jsonl`) and metadata-only trace persistence
+  (`~/.cache/synaps/request-trace.jsonl`); `off` (the default) disables both
+  — no writer thread exists and every trace seam is the no-op sink, so the
+  request path does zero observability work.
+- **Shutdown flush:** every clean process/runtime exit path that owns a
+  `Runtime` (headless chat, TUI teardown, autonomous agent, RPC, server)
+  calls `Runtime::shutdown_observability_async` under a short bounded budget
+  (`DEFAULT_SHUTDOWN_FLUSH_TIMEOUT`, 2 s). "Flushed" means every queued
+  record was appended into OS file buffers (`write(2)` returned) — there is
+  deliberately **no `fsync`**: these are best-effort diagnostic logs, and
+  surviving a kernel crash is not part of their contract. On timeout the
+  worker stays detached and keeps draining; the caller logs a metadata-only
+  warning (counter stats, never record content) and the exit proceeds —
+  trace loss never changes an exit outcome. With telemetry `off` the flush
+  returns `None` and is a true no-op.

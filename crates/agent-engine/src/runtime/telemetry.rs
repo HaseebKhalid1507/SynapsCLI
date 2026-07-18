@@ -7,11 +7,22 @@
 //! `basic` records timing + usage + cost. `full` additionally records
 //! rate-limit headers and cache-diagnostics results when available.
 //!
-//! Writes are best-effort: a broken log path must never break the request
-//! pipeline. All errors are silently dropped (matching `log_usage`).
+//! Writes are best-effort and non-blocking: persistence goes through the
+//! bounded background [`writer`] (Task 11, spec §6.5), so a slow or broken
+//! log path can never delay or fail the request pipeline. Failures are
+//! counted (never silent-and-invisible) with one warning per persistent
+//! failure class.
 
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub mod writer;
+
+pub use writer::{
+    default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
+    WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES, DEFAULT_QUEUE_CAPACITY,
+    DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+};
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -264,64 +275,6 @@ pub fn retry_delay_from_headers(
     (d, false)
 }
 
-/// Default telemetry log path: `~/.cache/synaps/api-log.jsonl`.
-fn default_log_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".cache/synaps/api-log.jsonl"))
-}
-
-/// Append a record to the telemetry log. Best-effort — all errors are
-/// silently dropped so a broken log path never breaks the request pipeline.
-///
-/// File is created 0600 with O_NOFOLLOW (CWE-59 hardening, matching
-/// `HelperMethods::log_usage`).
-pub fn write_record(record: &TelemetryRecord) {
-    let Some(path) = default_log_path() else {
-        return;
-    };
-    write_record_to(&path, record);
-}
-
-/// Path-parametrized body of [`write_record`] (separated for tests).
-fn write_record_to(path: &std::path::Path, record: &TelemetryRecord) {
-    let Ok(line) = serde_json::to_string(record) else {
-        return;
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = agent_core::core::private_fs::ensure_private_dir(parent);
-    }
-
-    // Size-capped rotation: at >50MB, rename to <path>.1 (clobbering any old
-    // .1) before appending. One generation is enough — this is a diagnostic
-    // log, not an audit trail. Errors silently dropped (best-effort contract).
-    const MAX_BYTES: u64 = 50 * 1024 * 1024;
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_BYTES {
-            let mut rotated = path.as_os_str().to_owned();
-            rotated.push(".1");
-            let rotated = std::path::PathBuf::from(rotated);
-            if std::fs::rename(path, &rotated).is_ok() {
-                // The rotated file keeps our 0600, but repair a broader mode
-                // inherited from older builds (best-effort, policy §5.4).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-        }
-    }
-
-    // Created 0600 with O_NOFOLLOW (CWE-59); pre-existing broader modes are
-    // repaired by the helper. Errors silently dropped (best-effort contract).
-    if let Ok(mut f) = agent_core::core::private_fs::open_private_append(path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,69 +507,5 @@ mod retry_delay_tests {
             d
         );
         assert!(from_hdr);
-    }
-
-    /// Private-mode tests (spec §5.4). Umask isolation: `#[serial(umask)]`
-    /// serializes umask-mutating tests crate-wide; the guard restores the
-    /// previous mask on drop (panic-safe). umask is process-global, hence
-    /// the dedicated serial key + RAII restore.
-    #[cfg(unix)]
-    mod private_modes {
-        use super::*;
-        use serial_test::serial;
-        use std::os::unix::fs::PermissionsExt;
-
-        struct UmaskGuard {
-            old: libc::mode_t,
-        }
-        impl UmaskGuard {
-            fn set(mask: libc::mode_t) -> Self {
-                Self {
-                    old: unsafe { libc::umask(mask) },
-                }
-            }
-        }
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::umask(self.old);
-                }
-            }
-        }
-
-        fn mode_of(path: &std::path::Path) -> u32 {
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-        }
-
-        #[test]
-        #[serial(umask)]
-        fn write_record_creates_0600_file_and_0700_dir_under_permissive_umask() {
-            let _umask = UmaskGuard::set(0);
-            let tmp = tempfile::TempDir::new().unwrap();
-            let path = tmp.path().join("synaps").join("api-log.jsonl");
-            write_record_to(&path, &TelemetryRecord::default());
-            assert_eq!(
-                mode_of(path.parent().unwrap()),
-                0o700,
-                "telemetry dir must be 0700"
-            );
-            assert_eq!(mode_of(&path), 0o600, "telemetry file must be 0600");
-        }
-
-        #[test]
-        fn write_record_refuses_symlink_target() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let dir = tmp.path().join("synaps");
-            std::fs::create_dir_all(&dir).unwrap();
-            let victim = tmp.path().join("victim.jsonl");
-            std::fs::write(&victim, "").unwrap();
-            std::os::unix::fs::symlink(&victim, dir.join("api-log.jsonl")).unwrap();
-            write_record_to(&dir.join("api-log.jsonl"), &TelemetryRecord::default());
-            assert_eq!(
-                std::fs::read_to_string(&victim).unwrap(),
-                "",
-                "no bytes may be written through the planted symlink"
-            );
-        }
     }
 }

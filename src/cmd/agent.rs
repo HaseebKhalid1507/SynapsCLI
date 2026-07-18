@@ -770,5 +770,18 @@ pub async fn run(config_path: String, trigger_context: String) {
         }
     });
 
+    // Bounded observability flush (Task 11) — MUST run before
+    // `process::exit`, which would otherwise bypass every queued
+    // telemetry/trace record. This worker builds its Runtime via
+    // `Runtime::new()` and never calls `apply_config`, so the telemetry
+    // level is Off and this returns `None` today (harmless no-op) — but
+    // the epilogue stays correct the day agent config gains telemetry.
+    // Bounded: a hung disk can never stall agent shutdown.
+    let _ = runtime
+        .shutdown_observability_async(
+            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+        )
+        .await;
+
     std::process::exit(0);
 }
