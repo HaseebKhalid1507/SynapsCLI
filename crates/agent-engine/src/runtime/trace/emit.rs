@@ -285,6 +285,17 @@ impl AttemptClock {
         }
     }
 
+    /// First parsed model event at a caller-measured monotonic offset from
+    /// this attempt's send start (set-once). Used by transports whose stream
+    /// events are observed on a task that does not own the clock (the
+    /// extension-provider forwarder records the offset through an atomic and
+    /// the owning task applies it here before finishing).
+    pub fn set_first_model_event_offset(&mut self, offset_ms: u64) {
+        if self.first_model_event_ms.is_none() {
+            self.first_model_event_ms = Some(offset_ms);
+        }
+    }
+
     /// Stream fully consumed / request finished (set-once).
     pub fn mark_stream_end(&mut self) {
         if self.stream_end_ms.is_none() {

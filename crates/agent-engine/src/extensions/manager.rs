@@ -907,6 +907,19 @@ impl ExtensionManager {
         self.tools.clone()
     }
 
+    /// Test-only: register a provider spec + in-process handler directly,
+    /// without spawning an extension process. Used by trace wiring tests.
+    #[cfg(test)]
+    pub(crate) fn register_provider_handler_for_tests(
+        &mut self,
+        plugin_id: &str,
+        spec: crate::extensions::runtime::process::RegisteredProviderSpec,
+        handler: Arc<dyn ExtensionHandler>,
+    ) -> Result<String, String> {
+        self.providers
+            .register_with_handler(plugin_id, spec, Some(handler))
+    }
+
     /// Discover and load all extensions from the user and project plugin directories.
     ///
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and

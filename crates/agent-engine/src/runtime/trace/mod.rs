@@ -21,14 +21,16 @@
 //! (the normalized IR / `TranslationReport` arrive in Task 9; the bounded
 //! persistence writer in Task 11). Task 10A extends the seam to the
 //! OpenAI-compatible transports — Chat Completions and Responses/Codex —
-//! via [`openai`] (Gemini/Vertex, cloud and extension providers follow in
-//! Task 10B/10C).
+//! via [`openai`]; Task 10B covers Gemini/Vertex and the cloud-invoke
+//! routes via [`google`]; Task 10C completes the set with extension-hosted
+//! providers via [`extension`].
 //! Serde contract (deliberate): optional metrics serialize as **absent** —
 //! never fabricated zeros — and both absent and explicit `null` deserialize
 //! to `None`. Struct field order is the deterministic serialization order.
 
 pub mod anthropic;
 pub mod emit;
+pub mod extension;
 pub mod google;
 mod key;
 pub mod openai;
@@ -62,3 +64,6 @@ mod openai_wiring_tests;
 
 #[cfg(test)]
 mod google_wiring_tests;
+
+#[cfg(test)]
+mod extension_wiring_tests;
