@@ -88,13 +88,19 @@ never a fabricated zero. Explicit `null` also reads back as `None`.
 
 ### Attempt/retries rule
 
-One `RequestTrace` records one logical request, including any
-transport-internal retries. `outcome.retries` lists the tries that **failed**
-before the final one, in order; each entry's `attempt` is the 1-based ordinal
-of that failed try and `delay_ms` the backoff before the next try. The
-envelope's top-level `attempt` is the total number of tries made, i.e.
-`outcome.retries.len() + 1`. A request that succeeds on the first try has
-`attempt = 1` and an empty `retries`.
+One `RequestTrace` records one **actual transport attempt** (one HTTP send).
+A request that is retried therefore yields one record per attempt, all
+sharing the same `request_id`, with strictly increasing `attempt` ordinals
+(Task 8 emission rule; see `runtime/trace/emit.rs`). `outcome.retries` lists
+the tries that **failed** before this record's attempt, in order; each
+entry's `attempt` is the 1-based ordinal of that failed try and `delay_ms`
+the backoff before the next try. Every record satisfies
+`attempt == retries.len() + 1`; a request that succeeds on the first try has
+`attempt = 1` and an empty `retries`. Non-final attempt records carry a
+typed `ProviderFailed` terminal describing that attempt's own failure; the
+final record carries the request's terminal outcome. A cancellation observed
+between attempts (during backoff, no send in flight) emits no extra record —
+the preceding failed attempt was already recorded.
 
 ## Privacy invariants
 

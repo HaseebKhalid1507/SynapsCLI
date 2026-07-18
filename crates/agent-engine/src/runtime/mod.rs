@@ -1324,6 +1324,10 @@ impl Runtime {
             self.reasoning_level(),
             &messages,
             self.api_retries,
+            // Default options: preserves this path's historical beta gating
+            // and endpoint; the trace seam stays disabled until the Task 11
+            // writer installs a production sink.
+            &api::ApiOptions::default(),
         )
         .await
     }
@@ -1362,6 +1366,7 @@ impl Runtime {
                     anthropic_base_url: None,
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
+                    trace: trace::TraceContext::disabled(),
                 },
             )
             .await?;
@@ -1754,6 +1759,7 @@ impl Runtime {
             anthropic_base_url: None,
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            trace: trace::TraceContext::disabled(),
         };
 
         let session = crate::runtime::stream::StreamSession {

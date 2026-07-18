@@ -107,6 +107,15 @@ struct ParseState {
     /// declined the request. Used by `classify_stream_outcome` to gate the
     /// refusal-retry path independently of the telemetry flag.
     stop_reason_is_refusal: bool,
+    // ── Trace captures (Task 8) — unconditional, metadata-only ──
+    /// Offset of the first parsed model event from `ctx.request_start`
+    /// (post-headers), in ms. Feeds the trace `first_model_event` bucket.
+    first_event_elapsed_ms: Option<u64>,
+    /// Normalized stop reason for the trace record (raw wire string is
+    /// mapped immediately, never retained).
+    trace_stop_reason: Option<crate::runtime::trace::StopReason>,
+    /// Provider-reported usage for the trace record; `None` until observed.
+    trace_usage: Option<crate::runtime::trace::UsageMeta>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -179,6 +188,9 @@ impl ParseState {
             stream_error: None,
             stop_reason_seen: false,
             stop_reason_is_refusal: false,
+            first_event_elapsed_ms: None,
+            trace_stop_reason: None,
+            trace_usage: None,
         }
     }
 
@@ -258,10 +270,14 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
 fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
-    // ═══ TELEMETRY: capture TTFT on first event ═══
-    if !state.first_event_seen && ctx.telemetry_level.enabled() {
-        state.telem_ttft = Some(ctx.request_start.elapsed().as_millis() as u64);
+    // First-event capture: the trace timing bucket is unconditional
+    // (Task 8); the telemetry TTFT mirror stays gated as before.
+    if !state.first_event_seen {
         state.first_event_seen = true;
+        state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+        if ctx.telemetry_level.enabled() {
+            state.telem_ttft = state.first_event_elapsed_ms;
+        }
     }
 
     match event {
@@ -377,6 +393,11 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 if sr.as_ref() == "refusal" {
                     state.stop_reason_is_refusal = true;
                 }
+                // Trace capture: map to the normalized enum immediately —
+                // the raw wire string is never retained (Task 8).
+                state.trace_stop_reason = Some(
+                    crate::runtime::trace::anthropic::stop_reason_from_wire(sr.as_ref()),
+                );
                 if ctx.telemetry_level.enabled() {
                     state.telem_stop_reason = Some(sr.into_owned());
                 }
@@ -493,6 +514,13 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     // downstream consumer is an accumulator, so a second
                     // emission double-bills input/cache.
                     state.usage_emitted = true;
+                    state.trace_usage = Some(crate::runtime::trace::UsageMeta {
+                        provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
+                        input_tokens: Some(input_t),
+                        output_tokens: Some(output_t),
+                        cache_read_tokens: Some(cache_read),
+                        cache_write_tokens: Some(cache_create),
+                    });
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -620,6 +648,13 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
         state.telem_usage.compute_hit_pct();
     }
     state.usage_emitted = true;
+    state.trace_usage = Some(crate::runtime::trace::UsageMeta {
+        provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
+        input_tokens: Some(input_t),
+        output_tokens: Some(output_t),
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: Some(cache_create),
+    });
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
         output_tokens: output_t,
@@ -731,6 +766,77 @@ pub struct ApiOptions {
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     /// Foreground/worker/internal request role.
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    /// Trace emission seam (Task 8). Default is a disabled context (no-op
+    /// sink, zero request-path work); tests install a collecting sink and
+    /// the Task 11 writer will install the production sink here.
+    pub trace: crate::runtime::trace::TraceContext,
+}
+
+/// Validate a provider-assigned request ID from response headers into a
+/// bounded [`trace::TraceId`]. Invalid or hostile values are omitted —
+/// never copied raw into a trace record.
+pub(super) fn provider_request_id_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<crate::runtime::trace::TraceId> {
+    crate::runtime::telemetry::request_id_from_headers(headers)
+        .and_then(|s| crate::runtime::trace::TraceId::new(s).ok())
+}
+
+/// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
+/// is disabled or any structural identity is unrepresentable — tracing can
+/// never fail the request. `body_bytes` MUST be the exact buffer handed to
+/// reqwest: it is the sole source of the wire length + digest.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn begin_anthropic_tracer(
+    options: &ApiOptions,
+    url: &str,
+    bare_model: &str,
+    body_bytes: &[u8],
+    messages: &[crate::SharedMessage],
+    system_prompt: Option<&str>,
+    tools_schema: &[Value],
+    has_tool_marker: bool,
+    has_system_marker: bool,
+) -> Option<crate::runtime::trace::RequestTracer> {
+    use crate::runtime::trace as tr;
+    if !options.trace.enabled() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let host = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let endpoint = tr::EndpointMeta::new(host, parsed.path()).ok()?;
+    let model =
+        agent_core::prompt::QualifiedModelId::parse(format!("anthropic/{bare_model}")).ok()?;
+    // Lazy, spawn_blocking-backed key load; `None` degrades the record to
+    // digest-free sections and is counted, never surfaced as an error.
+    let key = options.trace.digest_key().await;
+    let prefix_ttl = match options.cache_ttl {
+        crate::core::config::CacheTtl::FiveMinutes => Some(tr::CacheTtlClass::FiveMinutes),
+        crate::core::config::CacheTtl::OneHour | crate::core::config::CacheTtl::Hybrid => {
+            Some(tr::CacheTtlClass::OneHour)
+        }
+    };
+    let structure = tr::anthropic::anthropic_request_structure(
+        key.as_deref(),
+        body_bytes,
+        messages,
+        system_prompt,
+        tools_schema,
+        prefix_ttl,
+        has_tool_marker,
+        has_system_marker,
+    );
+    tr::RequestTracer::begin(
+        &options.trace,
+        model,
+        tr::TransportKind::AnthropicMessages,
+        endpoint,
+        structure,
+    )
 }
 
 pub(super) struct ApiMethods;
@@ -1030,6 +1136,34 @@ impl ApiMethods {
         // separate Claude-compatible persistent budget (10 retries), because
         // these 200/SSE overload responses carry no retry headers.
         const MAX_429_RETRIES: u32 = 8;
+        // Endpoint resolved once — identical across retry attempts.
+        let anthropic_base = options
+            .anthropic_base_url
+            .clone()
+            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
+        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+
+        // ═══ TRACE (Task 8): one record per actual attempt ════════════════════
+        // Emission rule documented in `trace::emit`. Tracing is metadata-only
+        // and can never fail or delay the request.
+        let mut tracer = begin_anthropic_tracer(
+            options,
+            &anthropic_url,
+            model,
+            &body_bytes,
+            &cleaned_messages,
+            system_prompt.as_deref(),
+            &tools_schema,
+            has_tool_marker,
+            has_system_marker,
+        )
+        .await;
+        // Placeholder value: every send re-starts the clock immediately
+        // before handing bytes to reqwest (per-attempt timing).
+        #[allow(unused_assignments)]
+        let mut clock = crate::runtime::trace::AttemptClock::start();
+
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
@@ -1053,13 +1187,6 @@ impl ApiMethods {
                     }
 
                     // Rebuild request (consumed on send)
-                    let anthropic_base = options
-                        .anthropic_base_url
-                        .clone()
-                        .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
-                        .unwrap_or_else(|| "https://api.anthropic.com".into());
-                    let anthropic_url =
-                        format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
                     let mut req = client
                         .post(&anthropic_url)
                         .header(auth_header_name.clone(), auth_header_value.clone())
@@ -1075,10 +1202,12 @@ impl ApiMethods {
                         req = req.header("anthropic-beta", beta);
                     }
 
+                    clock = crate::runtime::trace::AttemptClock::start();
                     match req.body(body_bytes.clone()).send().await {
                         Ok(resp) => {
                             let status = resp.status();
                             if status.is_success() {
+                                clock.mark_headers();
                                 response = Some(resp);
                                 break;
                             }
@@ -1092,6 +1221,18 @@ impl ApiMethods {
                                 && !auth_retried
                             {
                                 auth_retried = true;
+                                clock.mark_headers();
+                                if let Some(t) = tracer.as_mut() {
+                                    let rid = provider_request_id_from_headers(resp.headers());
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Auth,
+                                        Duration::ZERO,
+                                        Some(401),
+                                        rid,
+                                        "http_401",
+                                    );
+                                }
                                 let _ = resp.text().await; // drain body
                                 options.token_cache.invalidate("anthropic");
                                 {
@@ -1125,6 +1266,8 @@ impl ApiMethods {
                                 None
                             };
 
+                            clock.mark_headers();
+                            let trace_rid = provider_request_id_from_headers(resp.headers());
                             let error_text = resp.text().await.unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
@@ -1135,6 +1278,18 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                if let Some(t) = tracer.take() {
+                                    let terminal =
+                                        t.failed_terminal(&format!("http_{}", status.as_u16()));
+                                    t.finish(
+                                        clock,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        None,
+                                        None,
+                                        terminal,
+                                    );
+                                }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::ApiStatus(
                                     crate::core::error::humanize_api_error_with_reset(
@@ -1184,6 +1339,19 @@ impl ApiMethods {
                             );
                             let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
 
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::anthropic::retry_class_for_status(
+                                        status.as_u16(),
+                                    ),
+                                    delay,
+                                    Some(status.as_u16()),
+                                    trace_rid,
+                                    &format!("http_{}", status.as_u16()),
+                                );
+                            }
+
                             tokio::time::sleep(delay).await;
 
                             if cancel.is_cancelled() {
@@ -1193,6 +1361,10 @@ impl ApiMethods {
                         Err(e) => {
                             non_429_attempts += 1;
                             if non_429_attempts > max_retries {
+                                if let Some(t) = tracer.take() {
+                                    let terminal = t.failed_terminal("network");
+                                    t.finish(clock, None, None, None, None, terminal);
+                                }
                                 return Err(RuntimeError::ApiStatus(
                                     crate::core::error::humanize_network_error(&e),
                                 ));
@@ -1214,6 +1386,16 @@ impl ApiMethods {
                                 "⏳ API error, retrying ({}/{})…",
                                 non_429_attempts, max_retries
                             ))));
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::RetryClass::Network,
+                                    delay,
+                                    None,
+                                    None,
+                                    "network",
+                                );
+                            }
                             tokio::time::sleep(delay).await;
                             if cancel.is_cancelled() {
                                 return Err(RuntimeError::Canceled);
@@ -1239,6 +1421,12 @@ impl ApiMethods {
 
             // ═══ TELEMETRY: capture headers before consuming the response body ═══
             let request_start = std::time::Instant::now();
+            // Trace: validated provider request ID (invalid values omitted).
+            let trace_rid_stream = if tracer.is_some() {
+                provider_request_id_from_headers(response.headers())
+            } else {
+                None
+            };
             let telem_request_id = if telemetry_level.enabled() {
                 telemetry::request_id_from_headers(response.headers())
             } else {
@@ -1284,7 +1472,10 @@ impl ApiMethods {
                 // the turn. Bill any start-captured usage first: the API already
                 // processed the input even if the stream died on us.
                 let chunk = match chunk {
-                    Ok(c) => c,
+                    Ok(c) => {
+                        clock.mark_first_byte();
+                        c
+                    }
                     Err(e) => {
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
@@ -1323,6 +1514,24 @@ impl ApiMethods {
             let has_stop_reason = state.stop_reason_seen;
             let stop_reason_is_refusal = state.stop_reason_is_refusal;
             let cancelled = cancel.is_cancelled();
+
+            // ═══ TRACE: finish this attempt's monotonic clock + captures ═══
+            clock.mark_stream_end();
+            if let Some(offset_ms) = state.first_event_elapsed_ms {
+                clock.set_first_model_event_after_headers(offset_ms);
+            }
+            let trace_stop_reason = state.trace_stop_reason;
+            let trace_usage = state.trace_usage;
+            // Structural failure code for trace terminals: a vetted static
+            // error-class label or a fixed literal — never raw provider text.
+            let stream_error_code: &str = match stream_error.as_ref() {
+                Some(e) => e
+                    .error_type
+                    .as_deref()
+                    .and_then(crate::core::error::sanitize_error_type)
+                    .unwrap_or("stream_error"),
+                None => "empty_response",
+            };
 
             // ═══ TELEMETRY: write the record ═══
             if telemetry_level.enabled() {
@@ -1376,8 +1585,38 @@ impl ApiMethods {
                 stop_reason_is_refusal,
                 cancelled,
             ) {
-                StreamOutcome::Done(v) => return Ok(v),
-                StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
+                StreamOutcome::Done(v) => {
+                    if let Some(t) = tracer.take() {
+                        let terminal = if cancelled {
+                            agent_core::TurnOutcome::Canceled
+                        } else {
+                            agent_core::TurnOutcome::Completed
+                        };
+                        t.finish(
+                            clock,
+                            Some(200),
+                            trace_rid_stream,
+                            trace_stop_reason,
+                            trace_usage,
+                            terminal,
+                        );
+                    }
+                    return Ok(v);
+                }
+                StreamOutcome::Fail(msg) => {
+                    if let Some(t) = tracer.take() {
+                        let terminal = t.failed_terminal(stream_error_code);
+                        t.finish(
+                            clock,
+                            Some(200),
+                            trace_rid_stream,
+                            trace_stop_reason,
+                            trace_usage,
+                            terminal,
+                        );
+                    }
+                    return Err(RuntimeError::ApiStatus(msg));
+                }
                 StreamOutcome::Retry(stream_error) => {
                     let msg = stream_error.message;
                     // Anthropic OAuth overloads need the same persistent retry
@@ -1399,6 +1638,17 @@ impl ApiMethods {
                     if retries_used >= retry_budget || cancel.is_cancelled() {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
+                        if let Some(t) = tracer.take() {
+                            let terminal = t.failed_terminal(stream_error_code);
+                            t.finish(
+                                clock,
+                                Some(200),
+                                trace_rid_stream,
+                                trace_stop_reason,
+                                trace_usage,
+                                terminal,
+                            );
+                        }
                         return Err(RuntimeError::ApiStatus(msg));
                     }
                     let retry_index = retries_used.saturating_add(1);
@@ -1424,6 +1674,18 @@ impl ApiMethods {
                         "⏳ API stream error — retrying ({}/{})…",
                         retry_index, retry_budget
                     ))));
+                    if let Some(t) = tracer.as_mut() {
+                        t.attempt_failed(
+                            clock,
+                            crate::runtime::trace::anthropic::retry_class_for_stream_error(
+                                stream_error.error_type.as_deref(),
+                            ),
+                            delay,
+                            Some(200),
+                            trace_rid_stream,
+                            stream_error_code,
+                        );
+                    }
                     tokio::time::sleep(delay).await;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
@@ -1436,6 +1698,17 @@ impl ApiMethods {
                     // Check budget before sleeping so an immediate exhaustion is
                     // surfaced without a pointless delay.
                     if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                        if let Some(t) = tracer.take() {
+                            let terminal = t.failed_terminal("refusal");
+                            t.finish(
+                                clock,
+                                Some(200),
+                                trace_rid_stream,
+                                trace_stop_reason,
+                                trace_usage,
+                                terminal,
+                            );
+                        }
                         let msg = format!(
                             "⚠ model refused the request ({} attempt{})",
                             refusal_attempts + 1,
@@ -1462,6 +1735,16 @@ impl ApiMethods {
                         "⏳ model refusal — retrying ({}/{})…",
                         refusal_attempts, refusal_retries
                     ))));
+                    if let Some(t) = tracer.as_mut() {
+                        t.attempt_failed(
+                            clock,
+                            crate::runtime::trace::RetryClass::Other,
+                            delay,
+                            Some(200),
+                            trace_rid_stream,
+                            "refusal",
+                        );
+                    }
                     tokio::time::sleep(delay).await;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);

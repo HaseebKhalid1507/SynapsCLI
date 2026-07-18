@@ -15,6 +15,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Provider-reported usage from a non-streaming response body. Only fields
+/// the provider actually sent become `Some` — nothing is zero-filled.
+fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
+    let usage = json.get("usage")?.as_object()?;
+    let get = |key: &str| usage.get(key).and_then(Value::as_u64);
+    Some(crate::runtime::trace::UsageMeta {
+        provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cache_read_tokens: get("cache_read_input_tokens"),
+        cache_write_tokens: get("cache_creation_input_tokens"),
+    })
+}
+
 impl ApiMethods {
     /// Concatenate the `text` fields of every block in an Anthropic-shaped
     /// response `content` array. Returns the empty string if the value is
@@ -150,6 +164,32 @@ impl ApiMethods {
             })?
             .into();
 
+        // Same base-URL resolution as the streaming path (test seam + env
+        // override); production passes `None` with the env unset -> the
+        // canonical endpoint, unchanged.
+        let anthropic_base = options
+            .anthropic_base_url
+            .clone()
+            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
+        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+
+        // ═══ TRACE (Task 8): shared construction with the streaming path ═══
+        let mut tracer = super::api::begin_anthropic_tracer(
+            options,
+            &anthropic_url,
+            model,
+            &body_bytes,
+            &cleaned_messages,
+            system_prompt.as_deref(),
+            &tools_schema,
+            body.has_tool_marker(),
+            body.has_system_marker(),
+        )
+        .await;
+        #[allow(unused_assignments)]
+        let mut clock = crate::runtime::trace::AttemptClock::start();
+
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
         // 429 gets a higher budget (MAX_429_RETRIES) and honours rate-limit
         // headers for delay; other errors use the user-configured max_retries.
@@ -163,8 +203,9 @@ impl ApiMethods {
             let mut attempt: u32 = 0;
 
             loop {
+                clock = crate::runtime::trace::AttemptClock::start();
                 let mut req = client
-                    .post("https://api.anthropic.com/v1/messages")
+                    .post(&anthropic_url)
                     .header(auth_header.0.clone(), auth_header.1.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
@@ -179,6 +220,9 @@ impl ApiMethods {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
+                            clock.mark_headers();
+                            let trace_rid =
+                                super::api::provider_request_id_from_headers(resp.headers());
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
@@ -195,11 +239,37 @@ impl ApiMethods {
                                                 "API returned an error envelope in a 200 response \
                                                  (details withheld — untrusted)"
                                             );
+                                            if let Some(t) = tracer.take() {
+                                                clock.mark_stream_end();
+                                                let terminal = t.failed_terminal(vetted);
+                                                t.finish(
+                                                    clock,
+                                                    Some(200),
+                                                    trace_rid,
+                                                    None,
+                                                    None,
+                                                    terminal,
+                                                );
+                                            }
                                             return Err(RuntimeError::Tool(format!(
                                                 "API Error: {}",
                                                 vetted
                                             )));
                                         }
+                                    }
+                                    if let Some(t) = tracer.take() {
+                                        clock.mark_stream_end();
+                                        let stop = j["stop_reason"].as_str().map(
+                                            crate::runtime::trace::anthropic::stop_reason_from_wire,
+                                        );
+                                        t.finish(
+                                            clock,
+                                            Some(200),
+                                            trace_rid,
+                                            stop,
+                                            sync_usage_meta(&j),
+                                            agent_core::TurnOutcome::Completed,
+                                        );
                                     }
                                     result_json = Some(j);
                                     break;
@@ -207,7 +277,31 @@ impl ApiMethods {
                                 Err(e) => {
                                     non_429_attempts += 1;
                                     if non_429_attempts > max_retries {
+                                        if let Some(t) = tracer.take() {
+                                            let terminal = t.failed_terminal("response_decode");
+                                            t.finish(
+                                                clock,
+                                                Some(200),
+                                                trace_rid,
+                                                None,
+                                                None,
+                                                terminal,
+                                            );
+                                        }
                                         return Err(RuntimeError::Api(e));
+                                    }
+                                    if let Some(t) = tracer.as_mut() {
+                                        let delay = Duration::from_millis(
+                                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                                        );
+                                        t.attempt_failed(
+                                            clock,
+                                            crate::runtime::trace::RetryClass::Other,
+                                            delay,
+                                            Some(200),
+                                            trace_rid,
+                                            "response_decode",
+                                        );
                                     }
                                     last_err = e.to_string();
                                     let delay = Duration::from_millis(
@@ -236,6 +330,9 @@ impl ApiMethods {
                             } else {
                                 None
                             };
+                            clock.mark_headers();
+                            let trace_rid =
+                                super::api::provider_request_id_from_headers(resp.headers());
                             let error_text = resp.text().await.unwrap_or_default();
 
                             let retry_exhausted = if is_429 {
@@ -245,6 +342,18 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                if let Some(t) = tracer.take() {
+                                    let terminal =
+                                        t.failed_terminal(&format!("http_{}", status.as_u16()));
+                                    t.finish(
+                                        clock,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        None,
+                                        None,
+                                        terminal,
+                                    );
+                                }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::Tool(
                                     crate::core::error::humanize_api_error_with_reset(
@@ -282,18 +391,44 @@ impl ApiMethods {
                                 format!("⏳ API error, retrying ({}/{})…", retry_num, budget)
                             };
                             tracing::warn!("API retry after {:?}: {}", delay, notice);
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::anthropic::retry_class_for_status(
+                                        status.as_u16(),
+                                    ),
+                                    delay,
+                                    Some(status.as_u16()),
+                                    trace_rid,
+                                    &format!("http_{}", status.as_u16()),
+                                );
+                            }
                             tokio::time::sleep(delay).await;
                         }
                     }
                     Err(e) => {
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
+                            if let Some(t) = tracer.take() {
+                                let terminal = t.failed_terminal("network");
+                                t.finish(clock, None, None, None, None, terminal);
+                            }
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
                         let delay = Duration::from_millis(
                             1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
                         );
+                        if let Some(t) = tracer.as_mut() {
+                            t.attempt_failed(
+                                clock,
+                                crate::runtime::trace::RetryClass::Network,
+                                delay,
+                                None,
+                                None,
+                                "network",
+                            );
+                        }
                         tracing::warn!(
                             "API retry {}/{} after {:?}: {}",
                             non_429_attempts,
@@ -344,6 +479,7 @@ impl ApiMethods {
         reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
         max_retries: u32,
+        options: &ApiOptions,
     ) -> Result<String> {
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -425,6 +561,42 @@ impl ApiMethods {
             ]);
         }
 
+        // Serialize once up-front (exact-bytes contract, spec 6.2): the
+        // same buffer is sent on every retry and is the sole source for the
+        // trace wire digest. `.json(&body)` would re-serialize per attempt.
+        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+            .map_err(|e| {
+                RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
+            })?
+            .into();
+
+        // Base-URL resolution matches the other Anthropic transports.
+        // NOTE: `options` is used for the endpoint + trace seam ONLY -- beta
+        // gating below intentionally keeps the historical default-options
+        // behaviour of this compaction path.
+        let anthropic_base = options
+            .anthropic_base_url
+            .clone()
+            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
+        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+
+        // ═══ TRACE (Task 8): compaction requests are traced too ═══
+        let mut tracer = super::api::begin_anthropic_tracer(
+            options,
+            &anthropic_url,
+            model,
+            &body_bytes,
+            messages,
+            Some(system_prompt),
+            &[],
+            false,
+            false,
+        )
+        .await;
+        #[allow(unused_assignments)]
+        let mut clock = crate::runtime::trace::AttemptClock::start();
+
         // Retry loop for transient errors (compaction path).
         // Same header-aware 429 handling as the main call_api loop.
         const MAX_429_RETRIES_COMPACT: u32 = 8;
@@ -437,8 +609,9 @@ impl ApiMethods {
             let mut attempt: u32 = 0;
 
             loop {
+                clock = crate::runtime::trace::AttemptClock::start();
                 let mut req = client
-                    .post("https://api.anthropic.com/v1/messages")
+                    .post(&anthropic_url)
                     .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
@@ -448,10 +621,13 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.json(&body).send().await {
+                match req.body(body_bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
+                            clock.mark_headers();
+                            let trace_rid =
+                                super::api::provider_request_id_from_headers(resp.headers());
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
@@ -461,11 +637,37 @@ impl ApiMethods {
                                             let vetted =
                                                 crate::core::error::sanitize_error_type(error_type)
                                                     .unwrap_or("unrecognized_error");
+                                            if let Some(t) = tracer.take() {
+                                                clock.mark_stream_end();
+                                                let terminal = t.failed_terminal(vetted);
+                                                t.finish(
+                                                    clock,
+                                                    Some(200),
+                                                    trace_rid,
+                                                    None,
+                                                    None,
+                                                    terminal,
+                                                );
+                                            }
                                             return Err(RuntimeError::Tool(format!(
                                                 "API Error: {}",
                                                 vetted
                                             )));
                                         }
+                                    }
+                                    if let Some(t) = tracer.take() {
+                                        clock.mark_stream_end();
+                                        let stop = j["stop_reason"].as_str().map(
+                                            crate::runtime::trace::anthropic::stop_reason_from_wire,
+                                        );
+                                        t.finish(
+                                            clock,
+                                            Some(200),
+                                            trace_rid,
+                                            stop,
+                                            sync_usage_meta(&j),
+                                            agent_core::TurnOutcome::Completed,
+                                        );
                                     }
                                     result_json = Some(j);
                                     break;
@@ -473,12 +675,33 @@ impl ApiMethods {
                                 Err(e) => {
                                     non_429_attempts += 1;
                                     if non_429_attempts > max_retries {
+                                        if let Some(t) = tracer.take() {
+                                            let terminal = t.failed_terminal("response_decode");
+                                            t.finish(
+                                                clock,
+                                                Some(200),
+                                                trace_rid,
+                                                None,
+                                                None,
+                                                terminal,
+                                            );
+                                        }
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
                                     let delay = Duration::from_millis(
                                         1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
                                     );
+                                    if let Some(t) = tracer.as_mut() {
+                                        t.attempt_failed(
+                                            clock,
+                                            crate::runtime::trace::RetryClass::Other,
+                                            delay,
+                                            Some(200),
+                                            trace_rid,
+                                            "response_decode",
+                                        );
+                                    }
                                     tracing::warn!(
                                         "Compaction retry {}/{} after {:?}: {}",
                                         non_429_attempts,
@@ -490,6 +713,9 @@ impl ApiMethods {
                                 }
                             }
                         } else {
+                            clock.mark_headers();
+                            let trace_rid =
+                                super::api::provider_request_id_from_headers(resp.headers());
                             let is_429 = status.as_u16() == 429;
                             let is_retryable =
                                 matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
@@ -511,6 +737,18 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                if let Some(t) = tracer.take() {
+                                    let terminal =
+                                        t.failed_terminal(&format!("http_{}", status.as_u16()));
+                                    t.finish(
+                                        clock,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        None,
+                                        None,
+                                        terminal,
+                                    );
+                                }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::Tool(
                                     crate::core::error::humanize_api_error_with_reset(
@@ -535,18 +773,44 @@ impl ApiMethods {
                                 status,
                                 last_err
                             );
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::anthropic::retry_class_for_status(
+                                        status.as_u16(),
+                                    ),
+                                    delay,
+                                    Some(status.as_u16()),
+                                    trace_rid,
+                                    &format!("http_{}", status.as_u16()),
+                                );
+                            }
                             tokio::time::sleep(delay).await;
                         }
                     }
                     Err(e) => {
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
+                            if let Some(t) = tracer.take() {
+                                let terminal = t.failed_terminal("network");
+                                t.finish(clock, None, None, None, None, terminal);
+                            }
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
                         let delay = Duration::from_millis(
                             1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
                         );
+                        if let Some(t) = tracer.as_mut() {
+                            t.attempt_failed(
+                                clock,
+                                crate::runtime::trace::RetryClass::Network,
+                                delay,
+                                None,
+                                None,
+                                "network",
+                            );
+                        }
                         tracing::warn!(
                             "Compaction API retry {}/{} after {:?}: {}",
                             non_429_attempts,

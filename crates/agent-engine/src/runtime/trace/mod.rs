@@ -15,15 +15,24 @@
 //! contents from a leaked trace log. Neither the key nor digest preimages are
 //! ever logged.
 //!
-//! Task 7 scope: types + serde + key/digest primitives only (transports wire
-//! in via Task 8; the normalized IR / `TranslationReport` arrive in Task 9).
+//! Task 7 delivered the types + serde + key/digest primitives; Task 8 wires
+//! the Anthropic transports (`runtime/api.rs`, `runtime/api_sync.rs`) into
+//! the emission seam in [`emit`], with structural builders in [`anthropic`]
+//! (the normalized IR / `TranslationReport` arrive in Task 9; the bounded
+//! persistence writer in Task 11).
 //! Serde contract (deliberate): optional metrics serialize as **absent** —
 //! never fabricated zeros — and both absent and explicit `null` deserialize
 //! to `None`. Struct field order is the deterministic serialization order.
 
+pub mod anthropic;
+pub mod emit;
 mod key;
 mod types;
 
+pub use emit::{
+    wire_meta_from_sent_bytes, AttemptClock, CollectingTraceSink, NoopTraceSink, RequestStructure,
+    RequestTracer, TraceContext, TraceSink,
+};
 pub use key::{
     default_digest_key_path, keyed_digest, load_or_create_digest_key, load_or_create_digest_key_at,
     ComponentDigest, DigestDomain, TraceDigestKey, TraceKeyError,
@@ -39,3 +48,6 @@ pub use types::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wiring_tests;
