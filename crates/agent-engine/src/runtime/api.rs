@@ -24,6 +24,33 @@ fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Trace the outgoing Anthropic request. Metadata only — raw payload content
+/// (message text, system prompt, tool schemas/arguments) must NEVER reach any
+/// log sink at any level. Guarded by `outgoing_request_trace_is_metadata_only`.
+fn trace_outgoing_request(model: &str, body_bytes: &[u8], message_count: usize, tool_count: usize) {
+    // Per-process monotonic sequence: correlates this trace line with any
+    // later log lines for the same request without embedding content.
+    static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let correlation_id = REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Count prompt-cache markers by scanning the serialized bytes — reports
+    // marker placement (a count) without deserializing or echoing content.
+    const NEEDLE: &[u8] = b"\"cache_control\"";
+    let cache_marker_count = body_bytes
+        .windows(NEEDLE.len())
+        .filter(|w| *w == NEEDLE)
+        .count();
+    tracing::trace!(
+        provider = "anthropic",
+        model = %model,
+        payload_bytes = body_bytes.len(),
+        message_count,
+        tool_count,
+        cache_marker_count,
+        correlation_id,
+        "Outgoing API request (metadata only)"
+    );
+}
+
 /// Parse accumulated tool input JSON. On failure, returns a JSON object with
 /// `__parse_error` key so the tool executor can report it back to the model.
 fn parse_tool_input(raw: &str) -> Value {
@@ -969,11 +996,6 @@ impl ApiMethods {
             crate::core::config::CacheTtl::Hybrid => has_tool_marker || has_system_marker,
         };
 
-        tracing::trace!(
-            "Outgoing API Request Payload:\n{}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        );
-
         // Serialize the body once up-front; each retry attempt reuses the same
         // bytes via a cheap `Bytes::clone()` (refcount bump, no copy). Previously
         // we called `req.json(&body).send()` per attempt, which re-ran
@@ -984,6 +1006,13 @@ impl ApiMethods {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
             .into();
+
+        trace_outgoing_request(
+            model,
+            &body_bytes,
+            cleaned_messages.len(),
+            tools_schema.len(),
+        );
 
         // ═══ UNIFIED RETRY (task #130) ════════════════════════════════════════
         // ONE generic budget governs transient failures whether they surface as
@@ -3179,5 +3208,75 @@ mod on401_tests {
             "Local source must never retry on 401, got {} calls",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────
+    // A request body containing a unique sentinel must never surface in
+    // tracing output at ANY level (TRACE included); only metadata fields
+    // (provider, model, byte length, counts, correlation id) may appear.
+
+    /// `std::io::Write` sink that appends to a shared buffer, for capturing
+    /// formatted tracing output in-process.
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn outgoing_request_trace_is_metadata_only() {
+        let sentinel = "SENTINEL_5f2a9c_do_not_log";
+        let body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": sentinel,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "system": sentinel,
+            "tools": [],
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::trace_outgoing_request("claude-test", &body_bytes, 1, 0);
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!output.is_empty(), "expected a trace line to be emitted");
+        assert!(
+            !output.contains(sentinel),
+            "raw payload content leaked into trace output: {output}"
+        );
+        for field in [
+            "provider",
+            "model",
+            "payload_bytes",
+            "message_count",
+            "tool_count",
+            "cache_marker_count",
+            "correlation_id",
+        ] {
+            assert!(
+                output.contains(field),
+                "metadata field `{field}` missing from trace output: {output}"
+            );
+        }
     }
 }

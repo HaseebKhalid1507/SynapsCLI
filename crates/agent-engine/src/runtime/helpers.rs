@@ -1,6 +1,5 @@
 use super::types::{AgentEvent, StreamEvent};
 use crate::core::config::CacheTtl;
-use crate::truncate_str;
 use crate::SharedMessage;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -60,7 +59,9 @@ impl HelperMethods {
 
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
-            tracing::info!("Steering message injected: {}", truncate_str(&msg, 80));
+            // Metadata only — steering messages are user content and must not
+            // reach log sinks (request-lifecycle hardening T1).
+            tracing::info!(len = msg.len(), "Steering message injected");
             let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered {
                 message: msg.clone(),
             }));
