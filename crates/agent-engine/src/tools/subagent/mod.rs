@@ -1,5 +1,6 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
+pub mod authorize_model;
 pub mod collect;
 pub mod models;
 mod oneshot;
@@ -9,6 +10,7 @@ pub mod status;
 pub mod steer;
 pub mod resume;
 
+pub use authorize_model::SubagentModelAuthorizeTool;
 pub use collect::SubagentCollectTool;
 pub use models::SubagentModelsTool;
 pub use oneshot::SubagentTool;

@@ -136,6 +136,18 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// True iff `content` is a canonical agent-event payload — produced in exactly
+/// one place (`format_event_for_agent`): `<event id=… …>…</event>`.
+///
+/// Event payloads travel as `role=user` messages (the API needs a user turn)
+/// and ride the same steering channel as genuine user steering, but they are
+/// presented as Event cards. They must NEVER render as a `ChatMessage::User`
+/// bubble — that made subagent completion wakes appear in the transcript as a
+/// message the user typed and submitted.
+pub(super) fn is_event_payload(content: &str) -> bool {
+    content.starts_with("<event ") && content.ends_with("</event>")
+}
+
 pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
     app.transcript.clear();
     for msg in api_messages {
@@ -147,7 +159,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
         }
         // Skip event messages — already displayed as event cards
         if let Some(content) = msg["content"].as_str() {
-            if content.starts_with("<event ") && content.ends_with("</event>") {
+            if is_event_payload(content) {
                 continue;
             }
         }
@@ -206,12 +218,30 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 #[cfg(test)]
 mod tests {
     use super::super::app::{App, ChatMessage, LineCache, MsgSlot};
-    use super::{rebuild_display_messages, should_draw};
+    use super::{is_event_payload, rebuild_display_messages, should_draw};
     use std::time::Duration;
     use synaps_cli::Session;
 
     fn test_app() -> App {
         App::new(Session::new("test-model", "low", None))
+    }
+
+    /// Canonical event payloads (subagent completion wakes, watcher alerts)
+    /// must be recognized so they render as Event cards, never as user
+    /// bubbles — neither on session resume (rebuild_display_messages) nor
+    /// when steered into a live stream (SteeringDelivered).
+    #[test]
+    fn event_payloads_are_recognized_and_user_text_is_not() {
+        assert!(is_event_payload(
+            "<event id=\"c9ec5a4b\" type=\"subagent_completion\" severity=\"high\" \
+             source=\"subagent\">Subagent 'inline' (sa_1) finished with status \
+             'completed' after 231.1s. Call subagent_collect with handle_id \
+             \"sa_1\" to retrieve the full result.</event>"
+        ));
+        // Genuine user steering — even when it mentions events — stays a user bubble.
+        assert!(!is_event_payload("please re-read the <event ...> above"));
+        assert!(!is_event_payload("regular steering text"));
+        assert!(!is_event_payload(""));
     }
 
     /// Build a populated LineCache for all messages in `app` at `width`, then

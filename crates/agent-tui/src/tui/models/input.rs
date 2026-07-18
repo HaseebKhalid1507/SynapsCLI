@@ -12,6 +12,10 @@ pub(crate) enum InputOutcome {
     Close,
     Apply(String),
     ExpandProvider(String),
+    /// The user explicitly trusted a model mid-session (favorited it). The
+    /// caller must propagate this grant into the live delegation policy so
+    /// subagent dispatch honors it immediately — not only after a restart.
+    Trusted(String),
 }
 
 pub(crate) fn handle_event(
@@ -68,19 +72,26 @@ pub(crate) fn handle_event(
         }
         KeyCode::Char('f') => {
             if let Some(model) = selected_model(&sections, state) {
-                if model.is_favorite {
+                let trusted = if model.is_favorite {
                     remove_favorite_compat(&model.favorite_id);
+                    None
                 } else {
                     let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(
                         &model.favorite_id,
                     ));
-                }
+                    // Runtime-qualified identity of the visible row — the same
+                    // exact ID that Apply uses — for the live policy grant.
+                    Some(model.id.clone())
+                };
                 state.refresh_favorites();
                 let new_len = visible_rows(&build_sections(current_model, state), state).len();
                 if new_len == 0 {
                     state.cursor = 0;
                 } else if state.cursor >= new_len {
                     state.cursor = new_len - 1;
+                }
+                if let Some(model_id) = trusted {
+                    return InputOutcome::Trusted(model_id);
                 }
             }
             InputOutcome::None
@@ -170,13 +181,18 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
         }
         KeyCode::Char('f') => {
             if let Some(model) = selected_expanded_model(state) {
-                if model.is_favorite {
+                let trusted = if model.is_favorite {
                     remove_favorite_compat(&model.id);
+                    None
                 } else {
                     let _ =
                         synaps_cli::config::add_favorite_model(&normalize_favorite_id(&model.id));
-                }
+                    Some(model.id.clone())
+                };
                 state.refresh_favorites();
+                if let Some(model_id) = trusted {
+                    return InputOutcome::Trusted(model_id);
+                }
             }
             InputOutcome::None
         }

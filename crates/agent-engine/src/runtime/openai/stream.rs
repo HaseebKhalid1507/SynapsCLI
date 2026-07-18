@@ -11,13 +11,43 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+/// Persistent retry posture for the Codex transport, mirroring the Anthropic
+/// OAuth overload budget (`OAUTH_OVERLOAD_RETRIES` in `runtime/api.rs`).
+///
+/// chatgpt.com edge turbulence — 503 upstream connect errors, Cloudflare
+/// 520s, raw TCP connect/read timeouts (incident: 2026-07-16 log bursts at
+/// 14:19, 18:52, 20:21, 20:27, 20:55, 21:47) — clears on its own within a
+/// burst; a three-attempt budget risks aborting an autonomous turn mid-burst.
+pub(crate) const CODEX_PERSISTENT_RETRIES: u32 = 10;
+
+/// Exponential-backoff exponent cap shared with the Anthropic stream retry
+/// path (`stream_retry_policy`): delay = base·2^min(n−1, CAP). Without the
+/// cap a 10-deep budget would sleep 1s·2⁹ = 512s on its final attempt.
+const RETRY_BACKOFF_EXP_CAP: u32 = 6;
+
+/// Effective Codex transport retry budget: the persistent floor, unless the
+/// user configured something even larger. Pure — decided at the dispatch
+/// seam (`try_route`), never inside `send_with_retries`, so tests can still
+/// inject exact budgets.
+pub(crate) fn codex_retry_budget(configured_retries: u32) -> u32 {
+    configured_retries.max(CODEX_PERSISTENT_RETRIES)
+}
+
+/// Backoff for retry attempt *n* (1-based): 1s·2^(n−1), capped at 64s.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        1000 * 2u64.pow(attempt.saturating_sub(1).min(RETRY_BACKOFF_EXP_CAP)),
+    )
+}
+
 /// Send a provider streaming request, retrying transient failures.
 ///
 /// Parity fix: the Anthropic path retries transient errors with backoff
 /// (`call_api_stream_inner`) but the provider routes were single-shot — one
 /// transport blip against e.g. `chatgpt.com` aborted an entire autonomous
 /// turn (incident: session 20260714-025948-3dab). Attempt *n* sleeps
-/// 1s·2^(n−1), mirroring the Anthropic budget semantics.
+/// 1s·2^(n−1) capped at 2^`RETRY_BACKOFF_EXP_CAP`, mirroring the Anthropic
+/// budget semantics.
 ///
 /// Retryable: transport-level send failures (timeout / connect / request)
 /// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
@@ -32,9 +62,6 @@ async fn send_with_retries(
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempt: u32 = 0;
     loop {
-        let retry_delay = |attempt: u32| {
-            std::time::Duration::from_millis(1000 * 2u64.pow(attempt.saturating_sub(1)))
-        };
         match build().send().await {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
@@ -323,6 +350,9 @@ pub(crate) async fn call_codex_stream_inner(
     // body construction — no duplication between call_codex_stream_inner and tests.
     let instructions = codex_instructions(system_prompt);
     let mut input_items = codex_input_messages(oai_messages);
+    // Key on the pre-insertion head: the mode item varies with the execution
+    // plan (level/role switches) and must not churn the routing key.
+    let prompt_cache_key = codex_prompt_cache_key(&instructions, input_items.first());
     insert_codex_multi_agent_mode(&mut input_items, &plan);
     let input = serde_json::Value::Array(input_items);
     let body = build_codex_body(
@@ -333,6 +363,7 @@ pub(crate) async fn call_codex_stream_inner(
         tools,
         temperature,
         max_tokens,
+        &prompt_cache_key,
     );
 
     let url = format!(
@@ -402,6 +433,27 @@ pub(crate) async fn call_codex_stream_inner(
     }))
 }
 
+/// Stable prompt-cache routing key for this conversation.
+///
+/// The Codex backend routes prefix-cache lookups by `prompt_cache_key`
+/// (upstream codex-rs sends its conversation UUID on every request). Synaps
+/// doesn't thread a session id down to the transport, so derive a
+/// deterministic key from the stable head of the prompt: the instructions
+/// plus the first input item. Identical heads hash to the same key — which
+/// is exactly right, since those requests share the very prefix the cache
+/// stores — and a /compact rewrite changes the key together with the prefix
+/// it invalidates. Without this key, cache lookups are at the mercy of
+/// load-balancer routing and long conversations re-pay their full prefix.
+pub(crate) fn codex_prompt_cache_key(instructions: &str, first_item: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    if let Some(item) = first_item {
+        hasher.update(item.to_string().as_bytes());
+    }
+    format!("synaps-{:x}", hasher.finalize())
+}
+
 /// Pure body construction for Codex Responses-API requests.
 ///
 /// Separated from the async function so it can be unit-tested without
@@ -409,13 +461,15 @@ pub(crate) async fn call_codex_stream_inner(
 ///
 /// # Arguments
 /// - `model`: the Codex model id (already validated by the caller)
-/// - `level`: reasoning level (must already be validated against model capability)
+/// - `plan`: reasoning plan (must already be validated against model capability)
 /// - `input`: pre-built input items (from `codex_input_messages`)
 /// - `instructions`: pre-built instructions string (from `codex_instructions`)
 /// - `tools`: pre-built tool array
 /// - `temperature`: optional temperature override
 /// - `max_tokens`: optional max_output_tokens override
-// used in tests
+/// - `prompt_cache_key`: pre-computed routing key; computed on the
+///   pre-insertion input head by the caller, so it cannot be derived here
+#[allow(clippy::too_many_arguments)] // pure builder mirroring the wire body; grouping would obscure the 1:1 field mapping
 pub(crate) fn build_codex_body(
     model: &str,
     plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
@@ -424,6 +478,7 @@ pub(crate) fn build_codex_body(
     tools: Vec<serde_json::Value>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    prompt_cache_key: &str,
 ) -> serde_json::Value {
     let mut body = json!({
         "model": model,
@@ -435,6 +490,7 @@ pub(crate) fn build_codex_body(
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
         "text": { "verbosity": "medium" },
+        "prompt_cache_key": prompt_cache_key,
     });
     if let Some(effort) = plan.wire_effort {
         body["reasoning"] = json!({ "effort": effort.as_str() });
@@ -491,11 +547,16 @@ fn insert_codex_multi_agent_mode(
     let Some(item) = codex_multi_agent_mode_item(plan) else {
         return;
     };
-    let index = input
-        .iter()
-        .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"))
-        .unwrap_or(input.len());
-    input.insert(index, item);
+    // Prefix-cache stability: the mode item goes at a FIXED position (head of
+    // input), never relative to the latest user message. The previous
+    // placement (before the last user item) moved every user turn, so the
+    // prompt prefix diverged at the prior turn's user message and the entire
+    // preceding agentic turn — often the bulk of the context — was re-billed
+    // uncached (incident: 2026-07-16 codex cache investigation). At index 0
+    // the item is byte-stable across turns; it only changes when the
+    // execution plan's mode changes, which legitimately invalidates the
+    // prefix once.
+    input.insert(0, item);
 }
 
 fn codex_has_required_delegation_tools(tools_schema: &[Value]) -> bool {
@@ -810,12 +871,23 @@ impl CodexSseDecoder {
             .and_then(|u| u.get("output_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // Responses-API usage nests cache hits under input_tokens_details;
+        // input_tokens INCLUDES them. Downstream accounting uses Anthropic
+        // semantics (context = input + cache_read + cache_creation, hit% =
+        // cache_read/total), so report the cached slice separately and
+        // subtract it from input — otherwise cache hits are invisible
+        // (reported 0) and the context total double-counts.
+        let cached = usage
+            .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(input);
         if input > 0 || output > 0 {
             let _ = tx.send(StreamEvent::Session(
                 crate::runtime::types::SessionEvent::Usage {
-                    input_tokens: input,
+                    input_tokens: input - cached,
                     output_tokens: output,
-                    cache_read_input_tokens: 0,
+                    cache_read_input_tokens: cached,
                     cache_creation_input_tokens: 0,
                     cache_creation_5m: None,
                     cache_creation_1h: None,
@@ -1221,6 +1293,34 @@ mod codex_decoder_tests {
             _ => None,
         });
         assert_eq!(usage, Some((42, 17)));
+    }
+
+    /// Responses-API usage nests cache hits under input_tokens_details, and
+    /// input_tokens INCLUDES them. The decoder must surface the cached slice
+    /// as cache_read (Anthropic semantics) and subtract it from input —
+    /// dropping it (the old hardcoded 0) made every codex turn look 100%
+    /// uncached (incident: 2026-07-16 codex cache investigation).
+    #[test]
+    fn response_completed_surfaces_cached_tokens_without_double_count() {
+        let lines = [
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":900},"output_tokens":17}}}"#,
+            "",
+        ];
+        let (_decoder, _text, events) = drive(&lines);
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                ..
+            }) => Some((*input_tokens, *output_tokens, *cache_read_input_tokens)),
+            _ => None,
+        });
+        assert_eq!(
+            usage,
+            Some((100, 17, 900)),
+            "input must exclude the cached slice; cache_read must carry it"
+        );
     }
 
     #[test]
@@ -1663,6 +1763,7 @@ mod codex_wire_tests {
             tools,
             temperature,
             max_tokens,
+            "synaps-test-cache-key",
         )
     }
 
@@ -1793,7 +1894,7 @@ mod codex_wire_tests {
     }
 
     #[test]
-    fn mode_context_is_inserted_once_before_final_user_item() {
+    fn mode_context_is_inserted_once_at_stable_head_position() {
         let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
         let mut input = vec![
             serde_json::json!({"role":"user","content":"first"}),
@@ -1811,10 +1912,76 @@ mod codex_wire_tests {
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        assert_eq!(mode_positions, vec![2]);
+        assert_eq!(mode_positions, vec![0]);
         assert_eq!(
             input[3].get("content").and_then(serde_json::Value::as_str),
             Some("current")
+        );
+    }
+
+    /// Prefix-cache stability: as the conversation grows across user turns,
+    /// the already-sent items must remain a byte-identical prefix of the next
+    /// request's input. The old before-last-user placement moved the mode
+    /// item every turn, invalidating the cached prefix at the prior user
+    /// message and re-billing the entire previous agentic turn uncached.
+    #[test]
+    fn mode_context_placement_preserves_prompt_prefix_across_turns() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        let turn1 = vec![
+            serde_json::json!({"role":"user","content":"first"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+        ];
+        let mut turn2 = turn1.clone();
+        turn2.push(serde_json::json!({"role":"user","content":"follow-up"}));
+        let mut input1 = turn1;
+        let mut input2 = turn2;
+        super::insert_codex_multi_agent_mode(&mut input1, &plan);
+        super::insert_codex_multi_agent_mode(&mut input2, &plan);
+        assert_eq!(
+            &input2[..input1.len()],
+            &input1[..],
+            "turn N's input must be a strict prefix of turn N+1's input"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_for_the_same_conversation_head() {
+        let first = serde_json::json!({"role":"user","content":"hello"});
+        let a = super::codex_prompt_cache_key("sys", Some(&first));
+        let b = super::codex_prompt_cache_key("sys", Some(&first));
+        assert_eq!(a, b);
+        assert!(a.starts_with("synaps-"), "{a}");
+    }
+
+    #[test]
+    fn prompt_cache_key_differs_across_conversations() {
+        let first = serde_json::json!({"role":"user","content":"hello"});
+        let other = serde_json::json!({"role":"user","content":"different task"});
+        assert_ne!(
+            super::codex_prompt_cache_key("sys", Some(&first)),
+            super::codex_prompt_cache_key("sys", Some(&other)),
+        );
+        assert_ne!(
+            super::codex_prompt_cache_key("sys", Some(&first)),
+            super::codex_prompt_cache_key("other-sys", Some(&first)),
+        );
+    }
+
+    #[test]
+    fn body_carries_prompt_cache_key() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::Medium,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            body.get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str),
+            Some("synaps-test-cache-key")
         );
     }
 
@@ -2300,5 +2467,33 @@ mod send_retry_tests {
             "initial attempt + 1 retry"
         );
         assert!(err.to_string().starts_with("codex request failed: 503"));
+    }
+
+    /// The dispatch seam lifts the generic three-attempt budget to the
+    /// persistent posture adopted for Anthropic OAuth overloads (10 retries)
+    /// — incident: 2026-07-16 chatgpt.com 503/520/timeout bursts.
+    #[test]
+    fn codex_retry_budget_lifts_configured_default_to_persistent_floor() {
+        assert_eq!(codex_retry_budget(3), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(0), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(10), 10);
+    }
+
+    /// A user who explicitly configured an even larger budget keeps it —
+    /// the floor only ever raises, never lowers.
+    #[test]
+    fn codex_retry_budget_honors_larger_user_configuration() {
+        assert_eq!(codex_retry_budget(15), 15);
+    }
+
+    /// Backoff doubles per attempt but caps at 2^6 — a 10-deep budget must
+    /// never sleep 512s on its final attempt.
+    #[test]
+    fn retry_delay_is_exponential_with_a_capped_tail() {
+        assert_eq!(retry_delay(1).as_secs(), 1);
+        assert_eq!(retry_delay(2).as_secs(), 2);
+        assert_eq!(retry_delay(4).as_secs(), 8);
+        assert_eq!(retry_delay(7).as_secs(), 64);
+        assert_eq!(retry_delay(10).as_secs(), 64);
     }
 }

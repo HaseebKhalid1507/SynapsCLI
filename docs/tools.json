@@ -305,7 +305,7 @@
     }
   },
   {
-    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion. After inspecting a finished result, call again with reconciled=true to attest reconciliation and clear the completion gate; reconciled defaults to false so inspection and attestation stay intentional (first terminal collect always collects; any terminal collect with reconciled=true reconciles, including repeats).",
+    "description": "Retrieve a reactive subagent's result. Non-blocking — returns immediately (status + partial output if still running). Standard flow: poll with subagent_status while the subagent runs; when subagent_status reports a terminal status (completed/failed/timed_out/cancelled), call this ONCE with reconciled=true — that single call both collects the result and attests reconciliation, clearing the completion gate. Calling without reconciled=true is an inspection-only read: it leaves the completion gate blocked and forces a second call. reconciled=true is idempotent and safe on repeats.",
     "name": "subagent_collect",
     "parameters": {
       "properties": {
@@ -315,12 +315,30 @@
         },
         "reconciled": {
           "default": false,
-          "description": "After inspecting the collected result, set true to attest reconciliation with foreground work and unblock completion. Defaults to false; a later collect with reconciled=true still reconciles (idempotent).",
+          "description": "Set true on your terminal collect (after subagent_status reports done) to attest the result is reconciled with foreground work and unblock completion — one call collects AND reconciles. Leave false only for a deliberate inspection-only read; a later collect with reconciled=true still reconciles (idempotent).",
           "type": "boolean"
         }
       },
       "required": [
         "handle_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Authorize one exact qualified, locally known model for subagent use in this session. The grant is session-only: it does not change the foreground model or persist favorites. No sudo or interactive confirmation is required.",
+    "name": "subagent_model_authorize",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "description": "Exact runtime-qualified model identity, for example anthropic/claude-sonnet-4-6.",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     }
@@ -356,7 +374,7 @@
     }
   },
   {
-    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — use subagent_status to poll, subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call repeatedly until done). Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — poll with subagent_status until it reports a terminal status, use subagent_steer to inject guidance mid-run, then call subagent_collect once with reconciled=true to retrieve the result and attest reconciliation in the same call. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
     "name": "subagent_start",
     "parameters": {
       "properties": {

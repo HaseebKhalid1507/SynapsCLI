@@ -288,6 +288,10 @@ pub struct Runtime {
     /// In-memory cache of broker-fetched access tokens (Remote source only).
     /// Cheap to clone (Arc inside). Never persisted to disk.
     token_cache: crate::auth::TokenCache,
+    /// Exact operator-trusted worker identities loaded from `favorite_models`.
+    /// These seed the session policy and are replayed when a manifestless
+    /// foreground model change replaces that policy snapshot.
+    trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
 }
 
 /// Idle timeout for the runtime HTTP client: how long a request may go
@@ -315,6 +319,20 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(read_timeout)
         .build()
+}
+
+/// Preserve compatibility with favorite IDs written before Anthropic used its
+/// runtime-qualified provider name. Authorization always stores the canonical
+/// exact identity; unrelated bare values remain invalid and are ignored.
+fn canonical_trusted_worker_model(model: &str) -> String {
+    let model = model.trim();
+    if let Some(id) = model.strip_prefix("claude/") {
+        format!("anthropic/{id}")
+    } else if model.starts_with("claude-") {
+        format!("anthropic/{model}")
+    } else {
+        model.to_owned()
+    }
 }
 
 impl Runtime {
@@ -382,6 +400,7 @@ impl Runtime {
             reaper_cancel: Some(cancel),
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
+            trusted_worker_models: Vec::new(),
         })
     }
 
@@ -449,6 +468,7 @@ impl Runtime {
             reaper_cancel: None,
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
+            trusted_worker_models: Vec::new(),
         }
     }
 
@@ -591,11 +611,31 @@ impl Runtime {
         &mut self,
         runtime: Arc<crate::orchestration::OrchestrationRuntime>,
     ) {
+        for model in &self.trusted_worker_models {
+            if let Err(error) = runtime.grant_worker_model(model.as_str()) {
+                tracing::warn!(
+                    model = model.as_str(),
+                    error = %error,
+                    "failed to apply configured worker-model trust"
+                );
+            }
+        }
         self.orchestration = Some(runtime);
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
         self.orchestration.as_ref()
+    }
+
+    /// Extends the live session delegation policy with one explicitly
+    /// user-trusted worker model (e.g. favorited mid-session in the models
+    /// picker). Mid-session trust grants were always meant to be honored;
+    /// the policy snapshot is not pinned against user decisions.
+    pub fn grant_worker_model(&self, model: &str) -> std::result::Result<(), String> {
+        self.orchestration
+            .as_ref()
+            .ok_or_else(|| "delegation policy unavailable".to_string())?
+            .grant_worker_model(model)
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -645,11 +685,18 @@ impl Runtime {
         {
             let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
                 .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
-            Some(Arc::new(
-                crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64).map_err(
-                    |_| "model change blocked: trusted worker catalog unavailable".to_string(),
-                )?,
-            ))
+            let replacement = crate::orchestration::OrchestrationRuntime::baseline(
+                foreground, 8, 64,
+            )
+            .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
+            for trusted in &self.trusted_worker_models {
+                replacement
+                    .grant_worker_model(trusted.as_str())
+                    .map_err(|_| {
+                        "model change blocked: configured worker trust invalid".to_string()
+                    })?;
+            }
+            Some(Arc::new(replacement))
         } else {
             None
         };
@@ -1080,6 +1127,36 @@ impl Runtime {
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.trusted_worker_models = config
+            .favorite_models
+            .iter()
+            .filter_map(|model| {
+                let canonical = canonical_trusted_worker_model(model);
+                match agent_core::prompt::QualifiedModelId::parse(canonical) {
+                    Ok(model) => Some(model),
+                    Err(_) => {
+                        tracing::warn!(
+                            model = model.as_str(),
+                            "ignoring invalid favorite worker-model identity"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        self.trusted_worker_models.sort();
+        self.trusted_worker_models.dedup();
+        if let Some(orchestration) = &self.orchestration {
+            for model in &self.trusted_worker_models {
+                if let Err(error) = orchestration.grant_worker_model(model.as_str()) {
+                    tracing::warn!(
+                        model = model.as_str(),
+                        error = %error,
+                        "failed to apply configured worker-model trust"
+                    );
+                }
+            }
+        }
         self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
@@ -1761,6 +1838,7 @@ impl Clone for Runtime {
             reaper_cancel: None, // Cloned runtimes don't own the reaper
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
+            trusted_worker_models: self.trusted_worker_models.clone(),
         }
     }
 }
@@ -1820,6 +1898,78 @@ mod tests {
                 .delegation_policy_digest,
             digest
         );
+    }
+
+    #[test]
+    fn configured_favorite_models_seed_session_worker_choices() {
+        let mut runtime = Runtime::new_headless();
+        let config = crate::config::SynapsConfig {
+            favorite_models: vec![
+                "openai-codex/gpt-5.6-luna".to_owned(),
+                "anthropic/claude-opus-4-6".to_owned(),
+                // Legacy favorite spelling must retain its existing compatibility.
+                "claude/claude-fable-5".to_owned(),
+                // Malformed persisted values must fail closed without bricking boot.
+                "not-qualified".to_owned(),
+            ],
+            ..Default::default()
+        };
+        runtime.apply_config(&config);
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap(),
+        ));
+
+        let orchestration = runtime.orchestration().unwrap();
+        for trusted in [
+            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-luna",
+            "anthropic/claude-opus-4-6",
+            "anthropic/claude-fable-5",
+        ] {
+            assert!(
+                orchestration
+                    .effective_choices()
+                    .contains(&trusted.to_owned()),
+                "missing configured worker choice {trusted}: {:?}",
+                orchestration.effective_choices()
+            );
+        }
+        let authorized = orchestration
+            .resolve_and_authorize("sa_cross_provider", Some("anthropic/claude-opus-4-6"))
+            .expect("an explicitly favorited cross-provider model must be authorized");
+        assert_eq!(authorized.model.as_str(), "anthropic/claude-opus-4-6");
+        assert!(!orchestration
+            .effective_choices()
+            .contains(&"not-qualified".to_owned()));
+    }
+
+    #[test]
+    fn configured_worker_choices_survive_manifestless_foreground_changes() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&crate::config::SynapsConfig {
+            favorite_models: vec!["anthropic/claude-opus-4-6".to_owned()],
+            ..Default::default()
+        });
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap(),
+        ));
+
+        runtime
+            .try_set_model("xai-auth/grok-4.5-latest".to_owned())
+            .unwrap();
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(orchestration.foreground_model(), "xai-auth/grok-4.5-latest");
+        assert!(orchestration
+            .effective_choices()
+            .contains(&"anthropic/claude-opus-4-6".to_owned()));
+        orchestration
+            .resolve_and_authorize("sa_after_switch", Some("anthropic/claude-opus-4-6"))
+            .expect("configured worker trust must survive policy replacement");
     }
 
     #[test]

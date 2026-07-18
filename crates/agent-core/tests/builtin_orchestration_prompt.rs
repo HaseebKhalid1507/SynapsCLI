@@ -30,6 +30,18 @@ fn codex_models_compose_base_plus_supervision_doctrine() {
         assert!(composed.contains("subagent_collect"), "{model}");
         assert!(composed.contains("subagent_steer"), "{model}");
         assert!(
+            composed.contains("every started handle reports a terminal status"),
+            "{model}: status loop termination rule missing"
+        );
+        assert!(
+            composed.contains("exactly once with reconciled=true"),
+            "{model}: single-call terminal collection/reconciliation rule missing"
+        );
+        assert!(
+            composed.contains("Never call subagent_collect without reconciled=true"),
+            "{model}: unreconciled-collect prohibition missing"
+        );
+        assert!(
             composed.contains("NEVER end your turn"),
             "{model}: turn discipline missing"
         );

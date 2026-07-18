@@ -20,13 +20,14 @@ impl Tool for SubagentCollectTool {
     }
 
     fn description(&self) -> &str {
-        "Check if a reactive subagent is done and return its result. Non-blocking — \
-         returns immediately. If still running, returns status and partial output. \
-         If finished, returns the full result. Call repeatedly to poll for completion. \
-         After inspecting a finished result, call again with reconciled=true to attest \
-         reconciliation and clear the completion gate; reconciled defaults to false so \
-         inspection and attestation stay intentional (first terminal collect always \
-         collects; any terminal collect with reconciled=true reconciles, including repeats)."
+        "Retrieve a reactive subagent's result. Non-blocking — returns immediately \
+         (status + partial output if still running). Standard flow: poll with \
+         subagent_status while the subagent runs; when subagent_status reports a \
+         terminal status (completed/failed/timed_out/cancelled), call this ONCE with \
+         reconciled=true — that single call both collects the result and attests \
+         reconciliation, clearing the completion gate. Calling without reconciled=true \
+         is an inspection-only read: it leaves the completion gate blocked and forces \
+         a second call. reconciled=true is idempotent and safe on repeats."
     }
 
     fn parameters(&self) -> Value {
@@ -40,7 +41,7 @@ impl Tool for SubagentCollectTool {
                 "reconciled": {
                     "type": "boolean",
                     "default": false,
-                    "description": "After inspecting the collected result, set true to attest reconciliation with foreground work and unblock completion. Defaults to false; a later collect with reconciled=true still reconciles (idempotent)."
+                    "description": "Set true on your terminal collect (after subagent_status reports done) to attest the result is reconciled with foreground work and unblock completion — one call collects AND reconciles. Leave false only for a deliberate inspection-only read; a later collect with reconciled=true still reconciles (idempotent)."
                 }
             },
             "required": ["handle_id"]
@@ -151,6 +152,7 @@ impl Tool for SubagentCollectTool {
         // Done — return full result. The registry retains this record, making
         // repeated collection diagnostically idempotent; `collected` signals
         // idempotency to the caller.
+        let reconciled_now = params["reconciled"].as_bool().unwrap_or(false);
         let mut body = json!({
             "handle_id": handle_id,
             "status":    status.as_str(),
@@ -160,6 +162,17 @@ impl Tool for SubagentCollectTool {
             "authorization": authorization,
             "collected": already_collected,
         });
+        if !reconciled_now && ctx.capabilities.orchestration.is_some() {
+            // Nudge stragglers: an unreconciled terminal read leaves the
+            // completion gate blocked and forces a second collect. The
+            // standard flow (doctrine + tool description) is a single
+            // collect with reconciled=true after status turns terminal.
+            body["note"] = json!(
+                "UNRECONCILED read — the completion gate is still blocked. \
+                 Call subagent_collect again with reconciled=true after \
+                 integrating this result."
+            );
+        }
         if let Some(reason) = status.failure_reason() {
             body["error"] = json!(reason);
         }
@@ -380,6 +393,40 @@ mod tests {
             orch.completion_gate(),
             CompletionGate::Allowed,
             "first collect with reconciled=true must allow completion"
+        );
+    }
+
+    /// An unreconciled terminal read leaves the gate blocked, so the response
+    /// must carry an explicit nudge to re-collect with reconciled=true —
+    /// otherwise models stall on a gate they can no longer see. The standard
+    /// single-call flow (reconciled=true up front) must NOT carry the note.
+    #[tokio::test]
+    async fn unreconciled_terminal_collect_carries_reconcile_nudge() {
+        let tool = SubagentCollectTool;
+        let (_registry, _orch, ctx) = make_orch_ctx("sa_nudge", "result text");
+
+        let result = tool
+            .execute(json!({"handle_id": "sa_nudge", "reconciled": false}), ctx)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let note = body["note"].as_str().expect("unreconciled read must nudge");
+        assert!(note.contains("reconciled=true"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn reconciled_collect_carries_no_nudge() {
+        let tool = SubagentCollectTool;
+        let (_registry, _orch, ctx) = make_orch_ctx("sa_no_nudge", "result text");
+
+        let result = tool
+            .execute(json!({"handle_id": "sa_no_nudge", "reconciled": true}), ctx)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            body.get("note").is_none(),
+            "single-call collect+reconcile must not carry a nudge: {body}"
         );
     }
 

@@ -135,3 +135,88 @@ fn rollback_restores_dispatch_budget() {
         )
         .is_ok());
 }
+
+/// Regression: trusted models were never meant to be pinned at session start.
+/// An explicit mid-session user grant for a cross-provider model must flip the
+/// next dispatch from `provider_not_allowed` to authorized.
+#[test]
+fn mid_session_user_grant_admits_cross_provider_worker() {
+    let sol = model("openai-codex/gpt-5.6-sol");
+    let policy = DelegationPolicy::enforced(
+        model("anthropic/claude-fable-5"),
+        [model("anthropic/claude-fable-5")],
+        2,
+        4,
+    );
+    let mut r = WorkerRegistry::new(policy);
+    let denied = r.validate_dispatch(&sol).unwrap_err();
+    assert!(matches!(
+        denied.typed_code(),
+        DispatchFailureCode::ProviderNotAllowed | DispatchFailureCode::CatalogModelUnknown
+    ));
+
+    r.grant_worker_model(sol.clone()).unwrap();
+
+    r.validate_dispatch(&sol).unwrap();
+    let grant_id = r.policy().authorize(&sol).unwrap();
+    assert_eq!(
+        grant_id,
+        Some("session-user-grant-openai-codex/gpt-5.6-sol")
+    );
+    assert!(r.policy().effective_choices().contains(&sol));
+    let granted_events = r
+        .telemetry()
+        .iter()
+        .filter(|event| event.name == "worker.model_granted")
+        .count();
+    assert_eq!(granted_events, 1);
+}
+
+/// A mid-session grant for a same-provider model joins the allowlist directly
+/// (no cross-provider grant id) and is honored by the next dispatch.
+#[test]
+fn mid_session_user_grant_admits_same_provider_worker() {
+    let sonnet = model("anthropic/claude-sonnet-5");
+    let policy = DelegationPolicy::enforced(
+        model("anthropic/claude-fable-5"),
+        [model("anthropic/claude-fable-5")],
+        2,
+        4,
+    );
+    let mut r = WorkerRegistry::new(policy);
+    assert!(r.validate_dispatch(&sonnet).is_err());
+
+    r.grant_worker_model(sonnet.clone()).unwrap();
+
+    r.validate_dispatch(&sonnet).unwrap();
+    assert_eq!(r.policy().authorize(&sonnet).unwrap(), None);
+    assert!(r.policy().effective_choices().contains(&sonnet));
+}
+
+/// A fresh user grant must win over a stale expiring grant that names the
+/// same identity: the session grant is evaluated first and never expires.
+#[test]
+fn mid_session_user_grant_wins_over_expired_pinned_grant() {
+    let sol = model("openai-codex/gpt-5.6-sol");
+    let foreground = model("anthropic/claude-fable-5");
+    let catalog = CatalogSnapshot::new([foreground.clone(), sol.clone()]);
+    let expired =
+        CrossProviderGrant::new("pinned-grant", "anthropic", "openai-codex", [sol.clone()])
+            .unwrap()
+            .expiring_at(1)
+            .unwrap();
+    let mut policy =
+        DelegationPolicy::with_grants(foreground.clone(), catalog, [foreground], [expired], 2, 4)
+            .unwrap();
+    assert_eq!(
+        policy.authorize_at(&sol, 2).unwrap_err().typed_code(),
+        DispatchFailureCode::CrossProviderGrantExpired
+    );
+
+    policy.grant_worker_model(sol.clone()).unwrap();
+
+    assert_eq!(
+        policy.authorize_at(&sol, 2).unwrap(),
+        Some("session-user-grant-openai-codex/gpt-5.6-sol")
+    );
+}

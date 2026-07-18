@@ -77,6 +77,47 @@ pub fn canonical_foreground_identity(raw: &str) -> Result<QualifiedModelId, Stri
         .map_err(|e| e.to_string())
 }
 
+/// Validate an exact identity against source-controlled runtime routing/catalog
+/// descriptors before allowing a model-driven session grant. This operation is
+/// credential- and network-blind: availability is checked later by normal
+/// provider execution, while invented identities fail before policy mutation.
+pub fn validate_user_authorizable_model(raw: &str) -> Result<QualifiedModelId, String> {
+    let model = QualifiedModelId::parse(raw)
+        .map_err(|_| "authorization denied: invalid qualified model".to_string())?;
+    let known = if model.provider() == "anthropic" {
+        agent_core::models::KNOWN_MODELS
+            .iter()
+            .any(|(id, _)| *id == model.model())
+    } else if model.provider() == "openai-codex" {
+        crate::runtime::openai::catalog::codex_static_catalog_models()
+            .iter()
+            .any(|entry| entry.runtime_id() == model.as_str())
+    } else if model.provider() == "xai-auth" {
+        crate::runtime::openai::catalog::xai_model(model.model()).is_some()
+    } else if model.provider() == "github-copilot" {
+        crate::runtime::openai::catalog::github_copilot_runtime_model(model.model()).is_some()
+    } else if model.provider() == "google-gemini" {
+        crate::runtime::openai::catalog::google_gemini_model(model.model()).is_some()
+    } else {
+        crate::runtime::openai::registry::providers()
+            .iter()
+            .find(|provider| provider.key == model.provider())
+            .is_some_and(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|(id, _, _)| *id == model.model())
+            })
+    };
+    if !known || crate::runtime::openai::resolve_route(model.as_str()).is_none() {
+        return Err(format!(
+            "authorization denied: '{}' is not a known routable model",
+            model.as_str()
+        ));
+    }
+    Ok(model)
+}
+
 /// Exact source-controlled OpenRouter worker stack. These identities are
 /// trusted local descriptors (not live catalog results or historical logs).
 const OPENROUTER_WORKER_MODELS: &[&str] = &[
@@ -186,6 +227,22 @@ impl OrchestrationRuntime {
             .map_err(|e| format!("delegation denied: {}", e.code()))
     }
 
+    /// Honors an explicit mid-session user trust grant for one exact worker
+    /// model. Trusted models were never meant to be pinned at session start:
+    /// the live policy and catalog are extended in place while worker
+    /// lifecycle state and concurrency limits are preserved. The grant takes
+    /// effect for the next dispatch decision.
+    pub fn grant_worker_model(&self, model: &str) -> Result<(), String> {
+        let model = QualifiedModelId::parse(model)
+            .map_err(|_| "grant denied: invalid qualified model".to_string())?;
+        self.inner
+            .lock()
+            .unwrap()
+            .registry
+            .grant_worker_model(model)
+            .map_err(|error| format!("grant denied: {error}"))
+    }
+
     /// Read-only UltraCode authorization snapshot. The exact foreground identity,
     /// policy authorization, and configured limits are checked under one lock; no
     /// worker reservation or lifecycle state is created.
@@ -264,7 +321,7 @@ impl OrchestrationRuntime {
                 foreground_model: foreground.as_str().into(),
                 selection_source,
                 network_attempted: false,
-                remediation: "Omit model to inherit foreground or select an exact session choice.",
+                remediation: "Omit model to inherit foreground, select an exact session choice, or trust the model mid-session (favorite it in the models picker).",
             })?;
         inner.handles.insert(runtime_handle.to_owned(), handle);
         Ok(AuthorizedWorkerModel {
@@ -550,6 +607,51 @@ mod tests {
             denied.code,
             "provider_not_allowed" | "catalog_model_unknown"
         ));
+    }
+
+    /// Regression: an explicit mid-session user trust grant must flip an
+    /// exact-model dispatch from `provider_not_allowed` to authorized without
+    /// restarting the session. Trusted models were never meant to be pinned
+    /// at session start.
+    #[test]
+    fn baseline_honors_mid_session_user_grant() {
+        let foreground = model("anthropic/claude-fable-5");
+        let requested = "openai-codex/gpt-5.6-sol";
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 3, 8).unwrap();
+        assert_eq!(rt.effective_choices(), vec![foreground.as_str().to_owned()]);
+        let denied = rt
+            .resolve_and_authorize("sa_denied", Some(requested))
+            .unwrap_err();
+        assert!(matches!(
+            denied.code,
+            "provider_not_allowed" | "catalog_model_unknown"
+        ));
+        assert!(!denied.network_attempted);
+
+        rt.grant_worker_model(requested).unwrap();
+
+        assert!(rt.effective_choices().contains(&requested.to_owned()));
+        let authorized = rt
+            .resolve_and_authorize("sa_granted", Some(requested))
+            .unwrap();
+        assert_eq!(authorized.model.as_str(), requested);
+        assert_eq!(
+            authorized.cross_provider_grant_id.as_deref(),
+            Some("session-user-grant-openai-codex/gpt-5.6-sol")
+        );
+        assert!(!authorized.network_attempted);
+        rt.rollback("sa_granted");
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+    }
+
+    /// A grant for a malformed identity fails closed and changes nothing.
+    #[test]
+    fn mid_session_grant_rejects_invalid_qualified_model() {
+        let foreground = model("anthropic/claude-fable-5");
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 3, 8).unwrap();
+        assert!(rt.grant_worker_model("").is_err());
+        assert!(rt.grant_worker_model("not-qualified").is_err());
+        assert_eq!(rt.effective_choices(), vec![foreground.as_str().to_owned()]);
     }
 
     #[test]
