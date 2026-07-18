@@ -11,7 +11,7 @@
 
 use std::pin::Pin;
 
-use agent_core::auth::{BrokerError, CredentialBroker, ProxyMethod, ProxyRequest};
+use agent_core::auth::{BrokerError, CredentialBroker, ProxyRequest};
 use bytes::BytesMut;
 use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,30 @@ pub enum StreamError {
     LineTooLarge,
 }
 
+/// Build the exact-byte `ProxyRequest` for one streamed Code Assist turn.
+/// The JSON envelope is serialized **once** via
+/// [`ProxyRequest::post_json_exact`]; the returned [`bytes::Bytes`] handle is
+/// the very buffer `LocalBroker` sends verbatim, so a caller-side trace
+/// digest over it describes the true wire body on the local-broker path.
+pub fn build_stream_request(
+    model: impl Into<String>,
+    project: Option<String>,
+    system_prompt: Option<String>,
+    turns: &[ChatTurn],
+    tools: &[ToolSpec],
+) -> Result<(ProxyRequest, bytes::Bytes), StreamError> {
+    let body = translate_generate_content_request(model, project, system_prompt, turns, tools);
+    let body = serde_json::to_value(&body)
+        .map_err(|e| StreamError::Decode(format!("failed to serialize request: {e}")))?;
+    ProxyRequest::post_json_exact(
+        "google-gemini",
+        "/v1internal:streamGenerateContent",
+        body,
+        true,
+    )
+    .map_err(StreamError::Broker)
+}
+
 /// Start a broker-proxied streaming turn against Code Assist and yield
 /// decoded events as they arrive. The returned stream is `Send + 'static`
 /// so it can be forwarded through the runtime's event bus.
@@ -47,18 +71,19 @@ pub async fn stream_gemini<B: CredentialBroker + ?Sized>(
     cancel: CancellationToken,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<GeminiStreamEvent, StreamError>> + Send>>, StreamError>
 {
-    let body = translate_generate_content_request(model, project, system_prompt, turns, tools);
-    let request = ProxyRequest {
-        provider: "google-gemini".into(),
-        method: ProxyMethod::Post,
-        path: "/v1internal:streamGenerateContent".into(),
-        body: Some(
-            serde_json::to_value(&body)
-                .map_err(|e| StreamError::Decode(format!("failed to serialize request: {e}")))?,
-        ),
-        stream: true,
-        body_bytes: None,
-    };
+    let (request, _bytes) = build_stream_request(model, project, system_prompt, turns, tools)?;
+    stream_gemini_request(broker, request, cancel).await
+}
+
+/// Start one broker stream attempt from a prebuilt request (see
+/// [`build_stream_request`]). Retry loops reuse the same request value per
+/// attempt so every attempt sends identical bytes.
+pub async fn stream_gemini_request<B: CredentialBroker + ?Sized>(
+    broker: &B,
+    request: ProxyRequest,
+    cancel: CancellationToken,
+) -> Result<Pin<Box<dyn Stream<Item = Result<GeminiStreamEvent, StreamError>> + Send>>, StreamError>
+{
     let mut byte_stream = broker.proxy_stream(request).await?;
 
     // Pump on a dedicated task and forward decoded events through mpsc. The
@@ -146,7 +171,7 @@ pub async fn stream_gemini<B: CredentialBroker + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::auth::{AccessToken, ProxyByteStream, ProxyResponse};
+    use agent_core::auth::{AccessToken, ProxyByteStream, ProxyMethod, ProxyResponse};
     use async_trait::async_trait;
     use futures::stream;
     use std::sync::{Arc, Mutex};

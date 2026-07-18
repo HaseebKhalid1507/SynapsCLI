@@ -16,6 +16,7 @@ mod api_sync;
 mod auth;
 #[cfg(test)]
 mod body_golden;
+pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod google_gemini;
 pub mod google_vertex;

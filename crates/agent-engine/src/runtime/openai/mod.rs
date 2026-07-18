@@ -503,6 +503,8 @@ pub async fn try_route(
                 messages,
                 tx,
                 cancel,
+                trace,
+                exact_wire_bytes,
             )
             .await,
         ),

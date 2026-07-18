@@ -900,99 +900,31 @@ impl ApiMethods {
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
         // Cloud models always dispatch through the typed credential broker.
+        // Text-only pre-flight, invocation, cancellation, and Task 10B trace
+        // wiring live in `runtime::cloud_invoke` (extracted for testability).
         let (cloud_model, cloud_context) = crate::auth::cloud::split_model_route(model);
         if let Some((provider_key, _)) = cloud_model.split_once('/') {
             if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
-                use futures::StreamExt;
-                // Spec §5.5 pre-flight: cloud routes are text-only. A mode
-                // that exposes tools must fail HERE — before the broker is
-                // constructed, before any credential lookup, before any
-                // network access. The invoke-time guard inside the broker
-                // remains as defense in depth.
-                crate::auth::preflight_cloud_capability(provider, !tools.tools_schema().is_empty())
-                    .map_err(|e| RuntimeError::Config(e.to_string()))?;
-                let broker = crate::auth::broker_from_source(
-                    &options.credential_source,
-                    &options.token_cache,
-                    client.clone(),
-                );
-                let mut normalized = Vec::new();
-                if let Some(system) = system_prompt.as_ref().filter(|s| !s.is_empty()) {
-                    normalized.push(crate::auth::cloud::BrokerMessage {
-                        role: crate::auth::cloud::MessageRole::System,
-                        content: system.clone(),
-                    });
-                }
-                for message in messages {
-                    let role = match message["role"].as_str().unwrap_or("user") {
-                        "assistant" => crate::auth::cloud::MessageRole::Assistant,
-                        "system" => crate::auth::cloud::MessageRole::System,
-                        "tool" => crate::auth::cloud::MessageRole::Tool,
-                        _ => crate::auth::cloud::MessageRole::User,
-                    };
-                    let content = message["content"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| message["content"].to_string());
-                    normalized.push(crate::auth::cloud::BrokerMessage { role, content });
-                }
-                let request = crate::auth::cloud::InvokeRequest {
-                    messages: normalized,
-                    tools: Vec::new(),
-                    stream: true,
-                    options: Default::default(),
-                };
-                let context_ref = cloud_context.unwrap_or(provider.as_str());
-                let mut stream = broker
-                    .cloud_invoke(provider, context_ref, cloud_model, request)
-                    .await
-                    .map_err(|e| RuntimeError::Config(e.to_string()))?;
-                let mut text = String::new();
-                while let Some(event) = tokio::select! { _ = cancel.cancelled() => return Err(RuntimeError::Config("cloud invocation cancelled".into())), event = stream.next() => event }
-                {
-                    match event.map_err(|e| RuntimeError::Config(e.to_string()))? {
-                        crate::auth::broker::CloudEvent::TextDelta { delta } => {
-                            text.push_str(&delta);
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::Text(delta),
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::ToolArguments { id, name, delta } => {
-                            if let Some(name) = name {
-                                let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                    crate::runtime::types::LlmEvent::ToolUseStart {
-                                        tool_name: name,
-                                        tool_id: id.clone(),
-                                    },
-                                ));
-                            }
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::ToolUseDelta {
-                                    tool_id: id,
-                                    delta,
-                                },
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::Usage {
-                            input_tokens,
-                            output_tokens,
-                        } => {
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Session(
-                                crate::runtime::types::SessionEvent::Usage {
-                                    input_tokens,
-                                    output_tokens,
-                                    cache_read_input_tokens: 0,
-                                    cache_creation_input_tokens: 0,
-                                    cache_creation_5m: None,
-                                    cache_creation_1h: None,
-                                    model: Some(model.into()),
-                                },
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::Done => break,
-                    }
-                }
-                return Ok(serde_json::json!({"content":[{"type":"text","text":text}]}));
+                return crate::runtime::cloud_invoke::cloud_invoke_stream(
+                    provider,
+                    model,
+                    cloud_model,
+                    cloud_context,
+                    !tools.tools_schema().is_empty(),
+                    || {
+                        crate::auth::broker_from_source(
+                            &options.credential_source,
+                            &options.token_cache,
+                            client.clone(),
+                        )
+                    },
+                    system_prompt,
+                    messages,
+                    &tx,
+                    cancel,
+                    &options.trace,
+                )
+                .await;
             }
         }
         // Route to OpenAI-compat provider if the model id resolves to one.

@@ -164,7 +164,7 @@ async fn broker_streams_gemini_generate_content_end_to_end() {
                 tool_signatures.push(c.thought_signature.clone());
             }
             GeminiStreamEvent::Finish { .. } => finishes += 1,
-            GeminiStreamEvent::Ignored => {}
+            GeminiStreamEvent::Usage(_) | GeminiStreamEvent::Ignored => {}
         }
     }
     assert_eq!(text, "Hello world");

@@ -1646,9 +1646,7 @@ impl LocalBroker {
             if request.stream && request.path == "/v1internal:streamGenerateContent" {
                 builder = builder.query(&[("alt", "sse")]);
             }
-            builder = builder
-                .header("content-type", "application/json")
-                .header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
+            builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
         if let Some(bytes) = &request.body_bytes {
             // Exact-byte handoff (request-trace spec §6.2): send the very

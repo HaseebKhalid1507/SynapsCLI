@@ -29,6 +29,7 @@
 
 pub mod anthropic;
 pub mod emit;
+pub mod google;
 mod key;
 pub mod openai;
 mod types;
@@ -58,3 +59,6 @@ mod wiring_tests;
 
 #[cfg(test)]
 mod openai_wiring_tests;
+
+#[cfg(test)]
+mod google_wiring_tests;
