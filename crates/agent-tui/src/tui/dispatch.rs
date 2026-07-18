@@ -973,6 +973,8 @@ pub(crate) async fn handle_input_action(
                                 app.push_msg(ChatMessage::User(display_text));
                                 app.input_before_paste = None;
                                 app.pasted_char_count = 0;
+                                // Real user send — reset auto-turn counter.
+                                app.consecutive_auto_turns = 0;
                                 // Inject abort context if previous response was interrupted
                                 let api_content = if let Some(ref ctx) = app.abort_context {
                                     let combined = format!("{}\n\n{}", ctx, input);

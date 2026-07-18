@@ -110,6 +110,8 @@ pub async fn run(
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.
     let mut event_reader = Some(event_reader);
+    // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
+    let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     loop {
         // Only draw when something actually changed. During streaming, coalesce
         // redraws to the configured frame budget (`max_fps`, default 60fps =
@@ -235,11 +237,12 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() => {
                 if loop_arms::handle_animation_tick(
                     &mut app, &runtime, &config, &registry, &render_handle,
                     &secret_prompt_rx, &boot_done, &exit_done,
                     &mut boot_fx_sent, exit_fx_sent,
+                    &mut last_subagent_reconcile,
                 )
                 .await
                 {

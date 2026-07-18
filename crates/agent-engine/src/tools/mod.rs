@@ -31,7 +31,7 @@ pub mod watcher_exit;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use crate::runtime::subagent::{
-    SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
+    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
 pub use bash::BashTool;
@@ -56,6 +56,11 @@ pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{expand_path, strip_ansi, NEXT_SUBAGENT_ID};
+
+// Facade: expose finalize internals for integration tests without making the
+// subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
+#[doc(hidden)]
+pub use subagent::finalize::{build_completion_event, finalize_subagent};
 
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 

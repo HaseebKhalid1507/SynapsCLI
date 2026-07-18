@@ -213,6 +213,48 @@ impl CacheTtl {
     }
 }
 
+/// Runtime event routing configuration parsed from `events.*` keys.
+///
+/// Controls how runtime events (from the `EventQueue`) are delivered in
+/// server and RPC modes.
+#[derive(Debug, Clone)]
+pub struct EventsConfig {
+    /// When `true` (default), the server/RPC session automatically triggers a
+    /// model turn when runtime events arrive while idle.  Set
+    /// `events.auto_turn = false` (or `0` / `no` / `off`) to opt out.
+    /// Unrecognised values fail safe to `false` with a warning.
+    /// The built-in cap (`AUTO_TURN_CAP = 5`) still applies regardless.
+    pub auto_turn: bool,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self { auto_turn: true }
+    }
+}
+
+/// Parse `events.*` configuration keys.
+fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
+    if key == "events.auto_turn" {
+        let normalised = val.trim().to_lowercase();
+        cfg.auto_turn = match normalised.as_str() {
+            // Explicit true values.
+            "true" | "1" | "yes" | "on" => true,
+            // Explicit false values.
+            "false" | "0" | "no" | "off" => false,
+            // Unrecognised: fail safe to false and warn so the user knows.
+            other => {
+                eprintln!(
+                    "warning: config: unrecognised value for events.auto_turn = {:?}; \
+                     expected true/false/yes/no/on/off/1/0 — defaulting to false",
+                    other
+                );
+                false
+            }
+        };
+    } // unknown events.* keys ignored
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -251,6 +293,7 @@ pub struct SynapsConfig {
     pub server: ServerConfig,
     pub bridge: BridgeConfig,
     pub auth: AuthConfig,
+    pub events: EventsConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
     /// Non-fatal problems found while parsing the config file (unknown keys,
@@ -287,6 +330,7 @@ impl Default for SynapsConfig {
             server: ServerConfig::default(),
             bridge: BridgeConfig::default(),
             auth: AuthConfig::default(),
+            events: EventsConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             warnings: Vec::new(),
@@ -490,6 +534,15 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
         }
     }
 }
+
+/// Parse config from a raw string — useful for tests and embedded harnesses.
+/// Does NOT write to `PROVIDER_KEYS` or `IDENTITY` OnceLocks.
+pub fn load_config_from_str(content: &str) -> SynapsConfig {
+    let mut config = SynapsConfig::default();
+    apply_config_content(&mut config, content);
+    config
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -500,6 +553,22 @@ pub fn load_config() -> SynapsConfig {
         return config;
     };
     
+    apply_config_content(&mut config, &content);
+
+    // Publish provider keys to the process-wide cache for the API router.
+    // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
+    let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
+
+    // Publish identity to the process-wide cache for API system prompt preamble.
+    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
+    let _ = IDENTITY.set(identity_val);
+
+    config
+}
+
+/// Apply key=value config lines from `content` into `config`.
+/// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
+fn apply_config_content(config: &mut SynapsConfig, content: &str) {
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -618,6 +687,8 @@ pub fn load_config() -> SynapsConfig {
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
+                } else if key.starts_with("events.") {
+                    parse_events_config_key(&mut config.events, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
@@ -644,16 +715,6 @@ pub fn load_config() -> SynapsConfig {
             config.server.max_message_size = Some((ctx_tokens as usize) * 4);
         }
     }
-
-    // Publish provider keys to the process-wide cache for the API router.
-    // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
-    let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
-
-    // Publish identity to the process-wide cache for API system prompt preamble.
-    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
-    let _ = IDENTITY.set(identity_val);
-
-    config
 }
 
 /// Read a single config value by exact key from the active config file.
@@ -1299,6 +1360,37 @@ api_retries = 5
     }
 
     // ── auth.* config + credential source (#157) ──
+
+    // ── events.auto_turn parser ──────────────────────────────────────────────
+
+    #[test]
+    fn events_auto_turn_explicit_true_values() {
+        for val in &["true", "TRUE", "1", "yes", "YES", "on", "ON"] {
+            let cfg = load_config_from_str(&format!("events.auto_turn = {val}"));
+            assert!(cfg.events.auto_turn, "expected true for events.auto_turn = {val}");
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_explicit_false_values() {
+        for val in &["false", "FALSE", "0", "no", "NO", "off", "OFF"] {
+            let cfg = load_config_from_str(&format!("events.auto_turn = {val}"));
+            assert!(!cfg.events.auto_turn, "expected false for events.auto_turn = {val}");
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_typo_fails_safe_false() {
+        // Unrecognised value should fail safe to false (with a warning on stderr).
+        let cfg = load_config_from_str("events.auto_turn = fales");
+        assert!(!cfg.events.auto_turn, "typo 'fales' must fail safe to false");
+    }
+
+    #[test]
+    fn events_auto_turn_default_is_true() {
+        let cfg = load_config_from_str("model = claude-haiku");
+        assert!(cfg.events.auto_turn, "default must be true when key absent");
+    }
 
     #[test]
     #[serial]

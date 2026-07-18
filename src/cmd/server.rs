@@ -14,6 +14,7 @@ use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
 use axum::extract::Query;
@@ -49,6 +50,19 @@ struct ServerState {
     max_message_size: Option<usize>,
     /// Auto-approve confirm hooks (headless/agent mode).
     auto_approve_confirms: bool,
+    /// Auto-turn is on by default (`events.auto_turn` defaults to `true`).
+    /// Set `events.auto_turn = false` (or `0` / `no`) to opt out.
+    ///
+    /// POLICY: broadcasts ALWAYS happen (C3: removed). The auto-turn is gated on this flag.
+    events_auto_turn: bool,
+    /// Internal channel: event drainer signals the auto-turn listener task
+    /// when conditions are met. Unit trigger — the event content is already
+    /// in conv.api_messages from the drainer.
+    auto_turn_tx: tokio::sync::mpsc::Sender<()>,
+    /// Counts consecutive event-triggered model turns without an intervening
+    /// real client user message. Reset to 0 on every real user message.
+    /// Enforces AUTO_TURN_CAP — see reactor::AUTO_TURN_CAP.
+    consecutive_auto_turns: std::sync::atomic::AtomicU32,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -247,6 +261,10 @@ pub async fn run(
         }
     };
 
+    let (auto_turn_tx, auto_turn_rx) = tokio::sync::mpsc::channel::<()>(32);
+
+    let events_auto_turn = config.events.auto_turn;
+
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
         conv: RwLock::new(conv),
@@ -260,7 +278,85 @@ pub async fn run(
         allowed_origins,
         max_message_size,
         auto_approve_confirms,
+        events_auto_turn,
+        auto_turn_tx,
+        consecutive_auto_turns: std::sync::atomic::AtomicU32::new(0),
     });
+
+    // ── Event drainer task (exactly one per Runtime) ──────────────────────
+    //
+    // Policy:
+    //   * Runtime events are internalized into the single shared conversation.
+    //   * No raw event frame is broadcast; clients see the ordinary model stream.
+    //   * Auto-turn follows `events.auto_turn` (default true, explicit opt-out).
+    //   * Do NOT touch the `streaming` guard from this task — use the
+    //     auto_turn_tx channel to hand off to the listener task below.
+    //   * conv.pending_events tracks buffered strings while streaming; they
+    //     are flushed by the turn loop's AutoTriggerEvents path.
+    {
+        let state_d = Arc::clone(&state);
+        tokio::spawn(async move {
+            let eq = {
+                let rt = state_d.runtime.lock().await;
+                rt.event_queue().clone()
+            };
+            loop {
+                eq.notified().await;
+
+                // Drain + mutate conv fields — brief lock, released before sends.
+                let action = {
+                    let mut conv = state_d.conv.write().await;
+                    let busy = state_d.streaming.load(std::sync::atomic::Ordering::Acquire);
+                    // Reborrow through &mut *conv so NLL field-split borrow analysis
+                    // can see two disjoint fields (api_messages, pending_events).
+                    let conv_ref: &mut ConversationState = &mut *conv;
+                    let drained = drain_event_queue(
+                        &eq,
+                        &mut conv_ref.api_messages,
+                        &mut conv_ref.pending_events,
+                        busy,
+                        None,
+                    );
+                    let consecutive = state_d.consecutive_auto_turns
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    wake_action(
+                        &drained,
+                        &conv_ref.api_messages,
+                        busy,
+                        state_d.events_auto_turn,
+                        consecutive,
+                    )
+                }; // conv write-lock released
+
+                // Events are internalized into conv.api_messages by drain_event_queue.
+                // No raw event broadcast to clients — model turn is the delivery mechanism.
+
+                // If auto_turn enabled + conditions met, signal the listener.
+                // Unit signal — event content already in conv.api_messages.
+                if action == WakeAction::RunTurn {
+                    let _ = state_d.auto_turn_tx.send(()).await;
+                }
+            }
+        });
+    }
+
+    // ── Auto-turn listener task ───────────────────────────────────────────
+    //
+    // B2 FIX: calls `run_injected_event_turn` instead of `handle_user_message`.
+    // This avoids injecting a bogus sentinel user message and spurious
+    // "already-streaming" broadcasts. The event content is already in
+    // conv.api_messages from the drainer; we only need to acquire the streaming
+    // guard and run the turn loop.
+    {
+        let state_l = Arc::clone(&state);
+        let mut auto_turn_rx = auto_turn_rx;
+        tokio::spawn(async move {
+            while auto_turn_rx.recv().await.is_some() {
+                tracing::debug!("server: event auto-turn triggered");
+                run_injected_event_turn(&state_l).await;
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -566,6 +662,9 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
 }
 
 async fn handle_user_message(content: String, state: &Arc<ServerState>) {
+    // Reset consecutive auto-turn counter — real user message breaks the chain.
+    state.consecutive_auto_turns.store(0, std::sync::atomic::Ordering::Release);
+
     // Atomic check-then-set: if `streaming` was already true, reject.
     // AcqRel gives us happens-before ordering on the flag toggle without the
     // cross-thread sync overhead of SeqCst, which we don't need for a single
@@ -690,6 +789,23 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     continue 'turn;
                 }
                 StreamCompletion::AutoTriggerEvents => {
+                    // Issue 3 fix: gate on events_auto_turn config; enforce counter+cap.
+                    // handle_user_message already reset the counter to 0 at entry, but
+                    // subsequent auto-trigger iterations within this same user message
+                    // handling must still be bounded.
+                    if !state.events_auto_turn {
+                        state.save_session().await;
+                        break 'turn;
+                    }
+                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if cur >= AUTO_TURN_CAP {
+                        tracing::info!(
+                            cap = AUTO_TURN_CAP,
+                            "server: auto-turn cap reached (handle_user_message AutoTriggerEvents) — parking"
+                        );
+                        state.save_session().await;
+                        break 'turn;
+                    }
                     // pending_events were already drained into conv.api_messages
                     // by process_stream_event. Save and trigger a follow-up turn.
                     state.save_session().await;
@@ -880,6 +996,155 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
         | EngineStreamEvent::SteeringDelivered { .. }
         | EngineStreamEvent::Noop => None,
     }
+}
+
+/// Run a model turn driven by an injected runtime event (auto-turn path).
+///
+/// B2 FIX: Unlike `handle_user_message`, this function does NOT push a sentinel
+/// user message into history or conv.api_messages — the event content is already
+/// there from the drainer. It atomically acquires the streaming guard (silently
+/// dropping the trigger if a real stream is already active), increments the
+/// consecutive auto-turn counter, runs the turn loop, then resets on cap.
+///
+/// The streaming guard check here is the safety-critical piece: if a real client
+/// message arrived between the drainer signalling and this function running, the
+/// streaming flag will already be true and we drop the auto-turn silently.
+/// The event content remains in api_messages and will be processed with the
+/// client-driven turn.
+async fn run_injected_event_turn(state: &Arc<ServerState>) {
+    // Guard: if already streaming, event stays in api_messages for the active turn.
+    if state
+        .streaming
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        tracing::debug!("server: auto-turn skipped — stream already active; event stays in history");
+        return;
+    }
+    // RAII: clears `streaming` on every return path.
+    let _streaming_guard = StreamingGuard {
+        state: Arc::clone(state),
+    };
+
+    // Guard: last api_messages entry must be role=user (injected event content).
+    // Stale signals (e.g. fired after a user turn already consumed the message)
+    // are silently parked — no turn started.
+    {
+        let conv = state.conv.read().await;
+        let last_role = conv.api_messages.last()
+            .and_then(|m| m["role"].as_str());
+        if last_role != Some("user") {
+            tracing::debug!("server: auto-turn parked — last message is not role=user");
+            return;
+        }
+    }
+
+    // Increment counter; bail (saturate, do NOT reset) if cap reached.
+    // Only handle_user_message resets the counter so the cap stays latched
+    // until real user input arrives — preventing a looping event source from
+    // immediately re-saturating after a reset.
+    let prev = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if prev >= AUTO_TURN_CAP {
+        // Saturate at cap — leave counter elevated so further signals are
+        // also discarded. handle_user_message is the only reset path.
+        tracing::info!(
+            cap = AUTO_TURN_CAP,
+            "server: auto-turn cap reached — parking until real user input"
+        );
+        return;
+    }
+
+    let mut subagents: Vec<SubagentTracker> = Vec::new();
+    let model = {
+        let rt = state.runtime.lock().await;
+        rt.model().to_string()
+    };
+    let broadcast = state.broadcast_tx.clone();
+
+    // Turn loop — mirrors handle_user_message's loop but no history entry
+    // and no initial message push (event is already in api_messages).
+    'turn: loop {
+        let messages: Vec<synaps_cli::SharedMessage> =
+            state.conv.read().await.api_messages.clone();
+        let cancel = CancellationToken::new();
+        *state.cancel_token.write().await = Some(cancel.clone());
+
+        let mut stream = {
+            let rt = state.runtime.lock().await;
+            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
+                .await
+        };
+
+        while let Some(event) = stream.next().await {
+            let ts = ServerState::timestamp();
+
+            let (engine_event, completion) = {
+                let mut conv = state.conv.write().await;
+                let conv = &mut *conv;
+                stream::process_stream_event(
+                    event,
+                    &mut conv.api_messages,
+                    &mut subagents,
+                    &mut conv.queued_message,
+                    &mut conv.pending_events,
+                )
+            };
+
+            apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
+
+            if let Some(msg) = engine_event_to_server_message(engine_event) {
+                let _ = broadcast.send(msg);
+            }
+
+            match completion {
+                StreamCompletion::Continue => {}
+                StreamCompletion::Done => {
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::Error(ref err_msg) => {
+                    tracing::debug!(error = %err_msg, "auto-turn stream completed with error");
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::AutoSendQueued(queued) => {
+                    {
+                        let mut conv = state.conv.write().await;
+                        conv.api_messages.push(std::sync::Arc::new(
+                            serde_json::json!({"role": "user", "content": queued}),
+                        ));
+                    }
+                    state.save_session().await;
+                    continue 'turn;
+                }
+                StreamCompletion::AutoTriggerEvents => {
+                    // Issue 3 fix: gate on events_auto_turn and enforce cap.
+                    // Counter was already incremented at function entry. Check again
+                    // before spinning another turn — if cap is reached, park.
+                    if !state.events_auto_turn {
+                        state.save_session().await;
+                        break 'turn;
+                    }
+                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if cur >= AUTO_TURN_CAP {
+                        // Saturate — leave counter elevated until real user input.
+                        tracing::info!(
+                            cap = AUTO_TURN_CAP,
+                            "server: auto-turn cap reached (AutoTriggerEvents) — parking"
+                        );
+                        state.save_session().await;
+                        break 'turn;
+                    }
+                    state.save_session().await;
+                    continue 'turn;
+                }
+            }
+        }
+
+        state.save_session().await;
+        break 'turn;
+    }
+
+    *state.cancel_token.write().await = None;
 }
 
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {

@@ -4,19 +4,38 @@
 //! compaction) but renders to stdin/stdout. Built for scripting,
 //! piping, SSH, CI, and agent benchmark frameworks like Harbor.
 //!
-//! Note: the inbox watcher and session socket are started by `engine::setup::boot()`
-//! but inbound events are not actively drained in this mode. Events will accumulate
-//! until the session ends. Full event-queue handling is a TUI-only feature for now.
+//! C4a: chat continues turns when pending runtime events are injected at
+//! turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
+//!
+//! C4b: blocking read_line replaced with tokio::io::stdin + select! against
+//! event_queue.notified(), so runtime events wake the prompt immediately.
+//! Exactly ONE waiter on notified() exists while idle at the prompt.
+//! Piped stdin, EOF, and CRLF behaviour are preserved.
 
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::engine::session::ConversationState;
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::{CancellationToken, flush_stdout};
 use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::json;
-use std::io::{self, Write, BufRead};
+use std::io::{self, Write};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
+/// What was read while waiting at the prompt.
+enum PromptRead {
+    /// User typed (or pipe delivered) a line.
+    Line(String),
+    /// EOF on stdin.
+    Eof,
+    /// A runtime event woke us; drain + wake_action already ran.
+    /// `run_turn` = true when wake_action said RunTurn.
+    EventWake { run_turn: bool },
+    /// I/O error.
+    Error(std::io::Error),
+}
 
 pub async fn run(
     continue_session: Option<String>,
@@ -59,9 +78,8 @@ pub async fn run(
     // In pipe/headless mode (echo "..." | synaps chat ...) stdin is immediately
     // ready, so the old fire-and-forget approach caused a race: the first API
     // call fired before extension processes finished spawning, and the model
-    // never saw extension-registered tools (e.g. get_weather). Awaiting here
-    // ensures all extensions are loaded and their tools are registered in the
-    // ToolRegistry before we read stdin and send the first message to the API.
+    // never saw extension-registered tools. Awaiting here ensures all extensions
+    // are loaded before we read stdin.
     //
     // The TUI is unaffected — it has its own extension loader path that runs
     // concurrently with the event loop (human typing provides natural latency).
@@ -83,220 +101,354 @@ pub async fn run(
     eprintln!();
 
     // ── Main loop ──
-    let stdin = io::stdin();
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut subagents: Vec<SubagentTracker> = Vec::new();
     let compact_threshold: usize = 80_000;
     let mut last_compacted_tokens: usize = 0;
 
+    // C4a: consecutive auto-turn counter; reset to 0 on real user input.
+    // Initial value doesn't matter — always reset before first turn.
+    #[allow(unused_assignments)]
+    let mut consecutive_auto_turns: u32 = 0;
+
+    // C4b: async tokio stdin — lets us select! against event_queue.notified()
+    // while idle at the prompt so runtime events can wake us immediately.
+    //
+    // For piped stdin (is_tty=false) this is identical in behaviour to the
+    // old blocking read_line: lines() returns Ok(None) on EOF, each poll
+    // returns one complete line without blocking the executor.
+    let async_stdin = tokio::io::stdin();
+    let mut stdin_lines = TokioBufReader::new(async_stdin).lines();
+
     loop {
+        // ── Prompt ──
         if is_tty {
             eprint!("❯ ");
             io::stderr().flush().ok();
         }
 
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Err(e) => {
+        // C4b: Select between a new stdin line and a runtime event notification.
+        // Exactly ONE waiter on event_queue.notified() exists while we are idle.
+        let read = {
+            let event_queue = runtime.event_queue().clone();
+            tokio::select! {
+                // Branch 1: user typed a line (or pipe delivered one).
+                line = stdin_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => PromptRead::Line(l),
+                        Ok(None)    => PromptRead::Eof,
+                        Err(e)      => PromptRead::Error(e),
+                    }
+                }
+                // Branch 2: a runtime event arrived while we were idle.
+                _ = event_queue.notified() => {
+                    let drained = drain_event_queue(
+                        &event_queue,
+                        &mut conv.api_messages,
+                        &mut conv.pending_events,
+                        false, // idle
+                        None,  // no steer channel
+                    );
+                    for d in &drained {
+                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
+                    }
+                    let action = wake_action(
+                        &drained,
+                        &conv.api_messages,
+                        false,
+                        true,  // auto_turn_enabled in chat mode
+                        consecutive_auto_turns,
+                    );
+                    PromptRead::EventWake { run_turn: action == WakeAction::RunTurn }
+                }
+            }
+        };
+
+        match read {
+            PromptRead::Error(e) => {
                 eprintln!("input error: {}", e);
                 break;
             }
-            Ok(_) => {}
-        }
-        let input = input.trim();
-        if input.is_empty() { continue; }
+            PromptRead::Eof => break,
 
-        // ── Slash commands ──
-        if let Some((cmd, arg)) = commands::parse_command(input) {
-            // Try engine-level command first
-            if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
-                match result {
-                    CommandResult::Quit => break,
-                    CommandResult::ModelChanged { model } => {
-                        eprintln!("model → {}", model);
-                    }
-                    CommandResult::ThinkingChanged { level, budget } => {
-                        eprintln!("thinking → {} ({})", level, budget);
-                    }
-                    CommandResult::Compact { custom_instructions } => {
-                        eprintln!("compacting...");
-                        if let Ok(summary) = compact_conversation(
-                            &conv.api_messages, &runtime, custom_instructions.as_deref()
-                        ).await {
-                            conv.api_messages = vec![std::sync::Arc::new(json!({
-                                "role": "user",
-                                "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                            }))];
-                            last_compacted_tokens = conv.estimate_tokens();
-                            eprintln!("compacted → ~{} tokens", last_compacted_tokens);
-                        }
-                    }
-                    CommandResult::Error(e) => eprintln!("error: {}", e),
-                    CommandResult::Output(text) => println!("{}", text),
-                    _ => {} // Other results handled by TUI only
+            PromptRead::EventWake { run_turn: false } => {
+                // Forward/Nothing — redraw prompt and wait for real input.
+                if is_tty {
+                    eprint!("❯ ");
+                    io::stderr().flush().ok();
                 }
                 continue;
             }
 
-            // Commands not handled by engine — headless-specific handling
-            match cmd {
-                "clear" => {
-                    conv.clear(&runtime).await;
-                    eprintln!("session cleared → {}", &conv.session.id[..8]);
+            PromptRead::EventWake { run_turn: true } => {
+                // A runtime event was injected; policy says RunTurn.
+                // Events were already drained + injected by drain_event_queue above.
+                // claim_auto_turn: increment only if allowed; if denied (cap) we
+                // got run_turn=true from wake_action which already checked < cap,
+                // so this should always succeed here — but use the gate for safety.
+                let _ = claim_auto_turn(&mut consecutive_auto_turns);
+            }
+
+            PromptRead::Line(raw_line) => {
+                let trimmed = raw_line.trim_end_matches('\r').trim();
+
+                if trimmed.is_empty() {
+                    continue;
                 }
-                "sessions" => {
-                    match synaps_cli::list_recent_sessions(20) {
-                        Ok(sessions) => {
-                            for s in sessions.iter().take(20) {
-                                let marker = if s.id == conv.session.id { "→ " } else { "  " };
-                                eprintln!("{}{} {} ({}, ${:.4})", 
-                                    marker, &s.id[..8], s.title, s.model, s.session_cost);
+
+                // Real user input — reset auto-turn counter.
+                consecutive_auto_turns = 0;
+
+                // ── Slash commands ──
+                if let Some((cmd, arg)) = commands::parse_command(trimmed) {
+                    // Try engine-level command first
+                    if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
+                        match result {
+                            CommandResult::Quit => break,
+                            CommandResult::ModelChanged { model } => {
+                                eprintln!("model → {}", model);
+                            }
+                            CommandResult::ThinkingChanged { level, budget } => {
+                                eprintln!("thinking → {} ({})", level, budget);
+                            }
+                            CommandResult::Compact { custom_instructions } => {
+                                eprintln!("compacting...");
+                                if let Ok(summary) = compact_conversation(
+                                    &conv.api_messages, &runtime, custom_instructions.as_deref()
+                                ).await {
+                                    conv.api_messages = vec![std::sync::Arc::new(json!({
+                                        "role": "user",
+                                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
+                                    }))];
+                                    last_compacted_tokens = conv.estimate_tokens();
+                                    eprintln!("compacted → ~{} tokens", last_compacted_tokens);
+                                }
+                            }
+                            CommandResult::Error(e) => eprintln!("error: {}", e),
+                            CommandResult::Output(text) => println!("{}", text),
+                            _ => {} // Other results handled by TUI only
+                        }
+                        continue;
+                    }
+
+                    // Commands not handled by engine — headless-specific handling
+                    match cmd {
+                        "clear" => {
+                            conv.clear(&runtime).await;
+                            eprintln!("session cleared → {}", &conv.session.id[..8]);
+                        }
+                        "sessions" => {
+                            match synaps_cli::list_recent_sessions(20) {
+                                Ok(sessions) => {
+                                    for s in sessions.iter().take(20) {
+                                        let marker = if s.id == conv.session.id { "→ " } else { "  " };
+                                        eprintln!("{}{} {} ({}, ${:.4})", 
+                                            marker, &s.id[..8], s.title, s.model, s.session_cost);
+                                    }
+                                }
+                                Err(e) => eprintln!("error: {}", e),
                             }
                         }
-                        Err(e) => eprintln!("error: {}", e),
+                        "status" => {
+                            eprintln!("session: {}", &conv.session.id[..8]);
+                            eprintln!("model: {}", runtime.model());
+                            eprintln!("tokens: {}↑ {}↓", conv.total_input_tokens, conv.total_output_tokens);
+                            eprintln!("cost: ${:.4}", conv.session_cost);
+                            eprintln!("messages: {}", conv.api_messages.len());
+                            eprintln!("est. tokens: ~{}", conv.estimate_tokens());
+                        }
+                        "help" => {
+                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                        }
+                        _ => {
+                            eprintln!("unknown command: /{} (try /help)", cmd);
+                        }
                     }
+                    continue;
                 }
-                "status" => {
-                    eprintln!("session: {}", &conv.session.id[..8]);
-                    eprintln!("model: {}", runtime.model());
-                    eprintln!("tokens: {}↑ {}↓", conv.total_input_tokens, conv.total_output_tokens);
-                    eprintln!("cost: ${:.4}", conv.session_cost);
-                    eprintln!("messages: {}", conv.api_messages.len());
-                    eprintln!("est. tokens: ~{}", conv.estimate_tokens());
+
+                // ── Regular user message ──
+                let message = if let Some(ctx) = conv.abort_context.take() {
+                    format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", trimmed, ctx)
+                } else {
+                    trimmed.to_string()
+                };
+                conv.api_messages
+                    .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
+            }
+        }
+
+        // ── C4a: turn loop — run until no pending events or cap reached ──
+        'turn_loop: loop {
+            let cancel = CancellationToken::new();
+            // Vec<SharedMessage> clone = pointer bumps only.
+            let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
+            let mut stream = runtime.run_stream_with_messages(
+                msgs_in, cancel, None, None, false
+            ).await;
+
+            let mut in_thinking = false;
+
+            let turn_completion = loop {
+                let Some(event) = stream.next().await else {
+                    break StreamCompletion::Done;
+                };
+                let (engine_event, completion) = stream::process_stream_event(
+                    event,
+                    &mut conv.api_messages,
+                    &mut subagents,
+                    &mut conv.queued_message,
+                    &mut conv.pending_events,
+                );
+
+                match engine_event {
+                    EngineStreamEvent::Thinking(text) => {
+                        if !in_thinking {
+                            eprint!("\x1b[2m"); // dim
+                            in_thinking = true;
+                        }
+                        eprint!("{}", text);
+                        io::stderr().flush().ok();
+                    }
+                    EngineStreamEvent::Text(text) => {
+                        if in_thinking {
+                            eprintln!("\x1b[0m"); // reset
+                            in_thinking = false;
+                        }
+                        print!("{}", text);
+                        flush_stdout();
+                    }
+                    EngineStreamEvent::ToolStart { tool_name, .. } => {
+                        if in_thinking { eprintln!("\x1b[0m"); in_thinking = false; }
+                        eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
+                        io::stderr().flush().ok();
+                    }
+                    EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
+                        let input_preview = serde_json::to_string(&input).unwrap_or_default();
+                        let preview: String = input_preview.chars().take(60).collect();
+                        eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+                    }
+                    EngineStreamEvent::ToolResult { result, .. } => {
+                        let preview: String = result.chars().take(80).collect();
+                        eprintln!("\x1b[32m  → {}\x1b[0m", preview);
+                    }
+                    EngineStreamEvent::SubagentStart { name, task, .. } => {
+                        eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
+                    }
+                    EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
+                        eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
+                    }
+                    EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
+                        let model_name = model.as_deref().unwrap_or(runtime.model());
+                        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
+                    }
+                    EngineStreamEvent::SteeringDelivered { message } => {
+                        eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                    }
+                    EngineStreamEvent::Notice(text) => {
+                        eprintln!("\x1b[2m{}\x1b[0m", text);
+                    }
+                    EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
+                    EngineStreamEvent::Error(e) => {
+                        eprintln!("\x1b[31m❌ {}\x1b[0m", e);
+                    }
+                    _ => {}
                 }
-                "help" => {
-                    eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+
+                match completion {
+                    StreamCompletion::Done | StreamCompletion::Error(_) => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        println!();
+                        break StreamCompletion::Done;
+                    }
+                    StreamCompletion::AutoSendQueued(queued) => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        conv.api_messages.push(std::sync::Arc::new(
+                            json!({"role": "user", "content": queued})
+                        ));
+                        break StreamCompletion::AutoSendQueued(String::new());
+                    }
+                    StreamCompletion::AutoTriggerEvents => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        break StreamCompletion::AutoTriggerEvents;
+                    }
+                    StreamCompletion::Continue => {}
+                }
+            };
+
+            // Post-turn: save + auto-compact.
+            conv.save().await;
+            let est = conv.estimate_tokens();
+            let threshold = if last_compacted_tokens > 0 {
+                last_compacted_tokens + compact_threshold
+            } else {
+                compact_threshold
+            };
+            if est > threshold && conv.api_messages.len() >= 4 {
+                eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
+                if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
+                    conv.api_messages = vec![std::sync::Arc::new(json!({
+                        "role": "user",
+                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
+                    }))];
+                    last_compacted_tokens = conv.estimate_tokens();
+                    eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
+                }
+            }
+
+            // C4a: decide whether to continue for another auto-turn.
+            match turn_completion {
+                StreamCompletion::AutoSendQueued(_) => {
+                    // User-driven queued message — reset cap and loop.
+                    consecutive_auto_turns = 0;
+                    continue 'turn_loop;
+                }
+                StreamCompletion::AutoTriggerEvents => {
+                    // Pending events were injected by process_stream_event; drain any
+                    // remaining queue items and decide via central wake_action.
+                    let drained = drain_event_queue(
+                        runtime.event_queue(),
+                        &mut conv.api_messages,
+                        &mut conv.pending_events,
+                        false, // idle after turn
+                        None,
+                    );
+                    for d in &drained {
+                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
+                    }
+                    let action = wake_action(
+                        &drained,
+                        &conv.api_messages,
+                        false,
+                        true, // auto_turn_enabled
+                        consecutive_auto_turns,
+                    );
+                    match action {
+                        WakeAction::RunTurn => {
+                            if claim_auto_turn(&mut consecutive_auto_turns) {
+                                continue 'turn_loop;
+                            } else {
+                                // claim denied: counter was already at cap.
+                                // fall through to park (treated as Forward).
+                                eprintln!(
+                                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
+                                    AUTO_TURN_CAP
+                                );
+                                break 'turn_loop;
+                            }
+                        }
+                        WakeAction::Forward | WakeAction::Nothing => {
+                            // Cap reached or nothing more — park at prompt.
+                            break 'turn_loop;
+                        }
+                    }
                 }
                 _ => {
-                    eprintln!("unknown command: /{} (try /help)", cmd);
+                    // Done or Error — exit turn loop normally.
+                    break 'turn_loop;
                 }
             }
-            continue;
-        }
-
-        // ── Send message ──
-        // Inject abort context if present
-        let message = if let Some(ctx) = conv.abort_context.take() {
-            format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", input, ctx)
-        } else {
-            input.to_string()
-        };
-
-        conv.api_messages
-            .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
-
-        let cancel = CancellationToken::new();
-        // Vec<SharedMessage> clone = pointer bumps only.
-        let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
-        let mut stream = runtime.run_stream_with_messages(
-            msgs_in, cancel, None, None, false
-        ).await;
-
-        let mut in_thinking = false;
-
-        while let Some(event) = stream.next().await {
-            let (engine_event, completion) = stream::process_stream_event(
-                event,
-                &mut conv.api_messages,
-                &mut subagents,
-                &mut conv.queued_message,
-                &mut conv.pending_events,
-            );
-
-            match engine_event {
-                EngineStreamEvent::Thinking(text) => {
-                    if !in_thinking {
-                        eprint!("\x1b[2m"); // dim
-                        in_thinking = true;
-                    }
-                    eprint!("{}", text);
-                    io::stderr().flush().ok();
-                }
-                EngineStreamEvent::Text(text) => {
-                    if in_thinking {
-                        eprintln!("\x1b[0m"); // reset
-                        in_thinking = false;
-                    }
-                    print!("{}", text);
-                    flush_stdout();
-                }
-                EngineStreamEvent::ToolStart { tool_name, .. } => {
-                    if in_thinking { eprintln!("\x1b[0m"); in_thinking = false; }
-                    eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
-                    io::stderr().flush().ok();
-                }
-                EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
-                    let input_preview = serde_json::to_string(&input).unwrap_or_default();
-                    let preview: String = input_preview.chars().take(60).collect();
-                    eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
-                }
-                EngineStreamEvent::ToolResult { result, .. } => {
-                    let preview: String = result.chars().take(80).collect();
-                    eprintln!("\x1b[32m  → {}\x1b[0m", preview);
-                }
-                EngineStreamEvent::SubagentStart { name, task, .. } => {
-                    eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
-                }
-                EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
-                    eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
-                }
-                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
-                    let model_name = model.as_deref().unwrap_or(runtime.model());
-                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
-                }
-                EngineStreamEvent::SteeringDelivered { message } => {
-                    eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
-                }
-                EngineStreamEvent::Notice(text) => {
-                    eprintln!("\x1b[2m{}\x1b[0m", text);
-                }
-                EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
-                EngineStreamEvent::Error(e) => {
-                    eprintln!("\x1b[31m❌ {}\x1b[0m", e);
-                }
-                _ => {} // deltas handled above
-            }
-
-            match completion {
-                StreamCompletion::Done | StreamCompletion::Error(_) => {
-                    if in_thinking { eprintln!("\x1b[0m"); }
-                    println!();
-                    break;
-                }
-                StreamCompletion::AutoSendQueued(queued) => {
-                    // Re-inject and loop
-                    conv.api_messages
-                        .push(std::sync::Arc::new(json!({"role": "user", "content": queued})));
-                    // Stream will continue from the outer loop
-                    break;
-                }
-                StreamCompletion::AutoTriggerEvents => break,
-                StreamCompletion::Continue => {}
-            }
-        }
-
-        // Save after each turn
-        conv.save().await;
-
-        // Auto-compact
-        let est = conv.estimate_tokens();
-        let threshold = if last_compacted_tokens > 0 {
-            last_compacted_tokens + compact_threshold
-        } else {
-            compact_threshold
-        };
-        if est > threshold && conv.api_messages.len() >= 4 {
-            eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
-            if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
-                conv.api_messages = vec![std::sync::Arc::new(json!({
-                    "role": "user",
-                    "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                }))];
-                last_compacted_tokens = conv.estimate_tokens();
-                eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
-            }
-        }
+        } // end 'turn_loop
     }
 
     // ── Shutdown ──
@@ -305,7 +457,7 @@ pub async fn run(
     // Fire on_session_end hook
     let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
         &conv.session.id,
-        None, // no transcript in headless
+        None,
     );
     let _ = runtime.hook_bus().emit(&hook_event).await;
 

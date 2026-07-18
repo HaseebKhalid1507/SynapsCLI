@@ -125,10 +125,44 @@ impl Tool for SubagentStartTool {
         let model_inner      = model.clone();
         let tx_events_inner  = ctx.channels.tx_events.clone();
         let start_time       = std::time::Instant::now();
+        let parent_queue     = ctx.capabilities.event_queue.clone();
+        let handle_id_inner  = handle_id.clone();
+
+        // ── Fail fast if no registry — before spawning an unregistered thread ──
+        let registry = ctx.capabilities.subagent_registry.as_ref()
+            .ok_or_else(|| RuntimeError::Tool(
+                "subagent_start requires a subagent_registry in ToolContext".to_string()
+            ))?;
+
+        // ── Build and register handle BEFORE spawning ─────────────────────────
+        // This closes the publish-before-register race: finalize_subagent can
+        // push a completion event the instant the thread exits, but the registry
+        // must already contain the handle so the parent's collect succeeds.
+        let system_prompt_for_handle = system_prompt.clone();
+        let handle = SubagentHandle::new(
+            handle_id.clone(),
+            subagent_id,
+            label.clone(),
+            task_preview,
+            model.clone(),
+            system_prompt_for_handle,
+            timeout_secs,
+            Arc::clone(&state),
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        );
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(handle);
+        }
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
-        let system_prompt_for_handle = system_prompt.clone();
         let thread_handle = std::thread::spawn(move || {
+            // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
+            let state_for_finalizer = Arc::clone(&state_t);
+            let label_for_finalizer = label_inner.clone();
+
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -165,18 +199,7 @@ impl Tool for SubagentStartTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
-                    let tools = if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
-                        let mgr = ext_mgr.read().await;
-                        if let Some(shared) = mgr.tools_shared() {
-                            let extension_tools = shared.read().await;
-                            crate::ToolRegistry::without_subagent_with_extensions(&extension_tools)
-                        } else {
-                            crate::ToolRegistry::without_subagent()
-                        }
-                    } else {
-                        crate::ToolRegistry::without_subagent()
-                    };
-                    runtime.set_tools(tools);
+                    runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -301,6 +324,7 @@ impl Tool for SubagentStartTool {
                                     text.push_str("\n[partial response]:\n");
                                     text.push_str(&partial);
                                 }
+                                state_a.write().unwrap_or_else(|p| p.into_inner()).partial_text = text.clone();
                                 return Ok(SubagentResult {
                                     text,
                                     model: model_a.clone(),
@@ -331,10 +355,10 @@ impl Tool for SubagentStartTool {
 
                 match outcome {
                     Ok(sa_result) => {
-                        // Only overwrite Running → Completed (don't stomp TimedOut).
+                        // Only overwrite Running → Completed (don't stomp TimedOut or a cancellation).
                         {
                             let mut s = state_t.write().unwrap();
-                            if matches!(s.status, SubagentStatus::Running) {
+                            if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
                                 s.status = SubagentStatus::Completed;
                                 s.conversation_state = vec![
                                     serde_json::json!({"role": "user", "content": task_for_complete.clone()}),
@@ -379,34 +403,28 @@ impl Tool for SubagentStartTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Subagent thread panicked: {}", msg);
-                state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
+
+            // ── Terminal finalizer — exactly once, outside catch_unwind ────────
+            // Covers all paths: Ok, Err, timeout, panic, early tokio-build failure.
+            super::finalize::finalize_subagent(
+                &state_for_finalizer,
+                parent_queue.as_ref(),
+                &handle_id_inner,
+                subagent_id,
+                &label_for_finalizer,
+                start_time,
+                None,  // start.rs: not a resume
+            );
         });
 
-        // ── Build handle + register ────────────────────────────────────────────
-        let handle = SubagentHandle::new(
-            handle_id.clone(),
-            label.clone(),
-            task_preview,
-            model,
-            system_prompt_for_handle,
-            timeout_secs,
-            state,
-            Some(steer_tx),
-            Some(shutdown_tx),
-            Some(result_rx),
-        );
-
-        if let Some(registry) = &ctx.capabilities.subagent_registry {
+        // ── Wire thread handle into the already-registered entry ─────────────
+        {
             let mut reg = registry.lock().unwrap();
-            reg.register(handle);
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
-        } else {
-            return Err(RuntimeError::Tool(
-                "subagent_start requires a subagent_registry in ToolContext".to_string()
-            ));
         }
 
         Ok(json!({
@@ -424,6 +442,26 @@ mod tests {
     use crate::tools::{SubagentRegistry, Tool};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    // V4: registry=None must return Err immediately, before any thread is spawned.
+    #[tokio::test]
+    async fn test_subagent_start_no_registry_returns_err() {
+        let tool = SubagentStartTool;
+        let ctx = create_tool_context(); // subagent_registry is None by default
+
+        let params = json!({
+            "system_prompt": "You are a test subagent.",
+            "task": "Say ok",
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_err(), "missing registry must return Err before spawn");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("subagent_registry"),
+            "error must mention subagent_registry: {msg}"
+        );
+    }
 
     #[tokio::test]
     async fn test_subagent_start_blank_agent_uses_system_prompt() {

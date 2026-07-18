@@ -3,6 +3,7 @@
 
 use serde_json::json;
 use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+use synaps_cli::engine::reactor::{claim_auto_turn, drain_event_queue, wake_action, WakeAction, EventDisposition, AUTO_TURN_CAP};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
@@ -77,6 +78,7 @@ pub(super) async fn handle_stream_event(
                 start_time: app.clock.now(),
                 done: false,
                 duration_secs: None,
+                done_at: None,
             });
             app.invalidate();
         }
@@ -90,6 +92,7 @@ pub(super) async fn handle_stream_event(
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.done = true;
                 sa.duration_secs = Some(duration_secs);
+                sa.done_at = Some(std::time::Instant::now());
                 let preview: String = result_preview.chars().take(40).collect();
                 if result_preview.starts_with("[TIMED OUT") {
                     sa.status = "\u{26a0} timed out".to_string();
@@ -139,11 +142,17 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
             app.drop_empty_thinking();
-            app.subagents.clear();
-            // Clean up finished reactive subagent handles
-            if let Some(registry) = runtime.subagent_registry().lock().ok().as_mut() {
-                registry.cleanup_finished();
+            // Reconcile HUD against registry instead of clearing — retains running entries
+            // whose tx_events is now dead (stream dropped) but threads live on.
+            // Poison-recovering lock: a panicked subagent thread must not block teardown.
+            {
+                let rows = runtime.subagent_registry()
+                    .lock().unwrap_or_else(|p| p.into_inner())
+                    .display_rows();
+                reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
             }
+            // NOTE: cleanup_finished removed — engine now reaps at turn completion
+            // inside the tokio::spawn wrapper (runtime/mod.rs) before Done is sent.
 
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();
@@ -169,7 +178,13 @@ pub(super) async fn handle_stream_event(
             app.drop_empty_thinking();
             app.push_msg(ChatMessage::Error(sanitize_notice(&err)));
             app.streaming = false;
-            app.subagents.clear();
+            // Reconcile HUD against registry on error path too (same as Done).
+            {
+                let rows = runtime.subagent_registry()
+                    .lock().unwrap_or_else(|p| p.into_inner())
+                    .display_rows();
+                reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
+            }
             // Restore a valid trailing state — drop unmatched trailing messages
             if let Some(last) = app.api_messages.last() {
                 let role = last["role"].as_str().unwrap_or("");
@@ -222,52 +237,121 @@ pub(super) async fn handle_event_queue_arm(
     cancel_token: &mut Option<CancellationToken>,
     steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
-                let mut event_received = false;
-                while let Some(event) = runtime.event_queue().pop() {
-                    event_received = true;
-                    let formatted = synaps_cli::events::format_event_for_agent(&event);
-                    let severity_str = event.content.severity
-                        .as_ref()
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_else(|| "medium".to_string());
-                    app.push_msg(ChatMessage::Event {
-                        source: event.source.source_type.clone(),
-                        severity: severity_str,
-                        text: event.content.text.clone(),
-                    });
+    let busy = app.streaming || app.compact_task.is_some();
 
-                    if app.streaming || app.compact_task.is_some() {
-                        // Steer into active stream if possible, otherwise buffer
-                        let steered = steer_tx.as_ref()
-                            .map(|tx| tx.send(formatted.clone()).is_ok())
-                            .unwrap_or(false);
-                        if !steered {
-                            app.pending_events.push(formatted);
-                        }
-                    } else {
-                        app.api_messages.push(std::sync::Arc::new(serde_json::json!({
-                            "role": "user",
-                            "content": formatted
-                        })));
-                    }
-                    app.invalidate();
-                }
+    // Drain via the central reactor function.
+    let drained = drain_event_queue(
+        runtime.event_queue(),
+        &mut app.api_messages,
+        &mut app.pending_events,
+        busy,
+        steer_tx.as_ref(),
+    );
 
-                // Auto-trigger model turn when idle — only if we actually received events
-                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
-                    if let Some(last) = app.api_messages.last() {
-                        if last["role"].as_str() == Some("user") {
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.streaming = true;
-                            app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
+    if drained.is_empty() {
+        return;
+    }
+
+    // Presentation: push each event to the transcript and update the HUD.
+    for de in &drained {
+        let event = &de.event;
+        let severity_str = event.content.severity
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "medium".to_string());
+        app.push_msg(ChatMessage::Event {
+            source: event.source.source_type.clone(),
+            severity: severity_str,
+            text: event.content.text.clone(),
+        });
+
+        // Seam 3: subagent_completion → mark HUD entry done directly from
+        // event data (no lock needed — data was embedded at finalizer time).
+        if event.content.content_type == "subagent_completion" {
+            if let Some(data) = &event.content.data {
+                let maybe_id = data["subagent_id"].as_u64();
+                let maybe_status = data["status"].as_str();
+                let maybe_duration = data["duration_secs"].as_f64();
+                if let (Some(sid), Some(status_str)) = (maybe_id, maybe_status) {
+                    let now = std::time::Instant::now();
+                    if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == sid && !s.done) {
+                        sa.done = true;
+                        sa.done_at = Some(now);
+                        if let Some(dur) = maybe_duration {
+                            sa.duration_secs = Some(dur);
                         }
+                        sa.status = match status_str {
+                            "completed" => "\u{2714} done".to_string(),
+                            "cancelled" => "\u{26a0} cancelled".to_string(),
+                            "timed_out" => "\u{26a0} timed out".to_string(),
+                            s if s.starts_with("fail") => {
+                                let reason = data["error"].as_str().unwrap_or("error");
+                                let preview: String = reason.chars().take(30).collect();
+                                format!("\u{2718} {}", preview)
+                            }
+                            _ => format!("\u{2714} {status_str}"),
+                        };
                     }
                 }
+            }
+        }
+    }
+    app.invalidate();
+
+    // Wake decision.
+    let auto_turn_enabled = true; // C2+ will wire config; always on for C1
+    let action = wake_action(
+        &drained,
+        &app.api_messages,
+        busy,
+        auto_turn_enabled,
+        app.consecutive_auto_turns,
+    );
+
+    match action {
+        WakeAction::RunTurn => {
+            // Cap check: if we ARE at cap this would have returned Forward.
+            // Increment before spawning so cap is visible for the next wake.
+            // Optional guard: skip if a stream is already active (shouldn't
+            // happen if wake_action saw busy=false, but defend against it).
+            if stream.is_some() {
+                tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
+            } else {
+                app.consecutive_auto_turns += 1;
+                let ct = CancellationToken::new();
+                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                app.streaming = true;
+                app.spinner_frame = 0;
+                *stream = Some(runtime.run_stream_with_messages(
+                    app.api_messages.clone(),
+                    ct.clone(),
+                    Some(s_rx),
+                    Some(secret_prompt_handle.clone()),
+                    false,
+                ).await);
+                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                *cancel_token = Some(ct);
+                *steer_tx = Some(s_tx);
+            }
+        }
+        WakeAction::Forward => {
+            // Check if we hit the cap (some Injected events but cap blocked RunTurn).
+            let hit_cap = drained.iter().any(|d| d.disposition == EventDisposition::Injected)
+                && !busy
+                && auto_turn_enabled
+                && app.consecutive_auto_turns >= synaps_cli::engine::reactor::AUTO_TURN_CAP;
+            if hit_cap {
+                app.push_msg(ChatMessage::System(
+                    format!(
+                        "auto-turn cap reached ({} consecutive) — waiting for your input",
+                        synaps_cli::engine::reactor::AUTO_TURN_CAP
+                    )
+                ));
+                app.invalidate();
+            }
+        }
+        WakeAction::Nothing => {}
+    }
 }
 
 /// Stream-event arm body: route one `StreamEvent` through
@@ -318,7 +402,8 @@ pub(super) async fn handle_stream_arm(
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
                             }
-                            // Auto-send the queued message
+                            // Auto-send the queued message (user-authored — reset auto-turn counter)
+                            app.consecutive_auto_turns = 0;
                             app.push_msg(ChatMessage::User(queued.clone()));
                             app.transcript.scroll_to_bottom();
                             let api_content = if let Some(ref ctx) = app.abort_context {
@@ -350,14 +435,26 @@ pub(super) async fn handle_stream_arm(
                             drop(stream.take());
                             drop(cancel_token.take());
                             drop(steer_tx.take());
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.streaming = true;
-                            app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
+
+                            // Use the central claim_auto_turn gate: allows turns 1-5
+                            // (counter < CAP), denies the 6th (counter == CAP).
+                            // Increment happens inside claim on success — no inline +=.
+                            if claim_auto_turn(&mut app.consecutive_auto_turns) {
+                                let ct = CancellationToken::new();
+                                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                app.streaming = true;
+                                app.spinner_frame = 0;
+                                *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                                *cancel_token = Some(ct);
+                                *steer_tx = Some(s_tx);
+                            } else {
+                                app.push_msg(ChatMessage::System(format!(
+                                    "auto-turn cap reached ({} consecutive) — waiting for your input",
+                                    AUTO_TURN_CAP
+                                )));
+                                app.invalidate();
+                            }
                         }
                     }
 
@@ -381,6 +478,118 @@ fn sanitize_notice(text: &str) -> String {
         .collect()
 }
 
+// ── Flash expiry constant ──────────────────────────────────────────────────────
+/// How long a done entry stays visible before reconcile removes it.
+pub(super) const SUBAGENT_DONE_FLASH_SECS: f64 = 5.0;
+
+/// Pure reconcile: align the HUD Vec<SubagentState> with the registry snapshot.
+///
+/// Rules (applied in order per entry):
+/// 1. Running && !cancel_requested in rows but missing from HUD → insert.
+/// 2. Terminal (non-Running) in rows, HUD entry not yet done → mark done
+///    (stamp glyph / duration / done_at from registry elapsed).
+/// 3. done && done_at elapsed > SUBAGENT_DONE_FLASH_SECS → remove (flash expired).
+/// 4. Not in rows at all → remove ONLY if already done (spares in-flight oneshots
+///    that emitted SubagentStart but never registered — e.g. oneshot.rs).
+/// 5. cancel_requested && still Running in HUD → update status to "⚠ cancelling…".
+pub(super) fn reconcile_subagents(
+    hud: &mut Vec<SubagentState>,
+    rows: &[synaps_cli::tools::SubagentDisplayRow],
+    now: std::time::Instant,
+) {
+    use synaps_cli::runtime::subagent::SubagentStatus;
+
+    // Build a quick lookup: subagent_id → row
+    let row_map: std::collections::HashMap<u64, &synaps_cli::tools::SubagentDisplayRow> =
+        rows.iter().map(|r| (r.subagent_id, r)).collect();
+
+    // Pass 1: update existing HUD entries
+    hud.retain_mut(|sa| {
+        match row_map.get(&sa.id) {
+            Some(row) => {
+                // Rule 3: done entry whose flash has expired → remove
+                if sa.done {
+                    if let Some(done_at) = sa.done_at {
+                        if now.duration_since(done_at).as_secs_f64() > SUBAGENT_DONE_FLASH_SECS {
+                            return false; // remove
+                        }
+                    }
+                    return true; // still flashing
+                }
+
+                // Rule 2: terminal in registry, not yet marked done in HUD → mark done
+                if !matches!(row.status, SubagentStatus::Running) {
+                    sa.done = true;
+                    sa.done_at = Some(now);
+                    // Duration from registry elapsed (best available without tx_events)
+                    if sa.duration_secs.is_none() {
+                        sa.duration_secs = Some(row.elapsed_secs);
+                    }
+                    // Apply glyph if status wasn't already set by a stream event
+                    if !sa.status.starts_with('\u{2714}')
+                        && !sa.status.starts_with('\u{2718}')
+                        && !sa.status.starts_with('\u{26a0}')
+                    {
+                        sa.status = match &row.status {
+                            SubagentStatus::Completed => "\u{2714} done".to_string(),
+                            SubagentStatus::Cancelled => "\u{26a0} cancelled".to_string(),
+                            SubagentStatus::TimedOut  => "\u{26a0} timed out".to_string(),
+                            SubagentStatus::Failed(r) => {
+                                let preview: String = r.chars().take(30).collect();
+                                format!("\u{2718} {}", preview)
+                            }
+                            SubagentStatus::Running => sa.status.clone(), // unreachable
+                        };
+                    }
+                    return true;
+                }
+
+                // Rule 5: cancel_requested && Running in HUD → show cancelling status
+                if row.cancel_requested && !sa.done {
+                    sa.status = "\u{26a0} cancelling\u{2026}".to_string();
+                }
+
+                true // keep running entry
+            }
+            None => {
+                // Rule 4: not in registry → remove only if done (flash already set),
+                // KEEP if still running (in-flight oneshot or race with registration)
+                if sa.done {
+                    // Apply flash expiry
+                    if let Some(done_at) = sa.done_at {
+                        if now.duration_since(done_at).as_secs_f64() > SUBAGENT_DONE_FLASH_SECS {
+                            return false;
+                        }
+                    }
+                }
+                true // keep in-flight oneshots and still-flashing done entries
+            }
+        }
+    });
+
+    // Pass 2: insert missing Running entries from registry that aren't in HUD
+    let hud_ids: std::collections::HashSet<u64> = hud.iter().map(|s| s.id).collect();
+    for row in rows {
+        if hud_ids.contains(&row.subagent_id) {
+            continue;
+        }
+        // Rule 1: only insert Running, non-cancelled entries
+        if matches!(row.status, SubagentStatus::Running) && !row.cancel_requested {
+            let elapsed_dur = std::time::Duration::from_secs_f64(row.elapsed_secs.max(0.0));
+            let start_time = now.checked_sub(elapsed_dur).unwrap_or(now);
+            hud.push(SubagentState {
+                id: row.subagent_id,
+                name: row.agent_name.clone(),
+                status: "running".to_string(),
+                start_time,
+                done: false,
+                duration_secs: None,
+                done_at: None,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_notice;
@@ -398,5 +607,152 @@ mod tests {
     fn test_sanitize_notice_passes_normal_text() {
         let s = "retrying (attempt 2/5) — overloaded";
         assert_eq!(sanitize_notice(s), s);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::{reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
+    use super::super::app::SubagentState;
+    use synaps_cli::tools::SubagentDisplayRow;
+    use synaps_cli::runtime::subagent::SubagentStatus;
+    use std::time::{Duration, Instant};
+
+    fn make_row(id: u64, status: SubagentStatus, cancel_requested: bool) -> SubagentDisplayRow {
+        SubagentDisplayRow {
+            subagent_id: id,
+            agent_name: format!("agent-{id}"),
+            status,
+            cancel_requested,
+            elapsed_secs: 1.5,
+            finished_elapsed: None,
+        }
+    }
+
+    fn make_hud_entry(id: u64, done: bool) -> SubagentState {
+        SubagentState {
+            id,
+            name: format!("agent-{id}"),
+            status: if done { "\u{2714} done".to_string() } else { "running".to_string() },
+            start_time: Instant::now(),
+            done,
+            duration_secs: if done { Some(1.5) } else { None },
+            done_at: if done { Some(Instant::now()) } else { None },
+        }
+    }
+
+    // R1: idle-finish — Running in HUD, terminal in registry → marked done
+    #[test]
+    fn idle_finish_marks_done() {
+        let now = Instant::now();
+        let mut hud = vec![make_hud_entry(1, false)];
+        let rows = vec![make_row(1, SubagentStatus::Completed, false)];
+        reconcile_subagents(&mut hud, &rows, now);
+        assert_eq!(hud.len(), 1);
+        assert!(hud[0].done, "must be marked done");
+        assert!(hud[0].done_at.is_some(), "done_at must be stamped");
+        assert!(hud[0].status.contains('\u{2714}'), "must have ✔ glyph");
+    }
+
+    // R2: oneshot-in-flight — in HUD but NOT in registry (oneshot never registers)
+    // The entry must survive (not removed) because it's still running
+    #[test]
+    fn oneshot_in_flight_survives() {
+        let now = Instant::now();
+        let mut hud = vec![make_hud_entry(99, false)]; // not in registry
+        let rows: Vec<SubagentDisplayRow> = vec![]; // empty registry
+        reconcile_subagents(&mut hud, &rows, now);
+        assert_eq!(hud.len(), 1, "in-flight oneshot must survive even if not in registry");
+    }
+
+    // R3: cancelling — cancel_requested && Running → status updated
+    #[test]
+    fn cancelling_filtered() {
+        let now = Instant::now();
+        let mut hud = vec![make_hud_entry(1, false)];
+        let rows = vec![make_row(1, SubagentStatus::Running, true)]; // cancel_requested
+        reconcile_subagents(&mut hud, &rows, now);
+        assert_eq!(hud.len(), 1);
+        assert!(hud[0].status.contains("cancelling"), "status must say cancelling: {}", hud[0].status);
+    }
+
+    // R4: flash expiry — done entry with done_at > 5s → removed
+    #[test]
+    fn flash_expiry_removes_done() {
+        let old_done_at = Instant::now() - Duration::from_secs_f64(SUBAGENT_DONE_FLASH_SECS + 1.0);
+        let mut entry = make_hud_entry(1, true);
+        entry.done_at = Some(old_done_at);
+
+        let mut hud = vec![entry];
+        let rows = vec![make_row(1, SubagentStatus::Completed, false)];
+        let now = Instant::now();
+        reconcile_subagents(&mut hud, &rows, now);
+        assert!(hud.is_empty(), "expired done entry must be removed");
+    }
+
+    // R5: insert-missing — Running in registry but not in HUD → inserted
+    #[test]
+    fn insert_missing() {
+        let now = Instant::now();
+        let mut hud: Vec<SubagentState> = vec![];
+        let rows = vec![make_row(5, SubagentStatus::Running, false)];
+        reconcile_subagents(&mut hud, &rows, now);
+        assert_eq!(hud.len(), 1, "missing running entry must be inserted");
+        assert_eq!(hud[0].id, 5);
+        assert!(!hud[0].done);
+    }
+
+    // R6: multiple subagents — mix of states
+    #[test]
+    fn multiple_subagents_mixed_states() {
+        let now = Instant::now();
+
+        // HUD: sa_1 running, sa_2 running, sa_3 done (fresh)
+        let old_done_at = Instant::now() - Duration::from_secs_f64(SUBAGENT_DONE_FLASH_SECS + 1.0);
+        let mut sa3 = make_hud_entry(3, true);
+        sa3.done_at = Some(old_done_at); // expired
+
+        let mut hud = vec![
+            make_hud_entry(1, false), // running → will be completed
+            make_hud_entry(2, false), // running → cancel_requested
+            sa3,                       // done + expired → remove
+        ];
+
+        // Registry: sa_1 completed, sa_2 cancel_requested, sa_3 completed, sa_4 new running
+        let rows = vec![
+            make_row(1, SubagentStatus::Completed, false),
+            make_row(2, SubagentStatus::Running, true),
+            make_row(3, SubagentStatus::Completed, false),
+            make_row(4, SubagentStatus::Running, false), // new — must be inserted
+        ];
+
+        reconcile_subagents(&mut hud, &rows, now);
+
+        // sa_1 must be marked done
+        let sa1 = hud.iter().find(|s| s.id == 1).expect("sa_1 must exist");
+        assert!(sa1.done);
+
+        // sa_2 must have cancelling status
+        let sa2 = hud.iter().find(|s| s.id == 2).expect("sa_2 must exist");
+        assert!(sa2.status.contains("cancelling"), "sa2 status: {}", sa2.status);
+
+        // sa_3 expired → removed
+        assert!(hud.iter().find(|s| s.id == 3).is_none(), "sa_3 expired flash must be removed");
+
+        // sa_4 inserted
+        assert!(hud.iter().find(|s| s.id == 4).is_some(), "sa_4 must be inserted");
+    }
+
+    // R7: done entry not in registry stays until flash expires (oneshot completed)
+    #[test]
+    fn done_not_in_registry_stays_during_flash() {
+        let now = Instant::now();
+        let mut entry = make_hud_entry(99, true);
+        entry.done_at = Some(now - Duration::from_millis(100)); // very fresh done
+
+        let mut hud = vec![entry];
+        let rows: Vec<SubagentDisplayRow> = vec![];
+        reconcile_subagents(&mut hud, &rows, now);
+        assert_eq!(hud.len(), 1, "recently-done entry not in registry must stay for flash");
     }
 }

@@ -131,7 +131,7 @@ impl Tool for SubagentTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model);
-                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

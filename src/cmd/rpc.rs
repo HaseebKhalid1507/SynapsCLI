@@ -20,7 +20,7 @@ use anyhow::Context;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use futures::StreamExt;
@@ -32,7 +32,13 @@ use synaps_cli::{
         accumulate_usage, build_user_content, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES,
     },
     engine::setup::{self, EngineOpts},
+    engine::reactor::{
+        drain_event_queue, event_payload_from_drained,
+        wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP,
+        spawn_prompt_registration_check,
+    },
 };
+use synaps_cli::core::config::load_config;
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -61,6 +67,19 @@ struct RpcState {
     total_output_tokens: u64,
     session_cost: f64,
     in_flight: Option<InFlight>,
+    /// Events buffered while streaming is in flight. Flushed as `Event` frames
+    /// when the turn completes (Done path), then injected for the next turn.
+    pending_events: Vec<String>,
+    /// Number of consecutive auto-triggered turns since the last real user message.
+    /// Reset to 0 on every real Prompt / FollowUp. Capped at AUTO_TURN_CAP.
+    consecutive_auto_turns: u32,
+    /// `true` while an auto-turn has been reserved but its `spawn_prompt` call
+    /// has not yet registered `in_flight`.  Counts as busy so concurrent Prompt
+    /// commands are rejected during the narrow window between reservation and
+    /// actual task start.
+    auto_turn_pending: bool,
+    /// Mirror of `config.events.auto_turn` — loaded once at boot.
+    events_auto_turn: bool,
 }
 
 impl RpcState {
@@ -84,7 +103,14 @@ impl RpcState {
         }
     }
 
-    /// Returns `true` if a streaming task is currently running.
+    /// Returns `true` if the session is busy — either a streaming task is
+    /// running **or** an auto-turn has been reserved but not yet started.
+    /// All Prompt / FollowUp / NewSession commands must reject when busy.
+    fn is_busy(&self) -> bool {
+        self.in_flight.is_some() || self.auto_turn_pending
+    }
+
+    /// Convenience alias kept for the `GetState` body (legacy field name).
     fn is_streaming(&self) -> bool {
         self.in_flight.is_some()
     }
@@ -120,28 +146,149 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 
 // ─── Streaming task ───────────────────────────────────────────────────────────
 
+// ─── Terminal-path helper ─────────────────────────────────────────────────────
+
+/// Atomically close out a terminal path: clear `in_flight`, clear
+/// `auto_turn_pending`, and flush any buffered `pending_events` into
+/// `api_messages` — all under **one** mutex acquisition.
+///
+/// # `allow_chain` flag
+///
+/// Controls whether a post-flush auto-turn may be reserved:
+///
+/// * **`true`** (Done path): if all conditions are met (`events_auto_turn` enabled,
+///   buffered events present, `consecutive_auto_turns < AUTO_TURN_CAP`, last
+///   message is `role=user`), atomically claim the cap slot, set
+///   `auto_turn_pending = true`, and return `Some(auto_id)`.  The caller
+///   **must** forward the id to the scheduler without holding the lock.
+///
+/// * **`false`** (error / cancel / silent-drop paths): atomically clear
+///   `in_flight` and `auto_turn_pending`, flush `pending_events` into
+///   `api_messages` (so buffered events are not lost from history), but
+///   **never** claim a cap slot or set `auto_turn_pending`.  Returns `None`.
+///   The cap counter (`consecutive_auto_turns`) is left unchanged.
+///
+/// This eliminates the critical bug where error/cancel/drop paths previously
+/// allowed `terminal_flush` to increment `consecutive_auto_turns` and set
+/// `auto_turn_pending = true` while returning `Some(auto_id)` that was then
+/// silently discarded — leaving the session permanently stuck in busy state.
+async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<String> {
+    let mut st = state.lock().await;
+    st.in_flight = None;
+    st.auto_turn_pending = false;
+    let to_inject = std::mem::take(&mut st.pending_events);
+    let had_buffered = !to_inject.is_empty();
+    for formatted in to_inject {
+        st.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": formatted})
+        ));
+    }
+
+    // Only attempt to reserve a post-flush auto-turn on the Done path.
+    if allow_chain
+        && had_buffered
+        && st.events_auto_turn
+        && st.consecutive_auto_turns < AUTO_TURN_CAP
+        && st.api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
+    {
+        // Atomically claim the turn and reserve pending flag.
+        if claim_auto_turn(&mut st.consecutive_auto_turns) {
+            st.auto_turn_pending = true;
+            let auto_id = format!("auto:post-flush-{}", chrono::Utc::now().timestamp_millis());
+            return Some(auto_id);
+        }
+    }
+    None
+}
+
+// ─── Streaming task ───────────────────────────────────────────────────────────
+
 /// Spawn a streaming task for a `Prompt` or `FollowUp` command.
 ///
-/// The task takes a snapshot of `api_messages` while briefly holding the mutex,
-/// then releases it before the long-running LLM stream begins so that `Abort`
-/// and read-only commands (`GetState`, `GetSessionStats`) can still acquire the
-/// lock while the stream is in flight.
+/// **Race fix — oneshot start barrier (issue 1):**
+/// The spawned task must NOT touch shared state or call `terminal_flush` until
+/// `in_flight` has been set, otherwise a fast error path can call
+/// `terminal_flush` (clearing `in_flight = None`) before `in_flight` is even
+/// written — leaving a zombie `JoinHandle` in the slot.
+///
+/// Protocol:
+/// 1. Create a `oneshot` channel `(start_tx, start_rx)`.
+/// 2. Spawn the task — it immediately awaits `start_rx` before any state work.
+/// 3. Re-validate reservation under registration lock (see bug-1 fix below).
+/// 4. Set `in_flight = Some(InFlight { handle, … })` under the lock.
+/// 5. Send `start_tx` to release the task.
+///
+/// This guarantees: `terminal_flush` cannot run until `in_flight` is set, so
+/// every `in_flight = None` from inside the task sees a previously-set handle
+/// and leaves state consistent. Abort can always find the handle.
+///
+/// **Bug 1 fix — Abort-between-snapshot-and-registration:**
+/// There is a narrow window between the snapshot-guard lock release and the
+/// registration lock acquisition during which `Abort` can run and clear
+/// `auto_turn_pending`. Without the re-check, the task would be registered
+/// regardless — leaving a ghost `InFlight` that Abort already acknowledged as
+/// gone. The fix: re-validate `auto_turn_pending` (and `in_flight`) inside the
+/// registration lock. If the reservation was revoked, `start_tx` is dropped
+/// (task sees `Err` on `start_rx.await` and exits cleanly) and we return
+/// without registering `in_flight`.
+///
+/// **Bug 2 fix — guard-fail leaves `auto_turn_pending` set:**
+/// If the snapshot-guard check fails we now clear `auto_turn_pending` before
+/// returning so the session is never left permanently busy by a phantom
+/// reservation.
+///
+/// `auto_turn_tx`: channel to the scheduler task in `run()`. Terminal paths
+/// that want to chain an additional auto-turn send the reserved `auto_id` here
+/// instead of calling `spawn_prompt` recursively (which would create a
+/// non-`Send` recursive async future).
 async fn spawn_prompt(
     prompt_id: String,
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
-) -> InFlight {
+    auto_turn_tx: mpsc::UnboundedSender<String>,
+) {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let cancel_check = cancel.clone();
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
 
+    // Snapshot messages under the lock.
+    // For auto: IDs we also re-validate the reservation atomically — same lock
+    // acquisition for both the guard check and the snapshot so there is no
+    // window between "reservation still valid" and "messages snapshotted".
+    // Normal client prompts skip the guard (they were already validated by
+    // handle_prompt's is_busy() check before reaching here).
+    let messages: Vec<synaps_cli::SharedMessage> = {
+        let mut st = state.lock().await;
+        if prompt_id.starts_with("auto:") && (!st.auto_turn_pending || st.in_flight.is_some()) {
+            tracing::warn!(
+                prompt_id,
+                auto_turn_pending = st.auto_turn_pending,
+                in_flight_live = st.in_flight.is_some(),
+                "rpc: spawn_prompt: auto-turn reservation invalidated at snapshot — aborting"
+            );
+            // Bug 2 fix: defensively clear auto_turn_pending before returning so
+            // the session is never left in a permanently-busy phantom state when
+            // the guard check here fails.
+            st.auto_turn_pending = false;
+            return;
+        }
+        st.api_messages.clone()
+    };
+
+    // Start barrier: task awaits this before touching any state/stream work.
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+
+    let state_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
-        // Snapshot message history; release lock before blocking on the stream.
-        // Vec<SharedMessage> clone = pointer bumps only.
-        let messages: Vec<synaps_cli::SharedMessage> =
-            state.lock().await.api_messages.clone();
+        let state = state_task;
+
+        // Wait until in_flight has been registered so terminal_flush is safe.
+        // If the sender is dropped (caller panicked), just exit cleanly.
+        if start_rx.await.is_err() {
+            return;
+        }
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
@@ -185,14 +332,24 @@ async fn spawn_prompt(
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
+                    // terminal_flush(allow_chain=true): Done path — eligible to
+                    // reserve a post-flush auto-turn if conditions are met.
+                    let post_flush_id = terminal_flush(&state, true).await;
+                    let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
-                            command: "prompt".to_string(),
+                            command: resp_command.to_string(),
                             body: serde_json::json!({ "ok": true }),
                         })
                         .await;
-                    state.lock().await.in_flight = None;
+                    // Schedule post-flush auto-turn via the scheduler channel.
+                    // We must NOT call spawn_prompt(...).await here — that creates
+                    // a recursive async Send cycle. The scheduler task in run()
+                    // owns the call site.
+                    if let Some(auto_id) = post_flush_id {
+                        let _ = auto_turn_tx.send(auto_id);
+                    }
                     return;
                 }
                 // ── Turn error (always returns early) ───────────────────────
@@ -207,14 +364,16 @@ async fn spawn_prompt(
                         let _ = wtx
                             .send(RpcEvent::AgentEnd { usage: usage_acc.clone() })
                             .await;
+                        let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
                         let _ = wtx
                             .send(RpcEvent::Response {
                                 id: pid.clone(),
-                                command: "prompt".to_string(),
+                                command: resp_command.to_string(),
                                 body: serde_json::json!({ "ok": true, "cancelled": true }),
                             })
                             .await;
-                        state.lock().await.in_flight = None;
+                        // Cancel path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+                        let _ = terminal_flush(&state, false).await;
                         return;
                     }
                     let _ = wtx
@@ -224,14 +383,16 @@ async fn spawn_prompt(
                         })
                         .await;
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
+                    let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
-                            command: "prompt".to_string(),
+                            command: resp_command.to_string(),
                             body: serde_json::json!({ "ok": false, "error": msg }),
                         })
                         .await;
-                    state.lock().await.in_flight = None;
+                    // Error path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+                    let _ = terminal_flush(&state, false).await;
                     return;
                 }
                 _ => {}
@@ -259,17 +420,56 @@ async fn spawn_prompt(
                 "error": "stream ended without Done"
             })
         };
+        let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
         let _ = wtx
             .send(RpcEvent::Response {
                 id: pid.clone(),
-                command: "prompt".to_string(),
+                command: resp_command.to_string(),
                 body,
             })
             .await;
-        state.lock().await.in_flight = None;
+        // Silent-drop / abort path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+        let _ = terminal_flush(&state, false).await;
     });
 
-    InFlight { prompt_id, cancel, handle }
+    // Register in_flight BEFORE releasing the start barrier.
+    // Bug 1 fix — Abort-between-snapshot-and-registration:
+    // Between the snapshot guard above and this lock, Abort may have run and
+    // cleared auto_turn_pending (+ taken in_flight if any). Re-validate here
+    // under the same registration lock before writing in_flight. If the
+    // reservation was revoked, drop start_tx (the waiting task sees Err on
+    // start_rx.await and exits cleanly) and return without leaving a ghost.
+    {
+        let mut st = state.lock().await;
+        let is_auto = prompt_id.starts_with("auto:");
+        let in_flight_live = st.in_flight.is_some();
+        if !spawn_prompt_registration_check(
+            is_auto,
+            &mut st.auto_turn_pending,
+            in_flight_live,
+        ) {
+            tracing::warn!(
+                prompt_id,
+                auto_turn_pending = st.auto_turn_pending,
+                in_flight_live,
+                "rpc: spawn_prompt: Abort cleared reservation between snapshot and registration — dropping task"
+            );
+            // Defensively clear pending so the session is not stuck busy.
+            st.auto_turn_pending = false;
+            // Drop start_tx here — the spawned task's start_rx.await returns
+            // Err and the task exits without touching any state.
+            drop(start_tx);
+            // Drop the JoinHandle — task will finish immediately on start_rx Err.
+            drop(handle);
+            return;
+        }
+        st.in_flight = Some(InFlight { prompt_id, cancel, handle });
+        st.auto_turn_pending = false;
+    }
+
+    // Release the task. From this point the task may proceed with stream work.
+    // If send fails the task already exited (should never happen in practice).
+    let _ = start_tx.send(());
 }
 
 // ─── Per-command handlers ─────────────────────────────────────────────────────
@@ -281,12 +481,13 @@ async fn handle_prompt(
     attachments: Vec<RpcAttachment>,
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
+    auto_turn_tx: mpsc::UnboundedSender<String>,
 ) {
     // Reject concurrent prompt.
     {
         let st = state.lock().await;
-        if st.is_streaming() {
-            tracing::warn!(id, "rejected concurrent prompt — stream already in flight");
+        if st.is_busy() {
+            tracing::warn!(id, "rejected concurrent prompt — session busy");
             let _ = writer_tx
                 .send(RpcEvent::Error {
                     id: Some(id),
@@ -297,16 +498,18 @@ async fn handle_prompt(
         }
     }
 
-    // Push user message.
+    // Push user message and reset the auto-turn counter (real user input).
     let content = build_user_content(&message, &attachments);
     {
         let mut st = state.lock().await;
+        st.consecutive_auto_turns = 0;
         st.api_messages
             .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
     }
 
-    let in_flight = spawn_prompt(id, state.clone(), writer_tx).await;
-    state.lock().await.in_flight = Some(in_flight);
+    // spawn_prompt snapshots messages, sets in_flight atomically (issue 1 fix),
+    // and spawns the streaming task.  No separate write-back needed here.
+    spawn_prompt(id, state.clone(), writer_tx, auto_turn_tx).await;
 }
 
 /// Handle the `Compact` command.
@@ -364,11 +567,11 @@ async fn handle_new_session(
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
 ) {
-    // Reject if a streaming prompt is in flight.
+    // Reject if session is busy (streaming or auto-turn pending).
     {
         let st = state.lock().await;
-        if st.is_streaming() {
-            tracing::warn!(id, "rejected new_session — stream in flight");
+        if st.is_busy() {
+            tracing::warn!(id, "rejected new_session — session busy");
             let _ = writer_tx
                 .send(RpcEvent::Error {
                     id: Some(id),
@@ -473,6 +676,8 @@ async fn handle_abort(
 ) {
     let handle_opt = {
         let mut st = state.lock().await;
+        // Clear auto_turn_pending so a reserved-but-not-started auto-turn is cancelled.
+        st.auto_turn_pending = false;
         if let Some(inf) = st.in_flight.take() {
             tracing::info!(prompt_id = %inf.prompt_id, abort_id = %id, "aborted in-flight stream");
             inf.cancel.cancel();
@@ -652,6 +857,9 @@ pub async fn run(
     let ready_session_id = session.id.clone();
     let ready_model = runtime.model().to_string();
 
+    // Load config for events_auto_turn (default: true per SynapsConfig defaults).
+    let events_auto_turn = load_config().events.auto_turn;
+
     // 4. Build shared state.
     let state = Arc::new(Mutex::new(RpcState {
         runtime,
@@ -661,11 +869,158 @@ pub async fn run(
         total_output_tokens: initial_out,
         session_cost: initial_cost,
         in_flight: None,
+        pending_events: Vec::new(),
+        consecutive_auto_turns: 0,
+        auto_turn_pending: false,
+        events_auto_turn,
     }));
 
     // 5. Spawn the writer task that owns stdout.
     let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
     let writer_handle = spawn_writer(writer_rx);
+
+    // 6a. Auto-turn scheduler channel.
+    //
+    // Terminal paths (Done branch in spawned task) and the drainer send a
+    // reserved `auto_id` here instead of calling `spawn_prompt` directly.
+    // Calling `spawn_prompt(...).await` inside `tokio::spawn` creates a
+    // recursive async future that is not `Send`; routing through an unbounded
+    // mpsc channel eliminates the cycle entirely.  The scheduler task below
+    // is the single call site for `spawn_prompt` on auto-turn IDs.
+    let (auto_turn_tx, mut auto_turn_rx) = mpsc::unbounded_channel::<String>();
+
+    // 6. Spawn the exactly-one event-drainer task.
+    //
+    // Policy (per C2 spec):
+    //   * Always build Event frames from drained events.
+    //   * Idle + events_auto_turn + wake_action=RunTurn + claim_auto_turn:
+    //     atomically reserve auto_turn_pending=true, then schedule auto-turn
+    //     with synthetic id `auto:<first-event-id>` after releasing lock.
+    //   * Busy: drain → buffer in pending_events (flushed at Done via terminal_flush).
+    //   * One auto-turn per drained batch (coalesced).
+    //   * Opt-out: events_auto_turn=false → Event frames only, no turn.
+    {
+        let state_d = Arc::clone(&state);
+        let writer_d = writer_tx.clone();
+        let auto_turn_tx_d = auto_turn_tx.clone();
+        tokio::spawn(async move {
+            // Snapshot the event queue handle ONCE (Arc clone, cheap).
+            let eq = {
+                let st = state_d.lock().await;
+                st.runtime.event_queue().clone()
+            };
+            loop {
+                // Wait for at least one event (notify_one pattern).
+                eq.notified().await;
+
+                // Drain without holding the mutex across the await above.
+                // Lock briefly: snapshot busy flag + drain + mutate messages/pending
+                // + atomically reserve auto-turn if conditions met.
+                let (frames, auto_turn_id): (Vec<RpcEvent>, Option<String>) = {
+                    let mut st = state_d.lock().await;
+                    let busy = st.is_busy();
+                    let events_auto_turn = st.events_auto_turn;
+                    let consecutive = st.consecutive_auto_turns;
+                    // Drain: split borrows explicitly to satisfy the borrow checker
+                    // for the drain call, then drop the split borrow before
+                    // accessing st.consecutive_auto_turns / st.auto_turn_pending.
+                    let drained = {
+                        let RpcState { ref mut api_messages, ref mut pending_events, .. } = *st;
+                        drain_event_queue(
+                            &eq,
+                            api_messages,
+                            pending_events,
+                            busy,
+                            None, // RPC has no steer channel
+                        )
+                    };
+
+                    let frames: Vec<RpcEvent> = drained
+                        .iter()
+                        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
+                        .collect();
+
+                    // Decide auto-turn: only when idle + enabled + wake says RunTurn.
+                    let auto_id = if !busy && events_auto_turn {
+                        let action = wake_action(&drained, &st.api_messages, false, true, consecutive);
+                        if action == WakeAction::RunTurn {
+                            // Atomically claim and reserve — one turn per batch.
+                            if claim_auto_turn(&mut st.consecutive_auto_turns) {
+                                st.auto_turn_pending = true;
+                                let first_id = drained.first()
+                                    .map(|d| d.event.id.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                Some(format!("auto:{first_id}"))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    (frames, auto_id)
+                }; // mutex released here
+
+                // Forward ALL Event frames through the writer channel.
+                for frame in frames {
+                    if writer_d.send(frame).await.is_err() {
+                        tracing::warn!("rpc: event drainer: writer channel closed — exiting drainer");
+                        return;
+                    }
+                }
+
+                // Schedule auto-turn if reserved.  Send auto_id to the scheduler
+                // task — do NOT call spawn_prompt directly here as that would
+                // require awaiting it inside tokio::spawn which creates a
+                // non-Send recursive future cycle.
+                if let Some(auto_id) = auto_turn_id {
+                    tracing::debug!(auto_id, "rpc: scheduling auto-turn for runtime events");
+                    let _ = auto_turn_tx_d.send(auto_id);
+                }
+            }
+        });
+    }
+
+    // 7. Spawn the exactly-one auto-turn scheduler task.
+    //
+    // This is the ONLY place `spawn_prompt` is called for auto-generated turns.
+    // Both the drainer and the terminal Done-path send reserved `auto_id` strings
+    // here via `auto_turn_tx` (unbounded, so send never blocks).
+    // The task simply awaits each id in order — no lock is held across the await.
+    {
+        let state_s = Arc::clone(&state);
+        let writer_s = writer_tx.clone();
+        let auto_turn_tx_s = auto_turn_tx.clone();
+        tokio::spawn(async move {
+            while let Some(auto_id) = auto_turn_rx.recv().await {
+                // ── Stale-reservation guard ───────────────────────────────────
+                // An Abort or new Prompt can clear `auto_turn_pending` between
+                // the drainer/Done-path reserving the id and the scheduler
+                // receiving it.  Validate under lock before proceeding so we
+                // never overwrite a live `in_flight` with a ghost auto-turn.
+                {
+                    let mut st = state_s.lock().await;
+                    if !st.auto_turn_pending || st.in_flight.is_some() {
+                        tracing::warn!(
+                            auto_id,
+                            auto_turn_pending = st.auto_turn_pending,
+                            in_flight_live = st.in_flight.is_some(),
+                            "rpc: scheduler: stale auto-turn reservation — dropping"
+                        );
+                        // Clear the pending flag in case it's still set but
+                        // in_flight raced in from a concurrent real prompt.
+                        st.auto_turn_pending = false;
+                        continue;
+                    }
+                }
+                tracing::debug!(auto_id, "rpc: auto-turn scheduler: calling spawn_prompt");
+                spawn_prompt(auto_id, Arc::clone(&state_s), writer_s.clone(), auto_turn_tx_s.clone()).await;
+            }
+        });
+    }
 
     // 9. Emit Ready — guaranteed to be the first byte on stdout.
     writer_tx
@@ -715,12 +1070,12 @@ pub async fn run(
 
                 match cmd {
                     RpcCommand::Prompt { id, message, attachments } => {
-                        handle_prompt(id, message, attachments, state.clone(), writer_tx.clone())
+                        handle_prompt(id, message, attachments, state.clone(), writer_tx.clone(), auto_turn_tx.clone())
                             .await;
                     }
                     RpcCommand::FollowUp { id, message } => {
                         // Same engine path as Prompt — no attachments.
-                        handle_prompt(id, message, Vec::new(), state.clone(), writer_tx.clone())
+                        handle_prompt(id, message, Vec::new(), state.clone(), writer_tx.clone(), auto_turn_tx.clone())
                             .await;
                     }
                     RpcCommand::Compact { id } => {
@@ -755,12 +1110,29 @@ pub async fn run(
 
                         // Spec: let an in-flight stream finish naturally (no cancel).
                         // Poll in_flight until the streaming task clears it.
-                        loop {
-                            let done = state.lock().await.in_flight.is_none();
-                            if done {
-                                break;
+                        // Bounded by 30 s to prevent a zombie stream from hanging shutdown.
+                        let shutdown_poll = async {
+                            loop {
+                                let done = state.lock().await.in_flight.is_none();
+                                if done {
+                                    break;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        };
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(30),
+                            shutdown_poll,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Shutdown: in-flight stream did not finish within 30 s; \
+                                     proceeding with shutdown anyway"
+                                );
+                            }
                         }
 
                         state.lock().await.save_session().await;

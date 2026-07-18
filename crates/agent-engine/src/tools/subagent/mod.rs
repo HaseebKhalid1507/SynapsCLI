@@ -1,6 +1,7 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
 mod oneshot;
+pub(crate) mod finalize;
 pub mod start;
 pub mod status;
 pub mod steer;
@@ -40,6 +41,22 @@ pub(crate) fn apply_subagent_runtime_policy(
     // `FiveMinutes`, but this explicit call makes the invariant contract-level
     // so a future `apply_config` addition can't silently break it.
     runtime.set_cache_ttl(crate::core::config::CacheTtl::FiveMinutes);
+}
+
+/// Build the subagent tool registry: extension tools if the routing manager
+/// has a shared registry, otherwise the bare without_subagent set.
+///
+/// Single source of truth for all three spawn paths (oneshot, start, resume).
+/// Divergence is structurally impossible when all three call this function.
+pub(crate) async fn subagent_tools() -> crate::ToolRegistry {
+    if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
+        let mgr = ext_mgr.read().await;
+        if let Some(shared) = mgr.tools_shared() {
+            let extension_tools = shared.read().await;
+            return crate::ToolRegistry::without_subagent_with_extensions(&extension_tools);
+        }
+    }
+    crate::ToolRegistry::without_subagent()
 }
 
 #[cfg(test)]

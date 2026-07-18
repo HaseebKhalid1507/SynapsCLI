@@ -130,9 +130,36 @@ impl Tool for SubagentResumeTool {
         let model_inner     = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
         let start_time      = std::time::Instant::now();
+        let parent_queue    = ctx.capabilities.event_queue.clone();
+        let handle_id_inner = handle_id.clone();
+        let prior_handle_for_finalizer = prior_handle_id.clone();
 
+        // ── Build and register handle BEFORE spawning ─────────────────────────
         let system_prompt_for_handle = system_prompt.clone();
+        let handle = SubagentHandle::new(
+            handle_id.clone(),
+            subagent_id,
+            label.clone(),
+            task_preview,
+            model.clone(),
+            system_prompt_for_handle,
+            timeout_secs,
+            Arc::clone(&state),
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        );
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(handle);
+        }
+
+        // ── Spawn subagent thread ──────────────────────────────────────────────
         let thread_handle = std::thread::spawn(move || {
+            // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
+            let state_for_finalizer = Arc::clone(&state_t);
+            let label_for_finalizer = label_inner.clone();
+
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -169,7 +196,7 @@ impl Tool for SubagentResumeTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
-                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -300,6 +327,7 @@ impl Tool for SubagentResumeTool {
                                     text.push_str("\n[partial response]:\n");
                                     text.push_str(&partial);
                                 }
+                                state_a.write().unwrap_or_else(|p| p.into_inner()).partial_text = text.clone();
                                 return Ok(SubagentResult {
                                     text,
                                     model: model_a.clone(),
@@ -332,7 +360,7 @@ impl Tool for SubagentResumeTool {
                     Ok(sa_result) => {
                         {
                             let mut s = state_t.write().unwrap();
-                            if matches!(s.status, SubagentStatus::Running) {
+                            if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
                                 s.status = SubagentStatus::Completed;
                                 s.conversation_state = vec![
                                     serde_json::json!({"role": "user", "content": task_for_complete.clone()}),
@@ -376,26 +404,26 @@ impl Tool for SubagentResumeTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Resumed subagent thread panicked: {}", msg);
-                state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
+
+            // ── Terminal finalizer — exactly once, outside catch_unwind ────────
+            // Covers all paths: Ok, Err, timeout, panic, early tokio-build failure.
+            // Sets data.resumed_from so parent can correlate with the prior handle.
+            super::finalize::finalize_subagent(
+                &state_for_finalizer,
+                parent_queue.as_ref(),
+                &handle_id_inner,
+                subagent_id,
+                &label_for_finalizer,
+                start_time,
+                Some(&prior_handle_for_finalizer),
+            );
         });
 
-        let handle = SubagentHandle::new(
-            handle_id.clone(),
-            label.clone(),
-            task_preview,
-            model,
-            system_prompt_for_handle,
-            timeout_secs,
-            state,
-            Some(steer_tx),
-            Some(shutdown_tx),
-            Some(result_rx),
-        );
-
+        // ── Wire thread handle into the already-registered entry ─────────────
         {
             let mut reg = registry.lock().unwrap();
-            reg.register(handle);
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
