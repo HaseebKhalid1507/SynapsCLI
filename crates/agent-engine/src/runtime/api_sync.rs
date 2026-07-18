@@ -29,6 +29,43 @@ fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
     })
 }
 
+/// Assemble the compaction request's `system` blocks together with the
+/// [`TranslationReport`](crate::runtime::transport::report::TranslationReport)
+/// that describes the assembly decision — both are produced in the same
+/// branch so the report can never drift from the wire.
+///
+/// OAuth transport prepends exactly two synthesized identity/guidance
+/// segments ahead of the caller's compaction prompt (reported as
+/// `Synthesized`/`SystemSegment` with symbolic `system.synthetic[N]` IDs);
+/// API-key transport sends the prompt alone (lossless).
+fn compaction_system_blocks(
+    auth_type: &str,
+    system_prompt: &str,
+) -> (Value, crate::runtime::transport::report::TranslationReport) {
+    let mut report = crate::runtime::transport::report::TranslationReport::lossless();
+    let blocks = if auth_type == "oauth" {
+        let identity = crate::core::config::get_identity();
+        let synthesized: [&str; 2] = [
+            identity.as_str(),
+            "You are a helpful AI assistant with access to tools. Use them when needed.",
+        ];
+        let mut blocks = Vec::with_capacity(synthesized.len() + 1);
+        for (i, text) in synthesized.into_iter().enumerate() {
+            blocks.push(json!({"type": "text", "text": text}));
+            report.push(
+                crate::runtime::trace::TranslationAction::Synthesized,
+                crate::runtime::trace::TranslationElement::SystemSegment,
+                Some(crate::runtime::transport::report::synthetic_system_id(i)),
+            );
+        }
+        blocks.push(json!({"type": "text", "text": system_prompt}));
+        blocks
+    } else {
+        vec![json!({"type": "text", "text": system_prompt})]
+    };
+    (Value::Array(blocks), report)
+}
+
 impl ApiMethods {
     /// Concatenate the `text` fields of every block in an Anthropic-shaped
     /// response `content` array. Returns the empty string if the value is
@@ -143,7 +180,7 @@ impl ApiMethods {
         // `json!` deep rebuild. Sync transport → no "stream" key. Byte-identity
         // enforced by `runtime::body_golden` (sync_no_stream_1h fixture).
         let tools_schema = tools.tools_schema();
-        let body = super::request::RequestBody::new(
+        let parts = crate::runtime::transport::anthropic::build_anthropic_request(
             model,
             &cleaned_messages,
             &tools_schema,
@@ -155,6 +192,8 @@ impl ApiMethods {
             options.cache_ttl,
             false,
         );
+        let body = parts.body;
+        let translation_report = parts.report;
 
         // Serialize once up-front; each retry attempt reuses the same bytes
         // via a cheap `Bytes::clone()` (refcount bump, no copy).
@@ -185,6 +224,7 @@ impl ApiMethods {
             &tools_schema,
             body.has_tool_marker(),
             body.has_system_marker(),
+            &translation_report,
         )
         .await;
         #[allow(unused_assignments)]
@@ -548,18 +588,13 @@ impl ApiMethods {
             body["output_config"] = json!({"effort": "low"});
         }
 
-        if auth_type == "oauth" {
-            let system_blocks = vec![
-                json!({"type": "text", "text": crate::core::config::get_identity()}),
-                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
-                json!({"type": "text", "text": system_prompt}),
-            ];
-            body["system"] = json!(system_blocks);
-        } else {
-            body["system"] = json!([
-                {"type": "text", "text": system_prompt}
-            ]);
-        }
+        // System blocks + translation report come from one helper, in one
+        // branch: the report is derived from the actual assembly decision
+        // (OAuth synthesizes two identity/guidance segments; api_key is
+        // lossless) and can never drift from the wire bytes.
+        let (system_blocks, compaction_report) =
+            compaction_system_blocks(&auth_type, system_prompt);
+        body["system"] = system_blocks;
 
         // Serialize once up-front (exact-bytes contract, spec 6.2): the
         // same buffer is sent on every retry and is the sole source for the
@@ -582,6 +617,8 @@ impl ApiMethods {
         let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
 
         // ═══ TRACE (Task 8): compaction requests are traced too ═══
+        // Report built above alongside the system blocks (Task 9 fix): OAuth
+        // carries the two synthesized identity/guidance segment entries.
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
             &anthropic_url,
@@ -592,6 +629,7 @@ impl ApiMethods {
             &[],
             false,
             false,
+            &compaction_report,
         )
         .await;
         #[allow(unused_assignments)]
@@ -858,6 +896,88 @@ impl ApiMethods {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod compaction_system_blocks_tests {
+    use super::*;
+    use crate::runtime::trace::{TranslationAction, TranslationElement};
+    use serde_json::json;
+
+    const PROMPT_SENTINEL: &str = "COMPACTION-PROMPT-SENTINEL-4c1d";
+
+    /// OAuth compaction synthesizes exactly two identity/guidance system
+    /// segments; the report records exactly those two — action, element,
+    /// and symbolic structural ID all exact.
+    #[test]
+    fn oauth_report_has_exactly_two_synthesized_system_entries() {
+        let (_, report) = compaction_system_blocks("oauth", PROMPT_SENTINEL);
+        assert_eq!(
+            report.entries.len(),
+            2,
+            "oauth synthesizes exactly two system segments, got {:?}",
+            report
+        );
+        for (i, entry) in report.entries.iter().enumerate() {
+            assert_eq!(entry.action, TranslationAction::Synthesized);
+            assert_eq!(entry.element, TranslationElement::SystemSegment);
+            assert_eq!(
+                entry.element_id,
+                Some(crate::runtime::transport::report::synthetic_system_id(i)),
+                "entry {i} must carry structural ID system.synthetic[{i}]"
+            );
+        }
+    }
+
+    /// API-key compaction performs no synthesis: lossless report.
+    #[test]
+    fn api_key_report_is_lossless() {
+        let (_, report) = compaction_system_blocks("api_key", PROMPT_SENTINEL);
+        assert!(
+            report.is_lossless(),
+            "api_key compaction must be lossless, got {:?}",
+            report
+        );
+    }
+
+    /// The report never carries prompt content — only positional/symbolic
+    /// IDs (spec §6.3: entries never carry content or previews).
+    #[test]
+    fn report_serialization_contains_no_prompt_content() {
+        for auth in ["oauth", "api_key"] {
+            let (_, report) = compaction_system_blocks(auth, PROMPT_SENTINEL);
+            let serialized = serde_json::to_string(&report).unwrap();
+            assert!(
+                !serialized.contains(PROMPT_SENTINEL),
+                "{auth}: report leaked prompt content: {serialized}"
+            );
+        }
+    }
+
+    /// Wire bytes are unchanged from the legacy inline assembly: OAuth is
+    /// [identity, guidance, prompt]; api_key is [prompt] — byte-identical.
+    #[test]
+    fn system_blocks_match_legacy_wire_bytes() {
+        let (oauth_blocks, _) = compaction_system_blocks("oauth", PROMPT_SENTINEL);
+        let legacy_oauth = json!([
+            {"type": "text", "text": crate::core::config::get_identity()},
+            {"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."},
+            {"type": "text", "text": PROMPT_SENTINEL},
+        ]);
+        assert_eq!(
+            serde_json::to_vec(&oauth_blocks).unwrap(),
+            serde_json::to_vec(&legacy_oauth).unwrap(),
+            "oauth system blocks must be byte-identical to the legacy assembly"
+        );
+
+        let (key_blocks, _) = compaction_system_blocks("api_key", PROMPT_SENTINEL);
+        let legacy_key = json!([{"type": "text", "text": PROMPT_SENTINEL}]);
+        assert_eq!(
+            serde_json::to_vec(&key_blocks).unwrap(),
+            serde_json::to_vec(&legacy_key).unwrap(),
+            "api_key system blocks must be byte-identical to the legacy assembly"
+        );
     }
 }
 

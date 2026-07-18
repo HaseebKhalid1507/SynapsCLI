@@ -28,6 +28,7 @@ mod stream;
 pub mod subagent;
 pub mod telemetry;
 pub mod trace;
+pub(crate) mod transport;
 mod types;
 
 use api::ApiMethods;

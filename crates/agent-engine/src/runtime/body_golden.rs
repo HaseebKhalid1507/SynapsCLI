@@ -32,20 +32,20 @@ use std::sync::Arc;
 const EXPECTED_DEFAULT_IDENTITY: &str =
     "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
-struct Scenario {
-    name: &'static str,
-    model: &'static str,
-    thinking_budget: u32,
+pub(super) struct Scenario {
+    pub(super) name: &'static str,
+    pub(super) model: &'static str,
+    pub(super) thinking_budget: u32,
     /// Explicit reasoning level. Defaults to `Adaptive` for legacy scenarios
     /// so byte-identity with pre-Off-semantics fixtures is preserved.
-    reasoning_level: agent_core::reasoning::ReasoningLevel,
-    ttl: CacheTtl,
-    tools: Vec<Value>,
-    system_prompt: Option<String>,
-    auth_type: &'static str,
-    messages: Vec<SharedMessage>,
-    stream: bool,
-    identity_sensitive: bool,
+    pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
+    pub(super) ttl: CacheTtl,
+    pub(super) tools: Vec<Value>,
+    pub(super) system_prompt: Option<String>,
+    pub(super) auth_type: &'static str,
+    pub(super) messages: Vec<SharedMessage>,
+    pub(super) stream: bool,
+    pub(super) identity_sensitive: bool,
 }
 
 fn two_tools() -> Vec<Value> {
@@ -97,7 +97,7 @@ fn tool_history() -> Vec<SharedMessage> {
     ]
 }
 
-fn scenarios() -> Vec<Scenario> {
+pub(super) fn scenarios() -> Vec<Scenario> {
     let legacy = "claude-sonnet-4-5-20250929"; // enabled+budget_tokens path
     let adaptive = "claude-opus-4-7"; // adaptive path (128K max_tokens)
     vec![
@@ -310,7 +310,7 @@ fn scenarios() -> Vec<Scenario> {
 /// `sanitize_leaves_missing_content_key_absent` for one such frozen divergence:
 /// the old Vec-era code accidentally inserted `"content": null` on assistant
 /// messages lacking a content key via IndexMut; the Arc port does not).
-fn old_body_bytes(s: &Scenario) -> Vec<u8> {
+pub(super) fn old_body_bytes(s: &Scenario) -> Vec<u8> {
     use agent_core::reasoning::ReasoningLevel;
     let mut cleaned_messages = s.messages.to_vec();
     HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
@@ -396,14 +396,14 @@ fn new_body_bytes(s: &Scenario) -> (Vec<u8>, bool, bool) {
     )
 }
 
-fn fixture_dir() -> std::path::PathBuf {
+pub(super) fn fixture_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("golden_body")
 }
 
-fn identity_is_default() -> bool {
+pub(super) fn identity_is_default() -> bool {
     crate::core::config::get_identity() == EXPECTED_DEFAULT_IDENTITY
 }
 

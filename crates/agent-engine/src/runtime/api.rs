@@ -797,6 +797,7 @@ pub(super) async fn begin_anthropic_tracer(
     tools_schema: &[Value],
     has_tool_marker: bool,
     has_system_marker: bool,
+    translation: &crate::runtime::transport::report::TranslationReport,
 ) -> Option<crate::runtime::trace::RequestTracer> {
     use crate::runtime::trace as tr;
     if !options.trace.enabled() {
@@ -829,6 +830,7 @@ pub(super) async fn begin_anthropic_tracer(
         prefix_ttl,
         has_tool_marker,
         has_system_marker,
+        translation.clone().into_losses(),
     );
     tr::RequestTracer::begin(
         &options.trace,
@@ -1073,8 +1075,11 @@ impl ApiMethods {
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
         // and the tool schemas instead of the old `json!` assembly that deep-
         // rebuilt the entire history into a `Value` tree (copy C8). Byte-
-        // identical output is enforced by `runtime::body_golden`.
-        let body = super::request::RequestBody::new(
+        // identical output is enforced by `runtime::body_golden`. Task 9: the
+        // transport adapter wraps that same serializer and adds the
+        // provider-neutral `TranslationReport` (no Value round-trip, no
+        // second history copy).
+        let parts = crate::runtime::transport::anthropic::build_anthropic_request(
             model,
             &cleaned_messages,
             &tools_schema,
@@ -1086,6 +1091,8 @@ impl ApiMethods {
             options.cache_ttl,
             true,
         );
+        let body = parts.body;
+        let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
         // silent-downgrade detector. Mirrors cache_control_value(): OneHour
@@ -1157,6 +1164,7 @@ impl ApiMethods {
             &tools_schema,
             has_tool_marker,
             has_system_marker,
+            &translation_report,
         )
         .await;
         // Placeholder value: every send re-starts the clock immediately

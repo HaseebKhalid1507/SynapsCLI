@@ -58,6 +58,9 @@ pub fn stop_reason_from_wire(raw: &str) -> StopReason {
 /// digest come from it directly, never from re-serialization. When `key` is
 /// `None` (digest key unavailable) all digest-bearing sections (`wire`,
 /// `system_segments`, `tools`) are omitted; counts in `anatomy` remain.
+/// `translation` is the Anthropic adapter's Task 9 report entries
+/// (positional IDs only, never content).
+#[allow(clippy::too_many_arguments)]
 pub fn anthropic_request_structure(
     key: Option<&TraceDigestKey>,
     sent_bytes: &[u8],
@@ -67,6 +70,7 @@ pub fn anthropic_request_structure(
     prefix_marker_ttl: Option<CacheTtlClass>,
     has_tool_marker: bool,
     has_system_marker: bool,
+    translation: Vec<super::types::TranslationLoss>,
 ) -> RequestStructure {
     let message_meta: Vec<MessageMeta> = messages.iter().map(|m| message_meta(m)).collect();
     let block_count: u32 = message_meta.iter().map(|m| m.blocks.len() as u32).sum();
@@ -110,6 +114,7 @@ pub fn anthropic_request_structure(
             has_tool_marker,
             has_system_marker,
         ),
+        translation,
     }
 }
 

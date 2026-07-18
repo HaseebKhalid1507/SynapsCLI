@@ -1,0 +1,32 @@
+{
+  "description": "Deliberately unsupported input: an opaque block from a foreign provider (openai) that Anthropic cannot represent. Must yield an explicit `unsupported` report entry — never silent disappearance.",
+  "request": {
+    "system": [],
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [{ "type": "text", "text": "continue" }]
+      },
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "type": "unknown",
+            "provider": "openai",
+            "payload": { "type": "responses_item", "id": "rs_123", "encrypted_content": "opaque" }
+          },
+          { "type": "text", "text": "resuming" }
+        ]
+      }
+    ]
+  },
+  "expected_anthropic": {
+    "entries": [
+      {
+        "action": "unsupported",
+        "element": "message_block",
+        "element_id": "messages[1].blocks[0]"
+      }
+    ]
+  }
+}

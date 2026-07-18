@@ -1,0 +1,46 @@
+{
+  "description": "Tool call plus tool results — one success, one carrying the error state. Fully representable on Anthropic wire: expected report is empty.",
+  "request": {
+    "system": [],
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [{ "type": "text", "text": "Weather in Tokyo and Osaka?" }]
+      },
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "type": "tool_call",
+            "id": "toolu_01",
+            "name": "get_weather",
+            "input": { "location": "Tokyo" }
+          },
+          {
+            "type": "tool_call",
+            "id": "toolu_02",
+            "name": "get_weather",
+            "input": { "location": "Osaka" }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "type": "tool_result",
+            "call_id": "toolu_01",
+            "content": "22°C, clear skies"
+          },
+          {
+            "type": "tool_result",
+            "call_id": "toolu_02",
+            "is_error": true,
+            "content": "station offline"
+          }
+        ]
+      }
+    ]
+  },
+  "expected_anthropic": { "entries": [] }
+}

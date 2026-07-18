@@ -306,6 +306,9 @@ pub struct RequestStructure {
     pub messages: Vec<MessageMeta>,
     pub tools: Vec<ToolMeta>,
     pub cache: CacheMeta,
+    /// Provider-adapter translation report entries (Task 9): every semantic
+    /// loss/rewrite, positional IDs only. Populates `translation_losses`.
+    pub translation: Vec<super::types::TranslationLoss>,
 }
 
 /// Compute exact-wire metadata from the very byte buffer handed to the
@@ -462,7 +465,7 @@ impl RequestTracer {
             messages: self.structure.messages.clone(),
             tools: self.structure.tools.clone(),
             cache: self.structure.cache.clone(),
-            translation_losses: Vec::new(),
+            translation_losses: self.structure.translation.clone(),
             outcome,
         };
         self.ctx.sink.emit(record);

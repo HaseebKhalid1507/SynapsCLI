@@ -1,0 +1,33 @@
+{
+  "description": "Media blocks: an image and a document attachment. Both representable on Anthropic wire: expected report is empty.",
+  "request": {
+    "system": [],
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [
+          { "type": "text", "text": "Describe this image and summarize the PDF." },
+          {
+            "type": "media",
+            "media_kind": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "aWJlLXBpeGVscw=="
+            }
+          },
+          {
+            "type": "media",
+            "media_kind": "document",
+            "source": {
+              "type": "base64",
+              "media_type": "application/pdf",
+              "data": "cGRmLWJ5dGVz"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_anthropic": { "entries": [] }
+}

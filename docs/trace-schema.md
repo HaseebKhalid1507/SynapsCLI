@@ -24,7 +24,7 @@ deterministic JSON serialization order.
 | `messages` | array | Per message: `role` + per-block `kind`/`byte_len`. |
 | `tools` | array | `stable_id` (`TraceId`), `wire_name` (`WireName`), `schema_byte_len`, keyed `schema_digest`. |
 | `cache` | object | Boundary markers (`location`, `index`, `ttl`) plus optional tools/system stable-prefix `byte_len` + keyed digest. |
-| `translation_losses` | array | See *Translation losses*. Full report arrives with Task 9. |
+| `translation_losses` | array | See *Translation losses*. Populated by the provider adapter's `TranslationReport` (Task 9, `runtime/transport/`). |
 | `outcome` | object | `TransportOutcome`, below. |
 
 ## Validated identifiers
@@ -66,7 +66,13 @@ Each entry is `action`
 optional `element_id`. The `element_id` refers to the element **in the
 normalized (pre-translation) request** — a tool stable ID, or a positional
 path such as `messages[3].blocks[1]` indexing the provider-neutral IR, never
-positions in the provider wire body and never content.
+positions in the provider wire body and never content. The one exception is
+`synthesized` entries: a synthesized element has no pre-translation position,
+so it carries a symbolic ID in the `system.synthetic[N]` namespace (e.g. the
+Anthropic OAuth identity system blocks). Entries are produced by the provider
+adapter's `TranslationReport` (`runtime/transport/report.rs`): every dropped,
+merged, renamed, synthesized, downgraded, or unsupported element is explicit —
+silent semantic loss is a bug.
 
 ## `TransportOutcome`
 
