@@ -42,6 +42,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
             Arc::new(crate::tools::subagent::SubagentTool),
+            Arc::new(crate::tools::subagent::authorize_model::SubagentModelAuthorizeTool),
             Arc::new(crate::tools::subagent::models::SubagentModelsTool),
             Arc::new(crate::tools::subagent::start::SubagentStartTool),
             Arc::new(crate::tools::subagent::status::SubagentStatusTool),
@@ -355,6 +356,7 @@ fn is_recursive_subagent_tool_name(name: &str) -> bool {
             | "subagent_steer"
             | "subagent_collect"
             | "subagent_resume"
+            | "subagent_model_authorize"
             | "subagent_models"
     )
 }
@@ -503,8 +505,8 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Includes the read-only session worker catalog operation.
-        assert_eq!(registry.tools_schema().len(), 17);
+        // Includes read-only model discovery plus session authorization.
+        assert_eq!(registry.tools_schema().len(), 18);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());
@@ -521,6 +523,7 @@ mod tests {
         assert!(registry.get("find").is_some());
         assert!(registry.get("ls").is_some());
         assert!(registry.get("subagent").is_some());
+        assert!(registry.get("subagent_model_authorize").is_some());
         assert!(registry.get("subagent_models").is_some());
     }
 
@@ -724,6 +727,7 @@ mod tests {
             "subagent_steer",
             "subagent_collect",
             "subagent_resume",
+            "subagent_model_authorize",
             "subagent_models",
         ] {
             other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
@@ -737,6 +741,7 @@ mod tests {
             "subagent_steer",
             "subagent_collect",
             "subagent_resume",
+            "subagent_model_authorize",
             "subagent_models",
         ] {
             assert!(merged.get(name).is_none(), "{name} must stay unavailable");
@@ -752,6 +757,7 @@ mod tests {
             "subagent:steer",
             "subagent:collect",
             "subagent:resume",
+            "subagent:model:authorize",
             "subagent:models",
         ] {
             other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
@@ -764,6 +770,7 @@ mod tests {
             "subagent_steer",
             "subagent_collect",
             "subagent_resume",
+            "subagent_model_authorize",
             "subagent_models",
         ] {
             assert!(

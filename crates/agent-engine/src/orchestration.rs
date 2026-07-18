@@ -77,6 +77,47 @@ pub fn canonical_foreground_identity(raw: &str) -> Result<QualifiedModelId, Stri
         .map_err(|e| e.to_string())
 }
 
+/// Validate an exact identity against source-controlled runtime routing/catalog
+/// descriptors before allowing a model-driven session grant. This operation is
+/// credential- and network-blind: availability is checked later by normal
+/// provider execution, while invented identities fail before policy mutation.
+pub fn validate_user_authorizable_model(raw: &str) -> Result<QualifiedModelId, String> {
+    let model = QualifiedModelId::parse(raw)
+        .map_err(|_| "authorization denied: invalid qualified model".to_string())?;
+    let known = if model.provider() == "anthropic" {
+        agent_core::models::KNOWN_MODELS
+            .iter()
+            .any(|(id, _)| *id == model.model())
+    } else if model.provider() == "openai-codex" {
+        crate::runtime::openai::catalog::codex_static_catalog_models()
+            .iter()
+            .any(|entry| entry.runtime_id() == model.as_str())
+    } else if model.provider() == "xai-auth" {
+        crate::runtime::openai::catalog::xai_model(model.model()).is_some()
+    } else if model.provider() == "github-copilot" {
+        crate::runtime::openai::catalog::github_copilot_runtime_model(model.model()).is_some()
+    } else if model.provider() == "google-gemini" {
+        crate::runtime::openai::catalog::google_gemini_model(model.model()).is_some()
+    } else {
+        crate::runtime::openai::registry::providers()
+            .iter()
+            .find(|provider| provider.key == model.provider())
+            .is_some_and(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|(id, _, _)| *id == model.model())
+            })
+    };
+    if !known || crate::runtime::openai::resolve_route(model.as_str()).is_none() {
+        return Err(format!(
+            "authorization denied: '{}' is not a known routable model",
+            model.as_str()
+        ));
+    }
+    Ok(model)
+}
+
 /// Exact source-controlled OpenRouter worker stack. These identities are
 /// trusted local descriptors (not live catalog results or historical logs).
 const OPENROUTER_WORKER_MODELS: &[&str] = &[

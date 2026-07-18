@@ -31,7 +31,8 @@ pub mod watcher_exit;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use crate::runtime::subagent::{
-    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
+    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState,
+    SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
 pub use bash::BashTool;
@@ -48,8 +49,8 @@ pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
-    SubagentCollectTool, SubagentModelsTool, SubagentResumeTool, SubagentStartTool,
-    SubagentStatusTool, SubagentSteerTool, SubagentTool,
+    SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
+    SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
 pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
