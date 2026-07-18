@@ -65,6 +65,28 @@ fn find_reqwest_error<'a>(
     None
 }
 
+/// Strip the provider response-body snippet from a broker proxy error.
+///
+/// `LocalBroker::proxy_stream` flattens an upstream HTTP failure into
+/// `… provider request failed: {status}: {body snippet}`. The snippet is
+/// provider-controlled and may echo the full request (spec §5.1) — a byte
+/// bound is not redaction. Keep everything up to and including the status
+/// (canonical reason phrase, no `:`), drop the snippet. Messages without the
+/// marker pass through unchanged: every other `BrokerError` variant carries
+/// broker-authored, secret-free text, and transport-level reqwest errors are
+/// not response bodies.
+pub(crate) fn redact_provider_proxy_error(msg: &str) -> String {
+    const MARKER: &str = "provider request failed: ";
+    let Some(start) = msg.find(MARKER) else {
+        return msg.to_string();
+    };
+    let status_start = start + MARKER.len();
+    match msg[status_start..].find(':') {
+        Some(idx) => msg[..status_start + idx].to_string(),
+        None => msg.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +163,29 @@ mod tests {
             provider_error_to_runtime(e),
             RuntimeError::Canceled
         ));
+    }
+
+    #[test]
+    fn redact_provider_proxy_error_drops_body_snippet_keeps_status() {
+        let msg = "gemini stream error: broker transport error: provider request failed: \
+                   429 Too Many Requests: {\"error\":{\"message\":\"ECHOED:secret\"}}";
+        let redacted = redact_provider_proxy_error(msg);
+        assert_eq!(
+            redacted,
+            "gemini stream error: broker transport error: provider request failed: \
+             429 Too Many Requests"
+        );
+    }
+
+    #[test]
+    fn redact_provider_proxy_error_passes_through_non_proxy_messages() {
+        for msg in [
+            "broker transport error: connection reset",
+            "no credential configured for 'groq'. Run `synaps login` to add one.",
+            "request canceled",
+        ] {
+            assert_eq!(redact_provider_proxy_error(msg), msg);
+        }
     }
 
     #[test]

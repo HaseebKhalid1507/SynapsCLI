@@ -11,13 +11,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
-/// Truncate to at most `max` bytes without slicing mid-UTF-8-codepoint.
-/// Used for forensic logging of unknown event lines. Thin alias over the
-/// shared `agent_core::truncate_str` helper (T2 unification).
-fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    crate::truncate_str(s, max)
-}
-
 /// Trace the outgoing Anthropic request. Metadata only — raw payload content
 /// (message text, system prompt, tool schemas/arguments) must NEVER reach any
 /// log sink at any level. Guarded by `outgoing_request_trace_is_metadata_only`.
@@ -126,7 +119,9 @@ struct StreamError {
     /// Anthropic wire error type, retained separately from display text so
     /// retry policy never depends on parsing a human-facing message.
     error_type: Option<String>,
-    /// Human-facing, actionable message (already names the error type + body).
+    /// Human-facing, actionable message. Built from vetted static text only —
+    /// the provider's error message is untrusted (it can echo the request)
+    /// and is never copied into this field.
     message: String,
     /// True for transient classes that a backoff retry can clear.
     retryable: bool,
@@ -555,7 +550,7 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             // a visible, accurate error — never the silent "stopping" swallow
             // (task #130). First error wins — later frames don't clobber it.
             if state.stream_error.is_none() {
-                let (kind, body) = match &error {
+                let (kind, _body) = match &error {
                     Some(e) => (
                         e.error_type.as_deref().unwrap_or("error"),
                         e.message.as_deref(),
@@ -563,16 +558,21 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     None => ("error", None),
                 };
                 let retryable = StreamError::is_retryable_type(kind);
-                let message = match body {
-                    Some(m) => format!("API stream error ({kind}): {m}"),
-                    None => format!("API stream error ({kind})"),
-                };
-                // Gap-1 forensics: the raw frame is the ground truth for the
-                // next occurrence — log it once, verbatim (bounded).
+                // SECURITY (spec §5.1): the frame — error type AND message —
+                // is untrusted; a hostile provider can echo the entire request
+                // through it. Surface only a vetted static class label; never
+                // the message or the raw frame (bounded truncation is not
+                // redaction).
+                let vetted =
+                    crate::core::error::sanitize_error_type(kind).unwrap_or("unrecognized_error");
+                let message = format!(
+                    "API stream error ({vetted}). Provider error details withheld — they can echo request content."
+                );
                 tracing::warn!(
                     retryable,
-                    raw = %truncate_at_char_boundary(raw, 400),
-                    "SSE error event: {message}"
+                    error_type = vetted,
+                    frame_bytes = raw.len(),
+                    "SSE error event (payload withheld — untrusted)"
                 );
                 state.stream_error = Some(StreamError {
                     error_type: Some(kind.to_string()),
@@ -582,12 +582,12 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::Unknown => {
-            // #[serde(other)] discarded the tag — the raw line is the only
-            // forensics. Covers `ping` and future event types (`error` is now
-            // a real arm above).
+            // #[serde(other)] discarded the tag. The raw line is untrusted
+            // provider output — log only its size, never its content
+            // (spec §5.1: no response-derived text in logs at any level).
             tracing::trace!(
-                "Unknown SSE event type: {}",
-                truncate_at_char_boundary(raw, 200)
+                payload_bytes = raw.len(),
+                "Unknown SSE event type (payload withheld — untrusted)"
             );
         }
     }
@@ -1147,7 +1147,11 @@ impl ApiMethods {
 
                             last_status = Some(status.as_u16());
                             last_reset_hint = reset_hint.clone();
-                            last_err = format!("{}: {}", status, error_text);
+                            // SECURITY (spec §5.1): `error_text` is untrusted and can
+                            // echo the entire request. Retain only the status for
+                            // retry state — never the body (it reaches logs and the
+                            // exhausted-fallback error text below).
+                            last_err = format!("HTTP {}", status.as_u16());
 
                             if !is_429 {
                                 non_429_attempts += 1;
@@ -2255,8 +2259,9 @@ mod tests {
         // overloaded, context overflow) MUST be captured — not silently
         // dropped as an Unknown event. This is the root of task #130: a
         // dropped error event left the stream empty and the turn ended
-        // silently. The captured message must name the error type so the
-        // surfaced error is actionable.
+        // silently. The captured message must name the (vetted) error type so
+        // the surfaced error is actionable — but never the provider's raw
+        // message, which is untrusted (spec §5.1).
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
@@ -2275,8 +2280,8 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("Overloaded"),
-            "must carry the error message: {}",
+            !err.message.contains("Overloaded"),
+            "must NOT carry the raw provider message (untrusted): {}",
             err.message
         );
         assert!(
@@ -2295,6 +2300,81 @@ mod tests {
         assert!(
             state.stream_error.is_some(),
             "error event with no payload must still set a stream error"
+        );
+    }
+
+    /// Phase 1 holdout regression — RED at HEAD: the SSE `error` event arm
+    /// logged the raw frame (bounded 400 bytes) at WARN and copied the
+    /// provider message verbatim into `stream_error.message` (→ retry
+    /// warnings and the terminal error). GREEN: neither the captured message
+    /// nor any log line carries the hostile body; the vetted error type
+    /// survives for retry policy.
+    #[test]
+    fn hostile_sse_error_event_never_leaks_request_content() {
+        const HOSTILE_SENTINEL: &str = "HOLDOUT-SENTINEL-http500-77aa";
+
+        /// `std::io::Write` sink appending to a shared buffer.
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Cap {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || Cap(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        let hostile = format!(
+            r#"data: {{"type":"error","error":{{"type":"overloaded_error","message":"ECHOED:{HOSTILE_SENTINEL} {{\"system\":[...],\"tools\":[{{\"input_schema\":{{}}}}]}}"}}}}"#
+        );
+        feed(&[hostile.as_str()], &mut state, &ctx);
+
+        let err = state
+            .stream_error
+            .take()
+            .expect("error event must be captured");
+        for (text, ctx_name) in [(err.message.as_str(), "stream_error message")] {
+            assert!(
+                !text.contains(HOSTILE_SENTINEL),
+                "{ctx_name}: sentinel leaked: {text}"
+            );
+            assert!(
+                !text.contains("ECHOED") && !text.contains("input_schema"),
+                "{ctx_name}: echoed request content leaked: {text}"
+            );
+        }
+        assert_eq!(
+            err.error_type.as_deref(),
+            Some("overloaded_error"),
+            "vetted type must survive for retry policy"
+        );
+        assert!(err.retryable, "overloaded_error stays retryable");
+
+        // Hostile unknown SSE events must not leak via the forensics trace.
+        let unknown = format!(r#"data: {{"type":"fnord","echo":"{HOSTILE_SENTINEL}"}}"#);
+        feed(&[unknown.as_str()], &mut state, &ctx);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!logs.is_empty(), "expected SSE error warn to be logged");
+        assert!(
+            !logs.contains(HOSTILE_SENTINEL),
+            "log sink leaked the sentinel: {logs}"
+        );
+        assert!(
+            !logs.contains("ECHOED") && !logs.contains("input_schema"),
+            "log sink leaked echoed request content: {logs}"
         );
     }
 
@@ -3279,6 +3359,122 @@ mod on401_tests {
                 "metadata field `{field}` missing from trace output: {output}"
             );
         }
+    }
+
+    // ─── Phase 1 holdout regression: hostile provider echoes the request ─────
+    // A hostile loopback provider returns HTTP 500 whose `error.message` is
+    // "ECHOED:" + the full request body (user message, system prompts, tool
+    // schemas). spec §5.1 / Task 1: no raw-content sentinel may appear in
+    // logs at any level, in retry notices, or in the surfaced error.
+
+    const HOSTILE_SENTINEL: &str = "HOLDOUT-SENTINEL-http500-77aa";
+
+    /// Stub provider that echoes the entire request body inside a 500 JSON
+    /// error envelope — the exact hostile shape from the preserved probe.
+    async fn spawn_echoing_500_provider() -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move |body: String| async move {
+                let envelope = serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "api_error",
+                               "message": format!("ECHOED:{body}") }
+                });
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    envelope.to_string(),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn assert_no_hostile_leak(text: &str, ctx: &str) {
+        assert!(
+            !text.contains(HOSTILE_SENTINEL),
+            "{ctx}: sentinel leaked: {text}"
+        );
+        assert!(
+            !text.contains("ECHOED:"),
+            "{ctx}: echoed request body leaked: {text}"
+        );
+        assert!(
+            !text.contains("input_schema"),
+            "{ctx}: tool schema leaked: {text}"
+        );
+    }
+
+    /// RED at HEAD: the retry `tracing::warn!` prints `last_err` (status +
+    /// raw body) and the exhausted path humanizes the raw body into the
+    /// user-visible error — both carried the sentinel. GREEN: neither logs
+    /// (any level), notices, nor the typed error contain any body-derived
+    /// text.
+    #[tokio::test]
+    async fn hostile_500_retry_and_exhaustion_never_leak_request_content() {
+        let anthropic_url = spawn_echoing_500_provider().await;
+
+        // Capture ALL tracing output (TRACE included) on this thread.
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let options = make_options(anthropic_url, CredentialSource::Local, TokenCache::new());
+        let auth = auth_with_token("sk-local-key");
+        let client = Client::new();
+        let tools = ToolRegistry::new();
+        let messages = vec![std::sync::Arc::new(json!({
+            "role": "user",
+            "content": format!("{HOSTILE_SENTINEL} tell me things"),
+        }))];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        // max_retries=1 → exercises BOTH the retry-warning path (attempt 1)
+        // and the retries-exhausted error path (attempt 2).
+        let result = ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "claude-haiku-4-5",
+            &tools,
+            &Some(format!("system secret {HOSTILE_SENTINEL}")),
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &messages,
+            tx,
+            1, // max_retries
+            0, // refusal_retries
+            &options,
+            TelemetryLevel::Off,
+        )
+        .await;
+
+        // 1) Surfaced typed error must not carry any body-derived text.
+        let err = result.expect_err("hostile 500 must fail").to_string();
+        assert_no_hostile_leak(&err, "typed error");
+        assert!(
+            err.contains("500") || err.contains("server error"),
+            "error must stay actionable (status class): {err}"
+        );
+
+        // 2) User-visible notices (retry banners) must not leak.
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+                assert_no_hostile_leak(&n, "notice");
+            }
+        }
+
+        // 3) Log sink at every level must not leak.
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!logs.is_empty(), "expected retry warnings to be logged");
+        assert_no_hostile_leak(&logs, "tracing output");
     }
 }
 

@@ -47,10 +47,10 @@ use super::{load_provider_auth, storage};
 pub const MAX_PROXY_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum buffered (non-streaming) response body size.
 pub const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-/// Upstream error bodies are diagnostics, not payload: read at most this much.
+/// Historical cap for upstream error-body snippets. Upstream/broker error
+/// bodies are no longer read at all (spec §5.1: they may echo the request);
+/// the constant remains only because it is re-exported from `auth::mod`.
 pub const MAX_UPSTREAM_ERROR_BYTES: usize = 2 * 1024;
-/// Character cap for sanitized upstream error snippets surfaced in messages.
-const MAX_ERROR_SNIPPET_CHARS: usize = 512;
 /// Total time budget for a buffered (non-streaming) broker-executed request.
 pub const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1631,37 +1631,6 @@ async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<String,
         .map_err(|_| BrokerError::Transport("response body was not valid UTF-8".into()))
 }
 
-/// Bounded, sanitized snippet of an upstream error body. Reads at most
-/// [`MAX_UPSTREAM_ERROR_BYTES`], then truncates/sanitizes — arbitrary
-/// upstream content is never propagated at full size into error messages.
-async fn upstream_error_snippet(resp: reqwest::Response) -> String {
-    use futures::StreamExt;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(Ok(chunk)) = stream.next().await {
-        let room = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(buf.len());
-        if room == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
-    }
-    sanitize_error_text(&String::from_utf8_lossy(&buf))
-}
-
-/// Strip control characters and cap the length of upstream error text so a
-/// hostile body cannot inject terminal escapes or flood logs/UI.
-fn sanitize_error_text(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_ERROR_SNIPPET_CHARS)
-        .collect();
-    if s.chars().count() > MAX_ERROR_SNIPPET_CHARS {
-        out.push('…');
-    }
-    out
-}
-
 /// Legacy discovery for a static key: login config first, then env vars.
 /// Only callable from inside the broker boundary.
 fn discover_legacy_static_key(spec: &StaticProviderSpec) -> Option<String> {
@@ -1823,9 +1792,15 @@ impl CredentialBroker for LocalBroker {
         let resp = self.send(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            let snippet = upstream_error_snippet(resp).await;
+            // Spec §5.1: the upstream may echo the full request (prompts,
+            // tool schemas, credentials) in its error body. Drop the body
+            // unread — only the typed status reaches the error. The stable
+            // `provider request failed: {status}` prefix (with canonical
+            // reason phrase, e.g. `429 Too Many Requests`) is the transport
+            // contract engine-side classifiers parse.
+            drop(resp);
             return Err(BrokerError::Transport(format!(
-                "provider request failed: {status}: {snippet}"
+                "provider request failed: {status}"
             )));
         }
         use futures::StreamExt;
@@ -1854,9 +1829,11 @@ impl CredentialBroker for LocalBroker {
             .map_err(|e| BrokerError::Transport(format!("usage request failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            let snippet = upstream_error_snippet(resp).await;
+            // The error body is upstream-controlled and may echo the request;
+            // it never enters the error (spec §5.1).
+            drop(resp);
             return Err(BrokerError::Transport(format!(
-                "usage request failed: {status}: {snippet}"
+                "usage request failed: {status}"
             )));
         }
         let body = read_body_capped(resp, self.max_response_bytes).await?;
@@ -1970,22 +1947,18 @@ impl RemoteBroker {
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
-            400 | 403 => {
-                let body = upstream_error_snippet(resp).await;
-                Err(BrokerError::Denied(sanitize_broker_error(&body)))
+            s @ (400 | 403) => {
+                // A compromised broker controls every byte of its response —
+                // including JSON `error` fields. Static status-only message;
+                // the body is dropped unread (spec §5.1).
+                drop(resp);
+                Err(BrokerError::Denied(format!(
+                    "broker rejected the request (HTTP {s})"
+                )))
             }
             _ => Ok(resp),
         }
     }
-}
-
-/// Extract the `error` field from a broker JSON error body; the broker only
-/// ever puts static, secret-free strings there.
-fn sanitize_broker_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        .unwrap_or_else(|| "request rejected".to_string())
 }
 
 #[async_trait]
@@ -2031,10 +2004,10 @@ impl CredentialBroker for RemoteBroker {
         let resp = self.post_proxy(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = upstream_error_snippet(resp).await;
+            // Broker-controlled error body: dropped unread (spec §5.1).
+            drop(resp);
             return Err(BrokerError::Transport(format!(
-                "broker proxy stream failed: {status}: {}",
-                sanitize_broker_error(&body)
+                "broker proxy stream failed: {status}"
             )));
         }
         use futures::StreamExt;
@@ -2057,10 +2030,10 @@ impl CredentialBroker for RemoteBroker {
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             s if !(200..300).contains(&s) => {
-                let body = upstream_error_snippet(resp).await;
+                // Broker-controlled error body: dropped unread (spec §5.1).
+                drop(resp);
                 Err(BrokerError::Transport(format!(
-                    "broker usage returned HTTP {s}: {}",
-                    sanitize_broker_error(&body)
+                    "broker usage returned HTTP {s}"
                 )))
             }
             _ => {
@@ -2453,15 +2426,6 @@ mod tests {
             Err(BrokerError::Denied(msg)) => assert!(msg.contains("byte"), "got: {msg}"),
             other => panic!("oversize body must be denied, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn sanitize_error_text_strips_controls_and_caps_length() {
-        let hostile = format!("\x1b[2Jevil{}\x07", "A".repeat(4096));
-        let out = sanitize_error_text(&hostile);
-        assert!(!out.contains('\x1b') && !out.contains('\x07'));
-        assert!(out.chars().count() <= MAX_ERROR_SNIPPET_CHARS + 1);
-        assert!(out.ends_with('…'), "truncation must be visible");
     }
 
     #[test]
@@ -2949,10 +2913,10 @@ mod tests {
         assert!(msg.contains("limit"), "got: {msg}");
     }
 
-    /// Upstream error bodies are truncated and sanitized — a hostile provider
+    /// Upstream error bodies never reach the caller — a hostile provider
     /// cannot flood the caller or inject terminal escapes via error text.
     #[tokio::test]
-    async fn local_broker_stream_error_body_is_truncated_and_sanitized() {
+    async fn local_broker_stream_error_is_status_only() {
         use axum::routing::post;
         let app = axum::Router::new().route(
             "/chat/completions",
@@ -3032,6 +2996,250 @@ mod tests {
         // Idempotent: repeated calls return an installed instance.
         let again = global_broker();
         assert!(again.capabilities().await.is_ok());
+    }
+
+    // ── Upstream/broker error-body disclosure (spec §5.1) ────────────────────
+    //
+    // An upstream may echo the full request (prompts, tool input_schema,
+    // credentials) in its error body, and a compromised remote broker controls
+    // every byte of its responses including JSON `error` fields. No
+    // provider/broker-controlled bytes may reach BrokerError Display.
+
+    /// Unique sentinel: if this appears in any error Display, provider bytes
+    /// leaked across the broker boundary.
+    const HOSTILE_SENTINEL: &str = "ZX9-HOSTILE-SENTINEL-7Q";
+
+    /// A hostile error body shaped like an echoed request: sentinel, marker,
+    /// and request-shaped fields a provider could reflect back.
+    fn hostile_body() -> String {
+        format!(
+            "{{\"error\":{{\"message\":\"ECHOED {HOSTILE_SENTINEL} \
+             {{\\\"messages\\\":[{{\\\"content\\\":\\\"my secret prompt\\\"}}],\
+             \\\"tools\\\":[{{\\\"input_schema\\\":{{}}}}]}}\"}}}}"
+        )
+    }
+
+    /// A hostile broker-style JSON body whose top-level `error` field is
+    /// attacker-controlled (compromised remote broker).
+    fn hostile_broker_json() -> String {
+        format!(
+            "{{\"error\":\"ECHOED {HOSTILE_SENTINEL} input_schema \
+             my secret prompt\"}}"
+        )
+    }
+
+    fn assert_no_hostile_bytes(msg: &str) {
+        assert!(
+            !msg.contains(HOSTILE_SENTINEL),
+            "sentinel leaked into error: {msg}"
+        );
+        assert!(!msg.contains("ECHOED"), "echoed body leaked: {msg}");
+        assert!(
+            !msg.contains("input_schema"),
+            "request-shaped data leaked: {msg}"
+        );
+        assert!(
+            !msg.contains("secret prompt"),
+            "prompt content leaked: {msg}"
+        );
+    }
+
+    /// LocalBroker::proxy_stream: a non-2xx upstream body must never enter the
+    /// error, while the stable `provider request failed: {status}` prefix and
+    /// typed Transport category are retained for engine-side classification
+    /// (including Gemini 429 detection on the status reason phrase).
+    #[tokio::test]
+    async fn local_broker_stream_error_omits_upstream_body() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    format!("\x1b[2J{}", hostile_body()),
+                )
+            }),
+        );
+        let url = spawn_upstream(app).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url);
+        let err = broker
+            .proxy_stream(ProxyRequest {
+                provider: LOCAL_PROVIDER_KEY.into(),
+                method: ProxyMethod::Post,
+                path: "/chat/completions".into(),
+                body: None,
+                stream: true,
+            })
+            .await
+            .err()
+            .expect("non-2xx upstream must not yield a stream");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("provider request failed: 429 Too Many Requests"),
+            "status prefix must survive for engine classification: {msg}"
+        );
+        assert!(
+            !msg.contains('\x1b'),
+            "escapes must not reach errors: {msg}"
+        );
+        assert_no_hostile_bytes(&msg);
+    }
+
+    /// LocalBroker::anthropic_usage: a non-2xx usage-endpoint body must never
+    /// enter the error; operation + status survive. Serial: mutates
+    /// `SYNAPS_BASE_DIR`, which other `#[serial]` tests also depend on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_broker_usage_error_omits_upstream_body() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/usage",
+            get(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    hostile_body(),
+                )
+            }),
+        );
+        let url = spawn_upstream(app).await;
+
+        // Provide fresh Anthropic OAuth creds behind an isolated base dir so
+        // token resolution succeeds without touching the real auth store.
+        // Redirect via HOME (not SYNAPS_BASE_DIR): the non-serial
+        // `config::tests::test_base_dir` asserts only the `.synaps-cli`
+        // suffix, which every HOME-derived base dir preserves.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".synaps-cli");
+        std::fs::create_dir_all(&base).unwrap();
+        let creds = crate::auth::OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: String::new(),
+            access: "test-access-token".into(),
+            expires: crate::epoch_millis() + 3_600_000,
+            account_id: None,
+        };
+        super::super::storage::save_provider_auth_at_test_hook(
+            &base.join("auth.json"),
+            "anthropic",
+            &creds,
+        )
+        .unwrap();
+        let old_base = std::env::var("SYNAPS_BASE_DIR").ok();
+        let old_home = std::env::var("HOME").ok();
+        std::env::remove_var("SYNAPS_BASE_DIR");
+        std::env::set_var("HOME", dir.path());
+
+        let broker = LocalBroker::new(reqwest::Client::new())
+            .with_anthropic_usage_url(format!("{url}/usage"));
+        let result = broker.anthropic_usage().await;
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(v) = old_base {
+            std::env::set_var("SYNAPS_BASE_DIR", v);
+        }
+
+        let err = result.expect_err("non-2xx usage response must fail");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("usage request failed") && msg.contains("500"),
+            "operation + status must survive: {msg}"
+        );
+        assert_no_hostile_bytes(&msg);
+    }
+
+    async fn spawn_remote_broker_error(status: u16) -> RemoteBroker {
+        use axum::routing::{get, post};
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/proxy",
+                post(move || async move { (code, hostile_broker_json()) }),
+            )
+            .route(
+                "/usage",
+                get(move || async move { (code, hostile_broker_json()) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        RemoteBroker::new(
+            format!("http://{addr}"),
+            "opaque-machine-token",
+            reqwest::Client::new(),
+            super::super::TokenCache::new(),
+        )
+    }
+
+    fn groq_request(stream: bool) -> ProxyRequest {
+        ProxyRequest {
+            provider: "groq".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: None,
+            stream,
+        }
+    }
+
+    /// RemoteBroker 400/403: a compromised broker's `error` field must not
+    /// reach the Denied Display; the typed Denied category survives.
+    #[tokio::test]
+    async fn remote_broker_denied_omits_broker_error_body() {
+        for status in [400u16, 403] {
+            let broker = spawn_remote_broker_error(status).await;
+            let err = broker
+                .proxy(groq_request(false))
+                .await
+                .expect_err("4xx broker response must fail");
+            assert!(
+                matches!(err, BrokerError::Denied(_)),
+                "typed category must survive, got {err:?}"
+            );
+            let msg = format!("{err}");
+            assert!(msg.contains(&status.to_string()), "status lost: {msg}");
+            assert_no_hostile_bytes(&msg);
+        }
+    }
+
+    /// RemoteBroker::proxy_stream: a non-2xx broker body must never enter the
+    /// error; operation + status survive.
+    #[tokio::test]
+    async fn remote_broker_stream_error_omits_broker_body() {
+        let broker = spawn_remote_broker_error(500).await;
+        let err = broker
+            .proxy_stream(groq_request(true))
+            .await
+            .err()
+            .expect("non-2xx broker response must not yield a stream");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("broker proxy stream failed") && msg.contains("500"),
+            "operation + status must survive: {msg}"
+        );
+        assert_no_hostile_bytes(&msg);
+    }
+
+    /// RemoteBroker::anthropic_usage: a non-2xx broker body must never enter
+    /// the error; operation + status survive.
+    #[tokio::test]
+    async fn remote_broker_usage_error_omits_broker_body() {
+        let broker = spawn_remote_broker_error(502).await;
+        let err = broker
+            .anthropic_usage()
+            .await
+            .expect_err("non-2xx broker response must fail");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("broker usage returned HTTP 502"),
+            "operation + status must survive: {msg}"
+        );
+        assert_no_hostile_bytes(&msg);
     }
 
     /// Capability rows carry configured-ness only — the serialized form can

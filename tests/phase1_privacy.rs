@@ -92,6 +92,35 @@ async fn spawn_stub_provider(succeed: bool) -> (String, Arc<AtomicUsize>) {
     (format!("http://{addr}"), hits)
 }
 
+/// Spawn a HOSTILE loopback provider: every request gets HTTP 500 whose
+/// `error.message` is `"ECHOED:" + the full request body` — the exact shape
+/// of the preserved Phase 1 holdout probe (probe-3fYD). Loopback only.
+async fn spawn_hostile_echo_provider() -> (String, Arc<AtomicUsize>) {
+    use axum::{http::StatusCode, response::IntoResponse, Router};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&hits);
+    let app = Router::new().fallback(move |body: String| {
+        let hits = Arc::clone(&hits_clone);
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let envelope = serde_json::json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": format!("ECHOED:{body}") }
+            });
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/json")],
+                envelope.to_string(),
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
 /// Result of one scripted headless `synaps chat` run.
 struct ChatRun {
     status: std::process::ExitStatus,
@@ -377,6 +406,69 @@ async fn headless_provider_failure_exits_nonzero_and_preserves_history() -> anyh
             "partial history must retain the user message as a well-formed entry"
         );
     }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §5.1 — Hostile provider echoing the request in an error body (holdout
+// probe-3fYD regression). RED before the fix: the retry warning and the
+// terminal error printed the full `error.message` (= the echoed request:
+// user message, system prompts, tool schemas) to stderr and the log sink.
+// GREEN: no body-derived text in stderr, stdout, or logs at any level; the
+// turn still fails nonzero with static, status-based guidance.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_echoing_provider_never_leaks_request_content() -> anyhow::Result<()> {
+    let (stub_url, hits) = spawn_hostile_echo_provider().await;
+    let script = format!("{SENTINEL} tell me things\n");
+    let run = run_chat(
+        &script,
+        &[
+            ("SYNAPS_ANTHROPIC_BASE_URL", stub_url),
+            ("RUST_LOG", "trace".to_string()),
+        ],
+        false,
+    )
+    .await?;
+
+    assert!(
+        hits.load(Ordering::SeqCst) >= 1,
+        "hostile stub was never contacted — scan would be vacuous; stderr: {}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status.code(),
+        Some(0),
+        "hostile 500 must still fail the turn; stderr: {}",
+        run.stderr
+    );
+
+    let logs = read_log_files(&run.base_dir);
+    for (name, text) in [
+        ("stderr", &run.stderr),
+        ("stdout", &run.stdout),
+        ("logs", &logs),
+    ] {
+        assert!(
+            !text.contains(SENTINEL),
+            "{name} leaked the raw-content sentinel:\n{text}"
+        );
+        assert!(
+            !text.contains("ECHOED:"),
+            "{name} leaked the echoed request body:\n{text}"
+        );
+        assert!(
+            !text.contains("input_schema"),
+            "{name} leaked tool schemas:\n{text}"
+        );
+    }
+    // Still actionable: the surfaced failure names the server-error class.
+    assert!(
+        run.stderr.contains("server error") || run.stderr.contains("500"),
+        "error must remain actionable (status class); stderr: {}",
+        run.stderr
+    );
     Ok(())
 }
 

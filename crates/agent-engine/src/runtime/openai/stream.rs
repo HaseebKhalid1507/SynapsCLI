@@ -68,15 +68,19 @@ async fn send_with_retries(
                 let status = resp.status();
                 let retryable =
                     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
-                let text = resp.text().await.unwrap_or_default();
+                // Privacy (spec §5.1): the response body is provider-controlled
+                // and may echo the full request (prompts, system text, tool
+                // schemas, credentials). Drop it unread — it must never be
+                // stored, surfaced, or logged at any level. `status` Display
+                // uses the canonical reason phrase, never server bytes.
+                drop(resp);
                 if !retryable || attempt >= max_retries {
-                    return Err(format!("{label} request failed: {status}: {text}").into());
+                    return Err(format!("{label} request failed: {status}").into());
                 }
                 attempt += 1;
                 let delay = retry_delay(attempt);
                 tracing::warn!(
-                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}: {}",
-                    crate::truncate_str(&text, 200)
+                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -183,7 +187,14 @@ pub(crate) async fn call_oai_stream_inner(
             stream: true,
         })
         .await
-        .map_err(|e| format!("openai request failed: {e}"))?;
+        // Privacy (spec §5.1): a broker proxy error may carry an upstream
+        // response-body snippet; redact it to status-only before surfacing.
+        .map_err(|e| {
+            format!(
+                "openai request failed: {}",
+                super::net::redact_provider_proxy_error(&e.to_string())
+            )
+        })?;
 
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
@@ -1504,6 +1515,74 @@ mod broker_stream_tests {
         assert!(err.contains("unknown provider"), "got: {err}");
         assert!(!err.to_lowercase().contains("bearer"));
     }
+
+    /// Phase 1 privacy (spec §5.1): a hostile upstream answers the streaming
+    /// open with HTTP 500 whose body echoes the full request. The broker's
+    /// transport error carries a body snippet; the runtime must not surface
+    /// or log it — status + provider label only.
+    #[tokio::test]
+    async fn oai_stream_upstream_error_body_never_surfaces() {
+        use axum::response::IntoResponse;
+        const SENTINEL: &str = "PH1-OAI-BROKER-SENTINEL-91d2-RAW";
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |body: String| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    format!("{{\"error\":{{\"message\":\"ECHOED:{body}\"}}}}"),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            format!("http://{addr}"),
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let tools = vec![serde_json::json!({
+            "name": "ph1_secret_tool_zz",
+            "description": "internal tool schema",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(
+            serde_json::json!({"role": "user", "content": SENTINEL}),
+        )];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let err = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &tools,
+            &Some(format!("system secret {SENTINEL}")),
+            &msgs,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+        )
+        .await
+        .expect_err("500 must fail")
+        .to_string();
+
+        assert!(err.contains("500"), "status must survive: {err}");
+        for banned in ["ECHOED", SENTINEL, "ph1_secret_tool_zz", "system secret"] {
+            assert!(
+                !err.contains(banned),
+                "provider body content `{banned}` leaked into the surfaced error: {err}"
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1549,7 +1628,10 @@ pub(crate) async fn call_xai_responses_stream_inner(
             body: Some(body),
             stream: true,
         })
-        .await?;
+        .await
+        // Privacy (spec §5.1): a broker proxy error may carry an upstream
+        // response-body snippet; redact it to status-only before surfacing.
+        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()))?;
     let mut text = String::new();
     let mut parser = CodexSseDecoder::default();
     let mut buf = bytes::BytesMut::new();
@@ -2495,5 +2577,165 @@ mod send_retry_tests {
         assert_eq!(retry_delay(4).as_secs(), 8);
         assert_eq!(retry_delay(7).as_secs(), 64);
         assert_eq!(retry_delay(10).as_secs(), 64);
+    }
+
+    // ─── Phase 1 privacy: hostile provider echoes the request ───────────────
+    // spec §5.1: provider error bodies are untrusted and may echo the full
+    // request (prompts, system text, tool schemas, credentials). Neither the
+    // surfaced error nor ANY log line may contain response-body content —
+    // status + provider label only.
+
+    /// Unique raw-content sentinel placed in the outgoing request body.
+    const ECHO_SENTINEL: &str = "PH1-OAI-SENTINEL-2b8c4d-RAW-CONTENT";
+
+    /// `std::io::Write` sink capturing formatted tracing output in-process.
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_subscriber(
+        buf: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber + Send + Sync {
+        let sink = buf.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// Hostile loopback provider: every request is answered with `status` and
+    /// a JSON error envelope whose `message` is `"ECHOED:" + the full request
+    /// body` — the preserved holdout probe shape, aimed at the OpenAI routes.
+    async fn spawn_hostile_echo_provider(status: StatusCode) -> String {
+        let app = Router::new().fallback(move |body: String| async move {
+            let envelope = serde_json::json!({
+                "error": { "message": format!("ECHOED:{body}") }
+            });
+            (
+                status,
+                [("content-type", "application/json")],
+                envelope.to_string(),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Request body shaped like a real provider request: prompt sentinel plus
+    /// a distinctive tool schema. If the provider echo survives anywhere,
+    /// these markers betray it.
+    fn sentinel_request_body() -> Value {
+        json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": format!("system secret {ECHO_SENTINEL}")},
+                {"role": "user", "content": ECHO_SENTINEL},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ph1_secret_tool_zz",
+                    "description": "internal tool schema",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+        })
+    }
+
+    /// Markers that must never surface in errors or logs.
+    const BANNED_MARKERS: &[&str] = &[
+        "ECHOED",
+        ECHO_SENTINEL,
+        "ph1_secret_tool_zz",
+        "\"messages\"",
+        "system secret",
+    ];
+
+    fn assert_no_banned(haystack: &str, context: &str) {
+        for banned in BANNED_MARKERS {
+            assert!(
+                !haystack.contains(banned),
+                "provider body content `{banned}` leaked into {context}: {haystack}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_with_retries_non_retryable_error_never_surfaces_provider_body() {
+        let url = spawn_hostile_echo_provider(StatusCode::BAD_REQUEST).await;
+        let client = reqwest::Client::new();
+        let body = sentinel_request_body();
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+
+        let err = send_with_retries(
+            "codex",
+            &url,
+            || client.post(&url).json(&body),
+            &tokio_util::sync::CancellationToken::new(),
+            3,
+        )
+        .await
+        .expect_err("400 must fail fast");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 400"),
+            "status + label must survive for classification/usability: {msg}"
+        );
+        assert_no_banned(&msg, "the surfaced error");
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_no_banned(&logs, "tracing output");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_retries_retry_logs_never_contain_provider_body() {
+        let url = spawn_hostile_echo_provider(StatusCode::SERVICE_UNAVAILABLE).await;
+        let client = reqwest::Client::new();
+        let body = sentinel_request_body();
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+
+        let err = send_with_retries(
+            "codex",
+            &url,
+            || client.post(&url).json(&body),
+            &tokio_util::sync::CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect_err("persistent 503 must exhaust the budget");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 503"),
+            "status + label must survive after exhaustion: {msg}"
+        );
+        assert_no_banned(&msg, "the surfaced error");
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("retry 1/1"),
+            "retry accounting must stay observable: {logs}"
+        );
+        assert!(
+            logs.contains("503"),
+            "retry log must keep the status for diagnosis: {logs}"
+        );
+        assert_no_banned(&logs, "retry tracing output");
     }
 }

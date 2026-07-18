@@ -255,12 +255,18 @@ pub(crate) async fn call_google_gemini_stream_inner(
             {
                 Ok(stream) => break stream,
                 Err(e) => {
+                    // Full text is used ONLY for 429/reset classification —
+                    // the broker flattens the upstream status and rate-limit
+                    // hint into it. Anything surfaced must be the redacted
+                    // form: the snippet is provider-controlled and may echo
+                    // the request (spec §5.1).
                     let text = format!("{e}");
+                    let redacted = crate::runtime::openai::net::redact_provider_proxy_error(&text);
                     let Some(reset_secs) = code_assist_429_reset(&text) else {
-                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(text));
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(redacted));
                     };
                     if attempt >= MAX_GEMINI_429_RETRIES {
-                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(text));
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(redacted));
                     }
                     attempt += 1;
                     let wait = reset_secs
@@ -346,7 +352,14 @@ pub(crate) async fn call_google_gemini_stream_inner(
                 return Err("operation canceled".into());
             }
             Err(e) => {
-                return Err(format!("google-gemini: {e}").into());
+                // Mid-stream broker errors are transport-level, but redact
+                // defensively: any proxy-flattened upstream body snippet is
+                // provider-controlled (spec §5.1).
+                return Err(format!(
+                    "google-gemini: {}",
+                    crate::runtime::openai::net::redact_provider_proxy_error(&e.to_string())
+                )
+                .into());
             }
         }
     }
@@ -982,10 +995,70 @@ Begin now and continue autonomously until the exercise reaches a verified safe o
             .await
             .expect_err("persistent 429 must eventually surface");
         assert!(err.to_string().contains("429"), "{err}");
+        assert!(
+            !err.to_string().contains("You have exhausted"),
+            "provider 429 body text must not surface (spec §5.1): {err}"
+        );
         assert_eq!(
             stub.calls(),
             1 + MAX_GEMINI_429_RETRIES,
             "429 retries must stop at the budget"
         );
+    }
+
+    /// Phase 1 privacy (spec §5.1): the broker flattens an upstream HTTP
+    /// failure into a transport error that carries a response-body snippet.
+    /// A hostile provider echoes the full request there; the runtime must
+    /// surface status + provider label only — never the snippet.
+    #[tokio::test(start_paused = true)]
+    async fn non_429_broker_error_never_surfaces_provider_body() {
+        const SENTINEL: &str = "PH1-GEMINI-SENTINEL-5a9c-RAW";
+        struct EchoFailBroker;
+        #[async_trait]
+        impl CredentialBroker for EchoFailBroker {
+            async fn access_token(&self, _p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+                Err(BrokerError::NotConfigured("stub".into()))
+            }
+            async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+                if r.path == "/v1internal:loadCodeAssist" {
+                    return Ok(ProxyResponse {
+                        status: 200,
+                        body: r#"{"cloudaicompanionProject":"test-proj","currentTier":{"id":"STANDARD","name":"Std","hasOnboardedPreviously":true}}"#.to_string(),
+                    });
+                }
+                Err(BrokerError::Denied("not implemented".into()))
+            }
+            async fn proxy_stream(&self, _r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+                Err(BrokerError::Transport(format!(
+                    "provider request failed: 500 Internal Server Error: \
+                     ECHOED:{{\"request\":{{\"contents\":[{{\"parts\":[{{\"text\":\
+                     \"{SENTINEL}\"}}]}}]}}}}"
+                )))
+            }
+            async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+                Err(BrokerError::Denied("not implemented".into()))
+            }
+            async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
+                Ok(vec![])
+            }
+        }
+
+        let broker: Arc<dyn CredentialBroker> = Arc::new(EchoFailBroker);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+
+        let err = call_google_gemini_stream_inner(&cfg(), &broker, &[], &None, &msgs, &tx, &cancel)
+            .await
+            .expect_err("500 must fail")
+            .to_string();
+
+        assert!(err.contains("500"), "status must survive: {err}");
+        for banned in ["ECHOED", SENTINEL, "\"contents\""] {
+            assert!(
+                !err.contains(banned),
+                "provider body content `{banned}` leaked into the surfaced error: {err}"
+            );
+        }
     }
 }

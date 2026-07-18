@@ -182,14 +182,22 @@ impl ApiMethods {
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
-                                        eprintln!(
-                                            "API Error Response: {}",
-                                            serde_json::to_string_pretty(&j).unwrap_or_default()
-                                        );
+                                        // SECURITY (spec §5.1): the error envelope is
+                                        // untrusted and can echo the request — never
+                                        // print/log it. Surface only a vetted static
+                                        // class label.
                                         if let Some(error_type) = j["error"]["type"].as_str() {
+                                            let vetted =
+                                                crate::core::error::sanitize_error_type(error_type)
+                                                    .unwrap_or("unrecognized_error");
+                                            tracing::warn!(
+                                                error_type = vetted,
+                                                "API returned an error envelope in a 200 response \
+                                                 (details withheld — untrusted)"
+                                            );
                                             return Err(RuntimeError::Tool(format!(
                                                 "API Error: {}",
-                                                error_type
+                                                vetted
                                             )));
                                         }
                                     }
@@ -248,7 +256,9 @@ impl ApiMethods {
                             }
 
                             last_reset_hint = reset_hint.clone();
-                            last_err = format!("{}: {}", status, error_text);
+                            // SECURITY (spec §5.1): `error_text` is untrusted and can
+                            // echo the request — retain only the status.
+                            last_err = format!("HTTP {}", status.as_u16());
                             if !is_429 {
                                 non_429_attempts += 1;
                             }
@@ -445,10 +455,15 @@ impl ApiMethods {
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
+                                        // SECURITY (spec §5.1): untrusted envelope —
+                                        // surface only a vetted static class label.
                                         if let Some(error_type) = j["error"]["type"].as_str() {
+                                            let vetted =
+                                                crate::core::error::sanitize_error_type(error_type)
+                                                    .unwrap_or("unrecognized_error");
                                             return Err(RuntimeError::Tool(format!(
                                                 "API Error: {}",
-                                                error_type
+                                                vetted
                                             )));
                                         }
                                     }
@@ -507,7 +522,9 @@ impl ApiMethods {
                             }
 
                             last_reset_hint = reset_hint;
-                            last_err = format!("{}: {}", status, error_text);
+                            // SECURITY (spec §5.1): `error_text` is untrusted and can
+                            // echo the request — retain only the status.
+                            last_err = format!("HTTP {}", status.as_u16());
                             if !is_429 {
                                 non_429_attempts += 1;
                             }
