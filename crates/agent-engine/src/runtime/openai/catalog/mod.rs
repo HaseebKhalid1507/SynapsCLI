@@ -665,6 +665,7 @@ async fn broker_proxy_catalog_body(provider_key: &str, path: &str) -> Result<Str
             path: path.to_string(),
             body: None,
             stream: false,
+            body_bytes: None,
         })
         .await
         .map_err(|e| format!("request failed: {e}"))?;

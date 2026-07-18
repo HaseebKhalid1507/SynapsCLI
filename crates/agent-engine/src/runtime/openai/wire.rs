@@ -108,6 +108,10 @@ pub struct StreamDecoder {
     pub calls: HashMap<u32, ToolCallAccumulator>,
     pub truncated: bool,
     pub completed: bool,
+    /// First `finish_reason` string observed on the wire (set-once). Raw
+    /// provider value — read it only through a normalizing mapper (trace
+    /// records store the normalized enum, never this string).
+    pub finish_reason: Option<String>,
     role_emitted: bool,
     done_emitted: bool,
 }
@@ -124,6 +128,7 @@ impl StreamDecoder {
             calls: HashMap::new(),
             truncated: false,
             completed: false,
+            finish_reason: None,
             role_emitted: false,
             done_emitted: false,
         }
@@ -184,6 +189,9 @@ impl StreamDecoder {
                 }
             }
             if let Some(reason) = choice.finish_reason {
+                if self.finish_reason.is_none() {
+                    self.finish_reason = Some(reason.clone());
+                }
                 match reason.as_str() {
                     "tool_calls" => self.flush_complete(sink),
                     "length" => {

@@ -260,6 +260,16 @@ pub struct ProxyRequest {
     /// Request an SSE byte stream (`proxy_stream`) instead of a buffered body.
     #[serde(default)]
     pub stream: bool,
+    /// Typed exact-byte handoff (request-trace spec §6.2): when present this
+    /// MUST be the exact serialization of `body`, produced once by the
+    /// caller. [`LocalBroker`] sends these very bytes upstream verbatim, so
+    /// a caller-computed digest over them is a digest of the true wire body.
+    /// The field never crosses the remote broker HTTP boundary
+    /// (`serde(skip)`): a remote broker daemon re-serializes `body` on its
+    /// side, so callers on a remote path must NOT claim exact upstream
+    /// bytes. Never logged, never part of the broker wire schema.
+    #[serde(skip)]
+    pub body_bytes: Option<bytes::Bytes>,
 }
 
 impl ProxyRequest {
@@ -307,17 +317,72 @@ impl ProxyRequest {
                 self.path
             )));
         }
-        if let Some(body) = &self.body {
-            let size = serde_json::to_vec(body)
-                .map(|v| v.len())
-                .unwrap_or(usize::MAX);
+        // Size cap over the effective wire body. The exact-byte handoff is
+        // authoritative whenever present — even if `body` is unset, those
+        // bytes are what `LocalBroker` would send upstream, so they must
+        // never bypass the cap (fail closed).
+        let size = match (&self.body_bytes, &self.body) {
+            // Exact-byte handoff: the bytes ARE the wire body.
+            (Some(bytes), _) => Some(bytes.len()),
+            (None, Some(body)) => Some(
+                serde_json::to_vec(body)
+                    .map(|v| v.len())
+                    .unwrap_or(usize::MAX),
+            ),
+            (None, None) => None,
+        };
+        if let Some(size) = size {
             if size > MAX_PROXY_REQUEST_BYTES {
                 return Err(BrokerError::Denied(format!(
                     "request body exceeds the {MAX_PROXY_REQUEST_BYTES}-byte broker limit"
                 )));
             }
         }
+        // Coherence invariant (debug/test only — never a release hot-path
+        // re-serialization): when both representations are present,
+        // `body_bytes` MUST parse back to exactly `body`. A divergence
+        // means a caller bypassed [`ProxyRequest::post_json_exact`] and the
+        // digested bytes would not describe the JSON the broker validated.
+        #[cfg(any(test, debug_assertions))]
+        if let (Some(bytes), Some(body)) = (&self.body_bytes, &self.body) {
+            let parsed = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+            if parsed.as_ref() != Some(body) {
+                return Err(BrokerError::Denied(
+                    "body_bytes does not match the JSON body (exact-byte handoff incoherent)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Build a POST proxy request whose JSON body is serialized **exactly
+    /// once**: the returned [`bytes::Bytes`] handle shares the same buffer
+    /// stored in `body_bytes` (ref-counted clone, no copy), so a
+    /// caller-side digest over it is a digest of the true wire body on the
+    /// local-broker path. This is the sanctioned way to populate
+    /// `body_bytes` — going through it makes a `body`/`body_bytes`
+    /// semantic divergence unconstructible, and it never re-serializes on
+    /// the release hot path.
+    pub fn post_json_exact(
+        provider: impl Into<String>,
+        path: impl Into<String>,
+        body: serde_json::Value,
+        stream: bool,
+    ) -> Result<(Self, bytes::Bytes), BrokerError> {
+        let bytes =
+            bytes::Bytes::from(serde_json::to_vec(&body).map_err(|e| {
+                BrokerError::Denied(format!("request body failed to serialize: {e}"))
+            })?);
+        let request = Self {
+            provider: provider.into(),
+            method: ProxyMethod::Post,
+            path: path.into(),
+            body: Some(body),
+            stream,
+            body_bytes: Some(bytes.clone()),
+        };
+        Ok((request, bytes))
     }
 }
 
@@ -1585,7 +1650,14 @@ impl LocalBroker {
                 .header("content-type", "application/json")
                 .header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
-        if let Some(body) = &request.body {
+        if let Some(bytes) = &request.body_bytes {
+            // Exact-byte handoff (request-trace spec §6.2): send the very
+            // buffer the caller serialized (and digested) — never a
+            // re-serialization of the JSON value.
+            builder = builder
+                .header("content-type", "application/json")
+                .body(bytes.clone());
+        } else if let Some(body) = &request.body {
             builder = builder.json(body);
         }
         if request.stream {
@@ -2388,6 +2460,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             match req.validate() {
                 Err(BrokerError::Denied(msg)) => {
@@ -2404,6 +2477,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(req.validate().is_ok(), "{path} must be allowed");
         }
@@ -2421,10 +2495,72 @@ mod tests {
                 "blob": "x".repeat(MAX_PROXY_REQUEST_BYTES + 1)
             })),
             stream: false,
+            body_bytes: None,
         };
         match req.validate() {
             Err(BrokerError::Denied(msg)) => assert!(msg.contains("byte"), "got: {msg}"),
             other => panic!("oversize body must be denied, got {other:?}"),
+        }
+    }
+
+    /// Regression: the size cap must hold over the exact-byte handoff even
+    /// when the JSON `body` is unset — `body_bytes` alone is what
+    /// `LocalBroker` would send upstream, so it can never bypass the limit.
+    #[test]
+    fn proxy_rejects_oversize_body_bytes_without_json_body() {
+        let req = ProxyRequest {
+            provider: "groq".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: None,
+            stream: false,
+            body_bytes: Some(bytes::Bytes::from(vec![b'x'; MAX_PROXY_REQUEST_BYTES + 1])),
+        };
+        match req.validate() {
+            Err(BrokerError::Denied(msg)) => assert!(msg.contains("byte"), "got: {msg}"),
+            other => panic!("oversize body_bytes must be denied, got {other:?}"),
+        }
+    }
+
+    /// The sanctioned constructor serializes once and keeps `body` and
+    /// `body_bytes` coherent: same buffer returned to the caller (for
+    /// digesting) and stored on the request, parsing back to the very value.
+    #[test]
+    fn post_json_exact_sets_coherent_body_and_bytes() {
+        let value = serde_json::json!({"model": "m", "stream": true});
+        let (req, digest_bytes) =
+            ProxyRequest::post_json_exact("groq", "/chat/completions", value.clone(), true)
+                .expect("serializable body must construct");
+        assert_eq!(req.method, ProxyMethod::Post);
+        assert!(req.stream);
+        assert_eq!(req.body.as_ref(), Some(&value));
+        let stored = req.body_bytes.as_ref().expect("bytes must be set");
+        assert_eq!(stored, &digest_bytes, "caller digest bytes == wire bytes");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(stored).unwrap(),
+            value
+        );
+        req.validate().expect("coherent request must validate");
+    }
+
+    /// A semantically divergent `body`/`body_bytes` pair (constructed by
+    /// hand, bypassing `post_json_exact`) is rejected by validation in
+    /// debug/test builds — the digest would not describe the claimed body.
+    #[test]
+    fn mismatched_body_bytes_rejected_by_debug_validation() {
+        let req = ProxyRequest {
+            provider: "groq".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: Some(serde_json::json!({"model": "claimed"})),
+            stream: true,
+            body_bytes: Some(bytes::Bytes::from_static(b"{\"model\":\"actually-sent\"}")),
+        };
+        match req.validate() {
+            Err(BrokerError::Denied(msg)) => {
+                assert!(msg.contains("body_bytes"), "got: {msg}");
+            }
+            other => panic!("incoherent handoff must be denied, got {other:?}"),
         }
     }
 
@@ -2436,6 +2572,7 @@ mod tests {
             path: "/chat/completions".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(ok.validate().is_ok());
 
@@ -2479,6 +2616,7 @@ mod tests {
             path: "/models".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(
             matches!(claude.validate(), Err(BrokerError::UnknownProvider(_))),
@@ -2491,6 +2629,7 @@ mod tests {
             path: "/models".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(
             matches!(anth.validate(), Err(BrokerError::Denied(_))),
@@ -2503,6 +2642,7 @@ mod tests {
             path: "/models".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(
             matches!(bare.validate(), Err(BrokerError::Denied(_))),
@@ -2520,6 +2660,7 @@ mod tests {
             path: "/models?client_version=0.6.0".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(
             allowed.validate().is_ok(),
@@ -2542,6 +2683,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(
                 matches!(req.validate(), Err(BrokerError::Denied(_))),
@@ -2556,6 +2698,7 @@ mod tests {
             path: "/models?client_version=0.6.0".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(
             matches!(post.validate(), Err(BrokerError::Denied(_))),
@@ -2572,6 +2715,7 @@ mod tests {
             path: "/models".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(models.validate().is_ok());
 
@@ -2581,6 +2725,7 @@ mod tests {
             path: "/chat/completions".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(chat.validate().is_ok());
         let responses = ProxyRequest {
@@ -2589,6 +2734,7 @@ mod tests {
             path: "/responses".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(responses.validate().is_ok());
         for path in ["/v1/messages", "/models?x=1", "/embeddings"] {
@@ -2598,6 +2744,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(matches!(request.validate(), Err(BrokerError::Denied(_))));
         }
@@ -2617,6 +2764,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(req.validate().is_ok(), "{path} must be allowed");
         }
@@ -2637,6 +2785,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(
                 matches!(req.validate(), Err(BrokerError::Denied(_))),
@@ -2698,6 +2847,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(req.validate().is_ok(), "{path} must be allowed");
         }
@@ -2720,6 +2870,7 @@ mod tests {
                 path: path.into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             };
             assert!(
                 matches!(req.validate(), Err(BrokerError::Denied(_))),
@@ -2763,6 +2914,7 @@ mod tests {
             path: "/models".into(),
             body: Some(serde_json::json!({"a": 1})),
             stream: true,
+            body_bytes: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ProxyRequest = serde_json::from_str(&json).unwrap();
@@ -2816,6 +2968,7 @@ mod tests {
                 path: "/chat/completions".into(),
                 body: Some(serde_json::json!({"model": "m"})),
                 stream: true,
+                body_bytes: None,
             })
             .await
             .expect("stream must open");
@@ -2854,6 +3007,7 @@ mod tests {
                 path: "/chat/completions".into(),
                 body: None,
                 stream: true,
+                body_bytes: None,
             })
             .await
         {
@@ -2883,6 +3037,7 @@ mod tests {
                 path: "/models".into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             })
             .await
             .unwrap();
@@ -2906,6 +3061,7 @@ mod tests {
                 path: "/models".into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             })
             .await
             .expect_err("oversize body must be rejected");
@@ -2936,6 +3092,7 @@ mod tests {
                 path: "/chat/completions".into(),
                 body: None,
                 stream: true,
+                body_bytes: None,
             })
             .await
             .err()
@@ -2973,6 +3130,7 @@ mod tests {
                 path: "/models".into(),
                 body: None,
                 stream: false,
+                body_bytes: None,
             })
             .await
             .expect_err("hung upstream must time out");
@@ -3069,6 +3227,7 @@ mod tests {
                 path: "/chat/completions".into(),
                 body: None,
                 stream: true,
+                body_bytes: None,
             })
             .await
             .err()
@@ -3182,6 +3341,7 @@ mod tests {
             path: "/chat/completions".into(),
             body: None,
             stream,
+            body_bytes: None,
         }
     }
 

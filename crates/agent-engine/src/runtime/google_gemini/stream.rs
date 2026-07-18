@@ -57,6 +57,7 @@ pub async fn stream_gemini<B: CredentialBroker + ?Sized>(
                 .map_err(|e| StreamError::Decode(format!("failed to serialize request: {e}")))?,
         ),
         stream: true,
+        body_bytes: None,
     };
     let mut byte_stream = broker.proxy_stream(request).await?;
 

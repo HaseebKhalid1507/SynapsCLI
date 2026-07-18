@@ -274,6 +274,17 @@ impl AttemptClock {
         }
     }
 
+    /// First parsed model event, measured directly on this attempt's own
+    /// monotonic clock (set-once). Used by transports that observe the
+    /// event on the same task that owns the clock (OpenAI-compatible
+    /// paths); the Anthropic stream parser instead reports a post-headers
+    /// offset via [`Self::set_first_model_event_after_headers`].
+    pub fn mark_first_model_event(&mut self) {
+        if self.first_model_event_ms.is_none() {
+            self.first_model_event_ms = Some(self.elapsed_ms());
+        }
+    }
+
     /// Stream fully consumed / request finished (set-once).
     pub fn mark_stream_end(&mut self) {
         if self.stream_end_ms.is_none() {

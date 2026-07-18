@@ -188,6 +188,7 @@ pub async fn try_route(
     cache: &crate::auth::TokenCache,
     max_retries: u32,
     codex_request_role: catalog::CodexRequestRole,
+    trace: &crate::runtime::trace::TraceContext,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
@@ -432,6 +433,10 @@ pub async fn try_route(
     };
     let cfg = provider_config(&route);
     let broker = crate::auth::broker_from_source(source, cache, client.clone());
+    // Trace honesty (Task 10A): only a local (in-process) broker sends the
+    // exact bytes this process serialized (`ProxyRequest::body_bytes`); a
+    // remote broker daemon re-serializes upstream bodies out of process.
+    let exact_wire_bytes = !source.is_remote();
     match route.wire {
         WireProtocol::OpenAiChatCompletions => Some(
             stream::call_oai_stream_inner(
@@ -445,6 +450,8 @@ pub async fn try_route(
                 max_tokens,
                 thinking_budget,
                 cancel,
+                trace,
+                exact_wire_bytes,
             )
             .await,
         ),
@@ -459,6 +466,8 @@ pub async fn try_route(
                 max_tokens,
                 reasoning_level,
                 cancel,
+                trace,
+                exact_wire_bytes,
             )
             .await,
         ),
@@ -480,6 +489,7 @@ pub async fn try_route(
                 // same persistent posture as Anthropic OAuth overloads (10
                 // retries), not the generic three-attempt budget.
                 stream::codex_retry_budget(max_retries),
+                trace,
             )
             .await,
         ),
@@ -632,6 +642,7 @@ mod tests {
             "content": "hi"
         }))];
 
+        let trace = crate::runtime::trace::TraceContext::disabled();
         let fut = try_route(
             "google-gemini/gemini-2.5-pro",
             &client,
@@ -648,6 +659,7 @@ mod tests {
             &cache,
             0,
             catalog::CodexRequestRole::Foreground,
+            &trace,
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -713,6 +725,7 @@ mod tests {
                 &cache,
                 0,
                 catalog::CodexRequestRole::Foreground,
+                &crate::runtime::trace::TraceContext::disabled(),
             )
             .await
             .expect("xai-auth must route through try_route");

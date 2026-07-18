@@ -19,7 +19,10 @@
 //! the Anthropic transports (`runtime/api.rs`, `runtime/api_sync.rs`) into
 //! the emission seam in [`emit`], with structural builders in [`anthropic`]
 //! (the normalized IR / `TranslationReport` arrive in Task 9; the bounded
-//! persistence writer in Task 11).
+//! persistence writer in Task 11). Task 10A extends the seam to the
+//! OpenAI-compatible transports — Chat Completions and Responses/Codex —
+//! via [`openai`] (Gemini/Vertex, cloud and extension providers follow in
+//! Task 10B/10C).
 //! Serde contract (deliberate): optional metrics serialize as **absent** —
 //! never fabricated zeros — and both absent and explicit `null` deserialize
 //! to `None`. Struct field order is the deterministic serialization order.
@@ -27,6 +30,7 @@
 pub mod anthropic;
 pub mod emit;
 mod key;
+pub mod openai;
 mod types;
 
 pub use emit::{
@@ -51,3 +55,6 @@ mod tests;
 
 #[cfg(test)]
 mod wiring_tests;
+
+#[cfg(test)]
+mod openai_wiring_tests;

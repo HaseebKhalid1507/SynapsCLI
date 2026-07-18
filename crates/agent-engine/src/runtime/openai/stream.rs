@@ -6,10 +6,38 @@
 use super::translate;
 use super::types::{ChatMessage, OaiEvent, ProviderConfig, StreamOptions, ToolCall};
 use super::wire::StreamDecoder;
+use crate::runtime::trace::openai as tr;
 use crate::runtime::types::StreamEvent;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+
+/// Trace capture for one batch of decoded Chat Completions events: marks the
+/// first parsed model event and records provider-reported usage. Metadata
+/// only — token counts, no content.
+fn capture_oai_trace_signals(
+    events: &[OaiEvent],
+    attempt: &mut tr::StreamAttempt,
+    usage: &mut Option<crate::runtime::trace::UsageMeta>,
+) {
+    for ev in events {
+        if !matches!(ev, OaiEvent::Warning(_)) {
+            attempt.mark_first_model_event();
+        }
+        if let OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } = ev
+        {
+            *usage = Some(tr::provider_usage(
+                u64::from(*prompt_tokens),
+                u64::from(*completion_tokens),
+                u64::from(*cached_tokens),
+            ));
+        }
+    }
+}
 
 /// Persistent retry posture for the Codex transport, mirroring the Anthropic
 /// OAuth overload budget (`OAUTH_OVERLOAD_RETRIES` in `runtime/api.rs`).
@@ -53,19 +81,35 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
 /// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
 /// and localhost connection refusals (Ollama/LM Studio not running — a
 /// setup problem, not a blip) fail fast. Backoff sleeps are cancel-aware.
+///
+/// Trace (Task 10A): one record per actual HTTP send — every retried
+/// failure is recorded via `attempt_failed` (status + retry class, never
+/// provider text) and the per-attempt clock restarts right before each
+/// re-send. Terminal failures emit their final record here; on success the
+/// caller finishes the attempt after consuming the stream.
 async fn send_with_retries(
     label: &str,
     url: &str,
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
+    trace_attempt: &mut tr::StreamAttempt,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempt: u32 = 0;
     loop {
         match build().send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) if resp.status().is_success() => {
+                trace_attempt.mark_headers();
+                return Ok(resp);
+            }
             Ok(resp) => {
+                // A complete HTTP response was observed even when its status
+                // is non-success. Preserve that timing for retried and
+                // terminal failure records just as the success branch does.
+                trace_attempt.mark_headers();
                 let status = resp.status();
+                // Provider-assigned request id from validated headers only.
+                let trace_rid = tr::provider_request_id_from_headers(resp.headers());
                 let retryable =
                     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
                 // Privacy (spec §5.1): the response body is provider-controlled
@@ -74,18 +118,32 @@ async fn send_with_retries(
                 // stored, surfaced, or logged at any level. `status` Display
                 // uses the canonical reason phrase, never server bytes.
                 drop(resp);
+                let code = format!("http_{}", status.as_u16());
                 if !retryable || attempt >= max_retries {
+                    trace_attempt.finish_failed(&code, Some(status.as_u16()), trace_rid);
                     return Err(format!("{label} request failed: {status}").into());
                 }
                 attempt += 1;
                 let delay = retry_delay(attempt);
+                trace_attempt.attempt_failed(
+                    tr::retry_class_for_status(status.as_u16()),
+                    delay,
+                    Some(status.as_u16()),
+                    trace_rid,
+                    &code,
+                );
                 tracing::warn!(
                     "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                    _ = cancel.cancelled() => {
+                        trace_attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
                 }
+                // Retry clocks reset per attempt, right before the re-send.
+                trace_attempt.restart_clock();
             }
             Err(e) => {
                 let localhost_refusal = e.is_connect() && url.contains("localhost");
@@ -95,18 +153,35 @@ async fn send_with_retries(
                         "{label} request failed (no retry): {}",
                         crate::core::error::error_chain_string(&e)
                     );
+                    trace_attempt.finish_failed("transport_error", None, None);
                     return Err(e.into());
                 }
                 attempt += 1;
                 let delay = retry_delay(attempt);
+                trace_attempt.attempt_failed(
+                    if e.is_timeout() {
+                        crate::runtime::trace::RetryClass::Timeout
+                    } else {
+                        crate::runtime::trace::RetryClass::Other
+                    },
+                    delay,
+                    None,
+                    None,
+                    "transport_error",
+                );
                 tracing::warn!(
                     "{label} transport retry {attempt}/{max_retries} after {delay:?}: {}",
                     crate::core::error::error_chain_string(&e)
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                    _ = cancel.cancelled() => {
+                        trace_attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
                 }
+                // Retry clocks reset per attempt, right before the re-send.
+                trace_attempt.restart_clock();
             }
         }
     }
@@ -129,6 +204,8 @@ pub(crate) async fn call_oai_stream_inner(
     max_tokens: Option<u32>,
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -176,16 +253,43 @@ pub(crate) async fn call_oai_stream_inner(
 
     tracing::debug!(provider=%cfg.provider, model=%cfg.model, "openai stream request via broker proxy");
 
+    // Serialize ONCE via the sanctioned constructor: the returned bytes are
+    // both digested for the trace and the very buffer stored on the request
+    // (`body_bytes`), which `LocalBroker` sends verbatim — the digest is
+    // never computed over a re-serialization, and `body`/`body_bytes`
+    // cannot diverge.
+    let (proxy_request, body_bytes) = crate::auth::ProxyRequest::post_json_exact(
+        cfg.provider.clone(),
+        "/chat/completions",
+        body,
+        true,
+    )?;
+    // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
+    // A remote broker re-serializes the JSON out of process: honest kind
+    // `CloudProxy`, no wire-byte claim. Rule documented in `trace::emit`.
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        if exact_wire_bytes {
+            crate::runtime::trace::TransportKind::OpenAiChatCompletions
+        } else {
+            crate::runtime::trace::TransportKind::CloudProxy
+        },
+        &format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
+        exact_wire_bytes.then_some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&name_map),
+    )
+    .await;
+    let mut attempt = tr::StreamAttempt::new(tracer);
+
     // The broker owns the API key and executes/signs the request; this path
     // never resolves or attaches a credential.
-    let mut stream = broker
-        .proxy_stream(crate::auth::ProxyRequest {
-            provider: cfg.provider.clone(),
-            method: crate::auth::ProxyMethod::Post,
-            path: "/chat/completions".to_string(),
-            body: Some(body),
-            stream: true,
-        })
+    let stream = broker
+        .proxy_stream(proxy_request)
         .await
         // Privacy (spec §5.1): a broker proxy error may carry an upstream
         // response-body snippet; redact it to status-only before surfacing.
@@ -194,21 +298,46 @@ pub(crate) async fn call_oai_stream_inner(
                 "openai request failed: {}",
                 super::net::redact_provider_proxy_error(&e.to_string())
             )
-        })?;
+        });
+    let mut stream = match stream {
+        Ok(stream) => {
+            attempt.mark_headers();
+            stream
+        }
+        Err(msg) => {
+            // Status parsed from the redacted static-prefix message only;
+            // codes are `http_<status>` or the static `broker_error`.
+            let status = tr::broker_error_status(&msg);
+            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+            attempt.finish_failed(&code, status, None);
+            return Err(msg.into());
+        }
+    };
 
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
     let mut tool_use_blocks: Vec<Value> = Vec::new();
     let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
     let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
+    let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
 
     while let Some(chunk) = tokio::select! {
         chunk = stream.next() => chunk,
         _ = cancel.cancelled() => {
+            attempt.finish_canceled(None, trace_usage);
             return Err("request canceled".into());
         }
     } {
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(chunk) => {
+                attempt.mark_first_byte();
+                chunk
+            }
+            Err(e) => {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(e.into());
+            }
+        };
         buf.extend_from_slice(&chunk);
 
         // Scan for newline-delimited SSE lines (SIMD-accelerated via memchr)
@@ -218,6 +347,7 @@ pub(crate) async fn call_oai_stream_inner(
 
             sink.clear();
             decoder.push_line(line, &mut sink);
+            capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
             handle_events(
                 &sink,
                 tx,
@@ -233,6 +363,7 @@ pub(crate) async fn call_oai_stream_inner(
         let line = std::str::from_utf8(&buf).unwrap_or("");
         sink.clear();
         decoder.push_line(line, &mut sink);
+        capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
         handle_events(
             &sink,
             tx,
@@ -243,6 +374,7 @@ pub(crate) async fn call_oai_stream_inner(
     }
     sink.clear();
     decoder.finish(&mut sink);
+    capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
     handle_events(
         &sink,
         tx,
@@ -250,6 +382,15 @@ pub(crate) async fn call_oai_stream_inner(
         &mut tool_use_blocks,
         &name_map,
     );
+
+    // Normalized stop reason: only when a finish_reason was actually
+    // observed on the wire — never inferred.
+    let stop_reason = decoder
+        .finish_reason
+        .as_deref()
+        .map(tr::stop_reason_from_finish_reason);
+    // Broker paths never observe the upstream HTTP status: honest `None`.
+    attempt.finish_success(None, None, stop_reason, trace_usage);
 
     // Build Anthropic-shaped final response
     let mut content: Vec<Value> = Vec::new();
@@ -279,6 +420,7 @@ pub(crate) async fn call_codex_stream_inner(
     codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Build the exact provider-qualified plan before any credential or network
     // access. Logical Ultra is lowered here, never in the generic level enum.
@@ -385,6 +527,26 @@ pub(crate) async fn call_codex_stream_inner(
     );
     tracing::debug!(url=%url, model=%cfg.model, "codex stream request");
 
+    // Serialize ONCE. These exact bytes are digested for the trace AND are
+    // the request body of every attempt — retries resend the identical
+    // buffer, so one wire digest is honest for all attempt records.
+    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+    // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        crate::runtime::trace::TransportKind::OpenAiResponses,
+        &url,
+        Some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&name_map),
+    )
+    .await;
+    let mut attempt = tr::StreamAttempt::new(tracer);
+
     let resp = send_with_retries(
         "codex",
         &url,
@@ -397,12 +559,16 @@ pub(crate) async fn call_codex_stream_inner(
                 .header("OpenAI-Beta", "responses=experimental")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .json(&body)
+                .body(body_bytes.clone())
         },
         cancel,
         max_retries,
+        &mut attempt,
     )
     .await?;
+    // Direct HTTP: upstream status and provider request id are observed.
+    let http_status = Some(resp.status().as_u16());
+    let trace_rid = tr::provider_request_id_from_headers(resp.headers());
 
     let mut accumulated_text = String::new();
     let mut parser = CodexSseDecoder::default();
@@ -412,15 +578,28 @@ pub(crate) async fn call_codex_stream_inner(
     while let Some(chunk) = tokio::select! {
         chunk = stream.next() => chunk,
         _ = cancel.cancelled() => {
+            attempt.finish_canceled(http_status, parser.trace_usage());
             return Err("request canceled".into());
         }
     } {
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(chunk) => {
+                attempt.mark_first_byte();
+                chunk
+            }
+            Err(e) => {
+                attempt.finish_failed("stream_error", http_status, trace_rid.clone());
+                return Err(e.into());
+            }
+        };
         buf.extend_from_slice(&chunk);
         while let Some(nl) = memchr::memchr(b'\n', &buf) {
             let line_bytes = buf.split_to(nl + 1);
             let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
             parser.push_line(line, tx, &mut accumulated_text);
+        }
+        if parser.saw_model_event {
+            attempt.mark_first_model_event();
         }
     }
     if !buf.is_empty() {
@@ -428,6 +607,13 @@ pub(crate) async fn call_codex_stream_inner(
         parser.push_line(line, tx, &mut accumulated_text);
     }
     parser.finish();
+    // Trailing-buffer flush and finish() can surface the first (or only)
+    // model event — e.g. a payload dispatched by the tail line. Mark it so
+    // first_model_event_ms is honest even for tail-only streams.
+    if parser.saw_model_event {
+        attempt.mark_first_model_event();
+    }
+    attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
 
     let mut content: Vec<Value> = Vec::new();
     if !accumulated_text.is_empty() {
@@ -641,6 +827,12 @@ struct CodexSseDecoder {
     buffer: String,
     active_tools: Vec<CodexToolAccumulator>,
     completed_tools: Vec<ToolCall>,
+    /// Trace (Task 10A): set once the decoder parses any model event —
+    /// feeds the first-model-event timing bucket.
+    saw_model_event: bool,
+    /// Trace (Task 10A): provider-reported usage from `response.completed`
+    /// (input including cached, output, cached slice). `None` until observed.
+    observed_usage: Option<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -706,6 +898,17 @@ impl CodexSseDecoder {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.output_item.added"
+                | "response.function_call_arguments.delta"
+                | "response.output_item.done"
+                | "response.completed"
+                | "response.done"
+        ) {
+            self.saw_model_event = true;
+        }
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -869,7 +1072,7 @@ impl CodexSseDecoder {
         }
     }
 
-    fn push_usage(&self, event: &Value, tx: &mpsc::UnboundedSender<StreamEvent>) {
+    fn push_usage(&mut self, event: &Value, tx: &mpsc::UnboundedSender<StreamEvent>) {
         let usage = event
             .get("response")
             .and_then(|r| r.get("usage"))
@@ -894,6 +1097,11 @@ impl CodexSseDecoder {
             .unwrap_or(0)
             .min(input);
         if input > 0 || output > 0 {
+            // Trace capture (metadata only): the provider-reported totals as
+            // sent — input including the cached slice.
+            if self.observed_usage.is_none() {
+                self.observed_usage = Some((input, output, cached));
+            }
             let _ = tx.send(StreamEvent::Session(
                 crate::runtime::types::SessionEvent::Usage {
                     input_tokens: input - cached,
@@ -906,6 +1114,12 @@ impl CodexSseDecoder {
                 },
             ));
         }
+    }
+
+    /// Provider-reported usage for the trace record; `None` until observed.
+    fn trace_usage(&self) -> Option<crate::runtime::trace::UsageMeta> {
+        self.observed_usage
+            .map(|(input, output, cached)| tr::provider_usage(input, output, cached))
     }
 
     fn finish(&mut self) {
@@ -1472,10 +1686,22 @@ mod broker_stream_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let result =
-            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
-                .await
-                .expect("stream must complete");
+        let result = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .expect("stream must complete");
 
         // Final Anthropic-shaped value carries the accumulated text.
         assert_eq!(result["content"][0]["text"], "Hello");
@@ -1507,11 +1733,23 @@ mod broker_stream_tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let err =
-            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
-                .await
-                .unwrap_err()
-                .to_string();
+        let err = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown provider"), "got: {err}");
         assert!(!err.to_lowercase().contains("bearer"));
     }
@@ -1570,6 +1808,8 @@ mod broker_stream_tests {
             None,
             0,
             &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
         )
         .await
         .expect_err("500 must fail")
@@ -1596,6 +1836,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
     max_tokens: Option<u32>,
     reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, names) = translate::tools_to_oai(tools_schema);
     let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
@@ -1620,33 +1862,92 @@ pub(crate) async fn call_xai_responses_stream_inner(
         max_tokens,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let mut stream = broker
-        .proxy_stream(crate::auth::ProxyRequest {
-            provider: "xai-auth".into(),
-            method: crate::auth::ProxyMethod::Post,
-            path: "/responses".into(),
-            body: Some(body),
-            stream: true,
-        })
+    // Serialize ONCE via the sanctioned constructor: the digested bytes are
+    // the very bytes the broker sends upstream (`body_bytes` handoff,
+    // LocalBroker verbatim) — `body`/`body_bytes` cannot diverge. On a
+    // remote broker the daemon re-serializes out of process → honest
+    // `CloudProxy` kind and no wire-byte claim.
+    let (proxy_request, body_bytes) =
+        crate::auth::ProxyRequest::post_json_exact("xai-auth", "/responses", body, true)?;
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        if exact_wire_bytes {
+            crate::runtime::trace::TransportKind::OpenAiResponses
+        } else {
+            crate::runtime::trace::TransportKind::CloudProxy
+        },
+        &format!("{}/responses", cfg.base_url.trim_end_matches('/')),
+        exact_wire_bytes.then_some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&names),
+    )
+    .await;
+    let mut attempt = tr::StreamAttempt::new(tracer);
+    let stream = broker
+        .proxy_stream(proxy_request)
         .await
         // Privacy (spec §5.1): a broker proxy error may carry an upstream
         // response-body snippet; redact it to status-only before surfacing.
-        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()))?;
+        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+    let mut stream = match stream {
+        Ok(stream) => {
+            attempt.mark_headers();
+            stream
+        }
+        Err(msg) => {
+            let status = tr::broker_error_status(&msg);
+            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+            attempt.finish_failed(&code, status, None);
+            return Err(msg.into());
+        }
+    };
     let mut text = String::new();
     let mut parser = CodexSseDecoder::default();
     let mut buf = bytes::BytesMut::new();
-    while let Some(chunk) = tokio::select! { c=stream.next()=>c, _=cancel.cancelled()=>return Err("request canceled".into()) }
-    {
-        buf.extend_from_slice(&chunk?);
+    while let Some(chunk) = tokio::select! {
+        c = stream.next() => c,
+        _ = cancel.cancelled() => {
+            attempt.finish_canceled(None, parser.trace_usage());
+            return Err("request canceled".into());
+        }
+    } {
+        let chunk = match chunk {
+            Ok(chunk) => {
+                attempt.mark_first_byte();
+                chunk
+            }
+            Err(e) => {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(e.into());
+            }
+        };
+        buf.extend_from_slice(&chunk);
         while let Some(n) = memchr::memchr(b'\n', &buf) {
             let line = buf.split_to(n + 1);
             parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
+        }
+        if parser.saw_model_event {
+            attempt.mark_first_model_event();
         }
     }
     if !buf.is_empty() {
         parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
     }
     parser.finish();
+    // Trailing-buffer flush and finish() can surface the first (or only)
+    // model event; mark it so first_model_event_ms is honest for tail-only
+    // streams (mirrors the Codex direct path above).
+    if parser.saw_model_event {
+        attempt.mark_first_model_event();
+    }
+    // Broker paths never observe the upstream HTTP status; the Responses
+    // stream does not yet expose a normalized stop reason — both stay
+    // honest `None` rather than guessed values.
+    attempt.finish_success(None, None, None, parser.trace_usage());
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(json!({"type":"text","text":text}));
@@ -2407,6 +2708,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             max_retries,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
     }
@@ -2438,6 +2740,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             0,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
         .expect_err("foreground Ultra without delegation tools must fail closed");
@@ -2477,6 +2780,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             0,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
         .expect_err("the Codex seam must validate provider-qualified identity");
@@ -2687,6 +2991,7 @@ mod send_retry_tests {
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             3,
+            &mut tr::StreamAttempt::new(None),
         )
         .await
         .expect_err("400 must fail fast");
@@ -2716,6 +3021,7 @@ mod send_retry_tests {
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             1,
+            &mut tr::StreamAttempt::new(None),
         )
         .await
         .expect_err("persistent 503 must exhaust the budget");

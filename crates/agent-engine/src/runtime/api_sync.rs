@@ -115,6 +115,7 @@ impl ApiMethods {
             &options.token_cache,
             max_retries,
             options.codex_request_role,
+            &options.trace,
         )
         .await
         {
@@ -542,6 +543,7 @@ impl ApiMethods {
             &crate::auth::TokenCache::new(),
             max_retries,
             crate::runtime::openai::catalog::CodexRequestRole::Internal,
+            &options.trace,
         )
         .await
         {

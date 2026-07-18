@@ -1013,6 +1013,7 @@ impl ApiMethods {
             &options.token_cache,
             max_retries,
             options.codex_request_role,
+            &options.trace,
         )
         .await
         {
