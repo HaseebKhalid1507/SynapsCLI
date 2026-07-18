@@ -27,6 +27,7 @@ mod sse_types;
 mod stream;
 pub mod subagent;
 pub mod telemetry;
+pub mod trace;
 mod types;
 
 use api::ApiMethods;
