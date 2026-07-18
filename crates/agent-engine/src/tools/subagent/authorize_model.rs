@@ -12,7 +12,7 @@ impl Tool for SubagentModelAuthorizeTool {
     }
 
     fn description(&self) -> &str {
-        "Request interactive user confirmation to authorize one exact qualified model for subagent use in this session. Validate the exact runtime model locally, then show the user the identity before granting it. The grant is session-only: it does not change the foreground model or persist favorites."
+        "Authorize one exact qualified, locally known model for subagent use in this session. The grant is session-only: it does not change the foreground model or persist favorites. No sudo or interactive confirmation is required."
     }
 
     fn parameters(&self) -> Value {
@@ -61,29 +61,6 @@ impl Tool for SubagentModelAuthorizeTool {
             })
             .to_string());
         }
-        let prompt = ctx.capabilities.secret_prompt.as_ref().ok_or_else(|| {
-            RuntimeError::Tool(
-                "worker-model authorization denied: interactive confirmation is unavailable".into(),
-            )
-        })?;
-        let response = prompt
-            .prompt(
-                "Authorize worker model".to_string(),
-                format!(
-                    "Allow exact worker model '{}' for this session only? This will not change the foreground model or persist a favorite.\n\nType 'yes' or 'y' to allow.",
-                    model.as_str()
-                ),
-            )
-            .await;
-        let confirmed = response.as_deref().map(str::trim).is_some_and(|answer| {
-            answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y")
-        });
-        if !confirmed {
-            return Err(RuntimeError::Tool(format!(
-                "worker-model authorization confirmation denied for '{}'",
-                model.as_str()
-            )));
-        }
         policy
             .grant_worker_model(model.as_str())
             .map_err(RuntimeError::Tool)?;
@@ -115,36 +92,19 @@ mod tests {
         ctx
     }
 
-    fn install_confirmation(
-        ctx: &mut ToolContext,
-        response: Option<&'static str>,
-    ) -> tokio::task::JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        ctx.capabilities.secret_prompt = Some(crate::tools::SecretPromptHandle::new(tx));
-        tokio::spawn(async move {
-            let request = rx.recv().await.expect("authorization confirmation request");
-            assert_eq!(request.title, "Authorize worker model");
-            assert!(request.prompt.contains("anthropic/claude-sonnet-4-6"));
-            assert!(request.prompt.contains("session"));
-            let _ = request.response_tx.send(response.map(str::to_string));
-        })
-    }
-
     #[tokio::test]
-    async fn confirmed_known_model_is_added_for_this_session() {
-        let mut ctx = context_without_sonnet();
+    async fn known_model_is_added_for_this_session() {
+        let ctx = context_without_sonnet();
         let policy = ctx.capabilities.orchestration.clone().unwrap();
         assert!(!policy
             .effective_choices()
             .contains(&"anthropic/claude-sonnet-4-6".to_owned()));
-        let responder = install_confirmation(&mut ctx, Some("yes"));
 
         let output = SubagentModelAuthorizeTool
             .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
             .await
             .unwrap();
 
-        responder.await.unwrap();
         let output: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(output["authorized_model"], "anthropic/claude-sonnet-4-6");
         assert_eq!(output["scope"], "session");
@@ -175,84 +135,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_interactive_confirmation_fails_without_mutating_policy() {
+    async fn known_model_is_authorized_without_an_interactive_prompt() {
         let ctx = context_without_sonnet();
         let policy = ctx.capabilities.orchestration.clone().unwrap();
-        let before = policy.effective_choices();
+        assert!(ctx.capabilities.secret_prompt.is_none());
 
-        let error = SubagentModelAuthorizeTool
+        let output = SubagentModelAuthorizeTool
             .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("interactive confirmation"), "{error}");
-        assert_eq!(policy.effective_choices(), before);
-    }
-
-    #[tokio::test]
-    async fn denied_confirmation_fails_without_mutating_policy() {
-        let mut ctx = context_without_sonnet();
-        let policy = ctx.capabilities.orchestration.clone().unwrap();
-        let before = policy.effective_choices();
-        let responder = install_confirmation(&mut ctx, Some("no"));
-
-        let error = SubagentModelAuthorizeTool
-            .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        responder.await.unwrap();
-        assert!(error.contains("confirmation denied"), "{error}");
-        assert_eq!(policy.effective_choices(), before);
-    }
-
-    #[tokio::test]
-    async fn canceled_confirmation_fails_without_mutating_policy() {
-        let mut ctx = context_without_sonnet();
-        let policy = ctx.capabilities.orchestration.clone().unwrap();
-        let before = policy.effective_choices();
-        let responder = install_confirmation(&mut ctx, None);
-
-        let error = SubagentModelAuthorizeTool
-            .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        responder.await.unwrap();
-        assert!(error.contains("confirmation denied"), "{error}");
-        assert_eq!(policy.effective_choices(), before);
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["authorized_model"], "anthropic/claude-sonnet-4-6");
+        assert!(policy
+            .effective_choices()
+            .contains(&"anthropic/claude-sonnet-4-6".to_owned()));
+        policy
+            .resolve_and_authorize("sa_user_requested", Some("anthropic/claude-sonnet-4-6"))
+            .expect("newly authorized exact model must dispatch");
     }
 
     #[tokio::test]
     async fn authorization_is_exact_and_does_not_grant_sibling_models() {
-        let mut ctx = context_without_sonnet();
+        let ctx = context_without_sonnet();
         let policy = ctx.capabilities.orchestration.clone().unwrap();
-        let responder = install_confirmation(&mut ctx, Some("y"));
 
         SubagentModelAuthorizeTool
             .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
             .await
             .unwrap();
 
-        responder.await.unwrap();
         assert!(policy.preflight("anthropic/claude-sonnet-4-6").is_ok());
         assert!(policy.preflight("anthropic/claude-fable-5").is_err());
     }
 
     #[tokio::test]
     async fn authorization_is_not_present_in_a_fresh_session() {
-        let mut ctx = context_without_sonnet();
+        let ctx = context_without_sonnet();
         let policy = ctx.capabilities.orchestration.clone().unwrap();
-        let responder = install_confirmation(&mut ctx, Some("yes"));
 
         SubagentModelAuthorizeTool
             .execute(json!({"model": "anthropic/claude-sonnet-4-6"}), ctx)
             .await
             .unwrap();
-        responder.await.unwrap();
         assert!(policy.preflight("anthropic/claude-sonnet-4-6").is_ok());
 
         let fresh = context_without_sonnet();

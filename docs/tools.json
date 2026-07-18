@@ -326,7 +326,7 @@
     }
   },
   {
-    "description": "Request interactive user confirmation to authorize one exact qualified model for subagent use in this session. Validate the exact runtime model locally, then show the user the identity before granting it. The grant is session-only: it does not change the foreground model or persist favorites.",
+    "description": "Authorize one exact qualified, locally known model for subagent use in this session. The grant is session-only: it does not change the foreground model or persist favorites. No sudo or interactive confirmation is required.",
     "name": "subagent_model_authorize",
     "parameters": {
       "additionalProperties": false,
