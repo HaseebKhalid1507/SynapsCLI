@@ -7,6 +7,9 @@ legacy extension-manager tests that only need to assert resolved manifest config
 import json
 import sys
 
+EXIT_ON_HOOK_ONCE = "--exit-on-hook-once" in sys.argv
+EXIT_MARKER = ".exit-on-hook-once"
+
 
 def read_message():
     content_length = None
@@ -46,6 +49,9 @@ while True:
             json.dump(config, f, sort_keys=True)
         write_message(request, {"protocol_version": 1, "capabilities": {}})
     elif method == "hook.handle":
+        if EXIT_ON_HOOK_ONCE and not __import__("os").path.exists(EXIT_MARKER):
+            open(EXIT_MARKER, "w", encoding="utf-8").close()
+            sys.exit(42)
         write_message(request, {"action": "continue"})
     elif method == "shutdown":
         write_message(request, None)
