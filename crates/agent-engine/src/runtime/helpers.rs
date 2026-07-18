@@ -357,11 +357,6 @@ impl HelperMethods {
             setting
         };
 
-        // Best-effort: create parent dir; ignore failure (open will error out)
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
         let total = input_t + cache_read + cache_create;
         let pct = if total > 0 {
             (cache_read as f64 / total as f64 * 100.0) as u32
@@ -369,30 +364,28 @@ impl HelperMethods {
             0
         };
 
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: refuse to open if the target is a symlink. Defensive
-        // against a co-located user planting a symlink at a custom
-        // SYNAPS_USAGE_LOG path (CWE-59). The default path lives under
-        // $HOME/.cache which is typically 0700 so this is belt-and-braces.
-        #[cfg(target_os = "linux")]
-        const O_NOFOLLOW_FLAG: i32 = 0o400000;
-        #[cfg(target_os = "macos")]
-        const O_NOFOLLOW_FLAG: i32 = 0x0100;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const O_NOFOLLOW_FLAG: i32 = 0;
-        let result = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW_FLAG)
-            .open(&path);
-        if let Ok(mut f) = result {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
+        Self::append_usage_line(
+            std::path::Path::new(&path),
+            &format!(
                 "uncached={} cache_read={} cache_write={} output={} hit={}%",
                 input_t, cache_read, cache_create, output_t, pct
-            );
+            ),
+        );
+    }
+
+    /// Append one line to the usage log. Best-effort — errors silently
+    /// dropped so a broken log path never breaks the request pipeline.
+    ///
+    /// Delegates to `private_fs`: parent dir 0700, file created 0600 with
+    /// O_NOFOLLOW (CWE-59 — a co-located user planting a symlink at a custom
+    /// SYNAPS_USAGE_LOG path is refused), broader pre-existing modes repaired.
+    pub(super) fn append_usage_line(path: &std::path::Path, line: &str) {
+        if let Some(parent) = path.parent() {
+            let _ = agent_core::core::private_fs::ensure_private_dir(parent);
+        }
+        if let Ok(mut f) = agent_core::core::private_fs::open_private_append(path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
         }
     }
 }
@@ -1021,5 +1014,52 @@ mod tests {
             serde_json::to_string(&body["tools"][1]["cache_control"]).unwrap(),
             r#"{"type":"ephemeral"}"#,
         );
+    }
+
+    /// Private-mode test for the usage log (spec §5.4). Umask isolation:
+    /// `#[serial(umask)]` serializes umask-mutating tests crate-wide; the
+    /// guard restores the previous process-global mask on drop (panic-safe).
+    #[cfg(unix)]
+    mod usage_private_modes {
+        use super::*;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct UmaskGuard {
+            old: libc::mode_t,
+        }
+        impl UmaskGuard {
+            fn set(mask: libc::mode_t) -> Self {
+                Self {
+                    old: unsafe { libc::umask(mask) },
+                }
+            }
+        }
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.old);
+                }
+            }
+        }
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn usage_line_creates_0600_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join("synaps").join("usage.log");
+            HelperMethods::append_usage_line(&path, "uncached=1");
+            assert_eq!(
+                mode_of(path.parent().unwrap()),
+                0o700,
+                "usage dir must be 0700"
+            );
+            assert_eq!(mode_of(&path), 0o600, "usage file must be 0600");
+        }
     }
 }

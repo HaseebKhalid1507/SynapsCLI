@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,9 +124,10 @@ pub(crate) fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), Memory
         });
     }
     let dir = memory_dir_in(base);
-    fs::create_dir_all(&dir)?;
+    crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, &record.namespace);
-    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
+    let mut f =
+        crate::core::private_fs::open_private_append(&path).map_err(std::io::Error::from)?;
     let mut line = serde_json::to_string(record)?;
     line.push('\n');
     f.write_all(line.as_bytes())?;
@@ -419,5 +420,69 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let got = query_in(tmp.path(), "nope", &MemoryQuery::default()).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Private-mode tests (spec §5.4). Umask isolation: see
+    /// `private_fs::test_support::UmaskGuard` — `#[serial(umask)]` serializes
+    /// every umask-mutating test in the crate, and the guard restores the old
+    /// mask on drop (panic-safe).
+    #[cfg(unix)]
+    mod private_modes {
+        use super::*;
+        use crate::core::private_fs::test_support::UmaskGuard;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn append_creates_0600_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = TempDir::new().unwrap();
+            append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+            let dir = memory_dir_in(tmp.path());
+            assert_eq!(mode_of(&dir), 0o700, "memory dir must be 0700");
+            assert_eq!(
+                mode_of(&dir.join("ns.jsonl")),
+                0o600,
+                "memory file must be 0600"
+            );
+        }
+
+        #[test]
+        fn append_refuses_symlink_target() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("ns.jsonl")).unwrap();
+            let res = append_to(tmp.path(), &rec("ns", 1, "secret", vec![]));
+            assert!(res.is_err(), "append through a symlink must fail");
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "",
+                "no bytes may be written through the planted symlink"
+            );
+        }
+
+        #[test]
+        fn append_repairs_preexisting_broad_mode() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("ns.jsonl");
+            fs::write(&file, "").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
+            append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+            assert_eq!(
+                mode_of(&file),
+                0o600,
+                "broad pre-existing mode must be repaired"
+            );
+        }
     }
 }

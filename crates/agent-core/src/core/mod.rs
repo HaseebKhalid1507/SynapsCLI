@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod logging;
 pub mod models;
+pub mod private_fs;
 pub mod protocol;
 pub mod reasoning;
 pub mod rpc_dispatch;

@@ -3307,6 +3307,7 @@ dependencies = [
  "dirs",
  "fs4",
  "futures",
+ "libc",
  "rand 0.9.4",
  "reqwest",
  "serde",

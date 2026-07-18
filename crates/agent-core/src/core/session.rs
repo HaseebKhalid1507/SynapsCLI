@@ -142,12 +142,11 @@ impl Session {
 
     pub async fn save(&self) -> std::io::Result<()> {
         let dir = crate::config::resolve_write_path("sessions");
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{}.json", self.id));
-        let tmp = path.with_extension("tmp");
         let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        tokio::fs::write(&tmp, &json).await?;
-        tokio::fs::rename(&tmp, &path).await
+        let id = self.id.clone();
+        tokio::task::spawn_blocking(move || save_json_in_dir(&dir, &id, json.as_bytes()))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {
@@ -199,6 +198,20 @@ impl Session {
     pub fn clear_name(&mut self) {
         self.name = None;
     }
+}
+
+/// Blocking body of [`Session::save`]: create the sessions dir (0700), then
+/// write `<id>.json` atomically via `private_fs` (temp file created with mode
+/// 0600 — never create-then-chmod — then renamed; symlink targets refused).
+pub(crate) fn save_json_in_dir(
+    dir: &std::path::Path,
+    id: &str,
+    json: &[u8],
+) -> std::io::Result<()> {
+    crate::core::private_fs::ensure_private_dir(dir)?;
+    let path = dir.join(format!("{id}.json"));
+    crate::core::private_fs::write_atomic_private(&path, json)?;
+    Ok(())
 }
 
 /// Find a session by full or partial ID match
@@ -890,5 +903,53 @@ mod tests {
             resumed.parent_session.as_deref(),
             Some(original.id.as_str())
         );
+    }
+
+    /// Private-mode tests (spec §5.4). Umask isolation: `#[serial(umask)]`
+    /// serializes umask-mutating tests crate-wide; `UmaskGuard` restores the
+    /// previous mask on drop (panic-safe). These exercise the blocking body
+    /// of `Session::save` directly with a temp dir — no env mutation.
+    #[cfg(unix)]
+    mod private_modes {
+        use super::*;
+        use crate::core::private_fs::test_support::UmaskGuard;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn save_creates_0600_session_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            save_json_in_dir(&dir, "sess-1", b"{}").unwrap();
+            assert_eq!(mode_of(&dir), 0o700, "sessions dir must be 0700");
+            assert_eq!(
+                mode_of(&dir.join("sess-1.json")),
+                0o600,
+                "session file must be 0600"
+            );
+        }
+
+        #[test]
+        fn save_refuses_symlink_target() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.json");
+            std::fs::write(&victim, "original").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("sess-1.json")).unwrap();
+            let res = save_json_in_dir(&dir, "sess-1", b"{}");
+            assert!(res.is_err(), "save onto a symlink must fail");
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "original",
+                "no bytes may be written through the planted symlink"
+            );
+        }
     }
 }
