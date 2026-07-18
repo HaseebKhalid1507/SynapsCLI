@@ -1473,6 +1473,10 @@ pub(crate) async fn handle_input_action(
                                         false,
                                         vec![
                                             entry.context_label,
+                                            // Spec §5.5: cloud routes are
+                                            // text-only until tool translation
+                                            // exists; advertise it honestly.
+                                            "text-only".into(),
                                             if entry.stale {
                                                 "stale".into()
                                             } else {

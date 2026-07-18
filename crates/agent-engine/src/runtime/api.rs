@@ -796,6 +796,13 @@ impl ApiMethods {
         if let Some((provider_key, _)) = cloud_model.split_once('/') {
             if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
                 use futures::StreamExt;
+                // Spec §5.5 pre-flight: cloud routes are text-only. A mode
+                // that exposes tools must fail HERE — before the broker is
+                // constructed, before any credential lookup, before any
+                // network access. The invoke-time guard inside the broker
+                // remains as defense in depth.
+                crate::auth::preflight_cloud_capability(provider, !tools.tools_schema().is_empty())
+                    .map_err(|e| RuntimeError::Config(e.to_string()))?;
                 let broker = crate::auth::broker_from_source(
                     &options.credential_source,
                     &options.token_cache,
@@ -3272,5 +3279,111 @@ mod on401_tests {
                 "metadata field `{field}` missing from trace output: {output}"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 5 — honest cloud tool capability (spec §5.5).
+//
+// Cloud broker routes are text-only until full tool translation exists. A
+// mode that requires tools must fail with a typed unsupported-capability
+// error BEFORE any credential lookup or network access. The counting stub
+// broker below receives every credential/catalog/invoke request a Remote
+// source could make; the pre-flight is proven by the counter staying at 0.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod cloud_capability_tests {
+    use axum::{http::StatusCode, Router};
+    use reqwest::Client;
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::{mpsc, RwLock};
+
+    use super::{ApiMethods, ApiOptions};
+    use crate::auth::{CredentialSource, TokenCache};
+    use crate::runtime::telemetry::TelemetryLevel;
+    use crate::runtime::types::AuthState;
+    use crate::{StreamEvent, ToolRegistry};
+
+    /// Stub broker that counts EVERY inbound request (any method, any path):
+    /// token vend, cloud catalog, and cloud invoke all land here for a Remote
+    /// credential source, so `hits == 0` proves zero credential use and zero
+    /// network activity.
+    async fn spawn_counting_stub() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let app = Router::new().fallback(move || {
+            let hits = Arc::clone(&hits_clone);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    async fn drive_cloud(tools: ToolRegistry) -> (crate::error::Result<serde_json::Value>, usize) {
+        let (endpoint, hits) = spawn_counting_stub().await;
+        let options = ApiOptions {
+            credential_source: CredentialSource::Remote {
+                endpoint,
+                machine_token: "machine-tok".into(),
+            },
+            token_cache: TokenCache::new(),
+            ..Default::default()
+        };
+        let auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "unused".into(),
+            auth_type: "api_key".into(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+        }));
+        let client = Client::new();
+        let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "aws-bedrock/anthropic.claude-3-haiku#synaps-context=ctx-test",
+            &tools,
+            &None,
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &messages,
+            tx,
+            0,
+            0,
+            &options,
+            TelemetryLevel::Off,
+        )
+        .await;
+        (result, hits.load(Ordering::SeqCst))
+    }
+
+    /// RED at HEAD: no pre-flight exists, so the request reaches the stub
+    /// broker (hits > 0) and fails with a transport-ish error instead of the
+    /// typed unsupported-capability error. GREEN once the pre-flight fires
+    /// before `broker_from_source`.
+    #[tokio::test]
+    async fn tool_requiring_cloud_route_fails_before_credentials_or_network() {
+        // Default chat registry: tools are required.
+        let (result, hits) = drive_cloud(ToolRegistry::new()).await;
+        let msg = result
+            .expect_err("tool-requiring cloud route must fail")
+            .to_string();
+        assert!(
+            msg.contains("text-only") && msg.contains("tools"),
+            "expected typed unsupported-capability error, got: {msg}"
+        );
+        assert_eq!(
+            hits, 0,
+            "cloud pre-flight must reject tools before any credential or network use"
+        );
     }
 }

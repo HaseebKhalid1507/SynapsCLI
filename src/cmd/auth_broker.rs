@@ -701,9 +701,9 @@ async fn capabilities(
 /// Map a broker error to an HTTP response. Messages are secret-free.
 fn broker_error_response(e: auth::BrokerError) -> axum::response::Response {
     let status = match e {
-        auth::BrokerError::UnknownProvider(_) | auth::BrokerError::Denied(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        auth::BrokerError::UnknownProvider(_)
+        | auth::BrokerError::Denied(_)
+        | auth::BrokerError::UnsupportedCapability { .. } => StatusCode::BAD_REQUEST,
         auth::BrokerError::NotConfigured(_) => StatusCode::FORBIDDEN,
         auth::BrokerError::Unauthorized => StatusCode::UNAUTHORIZED,
         _ => StatusCode::BAD_GATEWAY,

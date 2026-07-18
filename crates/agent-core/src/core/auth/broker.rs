@@ -175,6 +175,12 @@ pub enum BrokerError {
     Unauthorized,
     /// The request was rejected by broker policy (e.g. malformed proxy path).
     Denied(String),
+    /// The route honestly lacks a capability the request needs (e.g. tools on
+    /// a text-only cloud route). Raised pre-flight, before credentials/network.
+    UnsupportedCapability {
+        provider: String,
+        capability: String,
+    },
     /// Transport-level failure talking to the broker or the provider.
     Transport(String),
     /// Credential storage/refresh failure (message is already secret-free).
@@ -197,6 +203,14 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Unauthorized => write!(f, "broker rejected machine auth"),
             Self::Denied(msg) => write!(f, "broker denied request: {msg}"),
+            Self::UnsupportedCapability {
+                provider,
+                capability,
+            } => write!(
+                f,
+                "cloud provider '{provider}' is text-only: {capability} are not supported yet \
+                 (no credential was used and no network request was made)"
+            ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
         }
@@ -2197,6 +2211,23 @@ impl CredentialBroker for RemoteBroker {
 
 /// Build the right broker for a credential source. Local sources get the
 /// in-process broker (no daemon needed); remote sources get the authenticated
+/// Pre-flight capability check for a cloud route (spec §5.5). Pure function:
+/// callers MUST run it before constructing a broker, looking up credentials,
+/// or opening any connection. The invoke-time guard inside the broker remains
+/// in place as defense in depth.
+pub fn preflight_cloud_capability(
+    provider: CloudProviderId,
+    needs_tools: bool,
+) -> Result<(), BrokerError> {
+    if needs_tools && !provider.supports_tools() {
+        return Err(BrokerError::UnsupportedCapability {
+            provider: provider.to_string(),
+            capability: "tools".into(),
+        });
+    }
+    Ok(())
+}
+
 /// remote transport. There is no third option — and no direct-read fallback.
 pub fn broker_from_source(
     source: &super::CredentialSource,
@@ -2275,6 +2306,31 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec §5.5: the pre-flight capability check is a pure function — it can
+    /// be (and is) called before any credential lookup or network access. A
+    /// tool-requiring request against any text-only cloud route must yield the
+    /// typed unsupported-capability error; text-only requests pass.
+    #[test]
+    fn preflight_rejects_tool_requiring_cloud_routes_with_typed_error() {
+        for provider in [
+            CloudProviderId::AzureOpenAi,
+            CloudProviderId::AwsBedrock,
+            CloudProviderId::GoogleVertex,
+        ] {
+            let err = preflight_cloud_capability(provider, true)
+                .expect_err("tool-requiring cloud route must fail pre-flight");
+            assert_eq!(
+                err,
+                BrokerError::UnsupportedCapability {
+                    provider: provider.to_string(),
+                    capability: "tools".into(),
+                }
+            );
+            assert!(err.to_string().contains("text-only"));
+            assert_eq!(preflight_cloud_capability(provider, false), Ok(()));
+        }
+    }
 
     async fn spawn_ndjson(body: &'static str) -> String {
         use axum::{body::Body, routing::post, Router};
