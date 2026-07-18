@@ -184,7 +184,13 @@ pub(super) async fn handle_stream_event(
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
             app.drop_empty_thinking();
-            app.push_msg(ChatMessage::Error(sanitize_notice(&err)));
+            // Typed spec §5.2 outcome from the engine — surface the message
+            // plus the terminal category + correlation ID, never re-derived.
+            app.push_msg(ChatMessage::Error(format!(
+                "{} [{}]",
+                sanitize_notice(&err.message),
+                err.category_label()
+            )));
             app.streaming = false;
             // Reconcile HUD against registry on error path too (same as Done).
             {
@@ -193,27 +199,15 @@ pub(super) async fn handle_stream_event(
                     .display_rows();
                 reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
             }
-            // Restore a valid trailing state — drop unmatched trailing messages
-            if let Some(last) = app.api_messages.last() {
-                let role = last["role"].as_str().unwrap_or("");
-                let is_text_user = role == "user" && last["content"].is_string();
-                let is_assistant = role == "assistant";
-                if is_text_user || is_assistant {
-                    // If we're dropping the user's own message (stream died
-                    // before any assistant content), recover it into the input
-                    // box instead of silently losing what they typed.
-                    if is_text_user && app.input.is_empty() {
-                        if let Some(text) = last["content"].as_str() {
-                            app.input = text.to_string();
-                            app.cursor_pos = app.input.chars().count();
-                            app.push_msg(ChatMessage::System(
-                                "your message was restored to the input box — press Enter to retry".to_string(),
-                            ));
-                        }
-                    }
-                    app.api_messages.pop();
-                }
-            }
+            // Restore a valid trailing state: remove only invalid messages
+            // appended by the ACTIVE turn. A pre-existing trailing user
+            // message (the prompt that started the turn) is never removed —
+            // it stays in history so the failed turn can be retried with
+            // full context (spec §5.2).
+            synaps_cli::engine::stream::repair_history_after_failure(
+                &mut app.api_messages,
+                app.turn_baseline,
+            );
         }
     }
     StreamAction::Continue
@@ -329,6 +323,7 @@ pub(super) async fn handle_event_queue_arm(
                 let ct = CancellationToken::new();
                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 app.streaming = true;
+                app.turn_baseline = app.api_messages.len();
                 app.spinner_frame = 0;
                 *stream = Some(runtime.run_stream_with_messages(
                     app.api_messages.clone(),
@@ -426,6 +421,7 @@ pub(super) async fn handle_stream_arm(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.status_text = Some("connecting…".to_string());
                             app.streaming = true;
+                            app.turn_baseline = app.api_messages.len();
                             app.spinner_frame = 0;
                             let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
                             let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
@@ -451,6 +447,7 @@ pub(super) async fn handle_stream_arm(
                                 let ct = CancellationToken::new();
                                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 app.streaming = true;
+                                app.turn_baseline = app.api_messages.len();
                                 app.spinner_frame = 0;
                                 *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));

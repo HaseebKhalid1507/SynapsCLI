@@ -524,7 +524,11 @@ mod tests {
         // directly with mutable access to RpcState.
         let events: &[StreamEvent] = &[
             StreamEvent::Session(SessionEvent::Done),
-            StreamEvent::Session(SessionEvent::Error("oops".to_string())),
+            StreamEvent::Session(SessionEvent::Error(crate::TurnError::provider(
+                "oops",
+                "api_status",
+                "turn-test-0",
+            ))),
             StreamEvent::Session(SessionEvent::MessageHistory(vec![])),
             StreamEvent::Session(SessionEvent::Usage {
                 input_tokens: 1,
@@ -641,7 +645,14 @@ mod tests {
     fn accumulate_usage_ignores_error() {
         let mut acc = zero_usage();
         acc.output_tokens = 3;
-        accumulate_usage(&mut acc, &SessionEvent::Error("boom".to_string()));
+        accumulate_usage(
+            &mut acc,
+            &SessionEvent::Error(crate::TurnError::provider(
+                "boom",
+                "api_status",
+                "turn-test-1",
+            )),
+        );
         assert_eq!(
             acc.output_tokens, 3,
             "Error must not mutate the accumulator"

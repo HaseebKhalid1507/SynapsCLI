@@ -1683,8 +1683,14 @@ impl Runtime {
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
+        // One correlation ID per turn: carried by the typed terminal outcome
+        // (spec §5.2) so every frontend can tie the failure to trace lines.
+        let turn_correlation_id = agent_core::next_turn_correlation_id();
+
         if let Err(error) = self.validate_request_preflight().await {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&error, &turn_correlation_id),
+            )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
@@ -1692,7 +1698,9 @@ impl Runtime {
         let anthropic_execution_plan = match self.authorized_anthropic_plan().await {
             Ok(plan) => plan,
             Err(error) => {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                    helpers::turn_error_for(&error, &turn_correlation_id),
+                )));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
                 return Box::pin(UnboundedReceiverStream::new(rx));
             }
@@ -1700,7 +1708,9 @@ impl Runtime {
 
         // Refresh OAuth token if expired after capability preflight.
         if let Err(e) = self.refresh_if_needed().await {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&e, &turn_correlation_id),
+            )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
@@ -1774,11 +1784,14 @@ impl Runtime {
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
+            turn_correlation_id: turn_correlation_id.clone(),
         };
 
         tokio::spawn(async move {
             if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                    helpers::turn_error_for(&e, &turn_correlation_id),
+                )));
             }
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync

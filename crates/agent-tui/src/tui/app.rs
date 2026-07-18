@@ -30,6 +30,9 @@ pub(crate) struct App {
     pub(crate) cursor_pos: usize,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
+    /// `api_messages.len()` at active-turn start. Failure repair may only
+    /// remove messages appended at or after this index (spec §5.2).
+    pub(crate) turn_baseline: usize,
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) input_stash: String,
@@ -220,6 +223,7 @@ impl App {
             cursor_pos: 0,
             api_messages: Vec::new(),
             streaming: false,
+            turn_baseline: 0,
             input_history: Vec::new(),
             history_index: None,
             input_stash: String::new(),

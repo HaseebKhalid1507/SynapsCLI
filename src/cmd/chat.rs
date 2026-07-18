@@ -106,6 +106,10 @@ pub async fn run(
     let mut subagents: Vec<SubagentTracker> = Vec::new();
     let compact_threshold: usize = 80_000;
     let mut last_compacted_tokens: usize = 0;
+    // Typed spec §5.2 terminal failure of the last turn. In headless (piped)
+    // mode an unrecovered failure aborts the read loop and the process exits
+    // nonzero — after the session (with valid partial history) is saved.
+    let mut fatal_failure: Option<synaps_cli::TurnError> = None;
 
     // C4a: consecutive auto-turn counter; reset to 0 on real user input.
     // Initial value doesn't matter — always reset before first turn.
@@ -286,6 +290,8 @@ pub async fn run(
             let cancel = CancellationToken::new();
             // Vec<SharedMessage> clone = pointer bumps only.
             let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
+            // Failure repair may only remove messages appended by this turn.
+            let turn_baseline = msgs_in.len();
             let mut stream = runtime.run_stream_with_messages(
                 msgs_in, cancel, None, None, false
             ).await;
@@ -302,6 +308,7 @@ pub async fn run(
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 );
 
                 match engine_event {
@@ -359,10 +366,18 @@ pub async fn run(
                 }
 
                 match completion {
-                    StreamCompletion::Done | StreamCompletion::Error(_) => {
+                    StreamCompletion::Done => {
                         if in_thinking { eprintln!("\x1b[0m"); }
                         println!();
                         break StreamCompletion::Done;
+                    }
+                    StreamCompletion::Error(err) => {
+                        // Typed spec §5.2 outcome — do NOT collapse into Done.
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                        }
+                        println!();
+                        break StreamCompletion::Error(err);
                     }
                     StreamCompletion::AutoSendQueued(queued) => {
                         if in_thinking { eprintln!("\x1b[0m"); }
@@ -446,12 +461,29 @@ pub async fn run(
                         }
                     }
                 }
+                StreamCompletion::Error(err) => {
+                    // Unrecovered turn failure. History was already repaired
+                    // (turn-appended invalid messages only) and saved above.
+                    eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
+                    fatal_failure = Some(err);
+                    break 'turn_loop;
+                }
                 _ => {
-                    // Done or Error — exit turn loop normally.
+                    // Done — exit turn loop normally.
                     break 'turn_loop;
                 }
             }
         } // end 'turn_loop
+
+        // Headless (piped) mode: an unrecovered failure must terminate with a
+        // nonzero exit instead of silently waiting for more input. In
+        // interactive (TTY) mode the user keeps their session and can retry.
+        if fatal_failure.is_some() {
+            if !is_tty {
+                break;
+            }
+            fatal_failure = None;
+        }
     }
 
     // ── Shutdown ──
@@ -466,5 +498,15 @@ pub async fn run(
 
     boot.background.shutdown();
     eprintln!("session saved: {} (${:.4})", &conv.session.id[..8], conv.session_cost);
+
+    // Criterion: headless `synaps chat` exits nonzero on an unrecovered
+    // provider/tool failure — after the partial history was saved above.
+    if let Some(err) = fatal_failure {
+        return Err(synaps_cli::RuntimeError::Session(format!(
+            "turn failed: {} [{}]",
+            err.message,
+            err.category_label()
+        )));
+    }
     Ok(())
 }

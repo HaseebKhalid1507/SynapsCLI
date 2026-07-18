@@ -726,6 +726,8 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         // Vec<SharedMessage> clone = pointer bumps only.
         let messages: Vec<synaps_cli::SharedMessage> =
             state.conv.read().await.api_messages.clone();
+        // Failure repair may only remove messages appended by this turn.
+        let turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -751,6 +753,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 )
             };
 
@@ -766,13 +769,17 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     state.save_session().await;
                     break 'turn;
                 }
-                StreamCompletion::Error(ref err_msg) => {
-                    // process_stream_event has already trimmed dangling
-                    // messages and emitted EngineStreamEvent::Error which
-                    // we translated to a ServerMessage::Error above. Log
-                    // for traceability instead of silently dropping the
-                    // string with `_`.
-                    tracing::debug!(error = %err_msg, "stream completed with error");
+                StreamCompletion::Error(ref err) => {
+                    // process_stream_event has already repaired the history
+                    // (turn-appended invalid messages only) and emitted
+                    // EngineStreamEvent::Error which we translated to a
+                    // ServerMessage::Error above. Log the typed terminal
+                    // category + correlation ID for traceability.
+                    tracing::debug!(
+                        error = %err.message,
+                        outcome = %err.category_label(),
+                        "stream completed with error"
+                    );
                     state.save_session().await;
                     break 'turn;
                 }
@@ -1066,6 +1073,8 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     'turn: loop {
         let messages: Vec<synaps_cli::SharedMessage> =
             state.conv.read().await.api_messages.clone();
+        // Failure repair may only remove messages appended by this turn.
+        let turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -1087,6 +1096,7 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 )
             };
 
@@ -1102,8 +1112,12 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     state.save_session().await;
                     break 'turn;
                 }
-                StreamCompletion::Error(ref err_msg) => {
-                    tracing::debug!(error = %err_msg, "auto-turn stream completed with error");
+                StreamCompletion::Error(ref err) => {
+                    tracing::debug!(
+                        error = %err.message,
+                        outcome = %err.category_label(),
+                        "auto-turn stream completed with error"
+                    );
                     state.save_session().await;
                     break 'turn;
                 }

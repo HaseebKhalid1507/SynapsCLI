@@ -55,6 +55,8 @@ pub(super) struct StreamSession {
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
+    /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
+    pub(super) turn_correlation_id: String,
 }
 
 pub(super) struct StreamMethods;
@@ -107,6 +109,7 @@ impl StreamMethods {
             auto_approve_confirms,
             telemetry_level,
             orchestration,
+            turn_correlation_id,
         } = session;
         let mut messages = initial_messages;
 
@@ -225,10 +228,13 @@ impl StreamMethods {
                 if content.is_empty() {
                     if !cancel.is_cancelled() {
                         let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                            "model returned an empty response — likely context-window \
-                             exceeded or API overload. Try /compact or start a fresh \
-                             session."
-                                .to_string(),
+                            agent_core::TurnError::provider(
+                                "model returned an empty response — likely context-window \
+                                 exceeded or API overload. Try /compact or start a fresh \
+                                 session.",
+                                "empty_response",
+                                &turn_correlation_id,
+                            ),
                         )));
                     }
                     let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));

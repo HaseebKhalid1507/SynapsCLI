@@ -44,6 +44,39 @@ pub(super) fn cache_control_value(ttl: CacheTtl, site: MarkerSite) -> Value {
 
 pub(crate) struct HelperMethods;
 
+/// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
+/// [`agent_core::TurnError`]. This is the SINGLE derivation point: every
+/// frontend receives the resulting typed outcome (variant + correlation ID)
+/// through `SessionEvent::Error` and must never re-derive it from text.
+pub(crate) fn turn_error_for(
+    err: &crate::RuntimeError,
+    correlation_id: &str,
+) -> agent_core::TurnError {
+    use crate::RuntimeError as E;
+    let provider = |code: &str| agent_core::TurnOutcome::ProviderFailed {
+        code: code.to_string(),
+        correlation_id: correlation_id.to_string(),
+    };
+    let outcome = match err {
+        E::Canceled => agent_core::TurnOutcome::Canceled,
+        E::Api(_) => provider("network_error"),
+        E::ApiStatus(_) => provider("api_status"),
+        E::Auth(_) => provider("auth_error"),
+        E::Config(_) => provider("config_error"),
+        E::Session(_) => provider("session_error"),
+        E::Timeout => provider("timeout"),
+        // Tool-loop failures surfaced as stream errors today carry no tool_id
+        // (they are protocol/orchestration failures, not a specific tool's
+        // result); `TurnOutcome::ToolFailed` is reserved for call-site-typed
+        // failures in later budget/ledger work.
+        E::Tool(_) => provider("tool_error"),
+    };
+    agent_core::TurnError {
+        message: err.to_string(),
+        outcome,
+    }
+}
+
 impl HelperMethods {
     /// Drain all pending steering messages from the channel and inject them
     /// into the conversation as user messages. Returns true if any were injected.

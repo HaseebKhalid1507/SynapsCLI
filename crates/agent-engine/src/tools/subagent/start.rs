@@ -329,7 +329,7 @@ impl Tool for SubagentStartTool {
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
-                                    crate::StreamEvent::Session(SessionEvent::Error(_)) => return Err("provider request failed".into()),
+                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(format!("provider request failed [{}]", e.category_label())),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }

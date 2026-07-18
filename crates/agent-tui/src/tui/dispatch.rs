@@ -356,6 +356,7 @@ pub(crate) async fn handle_input_action(
                     let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     app.status_text = Some("connecting…".to_string());
                     app.streaming = true;
+                    app.turn_baseline = app.api_messages.len();
                     app.spinner_frame = 0;
                     let term_size = crossterm::terminal::size()
                         .map(|(w, h)| ratatui::layout::Size {
@@ -1226,6 +1227,7 @@ pub(crate) async fn handle_input_action(
             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             app.status_text = Some("connecting…".to_string());
             app.streaming = true;
+            app.turn_baseline = app.api_messages.len();
             app.spinner_frame = 0;
             let term_size = crossterm::terminal::size()
                 .map(|(w, h)| ratatui::layout::Size {

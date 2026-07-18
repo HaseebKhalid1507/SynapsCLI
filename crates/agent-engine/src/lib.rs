@@ -24,6 +24,7 @@ pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 // These mirror what root lib.rs was exporting; they let intra-engine code use
 // `crate::Runtime`, `crate::StreamEvent`, etc. (45 uses of StreamEvent alone).
 pub use agent_core::SharedMessage;
+pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
 pub use config::{load_config, resolve_system_prompt, SynapsConfig};
 pub use error::{Result, RuntimeError};
 pub use runtime::{AgentEvent, LlmEvent, Runtime, SessionEvent, StreamEvent};

@@ -564,7 +564,12 @@ pub async fn run(config_path: String, trigger_context: String) {
                     }
                 }
                 StreamEvent::Session(SessionEvent::Error(e)) => {
-                    log(agent_name, &format!("ERROR: {}", e));
+                    // Typed spec §5.2 outcome — log the terminal category +
+                    // correlation ID alongside the message.
+                    log(
+                        agent_name,
+                        &format!("ERROR: {} [{}]", e.message, e.category_label()),
+                    );
                     turn_done = true;
                 }
                 _ => {} // Thinking, SubagentStart/Update/Done, etc.

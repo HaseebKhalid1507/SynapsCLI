@@ -378,16 +378,22 @@ async fn spawn_prompt(
                     let _ = wtx
                         .send(RpcEvent::Error {
                             id: Some(pid.clone()),
-                            message: msg.clone(),
+                            message: msg.message.clone(),
                         })
                         .await;
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
                     let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
+                    // Typed spec §5.2 outcome: forward the engine's terminal
+                    // category + correlation ID verbatim — never re-derived.
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
                             command: resp_command.to_string(),
-                            body: serde_json::json!({ "ok": false, "error": msg }),
+                            body: serde_json::json!({
+                                "ok": false,
+                                "error": msg.message,
+                                "outcome": msg.outcome,
+                            }),
                         })
                         .await;
                     // Error path: terminal_flush(allow_chain=false) — never reserve auto-turn.
