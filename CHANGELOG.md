@@ -4,19 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-18
+
+### Added
+
+- **Reactive subagents** — full lifecycle support for `subagent_start`,
+  `subagent_collect`, `subagent_resume`, `subagent_steer`, and
+  `subagent_status`. Subagents now publish a `subagent_completion` event to the
+  parent's `EventQueue` at thread exit (via a single terminal finalizer outside
+  `catch_unwind`), waking idle parents automatically. Finished-uncollected
+  handles are retained for 15 min via a TTL reaper. Kill-switch:
+  `SYNAPS_DISABLE_SUBAGENT_WAKE=1`. Covers start, resume, panic, timeout, and
+  tokio-build-failure exit paths.
+- **Runtime event system** — canonical `RuntimeEvent` frames added to the
+  protocol layer; the engine centralizes event drain and wake policy; the TUI
+  persists the subagent HUD across turns via registry reconciliation;
+  cross-mode event continuation contract enforced with lint gates and
+  integration tests.
+- **Event reactor** — sessions broadcast runtime events with policy-gated
+  continuation; RPC mode forwards events without auto-turning; chat mode wakes
+  and continues turns on injected runtime events.
+- **Auto-turn continuation** — agent reacts to runtime events instead of
+  polling; auto-turn cap boundary enforced atomically; cross-mode races closed.
+
 ### Fixed
 
-- **Reactive subagent wake (Phase 1)** — subagents no longer silently vanish
-  when the parent turn ends before they complete. `cleanup_finished()` now
-  retains uncollected finished handles for 15 minutes (TTL reaper); a
-  `finalize_subagent` hook fires exactly once at each subagent thread exit
-  (outside `catch_unwind`), stamps `finished_at`, and pushes a
-  `subagent_completion` event to the parent's `EventQueue` so the idle parent
-  wakes and can call `subagent_collect`. Kill-switch:
-  `SYNAPS_DISABLE_SUBAGENT_WAKE=1`. Covers start, resume, panic, timeout, and
-  tokio-build-failure exit paths. Encodes the live regression as integration
-  test I1 (`parent_wakes_after_turn_end_multi_subagent`). See
-  `IMPLEMENTATION-PLAN.md` in the workspace for full design rationale.
+- **Extension secrets retained across restart (PR #64)** — resolved config
+  (including user-supplied secrets) is now preserved when an extension process
+  restarts, eliminating repeated secret prompts.
+- **RPC socket path length fix (PR #64)** — runtime socket root shortened to
+  stay within the OS 104-char `sun_path` limit; path revalidation added on
+  client registration.
+- **Prompt-injection stripping** — tab whitespace stripped from client prompts
+  before registration to block injection via indentation.
+- **Shutdown zombie stream timeout** — auto-turn reservations are not made on
+  terminal error paths; abort is honored across auto-turn registration;
+  recursive futures eliminated in auto-turn scheduling.
 
 ## [0.6.0] — 2026-07-11
 
