@@ -1,9 +1,7 @@
-use serde::{Serialize, Deserialize};
 use crate::core::stream_types::SharedMessage;
-use std::path::PathBuf;
 use chrono::{DateTime, Utc};
-
-
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -29,6 +27,8 @@ pub struct Session {
     /// ID of the session created by compacting this one (forward link)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_into: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_provenance: Option<crate::prompt::PromptProvenance>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -48,7 +48,11 @@ pub struct SessionInfo {
 impl Session {
     pub fn new(model: &str, thinking_level: &str, system_prompt: Option<&str>) -> Self {
         let now = Utc::now();
-        let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().to_string()[..4]);
+        let id = format!(
+            "{}-{}",
+            now.format("%Y%m%d-%H%M%S"),
+            &uuid::Uuid::new_v4().to_string()[..4]
+        );
         Session {
             id,
             title: String::new(),
@@ -65,13 +69,18 @@ impl Session {
             abort_context: None,
             parent_session: None,
             compacted_into: None,
+            prompt_provenance: None,
         }
     }
 
     /// Create a new session from a compaction summary, linked to the parent.
     pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
         let now = Utc::now();
-        let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().to_string()[..4]);
+        let id = format!(
+            "{}-{}",
+            now.format("%Y%m%d-%H%M%S"),
+            &uuid::Uuid::new_v4().to_string()[..4]
+        );
         // Transfer session name from parent — the compacted session is the
         // continuation, so the name should follow. Parent's name will be
         // cleared when the caller saves it with compacted_into set.
@@ -86,7 +95,14 @@ impl Session {
         ));
         Session {
             id,
-            title: format!("↳ {}", if parent.title.is_empty() { &parent.id } else { &parent.title }),
+            title: format!(
+                "↳ {}",
+                if parent.title.is_empty() {
+                    &parent.id
+                } else {
+                    &parent.title
+                }
+            ),
             name,
             model: parent.model.clone(),
             thinking_level: parent.thinking_level.clone(),
@@ -98,11 +114,14 @@ impl Session {
             session_cost: 0.0,
             api_messages: vec![
                 SharedMessage::new(serde_json::json!({"role": "user", "content": summary_parts})),
-                SharedMessage::new(serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."})),
+                SharedMessage::new(
+                    serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
+                ),
             ],
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
+            prompt_provenance: None,
         }
     }
 
@@ -126,8 +145,7 @@ impl Session {
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", self.id));
         let tmp = path.with_extension("tmp");
-        let json = serde_json::to_string(self)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
         tokio::fs::write(&tmp, &json).await?;
         tokio::fs::rename(&tmp, &path).await
     }
@@ -135,8 +153,7 @@ impl Session {
     pub fn load(id: &str) -> std::io::Result<Self> {
         let path = sessions_dir().join(format!("{}.json", id));
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content)
-            .map_err(std::io::Error::other)
+        serde_json::from_str(&content).map_err(std::io::Error::other)
     }
 
     pub fn info(&self) -> SessionInfo {
@@ -188,7 +205,10 @@ impl Session {
 pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
     let dir = sessions_dir();
     if !dir.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions directory"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no sessions directory",
+        ));
     }
 
     // Try exact match first
@@ -211,9 +231,16 @@ pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
     }
 
     match matches.len() {
-        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session matching '{}'", partial_id))),
+        0 => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no session matching '{}'", partial_id),
+        )),
         1 => Session::load(&matches[0]),
-        _ => Err(std::io::Error::other(format!("ambiguous: {} sessions match '{}'", matches.len(), partial_id))),
+        _ => Err(std::io::Error::other(format!(
+            "ambiguous: {} sessions match '{}'",
+            matches.len(),
+            partial_id
+        ))),
     }
 }
 
@@ -244,13 +271,12 @@ pub fn latest_session() -> std::io::Result<Session> {
             }
         }
     }
-    let path = newest.map(|(_, p)| p).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found")
+    let path = newest
+        .map(|(_, p)| p)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found"))?;
+    let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad session filename")
     })?;
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad session filename"))?;
     Session::load(id)
 }
 
@@ -393,7 +419,10 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.len() > 40 {
         return Err(format!("invalid name '{}': must be 40 chars or less", name));
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(format!(
             "invalid name '{}': allowed characters are lowercase letters, digits, and '-'",
             name
@@ -462,28 +491,28 @@ mod tests {
     #[test]
     fn test_session_new() {
         let session = Session::new("gpt-4", "brief", Some("test prompt"));
-        
+
         // Check model and thinking_level are set correctly
         assert_eq!(session.model, "gpt-4");
         assert_eq!(session.thinking_level, "brief");
         assert_eq!(session.system_prompt, Some("test prompt".to_string()));
-        
+
         // Check ID is non-empty
         assert!(!session.id.is_empty());
-        
+
         // Check title starts empty
         assert_eq!(session.title, "");
-        
+
         // Check tokens are 0
         assert_eq!(session.total_input_tokens, 0);
         assert_eq!(session.total_output_tokens, 0);
-        
+
         // Check cost is 0
         assert_eq!(session.session_cost, 0.0);
-        
+
         // Check api_messages is empty
         assert!(session.api_messages.is_empty());
-        
+
         // Test without system prompt
         let session_no_prompt = Session::new("gpt-3.5-turbo", "normal", None);
         assert_eq!(session_no_prompt.model, "gpt-3.5-turbo");
@@ -494,38 +523,40 @@ mod tests {
     #[test]
     fn test_session_auto_title() {
         let mut session = Session::new("gpt-4", "brief", None);
-        
+
         // Add a user message
         session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": "hello world"
         })));
-        
+
         // Call auto_title
         session.auto_title();
-        
+
         // Check title is set to message content
         assert_eq!(session.title, "hello world");
-        
+
         // Test it doesn't overwrite existing title
         session.title = "existing title".to_string();
         session.auto_title();
         assert_eq!(session.title, "existing title");
-        
+
         // Test with empty session (no messages)
         let mut empty_session = Session::new("gpt-4", "brief", None);
         empty_session.auto_title();
         assert_eq!(empty_session.title, "");
-        
+
         // Test with non-user message
         let mut session_no_user = Session::new("gpt-4", "brief", None);
-        session_no_user.api_messages.push(std::sync::Arc::new(json!({
-            "role": "assistant",
-            "content": "response"
-        })));
+        session_no_user
+            .api_messages
+            .push(std::sync::Arc::new(json!({
+                "role": "assistant",
+                "content": "response"
+            })));
         session_no_user.auto_title();
         assert_eq!(session_no_user.title, "");
-        
+
         // Test with long content (should truncate to 80 chars)
         let mut session_long = Session::new("gpt-4", "brief", None);
         let long_content = "a".repeat(100);
@@ -541,7 +572,7 @@ mod tests {
     #[test]
     fn test_session_info() {
         let mut session = Session::new("gpt-4", "brief", Some("system prompt"));
-        
+
         // Add some messages to test message count
         session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
@@ -551,12 +582,12 @@ mod tests {
             "role": "assistant",
             "content": "test response"
         })));
-        
+
         session.title = "Test Title".to_string();
         session.session_cost = 0.05;
-        
+
         let info = session.info();
-        
+
         assert_eq!(info.id, session.id);
         assert_eq!(info.title, "Test Title");
         assert_eq!(info.model, "gpt-4");
@@ -569,7 +600,7 @@ mod tests {
     #[test]
     fn test_session_info_struct() {
         let now = Utc::now();
-        
+
         let session_info = SessionInfo {
             id: "test-id".to_string(),
             title: "Test Title".to_string(),
@@ -580,7 +611,7 @@ mod tests {
             session_cost: 1.23,
             message_count: 5,
         };
-        
+
         // Verify all fields are accessible
         assert_eq!(session_info.id, "test-id");
         assert_eq!(session_info.title, "Test Title");
@@ -593,18 +624,25 @@ mod tests {
 
     #[test]
     fn test_session_serialization_round_trip() {
-        let mut session = Session::new("gpt-4-turbo", "detailed", Some("You are a helpful assistant"));
+        let mut session = Session::new(
+            "gpt-4-turbo",
+            "detailed",
+            Some("You are a helpful assistant"),
+        );
         session.title = "Test Session".to_string();
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "test"})));
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "user", "content": "test"}),
+        ));
         session.total_input_tokens = 100;
         session.total_output_tokens = 200;
         session.session_cost = 0.15;
 
         // Serialize to JSON string
         let json_str = serde_json::to_string(&session).expect("Failed to serialize session");
-        
+
         // Deserialize back from JSON string
-        let deserialized: Session = serde_json::from_str(&json_str).expect("Failed to deserialize session");
+        let deserialized: Session =
+            serde_json::from_str(&json_str).expect("Failed to deserialize session");
 
         // Verify all fields match
         assert_eq!(deserialized.id, session.id);
@@ -615,22 +653,65 @@ mod tests {
         assert_eq!(deserialized.created_at, session.created_at);
         assert_eq!(deserialized.updated_at, session.updated_at);
         assert_eq!(deserialized.total_input_tokens, session.total_input_tokens);
-        assert_eq!(deserialized.total_output_tokens, session.total_output_tokens);
+        assert_eq!(
+            deserialized.total_output_tokens,
+            session.total_output_tokens
+        );
         assert_eq!(deserialized.session_cost, session.session_cost);
         assert_eq!(deserialized.api_messages.len(), session.api_messages.len());
         assert_eq!(deserialized.api_messages[0], session.api_messages[0]);
     }
 
-    #[test] 
+    #[test]
+    fn codex_ultra_round_trips_and_compaction_preserves_logical_mode() {
+        let parent = Session::new("openai-codex/gpt-5.6-sol", "ultra", None);
+        let encoded = serde_json::to_string(&parent).expect("serialize Ultra session");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&encoded).expect("inspect persisted session");
+        assert_eq!(persisted["thinking_level"], "ultra");
+        let restored: Session = serde_json::from_str(&encoded).expect("restore Ultra session");
+        assert_eq!(restored.model, "openai-codex/gpt-5.6-sol");
+        assert_eq!(restored.thinking_level, "ultra");
+
+        let compacted = Session::new_from_compaction(&restored, "summary".to_string());
+        assert_eq!(compacted.model, restored.model);
+        assert_eq!(compacted.thinking_level, "ultra");
+        assert_eq!(
+            compacted.parent_session.as_deref(),
+            Some(restored.id.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_max_round_trips_without_becoming_ultra_or_xhigh() {
+        let session = Session::new("openai-codex/gpt-5.6-luna", "max", None);
+        let encoded = serde_json::to_string(&session).expect("serialize Max session");
+        let restored: Session = serde_json::from_str(&encoded).expect("restore Max session");
+        assert_eq!(restored.thinking_level, "max");
+        assert_ne!(restored.thinking_level, "ultra");
+        assert_ne!(restored.thinking_level, "xhigh");
+    }
+
+    #[test]
     fn test_session_serialization_preserves_all_fields() {
-        let mut session = Session::new("claude-3-opus", "comprehensive", Some("Custom system prompt"));
+        let mut session = Session::new(
+            "claude-3-opus",
+            "comprehensive",
+            Some("Custom system prompt"),
+        );
         session.title = "Complex Session".to_string();
-        
+
         // Add multiple messages
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "First message"})));
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "assistant", "content": "First response"})));
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "Second message"})));
-        
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "user", "content": "First message"}),
+        ));
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "assistant", "content": "First response"}),
+        ));
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "user", "content": "Second message"}),
+        ));
+
         // Set token counts and cost
         session.total_input_tokens = 1500;
         session.total_output_tokens = 2500;
@@ -645,7 +726,10 @@ mod tests {
         assert_eq!(restored.title, "Complex Session");
         assert_eq!(restored.model, "claude-3-opus");
         assert_eq!(restored.thinking_level, "comprehensive");
-        assert_eq!(restored.system_prompt.as_ref().unwrap(), "Custom system prompt");
+        assert_eq!(
+            restored.system_prompt.as_ref().unwrap(),
+            "Custom system prompt"
+        );
         assert_eq!(restored.created_at, session.created_at);
         assert_eq!(restored.updated_at, session.updated_at);
         assert_eq!(restored.total_input_tokens, 1500);
@@ -661,33 +745,39 @@ mod tests {
     #[test]
     fn test_session_info_from_session_with_messages() {
         let mut session = Session::new("gpt-3.5-turbo", "normal", None);
-        
+
         // Add exactly 3 messages
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "message 1"})));
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "assistant", "content": "response 1"})));
-        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "message 2"})));
-        
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "user", "content": "message 1"}),
+        ));
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "assistant", "content": "response 1"}),
+        ));
+        session.api_messages.push(std::sync::Arc::new(
+            json!({"role": "user", "content": "message 2"}),
+        ));
+
         let info = session.info();
-        
+
         // Verify message count is exactly 3
         assert_eq!(info.message_count, 3);
         assert_eq!(info.id, session.id);
         assert_eq!(info.model, "gpt-3.5-turbo");
     }
 
-    #[test] 
+    #[test]
     fn test_session_auto_title_truncation() {
         let mut session = Session::new("gpt-4", "brief", None);
-        
+
         // Create a user message with exactly 200 characters
         let long_content = "a".repeat(200);
         session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": long_content
         })));
-        
+
         session.auto_title();
-        
+
         // Verify title is exactly 80 characters
         assert_eq!(session.title.len(), 80);
         assert_eq!(session.title, "a".repeat(80));
@@ -696,24 +786,24 @@ mod tests {
     #[test]
     fn test_session_auto_title_skips_non_user_messages() {
         let mut session = Session::new("gpt-4", "brief", None);
-        
+
         // Push only an assistant message (no user messages)
         session.api_messages.push(std::sync::Arc::new(json!({
-            "role": "assistant", 
+            "role": "assistant",
             "content": "This should be ignored for auto title"
         })));
-        
+
         session.auto_title();
-        
+
         // Verify title stays empty since there are no user messages
         assert_eq!(session.title, "");
-        
+
         // Test with system message too
         session.api_messages.push(std::sync::Arc::new(json!({
             "role": "system",
             "content": "System message should also be ignored"
         })));
-        
+
         session.auto_title();
         assert_eq!(session.title, "");
     }
@@ -722,7 +812,7 @@ mod tests {
     fn test_session_new_generates_unique_ids() {
         let session1 = Session::new("gpt-4", "brief", None);
         let session2 = Session::new("gpt-4", "brief", None);
-        
+
         // Verify IDs are different
         assert_ne!(session1.id, session2.id);
         assert!(!session1.id.is_empty());
@@ -734,17 +824,23 @@ mod tests {
         let before = Utc::now();
         let session = Session::new("gpt-4", "brief", None);
         let after = Utc::now();
-        
+
         // Verify created_at and updated_at are close to now (within 2 seconds)
         let created_diff = (session.created_at - before).num_seconds().abs();
         let updated_diff = (session.updated_at - before).num_seconds().abs();
-        
-        assert!(created_diff <= 2, "created_at should be within 2 seconds of now");
-        assert!(updated_diff <= 2, "updated_at should be within 2 seconds of now");
-        
+
+        assert!(
+            created_diff <= 2,
+            "created_at should be within 2 seconds of now"
+        );
+        assert!(
+            updated_diff <= 2,
+            "updated_at should be within 2 seconds of now"
+        );
+
         // Verify both timestamps are the same for new sessions
         assert_eq!(session.created_at, session.updated_at);
-        
+
         // Verify timestamps are not in the future
         assert!(session.created_at <= after);
         assert!(session.updated_at <= after);
@@ -775,5 +871,24 @@ mod tests {
         s.name = Some("foo".into());
         s.clear_name();
         assert_eq!(s.name, None);
+    }
+
+    #[test]
+    fn ultracode_serialization_and_compaction_roundtrip_is_distinct() {
+        let original = Session::new("anthropic/claude-fable-5", "ultracode", None);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.thinking_level, "ultracode");
+        for other in ["ultra", "max", "xhigh"] {
+            assert_ne!(restored.thinking_level, other);
+        }
+        let compacted = Session::new_from_compaction(&restored, "summary".into());
+        let resumed: Session =
+            serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
+        assert_eq!(resumed.thinking_level, "ultracode");
+        assert_eq!(
+            resumed.parent_session.as_deref(),
+            Some(original.id.as_str())
+        );
     }
 }

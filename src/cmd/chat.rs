@@ -48,6 +48,7 @@ pub async fn run(
     let boot = setup::boot(EngineOpts {
         continue_session: continue_session.map(Some),
         system,
+        prompt_manifest: None,
         profile,
         no_extensions,
     }).await?;
@@ -206,10 +207,12 @@ pub async fn run(
                         match result {
                             CommandResult::Quit => break,
                             CommandResult::ModelChanged { model } => {
+                                conv.session.model = runtime.model().to_string();
                                 eprintln!("model → {}", model);
                             }
-                            CommandResult::ThinkingChanged { level, budget } => {
-                                eprintln!("thinking → {} ({})", level, budget);
+                            CommandResult::ThinkingChanged { spec } => {
+                                conv.session.thinking_level = spec.config_value();
+                                eprintln!("thinking → {}", spec.level());
                             }
                             CommandResult::Compact { custom_instructions } => {
                                 eprintln!("compacting...");

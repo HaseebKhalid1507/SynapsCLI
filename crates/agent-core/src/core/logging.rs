@@ -1,6 +1,5 @@
 use tracing_appender::non_blocking::WorkerGuard;
 
-
 pub fn init_logging() -> Option<WorkerGuard> {
     let log_dir = crate::config::get_active_config_dir();
     if !log_dir.exists() {
@@ -11,12 +10,14 @@ pub fn init_logging() -> Option<WorkerGuard> {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     if let Err(e) = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("synaps_cli=debug".parse().expect("valid directive"))
-            .add_directive("agent_core=debug".parse().expect("valid directive"))
-            .add_directive("agent_engine=debug".parse().expect("valid directive"))
-            .add_directive("agent_tui=debug".parse().expect("valid directive"))
-            .add_directive("tracing=info".parse().expect("valid directive")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("synaps_cli=debug".parse().expect("valid directive"))
+                .add_directive("agent_core=debug".parse().expect("valid directive"))
+                .add_directive("agent_engine=debug".parse().expect("valid directive"))
+                .add_directive("agent_tui=debug".parse().expect("valid directive"))
+                .add_directive("tracing=info".parse().expect("valid directive")),
+        )
         .with_writer(non_blocking)
         .with_target(false)
         .with_thread_ids(true)

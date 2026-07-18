@@ -1,7 +1,7 @@
 //! SKILL.md parsing, {baseDir}/${CLAUDE_PLUGIN_ROOT} substitution, and discovery.
 
-use std::path::{Path, PathBuf};
 use crate::skills::LoadedSkill;
+use std::path::{Path, PathBuf};
 
 /// Parse YAML frontmatter from a markdown file.
 /// Returns (frontmatter_fields, body).
@@ -21,7 +21,9 @@ pub(super) fn parse_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
             .lines()
             .filter_map(|line| {
                 let line = line.trim();
-                if line.is_empty() { return None; }
+                if line.is_empty() {
+                    return None;
+                }
                 let (k, v) = line.split_once(':')?;
                 Some((k.trim().to_string(), v.trim().trim_matches('"').to_string()))
             })
@@ -46,8 +48,14 @@ pub fn load_skill_file(
     let content = std::fs::read_to_string(skill_md).ok()?;
     let (fields, body) = parse_frontmatter(&content);
 
-    let name = fields.iter().find(|(k, _)| k == "name").map(|(_, v)| v.clone())?;
-    let description = fields.iter().find(|(k, _)| k == "description").map(|(_, v)| v.clone())?;
+    let name = fields
+        .iter()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.clone())?;
+    let description = fields
+        .iter()
+        .find(|(k, _)| k == "description")
+        .map(|(_, v)| v.clone())?;
 
     if body.is_empty() {
         return None;
@@ -72,7 +80,10 @@ pub fn load_skill_file(
     })
 }
 
-use crate::skills::{Plugin, manifest::{PluginManifest, MarketplaceManifest}};
+use crate::skills::{
+    manifest::{MarketplaceManifest, PluginManifest},
+    Plugin,
+};
 
 /// The four default discovery roots, in priority order (local first, global second).
 pub fn default_roots() -> Vec<PathBuf> {
@@ -128,7 +139,9 @@ fn walk_root(
     skills: &mut Vec<LoadedSkill>,
     seen: &mut std::collections::HashSet<(Option<String>, String)>,
 ) {
-    if !root.exists() { return; }
+    if !root.exists() {
+        return;
+    }
 
     // 1. Marketplace pass
     let marketplace_name = if let Some(marketplace_json) = marketplace_json_for(root) {
@@ -138,7 +151,9 @@ fn walk_root(
         {
             Some(m) => {
                 for entry in &m.plugins {
-                    let Some(source) = entry.source.as_ref() else { continue; };
+                    let Some(source) = entry.source.as_ref() else {
+                        continue;
+                    };
                     let plugin_root = root.join(source);
                     load_plugin(&plugin_root, Some(&m.name), plugins, skills, seen);
                 }
@@ -160,7 +175,9 @@ fn walk_root(
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() { continue; }
+            if !path.is_dir() {
+                continue;
+            }
             if marketplace_json_for(&path).is_some() {
                 walk_root(&path, plugins, skills, seen);
             } else if plugin_json_for(&path).is_some() {
@@ -171,16 +188,22 @@ fn walk_root(
 
     // 3. Loose-skill pass — scan both root/ and root/skills/ for <name>/SKILL.md
     for loose_dir in [root.to_path_buf(), root.join("skills")] {
-        if !loose_dir.is_dir() { continue; }
+        if !loose_dir.is_dir() {
+            continue;
+        }
         if let Ok(entries) = std::fs::read_dir(&loose_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() { continue; }
+                if !path.is_dir() {
+                    continue;
+                }
                 let skill_md = path.join("SKILL.md");
                 if skill_md.exists() {
                     if let Some(s) = load_skill_file(&skill_md, None, None) {
                         let key = (None, s.name.clone());
-                        if seen.insert(key) { skills.push(s); }
+                        if seen.insert(key) {
+                            skills.push(s);
+                        }
                     }
                 }
             }
@@ -208,11 +231,13 @@ fn load_plugin(
         return;
     };
 
-    let Ok(root_abs) = plugin_root.canonicalize() else { return; };
+    let Ok(root_abs) = plugin_root.canonicalize() else {
+        return;
+    };
     if plugins.iter().any(|p| p.root == root_abs) {
         return;
     }
-        plugins.push(Plugin {
+    plugins.push(Plugin {
         name: m.name.clone(),
         root: root_abs,
         marketplace: marketplace.map(str::to_string),
@@ -223,16 +248,26 @@ fn load_plugin(
     });
 
     let skills_dir = plugin_root.join("skills");
-    if !skills_dir.is_dir() { return; }
-    let Ok(entries) = std::fs::read_dir(&skills_dir) else { return; };
+    if !skills_dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         let skill_md = path.join("SKILL.md");
-        if !skill_md.exists() { continue; }
+        if !skill_md.exists() {
+            continue;
+        }
         if let Some(s) = load_skill_file(&skill_md, Some(&m.name), Some(plugin_root)) {
             let key = (Some(m.name.clone()), s.name.clone());
-            if seen.insert(key) { skills.push(s); }
+            if seen.insert(key) {
+                skills.push(s);
+            }
         }
     }
 }
@@ -269,7 +304,10 @@ mod tests {
     fn load_skill_basic() {
         let tmp = tempdir();
         let skill_dir = tmp.join("my-skill");
-        let path = write_skill(&skill_dir, "---\nname: my-skill\ndescription: desc\n---\nBody");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: my-skill\ndescription: desc\n---\nBody",
+        );
         let s = load_skill_file(&path, Some("plugin-x"), None).unwrap();
         assert_eq!(s.name, "my-skill");
         assert_eq!(s.description, "desc");
@@ -282,7 +320,10 @@ mod tests {
     fn load_skill_basedir_substitution() {
         let tmp = tempdir();
         let skill_dir = tmp.join("skill");
-        let path = write_skill(&skill_dir, "---\nname: s\ndescription: d\n---\nRun {baseDir}/x.js");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: s\ndescription: d\n---\nRun {baseDir}/x.js",
+        );
         let s = load_skill_file(&path, None, None).unwrap();
         let expected = format!("Run {}/x.js", s.base_dir.to_str().unwrap());
         assert_eq!(s.body, expected);
@@ -325,7 +366,10 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("unclosed");
         // No closing `---`; parse_frontmatter returns ([], full_text) so name/description missing → None.
-        let path = write_skill(&skill_dir, "---\nname: x\ndescription: d\nbody without closing fence");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: x\ndescription: d\nbody without closing fence",
+        );
         assert!(load_skill_file(&path, None, None).is_none());
     }
 
@@ -395,9 +439,12 @@ mod tests {
         fs::write(
             plugin_dir.join(".synaps-plugin").join("plugin.json"),
             r#"{"name":"my-plugin"}"#,
-        ).unwrap();
-        write_skill(&plugin_dir.join("skills").join("s1"),
-            "---\nname: s1\ndescription: d\n---\nBody");
+        )
+        .unwrap();
+        write_skill(
+            &plugin_dir.join("skills").join("s1"),
+            "---\nname: s1\ndescription: d\n---\nBody",
+        );
 
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
@@ -420,7 +467,8 @@ mod tests {
                     {"name":"hello","description":"Say hello","command":"printf","args":["hello"]}
                 ]
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
 
@@ -442,15 +490,23 @@ mod tests {
         let tmp = tempdir();
         // marketplace.json at root
         fs::create_dir_all(tmp.join(".synaps-plugin")).unwrap();
-        fs::write(tmp.join(".synaps-plugin").join("marketplace.json"),
-            r#"{"name":"pi-skills","plugins":[{"name":"web","source":"./web"}]}"#).unwrap();
+        fs::write(
+            tmp.join(".synaps-plugin").join("marketplace.json"),
+            r#"{"name":"pi-skills","plugins":[{"name":"web","source":"./web"}]}"#,
+        )
+        .unwrap();
         // plugin at ./web
         let plugin_dir = tmp.join("web");
         fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
-        fs::write(plugin_dir.join(".synaps-plugin").join("plugin.json"),
-            r#"{"name":"web"}"#).unwrap();
-        write_skill(&plugin_dir.join("skills").join("search"),
-            "---\nname: search\ndescription: d\n---\nBody");
+        fs::write(
+            plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+        write_skill(
+            &plugin_dir.join("skills").join("search"),
+            "---\nname: search\ndescription: d\n---\nBody",
+        );
 
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
@@ -463,10 +519,14 @@ mod tests {
         let tmp_local = tempdir();
         let tmp_global = tempdir();
         // same skill name in both
-        write_skill(&tmp_local.join("skills").join("dup"),
-            "---\nname: dup\ndescription: local\n---\nBody");
-        write_skill(&tmp_global.join("skills").join("dup"),
-            "---\nname: dup\ndescription: global\n---\nBody");
+        write_skill(
+            &tmp_local.join("skills").join("dup"),
+            "---\nname: dup\ndescription: local\n---\nBody",
+        );
+        write_skill(
+            &tmp_global.join("skills").join("dup"),
+            "---\nname: dup\ndescription: global\n---\nBody",
+        );
 
         let (_p, skills) = load_all(&[tmp_local, tmp_global]);
         assert_eq!(skills.len(), 1);
@@ -522,14 +582,22 @@ mod tests {
         // also under .claude-plugin/.
         let tmp = tempdir();
         fs::create_dir_all(tmp.join(".claude-plugin")).unwrap();
-        fs::write(tmp.join(".claude-plugin").join("marketplace.json"),
-            r#"{"name":"cc-mp","plugins":[{"name":"web","source":"./web"}]}"#).unwrap();
+        fs::write(
+            tmp.join(".claude-plugin").join("marketplace.json"),
+            r#"{"name":"cc-mp","plugins":[{"name":"web","source":"./web"}]}"#,
+        )
+        .unwrap();
         let plugin_dir = tmp.join("web");
         fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
-        fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"),
-            r#"{"name":"web"}"#).unwrap();
-        write_skill(&plugin_dir.join("skills").join("search"),
-            "---\nname: search\ndescription: d\n---\nBody");
+        fs::write(
+            plugin_dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+        write_skill(
+            &plugin_dir.join("skills").join("search"),
+            "---\nname: search\ndescription: d\n---\nBody",
+        );
 
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
@@ -546,12 +614,20 @@ mod tests {
         let plugin_dir = tmp.join("dual");
         fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
         fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
-        fs::write(plugin_dir.join(".synaps-plugin").join("plugin.json"),
-            r#"{"name":"native"}"#).unwrap();
-        fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"),
-            r#"{"name":"claude"}"#).unwrap();
-        write_skill(&plugin_dir.join("skills").join("s"),
-            "---\nname: s\ndescription: d\n---\nBody");
+        fs::write(
+            plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"native"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"claude"}"#,
+        )
+        .unwrap();
+        write_skill(
+            &plugin_dir.join("skills").join("s"),
+            "---\nname: s\ndescription: d\n---\nBody",
+        );
 
         let (plugins, _skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
@@ -605,9 +681,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "synaps-skills-test-{}", std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("synaps-skills-test-{}", std::process::id()));
         let unique = base.join(format!("{}-{}", crate::epoch_millis(), n));
         std::fs::create_dir_all(&unique).unwrap();
         unique

@@ -227,7 +227,18 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -241,6 +252,50 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -250,18 +305,50 @@
     }
   },
   {
-    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion.",
+    "description": "Retrieve a reactive subagent's result. Non-blocking — returns immediately (status + partial output if still running). Standard flow: poll with subagent_status while the subagent runs; when subagent_status reports a terminal status (completed/failed/timed_out/cancelled), call this ONCE with reconciled=true — that single call both collects the result and attests reconciliation, clearing the completion gate. Calling without reconciled=true is an inspection-only read: it leaves the completion gate blocked and forces a second call. reconciled=true is idempotent and safe on repeats.",
     "name": "subagent_collect",
     "parameters": {
       "properties": {
         "handle_id": {
           "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
           "type": "string"
+        },
+        "reconciled": {
+          "default": false,
+          "description": "Set true on your terminal collect (after subagent_status reports done) to attest the result is reconciled with foreground work and unblock completion — one call collects AND reconciles. Leave false only for a deliberate inspection-only read; a later collect with reconciled=true still reconciles (idempotent).",
+          "type": "boolean"
         }
       },
       "required": [
         "handle_id"
       ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Authorize one exact qualified, locally known model for subagent use in this session. The grant is session-only: it does not change the foreground model or persist favorites. No sudo or interactive confirmation is required.",
+    "name": "subagent_model_authorize",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "description": "Exact runtime-qualified model identity, for example anthropic/claude-sonnet-4-6.",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List this session's exact trusted worker model choices. Omit model on delegation to inherit the foreground identity.",
+    "name": "subagent_models",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
       "type": "object"
     }
   },
@@ -287,7 +374,7 @@
     }
   },
   {
-    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — use subagent_status to poll, subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call repeatedly until done). Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — poll with subagent_status until it reports a terminal status, use subagent_steer to inject guidance mid-run, then call subagent_collect once with reconciled=true to retrieve the result and attest reconciliation in the same call. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
     "name": "subagent_start",
     "parameters": {
       "properties": {
@@ -296,7 +383,19 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Typed orchestration role.",
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -310,6 +409,51 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "description": "Declared write isolation and path scopes.",
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -319,7 +463,7 @@
     }
   },
   {
-    "description": "Poll the current state of a reactive subagent. Returns status (running/finished/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. Non-blocking — returns immediately.",
+    "description": "Poll the current state of a reactive subagent. Returns status (running/completed/cancelled/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. If the status is 'failed', an 'error' field contains the failure reason. Non-blocking — returns immediately.",
     "name": "subagent_status",
     "parameters": {
       "properties": {

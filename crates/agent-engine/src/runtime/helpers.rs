@@ -227,10 +227,11 @@ impl HelperMethods {
     /// last block. Shared by both transports so the auth-specific block
     /// layout (and the OAuth identity-first invariant) has exactly one truth.
     ///
-    /// - OAuth: identity block FIRST (never reorder — it heads the cached
-    ///   prefix; changing it invalidates every active session), then the
-    ///   spoof-guard block, then the optional user system prompt. Last block
-    ///   gets the stable-prefix marker.
+    /// - OAuth: Anthropic's fixed Claude Code transport-contract identity block
+    ///   FIRST, then Synaps's configurable product identity, the general
+    ///   assistant guidance, and optional user system prompt. The transport
+    ///   identity is deliberately not configurable. Last block gets the
+    ///   stable-prefix marker.
     /// - API key (or any non-oauth): single user-prompt block with the
     ///   stable-prefix marker; `None` when there is no system prompt.
     pub(super) fn build_system_blocks(
@@ -239,7 +240,12 @@ impl HelperMethods {
         ttl: CacheTtl,
     ) -> Option<Value> {
         if auth_type == "oauth" {
+            // Anthropic OAuth routes on this first system block. It is a wire
+            // protocol contract, not Synaps branding or user-configurable identity.
+            const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
+                "You are Claude Code, Anthropic's official CLI for Claude.";
             let mut system_blocks = vec![
+                json!({"type": "text", "text": CLAUDE_CODE_TRANSPORT_IDENTITY}),
                 json!({"type": "text", "text": crate::core::config::get_identity()}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
@@ -427,7 +433,10 @@ mod tests {
         assert!(input[4]["content"].is_string());
         assert!(input[4]["content"].as_str() == Some("five"));
         // ...while the cleaned copy carries the marker.
-        assert_eq!(cleaned[4]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            cleaned[4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     /// Finding-1 freeze (S241 gate review): the OLD Vec-era sanitize used
@@ -442,8 +451,14 @@ mod tests {
         let before = serde_json::to_string(&msgs[0]).unwrap();
         sanitize_vals(&mut msgs);
         let after = serde_json::to_string(&msgs[0]).unwrap();
-        assert_eq!(before, after, "message without content key must pass through byte-identical");
-        assert!(msgs[0].get("content").is_none(), "content key must NOT be inserted");
+        assert_eq!(
+            before, after,
+            "message without content key must pass through byte-identical"
+        );
+        assert!(
+            msgs[0].get("content").is_none(),
+            "content key must NOT be inserted"
+        );
     }
 
     #[test]
@@ -826,18 +841,24 @@ mod tests {
     // ── build_system_blocks (OAuth + API-key sites, both transports) ────────
 
     #[test]
-    fn system_blocks_oauth_identity_first_and_marker_on_last() {
+    fn system_blocks_oauth_transport_identity_first_and_marker_on_last() {
+        const CLAUDE_CODE_IDENTITY: &str =
+            "You are Claude Code, Anthropic's official CLI for Claude.";
         for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
             let prompt = Some("custom prompt".to_string());
             let system = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
             let blocks = system.as_array().unwrap();
-            assert_eq!(blocks.len(), 3);
-            // Identity block is FIRST and unmarked — head of the cached prefix.
-            assert_eq!(blocks[0]["text"], crate::core::config::get_identity());
+            assert_eq!(blocks.len(), 4);
+            // OAuth's protocol identity is fixed and FIRST. Product/user identity
+            // remains additive and therefore cannot replace the transport contract.
+            assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+            assert_eq!(blocks[1]["text"], crate::core::config::get_identity());
+            assert_ne!(blocks[0]["text"], blocks[1]["text"]);
             assert!(blocks[0].get("cache_control").is_none());
             assert!(blocks[1].get("cache_control").is_none());
+            assert!(blocks[2].get("cache_control").is_none());
             // Last block carries the stable-prefix marker.
-            let cc = &blocks[2]["cache_control"];
+            let cc = &blocks[3]["cache_control"];
             assert_eq!(cc["type"], "ephemeral");
             match ttl {
                 CacheTtl::FiveMinutes => assert!(cc.get("ttl").is_none(), "5m: no ttl key"),

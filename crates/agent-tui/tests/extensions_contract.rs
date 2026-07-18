@@ -11,9 +11,7 @@
 //!    with `theme_tokens` stripped validates identically — proving
 //!    pre-P19.2 extensions are unaffected.
 
-use agent_engine::extensions::manifest::{
-    ExtensionManifest, CURRENT_EXTENSION_PROTOCOL_VERSION,
-};
+use agent_engine::extensions::manifest::{ExtensionManifest, CURRENT_EXTENSION_PROTOCOL_VERSION};
 
 const CONTRACT: &str = include_str!("../../../docs/extensions/contract.json");
 const HELLO_EXT_PLUGIN: &str =
@@ -50,7 +48,10 @@ fn contract_json_documents_theme_tokens_as_additive_optional() {
         .as_array()
         .expect("override_order must be an array");
     assert!(
-        order[0].as_str().unwrap_or_default().contains("user theme TOML"),
+        order[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("user theme TOML"),
         "user theme TOML override must be documented as winning"
     );
 }
@@ -58,9 +59,8 @@ fn contract_json_documents_theme_tokens_as_additive_optional() {
 #[test]
 fn hello_ext_manifest_ships_a_token_and_validates() {
     let plugin: serde_json::Value = serde_json::from_str(HELLO_EXT_PLUGIN).unwrap();
-    let ext: ExtensionManifest =
-        serde_json::from_value(plugin["extension"].clone())
-            .expect("hello-ext extension block must deserialize");
+    let ext: ExtensionManifest = serde_json::from_value(plugin["extension"].clone())
+        .expect("hello-ext extension block must deserialize");
     // The P19.2 acceptance vehicle: one declared token.
     assert_eq!(
         ext.theme_tokens.get("accent").map(String::as_str),
@@ -81,8 +81,7 @@ fn manifest_without_theme_tokens_is_unaffected() {
         .as_object_mut()
         .unwrap()
         .remove("theme_tokens");
-    let ext: ExtensionManifest =
-        serde_json::from_value(plugin["extension"].clone()).unwrap();
+    let ext: ExtensionManifest = serde_json::from_value(plugin["extension"].clone()).unwrap();
     assert!(
         ext.theme_tokens.is_empty(),
         "absent theme_tokens must default to empty"

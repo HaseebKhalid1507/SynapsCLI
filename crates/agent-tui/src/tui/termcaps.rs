@@ -117,12 +117,12 @@ impl Default for TermCaps {
     /// behavior.** See each field's doc comment for the mirrored call site.
     fn default() -> Self {
         Self {
-            sync_output: true,     // = draw.rs unconditionally brackets frames
-            kitty_keyboard: true,  // = lifecycle blind-pushes kitty flags
-            mode_2027: false,      // = no width negotiation today
+            sync_output: true,    // = draw.rs unconditionally brackets frames
+            kitty_keyboard: true, // = lifecycle blind-pushes kitty flags
+            mode_2027: false,     // = no width negotiation today
             term_program: None,
             tmux: None,
-            da1_answered: false,   // = we never query the terminal today
+            da1_answered: false, // = we never query the terminal today
         }
     }
 }
@@ -237,8 +237,8 @@ impl TermCaps {
 /// | `Some` with `tmux: None`          | no     | affirmatively not under tmux    |
 pub(crate) fn edge_scrub_enabled(caps: Option<&TermCaps>) -> bool {
     match caps {
-        None => true,                   // unknown ⇒ current behavior (scrub)
-        Some(c) => c.tmux.is_some(),    // known ⇒ scrub only under tmux
+        None => true,                // unknown ⇒ current behavior (scrub)
+        Some(c) => c.tmux.is_some(), // known ⇒ scrub only under tmux
     }
 }
 
@@ -257,9 +257,9 @@ pub(crate) fn edge_scrub_enabled(caps: Option<&TermCaps>) -> bool {
 /// | `Some`, DA1-fenced, `sync_output == false`  | no            |
 pub(crate) fn sync_output_enabled(caps: Option<&TermCaps>) -> bool {
     match caps {
-        None => true,                        // unknown ⇒ emit (current)
-        Some(c) if !c.da1_answered => true,  // DA1 timed out ⇒ emit (current)
-        Some(c) => c.sync_output,            // negotiated fact
+        None => true,                       // unknown ⇒ emit (current)
+        Some(c) if !c.da1_answered => true, // DA1 timed out ⇒ emit (current)
+        Some(c) => c.sync_output,           // negotiated fact
     }
 }
 
@@ -280,9 +280,9 @@ pub(crate) fn sync_output_enabled(caps: Option<&TermCaps>) -> bool {
 /// | `Some`, DA1-fenced, `kitty_keyboard == false` | no    |
 pub(crate) fn kitty_push_enabled(caps: Option<&TermCaps>) -> bool {
     match caps {
-        None => true,                        // unknown ⇒ push (current)
-        Some(c) if !c.da1_answered => true,  // DA1 timed out ⇒ push (current)
-        Some(c) => c.kitty_keyboard,         // negotiated fact
+        None => true,                       // unknown ⇒ push (current)
+        Some(c) if !c.da1_answered => true, // DA1 timed out ⇒ push (current)
+        Some(c) => c.kitty_keyboard,        // negotiated fact
     }
 }
 
@@ -336,11 +336,23 @@ mod tests {
     fn defaults_are_identical_to_current_unconditional_behavior() {
         let caps = TermCaps::default();
         // sync output + kitty push happen unconditionally today → default on.
-        assert!(caps.sync_output, "sync_output default must stay true (= today's unconditional bracket)");
-        assert!(caps.kitty_keyboard, "kitty_keyboard default must stay true (= today's blind push)");
+        assert!(
+            caps.sync_output,
+            "sync_output default must stay true (= today's unconditional bracket)"
+        );
+        assert!(
+            caps.kitty_keyboard,
+            "kitty_keyboard default must stay true (= today's blind push)"
+        );
         // No negotiation today → these stay off / unknown.
-        assert!(!caps.mode_2027, "mode_2027 default must stay false (no width negotiation today)");
-        assert!(!caps.da1_answered, "da1_answered default must stay false (we never query today)");
+        assert!(
+            !caps.mode_2027,
+            "mode_2027 default must stay false (no width negotiation today)"
+        );
+        assert!(
+            !caps.da1_answered,
+            "da1_answered default must stay false (we never query today)"
+        );
         assert_eq!(caps.term_program, None);
         assert_eq!(caps.tmux, None);
     }
@@ -350,7 +362,10 @@ mod tests {
         // Even a fully-populated env leaves the boolean caps at defaults — env
         // detection records provenance, it does not negotiate capabilities.
         let caps = TermCaps::detect_from_env(
-            env_of(&[("TERM_PROGRAM", "WezTerm"), ("TMUX", "/tmp/tmux-1000/default,42,0")]),
+            env_of(&[
+                ("TERM_PROGRAM", "WezTerm"),
+                ("TMUX", "/tmp/tmux-1000/default,42,0"),
+            ]),
             || Some("tmux 3.4".to_string()),
         );
         assert!(caps.sync_output);
@@ -363,19 +378,19 @@ mod tests {
 
     #[test]
     fn tmux_present_parses_version() {
-        let caps = TermCaps::detect_from_env(
-            env_of(&[("TMUX", "/tmp/tmux-1000/default,4242,0")]),
-            || Some("tmux 3.3a\n".to_string()),
-        );
+        let caps =
+            TermCaps::detect_from_env(env_of(&[("TMUX", "/tmp/tmux-1000/default,4242,0")]), || {
+                Some("tmux 3.3a\n".to_string())
+            });
         assert_eq!(caps.tmux.as_deref(), Some("3.3a"));
     }
 
     #[test]
     fn tmux_present_parses_prerelease_version() {
-        let caps = TermCaps::detect_from_env(
-            env_of(&[("TMUX", "/tmp/tmux-1000/default,1,0")]),
-            || Some("tmux next-3.4".to_string()),
-        );
+        let caps =
+            TermCaps::detect_from_env(env_of(&[("TMUX", "/tmp/tmux-1000/default,1,0")]), || {
+                Some("tmux next-3.4".to_string())
+            });
         assert_eq!(caps.tmux.as_deref(), Some("next-3.4"));
     }
 
@@ -391,10 +406,9 @@ mod tests {
     #[test]
     fn tmux_present_but_garbage_version_records_unknown() {
         // Non-empty but unparseable → "" after prefix strip → unknown.
-        let caps = TermCaps::detect_from_env(
-            env_of(&[("TMUX", "/tmp/x,1,0")]),
-            || Some("tmux \n".to_string()),
-        );
+        let caps = TermCaps::detect_from_env(env_of(&[("TMUX", "/tmp/x,1,0")]), || {
+            Some("tmux \n".to_string())
+        });
         assert_eq!(caps.tmux.as_deref(), Some("unknown"));
     }
 
@@ -403,23 +417,18 @@ mod tests {
     #[test]
     fn no_tmux_env_yields_none_and_never_reads_version() {
         let mut called = false;
-        let caps = TermCaps::detect_from_env(
-            env_of(&[("TERM_PROGRAM", "Apple_Terminal")]),
-            || {
-                called = true;
-                Some("tmux 3.3a".to_string())
-            },
-        );
+        let caps = TermCaps::detect_from_env(env_of(&[("TERM_PROGRAM", "Apple_Terminal")]), || {
+            called = true;
+            Some("tmux 3.3a".to_string())
+        });
         assert_eq!(caps.tmux, None);
         assert!(!called, "tmux -V must not be invoked when $TMUX is absent");
     }
 
     #[test]
     fn empty_tmux_var_is_treated_as_no_tmux() {
-        let caps = TermCaps::detect_from_env(
-            env_of(&[("TMUX", "")]),
-            || Some("tmux 3.3a".to_string()),
-        );
+        let caps =
+            TermCaps::detect_from_env(env_of(&[("TMUX", "")]), || Some("tmux 3.3a".to_string()));
         assert_eq!(caps.tmux, None);
     }
 
@@ -437,7 +446,10 @@ mod tests {
         // from the $TMUX presence check.
         let caps = TermCaps::detect_from_env(env_of(&[("TERM_PROGRAM", "tmux")]), || None);
         assert_eq!(caps.term_program.as_deref(), Some("tmux"));
-        assert_eq!(caps.tmux, None, "$TERM_PROGRAM=tmux must NOT imply tmux provenance without $TMUX");
+        assert_eq!(
+            caps.tmux, None,
+            "$TERM_PROGRAM=tmux must NOT imply tmux provenance without $TMUX"
+        );
     }
 
     #[test]
@@ -477,9 +489,18 @@ mod tests {
 
     #[test]
     fn parse_version_edge_cases() {
-        assert_eq!(parse_tmux_version(Some("tmux 3.3a")).as_deref(), Some("3.3a"));
-        assert_eq!(parse_tmux_version(Some("  tmux 3.3a  ")).as_deref(), Some("3.3a"));
-        assert_eq!(parse_tmux_version(Some("tmux master")).as_deref(), Some("master"));
+        assert_eq!(
+            parse_tmux_version(Some("tmux 3.3a")).as_deref(),
+            Some("3.3a")
+        );
+        assert_eq!(
+            parse_tmux_version(Some("  tmux 3.3a  ")).as_deref(),
+            Some("3.3a")
+        );
+        assert_eq!(
+            parse_tmux_version(Some("tmux master")).as_deref(),
+            Some("master")
+        );
         assert_eq!(parse_tmux_version(Some("3.3a")).as_deref(), Some("3.3a")); // no prefix
         assert_eq!(parse_tmux_version(Some("")), None);
         assert_eq!(parse_tmux_version(Some("   ")), None);
@@ -518,7 +539,10 @@ mod gate_tests {
     }
     // Helper: env-detected caps affirmatively NOT under tmux.
     fn caps_no_tmux() -> TermCaps {
-        TermCaps { tmux: None, ..TermCaps::default() }
+        TermCaps {
+            tmux: None,
+            ..TermCaps::default()
+        }
     }
 
     // ── Gate 1: edge-scrub (tmux provenance) ───────────────────────────────
@@ -526,12 +550,18 @@ mod gate_tests {
     #[test]
     fn edge_scrub_unknown_caps_defaults_to_current_behavior() {
         // No negotiated facts ⇒ today's UNCONDITIONAL scrub.
-        assert!(edge_scrub_enabled(None), "unknown caps must scrub (= today)");
+        assert!(
+            edge_scrub_enabled(None),
+            "unknown caps must scrub (= today)"
+        );
     }
 
     #[test]
     fn edge_scrub_runs_under_tmux() {
-        assert!(edge_scrub_enabled(Some(&caps_tmux())), "tmux provenance ⇒ scrub");
+        assert!(
+            edge_scrub_enabled(Some(&caps_tmux())),
+            "tmux provenance ⇒ scrub"
+        );
     }
 
     #[test]
@@ -556,7 +586,10 @@ mod gate_tests {
     #[test]
     fn sync_output_unknown_caps_defaults_to_emit() {
         // No caps threaded ⇒ emit the bracket (= today's unconditional Begin).
-        assert!(sync_output_enabled(None), "unknown caps must emit (= today)");
+        assert!(
+            sync_output_enabled(None),
+            "unknown caps must emit (= today)"
+        );
     }
 
     #[test]
@@ -564,20 +597,34 @@ mod gate_tests {
         // DA1 never answered (default caps) ⇒ still emit — preserves today.
         let caps = TermCaps::default();
         assert!(!caps.da1_answered);
-        assert!(sync_output_enabled(Some(&caps)), "no DA1 fence ⇒ emit (= today)");
+        assert!(
+            sync_output_enabled(Some(&caps)),
+            "no DA1 fence ⇒ emit (= today)"
+        );
     }
 
     #[test]
     fn sync_output_negotiated_supported_emits() {
-        let caps = TermCaps { da1_answered: true, sync_output: true, ..TermCaps::default() };
+        let caps = TermCaps {
+            da1_answered: true,
+            sync_output: true,
+            ..TermCaps::default()
+        };
         assert!(sync_output_enabled(Some(&caps)));
     }
 
     #[test]
     fn sync_output_negotiated_unsupported_suppressed() {
         // Only affirmatively-negotiated 2026-unsupported suppresses the bracket.
-        let caps = TermCaps { da1_answered: true, sync_output: false, ..TermCaps::default() };
-        assert!(!sync_output_enabled(Some(&caps)), "2026 negotiated off ⇒ no bracket");
+        let caps = TermCaps {
+            da1_answered: true,
+            sync_output: false,
+            ..TermCaps::default()
+        };
+        assert!(
+            !sync_output_enabled(Some(&caps)),
+            "2026 negotiated off ⇒ no bracket"
+        );
     }
 
     // ── Gate 3: kitty push (DA1-fenced fact, blind fallback) ───────────────
@@ -592,19 +639,33 @@ mod gate_tests {
         // Default caps (no fence) ⇒ blind best-effort push, exactly like today.
         let caps = TermCaps::default();
         assert!(!caps.da1_answered);
-        assert!(kitty_push_enabled(Some(&caps)), "no DA1 fence ⇒ blind push (= today)");
+        assert!(
+            kitty_push_enabled(Some(&caps)),
+            "no DA1 fence ⇒ blind push (= today)"
+        );
     }
 
     #[test]
     fn kitty_push_negotiated_supported_pushes() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: true, ..TermCaps::default() };
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: true,
+            ..TermCaps::default()
+        };
         assert!(kitty_push_enabled(Some(&caps)));
     }
 
     #[test]
     fn kitty_push_negotiated_unsupported_skipped() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: false, ..TermCaps::default() };
-        assert!(!kitty_push_enabled(Some(&caps)), "kitty negotiated off ⇒ no push");
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: false,
+            ..TermCaps::default()
+        };
+        assert!(
+            !kitty_push_enabled(Some(&caps)),
+            "kitty negotiated off ⇒ no push"
+        );
     }
 }
 
@@ -915,7 +976,10 @@ mod burst_tests {
         assert!(s.contains("\x1b[?2027$p"), "DECRQM 2027 query missing");
         assert!(s.contains("\x1b[?u"), "kitty keyboard query missing");
         assert!(s.contains("\x1b[>c"), "DA2 query missing");
-        assert!(s.ends_with("\x1b[c"), "DA1 must be the LAST query (the fence)");
+        assert!(
+            s.ends_with("\x1b[c"),
+            "DA1 must be the LAST query (the fence)"
+        );
         assert_eq!(s.matches("\x1b[c").count(), 1, "exactly one DA1 query");
     }
 
@@ -932,7 +996,10 @@ mod burst_tests {
         caps.merge_burst(&r);
         assert!(caps.da1_answered);
         assert!(caps.kitty_keyboard);
-        assert!(caps.sync_output, "DECRPM 2 = reset-but-settable = supported");
+        assert!(
+            caps.sync_output,
+            "DECRPM 2 = reset-but-settable = supported"
+        );
         assert!(!caps.mode_2027, "DECRPM 0 = not recognized");
     }
 
@@ -955,7 +1022,10 @@ mod burst_tests {
         caps.merge_burst(&parse_burst_replies(b"\x1b[?62;4c"));
         assert!(caps.da1_answered);
         assert!(!caps.kitty_keyboard);
-        assert!(caps.sync_output, "no DECRQM answer ⇒ keep harmless default-on");
+        assert!(
+            caps.sync_output,
+            "no DECRQM answer ⇒ keep harmless default-on"
+        );
     }
 
     #[test]

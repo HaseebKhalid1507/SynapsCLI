@@ -2,7 +2,9 @@
 
 use serde::Deserialize;
 
-use super::{CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport};
+use super::{
+    CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport,
+};
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterModelsResponse {
@@ -60,30 +62,45 @@ pub fn parse_openrouter_catalog_models(body: &str) -> Result<Vec<CatalogModel>, 
             m.provider_kind = CatalogProviderKind::OpenRouter;
             m.label = item.name.filter(|n| !n.trim().is_empty());
             m.context_tokens = item.context_length;
-            m.max_output_tokens = item.top_provider.as_ref().and_then(|p| p.max_completion_tokens);
+            m.max_output_tokens = item
+                .top_provider
+                .as_ref()
+                .and_then(|p| p.max_completion_tokens);
 
             let mods: Vec<Modality> = item
                 .architecture
-                .map(|a| a.input_modalities.iter().map(|s| Modality::from_str(s)).collect())
+                .map(|a| {
+                    a.input_modalities
+                        .iter()
+                        .map(|s| Modality::from_str(s))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![Modality::Text]);
             m.input_modalities = mods;
 
-            let pricing = item.pricing.map(|p| PricingSummary {
-                prompt:             p.prompt.filter(|v| !v.trim().is_empty()),
-                completion:         p.completion.filter(|v| !v.trim().is_empty()),
-                internal_reasoning: p.internal_reasoning.filter(|v| !v.trim().is_empty()),
-            }).unwrap_or_default();
+            let pricing = item
+                .pricing
+                .map(|p| PricingSummary {
+                    prompt: p.prompt.filter(|v| !v.trim().is_empty()),
+                    completion: p.completion.filter(|v| !v.trim().is_empty()),
+                    internal_reasoning: p.internal_reasoning.filter(|v| !v.trim().is_empty()),
+                })
+                .unwrap_or_default();
 
             let has = |param: &str| item.supported_parameters.iter().any(|p| p == param);
             let internal_priced = pricing.has_internal_reasoning_cost();
 
             m.reasoning = if has("verbosity") {
                 ReasoningSupport::AnthropicAdaptive { adaptive: true }
-            } else if has("reasoning") || has("include_reasoning") || has("reasoning_effort") || internal_priced {
+            } else if has("reasoning")
+                || has("include_reasoning")
+                || has("reasoning_effort")
+                || internal_priced
+            {
                 ReasoningSupport::OpenRouter {
                     include_reasoning: has("include_reasoning"),
-                    effort:            has("reasoning_effort"),
-                    verbosity:         false,
+                    effort: has("reasoning_effort"),
+                    verbosity: false,
                     internal_reasoning_priced: internal_priced,
                 }
             } else {

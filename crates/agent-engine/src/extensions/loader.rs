@@ -13,9 +13,20 @@ use super::manager::{ExtensionLoadFailure, ExtensionManager};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionLoaderEvent {
     Started,
-    Loaded { plugin: String, loaded: usize, failed: usize },
-    Failed { failure: ExtensionLoadFailure, loaded: usize, failed: usize },
-    Finished { loaded: Vec<String>, failed: Vec<ExtensionLoadFailure> },
+    Loaded {
+        plugin: String,
+        loaded: usize,
+        failed: usize,
+    },
+    Failed {
+        failure: ExtensionLoadFailure,
+        loaded: usize,
+        failed: usize,
+    },
+    Finished {
+        loaded: Vec<String>,
+        failed: Vec<ExtensionLoadFailure>,
+    },
 }
 
 impl ExtensionLoaderEvent {
@@ -35,9 +46,13 @@ pub fn spawn_discover_and_load(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _ = tx.send(ExtensionLoaderEvent::Started);
-        let (loaded, failed) = manager.write().await.discover_and_load_with_progress(|event| {
-            let _ = tx.send(event);
-        }).await;
+        let (loaded, failed) = manager
+            .write()
+            .await
+            .discover_and_load_with_progress(|event| {
+                let _ = tx.send(event);
+            })
+            .await;
         let _ = tx.send(ExtensionLoaderEvent::Finished { loaded, failed });
     })
 }

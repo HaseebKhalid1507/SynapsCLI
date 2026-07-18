@@ -44,6 +44,30 @@
     "related": ["/help"]
   },
   {
+    "id": "effort",
+    "command": "/effort",
+    "title": "Reasoning effort",
+    "summary": "Pick a reasoning effort level for the active model from a lightbox.",
+    "category": "Models",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["effort", "reasoning", "thinking", "level", "budget"],
+    "lines": [
+      "Open a lightbox listing ONLY the effort levels the active exact model supports.",
+      "",
+      "  /effort          Open the effort lightbox",
+      "  /effort <level>  Apply a level directly (same checked path as /thinking)",
+      "",
+      "Enter applies on the fly (validated against the exact model; persisted to config and the session). Esc cancels.",
+      "Not available while a response is streaming.",
+      "",
+      "Related: /thinking, /model, /settings"
+    ],
+    "related": ["/model", "/settings"]
+  },
+  {
     "id": "settings",
     "command": "/help settings",
     "title": "Settings",

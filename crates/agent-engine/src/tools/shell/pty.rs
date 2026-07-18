@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system, Child, ChildKiller};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -255,25 +255,17 @@ impl Drop for PtyHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use serial_test::serial;
+    use std::collections::HashMap;
 
     #[tokio::test]
     #[serial]
     async fn test_spawn_echo_hello() {
-        let mut handle = PtyHandle::spawn(
-            "echo hello",
-            None,
-            HashMap::new(),
-            24,
-            80,
-        )
-        .expect("failed to spawn echo");
+        let mut handle = PtyHandle::spawn("echo hello", None, HashMap::new(), 24, 80)
+            .expect("failed to spawn echo");
 
         // Give the process time to produce output and exit.
-        let output = handle
-            .try_read_output(Duration::from_secs(3))
-            .await;
+        let output = handle.try_read_output(Duration::from_secs(3)).await;
 
         let text = String::from_utf8_lossy(&output);
         assert!(
@@ -285,21 +277,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_cat_echo_back() {
-        let mut handle = PtyHandle::spawn(
-            "cat",
-            None,
-            HashMap::new(),
-            24,
-            80,
-        )
-        .expect("failed to spawn cat");
+        let mut handle =
+            PtyHandle::spawn("cat", None, HashMap::new(), 24, 80).expect("failed to spawn cat");
 
         // Write input — cat will echo it back via the PTY.
         handle.write(b"test\n").expect("write failed");
 
-        let output = handle
-            .try_read_output(Duration::from_secs(3))
-            .await;
+        let output = handle.try_read_output(Duration::from_secs(3)).await;
 
         let text = String::from_utf8_lossy(&output);
         assert!(
@@ -311,26 +295,15 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_exit_code_detection() {
-        let mut handle = PtyHandle::spawn(
-            "bash -c exit 42",
-            None,
-            HashMap::new(),
-            24,
-            80,
-        )
-        .expect("failed to spawn bash exit");
+        let mut handle = PtyHandle::spawn("bash -c exit 42", None, HashMap::new(), 24, 80)
+            .expect("failed to spawn bash exit");
 
         // Wait for the process to finish — read until EOF / timeout.
-        let _ = handle
-            .try_read_output(Duration::from_secs(3))
-            .await;
+        let _ = handle.try_read_output(Duration::from_secs(3)).await;
 
         // Small additional delay to let try_wait catch up.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        assert!(
-            !handle.is_alive(),
-            "expected process to have exited"
-        );
+        assert!(!handle.is_alive(), "expected process to have exited");
     }
 }

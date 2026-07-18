@@ -20,11 +20,16 @@ struct GroqModelItem {
     owned_by: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 pub fn infer_groq_reasoning(model_id: &str) -> ReasoningSupport {
     let id = model_id.to_ascii_lowercase();
-    if id.starts_with("openai/gpt-oss-") || id.starts_with("qwen/qwen3-") || id.starts_with("groq/compound") {
+    if id.starts_with("openai/gpt-oss-")
+        || id.starts_with("qwen/qwen3-")
+        || id.starts_with("groq/compound")
+    {
         ReasoningSupport::GroqReasoning
     } else {
         ReasoningSupport::None
@@ -40,7 +45,10 @@ pub fn parse_groq_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde_
         .filter_map(|item| {
             let mut m = CatalogModel::new("groq", "Groq", item.id)?;
             m.provider_kind = CatalogProviderKind::Groq;
-            m.label = item.owned_by.as_ref().map(|owner| format!("{} — {}", m.id, owner));
+            m.label = item
+                .owned_by
+                .as_ref()
+                .map(|owner| format!("{} — {}", m.id, owner));
             m.context_tokens = item.context_window;
             m.reasoning = infer_groq_reasoning(&m.id);
             m.source = CatalogSource::Live;

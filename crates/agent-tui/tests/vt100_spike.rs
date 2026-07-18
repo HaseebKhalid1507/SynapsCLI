@@ -160,13 +160,26 @@ fn termcaps_burst_emits_da1_fenced_query_bytes() {
     let s = String::from_utf8(sink).expect("burst is pure ASCII");
     // Every query present…
     assert!(s.contains("\x1b[>0q"), "XTVERSION query missing: {s:?}");
-    assert!(s.contains("\x1b[?2026$p"), "DECRQM 2026 (sync output) query missing: {s:?}");
-    assert!(s.contains("\x1b[?2027$p"), "DECRQM 2027 (unicode width) query missing: {s:?}");
+    assert!(
+        s.contains("\x1b[?2026$p"),
+        "DECRQM 2026 (sync output) query missing: {s:?}"
+    );
+    assert!(
+        s.contains("\x1b[?2027$p"),
+        "DECRQM 2027 (unicode width) query missing: {s:?}"
+    );
     assert!(s.contains("\x1b[?u"), "kitty keyboard query missing: {s:?}");
     assert!(s.contains("\x1b[>c"), "DA2 query missing: {s:?}");
     // …and the fence is last, exactly once.
-    assert!(s.ends_with("\x1b[c"), "DA1 must be the FINAL query (the fence): {s:?}");
-    assert_eq!(s.matches("\x1b[c").count(), 1, "exactly one DA1 in the burst");
+    assert!(
+        s.ends_with("\x1b[c"),
+        "DA1 must be the FINAL query (the fence): {s:?}"
+    );
+    assert_eq!(
+        s.matches("\x1b[c").count(),
+        1,
+        "exactly one DA1 in the burst"
+    );
 }
 
 /// The burst must be invisible: feeding the query bytes through a real vt100
@@ -180,7 +193,11 @@ fn termcaps_burst_is_invisible_on_a_vt100_screen() {
         contents.trim().is_empty(),
         "query burst painted visible cells: {contents:?}"
     );
-    assert_eq!(parser.screen().cursor_position(), (0, 0), "burst moved the cursor");
+    assert_eq!(
+        parser.screen().cursor_position(),
+        (0, 0),
+        "burst moved the cursor"
+    );
 }
 
 /// A realistic kitty-style answer stream (XTVERSION DCS, kitty flags,
@@ -199,8 +216,14 @@ fn termcaps_synthetic_da1_reply_parses_into_caps() {
     let mut caps = TermCaps::default();
     caps.merge_burst(&parsed);
     assert!(caps.da1_answered);
-    assert!(caps.kitty_keyboard, "kitty reply must flip kitty_keyboard to fact-true");
-    assert!(caps.sync_output, "DECRPM 2 (reset, settable) counts as supported");
+    assert!(
+        caps.kitty_keyboard,
+        "kitty reply must flip kitty_keyboard to fact-true"
+    );
+    assert!(
+        caps.sync_output,
+        "DECRPM 2 (reset, settable) counts as supported"
+    );
     assert!(caps.mode_2027, "DECRPM 1 (set) counts as supported");
 }
 
@@ -285,7 +308,10 @@ fn termcaps_negotiation_full_reply_2026_unsupported() {
     let art = caps_artifact("2026-unsupported", &caps);
     assert!(caps.da1_answered, "{art}");
     assert!(caps.kitty_keyboard, "kitty answered ⇒ true — {art}");
-    assert!(!caps.sync_output, "DECRPM 4 = permanently reset = unsupported — {art}");
+    assert!(
+        !caps.sync_output,
+        "DECRPM 4 = permanently reset = unsupported — {art}"
+    );
     assert!(!caps.mode_2027, "DECRPM 0 = not recognized — {art}");
 }
 
@@ -315,12 +341,16 @@ fn termcaps_negotiation_unfenced_replies_discarded_wholesale() {
     let stream: &[u8] = b"\x1b[?1u\x1b[?2026;1$y\x1b[?2027;1$y";
     let parsed = parse_burst_replies(stream);
     assert!(!parsed.da1, "no DA1 in this stream");
-    assert!(parsed.kitty && parsed.mode_2026.is_some(), "parser still saw them");
+    assert!(
+        parsed.kitty && parsed.mode_2026.is_some(),
+        "parser still saw them"
+    );
 
     let before = TermCaps::default();
     let after = negotiate_synthetic(before.clone(), stream);
     assert_eq!(
-        after, before,
+        after,
+        before,
         "unfenced replies must NOT mutate caps — {}",
         caps_artifact("unfenced", &after)
     );
@@ -344,7 +374,10 @@ fn termcaps_negotiation_partial_da1_arrives_unanswered_stay_default() {
     assert!(caps.da1_answered, "{art}");
     assert!(caps.kitty_keyboard, "{art}");
     assert!(caps.mode_2027, "answered 2027 merges — {art}");
-    assert!(caps.sync_output, "un-answered 2026 keeps default-on — {art}");
+    assert!(
+        caps.sync_output,
+        "un-answered 2026 keeps default-on — {art}"
+    );
 }
 
 /// Partial the other way: DA1 fences but the terminal answered NOTHING else
@@ -356,8 +389,14 @@ fn termcaps_negotiation_partial_da1_only_turns_kitty_off() {
     let caps = negotiate_synthetic(TermCaps::default(), b"\x1b[?6c");
     let art = caps_artifact("da1-only", &caps);
     assert!(caps.da1_answered, "{art}");
-    assert!(!caps.kitty_keyboard, "no kitty reply by fence ⇒ off — {art}");
-    assert!(caps.sync_output, "no DECRQM answer ⇒ harmless default-on — {art}");
+    assert!(
+        !caps.kitty_keyboard,
+        "no kitty reply by fence ⇒ off — {art}"
+    );
+    assert!(
+        caps.sync_output,
+        "no DECRQM answer ⇒ harmless default-on — {art}"
+    );
     assert!(!caps.mode_2027, "no DECRQM answer ⇒ default-off — {art}");
 }
 
@@ -373,11 +412,13 @@ fn termcaps_negotiation_partial_da1_only_turns_kitty_off() {
 fn termcaps_negotiation_tmux_wrapped_dcs_is_skipped_trailing_csi_parsed() {
     // A tmux passthrough DCS (inner ESCs doubled) carrying a 2026 reply, then a
     // real (unwrapped) kitty reply + DA1 fence forwarded by tmux.
-    let stream: &[u8] =
-        b"\x1bPtmux;\x1b\x1b[?2026;1$y\x1b\\\x1b[?1u\x1b[?62;9;15c";
+    let stream: &[u8] = b"\x1bPtmux;\x1b\x1b[?2026;1$y\x1b\\\x1b[?1u\x1b[?62;9;15c";
     let parsed = parse_burst_replies(stream);
     assert!(parsed.da1, "unwrapped DA1 after the DCS must still fence");
-    assert!(parsed.kitty, "unwrapped kitty reply after the DCS must parse");
+    assert!(
+        parsed.kitty,
+        "unwrapped kitty reply after the DCS must parse"
+    );
     assert_eq!(
         parsed.mode_2026, None,
         "the 2026 reply buried inside the tmux DCS is NOT unwrapped — honest behavior"
@@ -387,7 +428,10 @@ fn termcaps_negotiation_tmux_wrapped_dcs_is_skipped_trailing_csi_parsed() {
     let art = caps_artifact("tmux-wrapped", &caps);
     assert!(caps.da1_answered, "{art}");
     assert!(caps.kitty_keyboard, "{art}");
-    assert!(caps.sync_output, "wrapped 2026 unseen ⇒ default-on holds — {art}");
+    assert!(
+        caps.sync_output,
+        "wrapped 2026 unseen ⇒ default-on holds — {art}"
+    );
 }
 
 /// A well-formed XTVERSION DCS reply (`DCS > | … ST`) is skipped cleanly and
@@ -412,7 +456,10 @@ fn termcaps_negotiation_garbage_interleaved_recovers_real_replies() {
     // 'q' keystroke, a truecolor SGR, a BEL, then real 2026 + kitty + DA1.
     let stream: &[u8] = b"q\x1b[38;2;10;20;30m\x07\x1b[?2026;1$y\x1b[?0u\x1b[?6c";
     let parsed = parse_burst_replies(stream);
-    assert!(parsed.da1 && parsed.kitty, "real replies recovered past the noise");
+    assert!(
+        parsed.da1 && parsed.kitty,
+        "real replies recovered past the noise"
+    );
     assert_eq!(parsed.mode_2026, Some(1));
 
     let caps = negotiate_synthetic(TermCaps::default(), stream);
@@ -426,15 +473,15 @@ fn termcaps_negotiation_garbage_interleaved_recovers_real_replies() {
 fn termcaps_negotiation_adversarial_bytes_never_panic() {
     let corpus: &[&[u8]] = &[
         b"",
-        b"\x1b",                       // lone ESC
-        b"\x1b[",                      // ESC + CSI introducer, nothing else
-        b"\x1b[?2026",                 // truncated mid-CSI (no final byte)
-        b"\x1bP>|never terminated",    // truncated DCS (no ST)
-        b"\x00\x00\x00\x00",           // NULs
-        b"\xff\xfe\xfd\xfc\xfb",       // high bytes / invalid UTF-8
-        b"\x1b[999999999999;0$y",      // absurd DECRQM mode (overflow-safe parse)
-        b"\x1b]0;window title\x07",    // OSC (not a burst reply)
-        &[0xffu8; 256],                // large invalid slab
+        b"\x1b",                    // lone ESC
+        b"\x1b[",                   // ESC + CSI introducer, nothing else
+        b"\x1b[?2026",              // truncated mid-CSI (no final byte)
+        b"\x1bP>|never terminated", // truncated DCS (no ST)
+        b"\x00\x00\x00\x00",        // NULs
+        b"\xff\xfe\xfd\xfc\xfb",    // high bytes / invalid UTF-8
+        b"\x1b[999999999999;0$y",   // absurd DECRQM mode (overflow-safe parse)
+        b"\x1b]0;window title\x07", // OSC (not a burst reply)
+        &[0xffu8; 256],             // large invalid slab
     ];
     for (idx, bytes) in corpus.iter().enumerate() {
         let parsed = parse_burst_replies(bytes); // must not panic
@@ -520,9 +567,18 @@ fn termcaps_negotiation_verbose_summary_dumps_all_fields() {
 fn termcaps_negotiation_verbose_summary_reports_timeout_as_unfenced() {
     let caps = negotiate_synthetic(TermCaps::default(), b"");
     let line = caps.summary();
-    assert!(line.contains("da1_answered=false"), "timeout must log unfenced: {line:?}");
-    assert!(line.contains("term_program=-"), "unset provenance renders as '-': {line:?}");
-    assert!(line.contains("tmux=-"), "unset tmux renders as '-': {line:?}");
+    assert!(
+        line.contains("da1_answered=false"),
+        "timeout must log unfenced: {line:?}"
+    );
+    assert!(
+        line.contains("term_program=-"),
+        "unset provenance renders as '-': {line:?}"
+    );
+    assert!(
+        line.contains("tmux=-"),
+        "unset tmux renders as '-': {line:?}"
+    );
 }
 
 // ── Emit⇄parse round-trip: the production writer feeds the production parser ──
@@ -534,12 +590,19 @@ fn termcaps_negotiation_verbose_summary_reports_timeout_as_unfenced() {
 fn termcaps_negotiation_emit_then_reply_roundtrip() {
     let mut burst: Vec<u8> = Vec::new();
     write_query_burst(&mut burst).expect("write into Vec is infallible");
-    assert_eq!(burst.as_slice(), QUERY_BURST, "writer emits the canonical burst");
+    assert_eq!(
+        burst.as_slice(),
+        QUERY_BURST,
+        "writer emits the canonical burst"
+    );
 
     // A terminal that supports everything answers each query in the burst.
     let reply: &[u8] =
         b"\x1bP>|xterm(390)\x1b\\\x1b[?1u\x1b[?2026;1$y\x1b[?2027;1$y\x1b[>41;390;0c\x1b[?64;1;9c";
     let caps = negotiate_synthetic(TermCaps::default(), reply);
     let art = caps_artifact("roundtrip", &caps);
-    assert!(caps.da1_answered && caps.kitty_keyboard && caps.sync_output && caps.mode_2027, "{art}");
+    assert!(
+        caps.da1_answered && caps.kitty_keyboard && caps.sync_output && caps.mode_2027,
+        "{art}"
+    );
 }

@@ -177,6 +177,7 @@ pub async fn run(
     let boot = setup::boot(EngineOpts {
         continue_session,
         system,
+        prompt_manifest: None,
         profile,
         no_extensions: false,
     })
@@ -1187,13 +1188,15 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     if let Some(result) = engine_result {
         match result {
             CommandResult::ModelChanged { model } => {
+                state.conv.write().await.session.model = model.clone();
                 let _ = broadcast.send(ServerMessage::System {
                     message: format!("model set to: {model}"),
                 });
             }
-            CommandResult::ThinkingChanged { level, .. } => {
+            CommandResult::ThinkingChanged { spec } => {
+                state.conv.write().await.session.thinking_level = spec.config_value();
                 let _ = broadcast.send(ServerMessage::System {
-                    message: format!("thinking set to: {level}"),
+                    message: format!("thinking set to: {}", spec.level()),
                 });
             }
             CommandResult::Quit => {

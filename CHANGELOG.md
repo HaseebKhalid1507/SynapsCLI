@@ -4,6 +4,91 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Typed, brokered provider authentication and routing.** `synaps login` now
+  discovers typed OAuth, cloud, and static-key targets from provider
+  descriptors. New broker-owned flows cover Grok/xAI, GitHub Copilot, Google
+  Gemini CLI / Code Assist, Azure OpenAI, Amazon Bedrock, and Google Vertex AI,
+  while preserving Anthropic and OpenAI Codex. Provider-qualified identities
+  survive login, persistence, model selection, catalog refresh, runtime routing,
+  and status output without exposing long-lived credentials to model runtimes.
+- **Exact model capabilities and live effort controls.** `/settings` reuses the
+  model picker and `/effort` exposes only modes authorized for the active exact
+  model. OpenAI Codex keeps seven source-controlled ChatGPT OAuth model rows and
+  distinct `xhigh`, `max`, and logical `ultra` modes. Claude Fable 5 adds wire
+  `max` and logical `ultracode`; UltraCode lowers to Anthropic `xhigh` plus
+  bounded orchestration doctrine rather than sending a made-up wire value.
+- **Typed modular prompt orchestration.** Source-controlled manifests compose
+  exact provider/model/role prompt modules, path-confine local files, persist
+  provenance, reload transactionally, and install runtime-owned delegation
+  policy. Worker authorization validates exact models, roles, write scopes,
+  grants, concurrency, and recursion before credentials, network, billing,
+  threads, or worker-state side effects.
+- **Reactive subagent lifecycle tools and completion gates.** Foregrounds can
+  start, poll, steer, inspect, collect, resume, and explicitly reconcile
+  workers. Completion waits for required reconciliation. Manifestless
+  OpenRouter sessions have an exact three-model worker authority for DeepSeek
+  V4 Pro, GLM 5.2, and Kimi K2.7 Code; other manifestless providers remain
+  foreground-only unless explicitly authorized.
+- **Brokered dynamic catalogs and provider-native streaming.** Catalog and
+  streaming support now covers xAI Responses, GitHub Copilot descriptors,
+  Gemini Code Assist, Azure OpenAI, Bedrock ConverseStream, Vertex SSE, OpenAI
+  Codex, and Anthropic. Broker requests pin hosts and paths, reject redirects,
+  and retain credentials inside the broker boundary.
+
+### Changed
+
+- Model identity is provider-qualified end to end; model switching now replaces
+  manifestless orchestration authority atomically and is refused while workers
+  still require collection or reconciliation.
+- OpenAI-compatible schema translation recursively sanitizes tool schemas and
+  preserves provider-specific call identifiers, while Gemini function
+  responses use Code Assist-compatible object payloads and replay thought
+  signatures.
+- Direct Codex transport errors include provider hosts and full cause chains,
+  retry only bounded transient send failures, and use idle read timeouts so
+  healthy long-running streams can continue.
+
+### Fixed
+
+- **Reactive subagent wake and garbage collection.** Finished workers no longer
+  disappear before collection, and expired unreconciled workers become bounded,
+  transport-free tombstones. Tombstones release steering/shutdown channels,
+  receiver/thread state, tool logs, and resumable conversation state while
+  retaining a UTF-8-safe terminal-output tail and idempotent
+  collection/reconciliation path. Reconciled tombstones are removed on the next
+  reaper pass, eliminating the completion-gate ⇄ GC deadlock.
+- Gemini Code Assist continuation now honors rate-limit reset hints, serializes
+  function responses correctly, and removes a public-API alias that Code Assist
+  rejects.
+- TUI model and effort changes fail closed on unsupported provider/model/mode
+  combinations, stale capability generations, active streams, and
+  unreconciled-worker races without persisting partial state.
+
+### Testing
+
+- Added zero-network OAuth, broker, cloud, catalog, routing, reasoning,
+  orchestration, provider-confinement, and streaming harnesses; golden request
+  bodies for OpenAI and Anthropic; and an external tombstone harness proving
+  bounded allocation release and real completion-gate recovery.
+- Live certification artifacts exercised Grok 4.5 fan-out, GLM 5.2 recovery,
+  and a heterogeneous DeepSeek → GLM → Kimi workflow. These are validation
+  evidence, not guarantees of upstream entitlement or availability.
+
+### Fixed (existing development line)
+
+- **Reactive subagent wake (Phase 1)** — subagents no longer silently vanish
+  when the parent turn ends before they complete. `cleanup_finished()` now
+  retains uncollected finished handles for 15 minutes (TTL reaper); a
+  `finalize_subagent` hook fires exactly once at each subagent thread exit
+  (outside `catch_unwind`), stamps `finished_at`, and pushes a
+  `subagent_completion` event to the parent's `EventQueue` so the idle parent
+  wakes and can call `subagent_collect`. Kill-switch:
+  `SYNAPS_DISABLE_SUBAGENT_WAKE=1`. Covers start, resume, panic, timeout, and
+  tokio-build-failure exit paths. Encodes the live regression as integration
+  test I1 (`parent_wakes_after_turn_end_multi_subagent`). See
+  `IMPLEMENTATION-PLAN.md` in the workspace for full design rationale.
 ## [0.6.1] — 2026-07-18
 
 ### Added

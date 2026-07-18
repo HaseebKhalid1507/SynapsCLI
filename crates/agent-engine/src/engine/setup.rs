@@ -3,9 +3,9 @@
 //! Extracts the initialization logic that was previously inlined in
 //! chatui/mod.rs so both renderers can use the same boot path.
 
-use crate::{Runtime, Result, Session, latest_session, resolve_session};
-use crate::skills::registry::CommandRegistry;
 use crate::skills::keybinds::KeybindRegistry;
+use crate::skills::registry::CommandRegistry;
+use crate::{latest_session, resolve_session, Result, Runtime, Session};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 pub struct EngineOpts {
     pub continue_session: Option<Option<String>>,
     pub system: Option<String>,
+    pub prompt_manifest: Option<std::path::PathBuf>,
     pub profile: Option<String>,
     pub no_extensions: bool,
 }
@@ -38,16 +39,20 @@ pub struct BackgroundTasks {
 impl BackgroundTasks {
     /// Signal all tasks to stop and unregister the session.
     pub fn shutdown(&self) {
-        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Release);
-        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        self.watcher_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.socket_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         crate::events::registry::unregister_session(&self.session_id);
     }
 }
 
 impl Drop for BackgroundTasks {
     fn drop(&mut self) {
-        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.watcher_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.socket_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.watcher_task.abort();
         self.socket_task.abort();
     }
@@ -112,9 +117,69 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let config = crate::config::load_config();
     runtime.apply_config(&config);
 
-    // Load system prompt
-    let system_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
-    runtime.set_system_prompt(system_prompt);
+    // Resolve the final foreground route before compiling immutable delegation
+    // policy. Continuing a session may replace the configured model.
+    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+
+    // Validate and compile an opted-in manifest before any session/network work.
+    let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
+    if let Some(path) = &opts.prompt_manifest {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| crate::RuntimeError::Config("prompt manifest is unavailable".into()))?;
+        let manifest = agent_core::prompt::PromptManifest::parse(&raw)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let registry = manifest
+            .registry(path.parent())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let model = crate::orchestration::canonical_foreground_identity(runtime.model())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
+        let context = agent_core::prompt::SelectionContext::new(model.clone(), None)
+            .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            &model,
+            manifest.delegation_catalog_candidates(),
+        )
+        .map_err(|error| crate::RuntimeError::Config(error.into()))?;
+        let delegation_policy = manifest
+            .delegation_policy(model.clone(), &catalog)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        let delegation_policy_digest = delegation_policy.as_ref().map(|policy| policy.digest());
+        if let Some(policy) = delegation_policy {
+            runtime.install_orchestration(Arc::new(
+                crate::orchestration::OrchestrationRuntime::new(policy),
+            ));
+        } else {
+            runtime.install_orchestration(Arc::new(
+                crate::orchestration::OrchestrationRuntime::baseline(model.clone(), 8, 64)
+                    .map_err(|error| crate::RuntimeError::Config(error.into()))?,
+            ));
+        }
+        let user = opts
+            .system
+            .as_ref()
+            .map(|_| {
+                agent_core::prompt::resolved_system_prompt_as_user_module(legacy_prompt.clone())
+            })
+            .transpose()
+            .map_err(|e| crate::RuntimeError::Config(e.to_string()))?;
+        let stack =
+            agent_core::prompt::compile_prompt_stack(&manifest, &registry, &context, user.clone())
+                .map_err(|e| {
+                    crate::RuntimeError::Config(format!("invalid prompt manifest: {e}"))
+                })?;
+        runtime
+            .apply_prompt_stack(stack)
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
+        runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
+    } else {
+        let foreground = crate::orchestration::canonical_foreground_identity(runtime.model())
+            .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
+        runtime.install_orchestration(Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
+                .map_err(|error| crate::RuntimeError::Config(error.into()))?,
+        ));
+        runtime.set_system_prompt(legacy_prompt);
+    }
 
     // Discover plugins/skills, build command registry, register load_skill tool.
     let tools_shared = runtime.tools_shared();
@@ -125,8 +190,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
-    // Session: continue existing or create new
-    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    // Session was resolved before policy compilation so its model is the immutable
+    // foreground identity used by worker inheritance and authorization.
 
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -140,7 +205,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     };
 
     // Helper: abort background tasks on error
-    let abort_tasks = |ws: &Arc<std::sync::atomic::AtomicBool>, wt: &tokio::task::JoinHandle<()>| {
+    let abort_tasks = |ws: &Arc<std::sync::atomic::AtomicBool>,
+                       wt: &tokio::task::JoinHandle<()>| {
         ws.store(true, std::sync::atomic::Ordering::Relaxed);
         wt.abort();
     };
@@ -184,7 +250,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Session start hook
     {
-        let mut index_record = crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
+        let mut index_record =
+            crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
         index_record.model = Some(sb.session.model.clone());
         index_record.profile = crate::core::config::get_profile();
         index_record.cwd = std::env::current_dir().ok();
@@ -192,12 +259,16 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             tracing::warn!("failed to append session start index record: {}", err);
         }
 
-        let hook_event = crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
+        let hook_event =
+            crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
     if mcp_server_count > 0 {
-        tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
+        tracing::info!(
+            "{} MCP servers available (use connect_mcp_server to activate)",
+            mcp_server_count
+        );
     }
 
     let session_id = sb.session.id.clone();
@@ -252,13 +323,27 @@ fn resolve_or_create_session(
         Some(ref maybe_id) => {
             let session = match maybe_id {
                 Some(ref id) => resolve_session(id).map_err(|e| {
-                    crate::error::RuntimeError::Tool(format!("Failed to load session '{}': {}", id, e))
+                    crate::error::RuntimeError::Tool(format!(
+                        "Failed to load session '{}': {}",
+                        id, e
+                    ))
                 })?,
                 None => latest_session().map_err(|e| {
                     crate::error::RuntimeError::Tool(format!("No sessions to continue: {}", e))
                 })?,
             };
             runtime.set_model(session.model.clone());
+            // Restore the session's named reasoning level so max/ultra/off
+            // and custom budgets survive --continue.
+            if let Some(level) =
+                agent_core::reasoning::ReasoningLevel::parse(&session.thinking_level)
+            {
+                runtime.set_reasoning_level_explicit(level);
+            } else if let Some(budget) =
+                crate::models::budget_for_thinking_level(&session.thinking_level)
+            {
+                runtime.set_thinking_budget_explicit(budget);
+            }
             if let Some(ref sp) = session.system_prompt {
                 runtime.set_system_prompt(sp.clone());
             }
@@ -294,7 +379,11 @@ fn resolve_or_create_session(
             })
         }
         None => {
-            let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
+            let session = Session::new(
+                runtime.model(),
+                runtime.thinking_level(),
+                runtime.system_prompt(),
+            );
             Ok(SessionBootResult {
                 session,
                 api_messages: Vec::new(),
@@ -306,5 +395,54 @@ fn resolve_or_create_session(
                 continue_info: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    /// B1: --continue path must restore thinking_level from the saved session.
+    /// Simulates what resolve_or_create_session does when a session is continued.
+    #[test]
+    fn continue_path_restores_thinking_level_from_session() {
+        let mut runtime = Runtime::new_headless();
+
+        // Simulate what resolve_or_create_session does on --continue.
+        let thinking_level_str = "ultra";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+
+        assert_eq!(
+            runtime.reasoning_level(),
+            ReasoningLevel::Ultra,
+            "thinking level must be restored from session on --continue"
+        );
+        assert!(
+            runtime.is_reasoning_explicit(),
+            "restored thinking level must be marked explicit so set_model won't overwrite it"
+        );
+    }
+
+    #[test]
+    fn continue_path_restores_max_level() {
+        let mut runtime = Runtime::new_headless();
+        let thinking_level_str = "max";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Max);
+    }
+
+    #[test]
+    fn continue_path_restores_off_level() {
+        let mut runtime = Runtime::new_headless();
+        let thinking_level_str = "off";
+        if let Some(level) = ReasoningLevel::parse(thinking_level_str) {
+            runtime.set_reasoning_level_explicit(level);
+        }
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
     }
 }

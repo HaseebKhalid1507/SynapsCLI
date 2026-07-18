@@ -111,7 +111,11 @@ pub(crate) struct ToastProvider {
 
 impl ToastProvider {
     pub(crate) fn new(clock: TuiClock) -> Self {
-        Self { toasts: VecDeque::new(), max_visible: 5, clock }
+        Self {
+            toasts: VecDeque::new(),
+            max_visible: 5,
+            clock,
+        }
     }
 
     /// Insert or update a toast by id. Returns `true` if the VISIBLE content
@@ -166,7 +170,12 @@ impl ToastProvider {
 }
 
 /// Compute the rectangle for a toast with the given content size.
-pub(crate) fn toast_rect(area: Rect, toast_width: u16, toast_height: u16, position: ToastPosition) -> Rect {
+pub(crate) fn toast_rect(
+    area: Rect,
+    toast_width: u16,
+    toast_height: u16,
+    position: ToastPosition,
+) -> Rect {
     let safe = super::lightbox::lightbox_safe_area(area);
     let width = toast_width.min(safe.width);
     let height = toast_height.min(safe.height);
@@ -179,8 +188,14 @@ pub(crate) fn toast_rect(area: Rect, toast_width: u16, toast_height: u16, positi
         ToastY::Top => safe.y.saturating_add(1),
         ToastY::Middle => safe.y + safe.height.saturating_sub(height) / 2,
         ToastY::Bottom => safe.y + safe.height.saturating_sub(height),
-    }.min(safe.y + safe.height.saturating_sub(height));
-    Rect { x, y, width, height }
+    }
+    .min(safe.y + safe.height.saturating_sub(height));
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 /// Return a stable anchor point for extension-controlled persistent overlays
@@ -189,7 +204,10 @@ pub(crate) fn toast_rect(area: Rect, toast_width: u16, toast_height: u16, positi
 #[allow(dead_code)]
 pub(crate) fn anchor_point(area: Rect, position: ToastPosition) -> Position {
     let rect = toast_rect(area, 1, 1, position);
-    Position { x: rect.x, y: rect.y }
+    Position {
+        x: rect.x,
+        y: rect.y,
+    }
 }
 
 pub(crate) fn toast_lines(toast: &Toast) -> Vec<Line<'static>> {
@@ -217,27 +235,57 @@ mod tests {
     #[test]
     fn rect_places_diagonal_positions_inside_safe_edges() {
         let area = Rect::new(0, 0, 100, 40);
-        assert_eq!(toast_rect(area, 20, 5, ToastPosition::TOP_LEFT), Rect::new(2, 1, 20, 5));
-        assert_eq!(toast_rect(area, 20, 5, ToastPosition::TOP_RIGHT), Rect::new(78, 1, 20, 5));
-        assert_eq!(toast_rect(area, 20, 5, ToastPosition::BOTTOM_LEFT), Rect::new(2, 35, 20, 5));
-        assert_eq!(toast_rect(area, 20, 5, ToastPosition::BOTTOM_RIGHT), Rect::new(78, 35, 20, 5));
+        assert_eq!(
+            toast_rect(area, 20, 5, ToastPosition::TOP_LEFT),
+            Rect::new(2, 1, 20, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 20, 5, ToastPosition::TOP_RIGHT),
+            Rect::new(78, 1, 20, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 20, 5, ToastPosition::BOTTOM_LEFT),
+            Rect::new(2, 35, 20, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 20, 5, ToastPosition::BOTTOM_RIGHT),
+            Rect::new(78, 35, 20, 5)
+        );
     }
 
     #[test]
     fn rect_places_center_positions() {
         let area = Rect::new(0, 0, 101, 41);
-        assert_eq!(toast_rect(area, 21, 5, ToastPosition::CENTER), Rect::new(40, 18, 21, 5));
-        assert_eq!(toast_rect(area, 21, 5, ToastPosition::TOP_CENTER), Rect::new(40, 1, 21, 5));
-        assert_eq!(toast_rect(area, 21, 5, ToastPosition::MIDDLE_LEFT), Rect::new(2, 18, 21, 5));
-        assert_eq!(toast_rect(area, 21, 5, ToastPosition::MIDDLE_RIGHT), Rect::new(78, 18, 21, 5));
-        assert_eq!(toast_rect(area, 21, 5, ToastPosition::BOTTOM_CENTER), Rect::new(40, 36, 21, 5));
+        assert_eq!(
+            toast_rect(area, 21, 5, ToastPosition::CENTER),
+            Rect::new(40, 18, 21, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 21, 5, ToastPosition::TOP_CENTER),
+            Rect::new(40, 1, 21, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 21, 5, ToastPosition::MIDDLE_LEFT),
+            Rect::new(2, 18, 21, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 21, 5, ToastPosition::MIDDLE_RIGHT),
+            Rect::new(78, 18, 21, 5)
+        );
+        assert_eq!(
+            toast_rect(area, 21, 5, ToastPosition::BOTTOM_CENTER),
+            Rect::new(40, 36, 21, 5)
+        );
     }
 
     #[test]
     fn default_toast_position_is_top_center_below_status_bar() {
         let area = Rect::new(0, 0, 100, 40);
         assert_eq!(ToastPosition::default(), ToastPosition::TOP_CENTER);
-        assert_eq!(toast_rect(area, 20, 5, ToastPosition::default()), Rect::new(40, 1, 20, 5));
+        assert_eq!(
+            toast_rect(area, 20, 5, ToastPosition::default()),
+            Rect::new(40, 1, 20, 5)
+        );
     }
 
     #[test]

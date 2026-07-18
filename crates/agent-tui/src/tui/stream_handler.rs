@@ -105,7 +105,15 @@ pub(super) async fn handle_stream_event(
             app.invalidate();
         }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
-            app.push_msg(ChatMessage::User(message.clone()));
+            // Queue-drained events (subagent completion wakes, watcher
+            // alerts) ride the same steering channel as genuine user
+            // steering, but they were already presented as Event cards at
+            // drain time (handle_event_queue_arm). Rendering them here as
+            // ChatMessage::User made subagent continuation text land in the
+            // transcript as a message the user typed and submitted.
+            if !super::helpers::is_event_payload(&message) {
+                app.push_msg(ChatMessage::User(message.clone()));
+            }
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
             }

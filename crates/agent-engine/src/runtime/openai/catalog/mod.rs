@@ -22,7 +22,6 @@
 //! **Anthropic** `GET https://api.anthropic.com/v1/models` — paginated, Bearer/x-api-key.
 //! Optional capabilities.thinking / capabilities.effort.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -31,21 +30,54 @@ pub const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTHROPIC_MODELS_MAX_PAGES: usize = 20;
 
 mod anthropic;
+pub mod capability_cache;
 mod codex;
 mod generic;
+mod github_copilot;
+mod google_gemini;
 mod groq;
 mod nvidia;
 mod openrouter;
+pub mod validation;
+mod xai;
 
 pub use anthropic::{
-    anthropic_models_url, merge_catalog_pages, parse_anthropic_catalog_models,
-    parse_anthropic_catalog_page, AnthropicCatalogPage,
+    anthropic_mode_capabilities, anthropic_models_url, anthropic_static_capability,
+    merge_catalog_pages, parse_anthropic_catalog_models, parse_anthropic_catalog_page,
+    plan_anthropic_execution, plan_standard_anthropic_transport, AnthropicCatalogPage,
+    AnthropicExecutionMode, AnthropicExecutionPlan,
+    AnthropicPlanError, AnthropicPlanErrorCode, AnthropicPlanPrerequisites, AnthropicWireEffort,
+    AnthropicWorkflowPlan,
 };
-pub use codex::codex_static_catalog_models;
+pub use codex::{
+    codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
+    parse_codex_catalog_models, plan_codex_execution, validate_codex_level, CodexCapabilitySource,
+    CodexExecutionMode, CodexExecutionPlan, CodexMultiAgentMode, CodexPlanError,
+    CodexPlanErrorCode, CodexRequestRole, CodexWireEffort, ExecutionRole,
+    PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
+};
 pub use generic::parse_generic_catalog_models;
+pub use github_copilot::{
+    copilot_model, copilot_static_catalog_models, models_request_headers,
+    parse_copilot_catalog_entries, parse_copilot_catalog_models,
+    preferred_wire_protocol_from_endpoints, runtime_wire_protocol as github_copilot_runtime_model,
+    selectable_copilot_entries, validate_models_endpoint, CopilotCatalogEntry, CopilotEndpoint,
+    CopilotModelDescriptor, CopilotPolicyState, CopilotWire, COPILOT_API_VERSION,
+    COPILOT_FALLBACK_MODELS, MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL,
+    PROVIDER_KEY as COPILOT_PROVIDER_KEY, PROVIDER_NAME as COPILOT_PROVIDER_NAME,
+};
+pub use google_gemini::{
+    google_gemini_model, google_gemini_static_catalog_models, GoogleGeminiModelDescriptor,
+    GOOGLE_GEMINI_TEXT_MODELS, PROVIDER_KEY as GOOGLE_GEMINI_PROVIDER_KEY,
+    PROVIDER_NAME as GOOGLE_GEMINI_PROVIDER_NAME,
+};
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
+pub use xai::{
+    xai_model, xai_static_capability, xai_static_catalog_models, XaiModelDescriptor,
+    XaiReasoningCapability, XAI_TEXT_MODELS,
+};
 
 // ─── Modality ────────────────────────────────────────────────────────────────
 
@@ -64,12 +96,12 @@ impl Modality {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "text"  => Modality::Text,
+            "text" => Modality::Text,
             "image" => Modality::Image,
             "audio" => Modality::Audio,
             "video" => Modality::Video,
-            "file"  => Modality::File,
-            other   => Modality::Other(other.to_string()),
+            "file" => Modality::File,
+            other => Modality::Other(other.to_string()),
         }
     }
 }
@@ -99,6 +131,27 @@ impl PricingSummary {
 
 // ─── ReasoningSupport ─────────────────────────────────────────────────────────
 
+/// Multi-agent protocol version advertised by the exact OpenAI Codex model.
+///
+/// Unknown server strings are retained only as this sanitized sentinel; raw
+/// catalog values never enter diagnostics or authorization decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexMultiAgentVersion {
+    V1,
+    V2,
+    Unknown,
+}
+
+impl CodexMultiAgentVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Normalized reasoning/thinking capability for a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReasoningSupport {
@@ -119,6 +172,16 @@ pub enum ReasoningSupport {
     NvidiaInlineThinking,
     /// Generic OpenAI-compatible (capability unknown).
     GenericOpenAi,
+    /// OpenAI Codex (ChatGPT OAuth): named effort levels, exact set from catalog.
+    CodexNamed {
+        /// Ordered list of supported named reasoning effort strings from the
+        /// live catalog's `supported_reasoning_levels[].effort` field.
+        supported: Vec<agent_core::reasoning::ReasoningLevel>,
+        /// Default level from catalog's `default_reasoning_level`, if present.
+        default_level: Option<agent_core::reasoning::ReasoningLevel>,
+        /// Exact model's collaboration protocol. Ultra requires V2.
+        multi_agent_version: Option<CodexMultiAgentVersion>,
+    },
     /// Not yet classified.
     Unknown,
 }
@@ -206,17 +269,42 @@ impl CatalogModel {
         })
     }
 
-    /// Synaps runtime id: bare for Anthropic/Claude, "provider/id" otherwise.
+    /// Synaps runtime id. Provider identity is always explicit, including Anthropic.
     pub fn runtime_id(&self) -> String {
-        match &self.provider_kind {
-            CatalogProviderKind::Anthropic => self.id.clone(),
-            _ => format!("{}/{}", self.provider_key, self.id),
-        }
+        format!("{}/{}", self.provider_key, self.id)
     }
 
     /// Label if present, id otherwise.
     pub fn display_label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.id)
+    }
+
+    /// For Codex models: returns the exact ordered set of supported named levels,
+    /// or `None` if this model has no Codex-named capability data.
+    pub fn codex_supported_levels(&self) -> Option<&[agent_core::reasoning::ReasoningLevel]> {
+        match &self.reasoning {
+            ReasoningSupport::CodexNamed { supported, .. } => Some(supported),
+            _ => None,
+        }
+    }
+
+    /// Exact Codex collaboration protocol, if the authoritative capability
+    /// record advertised one.
+    pub fn codex_multi_agent_version(&self) -> Option<CodexMultiAgentVersion> {
+        match &self.reasoning {
+            ReasoningSupport::CodexNamed {
+                multi_agent_version,
+                ..
+            } => *multi_agent_version,
+            _ => None,
+        }
+    }
+
+    /// For Codex models: true iff the given level is in the supported set.
+    /// Always returns false for models without Codex-named capability data.
+    pub fn codex_supports_level(&self, level: agent_core::reasoning::ReasoningLevel) -> bool {
+        self.codex_supported_levels()
+            .is_some_and(|levels| levels.contains(&level))
     }
 }
 
@@ -230,21 +318,21 @@ pub fn from_static_seed(
     label: &str,
 ) -> Option<CatalogModel> {
     let mut m = CatalogModel::new(provider_key, provider_name, id)?;
-    m.label = if label.trim().is_empty() { None } else { Some(label.to_string()) };
+    m.label = if label.trim().is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    };
     m.source = CatalogSource::StaticFallback;
     m.reasoning = ReasoningSupport::Unknown;
     Some(m)
 }
 
 /// Convert all static seeds in a ProviderSpec to CatalogModel entries.
-pub fn static_seeds_from_spec(
-    spec: &super::registry::ProviderSpec,
-) -> Vec<CatalogModel> {
+pub fn static_seeds_from_spec(spec: &super::registry::ProviderSpec) -> Vec<CatalogModel> {
     spec.models
         .iter()
-        .filter_map(|(id, label, _tier)| {
-            from_static_seed(spec.key, spec.name, id, label)
-        })
+        .filter_map(|(id, label, _tier)| from_static_seed(spec.key, spec.name, id, label))
         .collect()
 }
 
@@ -256,7 +344,6 @@ pub trait ModelCatalogProvider: Sync {
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>>;
 }
 
@@ -265,6 +352,9 @@ pub struct GroqCatalogProvider;
 pub struct NvidiaCatalogProvider;
 pub struct AnthropicCatalogProvider;
 pub struct CodexCatalogProvider;
+pub struct XaiCatalogProvider;
+pub struct GitHubCopilotCatalogProvider;
+pub struct GoogleGeminiCatalogProvider;
 pub struct GenericCatalogProvider;
 
 pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProvider {
@@ -274,6 +364,9 @@ pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProv
         "nvidia" => &NvidiaCatalogProvider,
         "claude" | "anthropic" => &AnthropicCatalogProvider,
         "openai-codex" => &CodexCatalogProvider,
+        "xai-auth" => &XaiCatalogProvider,
+        "github-copilot" => &GitHubCopilotCatalogProvider,
+        "google-gemini" => &GoogleGeminiCatalogProvider,
         _ => &GenericCatalogProvider,
     }
 }
@@ -292,30 +385,17 @@ async fn read_catalog_response(resp: reqwest::Response) -> Result<String, String
 }
 
 async fn fetch_anthropic_catalog_models(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
 ) -> Result<Vec<CatalogModel>, String> {
-    // Honor the credential source so a Remote client lists models via a
-    // broker-issued token instead of refreshing (and rotating) auth.json
-    // client-side — which would lock the broker out. (#158 A4)
-    let config = crate::config::load_config();
-    let source = config.auth.credential_source();
-    let cache = crate::auth::TokenCache::new();
-    let access = crate::auth::resolve_access_token("anthropic", &source, &cache, client)
-        .await
-        .map_err(|e| format!("Anthropic is not configured: {e}"))?;
+    // Paginated live discovery through the broker-owned Anthropic credential.
+    // Tokens never enter this module — each page is a allowlisted ProxyRequest
+    // for `/v1/models` (+ limit/after_id query).
     let mut pages = Vec::new();
     let mut after_id: Option<String> = None;
 
     for _ in 0..ANTHROPIC_MODELS_MAX_PAGES {
-        let url = anthropic_models_url(after_id.as_deref());
-        let resp = catalog_get(client, &url)
-            .bearer_auth(&access)
-            .header("x-api-key", &access)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        let body = read_catalog_response(resp).await?;
+        let path = anthropic_models_proxy_path(after_id.as_deref());
+        let body = broker_proxy_catalog_body("anthropic", &path).await?;
         let page = parse_anthropic_catalog_page(&body).map_err(|e| format!("parse failed: {e}"))?;
         let next_after_id = page.last_id.clone();
         let has_more = page.has_more && next_after_id.is_some();
@@ -329,53 +409,53 @@ async fn fetch_anthropic_catalog_models(
     Ok(merge_catalog_pages(pages))
 }
 
+/// Relative Anthropic models path for the broker allowlist (no host).
+pub fn anthropic_models_proxy_path(after_id: Option<&str>) -> String {
+    // Keep query shape identical to `anthropic_models_url` without the host.
+    let absolute = anthropic_models_url(after_id);
+    absolute
+        .strip_prefix("https://api.anthropic.com")
+        .unwrap_or(&absolute)
+        .to_string()
+}
+
 impl ModelCatalogProvider for OpenRouterCatalogProvider {
-    fn provider_key(&self) -> &'static str { "openrouter" }
+    fn provider_key(&self) -> &'static str {
+        "openrouter"
+    }
 
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { fetch_openrouter_catalog_models(client).await })
     }
 }
 
 impl ModelCatalogProvider for GroqCatalogProvider {
-    fn provider_key(&self) -> &'static str { "groq" }
+    fn provider_key(&self) -> &'static str {
+        "groq"
+    }
 
     fn fetch<'a>(
         &'a self,
-        client: &'a reqwest::Client,
-        overrides: &'a BTreeMap<String, String>,
+        _client: &'a reqwest::Client,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let spec = super::registry::providers()
-                .iter()
-                .find(|s| s.key == "groq")
-                .ok_or_else(|| "unknown provider: groq".to_string())?;
-            let api_key = super::registry::resolve_provider("groq", overrides)
-                .map(|(cfg, _)| cfg.api_key)
-                .ok_or_else(|| format!("{} is not configured", spec.name))?;
-            let url = format!("{}/models", spec.base_url.trim_end_matches('/'));
-            let resp = catalog_get(client, &url)
-                .bearer_auth(api_key)
-                .send()
-                .await
-                .map_err(|e| format!("request failed: {e}"))?;
-            let body = read_catalog_response(resp).await?;
+            let body = broker_catalog_models_body("groq").await?;
             parse_groq_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
         })
     }
 }
 
 impl ModelCatalogProvider for NvidiaCatalogProvider {
-    fn provider_key(&self) -> &'static str { "nvidia" }
+    fn provider_key(&self) -> &'static str {
+        "nvidia"
+    }
 
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
             let resp = catalog_get(client, "https://integrate.api.nvidia.com/v1/models")
@@ -389,36 +469,163 @@ impl ModelCatalogProvider for NvidiaCatalogProvider {
 }
 
 impl ModelCatalogProvider for AnthropicCatalogProvider {
-    fn provider_key(&self) -> &'static str { "claude" }
+    fn provider_key(&self) -> &'static str {
+        "claude"
+    }
 
     fn fetch<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move { fetch_anthropic_catalog_models(client).await })
     }
 }
 
+/// True when a broker catalog error means "no credential / not logged in",
+/// so static seeds are an acceptable offline fallback.
+///
+/// Transport, HTTP status, parse, denial, and credential-shape failures must
+/// NOT fall through to static seeds — they are real errors.
+pub fn is_missing_credential_catalog_error(err: &str) -> bool {
+    // Prefer structured BrokerError Display forms when present.
+    // Note: broker_proxy_catalog_body wraps broker errors as
+    // `request failed: {BrokerError}` — so "request failed" alone is NOT
+    // a transport signal.
+    let lower = err.to_lowercase();
+
+    // Hard excludes: real operational failures must never fall back to seeds.
+    if lower.contains("model list failed")
+        || lower.contains("parse failed")
+        || lower.contains("broker denied")
+        || lower.contains("broker transport error")
+        || lower.contains("missing chatgpt account id")
+        || lower.contains("http 4")
+        || lower.contains("http 5")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+
+    // Stable BrokerError::Credential prefix from token.rs load-miss:
+    // "credential error: No credentials for {provider} at {path}. Run `synaps login`."
+    // Match only the stable prefix so account-shape / other Credential variants
+    // (e.g. missing chatgpt account id) remain hard errors above.
+    lower.contains("credential error: no credentials for ")
+        || lower.contains("no credential configured")
+        || lower.contains("unknown provider:")
+        || lower.contains("not logged")
+        || lower.contains("registration required")
+}
+
 impl ModelCatalogProvider for CodexCatalogProvider {
-    fn provider_key(&self) -> &'static str { "openai-codex" }
+    fn provider_key(&self) -> &'static str {
+        "openai-codex"
+    }
 
     fn fetch<'a>(
         &'a self,
         _client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
-        Box::pin(async move { Ok(codex_static_catalog_models()) })
+        // Prefer broker-proxied live discovery against the ChatGPT backend
+        // models endpoint. Static seeds are offline / not-configured fallback
+        // only — never the normal successful result when auth is available.
+        Box::pin(async move {
+            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
+            match broker_proxy_catalog_body("openai-codex", &path).await {
+                Ok(body) => {
+                    let models = parse_codex_catalog_models(&body)
+                        .map_err(|e| format!("parse failed: {e}"))?;
+                    capability_cache::replace_provider(self.provider_key(), &models);
+                    Ok(models)
+                }
+                Err(err) => {
+                    if is_missing_credential_catalog_error(&err) {
+                        Ok(codex_static_catalog_models())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl ModelCatalogProvider for XaiCatalogProvider {
+    fn provider_key(&self) -> &'static str {
+        "xai-auth"
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(xai_static_catalog_models()) })
+    }
+}
+
+impl ModelCatalogProvider for GitHubCopilotCatalogProvider {
+    fn provider_key(&self) -> &'static str {
+        "github-copilot"
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
+        // Prefer broker-proxied live discovery (session token never enters this
+        // module as a caller-supplied secret). Fall back to curated static seeds
+        // only when the account is not configured for proxy discovery.
+        Box::pin(async move {
+            match broker_catalog_models_body("github-copilot").await {
+                Ok(body) => {
+                    parse_copilot_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
+                }
+                Err(err) => {
+                    // Offline / not-logged-in / transport: surface static fallback
+                    // only for explicit not-configured cases; other errors fail closed.
+                    let lower = err.to_lowercase();
+                    if lower.contains("not configured")
+                        || lower.contains("unknown provider")
+                        || lower.contains("not logged")
+                    {
+                        Ok(copilot_static_catalog_models())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl ModelCatalogProvider for GoogleGeminiCatalogProvider {
+    fn provider_key(&self) -> &'static str {
+        "google-gemini"
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
+        // The Code Assist model-discovery surface is not documented as a
+        // stable third-party API and there is no reviewed live-listing method
+        // in the broker allowlist yet. Fail closed to the conservative static
+        // catalog: text + tool-capable IDs whose provenance is the official
+        // Gemini CLI reference source.
+        Box::pin(async move { Ok(google_gemini_static_catalog_models()) })
     }
 }
 
 impl ModelCatalogProvider for GenericCatalogProvider {
-    fn provider_key(&self) -> &'static str { "generic" }
+    fn provider_key(&self) -> &'static str {
+        "generic"
+    }
 
     fn fetch<'a>(
         &'a self,
         _client: &'a reqwest::Client,
-        _overrides: &'a BTreeMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         Box::pin(async move {
             Err("generic catalog fetch requires provider key; use fetch_generic_catalog_provider_models".to_string())
@@ -427,27 +634,44 @@ impl ModelCatalogProvider for GenericCatalogProvider {
 }
 
 async fn fetch_generic_catalog_provider_models(
-    client: &reqwest::Client,
     provider_key: &str,
-    overrides: &BTreeMap<String, String>,
 ) -> Result<Vec<CatalogModel>, String> {
     let specs = super::registry::providers();
     let spec = specs
         .iter()
         .find(|s| s.key == provider_key)
         .ok_or_else(|| format!("unknown provider: {provider_key}"))?;
+    if !crate::auth::broker::static_key_configured(provider_key) {
+        return Err(format!("{} is not configured", spec.name));
+    }
+    let body = broker_catalog_models_body(provider_key).await?;
+    parse_generic_catalog_models(&body, provider_key, spec.name)
+        .map_err(|e| format!("parse failed: {e}"))
+}
 
-    let api_key = super::registry::resolve_provider(provider_key, overrides)
-        .map(|(cfg, _)| cfg.api_key)
-        .ok_or_else(|| format!("{} is not configured", spec.name))?;
+/// GET `/models` through the credential broker (the key never enters this
+/// module). Returns the body on 2xx, an HTTP-status error otherwise.
+async fn broker_catalog_models_body(provider_key: &str) -> Result<String, String> {
+    broker_proxy_catalog_body(provider_key, "/models").await
+}
 
-    fetch_generic_catalog_models(
-        client,
-        provider_key,
-        spec.name,
-        spec.base_url,
-        &api_key,
-    ).await
+/// GET an allowlisted catalog path through the credential broker.
+/// The credential never enters this module — only the provider key + path.
+async fn broker_proxy_catalog_body(provider_key: &str, path: &str) -> Result<String, String> {
+    let resp = crate::auth::broker::global_broker()
+        .proxy(crate::auth::ProxyRequest {
+            provider: provider_key.to_string(),
+            method: crate::auth::ProxyMethod::Get,
+            path: path.to_string(),
+            body: None,
+            stream: false,
+        })
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("model list failed: HTTP {}", resp.status));
+    }
+    Ok(resp.body)
 }
 
 /// Fetch the OpenRouter live model list. Auth not required.
@@ -462,25 +686,6 @@ pub async fn fetch_openrouter_catalog_models(
     parse_openrouter_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
 }
 
-/// Fetch a generic provider's `/models` endpoint.
-pub async fn fetch_generic_catalog_models(
-    client: &reqwest::Client,
-    provider_key: &str,
-    provider_name: &str,
-    base_url: &str,
-    api_key: &str,
-) -> Result<Vec<CatalogModel>, String> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = catalog_get(client, &url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let body = read_catalog_response(resp).await?;
-    parse_generic_catalog_models(&body, provider_key, provider_name)
-        .map_err(|e| format!("parse failed: {e}"))
-}
-
 /// Fetch catalog models for any registered provider.
 /// OpenRouter uses its rich parser; all others use the generic parser.
 /// Compatible shim: callers that previously used `registry::fetch_provider_models`
@@ -488,13 +693,12 @@ pub async fn fetch_generic_catalog_models(
 pub async fn fetch_catalog_models(
     client: &reqwest::Client,
     provider_key: &str,
-    overrides: &BTreeMap<String, String>,
 ) -> Result<Vec<CatalogModel>, String> {
     let provider = catalog_provider_for(provider_key);
     if provider.provider_key() == "generic" {
-        return fetch_generic_catalog_provider_models(client, provider_key, overrides).await;
+        return fetch_generic_catalog_provider_models(provider_key).await;
     }
-    provider.fetch(client, overrides).await
+    provider.fetch(client).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -540,22 +744,25 @@ mod tests {
             .expect("groq spec");
         let seeds = static_seeds_from_spec(spec);
         assert_eq!(seeds.len(), spec.models.len());
-        assert!(seeds.iter().all(|m| m.source == CatalogSource::StaticFallback));
+        assert!(seeds
+            .iter()
+            .all(|m| m.source == CatalogSource::StaticFallback));
         assert!(seeds.iter().all(|m| !m.id.is_empty()));
         assert!(seeds.iter().all(|m| m.runtime_id().starts_with("groq/")));
     }
 
     #[test]
-    fn anthropic_runtime_id_is_bare() {
+    fn anthropic_runtime_id_is_provider_qualified() {
         let mut m = CatalogModel::new("anthropic", "Anthropic", "claude-opus-4-7").unwrap();
         m.provider_kind = CatalogProviderKind::Anthropic;
-        assert_eq!(m.runtime_id(), "claude-opus-4-7");
+        assert_eq!(m.runtime_id(), "anthropic/claude-opus-4-7");
     }
 
     #[test]
     fn pricing_summary_has_internal_reasoning_cost_zero_is_false() {
         let p = PricingSummary {
-            prompt: None, completion: None,
+            prompt: None,
+            completion: None,
             internal_reasoning: Some("0".to_string()),
         };
         assert!(!p.has_internal_reasoning_cost());
@@ -564,19 +771,75 @@ mod tests {
     #[test]
     fn pricing_summary_has_internal_reasoning_cost_nonzero_is_true() {
         let p = PricingSummary {
-            prompt: None, completion: None,
+            prompt: None,
+            completion: None,
             internal_reasoning: Some("0.0000035".to_string()),
         };
         assert!(p.has_internal_reasoning_cost());
     }
 
+    #[tokio::test]
+    async fn ui_catalog_fetch_includes_xai_static_models() {
+        let models = fetch_catalog_models(&reqwest::Client::new(), "xai-auth")
+            .await
+            .expect("static xAI catalog");
+        assert_eq!(models, xai_static_catalog_models());
+        assert!(models
+            .iter()
+            .all(|model| model.runtime_id().starts_with("xai-auth/")));
+    }
+
+    #[tokio::test]
+    // Broker-proxied discovery reads ambient credentials via base-dir
+    // resolution; racing SYNAPS_BASE_DIR mutators made this flaky.
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ui_catalog_fetch_github_copilot_returns_prefixed_chat_models() {
+        // When the operator has a live session, broker-proxied discovery wins.
+        // Otherwise the curated static fallback is returned. Either way runtime
+        // ids are github-copilot/<wire-id> and include fixture-established IDs.
+        let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
+            .await
+            .expect("GitHub Copilot catalog");
+        assert!(!models.is_empty());
+        assert!(models
+            .iter()
+            .all(|model| model.runtime_id().starts_with("github-copilot/")));
+        let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
+        // High-value ids from the curated set must be present for this account
+        // or via static fallback.
+        for required in ["gpt-5.3-codex", "claude-sonnet-4.6", "gemini-3.5-flash"] {
+            assert!(ids.contains(required), "missing {required}");
+        }
+        assert!(!ids.contains("text-embedding-3-small"));
+    }
+
+    #[test]
+    fn github_copilot_static_catalog_is_available_without_network() {
+        let models = copilot_static_catalog_models();
+        assert_eq!(models.len(), COPILOT_FALLBACK_MODELS.len());
+        assert!(models
+            .iter()
+            .all(|m| m.source == CatalogSource::StaticFallback));
+    }
+
     #[test]
     fn catalog_provider_trait_dispatch_selects_specialized_handlers() {
-        assert_eq!(catalog_provider_for("openrouter").provider_key(), "openrouter");
+        assert_eq!(
+            catalog_provider_for("openrouter").provider_key(),
+            "openrouter"
+        );
         assert_eq!(catalog_provider_for("groq").provider_key(), "groq");
         assert_eq!(catalog_provider_for("nvidia").provider_key(), "nvidia");
         assert_eq!(catalog_provider_for("claude").provider_key(), "claude");
-        assert_eq!(catalog_provider_for("openai-codex").provider_key(), "openai-codex");
+        assert_eq!(
+            catalog_provider_for("openai-codex").provider_key(),
+            "openai-codex"
+        );
+        assert_eq!(catalog_provider_for("xai-auth").provider_key(), "xai-auth");
+        assert_eq!(
+            catalog_provider_for("github-copilot").provider_key(),
+            "github-copilot"
+        );
         assert_eq!(catalog_provider_for("cerebras").provider_key(), "generic");
     }
 
@@ -587,11 +850,14 @@ mod tests {
 
     #[test]
     fn anthropic_page_metadata_is_exposed_for_pagination() {
-        let page = parse_anthropic_catalog_page(r#"{
+        let page = parse_anthropic_catalog_page(
+            r#"{
             "data":[{"id":"claude-opus-4-7"}],
             "has_more": true,
             "last_id": "claude-opus-4-7"
-        }"#).expect("parse page");
+        }"#,
+        )
+        .expect("parse page");
         assert!(page.has_more);
         assert_eq!(page.last_id.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(page.models.len(), 1);
@@ -611,8 +877,12 @@ mod tests {
 
     #[test]
     fn merge_catalog_pages_dedupes_by_id() {
-        let first = parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"}]}"#).unwrap();
-        let second = parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"}]}"#).unwrap();
+        let first =
+            parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"}]}"#).unwrap();
+        let second = parse_anthropic_catalog_models(
+            r#"{"data":[{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"}]}"#,
+        )
+        .unwrap();
         let merged = merge_catalog_pages(vec![first, second]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "claude-opus-4-7");
@@ -703,7 +973,10 @@ mod tests {
         #[test]
         fn parses_internal_reasoning_cost_flag() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
             assert!(gemini.pricing.has_internal_reasoning_cost());
         }
 
@@ -717,38 +990,56 @@ mod tests {
         #[test]
         fn verbosity_param_maps_to_anthropic_adaptive() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let claude = models.iter().find(|m| m.id == "anthropic/claude-opus-4-7").unwrap();
-            assert_eq!(claude.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            let claude = models
+                .iter()
+                .find(|m| m.id == "anthropic/claude-opus-4-7")
+                .unwrap();
+            assert_eq!(
+                claude.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
         fn reasoning_effort_maps_to_openrouter_reasoning() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
             let o4 = models.iter().find(|m| m.id == "openai/o4-mini").unwrap();
-            assert_eq!(o4.reasoning, ReasoningSupport::OpenRouter {
-                include_reasoning: false,
-                effort: true,
-                verbosity: false,
-                internal_reasoning_priced: false,
-            });
+            assert_eq!(
+                o4.reasoning,
+                ReasoningSupport::OpenRouter {
+                    include_reasoning: false,
+                    effort: true,
+                    verbosity: false,
+                    internal_reasoning_priced: false,
+                }
+            );
         }
 
         #[test]
         fn reasoning_include_reasoning_maps_correctly() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
-            assert_eq!(gemini.reasoning, ReasoningSupport::OpenRouter {
-                include_reasoning: true,
-                effort: false,
-                verbosity: false,
-                internal_reasoning_priced: true,
-            });
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
+            assert_eq!(
+                gemini.reasoning,
+                ReasoningSupport::OpenRouter {
+                    include_reasoning: true,
+                    effort: false,
+                    verbosity: false,
+                    internal_reasoning_priced: true,
+                }
+            );
         }
 
         #[test]
         fn parses_multimodal_input() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
             assert!(gemini.input_modalities.contains(&Modality::Text));
             assert!(gemini.input_modalities.contains(&Modality::Image));
             assert!(gemini.input_modalities.contains(&Modality::Audio));
@@ -784,7 +1075,10 @@ mod tests {
             assert_eq!(m.max_output_tokens, Some(128_000));
             assert!(m.input_modalities.contains(&Modality::Image));
             // verbosity wins → AnthropicAdaptive
-            assert_eq!(m.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            assert_eq!(
+                m.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
@@ -813,9 +1107,6 @@ mod tests {
 
     // ── Task 3: Generic handler / compat with registry ────────────────────────
 
-
-
-
     // ── Task 5: Anthropic parser and Codex static catalog ───────────────────
 
     mod anthropic {
@@ -839,16 +1130,20 @@ mod tests {
             let models = parse_anthropic_catalog_models(json).expect("parse anthropic");
             assert_eq!(models.len(), 1);
             let model = &models[0];
-            assert_eq!(model.runtime_id(), "claude-opus-4-7");
+            assert_eq!(model.runtime_id(), "anthropic/claude-opus-4-7");
             assert_eq!(model.label.as_deref(), Some("Claude Opus 4.7"));
             assert_eq!(model.context_tokens, Some(200_000));
             assert_eq!(model.max_output_tokens, Some(32_000));
-            assert_eq!(model.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            assert_eq!(
+                model.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
         fn parser_tolerates_missing_capabilities_as_unknown() {
-            let json = r#"{"data":[{"id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku"}]}"#;
+            let json =
+                r#"{"data":[{"id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku"}]}"#;
             let models = parse_anthropic_catalog_models(json).expect("parse anthropic");
             assert_eq!(models[0].reasoning, ReasoningSupport::Unknown);
         }
@@ -874,8 +1169,107 @@ mod tests {
             assert!(!models.iter().any(|m| m.id == "gpt-5.5-pro"));
             assert!(!models.iter().any(|m| m.id == "gpt-5.4-nano"));
             assert!(!models.iter().any(|m| m.id == "gpt-5.1-codex-mini"));
-            assert!(models.iter().all(|m| m.source == CatalogSource::StaticFallback));
-            assert!(models.iter().all(|m| m.runtime_id().starts_with("openai-codex/")));
+            assert!(models
+                .iter()
+                .all(|m| m.source == CatalogSource::StaticFallback));
+            assert!(models
+                .iter()
+                .all(|m| m.runtime_id().starts_with("openai-codex/")));
+        }
+
+        #[test]
+        fn live_parser_filters_non_list_visibility_from_fixture() {
+            let fixture = include_str!("fixtures/openai_codex_models.json");
+            let models = parse_codex_catalog_models(fixture).expect("parse");
+            let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
+            assert!(ids.contains("gpt-5.6-sol"));
+            assert!(ids.contains("gpt-5.3-codex-spark"));
+            assert!(!ids.contains("codex-auto-review"));
+            assert!(!ids.contains("codex-internal-eval"));
+            assert!(models.iter().all(|m| m.source == CatalogSource::Live));
+        }
+
+        #[test]
+        fn models_path_carries_package_client_version() {
+            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
+            assert!(path.starts_with("/models?client_version="));
+            assert!(path.contains(env!("CARGO_PKG_VERSION")));
+        }
+
+        #[test]
+        fn missing_credential_fallback_classifies_real_broker_not_configured_text() {
+            let not_configured = format!(
+                "request failed: {}",
+                crate::auth::BrokerError::NotConfigured("openai-codex".into())
+            );
+            assert!(
+                is_missing_credential_catalog_error(&not_configured),
+                "got: {not_configured}"
+            );
+            let unknown = format!(
+                "request failed: {}",
+                crate::auth::BrokerError::UnknownProvider("openai-codex".into())
+            );
+            assert!(
+                is_missing_credential_catalog_error(&unknown),
+                "got: {unknown}"
+            );
+        }
+
+        #[test]
+        fn missing_credential_fallback_classifies_exact_broker_credential_no_credentials_text() {
+            // Production path: LocalBroker::access_token maps
+            // ensure_fresh_provider_token's load miss through BrokerError::Credential.
+            // Display form is exactly:
+            //   credential error: No credentials for {provider} at {path}. Run `synaps login`.
+            let raw = crate::auth::BrokerError::Credential(format!(
+                "No credentials for openai-codex at {}. Run `synaps login`.",
+                std::path::Path::new("/tmp/auth.json").display()
+            ));
+            let wrapped = format!("request failed: {raw}");
+            assert!(
+                is_missing_credential_catalog_error(&wrapped),
+                "exact BrokerError::Credential missing-login text must fall back to static seeds; got: {wrapped}"
+            );
+            // Prefix-stable form (path/provider vary; Display prefix does not).
+            assert!(is_missing_credential_catalog_error(
+                "request failed: credential error: No credentials for openai-codex at /home/user/.synaps/auth.json. Run `synaps login`."
+            ));
+        }
+
+        #[test]
+        fn missing_credential_fallback_does_not_hide_transport_http_parse_or_account_errors() {
+            for err in [
+                "request failed: broker transport error: connection reset",
+                "model list failed: HTTP 401",
+                "model list failed: HTTP 500",
+                "parse failed: missing field `models`",
+                "request failed: broker denied request: proxy path '/models' is not in the provider's endpoint allowlist",
+                "request failed: credential error: openai-codex credential is missing chatgpt account id",
+                "request failed: broker transport error: provider request failed: 403 Forbidden",
+            ] {
+                assert!(
+                    !is_missing_credential_catalog_error(err),
+                    "must not fallback for: {err}"
+                );
+            }
+        }
+    }
+
+    mod anthropic_paths {
+        use super::super::*;
+
+        #[test]
+        fn proxy_path_round_trips_limit_and_after_id() {
+            assert_eq!(anthropic_models_proxy_path(None), "/v1/models?limit=100");
+            assert_eq!(
+                anthropic_models_proxy_path(Some("claude-opus-4-7")),
+                "/v1/models?limit=100&after_id=claude-opus-4-7"
+            );
+            assert_eq!(
+                anthropic_models_proxy_path(Some("")),
+                "/v1/models?limit=100"
+            );
         }
     }
 
@@ -899,10 +1293,22 @@ mod tests {
 
         #[test]
         fn inference_maps_reasoning_families() {
-            assert_eq!(infer_groq_reasoning("openai/gpt-oss-120b"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("qwen/qwen3-32b"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("groq/compound-mini"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("llama-3.3-70b-versatile"), ReasoningSupport::None);
+            assert_eq!(
+                infer_groq_reasoning("openai/gpt-oss-120b"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("qwen/qwen3-32b"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("groq/compound-mini"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("llama-3.3-70b-versatile"),
+                ReasoningSupport::None
+            );
         }
 
         #[test]
@@ -935,9 +1341,18 @@ mod tests {
 
         #[test]
         fn inference_detects_thinking_and_standard_models() {
-            assert_eq!(infer_nvidia_reasoning("qwen/qwen3-next-80b-a3b-thinking"), ReasoningSupport::NvidiaInlineThinking);
-            assert_eq!(infer_nvidia_reasoning("nvidia/cosmos-reason2-8b"), ReasoningSupport::NvidiaInlineThinking);
-            assert_eq!(infer_nvidia_reasoning("meta/llama-3.3-70b-instruct"), ReasoningSupport::None);
+            assert_eq!(
+                infer_nvidia_reasoning("qwen/qwen3-next-80b-a3b-thinking"),
+                ReasoningSupport::NvidiaInlineThinking
+            );
+            assert_eq!(
+                infer_nvidia_reasoning("nvidia/cosmos-reason2-8b"),
+                ReasoningSupport::NvidiaInlineThinking
+            );
+            assert_eq!(
+                infer_nvidia_reasoning("meta/llama-3.3-70b-instruct"),
+                ReasoningSupport::None
+            );
         }
 
         #[test]
@@ -948,7 +1363,6 @@ mod tests {
             assert_eq!(models[0].id, "meta/llama-3.3-70b-instruct");
         }
     }
-
 
     mod generic_compat {
         use super::super::*;
@@ -962,8 +1376,8 @@ mod tests {
                     { "id": "openai/gpt-oss-120b" }
                 ]
             }"#;
-            let models = parse_generic_catalog_models(json, "openrouter", "OpenRouter")
-                .expect("parse ok");
+            let models =
+                parse_generic_catalog_models(json, "openrouter", "OpenRouter").expect("parse ok");
             assert_eq!(models.len(), 2);
             assert_eq!(models[0].runtime_id(), "openrouter/qwen/qwen3-coder");
             assert_eq!(models[0].display_label(), "Qwen: Qwen3 Coder");
@@ -988,8 +1402,8 @@ mod tests {
         #[test]
         fn generic_catalog_source_is_live() {
             let json = r#"{"data":[{"id":"m1","name":"Model One"}]}"#;
-            let models = parse_generic_catalog_models(json, "testprovider", "Test")
-                .expect("parse ok");
+            let models =
+                parse_generic_catalog_models(json, "testprovider", "Test").expect("parse ok");
             assert_eq!(models[0].source, CatalogSource::Live);
         }
 
@@ -1025,11 +1439,15 @@ mod tests {
         fn static_seeds_from_spec_all_providers() {
             // Every registered provider should produce at least one seed
             for spec in super::super::super::registry::providers() {
-                if spec.models.is_empty() { continue; }
+                if spec.models.is_empty() {
+                    continue;
+                }
                 let seeds = super::super::static_seeds_from_spec(spec);
                 assert!(!seeds.is_empty(), "no seeds for {}", spec.key);
                 assert!(
-                    seeds.iter().all(|m| m.runtime_id().starts_with(&format!("{}/", spec.key))),
+                    seeds
+                        .iter()
+                        .all(|m| m.runtime_id().starts_with(&format!("{}/", spec.key))),
                     "runtime_id prefix wrong for {}",
                     spec.key
                 );

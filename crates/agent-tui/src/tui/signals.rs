@@ -48,8 +48,8 @@
 //   SAVE_TIMEOUT_SECS  — budget for save_session() + append_record()
 //   HOOKS_TIMEOUT_SECS — budget for concurrent on_session_end hook emit
 //   TEARDOWN_TIMEOUT_SECS — sum of the above; total teardown budget for mod.rs
-pub(crate) const SAVE_TIMEOUT_SECS:     u64 = 2;
-pub(crate) const HOOKS_TIMEOUT_SECS:    u64 = 5;
+pub(crate) const SAVE_TIMEOUT_SECS: u64 = 2;
+pub(crate) const HOOKS_TIMEOUT_SECS: u64 = 5;
 pub(crate) const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +85,7 @@ pub(crate) fn signal_label(signal: ShutdownSignal) -> &'static str {
     match signal {
         ShutdownSignal::Interrupt => "interrupt",
         ShutdownSignal::Terminate => "terminate",
-        ShutdownSignal::Hangup    => "hangup",
+        ShutdownSignal::Hangup => "hangup",
     }
 }
 
@@ -121,8 +121,8 @@ pub(crate) fn spawn_shutdown_signal_task(
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    let mut signals = Signals::new([SIGTERM, SIGHUP, SIGINT])
-        .expect("failed to register signal hooks");
+    let mut signals =
+        Signals::new([SIGTERM, SIGHUP, SIGINT]).expect("failed to register signal hooks");
     let handle = signals.handle();
 
     std::thread::Builder::new()
@@ -131,10 +131,10 @@ pub(crate) fn spawn_shutdown_signal_task(
             for sig in signals.forever() {
                 tracing::debug!(sig, "signal-listener: received signal");
                 let shutdown = match sig {
-                    SIGINT  => ShutdownSignal::Interrupt,
+                    SIGINT => ShutdownSignal::Interrupt,
                     SIGTERM => ShutdownSignal::Terminate,
-                    SIGHUP  => ShutdownSignal::Hangup,
-                    _       => continue,
+                    SIGHUP => ShutdownSignal::Hangup,
+                    _ => continue,
                 };
 
                 // IMPORTANT: do NOT call emergency_teardown_terminal() here.
@@ -177,7 +177,7 @@ mod tests {
     fn labels_are_human_readable() {
         assert_eq!(signal_label(ShutdownSignal::Interrupt), "interrupt");
         assert_eq!(signal_label(ShutdownSignal::Terminate), "terminate");
-        assert_eq!(signal_label(ShutdownSignal::Hangup),    "hangup");
+        assert_eq!(signal_label(ShutdownSignal::Hangup), "hangup");
     }
 
     // Verify the signal→action policy is correct and stays correct.
@@ -186,20 +186,36 @@ mod tests {
     // load and never races the watchdog.
     #[test]
     fn all_signals_are_immediate_exit() {
-        assert_eq!(shutdown_action(ShutdownSignal::Terminate), ShutdownAction::ImmediateExit);
-        assert_eq!(shutdown_action(ShutdownSignal::Hangup),    ShutdownAction::ImmediateExit);
-        assert_eq!(shutdown_action(ShutdownSignal::Interrupt), ShutdownAction::ImmediateExit);
+        assert_eq!(
+            shutdown_action(ShutdownSignal::Terminate),
+            ShutdownAction::ImmediateExit
+        );
+        assert_eq!(
+            shutdown_action(ShutdownSignal::Hangup),
+            ShutdownAction::ImmediateExit
+        );
+        assert_eq!(
+            shutdown_action(ShutdownSignal::Interrupt),
+            ShutdownAction::ImmediateExit
+        );
     }
 
     #[test]
     fn all_signals_have_labels() {
-        for sig in [ShutdownSignal::Interrupt, ShutdownSignal::Terminate, ShutdownSignal::Hangup] {
+        for sig in [
+            ShutdownSignal::Interrupt,
+            ShutdownSignal::Terminate,
+            ShutdownSignal::Hangup,
+        ] {
             assert!(!signal_label(sig).is_empty());
         }
     }
 
     #[test]
     fn teardown_budget_is_sum_of_parts() {
-        assert_eq!(TEARDOWN_TIMEOUT_SECS, SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS);
+        assert_eq!(
+            TEARDOWN_TIMEOUT_SECS,
+            SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
+        );
     }
 }

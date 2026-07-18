@@ -1,13 +1,15 @@
 //! SendChannelTool — proactively send a message to a specific channel.
-use serde_json::{json, Value};
-use crate::Result;
 use super::{Tool, ToolContext};
+use crate::Result;
+use serde_json::{json, Value};
 
 pub struct SendChannelTool;
 
 #[async_trait::async_trait]
 impl Tool for SendChannelTool {
-    fn name(&self) -> &str { "send_channel" }
+    fn name(&self) -> &str {
+        "send_channel"
+    }
 
     fn description(&self) -> &str {
         "Send a message to a specific channel (discord, slack, system, etc). Use this to proactively notify through a specific channel rather than replying to an event."
@@ -32,13 +34,18 @@ impl Tool for SendChannelTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let channel_type = params["channel_type"].as_str()
-            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'channel_type' parameter".to_string()))?
+        let channel_type = params["channel_type"]
+            .as_str()
+            .ok_or_else(|| {
+                crate::RuntimeError::Tool("Missing 'channel_type' parameter".to_string())
+            })?
             .to_string();
-        let channel_id = params["channel_id"].as_str()
+        let channel_id = params["channel_id"]
+            .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'channel_id' parameter".to_string()))?
             .to_string();
-        let text = params["text"].as_str()
+        let text = params["text"]
+            .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'text' parameter".to_string()))?
             .to_string();
 
@@ -54,6 +61,7 @@ impl Tool for SendChannelTool {
             "error": "send_channel is not yet implemented — no channel dispatch wired",
             "channel_type": channel_type,
             "channel_id": channel_id,
-        }).to_string())
+        })
+        .to_string())
     }
 }

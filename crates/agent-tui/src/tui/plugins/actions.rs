@@ -11,18 +11,18 @@ use std::sync::{Arc, Mutex};
 
 use synaps_cli::skills::{
     install,
+    manifest::PluginManifest,
     marketplace::{
         derive_git_clone_url, fetch_manifest, fetch_marketplace, is_safe_plugin_name, is_trusted,
         trust_host_for_source,
     },
-    manifest::PluginManifest,
     plugin_index::{
         PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
         PluginIndexTrust,
     },
     post_install,
-    reload_registry,
     registry::CommandRegistry,
+    reload_registry,
     state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState, SetupStatus},
     update_diff::diff_plugin_manifests,
 };
@@ -124,7 +124,12 @@ pub(crate) async fn apply_add_marketplace(state: &mut PluginsModalState, url: St
         .iter()
         .map(|p| synaps_cli::skills::state::CachedPlugin {
             name: p.name.clone(),
-            source: p.source.clone().unwrap_or_else(|| p.index.as_ref().map(|idx| idx.repository.clone()).unwrap_or_default()),
+            source: p.source.clone().unwrap_or_else(|| {
+                p.index
+                    .as_ref()
+                    .map(|idx| idx.repository.clone())
+                    .unwrap_or_default()
+            }),
             version: p.version.clone(),
             description: p.description.clone(),
             index: p.index.as_ref().map(cached_index_metadata),
@@ -139,7 +144,12 @@ pub(crate) async fn apply_add_marketplace(state: &mut PluginsModalState, url: St
         repo_url,
     };
     // Replace existing marketplace with same name, or push.
-    if let Some(slot) = state.file.marketplaces.iter_mut().find(|m| m.name == new_m.name) {
+    if let Some(slot) = state
+        .file
+        .marketplaces
+        .iter_mut()
+        .find(|m| m.name == new_m.name)
+    {
         *slot = new_m;
     } else {
         state.file.marketplaces.push(new_m);
@@ -177,7 +187,10 @@ pub(crate) async fn apply_install(
         .find(|p| p.name == plugin_name)
         .cloned()
     else {
-        state.row_error = Some(format!("plugin '{}' not found in '{}'", plugin_name, marketplace_name));
+        state.row_error = Some(format!(
+            "plugin '{}' not found in '{}'",
+            plugin_name, marketplace_name
+        ));
         return;
     };
     let summary = permission_summary_for_plugin_name(&plugin_name)
@@ -211,8 +224,14 @@ pub(crate) async fn apply_install(
         return;
     }
     run_install_flow(
-        state, plugin_name, effective_source, subdir, Some(marketplace_name), None,
-        registry, config,
+        state,
+        plugin_name,
+        effective_source,
+        subdir,
+        Some(marketplace_name),
+        None,
+        registry,
+        config,
     );
 }
 
@@ -224,7 +243,10 @@ fn plugin_index_entry_from_cached(
     PluginIndexEntry {
         id: fallback_name.to_string(),
         name: cached.name.clone(),
-        version: cached.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+        version: cached
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".to_string()),
         description: cached.description.clone().unwrap_or_default(),
         repository: index.repository,
         subdir: index.subdir,
@@ -268,19 +290,55 @@ pub(crate) async fn apply_install_from_index_entry(
     let mut summary = vec![
         format!("index plugin: {} {}", entry.id, entry.version),
         format!("repository: {}", entry.repository),
-        format!("checksum: {}:{}", entry.checksum.algorithm, entry.checksum.value),
-        format!("executable extension: {}", if entry.capabilities.has_extension { "yes" } else { "no" }),
-        format!("permissions: {}", if entry.capabilities.permissions.is_empty() { "none".to_string() } else { entry.capabilities.permissions.join(", ") }),
-        format!("hooks: {}", if entry.capabilities.hooks.is_empty() { "none".to_string() } else { entry.capabilities.hooks.join(", ") }),
+        format!(
+            "checksum: {}:{}",
+            entry.checksum.algorithm, entry.checksum.value
+        ),
+        format!(
+            "executable extension: {}",
+            if entry.capabilities.has_extension {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!(
+            "permissions: {}",
+            if entry.capabilities.permissions.is_empty() {
+                "none".to_string()
+            } else {
+                entry.capabilities.permissions.join(", ")
+            }
+        ),
+        format!(
+            "hooks: {}",
+            if entry.capabilities.hooks.is_empty() {
+                "none".to_string()
+            } else {
+                entry.capabilities.hooks.join(", ")
+            }
+        ),
     ];
     if !entry.capabilities.providers.is_empty() {
         summary.push(format!(
             "providers: {}",
-            entry.capabilities.providers.iter().map(|p| format!("{} ({})", p.id, p.models.join(", "))).collect::<Vec<_>>().join("; ")
+            entry
+                .capabilities
+                .providers
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.models.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
-    if entry.capabilities.permissions.iter().any(|permission| permission == "providers.register") {
-        summary.push("HIGH IMPACT: selected provider models receive conversation content".to_string());
+    if entry
+        .capabilities
+        .permissions
+        .iter()
+        .any(|permission| permission == "providers.register")
+    {
+        summary
+            .push("HIGH IMPACT: selected provider models receive conversation content".to_string());
     }
     summary.push("fetched plugin manifest will be re-inspected before final install".to_string());
     let host = match trust_host_for_source(&entry.repository) {
@@ -307,7 +365,10 @@ pub(crate) async fn apply_install_from_index_entry(
         .and_then(|m| m.cached_plugins.iter().find(|p| p.name == entry.id))
         .map(|p| p.source.clone())
         .unwrap_or_else(|| entry.repository.clone());
-    let checksum = Some((entry.checksum.algorithm.clone(), entry.checksum.value.clone()));
+    let checksum = Some((
+        entry.checksum.algorithm.clone(),
+        entry.checksum.value.clone(),
+    ));
     run_install_flow(
         state,
         entry.id,
@@ -339,7 +400,9 @@ pub(crate) async fn apply_trust_and_install(
     let mut subdir: Option<String> = None;
     for m in &state.file.marketplaces {
         for p in &m.cached_plugins {
-            if p.name != plugin_name { continue; }
+            if p.name != plugin_name {
+                continue;
+            }
             marketplace_name = Some(m.name.clone());
             if let Some(rest) = p.source.strip_prefix("./") {
                 subdir = Some(rest.to_string());
@@ -347,7 +410,16 @@ pub(crate) async fn apply_trust_and_install(
             break;
         }
     }
-    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config);
+    run_install_flow(
+        state,
+        plugin_name,
+        source,
+        subdir,
+        marketplace_name,
+        None,
+        registry,
+        config,
+    );
 }
 
 /// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
@@ -380,12 +452,16 @@ fn install_plugin_to_temp_with_progress(
     expected_checksum: Option<(String, String)>,
     on_chunk: impl FnMut(&str),
 ) -> Result<(String, PathBuf), String> {
-    let parent = final_dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
+    let parent = final_dest
+        .parent()
+        .ok_or_else(|| "dest has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     let tmp = parent.join(format!(".{}-pending-install", plugin_name));
     let _ = std::fs::remove_dir_all(&tmp);
     let sha = match subdir {
-        Some(s) => install::install_plugin_from_subdir_with_progress(source_url, &s, &tmp, on_chunk),
+        Some(s) => {
+            install::install_plugin_from_subdir_with_progress(source_url, &s, &tmp, on_chunk)
+        }
         None => install::install_plugin_with_progress(source_url, &tmp, on_chunk),
     }?;
     if let Some((algorithm, expected)) = expected_checksum {
@@ -397,13 +473,25 @@ fn install_plugin_to_temp_with_progress(
     Ok((sha, tmp))
 }
 
-fn finalize_pending_install(temp_dir: &std::path::Path, final_dir: &std::path::Path) -> Result<(), String> {
+fn finalize_pending_install(
+    temp_dir: &std::path::Path,
+    final_dir: &std::path::Path,
+) -> Result<(), String> {
     if final_dir.exists() {
         let _ = std::fs::remove_dir_all(temp_dir);
-        return Err(format!("{} already exists on disk; uninstall first", final_dir.display()));
+        return Err(format!(
+            "{} already exists on disk; uninstall first",
+            final_dir.display()
+        ));
     }
-    std::fs::rename(temp_dir, final_dir)
-        .map_err(|e| format!("finalize install {} -> {}: {}", temp_dir.display(), final_dir.display(), e))
+    std::fs::rename(temp_dir, final_dir).map_err(|e| {
+        format!(
+            "finalize install {} -> {}: {}",
+            temp_dir.display(),
+            final_dir.display(),
+            e
+        )
+    })
 }
 
 fn cancel_pending_temp(temp_dir: &std::path::Path) {
@@ -488,7 +576,9 @@ async fn run_post_install_setup_for_dir(
         Ok(_resolved) => return Ok(PostInstallOutcome::PrebuiltInstalled),
         Err(post_install::PrebuiltError::NoMatchingAsset) => {}
         Err(e) => {
-            return Err(PostInstallError::Hard(format!("prebuilt asset install failed: {e}")));
+            return Err(PostInstallError::Hard(format!(
+                "prebuilt asset install failed: {e}"
+            )));
         }
     }
 
@@ -499,8 +589,9 @@ async fn run_post_install_setup_for_dir(
         // extension.command, verify it now — otherwise we'd silently
         // accept an install with a dangling binary path.
         if manifest.extension.is_some() {
-            post_install::verify_extension_command(&manifest, final_dir)
-                .map_err(|e| PostInstallError::Hard(format!("extension command verification failed: {e}")))?;
+            post_install::verify_extension_command(&manifest, final_dir).map_err(|e| {
+                PostInstallError::Hard(format!("extension command verification failed: {e}"))
+            })?;
         }
         return Ok(PostInstallOutcome::NotRequired);
     };
@@ -539,8 +630,7 @@ fn read_plugin_manifest(path: &std::path::Path) -> Result<PluginManifest, String
     let manifest_path = path.join(".synaps-plugin/plugin.json");
     let body = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
-    serde_json::from_str(&body)
-        .map_err(|e| format!("parse {}: {}", manifest_path.display(), e))
+    serde_json::from_str(&body).map_err(|e| format!("parse {}: {}", manifest_path.display(), e))
 }
 
 fn summarize_plugin_dir(path: &std::path::Path) -> Vec<String> {
@@ -583,7 +673,10 @@ fn record_installed_plugin(
     });
 }
 
-fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -> Option<(String, String)> {
+fn expected_update_checksum(
+    state: &PluginsState,
+    installed: &InstalledPlugin,
+) -> Option<(String, String)> {
     let marketplace_name = installed.marketplace.as_deref()?;
     state
         .marketplaces
@@ -591,7 +684,12 @@ fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -
         .find(|m| m.name == marketplace_name)
         .and_then(|m| m.cached_plugins.iter().find(|p| p.name == installed.name))
         .and_then(|p| p.index.as_ref())
-        .map(|index| (index.checksum_algorithm.clone(), index.checksum_value.clone()))
+        .map(|index| {
+            (
+                index.checksum_algorithm.clone(),
+                index.checksum_value.clone(),
+            )
+        })
 }
 
 /// Kick off a background `git clone --progress` for `plugin_name` and
@@ -741,9 +839,7 @@ pub(crate) async fn complete_pending_install_clone(
             checksum_algorithm: expected_checksum
                 .as_ref()
                 .map(|(algorithm, _)| algorithm.clone()),
-            checksum_value: expected_checksum
-                .as_ref()
-                .map(|(_, value)| value.clone()),
+            checksum_value: expected_checksum.as_ref().map(|(_, value)| value.clone()),
             temp_dir,
             final_dir: dest,
         };
@@ -758,7 +854,10 @@ pub(crate) async fn complete_pending_install_clone(
         p.set_setup_running();
     }
     let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &dest).await;
-    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
+    let setup_status = setup_outcome
+        .as_ref()
+        .map(|o| o.setup_status())
+        .unwrap_or_else(|e| e.setup_status());
     let plugin_name_for_msg = plugin_name.clone();
     record_installed_plugin(
         state,
@@ -803,7 +902,8 @@ pub(crate) async fn apply_confirm_pending_install(
         temp_dir,
         final_dir,
         ..
-    } = std::mem::replace(&mut state.mode, RightMode::List) else {
+    } = std::mem::replace(&mut state.mode, RightMode::List)
+    else {
         return;
     };
 
@@ -811,7 +911,8 @@ pub(crate) async fn apply_confirm_pending_install(
     let temp_dir_for_task = temp_dir.clone();
     let finalize_res = tokio::task::spawn_blocking(move || {
         finalize_pending_install(&temp_dir_for_task, &final_dir_for_task)
-    }).await;
+    })
+    .await;
     match finalize_res {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -825,7 +926,10 @@ pub(crate) async fn apply_confirm_pending_install(
     }
 
     let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &final_dir).await;
-    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
+    let setup_status = setup_outcome
+        .as_ref()
+        .map(|o| o.setup_status())
+        .unwrap_or_else(|e| e.setup_status());
 
     record_installed_plugin(
         state,
@@ -911,7 +1015,12 @@ pub(crate) async fn apply_update(
             return;
         }
     };
-    let installed = state.file.installed.iter().find(|p| p.name == name).cloned();
+    let installed = state
+        .file
+        .installed
+        .iter()
+        .find(|p| p.name == name)
+        .cloned();
     let Some(installed) = installed else {
         state.row_error = Some(format!("plugin '{}' is not installed", name));
         return;
@@ -933,8 +1042,12 @@ pub(crate) async fn apply_update(
     let temp_dir = parent.join(format!(".{}-pending-update", name));
     let source = installed.source_url.clone();
     let subdir = installed.source_subdir.clone();
-    let expected_checksum = expected_update_checksum(&state.file, &installed)
-        .or_else(|| installed.checksum_algorithm.clone().zip(installed.checksum_value.clone()));
+    let expected_checksum = expected_update_checksum(&state.file, &installed).or_else(|| {
+        installed
+            .checksum_algorithm
+            .clone()
+            .zip(installed.checksum_value.clone())
+    });
     let temp_for_task = temp_dir.clone();
     let update_res = tokio::task::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(&temp_for_task);
@@ -943,13 +1056,16 @@ pub(crate) async fn apply_update(
             None => install::install_plugin(&source, &temp_for_task),
         }?;
         if let Some((algorithm, expected)) = expected_checksum {
-            if let Err(e) = install::verify_plugin_dir_checksum(&temp_for_task, &algorithm, &expected) {
+            if let Err(e) =
+                install::verify_plugin_dir_checksum(&temp_for_task, &algorithm, &expected)
+            {
                 let _ = std::fs::remove_dir_all(&temp_for_task);
                 return Err(e);
             }
         }
         Ok(sha)
-    }).await;
+    })
+    .await;
     let sha = match update_res {
         Ok(Ok(sha)) => sha,
         Ok(Err(e)) => {
@@ -991,7 +1107,8 @@ pub(crate) async fn apply_confirm_pending_update(
         temp_dir,
         final_dir,
         ..
-    } = std::mem::replace(&mut state.mode, RightMode::List) else {
+    } = std::mem::replace(&mut state.mode, RightMode::List)
+    else {
         return;
     };
     let final_for_task = final_dir.clone();
@@ -1003,11 +1120,17 @@ pub(crate) async fn apply_confirm_pending_update(
             .map_err(|e| format!("backup existing plugin {}: {}", final_for_task.display(), e))?;
         if let Err(e) = std::fs::rename(&temp_for_task, &final_for_task) {
             let _ = std::fs::rename(&backup, &final_for_task);
-            return Err(format!("apply update {} -> {}: {}", temp_for_task.display(), final_for_task.display(), e));
+            return Err(format!(
+                "apply update {} -> {}: {}",
+                temp_for_task.display(),
+                final_for_task.display(),
+                e
+            ));
         }
         let _ = std::fs::remove_dir_all(&backup);
         Ok(())
-    }).await;
+    })
+    .await;
     match apply_res {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -1020,8 +1143,16 @@ pub(crate) async fn apply_confirm_pending_update(
         }
     }
     let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &final_dir).await;
-    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
-    if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
+    let setup_status = setup_outcome
+        .as_ref()
+        .map(|o| o.setup_status())
+        .unwrap_or_else(|e| e.setup_status());
+    if let Some(p) = state
+        .file
+        .installed
+        .iter_mut()
+        .find(|p| p.name == plugin_name)
+    {
         p.installed_commit = installed_commit;
         p.latest_commit = None;
         p.setup_status = setup_status;
@@ -1092,7 +1223,12 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
             .iter()
             .map(|p| synaps_cli::skills::state::CachedPlugin {
                 name: p.name.clone(),
-                source: p.source.clone().unwrap_or_else(|| p.index.as_ref().map(|idx| idx.repository.clone()).unwrap_or_default()),
+                source: p.source.clone().unwrap_or_else(|| {
+                    p.index
+                        .as_ref()
+                        .map(|idx| idx.repository.clone())
+                        .unwrap_or_default()
+                }),
                 version: p.version.clone(),
                 description: p.description.clone(),
                 index: p.index.as_ref().map(cached_index_metadata),
@@ -1104,7 +1240,12 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
     for (plugin_name, res) in ls_results {
         match res {
             Ok(sha) => {
-                if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
+                if let Some(p) = state
+                    .file
+                    .installed
+                    .iter_mut()
+                    .find(|p| p.name == plugin_name)
+                {
                     p.latest_commit = Some(sha);
                 }
             }
@@ -1148,7 +1289,10 @@ pub(crate) async fn apply_remove_marketplace(
     for plugin_name in &to_uninstall {
         let dir = match install_dir_for(plugin_name) {
             Ok(d) => d,
-            Err(e) => { failed.push(format!("{}: {}", plugin_name, e)); continue; }
+            Err(e) => {
+                failed.push(format!("{}: {}", plugin_name, e));
+                continue;
+            }
         };
         let res = tokio::task::spawn_blocking(move || install::uninstall_plugin(&dir)).await;
         match res {
@@ -1158,7 +1302,10 @@ pub(crate) async fn apply_remove_marketplace(
         }
     }
 
-    state.file.installed.retain(|p| p.marketplace.as_deref() != Some(name.as_str()));
+    state
+        .file
+        .installed
+        .retain(|p| p.marketplace.as_deref() != Some(name.as_str()));
     state.file.marketplaces.retain(|m| m.name != name);
 
     if let Err(e) = commit_plugins_state(&state.file) {
@@ -1202,8 +1349,7 @@ pub(crate) fn toggle_plugin_config(
         new_disabled.push(name.to_string());
     }
     let csv = new_disabled.join(", ");
-    synaps_cli::config::write_config_value("disabled_plugins", &csv)
-        .map_err(|e| e.to_string())?;
+    synaps_cli::config::write_config_value("disabled_plugins", &csv).map_err(|e| e.to_string())?;
     config.disabled_plugins = new_disabled;
     reload_registry(registry, config);
     Ok(())
@@ -1235,10 +1381,7 @@ fn permission_summary_for_plugin_name(name: &str) -> Option<Vec<String>> {
         .map(|plugin| synaps_cli::skills::trust::summarize_plugin_permissions(&plugin).lines())
 }
 
-pub(crate) fn confirm_enable_plugin(
-    state: &mut PluginsModalState,
-    name: String,
-) {
+pub(crate) fn confirm_enable_plugin(state: &mut PluginsModalState, name: String) {
     let summary = permission_summary_for_plugin_name(&name).unwrap_or_else(|| {
         vec!["plugin manifest not found; enabling will reload available plugin content".to_string()]
     });
@@ -1257,7 +1400,6 @@ fn set_editor_or_row_error(state: &mut PluginsModalState, msg: String) {
     }
 }
 
-
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // test-only: guards held across await in tests are benign
 mod tests {
@@ -1266,11 +1408,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
-    use synaps_cli::skills::registry::CommandRegistry;
-    use synaps_cli::skills::state::{CachedPlugin, Marketplace, PluginsState};
     use synaps_cli::skills::plugin_index::{
         PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
     };
+    use synaps_cli::skills::registry::CommandRegistry;
+    use synaps_cli::skills::state::{CachedPlugin, Marketplace, PluginsState};
 
     // All config-env tests in agent-tui must share ONE lock so that the
     // migration_tests (tui/mod.rs) and these async tests can never interleave.
@@ -1289,7 +1431,10 @@ mod tests {
             let old_git_config_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
             synaps_cli::config::set_base_dir_for_tests(path.to_path_buf());
             std::env::set_var("GIT_CONFIG_GLOBAL", git_config_global);
-            Self { old_base_dir, old_git_config_global }
+            Self {
+                old_base_dir,
+                old_git_config_global,
+            }
         }
     }
 
@@ -1359,7 +1504,8 @@ mod tests {
         };
         fs::write(
             work.join(".synaps-plugin/plugin.json"),
-            format!(r#"{{
+            format!(
+                r#"{{
   "name": "policy-test",
   "version": "{}",
   "description": "test plugin with an executable extension",
@@ -1371,7 +1517,9 @@ mod tests {
     "permissions": {},
     "hooks": [{{"hook": "before_tool_call", "tool": "bash"}}]
   }}
-}}"#, version, permissions),
+}}"#,
+                version, permissions
+            ),
         )
         .unwrap();
         git(&["add", "."], work);
@@ -1505,12 +1653,12 @@ mod tests {
             &mut state,
             "local-index".into(),
             PluginIndexEntry {
-            repository: repository.clone(),
-            checksum: PluginIndexChecksum {
-                algorithm: "sha256".into(),
-                value: checksum.clone(),
-            },
-            ..index_entry(source.clone())
+                repository: repository.clone(),
+                checksum: PluginIndexChecksum {
+                    algorithm: "sha256".into(),
+                    value: checksum.clone(),
+                },
+                ..index_entry(source.clone())
             },
             &registry,
             &config,
@@ -1526,12 +1674,18 @@ mod tests {
             temp_dir,
             final_dir,
             ..
-        } = &state.mode else {
-            panic!("expected pending install confirmation, got {:?}; error {:?}", state.mode, state.row_error);
+        } = &state.mode
+        else {
+            panic!(
+                "expected pending install confirmation, got {:?}; error {:?}",
+                state.mode, state.row_error
+            );
         };
         assert_eq!(source_url, &source);
         assert_eq!(marketplace_name.as_deref(), Some("local-index"));
-        assert!(summary.iter().any(|line| line == "executable extension: yes"));
+        assert!(summary
+            .iter()
+            .any(|line| line == "executable extension: yes"));
         assert!(temp_dir.exists());
         assert!(!final_dir.exists());
     }
@@ -1554,7 +1708,9 @@ mod tests {
                 installed_at: "now".into(),
                 source_subdir: None,
                 checksum_algorithm: Some("sha256".into()),
-                checksum_value: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                checksum_value: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                ),
                 setup_status: Default::default(),
             }],
             trusted_hosts: vec![],
@@ -1568,8 +1724,16 @@ mod tests {
         apply_update(&mut state, "policy-test".into(), &registry, &config).await;
 
         assert!(matches!(state.mode, RightMode::List));
-        assert!(state.row_error.as_deref().unwrap_or_default().contains("checksum mismatch"));
-        assert!(!final_dir.parent().unwrap().join(".policy-test-pending-update").exists());
+        assert!(state
+            .row_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("checksum mismatch"));
+        assert!(!final_dir
+            .parent()
+            .unwrap()
+            .join(".policy-test-pending-update")
+            .exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1636,13 +1800,24 @@ mod tests {
 
         apply_update(&mut state, "policy-test".into(), &registry, &config).await;
 
-        let RightMode::PendingUpdateConfirm { summary, temp_dir, final_dir: pending_final, .. } = &state.mode else {
-            panic!("expected pending update confirmation, got {:?}; error {:?}", state.mode, state.row_error);
+        let RightMode::PendingUpdateConfirm {
+            summary,
+            temp_dir,
+            final_dir: pending_final,
+            ..
+        } = &state.mode
+        else {
+            panic!(
+                "expected pending update confirmation, got {:?}; error {:?}",
+                state.mode, state.row_error
+            );
         };
         assert_eq!(pending_final, &final_dir);
         assert!(temp_dir.exists());
         assert!(summary.iter().any(|line| line == "version: 0.1.0 -> 0.2.0"));
-        assert!(summary.iter().any(|line| line == "added permissions: privacy.llm_content"));
+        assert!(summary
+            .iter()
+            .any(|line| line == "added permissions: privacy.llm_content"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1669,8 +1844,15 @@ mod tests {
         complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
-            RightMode::PendingInstallConfirm { temp_dir, final_dir, summary, .. } => {
-                assert!(summary.iter().any(|line| line == "executable extension: yes"));
+            RightMode::PendingInstallConfirm {
+                temp_dir,
+                final_dir,
+                summary,
+                ..
+            } => {
+                assert!(summary
+                    .iter()
+                    .any(|line| line == "executable extension: yes"));
                 (temp_dir.clone(), final_dir.clone())
             }
             other => panic!("expected pending install confirmation, got {other:?}"),
@@ -1713,9 +1895,11 @@ mod tests {
         complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
-            RightMode::PendingInstallConfirm { temp_dir, final_dir, .. } => {
-                (temp_dir.clone(), final_dir.clone())
-            }
+            RightMode::PendingInstallConfirm {
+                temp_dir,
+                final_dir,
+                ..
+            } => (temp_dir.clone(), final_dir.clone()),
             other => panic!("expected pending install confirmation, got {other:?}"),
         };
         assert!(temp_dir.exists());
@@ -1763,14 +1947,21 @@ mod tests {
         std::fs::write(
             &setup,
             format!("#!/bin/bash\ntouch {}\necho ok\n", marker.display()),
-        ).unwrap();
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let res = run_post_install_setup_for_dir("hook-test", plugin_dir.path()).await;
         assert!(res.is_ok(), "got {res:?}");
-        let log = match res.unwrap() { PostInstallOutcome::SetupSucceeded(p) => p, other => panic!("expected setup success, got {other:?}") };
-        assert!(marker.exists(), "setup script should have created the marker");
+        let log = match res.unwrap() {
+            PostInstallOutcome::SetupSucceeded(p) => p,
+            other => panic!("expected setup success, got {other:?}"),
+        };
+        assert!(
+            marker.exists(),
+            "setup script should have created the marker"
+        );
         assert!(log.starts_with(home.path().join("logs/install")));
     }
 
@@ -1786,11 +1977,16 @@ mod tests {
         std::fs::write(
             synaps_dir.join("plugin.json"),
             r#"{"name":"no-setup-test"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let res = run_post_install_setup_for_dir("no-setup-test", plugin_dir.path()).await;
         match res {
-            Ok(PostInstallOutcome::NotRequired | PostInstallOutcome::BinaryAlreadyPresent | PostInstallOutcome::PrebuiltInstalled) => {}
+            Ok(
+                PostInstallOutcome::NotRequired
+                | PostInstallOutcome::BinaryAlreadyPresent
+                | PostInstallOutcome::PrebuiltInstalled,
+            ) => {}
             other => panic!("expected Ok(None), got {other:?}"),
         }
     }
@@ -1815,8 +2011,14 @@ mod tests {
 
         let res = run_post_install_setup_for_dir("fail-test", plugin_dir.path()).await;
         let err = res.expect_err("non-zero exit should propagate");
-        assert!(err.to_string().contains("13"), "error should mention exit code 13: {err}");
-        assert!(err.to_string().contains(".log"), "error should point at log path: {err}");
+        assert!(
+            err.to_string().contains("13"),
+            "error should mention exit code 13: {err}"
+        );
+        assert!(
+            err.to_string().contains(".log"),
+            "error should point at log path: {err}"
+        );
     }
 
     /// Slice D: when the manifest's `extension.command` already exists
@@ -1850,15 +2052,27 @@ mod tests {
         std::fs::write(
             scripts.join("setup.sh"),
             format!("#!/bin/bash\ntouch {}\necho ran\n", marker.display()),
-        ).unwrap();
-        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            scripts.join("setup.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         let res = run_post_install_setup_for_dir("skip-test", plugin_dir.path()).await;
         match res {
-            Ok(PostInstallOutcome::NotRequired | PostInstallOutcome::BinaryAlreadyPresent | PostInstallOutcome::PrebuiltInstalled) => {}
+            Ok(
+                PostInstallOutcome::NotRequired
+                | PostInstallOutcome::BinaryAlreadyPresent
+                | PostInstallOutcome::PrebuiltInstalled,
+            ) => {}
             other => panic!("expected Ok(None) (fast-path skip), got {other:?}"),
         }
-        assert!(!marker.exists(), "setup script must NOT have run on fast-path");
+        assert!(
+            !marker.exists(),
+            "setup script must NOT have run on fast-path"
+        );
     }
 
     /// Slice C/F: setup script exits 0 but the declared
@@ -1880,9 +2094,17 @@ mod tests {
         let scripts = plugin_dir.path().join("scripts");
         std::fs::create_dir(&scripts).unwrap();
         // Setup that "succeeds" but doesn't produce bin/missing.
-        std::fs::write(scripts.join("setup.sh"), "#!/bin/bash\necho lying setup\nexit 0\n").unwrap();
+        std::fs::write(
+            scripts.join("setup.sh"),
+            "#!/bin/bash\necho lying setup\nexit 0\n",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            scripts.join("setup.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         let res = run_post_install_setup_for_dir("verify-test", plugin_dir.path()).await;
         let err = res.expect_err("missing post-build artifact must error");
@@ -1890,7 +2112,10 @@ mod tests {
             err.to_string().contains("did not produce"),
             "error should explain build didn't produce binary: {err}"
         );
-        assert!(err.to_string().contains("bin/missing"), "error should name the missing path: {err}");
+        assert!(
+            err.to_string().contains("bin/missing"),
+            "error should name the missing path: {err}"
+        );
     }
 
     /// Slice F: no setup script declared but extension.command is also
@@ -1910,7 +2135,10 @@ mod tests {
         ).unwrap();
         let res = run_post_install_setup_for_dir("no-setup-no-bin", plugin_dir.path()).await;
         let err = res.expect_err("missing binary with no setup must error");
-        assert!(err.to_string().contains("verification failed"), "expected verify msg: {err}");
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verify msg: {err}"
+        );
     }
 
     /// file:// prebuilt assets are not accepted through the production post-install
@@ -1929,11 +2157,8 @@ mod tests {
         std::fs::create_dir_all(work.join("bin")).unwrap();
         std::fs::write(work.join("bin/ext"), "#!/bin/sh\necho prebuilt\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            work.join("bin/ext"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(work.join("bin/ext"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let archive = staging.path().join("ext.tar.gz");
         let out = std::process::Command::new("tar")
             .arg("-czf")
@@ -1949,8 +2174,7 @@ mod tests {
         let mut h = Sha256::new();
         h.update(&bytes);
         let sha: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
-        let triple = synaps_cli::skills::post_install::host_triple()
-            .expect("supported test host");
+        let triple = synaps_cli::skills::post_install::host_triple().expect("supported test host");
 
         // Plugin dir with a manifest that declares both prebuilt AND
         // setup — prebuilt wins, setup must NOT run.
@@ -1986,12 +2210,23 @@ mod tests {
             format!("#!/bin/bash\ntouch {}\n", marker.display()),
         )
         .unwrap();
-        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            scripts.join("setup.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         let res = run_post_install_setup_for_dir("prebuilt-test", plugin_dir.path()).await;
-        let err = res.expect_err("file:// prebuilt should be rejected outside post_install cfg(test) unit tests");
-        assert!(err.to_string().contains("refusing non-https prebuilt url"), "got: {err}");
-        assert!(!marker.exists(), "setup script must not run after unsafe prebuilt URL");
+        let err = res.expect_err(
+            "file:// prebuilt should be rejected outside post_install cfg(test) unit tests",
+        );
+        assert!(
+            err.to_string().contains("refusing non-https prebuilt url"),
+            "got: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "setup script must not run after unsafe prebuilt URL"
+        );
     }
 }

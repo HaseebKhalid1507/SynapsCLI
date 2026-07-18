@@ -3,7 +3,7 @@
 //! Processes StreamEvent variants, tracks subagent state and usage,
 //! and returns renderer-agnostic actions.
 
-use crate::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 /// What happened during a stream event — renderer decides how to display.
 #[derive(Debug)]
@@ -22,7 +22,11 @@ pub enum EngineStreamEvent {
     /// that need a string preview (chat.rs, server's HistoryEntry::ToolUse)
     /// can call `serde_json::to_string` themselves; the wire-format ToolUse
     /// in server mode passes the Value through directly.
-    ToolFinalized { tool_id: String, tool_name: String, input: serde_json::Value },
+    ToolFinalized {
+        tool_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
     /// Tool result delta.
     ToolResultDelta { tool_id: String, delta: String },
     /// Tool result complete.
@@ -32,7 +36,11 @@ pub enum EngineStreamEvent {
     /// Subagent status update.
     SubagentUpdate { id: u64, status: String },
     /// Subagent finished.
-    SubagentDone { id: u64, status: String, duration_secs: f64 },
+    SubagentDone {
+        id: u64,
+        status: String,
+        duration_secs: f64,
+    },
     /// Steering message was delivered.
     SteeringDelivered { message: String },
     /// Usage stats for this turn.
@@ -97,32 +105,50 @@ pub fn process_stream_event(
     pending_events: &mut Vec<String>,
 ) -> (EngineStreamEvent, StreamCompletion) {
     match event {
-        StreamEvent::Llm(LlmEvent::Thinking(text)) => {
-            (EngineStreamEvent::Thinking(text), StreamCompletion::Continue)
-        }
+        StreamEvent::Llm(LlmEvent::Thinking(text)) => (
+            EngineStreamEvent::Thinking(text),
+            StreamCompletion::Continue,
+        ),
         StreamEvent::Llm(LlmEvent::Text(text)) => {
             (EngineStreamEvent::Text(text), StreamCompletion::Continue)
         }
-        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
-            (EngineStreamEvent::ToolStart { tool_id, tool_name }, StreamCompletion::Continue)
-        }
-        StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
-            (EngineStreamEvent::ToolDelta { tool_id, delta }, StreamCompletion::Continue)
-        }
-        StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-            (EngineStreamEvent::ToolFinalized { tool_id, tool_name, input }, StreamCompletion::Continue)
-        }
-        StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
-            (EngineStreamEvent::ToolResultDelta { tool_id, delta }, StreamCompletion::Continue)
-        }
-        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
-            (EngineStreamEvent::ToolResult { tool_id, result }, StreamCompletion::Continue)
-        }
+        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => (
+            EngineStreamEvent::ToolStart { tool_id, tool_name },
+            StreamCompletion::Continue,
+        ),
+        StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => (
+            EngineStreamEvent::ToolDelta { tool_id, delta },
+            StreamCompletion::Continue,
+        ),
+        StreamEvent::Llm(LlmEvent::ToolUse {
+            tool_name,
+            tool_id,
+            input,
+        }) => (
+            EngineStreamEvent::ToolFinalized {
+                tool_id,
+                tool_name,
+                input,
+            },
+            StreamCompletion::Continue,
+        ),
+        StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => (
+            EngineStreamEvent::ToolResultDelta { tool_id, delta },
+            StreamCompletion::Continue,
+        ),
+        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => (
+            EngineStreamEvent::ToolResult { tool_id, result },
+            StreamCompletion::Continue,
+        ),
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             *messages = history;
             (EngineStreamEvent::Noop, StreamCompletion::Continue)
         }
-        StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
+        StreamEvent::Agent(AgentEvent::SubagentStart {
+            subagent_id,
+            agent_name,
+            task_preview,
+        }) => {
             subagents.push(SubagentTracker {
                 id: subagent_id,
                 name: agent_name.clone(),
@@ -131,15 +157,37 @@ pub fn process_stream_event(
                 done: false,
                 duration_secs: None,
             });
-            (EngineStreamEvent::SubagentStart { id: subagent_id, name: agent_name, task: task_preview }, StreamCompletion::Continue)
+            (
+                EngineStreamEvent::SubagentStart {
+                    id: subagent_id,
+                    name: agent_name,
+                    task: task_preview,
+                },
+                StreamCompletion::Continue,
+            )
         }
-        StreamEvent::Agent(AgentEvent::SubagentUpdate { subagent_id, status, .. }) => {
+        StreamEvent::Agent(AgentEvent::SubagentUpdate {
+            subagent_id,
+            status,
+            ..
+        }) => {
             if let Some(sa) = subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.status = status.clone();
             }
-            (EngineStreamEvent::SubagentUpdate { id: subagent_id, status }, StreamCompletion::Continue)
+            (
+                EngineStreamEvent::SubagentUpdate {
+                    id: subagent_id,
+                    status,
+                },
+                StreamCompletion::Continue,
+            )
         }
-        StreamEvent::Agent(AgentEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. }) => {
+        StreamEvent::Agent(AgentEvent::SubagentDone {
+            subagent_id,
+            result_preview,
+            duration_secs,
+            ..
+        }) => {
             let status = if result_preview.starts_with("[TIMED OUT") {
                 "\u{26a0} timed out".to_string()
             } else if result_preview.starts_with("ERROR") {
@@ -154,13 +202,23 @@ pub fn process_stream_event(
                 sa.duration_secs = Some(duration_secs);
                 sa.status = status.clone();
             }
-            (EngineStreamEvent::SubagentDone { id: subagent_id, status, duration_secs }, StreamCompletion::Continue)
+            (
+                EngineStreamEvent::SubagentDone {
+                    id: subagent_id,
+                    status,
+                    duration_secs,
+                },
+                StreamCompletion::Continue,
+            )
         }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
             if queued_message.as_ref() == Some(&message) {
                 *queued_message = None;
             }
-            (EngineStreamEvent::SteeringDelivered { message }, StreamCompletion::Continue)
+            (
+                EngineStreamEvent::SteeringDelivered { message },
+                StreamCompletion::Continue,
+            )
         }
         StreamEvent::Session(SessionEvent::Usage {
             input_tokens,
@@ -170,8 +228,8 @@ pub fn process_stream_event(
             cache_creation_5m,
             cache_creation_1h,
             model,
-        }) => {
-            (EngineStreamEvent::Usage {
+        }) => (
+            EngineStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
                 cache_read: cache_read_input_tokens,
@@ -179,8 +237,9 @@ pub fn process_stream_event(
                 cache_creation_5m,
                 cache_creation_1h,
                 model,
-            }, StreamCompletion::Continue)
-        }
+            },
+            StreamCompletion::Continue,
+        ),
         StreamEvent::Session(SessionEvent::Done) => {
             subagents.clear();
 
@@ -195,7 +254,10 @@ pub fn process_stream_event(
 
             // Check for queued message
             if let Some(queued) = queued_message.take() {
-                (EngineStreamEvent::Done, StreamCompletion::AutoSendQueued(queued))
+                (
+                    EngineStreamEvent::Done,
+                    StreamCompletion::AutoSendQueued(queued),
+                )
             } else if had_pending {
                 (EngineStreamEvent::Done, StreamCompletion::AutoTriggerEvents)
             } else {
@@ -218,7 +280,10 @@ pub fn process_stream_event(
                     messages.pop();
                 }
             }
-            (EngineStreamEvent::Error(err.clone()), StreamCompletion::Error(err))
+            (
+                EngineStreamEvent::Error(err.clone()),
+                StreamCompletion::Error(err),
+            )
         }
     }
 }

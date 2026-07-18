@@ -1,6 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{ExpandedLoadState, ExpandedModelsState, ModelsModalState, ModelsView, build_sections, expanded_visible_models, selected_expanded_model, selected_model, selected_provider, visible_rows, model_id_for_runtime};
+use super::{
+    build_sections, expanded_visible_models, normalize_favorite_id, remove_favorite_compat,
+    selected_expanded_model, selected_model, selected_provider, visible_rows, ExpandedLoadState,
+    ExpandedModelsState, ModelsModalState, ModelsView,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputOutcome {
@@ -8,6 +12,10 @@ pub(crate) enum InputOutcome {
     Close,
     Apply(String),
     ExpandProvider(String),
+    /// The user explicitly trusted a model mid-session (favorited it). The
+    /// caller must propagate this grant into the live delegation policy so
+    /// subagent dispatch honors it immediately — not only after a restart.
+    Trusted(String),
 }
 
 pub(crate) fn handle_event(
@@ -54,24 +62,27 @@ pub(crate) fn handle_event(
         }
         KeyCode::Char('e') => {
             if let Some(provider) = selected_provider(&sections, state) {
-                state.expanded = Some(ExpandedModelsState {
-                    provider_key: provider.provider_key.clone(),
-                    provider_name: provider.provider_name.clone(),
-                    cursor: 0,
-                    search: String::new(),
-                    load_state: ExpandedLoadState::Loading,
-                });
-                return InputOutcome::ExpandProvider(provider.provider_key.clone());
+                let (provider_key, provider_name) = (
+                    provider.provider_key.clone(),
+                    provider.provider_name.clone(),
+                );
+                return open_expanded_provider(state, provider_key, provider_name);
             }
             InputOutcome::None
         }
         KeyCode::Char('f') => {
             if let Some(model) = selected_model(&sections, state) {
-                if model.is_favorite {
-                    let _ = synaps_cli::config::remove_favorite_model(&model.favorite_id);
+                let trusted = if model.is_favorite {
+                    remove_favorite_compat(&model.favorite_id);
+                    None
                 } else {
-                    let _ = synaps_cli::config::add_favorite_model(&model.favorite_id);
-                }
+                    let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(
+                        &model.favorite_id,
+                    ));
+                    // Runtime-qualified identity of the visible row — the same
+                    // exact ID that Apply uses — for the live policy grant.
+                    Some(model.id.clone())
+                };
                 state.refresh_favorites();
                 let new_len = visible_rows(&build_sections(current_model, state), state).len();
                 if new_len == 0 {
@@ -79,12 +90,17 @@ pub(crate) fn handle_event(
                 } else if state.cursor >= new_len {
                     state.cursor = new_len - 1;
                 }
+                if let Some(model_id) = trusted {
+                    return InputOutcome::Trusted(model_id);
+                }
             }
             InputOutcome::None
         }
         KeyCode::Enter => {
             if let Some(model) = selected_model(&sections, state) {
-                InputOutcome::Apply(model_id_for_runtime(&model.favorite_id))
+                // Apply the provider-qualified identity of the visible row directly.
+                // Favorite normalization is compatibility-only and must not reroute it.
+                InputOutcome::Apply(model.id.clone())
             } else {
                 InputOutcome::None
             }
@@ -95,7 +111,10 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         KeyCode::Char(ch) => {
-            if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
                 state.search.push(ch);
                 state.cursor = 0;
             }
@@ -103,6 +122,33 @@ pub(crate) fn handle_event(
         }
         _ => InputOutcome::None,
     }
+}
+
+/// Open the expanded provider browser for `provider_key` (the 'e' key).
+///
+/// Source-controlled providers (openai-codex) resolve immediately to their
+/// static entries — no `ExpandProvider` action is emitted, so no network
+/// catalog fetch is ever initiated. All other providers (Anthropic included)
+/// enter `Loading` and request an async live catalog fetch as before.
+pub(crate) fn open_expanded_provider(
+    state: &mut ModelsModalState,
+    provider_key: String,
+    provider_name: String,
+) -> InputOutcome {
+    state.expanded = Some(ExpandedModelsState {
+        provider_key: provider_key.clone(),
+        provider_name,
+        cursor: 0,
+        search: String::new(),
+        load_state: ExpandedLoadState::Loading,
+    });
+    if provider_key == "openai-codex" {
+        // Canonicalization resolves this to the seven static OAuth entries
+        // (and marks favorites) — same central invariant as live results.
+        super::apply_model_list_result(state, &provider_key, Ok(Vec::new()));
+        return InputOutcome::None;
+    }
+    InputOutcome::ExpandProvider(provider_key)
 }
 
 fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOutcome {
@@ -135,12 +181,18 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
         }
         KeyCode::Char('f') => {
             if let Some(model) = selected_expanded_model(state) {
-                if model.is_favorite {
-                    let _ = synaps_cli::config::remove_favorite_model(&model.id);
+                let trusted = if model.is_favorite {
+                    remove_favorite_compat(&model.id);
+                    None
                 } else {
-                    let _ = synaps_cli::config::add_favorite_model(&model.id);
-                }
+                    let _ =
+                        synaps_cli::config::add_favorite_model(&normalize_favorite_id(&model.id));
+                    Some(model.id.clone())
+                };
                 state.refresh_favorites();
+                if let Some(model_id) = trusted {
+                    return InputOutcome::Trusted(model_id);
+                }
             }
             InputOutcome::None
         }
@@ -152,7 +204,10 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
             InputOutcome::None
         }
         KeyCode::Char(ch) => {
-            if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
                 if let Some(expanded) = state.expanded.as_mut() {
                     expanded.search.push(ch);
                     expanded.cursor = 0;
@@ -167,7 +222,7 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::models::ExpandedModelEntry;
+    use crate::tui::models::{model_id_for_runtime, ExpandedModelEntry};
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -175,13 +230,110 @@ mod tests {
     }
 
     #[test]
+    fn every_copilot_curated_selection_emits_provider_qualified_routable_id() {
+        for model in synaps_cli::runtime::openai::catalog::copilot_static_catalog_models() {
+            let favorite_id = format!("github-copilot/{}", model.id);
+            let emitted = model_id_for_runtime(&favorite_id);
+            assert_eq!(emitted, favorite_id);
+            let route = synaps_cli::runtime::openai::resolve_route(&emitted)
+                .unwrap_or_else(|| panic!("Copilot model did not route: {emitted}"));
+            assert_eq!(route.provider, "github-copilot");
+        }
+    }
+
+    #[test]
+    fn expanded_copilot_enter_emits_provider_qualified_claude_ids() {
+        for wire_id in ["claude-fable-5", "claude-opus-4.8"] {
+            let expected = format!("github-copilot/{wire_id}");
+            let mut state = ModelsModalState::new();
+            state.expanded = Some(ExpandedModelsState {
+                provider_key: "github-copilot".to_string(),
+                provider_name: "GitHub Copilot".to_string(),
+                cursor: 0,
+                search: String::new(),
+                load_state: ExpandedLoadState::Ready(vec![ExpandedModelEntry::new(
+                    expected.clone(),
+                    wire_id.to_string(),
+                    false,
+                )]),
+            });
+            assert_eq!(
+                handle_event(&mut state, key(KeyCode::Enter), "other"),
+                InputOutcome::Apply(expected.clone())
+            );
+            assert_eq!(
+                synaps_cli::runtime::openai::resolve_route(&expected)
+                    .unwrap()
+                    .provider,
+                "github-copilot"
+            );
+        }
+    }
+
+    #[test]
+    fn expanding_openai_codex_bypasses_network_and_shows_seven_static_rows() {
+        let mut state = ModelsModalState::new();
+        let outcome = open_expanded_provider(
+            &mut state,
+            "openai-codex".to_string(),
+            "OpenAI Codex".to_string(),
+        );
+        // No ExpandProvider action → no catalog fetch is ever initiated.
+        assert_eq!(
+            outcome,
+            InputOutcome::None,
+            "openai-codex expansion must not request a live catalog fetch"
+        );
+        let expanded = state.expanded.expect("expanded state");
+        assert_eq!(expanded.provider_key, "openai-codex");
+        match expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "openai-codex/gpt-5.6-sol",
+                        "openai-codex/gpt-5.6-terra",
+                        "openai-codex/gpt-5.6-luna",
+                        "openai-codex/gpt-5.5",
+                        "openai-codex/gpt-5.4",
+                        "openai-codex/gpt-5.4-mini",
+                        "openai-codex/gpt-5.3-codex-spark",
+                    ],
+                    "expanded rows must be exactly the seven static OAuth models, in order"
+                );
+            }
+            other => panic!("expected static Ready rows without fetching, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expanding_anthropic_still_requests_live_catalog() {
+        let mut state = ModelsModalState::new();
+        let outcome = open_expanded_provider(
+            &mut state,
+            "anthropic".to_string(),
+            "Anthropic".to_string(),
+        );
+        assert_eq!(
+            outcome,
+            InputOutcome::ExpandProvider("anthropic".to_string())
+        );
+        let expanded = state.expanded.expect("expanded state");
+        assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
+    }
+
+    #[test]
     fn e_opens_expanded_provider_browser() {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
         let outcome = handle_event(&mut state, key(KeyCode::Char('e')), "claude-opus-4-7");
-        assert_eq!(outcome, InputOutcome::ExpandProvider("claude".to_string()));
+        assert_eq!(
+            outcome,
+            InputOutcome::ExpandProvider("anthropic".to_string())
+        );
         let expanded = state.expanded.expect("expanded state");
-        assert_eq!(expanded.provider_key, "claude");
+        assert_eq!(expanded.provider_key, "anthropic");
         assert_eq!(expanded.search, "");
         assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
     }
@@ -195,13 +347,27 @@ mod tests {
             cursor: 0,
             search: String::new(),
             load_state: ExpandedLoadState::Ready(vec![
-                ExpandedModelEntry::new("openrouter/deepseek/deepseek-chat".to_string(), "DeepSeek".to_string(), false),
-                ExpandedModelEntry::new("openrouter/qwen/qwen3-coder".to_string(), "Qwen3 Coder".to_string(), false),
+                ExpandedModelEntry::new(
+                    "openrouter/deepseek/deepseek-chat".to_string(),
+                    "DeepSeek".to_string(),
+                    false,
+                ),
+                ExpandedModelEntry::new(
+                    "openrouter/qwen/qwen3-coder".to_string(),
+                    "Qwen3 Coder".to_string(),
+                    false,
+                ),
             ]),
         });
 
-        assert_eq!(handle_event(&mut state, key(KeyCode::Char('q')), "claude-opus-4-7"), InputOutcome::None);
-        assert_eq!(handle_event(&mut state, key(KeyCode::Enter), "claude-opus-4-7"), InputOutcome::Apply("openrouter/qwen/qwen3-coder".to_string()));
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Char('q')), "claude-opus-4-7"),
+            InputOutcome::None
+        );
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Enter), "claude-opus-4-7"),
+            InputOutcome::Apply("openrouter/qwen/qwen3-coder".to_string())
+        );
     }
 
     #[test]
@@ -215,7 +381,10 @@ mod tests {
             load_state: ExpandedLoadState::Loading,
         });
 
-        assert_eq!(handle_event(&mut state, key(KeyCode::Esc), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Esc), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert!(state.expanded.is_none());
     }
 
@@ -223,9 +392,15 @@ mod tests {
     fn tab_toggles_all_and_favorites_view() {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
-        assert_eq!(handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert_eq!(state.view, ModelsView::Favorites);
-        assert_eq!(handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert_eq!(state.view, ModelsView::All);
     }
 

@@ -22,7 +22,10 @@ pub struct PluginConfigChange {
 
 /// Compute the on-disk config path for one plugin id.
 pub fn plugin_config_path(plugin_id: &str) -> PathBuf {
-    crate::config::base_dir().join("plugins").join(plugin_id).join("config")
+    crate::config::base_dir()
+        .join("plugins")
+        .join(plugin_id)
+        .join("config")
 }
 
 /// Read one plugin-owned config value.
@@ -226,7 +229,10 @@ mod tests {
 
         write_plugin_config_to(&path, "language", "auto").unwrap();
 
-        assert_eq!(read_plugin_config_from(&path, "language"), Some("auto".to_string()));
+        assert_eq!(
+            read_plugin_config_from(&path, "language"),
+            Some("auto".to_string())
+        );
     }
 
     #[tokio::test]
@@ -241,10 +247,16 @@ mod tests {
         assert!(rx.borrow().is_none());
 
         write_plugin_config_to(&path, "backend", "cpu").unwrap();
-        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             rx.borrow().clone(),
-            Some(PluginConfigChange { key: "backend".to_string(), value: Some("cpu".to_string()) })
+            Some(PluginConfigChange {
+                key: "backend".to_string(),
+                value: Some("cpu".to_string())
+            })
         );
     }
 }

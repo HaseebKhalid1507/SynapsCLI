@@ -1,8 +1,8 @@
 //! Tool registry — maintains name→tool map and cached JSON schema for the API.
-use std::sync::Arc;
+use crate::tools::Tool;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use crate::tools::Tool;
+use std::sync::Arc;
 
 /// Registry of available tools. Maintains a name→tool map and a cached JSON schema
 /// array that gets sent to the API. Thread-safe via `Arc<RwLock<ToolRegistry>>`.
@@ -42,6 +42,8 @@ impl ToolRegistry {
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
             Arc::new(crate::tools::subagent::SubagentTool),
+            Arc::new(crate::tools::subagent::authorize_model::SubagentModelAuthorizeTool),
+            Arc::new(crate::tools::subagent::models::SubagentModelsTool),
             Arc::new(crate::tools::subagent::start::SubagentStartTool),
             Arc::new(crate::tools::subagent::status::SubagentStatusTool),
             Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
@@ -102,7 +104,7 @@ impl ToolRegistry {
     pub fn without_subagent_with_extensions(extension_tools: &ToolRegistry) -> Self {
         let mut combined = Self::without_subagent();
         for tool in extension_tools.tools.values() {
-            if tool.extension_id().is_some() {
+            if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
                 combined.tools.insert(tool.name().to_string(), tool.clone());
             }
         }
@@ -136,7 +138,12 @@ impl ToolRegistry {
         Self::api_safe_identifier(name, used, 64, true)
     }
 
-    fn api_safe_identifier(name: &str, used: &HashSet<String>, max_len: usize, allow_dot: bool) -> String {
+    fn api_safe_identifier(
+        name: &str,
+        used: &HashSet<String>,
+        max_len: usize,
+        allow_dot: bool,
+    ) -> String {
         let mut sanitized = String::with_capacity(name.len());
         for ch in name.chars() {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || (allow_dot && ch == '.') {
@@ -203,7 +210,10 @@ impl ToolRegistry {
         // translate_input_names can reverse-map property names inside array elements.
         if let Some(items) = obj.get_mut("items") {
             let (sanitized_items, items_map) = Self::sanitize_schema(std::mem::take(items));
-            if !items_map.api_to_runtime.is_empty() || !items_map.children.is_empty() || items_map.items.is_some() {
+            if !items_map.api_to_runtime.is_empty()
+                || !items_map.children.is_empty()
+                || items_map.items.is_some()
+            {
                 map.items = Some(Box::new(items_map));
             }
             *items = sanitized_items;
@@ -217,7 +227,11 @@ impl ToolRegistry {
             Value::Object(obj) => {
                 let mut out = serde_json::Map::new();
                 for (api_name, value) in obj {
-                    let runtime_name = map.api_to_runtime.get(&api_name).cloned().unwrap_or_else(|| api_name.clone());
+                    let runtime_name = map
+                        .api_to_runtime
+                        .get(&api_name)
+                        .cloned()
+                        .unwrap_or_else(|| api_name.clone());
                     let value = if let Some(child) = map.children.get(&api_name) {
                         Self::translate_input_names(value, child)
                     } else {
@@ -230,7 +244,11 @@ impl ToolRegistry {
             Value::Array(arr) => {
                 // If the schema had an items map, apply it to each array element.
                 if let Some(items_map) = &map.items {
-                    Value::Array(arr.into_iter().map(|v| Self::translate_input_names(v, items_map)).collect())
+                    Value::Array(
+                        arr.into_iter()
+                            .map(|v| Self::translate_input_names(v, items_map))
+                            .collect(),
+                    )
                 } else {
                     Value::Array(arr)
                 }
@@ -279,12 +297,19 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        let runtime_name = self.api_to_runtime_names.get(name).map(String::as_str).unwrap_or(name);
+        let runtime_name = self
+            .api_to_runtime_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name);
         self.tools.get(runtime_name)
     }
 
     pub fn runtime_name_for_api<'a>(&'a self, name: &'a str) -> &'a str {
-        self.api_to_runtime_names.get(name).map(String::as_str).unwrap_or(name)
+        self.api_to_runtime_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     pub fn translate_input_for_api_tool(&self, tool_name: &str, input: Value) -> Value {
@@ -320,6 +345,21 @@ impl ToolRegistry {
         tools
     }
 }
+
+fn is_recursive_subagent_tool_name(name: &str) -> bool {
+    let api_name = ToolRegistry::api_safe_name(name, &HashSet::new());
+    matches!(
+        api_name.as_str(),
+        "subagent"
+            | "subagent_start"
+            | "subagent_status"
+            | "subagent_steer"
+            | "subagent_collect"
+            | "subagent_resume"
+            | "subagent_model_authorize"
+            | "subagent_models"
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,22 +370,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for NamedTool {
-        fn name(&self) -> &str { self.0 }
-        fn description(&self) -> &str { "test tool" }
-        fn parameters(&self) -> Value { json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
         async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
             Ok("ok".to_string())
         }
     }
 
-
-
     struct SchemaTool;
 
     #[async_trait::async_trait]
     impl Tool for SchemaTool {
-        fn name(&self) -> &str { "schema_tool" }
-        fn description(&self) -> &str { "schema tool" }
+        fn name(&self) -> &str {
+            "schema_tool"
+        }
+        fn description(&self) -> &str {
+            "schema tool"
+        }
         fn parameters(&self) -> Value {
             json!({
                 "type": "object",
@@ -375,16 +423,19 @@ mod tests {
         assert_eq!(registry.tools_schema()[0]["name"], "plugin_skill_tool");
         assert!(registry.get("plugin:skill.tool").is_some());
         assert!(registry.get("plugin_skill_tool").is_some());
-        assert_eq!(registry.runtime_name_for_api("plugin_skill_tool"), "plugin:skill.tool");
+        assert_eq!(
+            registry.runtime_name_for_api("plugin_skill_tool"),
+            "plugin:skill.tool"
+        );
     }
 
     #[test]
     fn tool_schema_disambiguates_sanitized_name_collisions() {
-        let registry = ToolRegistry::from_tools(vec![
-            Arc::new(NamedTool("a:b")),
-            Arc::new(NamedTool("a.b")),
-        ]);
-        let names: HashSet<String> = registry.tools_schema().iter()
+        let registry =
+            ToolRegistry::from_tools(vec![Arc::new(NamedTool("a:b")), Arc::new(NamedTool("a.b"))]);
+        let names: HashSet<String> = registry
+            .tools_schema()
+            .iter()
             .filter_map(|s| s["name"].as_str().map(str::to_string))
             .collect();
 
@@ -404,7 +455,9 @@ mod tests {
         let name = schema[0]["name"].as_str().unwrap();
 
         assert_eq!(name.len(), 128);
-        assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
         assert!(registry.get(name).is_some());
     }
 
@@ -415,19 +468,36 @@ mod tests {
         let input_schema = &schema[0]["input_schema"];
         let props = input_schema["properties"].as_object().unwrap();
 
-        assert!(props.keys().all(|k| k.len() <= 64 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')));
-        assert_eq!(input_schema["required"].as_array().unwrap()[0].as_str().unwrap().len(), 64);
+        assert!(props.keys().all(|k| k.len() <= 64
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')));
+        assert_eq!(
+            input_schema["required"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         assert_eq!(input_schema["required"][1], "nested_obj");
-        assert!(props["nested_obj"]["properties"].as_object().unwrap().contains_key("inner_key"));
+        assert!(props["nested_obj"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("inner_key"));
         assert_eq!(props["nested_obj"]["required"][0], "inner_key");
 
         let first_required = input_schema["required"][0].as_str().unwrap();
-        let translated = registry.translate_input_for_api_tool("schema_tool", json!({
-            first_required: "value",
-            "nested_obj": {"inner_key": "nested"}
-        }));
+        let translated = registry.translate_input_for_api_tool(
+            "schema_tool",
+            json!({
+                first_required: "value",
+                "nested_obj": {"inner_key": "nested"}
+            }),
+        );
 
-        assert_eq!(translated["bad:key/that/is/far/too/long/for/anthropic/property/names/and/keeps/going"], "value");
+        assert_eq!(
+            translated["bad:key/that/is/far/too/long/for/anthropic/property/names/and/keeps/going"],
+            "value"
+        );
         assert_eq!(translated["nested:obj"]["inner/key"], "nested");
     }
 
@@ -435,8 +505,8 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Should have 11 tools including subagent + 3 shell tools
-        assert_eq!(registry.tools_schema().len(), 16);
+        // Includes read-only model discovery plus session authorization.
+        assert_eq!(registry.tools_schema().len(), 18);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());
@@ -453,6 +523,8 @@ mod tests {
         assert!(registry.get("find").is_some());
         assert!(registry.get("ls").is_some());
         assert!(registry.get("subagent").is_some());
+        assert!(registry.get("subagent_model_authorize").is_some());
+        assert!(registry.get("subagent_models").is_some());
     }
 
     #[test]
@@ -514,9 +586,15 @@ mod tests {
         struct TestTool;
         #[async_trait::async_trait]
         impl Tool for TestTool {
-            fn name(&self) -> &str { "test_tool" }
-            fn description(&self) -> &str { "A test tool" }
-            fn parameters(&self) -> Value { json!({"type": "object"}) }
+            fn name(&self) -> &str {
+                "test_tool"
+            }
+            fn description(&self) -> &str {
+                "A test tool"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type": "object"})
+            }
             async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
                 Ok("test result".to_string())
             }
@@ -536,13 +614,21 @@ mod tests {
         struct OwnedTool(&'static str, Option<&'static str>);
         #[async_trait::async_trait]
         impl Tool for OwnedTool {
-            fn name(&self) -> &str { self.0 }
-            fn description(&self) -> &str { "owned" }
-            fn parameters(&self) -> Value { json!({"type": "object"}) }
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "owned"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type": "object"})
+            }
             async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
                 Ok("ok".to_string())
             }
-            fn extension_id(&self) -> Option<&str> { self.1 }
+            fn extension_id(&self) -> Option<&str> {
+                self.1
+            }
         }
 
         let mut registry = ToolRegistry::without_subagent();
@@ -566,13 +652,21 @@ mod tests {
     struct OwnedTool(&'static str, Option<&'static str>);
     #[async_trait::async_trait]
     impl Tool for OwnedTool {
-        fn name(&self) -> &str { self.0 }
-        fn description(&self) -> &str { "owned" }
-        fn parameters(&self) -> Value { json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "owned"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
         async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
             Ok("ok".to_string())
         }
-        fn extension_id(&self) -> Option<&str> { self.1 }
+        fn extension_id(&self) -> Option<&str> {
+            self.1
+        }
     }
 
     #[test]
@@ -621,6 +715,69 @@ mod tests {
         // No subagent tools leaked from `other`.
         assert!(merged.get("subagent_start").is_none());
         assert!(merged.get("subagent").is_none());
+    }
+
+    #[test]
+    fn without_subagent_with_extensions_rejects_recursive_tool_name_collisions() {
+        let mut other = ToolRegistry::empty();
+        for name in [
+            "subagent",
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_model_authorize",
+            "subagent_models",
+        ] {
+            other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
+        }
+
+        let merged = ToolRegistry::without_subagent_with_extensions(&other);
+        for name in [
+            "subagent",
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_model_authorize",
+            "subagent_models",
+        ] {
+            assert!(merged.get(name).is_none(), "{name} must stay unavailable");
+        }
+    }
+
+    #[test]
+    fn without_subagent_with_extensions_rejects_api_sanitized_recursive_collisions() {
+        let mut other = ToolRegistry::empty();
+        for runtime_name in [
+            "subagent:start",
+            "subagent:status",
+            "subagent:steer",
+            "subagent:collect",
+            "subagent:resume",
+            "subagent:model:authorize",
+            "subagent:models",
+        ] {
+            other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
+        }
+
+        let merged = ToolRegistry::without_subagent_with_extensions(&other);
+        for api_name in [
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_model_authorize",
+            "subagent_models",
+        ] {
+            assert!(
+                merged.get(api_name).is_none(),
+                "API-safe recursive name {api_name} must stay unavailable"
+            );
+        }
     }
 
     #[test]

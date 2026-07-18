@@ -1,18 +1,22 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
+pub mod authorize_model;
+pub mod collect;
+pub mod models;
 mod oneshot;
 pub(crate) mod finalize;
 pub mod start;
 pub mod status;
 pub mod steer;
-pub mod collect;
 pub mod resume;
 
+pub use authorize_model::SubagentModelAuthorizeTool;
+pub use collect::SubagentCollectTool;
+pub use models::SubagentModelsTool;
 pub use oneshot::SubagentTool;
 pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
-pub use collect::SubagentCollectTool;
 pub use resume::SubagentResumeTool;
 
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
@@ -35,6 +39,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     // resolved config — Remote broker endpoints must be reachable from
     // the subagent thread. (#158 A3)
     runtime.apply_auth_config(config);
+    runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
     // parent session configured. `Runtime::new()` already defaults to
@@ -151,6 +156,21 @@ mod cache_ttl_policy_tests {
             runtime.cache_ttl(),
             CacheTtl::FiveMinutes,
             "subagent spawn must stay 5m when parent is already 5m (idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_policy_marks_runtime_as_non_recursive_worker() {
+        let config = crate::config::SynapsConfig::default();
+        let mut runtime = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+
+        apply_subagent_runtime_policy(&mut runtime, &config);
+
+        assert_eq!(
+            runtime.codex_request_role(),
+            crate::runtime::openai::catalog::CodexRequestRole::Worker
         );
     }
 }

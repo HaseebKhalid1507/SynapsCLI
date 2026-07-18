@@ -31,7 +31,8 @@ pub mod watcher_exit;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use crate::runtime::subagent::{
-    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
+    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState,
+    SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
 pub use bash::BashTool;
@@ -48,8 +49,8 @@ pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
-    SubagentCollectTool, SubagentResumeTool, SubagentStartTool, SubagentStatusTool,
-    SubagentSteerTool, SubagentTool,
+    SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
+    SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
 pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
@@ -78,6 +79,9 @@ pub struct ToolCapabilities {
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
     pub secret_prompt: Option<SecretPromptHandle>,
+    /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
+    /// path must authorize before creating channels, threads, or provider runtimes.
+    pub orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
 }
 
 /// Configuration limits and timeouts.

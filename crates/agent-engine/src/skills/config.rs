@@ -7,26 +7,32 @@ pub fn filter_disabled(
     disabled_plugins: &[String],
     disabled_skills: &[String],
 ) -> Vec<LoadedSkill> {
-    skills.into_iter().filter(|s| {
-        if let Some(ref p) = s.plugin {
-            if disabled_plugins.iter().any(|d| d == p) {
-                tracing::debug!("skill '{}' disabled via disabled_plugins='{}'", s.name, p);
+    skills
+        .into_iter()
+        .filter(|s| {
+            if let Some(ref p) = s.plugin {
+                if disabled_plugins.iter().any(|d| d == p) {
+                    tracing::debug!("skill '{}' disabled via disabled_plugins='{}'", s.name, p);
+                    return false;
+                }
+            }
+            if disabled_skills.iter().any(|d| d == &s.name) {
+                tracing::debug!("skill '{}' disabled via disabled_skills (bare)", s.name);
                 return false;
             }
-        }
-        if disabled_skills.iter().any(|d| d == &s.name) {
-            tracing::debug!("skill '{}' disabled via disabled_skills (bare)", s.name);
-            return false;
-        }
-        if let Some(ref p) = s.plugin {
-            let qualified = format!("{}:{}", p, s.name);
-            if disabled_skills.iter().any(|d| d == &qualified) {
-                tracing::debug!("skill '{}' disabled via disabled_skills (qualified)", qualified);
-                return false;
+            if let Some(ref p) = s.plugin {
+                let qualified = format!("{}:{}", p, s.name);
+                if disabled_skills.iter().any(|d| d == &qualified) {
+                    tracing::debug!(
+                        "skill '{}' disabled via disabled_skills (qualified)",
+                        qualified
+                    );
+                    return false;
+                }
             }
-        }
-        true
-    }).collect()
+            true
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -55,7 +61,11 @@ mod tests {
 
     #[test]
     fn disable_by_bare_name() {
-        let s = vec![mk_skill("a", Some("p1")), mk_skill("a", Some("p2")), mk_skill("b", None)];
+        let s = vec![
+            mk_skill("a", Some("p1")),
+            mk_skill("a", Some("p2")),
+            mk_skill("b", None),
+        ];
         let out = filter_disabled(s, &[], &["a".to_string()]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "b");

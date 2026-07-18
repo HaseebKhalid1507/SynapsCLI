@@ -34,6 +34,7 @@ pub(super) struct StreamSession {
     pub(super) tools: Arc<RwLock<ToolRegistry>>,
     pub(super) system_prompt: Option<String>,
     pub(super) thinking_budget: u32,
+    pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
 
     // Channels
     pub(super) tx: mpsc::UnboundedSender<StreamEvent>,
@@ -53,6 +54,7 @@ pub(super) struct StreamSession {
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
 }
 
 pub(super) struct StreamMethods;
@@ -88,6 +90,7 @@ impl StreamMethods {
             tools,
             system_prompt,
             thinking_budget,
+            reasoning_level: _reasoning_level,
             tx,
             cancel,
             mut steering_rx,
@@ -103,6 +106,7 @@ impl StreamMethods {
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
+            orchestration,
         } = session;
         let mut messages = initial_messages;
 
@@ -186,6 +190,7 @@ impl StreamMethods {
                 &tools_snapshot,
                 &injected_system,
                 thinking_budget,
+                session.reasoning_level,
                 &messages,
                 tx.clone(),
                 &cancel,
@@ -261,7 +266,32 @@ impl StreamMethods {
                     let steered =
                         HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
-                        // No steering, truly done
+                        // No steering, truly done. Completion is still subject to the
+                        // session orchestration policy (including streamed runs).
+                        if let Some(orchestration) = &orchestration {
+                            match orchestration.completion_gate() {
+                                agent_core::orchestration::CompletionGate::Allowed => {}
+                                agent_core::orchestration::CompletionGate::Warning { workers } => {
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                        format!(
+                                            "completion advisory: {} worker(s) still require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                            workers.len(),
+                                            workers.join(", ")
+                                        ),
+                                    )));
+                                }
+                                agent_core::orchestration::CompletionGate::Blocked { workers } => {
+                                    let _ = tx.send(StreamEvent::Session(
+                                        SessionEvent::MessageHistory(messages),
+                                    ));
+                                    return Err(RuntimeError::Tool(format!(
+                                        "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                        workers.len(),
+                                        workers.join(", ")
+                                    )));
+                                }
+                            }
+                        }
                         let _ =
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Ok(());
@@ -366,7 +396,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {
@@ -451,6 +481,7 @@ impl StreamMethods {
                         let runtime_name_for_hook = runtime_name.clone();
                         let prompt_inner = secret_prompt.clone();
                         let auto_approve_inner = auto_approve_confirms;
+                        let orchestration_inner = orchestration.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -486,7 +517,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {

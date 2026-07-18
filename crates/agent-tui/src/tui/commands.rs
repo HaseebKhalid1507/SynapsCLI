@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::{Runtime, Session, list_recent_sessions, resolve_session};
+use synaps_cli::{list_recent_sessions, resolve_session, Runtime, Session};
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -35,13 +35,16 @@ pub(super) enum CommandAction {
     /// Nothing special — continue the loop.
     None,
     /// Start a new stream with these API messages.
-    #[allow(dead_code)] StartStream,
+    #[allow(dead_code)]
+    StartStream,
     /// Trigger the quit animation.
     Quit,
     /// Launch the casino (requires dropping/recreating EventStream).
     LaunchGamba,
     /// Open the /model(s) router modal.
     OpenModels,
+    /// Open the /effort lightbox (valid levels for the active exact model).
+    OpenEffort,
     /// Open the /settings modal.
     OpenSettings,
     /// Open the /plugins modal.
@@ -61,9 +64,7 @@ pub(super) enum CommandAction {
         arg: String,
     },
     /// Compact the conversation history into a summary.
-    Compact {
-        custom_instructions: Option<String>,
-    },
+    Compact { custom_instructions: Option<String> },
     /// Ping all configured provider models.
     Ping,
     /// Show the session compaction chain.
@@ -99,8 +100,13 @@ pub(super) enum CommandAction {
 #[derive(Debug, Clone)]
 pub enum ExtensionsTrustAction {
     List,
-    Enable { runtime_id: String },
-    Disable { runtime_id: String, reason: Option<String> },
+    Enable {
+        runtime_id: String,
+    },
+    Disable {
+        runtime_id: String,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +114,10 @@ pub enum ExtensionsMemoryAction {
     /// List all known memory namespaces.
     Namespaces,
     /// Show the most recent N records of a namespace (default 20).
-    Recent { namespace: String, limit: Option<usize> },
+    Recent {
+        namespace: String,
+        limit: Option<usize>,
+    },
 }
 
 pub(super) async fn execute_command_action(
@@ -121,13 +130,18 @@ pub(super) async fn execute_command_action(
             &command,
             &arg,
             runtime.tools_shared(),
-        ).await {
+        )
+        .await
+        {
             Ok(output) => {
                 let mut lines = vec![format!(
                     "plugin command /{}:{} exited with {}",
                     command.plugin,
                     command.name,
-                    output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                    output
+                        .status
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string())
                 )];
                 if !output.stdout.trim().is_empty() {
                     lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
@@ -142,7 +156,6 @@ pub(super) async fn execute_command_action(
     }
 }
 
-
 pub(crate) async fn execute_interactive_plugin_command_events(
     command: &synaps_cli::skills::registry::RegisteredPluginCommand,
     arg: &str,
@@ -151,7 +164,8 @@ pub(crate) async fn execute_interactive_plugin_command_events(
 ) {
     let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive {
         plugin_extension_id,
-    } = &command.backend else {
+    } = &command.backend
+    else {
         app.push_msg(ChatMessage::Error(
             "plugin command is not interactive".to_string(),
         ));
@@ -165,7 +179,8 @@ pub(crate) async fn execute_interactive_plugin_command_events(
         args,
         manager,
         app,
-    ).await;
+    )
+    .await;
 }
 
 pub(crate) async fn execute_interactive_plugin_command_by_parts(
@@ -188,7 +203,9 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
                     app.push_msg(msg);
                 }
             }
-            InvokeCommandEvent::Task(task) => std::sync::Arc::make_mut(&mut app.active_tasks).apply(task),
+            InvokeCommandEvent::Task(task) => {
+                std::sync::Arc::make_mut(&mut app.active_tasks).apply(task)
+            }
         }
     }
 
@@ -200,7 +217,9 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
     }
 }
 
-pub(crate) fn command_output_event_to_chat_message(event: CommandOutputEvent) -> Option<ChatMessage> {
+pub(crate) fn command_output_event_to_chat_message(
+    event: CommandOutputEvent,
+) -> Option<ChatMessage> {
     match event {
         CommandOutputEvent::Text { content } => Some(ChatMessage::Text(content)),
         CommandOutputEvent::System { content } => Some(ChatMessage::System(content)),
@@ -230,9 +249,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -267,7 +284,11 @@ pub(super) fn fuzzy_match<'a>(raw: &str, commands: &'a [String]) -> Option<&'a S
             _ => {}
         }
     }
-    if ambiguous { None } else { best.map(|(_, cmd)| cmd) }
+    if ambiguous {
+        None
+    } else {
+        best.map(|(_, cmd)| cmd)
+    }
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -290,6 +311,14 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
+fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) {
+    if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(thinking_level) {
+        runtime.set_reasoning_level_explicit(level);
+    } else if let Some(budget) = synaps_cli::models::budget_for_thinking_level(thinking_level) {
+        runtime.set_thinking_budget_explicit(budget);
+    }
+}
+
 /// Handle a slash command when NOT streaming.
 pub(super) async fn handle_command(
     cmd: &str,
@@ -310,15 +339,21 @@ pub(super) async fn handle_command(
     if let Some(claim) = registry.lifecycle_for_command(cmd) {
         let trimmed = arg.trim();
         match trimmed {
-            "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(claim.plugin.clone()) },
-            "status" => return CommandAction::SidecarStatus { plugin_id: Some(claim.plugin.clone()) },
+            "" | "toggle" => {
+                return CommandAction::SidecarToggle {
+                    plugin_id: Some(claim.plugin.clone()),
+                }
+            }
+            "status" => {
+                return CommandAction::SidecarStatus {
+                    plugin_id: Some(claim.plugin.clone()),
+                }
+            }
             _ => {
                 // Fall through to the plugin-command resolver: the
                 // plugin can define `<command> <other-sub>` (e.g.
                 // `/capture models`) as a normal interactive command.
-                if let Some(command) =
-                    registry.find_plugin_command_unqualified(&claim.command)
-                {
+                if let Some(command) = registry.find_plugin_command_unqualified(&claim.command) {
                     return CommandAction::PluginCommand {
                         command,
                         arg: trimmed.to_string(),
@@ -339,8 +374,19 @@ pub(super) async fn handle_command(
     // NOTE: this intercept runs BEFORE the match below — any arm there for a
     // command the engine claims (model/thinking with args, compact, quit) is
     // unreachable for the intercepted case.
+    // `/effort <level>` is the SAME checked mutation + persistence path as
+    // `/thinking <level>` — normalize before the engine intercept so the
+    // engine's validation (set_reasoning_level_checked, numeric legacy
+    // budgets included) and the ThinkingChanged persist arm below apply.
+    let cmd = if cmd == "effort" && !arg.is_empty() {
+        "thinking"
+    } else {
+        cmd
+    };
     if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
-        use synaps_cli::engine::commands::{persist_to_config, thinking_config_value, CommandResult};
+        use synaps_cli::engine::commands::{
+            persist_to_config, thinking_config_value, CommandResult,
+        };
         return match result {
             CommandResult::Quit => CommandAction::Quit,
             CommandResult::ModelChanged { .. } => {
@@ -348,18 +394,27 @@ pub(super) async fn handle_command(
                 let applied = runtime.model().to_string();
                 app.session.model = applied.clone();
                 let status = persist_to_config("model", &applied);
-                app.push_msg(ChatMessage::System(format!("model set to: {} {}", applied, status)));
+                app.push_msg(ChatMessage::System(format!(
+                    "model set to: {} {}",
+                    applied, status
+                )));
                 CommandAction::None
             }
-            CommandResult::ThinkingChanged { level, budget } => {
-                app.session.thinking_level = level.clone();
-                let status = persist_to_config("thinking", &thinking_config_value(&level, budget));
-                app.push_msg(ChatMessage::System(format!("thinking set to: {} ({}) {}", level, budget, status)));
+            CommandResult::ThinkingChanged { spec } => {
+                app.session.thinking_level = thinking_config_value(spec);
+                let status = persist_to_config("thinking", &thinking_config_value(spec));
+                app.push_msg(ChatMessage::System(format!(
+                    "thinking set to: {} {}",
+                    spec.level(),
+                    status,
+                )));
                 CommandAction::None
             }
-            CommandResult::Compact { custom_instructions } => {
-                CommandAction::Compact { custom_instructions }
-            }
+            CommandResult::Compact {
+                custom_instructions,
+            } => CommandAction::Compact {
+                custom_instructions,
+            },
             CommandResult::Error(e) => {
                 app.push_msg(ChatMessage::Error(e));
                 CommandAction::None
@@ -369,6 +424,23 @@ pub(super) async fn handle_command(
     }
 
     match cmd {
+        "prompt" => match arg.trim() {
+            "reload" | "apply" => match runtime.reload_prompt() {
+                Ok(generation) => app.push_msg(ChatMessage::System(format!(
+                    "prompt applied (generation {generation})"
+                ))),
+                Err(error) => app.push_msg(ChatMessage::Error(format!(
+                    "prompt reload rejected: {error}"
+                ))),
+            },
+            "status" | "" => match runtime.prompt_inspection_json() {
+                Some(status) => app.push_msg(ChatMessage::System(status)),
+                None => app.push_msg(ChatMessage::Error("no prompt manifest is active".into())),
+            },
+            _ => app.push_msg(ChatMessage::Error(
+                "usage: /prompt [status|reload|apply]".into(),
+            )),
+        },
         "clear" => {
             app.save_session().await;
             app.transcript.clear();
@@ -381,7 +453,11 @@ pub(super) async fn handle_command(
             app.session_cost = 0.0;
             app.input_tokens = 0;
             app.output_tokens = 0;
-            app.session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
+            app.session = Session::new(
+                runtime.model(),
+                runtime.thinking_level(),
+                runtime.system_prompt(),
+            );
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         "model" | "models" => {
@@ -389,37 +465,41 @@ pub(super) async fn handle_command(
             // (set + persist); only the empty-arg picker case reaches here.
             return CommandAction::OpenModels;
         }
+        "effort" => {
+            // Non-empty args were normalized to the engine "thinking" path
+            // above; only the empty-arg lightbox case reaches here.
+            return CommandAction::OpenEffort;
+        }
         "system" => {
             if arg.is_empty() {
                 app.push_msg(ChatMessage::System(
-                    "usage: /system <prompt>  |  /system save  |  /system show".to_string()
+                    "usage: /system <prompt>  |  /system save  |  /system show".to_string(),
                 ));
             } else if arg == "save" {
                 let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
                 match std::fs::write(system_prompt_path, runtime.system_prompt().unwrap_or("")) {
-                    Ok(_) => app.push_msg(ChatMessage::System(
-                        format!("saved to {}", system_prompt_path.display())
-                    )),
-                    Err(e) => app.push_msg(ChatMessage::Error(
-                        format!("failed to save: {}", e)
-                    )),
+                    Ok(_) => app.push_msg(ChatMessage::System(format!(
+                        "saved to {}",
+                        system_prompt_path.display()
+                    ))),
+                    Err(e) => app.push_msg(ChatMessage::Error(format!("failed to save: {}", e))),
                 }
             } else if arg == "show" {
                 let prompt = runtime.system_prompt().unwrap_or("(none)");
                 app.push_msg(ChatMessage::System(prompt.to_string()));
             } else {
                 runtime.set_system_prompt(arg.to_string());
-                app.push_msg(ChatMessage::System(
-                    "system prompt updated".to_string()
-                ));
+                app.push_msg(ChatMessage::System("system prompt updated".to_string()));
             }
         }
         "thinking" => {
             // Non-empty args are intercepted by handle_engine_command above
             // (set + persist); only the empty-arg status case reaches here.
-            app.push_msg(ChatMessage::System(
-                format!("thinking: {} ({})", runtime.thinking_level(), runtime.thinking_budget())
-            ));
+            app.push_msg(ChatMessage::System(format!(
+                "thinking: {} ({})",
+                runtime.thinking_level(),
+                runtime.thinking_budget()
+            )));
         }
         "context" => {
             // Mirrors the settings cycler (settings/defs.rs `context_window`).
@@ -428,14 +508,15 @@ pub(super) async fn handle_command(
                 "1m" | "1M" => Some(Some(1_000_000u64)),
                 "auto" => Some(None),
                 "" => {
-                    app.push_msg(ChatMessage::System(
-                        format!("context window: {} tokens", runtime.context_window())
-                    ));
+                    app.push_msg(ChatMessage::System(format!(
+                        "context window: {} tokens",
+                        runtime.context_window()
+                    )));
                     None
                 }
                 _ => {
                     app.push_msg(ChatMessage::Error(
-                        "usage: /context 200k|1m|auto".to_string()
+                        "usage: /context 200k|1m|auto".to_string(),
                     ));
                     None
                 }
@@ -444,49 +525,60 @@ pub(super) async fn handle_command(
                 runtime.set_context_window(window);
                 app.last_turn_context_window = runtime.context_window();
                 let canonical = arg.to_ascii_lowercase();
-                let status = synaps_cli::engine::commands::persist_to_config("context_window", &canonical);
-                app.push_msg(ChatMessage::System(
-                    format!("context window set to: {} {}", canonical, status)
-                ));
+                let status =
+                    synaps_cli::engine::commands::persist_to_config("context_window", &canonical);
+                app.push_msg(ChatMessage::System(format!(
+                    "context window set to: {} {}",
+                    canonical, status
+                )));
             }
         }
-        "sessions" => {
-            match list_recent_sessions(20) {
-                Ok(sessions) if sessions.is_empty() => {
-                    app.push_msg(ChatMessage::System("no saved sessions".to_string()));
-                }
-                Ok(sessions) => {
-                    app.push_msg(ChatMessage::System(format!("{} session(s):", sessions.len())));
-                    for s in sessions.iter().take(20) {
-                        let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
-                        let active = if s.id == app.session.id { " *" } else { "" };
-                        let name_tag = s.name.as_deref().map(|n| format!(" [@{}]", n)).unwrap_or_default();
-                        app.push_msg(ChatMessage::System(format!(
-                            "  {}{} — {} [{}] ${:.4}{}",
-                            &s.id, name_tag, title, s.model, s.session_cost, active
-                        )));
-                    }
-                }
-                Err(e) => {
-                    app.push_msg(ChatMessage::Error(format!("failed to list sessions: {}", e)));
+        "sessions" => match list_recent_sessions(20) {
+            Ok(sessions) if sessions.is_empty() => {
+                app.push_msg(ChatMessage::System("no saved sessions".to_string()));
+            }
+            Ok(sessions) => {
+                app.push_msg(ChatMessage::System(format!(
+                    "{} session(s):",
+                    sessions.len()
+                )));
+                for s in sessions.iter().take(20) {
+                    let title = if s.title.is_empty() {
+                        "(untitled)"
+                    } else {
+                        &s.title
+                    };
+                    let active = if s.id == app.session.id { " *" } else { "" };
+                    let name_tag = s
+                        .name
+                        .as_deref()
+                        .map(|n| format!(" [@{}]", n))
+                        .unwrap_or_default();
+                    app.push_msg(ChatMessage::System(format!(
+                        "  {}{} — {} [{}] ${:.4}{}",
+                        &s.id, name_tag, title, s.model, s.session_cost, active
+                    )));
                 }
             }
-        }
+            Err(e) => {
+                app.push_msg(ChatMessage::Error(format!(
+                    "failed to list sessions: {}",
+                    e
+                )));
+            }
+        },
         "resume" => {
             if arg.is_empty() {
-                app.push_msg(ChatMessage::System("usage: /resume <name_or_id>".to_string()));
+                app.push_msg(ChatMessage::System(
+                    "usage: /resume <name_or_id>".to_string(),
+                ));
             } else {
                 match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
-                        // Restore the session's thinking level alongside model
-                        // and system prompt (it's serialized round-trip, was
-                        // just never re-applied).
-                        if let Some(budget) =
-                            synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
-                        {
-                            runtime.set_thinking_budget(budget);
-                        }
+                        // A resumed session owns its saved choice. Preserve that
+                        // explicit provenance across later model switches.
+                        restore_session_reasoning(runtime, &session.thinking_level);
                         if let Some(ref sp) = session.system_prompt {
                             runtime.set_system_prompt(sp.clone());
                         }
@@ -508,9 +600,10 @@ pub(super) async fn handle_command(
                         } else {
                             String::new()
                         };
-                        app.push_msg(ChatMessage::System(
-                            format!("switched from {} to {}{}", old_id, new_id, via)
-                        ));
+                        app.push_msg(ChatMessage::System(format!(
+                            "switched from {} to {}{}",
+                            old_id, new_id, via
+                        )));
                     }
                     Err(e) => {
                         app.push_msg(ChatMessage::Error(format!("failed to load session: {}", e)));
@@ -541,7 +634,11 @@ pub(super) async fn handle_command(
         "help" => {
             let trimmed = arg.trim();
             if trimmed == "find" || trimmed.starts_with("find ") {
-                let query = trimmed.strip_prefix("find").unwrap_or("").trim().to_string();
+                let query = trimmed
+                    .strip_prefix("find")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 return CommandAction::OpenHelpFind { query };
             }
 
@@ -551,7 +648,11 @@ pub(super) async fn handle_command(
             );
             if let Some(rendered) = synaps_cli::help::render_help(
                 &registry,
-                if trimmed.is_empty() { None } else { Some(trimmed) },
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                },
             ) {
                 app.push_msg(ChatMessage::System(rendered));
             }
@@ -588,17 +689,24 @@ pub(super) async fn handle_command(
                         app.push_msg(ChatMessage::System("usage: /chain name <name>".into()));
                         return CommandAction::None;
                     }
-                    return CommandAction::ChainName { name: rest.to_string() };
+                    return CommandAction::ChainName {
+                        name: rest.to_string(),
+                    };
                 }
                 "unname" | "rm" => {
                     if rest.is_empty() {
                         app.push_msg(ChatMessage::System("usage: /chain unname <name>".into()));
                         return CommandAction::None;
                     }
-                    return CommandAction::ChainUnname { name: rest.to_string() };
+                    return CommandAction::ChainUnname {
+                        name: rest.to_string(),
+                    };
                 }
                 _ => {
-                    app.push_msg(ChatMessage::Error(format!("unknown /chain subcommand: {}", sub)));
+                    app.push_msg(ChatMessage::Error(format!(
+                        "unknown /chain subcommand: {}",
+                        sub
+                    )));
                 }
             }
         }
@@ -615,7 +723,9 @@ pub(super) async fn handle_command(
                     if rest.is_empty() {
                         return CommandAction::ExtensionsConfig { id: None };
                     }
-                    return CommandAction::ExtensionsConfig { id: Some(rest.to_string()) };
+                    return CommandAction::ExtensionsConfig {
+                        id: Some(rest.to_string()),
+                    };
                 }
                 "trust" => {
                     if rest.is_empty() || rest == "list" {
@@ -632,14 +742,15 @@ pub(super) async fn handle_command(
                                 ));
                                 return CommandAction::None;
                             }
-                            return CommandAction::ExtensionsTrust(
-                                ExtensionsTrustAction::Enable { runtime_id: trest.to_string() },
-                            );
+                            return CommandAction::ExtensionsTrust(ExtensionsTrustAction::Enable {
+                                runtime_id: trest.to_string(),
+                            });
                         }
                         "disable" => {
                             if trest.is_empty() {
                                 app.push_msg(ChatMessage::System(
-                                    "usage: /extensions trust disable <runtime_id> [reason]".to_string(),
+                                    "usage: /extensions trust disable <runtime_id> [reason]"
+                                        .to_string(),
                                 ));
                                 return CommandAction::None;
                             }
@@ -766,16 +877,27 @@ pub(super) async fn handle_command(
             if rest.is_empty() {
                 // Unqualified form.
                 let claims = registry.lifecycle_claims();
-                let render_disambig = |verb: &str, claims: &[synaps_cli::skills::registry::LifecycleClaim]| -> String {
-                    let mut sorted: Vec<_> = claims.iter().collect();
-                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
-                    let plugins = sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ");
-                    let cmds = sorted.iter().map(|c| format!("/{}", c.command)).collect::<Vec<_>>().join(", ");
-                    format!(
+                let render_disambig =
+                    |verb: &str,
+                     claims: &[synaps_cli::skills::registry::LifecycleClaim]|
+                     -> String {
+                        let mut sorted: Vec<_> = claims.iter().collect();
+                        sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+                        let plugins = sorted
+                            .iter()
+                            .map(|c| c.plugin.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let cmds = sorted
+                            .iter()
+                            .map(|c| format!("/{}", c.command))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
                         "multiple sidecars loaded: {}; use /sidecar <plugin-id> {} or one of the per-plugin commands ({})",
                         plugins, verb, cmds
                     )
-                };
+                    };
                 match first {
                     "" | "toggle" => match claims.len() {
                         0 => return CommandAction::SidecarToggle { plugin_id: None },
@@ -785,7 +907,9 @@ pub(super) async fn handle_command(
                                 "hint: this sidecar is claimed by /{} — try /{} toggle",
                                 c.command, c.command
                             )));
-                            return CommandAction::SidecarToggle { plugin_id: Some(c.plugin.clone()) };
+                            return CommandAction::SidecarToggle {
+                                plugin_id: Some(c.plugin.clone()),
+                            };
                         }
                         _ => {
                             app.push_msg(ChatMessage::Error(render_disambig("toggle", &claims)));
@@ -800,7 +924,9 @@ pub(super) async fn handle_command(
                                 "hint: this sidecar is claimed by /{} — try /{} status",
                                 c.command, c.command
                             )));
-                            return CommandAction::SidecarStatus { plugin_id: Some(c.plugin.clone()) };
+                            return CommandAction::SidecarStatus {
+                                plugin_id: Some(c.plugin.clone()),
+                            };
                         }
                         _ => {
                             app.push_msg(ChatMessage::Error(render_disambig("status", &claims)));
@@ -825,7 +951,11 @@ pub(super) async fn handle_command(
                     let list = if sorted.is_empty() {
                         "none".to_string()
                     } else {
-                        sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ")
+                        sorted
+                            .iter()
+                            .map(|c| c.plugin.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     };
                     app.push_msg(ChatMessage::Error(format!(
                         "unknown sidecar plugin: '{}' (loaded: {})",
@@ -834,8 +964,16 @@ pub(super) async fn handle_command(
                     return CommandAction::None;
                 }
                 match rest.as_str() {
-                    "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(plugin_id.to_string()) },
-                    "status" => return CommandAction::SidecarStatus { plugin_id: Some(plugin_id.to_string()) },
+                    "toggle" => {
+                        return CommandAction::SidecarToggle {
+                            plugin_id: Some(plugin_id.to_string()),
+                        }
+                    }
+                    "status" => {
+                        return CommandAction::SidecarStatus {
+                            plugin_id: Some(plugin_id.to_string()),
+                        }
+                    }
                     other => {
                         app.push_msg(ChatMessage::Error(format!(
                             "unknown /sidecar subcommand: `{}` (try: toggle, status)",
@@ -849,13 +987,17 @@ pub(super) async fn handle_command(
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
-                app.push_msg(ChatMessage::System("No plugin or user keybinds registered.".to_string()));
+                app.push_msg(ChatMessage::System(
+                    "No plugin or user keybinds registered.".to_string(),
+                ));
             } else {
                 let mut lines = vec!["Keybinds:".to_string()];
                 for bind in &custom {
                     let key = synaps_cli::skills::keybinds::format_key(&bind.key);
                     let source = match &bind.source {
-                        synaps_cli::skills::keybinds::KeybindSource::Plugin(name) => format!(" ({})", name),
+                        synaps_cli::skills::keybinds::KeybindSource::Plugin(name) => {
+                            format!(" ({})", name)
+                        }
                         synaps_cli::skills::keybinds::KeybindSource::User => " (user)".to_string(),
                         _ => String::new(),
                     };
@@ -864,26 +1006,33 @@ pub(super) async fn handle_command(
                 app.push_msg(ChatMessage::System(lines.join("\n")));
             }
         }
-        _ => {
-            match registry.resolve(cmd) {
-                Resolution::Skill(skill) => {
-                    return CommandAction::LoadSkill { skill, arg: arg.to_string() };
-                }
-                Resolution::PluginCommand(command) => {
-                    return CommandAction::PluginCommand { command, arg: arg.to_string() };
-                }
-                Resolution::Ambiguous(opts) => {
-                    app.push_msg(ChatMessage::Error(format!(
-                        "ambiguous command /{}; try one of: {}",
-                        cmd,
-                        opts.iter().map(|o| format!("/{}", o)).collect::<Vec<_>>().join(", ")
-                    )));
-                }
-                Resolution::Builtin | Resolution::Unknown => {
-                    app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
-                }
+        _ => match registry.resolve(cmd) {
+            Resolution::Skill(skill) => {
+                return CommandAction::LoadSkill {
+                    skill,
+                    arg: arg.to_string(),
+                };
             }
-        }
+            Resolution::PluginCommand(command) => {
+                return CommandAction::PluginCommand {
+                    command,
+                    arg: arg.to_string(),
+                };
+            }
+            Resolution::Ambiguous(opts) => {
+                app.push_msg(ChatMessage::Error(format!(
+                    "ambiguous command /{}; try one of: {}",
+                    cmd,
+                    opts.iter()
+                        .map(|o| format!("/{}", o))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Resolution::Builtin | Resolution::Unknown => {
+                app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
+            }
+        },
     }
     CommandAction::None
 }
@@ -916,15 +1065,20 @@ pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
         }
     };
     // Count user/assistant exchanges (each user msg is one turn).
-    let turn_count = app.transcript.messages().iter().filter(|m| matches!(m.msg, ChatMessage::User(_))).count();
+    let turn_count = app
+        .transcript
+        .messages()
+        .iter()
+        .filter(|m| matches!(m.msg, ChatMessage::User(_)))
+        .count();
 
     // ── Token totals ──────────────────────────────────────────────────────
-    let input   = app.total_input_tokens;
-    let output  = app.total_output_tokens;
-    let c_read  = app.total_cache_read_tokens;
+    let input = app.total_input_tokens;
+    let output = app.total_output_tokens;
+    let c_read = app.total_cache_read_tokens;
     let c_write = app.total_cache_creation_tokens;
-    let c5      = app.total_cache_write_5m;
-    let c1      = app.total_cache_write_1h;
+    let c5 = app.total_cache_write_5m;
+    let c1 = app.total_cache_write_1h;
 
     // ── Cache hit-rate (mirrors the footer formula) ───────────────────────
     let total_input_all = input + c_read + c_write;
@@ -942,7 +1096,7 @@ pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
     //         = cost_split(model, c_read, 0, 0, 0, 0) − cost_split(model, 0, 0, c_read, 0, 0)
     let savings = if c_read > 0 {
         let full_price = calculate_cost_split(&model, c_read, 0, 0, 0, 0);
-        let actual     = calculate_cost_split(&model, 0, 0, c_read, 0, 0);
+        let actual = calculate_cost_split(&model, 0, 0, c_read, 0, 0);
         full_price - actual
     } else {
         0.0
@@ -954,7 +1108,11 @@ pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
     // ── Format ───────────────────────────────────────────────────────────
     let mut lines = vec![
         "─── Session Stats ───────────────────────────────".to_string(),
-        format!("  Session  {:>12}  model: {}", &session_id[..session_id.len().min(12)], model),
+        format!(
+            "  Session  {:>12}  model: {}",
+            &session_id[..session_id.len().min(12)],
+            model
+        ),
         format!("  Duration {:>12}  turns: {}", duration_str, turn_count),
         String::new(),
         "  Tokens".to_string(),
@@ -964,14 +1122,21 @@ pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
     ];
 
     if c5 > 0 || c1 > 0 {
-        lines.push(format!("    cache write  {:>10}  (5m: {} / 1h: {})",
-            fmt_tokens(c_write), fmt_tokens(c5), fmt_tokens(c1)));
+        lines.push(format!(
+            "    cache write  {:>10}  (5m: {} / 1h: {})",
+            fmt_tokens(c_write),
+            fmt_tokens(c5),
+            fmt_tokens(c1)
+        ));
     } else {
         lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
     }
 
     lines.push(String::new());
-    lines.push(format!("  Cache  hit rate {:>9}  saved: ${:.4}", hit_rate_str, savings));
+    lines.push(format!(
+        "  Cache  hit rate {:>9}  saved: ${:.4}",
+        hit_rate_str, savings
+    ));
     lines.push(String::new());
     lines.push(format!("  Cost   ${:.4}", session_cost));
     lines.push("─────────────────────────────────────────────────".to_string());
@@ -998,7 +1163,11 @@ pub(super) fn handle_streaming_command(
     match cmd {
         "gamba" => CommandAction::LaunchGamba,
         "theme" => {
-            let arg = full_input[1..].split_once(' ').map(|x| x.1).unwrap_or("").trim();
+            let arg = full_input[1..]
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim();
             app.handle_theme_command(arg);
             CommandAction::None
         }
@@ -1009,16 +1178,22 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_stats_receipt, edit_distance, execute_command_action, execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
     use super::command_output_event_to_chat_message;
+    use super::{
+        build_stats_receipt, edit_distance, execute_command_action,
+        execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix,
+        restore_session_reasoning, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction,
+    };
     use crate::tui::app::ChatMessage;
-    use synaps_cli::extensions::commands::CommandOutputEvent;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use synaps_cli::extensions::commands::CommandOutputEvent;
     use synaps_cli::skills::manifest::ManifestSkillPromptCommand;
-    use synaps_cli::skills::registry::{CommandRegistry, RegisteredPluginCommand, RegisteredPluginCommandBackend};
+    use synaps_cli::skills::registry::{
+        CommandRegistry, RegisteredPluginCommand, RegisteredPluginCommandBackend,
+    };
     use synaps_cli::{Tool, ToolContext, ToolRegistry};
 
     #[test]
@@ -1094,7 +1269,9 @@ mod tests {
             &system_prompt_path,
             &registry,
             &keybinds,
-        ).await {
+        )
+        .await
+        {
             CommandAction::PluginCommand { command, arg } => {
                 assert_eq!(command.plugin, "policy");
                 assert_eq!(command.name, "mode");
@@ -1108,11 +1285,20 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "policy:echo" }
-        fn description(&self) -> &str { "echo" }
-        fn parameters(&self) -> Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "policy:echo"
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
-            Ok(format!("echo {}", params["text"].as_str().unwrap_or_default()))
+            Ok(format!(
+                "echo {}",
+                params["text"].as_str().unwrap_or_default()
+            ))
         }
     }
 
@@ -1135,27 +1321,38 @@ mod tests {
         });
 
         execute_command_action(
-            CommandAction::PluginCommand { command, arg: "hello".to_string() },
+            CommandAction::PluginCommand {
+                command,
+                arg: "hello".to_string(),
+            },
             &mut app,
             &runtime,
-        ).await;
+        )
+        .await;
 
-        let last = app.transcript.messages().last().expect("system message should be pushed");
+        let last = app
+            .transcript
+            .messages()
+            .last()
+            .expect("system message should be pushed");
         match &last.msg {
             crate::tui::app::ChatMessage::System(text) => {
-                assert!(text.contains("plugin command /policy:echo exited with 0"), "{text}");
+                assert!(
+                    text.contains("plugin command /policy:echo exited with 0"),
+                    "{text}"
+                );
                 assert!(text.contains("stdout:\necho hello"), "{text}");
             }
             _ => panic!("expected system message"),
         }
     }
 
-
     #[test]
     fn command_output_event_text_becomes_chat_text() {
         let msg = command_output_event_to_chat_message(CommandOutputEvent::Text {
             content: "hello".to_string(),
-        }).expect("text event should produce chat message");
+        })
+        .expect("text event should produce chat message");
         match msg {
             ChatMessage::Text(text) => assert_eq!(text, "hello"),
             _ => panic!("expected text chat message"),
@@ -1167,7 +1364,8 @@ mod tests {
         let msg = command_output_event_to_chat_message(CommandOutputEvent::Table {
             headers: vec!["ID".into(), "Status".into()],
             rows: vec![vec!["tiny".into(), "installed".into()]],
-        }).expect("table event should produce chat message");
+        })
+        .expect("table event should produce chat message");
         match msg {
             ChatMessage::System(text) => {
                 assert!(text.contains("ID"), "{text}");
@@ -1177,7 +1375,6 @@ mod tests {
             _ => panic!("expected system table message"),
         }
     }
-
 
     #[tokio::test]
     async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
@@ -1209,7 +1406,9 @@ mod tests {
 
         execute_interactive_plugin_command_events(&command, "models", &manager, &mut app).await;
 
-        assert!(app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))));
+        assert!(app.transcript.messages().iter().any(
+            |m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))
+        ));
         assert!(app.active_tasks.get("demo-task").is_some());
         assert!(app.active_tasks.get("demo-task").unwrap().done);
         manager.shutdown_all().await;
@@ -1245,11 +1444,26 @@ mod tests {
 
     fn commands() -> Vec<String> {
         vec![
-            "clear".into(), "compact".into(), "chain".into(), "model".into(),
-            "models".into(), "system".into(), "thinking".into(), "context".into(), "sessions".into(), "resume".into(),
-            "saveas".into(), "theme".into(), "gamba".into(), "help".into(),
-            "quit".into(), "exit".into(), "settings".into(), "plugins".into(),
-            "status".into(), "stats".into(),
+            "clear".into(),
+            "compact".into(),
+            "chain".into(),
+            "model".into(),
+            "models".into(),
+            "system".into(),
+            "thinking".into(),
+            "context".into(),
+            "sessions".into(),
+            "resume".into(),
+            "saveas".into(),
+            "theme".into(),
+            "gamba".into(),
+            "help".into(),
+            "quit".into(),
+            "exit".into(),
+            "settings".into(),
+            "plugins".into(),
+            "status".into(),
+            "stats".into(),
         ]
     }
 
@@ -1340,7 +1554,8 @@ mod tests {
             &system_prompt_path,
             &registry,
             &keybinds,
-        ).await
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1396,7 +1611,10 @@ mod tests {
     #[tokio::test]
     async fn parse_extensions_trust_disable_with_reason() {
         match invoke_extensions("trust disable plug:prov untrusted vendor").await {
-            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable {
+                runtime_id,
+                reason,
+            }) => {
                 assert_eq!(runtime_id, "plug:prov");
                 assert_eq!(reason.as_deref(), Some("untrusted vendor"));
             }
@@ -1407,7 +1625,10 @@ mod tests {
     #[tokio::test]
     async fn parse_extensions_trust_disable_no_reason() {
         match invoke_extensions("trust disable plug:prov").await {
-            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable {
+                runtime_id,
+                reason,
+            }) => {
                 assert_eq!(runtime_id, "plug:prov");
                 assert!(reason.is_none(), "expected no reason");
             }
@@ -1446,7 +1667,10 @@ mod tests {
     #[tokio::test]
     async fn parse_extensions_memory_recent_default_limit() {
         match invoke_extensions("memory recent my-ns").await {
-            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent {
+                namespace,
+                limit,
+            }) => {
                 assert_eq!(namespace, "my-ns");
                 assert_eq!(limit, None);
             }
@@ -1457,7 +1681,10 @@ mod tests {
     #[tokio::test]
     async fn parse_extensions_memory_recent_with_limit() {
         match invoke_extensions("memory recent my-ns 5").await {
-            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent {
+                namespace,
+                limit,
+            }) => {
                 assert_eq!(namespace, "my-ns");
                 assert_eq!(limit, Some(5));
             }
@@ -1536,7 +1763,10 @@ mod tests {
             CommandAction::SidecarToggle { plugin_id } => {
                 assert_eq!(plugin_id.as_deref(), Some("sample-sidecar"));
             }
-            other => panic!("expected SidecarToggle with plugin_id, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected SidecarToggle with plugin_id, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1588,7 +1818,10 @@ mod tests {
             CommandAction::SidecarStatus { plugin_id } => {
                 assert_eq!(plugin_id.as_deref(), Some("sample-sidecar"));
             }
-            other => panic!("expected SidecarStatus with plugin_id, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected SidecarStatus with plugin_id, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1674,7 +1907,11 @@ mod tests {
     async fn sidecar_toggle_works_when_zero_claims_loaded() {
         let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
+        let pushed_err = app
+            .transcript
+            .messages()
+            .iter()
+            .any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for zero-claim back-compat");
     }
 
@@ -1683,10 +1920,14 @@ mod tests {
         let (action, app) = invoke_sidecar_with_plugins(
             "toggle",
             vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
         let pushed_hint = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::System(s) if s.contains("try /capture toggle")));
-        assert!(pushed_hint, "expected a System hint mentioning `try /capture toggle`");
+        assert!(
+            pushed_hint,
+            "expected a System hint mentioning `try /capture toggle`"
+        );
     }
 
     #[tokio::test]
@@ -1697,16 +1938,26 @@ mod tests {
                 lifecycle_plugin("sample-sidecar", "capture"),
                 lifecycle_plugin("local-ocr", "ocr"),
             ],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::None));
         let pushed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             crate::tui::app::ChatMessage::Error(s) => Some(s.clone()),
             _ => None,
         });
         let s = pushed.expect("expected an Error message");
-        assert!(s.contains("sample-sidecar"), "error should list sample-sidecar; got: {s}");
-        assert!(s.contains("local-ocr"), "error should list local-ocr; got: {s}");
-        assert!(s.contains("/capture"), "error should mention /capture; got: {s}");
+        assert!(
+            s.contains("sample-sidecar"),
+            "error should list sample-sidecar; got: {s}"
+        );
+        assert!(
+            s.contains("local-ocr"),
+            "error should list local-ocr; got: {s}"
+        );
+        assert!(
+            s.contains("/capture"),
+            "error should mention /capture; got: {s}"
+        );
         assert!(s.contains("/ocr"), "error should mention /ocr; got: {s}");
     }
 
@@ -1718,9 +1969,14 @@ mod tests {
                 lifecycle_plugin("sample-sidecar", "capture"),
                 lifecycle_plugin("local-ocr", "ocr"),
             ],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
+        let pushed_err = app
+            .transcript
+            .messages()
+            .iter()
+            .any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for valid qualified form");
     }
 
@@ -1729,7 +1985,8 @@ mod tests {
         let (action, app) = invoke_sidecar_with_plugins(
             "nonexistent toggle",
             vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::None));
         let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
         assert!(pushed, "expected `unknown sidecar plugin` error");
@@ -1740,7 +1997,8 @@ mod tests {
         let (action, _app) = invoke_sidecar_with_plugins(
             "sample-sidecar status",
             vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::SidecarStatus { .. }));
     }
 
@@ -1749,7 +2007,8 @@ mod tests {
         let (action, app) = invoke_sidecar_with_plugins(
             "sample-sidecar bogus",
             vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ).await;
+        )
+        .await;
         assert!(matches!(action, CommandAction::None));
         let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
         assert!(pushed, "expected `unknown /sidecar subcommand` error");
@@ -1765,10 +2024,13 @@ mod tests {
         let model = "claude-sonnet-4-5";
         let c_read: u64 = 1_000_000;
         let full_price = calculate_cost_split(model, c_read, 0, 0, 0, 0); // at input rate
-        let actual     = calculate_cost_split(model, 0, 0, c_read, 0, 0); // at 0.1× rate
+        let actual = calculate_cost_split(model, 0, 0, c_read, 0, 0); // at 0.1× rate
         let savings = full_price - actual;
         // $3.00 − $0.30 = $2.70
-        assert!((savings - 2.70).abs() < 1e-9, "expected $2.70, got ${savings}");
+        assert!(
+            (savings - 2.70).abs() < 1e-9,
+            "expected $2.70, got ${savings}"
+        );
     }
 
     /// Zero cache reads → zero savings.
@@ -1777,7 +2039,7 @@ mod tests {
         use synaps_cli::pricing::calculate_cost_split;
         let model = "claude-sonnet-4-5";
         let full_price = calculate_cost_split(model, 0, 0, 0, 0, 0);
-        let actual     = calculate_cost_split(model, 0, 0, 0, 0, 0);
+        let actual = calculate_cost_split(model, 0, 0, 0, 0, 0);
         let savings = full_price - actual;
         assert_eq!(savings, 0.0);
     }
@@ -1807,5 +2069,25 @@ mod tests {
         assert!(receipt.contains("saved:"), "missing savings line");
         assert!(receipt.contains("5m:"), "missing 5m split");
         assert!(receipt.contains("1h:"), "missing 1h split");
+    }
+
+    #[tokio::test]
+    async fn resume_restores_ultra_with_explicit_provenance() {
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_model("openai-codex/gpt-5.6-sol".to_string());
+
+        restore_session_reasoning(&mut runtime, "ultra");
+
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::Ultra
+        );
+        assert!(runtime.is_reasoning_explicit());
+        runtime.set_model("openai-codex/gpt-5.6-terra".to_string());
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::Ultra,
+            "restored explicit Ultra must survive model switches"
+        );
     }
 }

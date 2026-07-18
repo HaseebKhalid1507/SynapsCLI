@@ -3,15 +3,12 @@ use std::io::{self, Write};
 use crossterm::{cursor::MoveTo, style::Print, QueueableCommand};
 #[cfg(test)]
 use ratatui::backend::Backend;
-use ratatui::{
-    backend::CrosstermBackend,
-    buffer::Buffer,
-    layout::Rect,
-    style::Style,
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, buffer::Buffer, layout::Rect, style::Style, Terminal};
 #[cfg(test)]
-use ratatui::{text::Line, widgets::{Paragraph, Widget}};
+use ratatui::{
+    text::Line,
+    widgets::{Paragraph, Widget},
+};
 
 /// Terminal cells that should be physically blanked before each diff draw.
 ///
@@ -24,7 +21,8 @@ pub(crate) fn edge_scrub_positions(area: Rect) -> Vec<(u16, u16)> {
         return Vec::new();
     }
 
-    let mut positions = Vec::with_capacity(area.height as usize * if area.width > 1 { 2 } else { 1 });
+    let mut positions =
+        Vec::with_capacity(area.height as usize * if area.width > 1 { 2 } else { 1 });
     for y in area.y..area.y.saturating_add(area.height) {
         positions.push((area.x, y));
         if area.width > 1 {
@@ -84,10 +82,7 @@ where
 /// captured in a vt100/byte-level test with an explicit `area` — the parent
 /// derives `area` from `terminal.size()`, which opens `/dev/tty` and is
 /// therefore non-deterministic headless.
-fn queue_edge_scrub<W: Write>(
-    backend: &mut CrosstermBackend<W>,
-    area: Rect,
-) -> io::Result<()> {
+fn queue_edge_scrub<W: Write>(backend: &mut CrosstermBackend<W>, area: Rect) -> io::Result<()> {
     for (x, y) in edge_scrub_positions(area) {
         backend.queue(MoveTo(x, y))?;
         backend.queue(Print(" "))?;
@@ -129,7 +124,10 @@ where
     }
 
     let size = terminal.size()?;
-    let Some(area) = edge_scrub_area(Rect::new(0, 0, size.width, size.height), protected_bottom_rows) else {
+    let Some(area) = edge_scrub_area(
+        Rect::new(0, 0, size.width, size.height),
+        protected_bottom_rows,
+    ) else {
         return Ok(());
     };
 
@@ -165,7 +163,9 @@ pub(crate) fn render_scrolled_lines(
         }
     }
 
-    Paragraph::new(lines.to_vec()).style(style).render(area, buf);
+    Paragraph::new(lines.to_vec())
+        .style(style)
+        .render(area, buf);
 }
 
 #[cfg(test)]
@@ -207,17 +207,25 @@ mod scrub_gate_tests {
     }
 
     fn caps_tmux() -> TermCaps {
-        TermCaps { tmux: Some("3.4".to_string()), ..TermCaps::default() }
+        TermCaps {
+            tmux: Some("3.4".to_string()),
+            ..TermCaps::default()
+        }
     }
     fn caps_no_tmux() -> TermCaps {
-        TermCaps { tmux: None, ..TermCaps::default() }
+        TermCaps {
+            tmux: None,
+            ..TermCaps::default()
+        }
     }
 
     fn fixed_terminal(sink: SharedSink) -> Terminal<CrosstermBackend<SharedSink>> {
         // Fixed viewport ⇒ construction never calls backend.size()/`/dev/tty`.
         Terminal::with_options(
             CrosstermBackend::new(sink),
-            TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)) },
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
         )
         .expect("fixed-viewport in-memory terminal construction is infallible")
     }

@@ -136,9 +136,9 @@ pub fn parse_command_output_event(event: &Value) -> Result<CommandOutputEvent, S
                         .ok_or_else(|| "command.output table row must be array".to_string())?
                         .iter()
                         .map(|cell| {
-                            cell.as_str()
-                                .map(str::to_string)
-                                .ok_or_else(|| "command.output table cell must be string".to_string())
+                            cell.as_str().map(str::to_string).ok_or_else(|| {
+                                "command.output table cell must be string".to_string()
+                            })
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -162,7 +162,9 @@ mod tests {
         assert_eq!(frame.request_id, "r1");
         assert_eq!(
             frame.event,
-            CommandOutputEvent::Text { content: "hello".into() }
+            CommandOutputEvent::Text {
+                content: "hello".into()
+            }
         );
     }
 
@@ -173,7 +175,9 @@ mod tests {
         assert_eq!(frame.request_id, "r2");
         assert_eq!(
             frame.event,
-            CommandOutputEvent::Text { content: "hi".into() }
+            CommandOutputEvent::Text {
+                content: "hi".into()
+            }
         );
     }
 
@@ -191,7 +195,8 @@ mod tests {
         .unwrap();
         assert!(matches!(frame.event, CommandOutputEvent::Error { .. }));
 
-        let frame = parse_command_output(&json!({"request_id":"x","event":{"kind":"done"}})).unwrap();
+        let frame =
+            parse_command_output(&json!({"request_id":"x","event":{"kind":"done"}})).unwrap();
         assert_eq!(frame.event, CommandOutputEvent::Done);
     }
 

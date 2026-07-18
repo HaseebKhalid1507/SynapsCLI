@@ -22,10 +22,11 @@ impl Tool for SubagentStartTool {
 
     fn description(&self) -> &str {
         "Dispatch a reactive subagent and return immediately with a handle_id. \
-         The subagent runs in the background — use subagent_status to poll, \
-         subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call \
-         repeatedly until done). Use this for parallel execution or when you \
-         want to continue working while the subagent runs. For simple sequential \
+         The subagent runs in the background — poll with subagent_status until it \
+         reports a terminal status, use subagent_steer to inject guidance mid-run, \
+         then call subagent_collect once with reconciled=true to retrieve the result \
+         and attest reconciliation in the same call. Use this for parallel execution \
+         or when you want to continue working while the subagent runs. For simple sequential \
          delegation, use subagent instead. Provide either an agent name (resolves \
          from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
     }
@@ -48,7 +49,20 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
+                    "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"],
+                    "description": "Typed orchestration role."
+                },
+                "write_policy": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
+                    ],
+                    "description": "Declared write isolation and path scopes."
                 },
                 "timeout": {
                     "type": "integer",
@@ -79,25 +93,39 @@ impl Tool for SubagentStartTool {
             .as_str()
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
-        let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
-
+        let requested_model = params["model"].as_str();
+        // Validate the registry before authorization, id allocation, or event emission;
+        // the same borrow is reused below when publishing the authorized handle.
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("subagent_start requires a subagent_registry in ToolContext".into())
+        })?;
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
             (None, Some(p)) => p.clone(),
             (None, None) => {
                 return Err(RuntimeError::Tool(
-                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither."
+                        .to_string(),
                 ));
             }
         };
-
-        let label = agent_name.as_deref().unwrap_or("inline").to_string();
-        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
-        let task_preview: String = task.chars().take(80).collect();
-        let task_full = task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
+        let decision = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .resolve_and_authorize(&handle_id, requested_model)
+            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+        let model = decision.model.as_str().to_owned();
+        let timeout_secs = params["timeout"]
+            .as_u64()
+            .unwrap_or(ctx.limits.subagent_timeout);
+
+        let label = agent_name.as_deref().unwrap_or("inline").to_string();
+        let task_preview: String = task.chars().take(80).collect();
+        let task_full = task.clone();
 
         tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
 
@@ -128,12 +156,6 @@ impl Tool for SubagentStartTool {
         let parent_queue     = ctx.capabilities.event_queue.clone();
         let handle_id_inner  = handle_id.clone();
 
-        // ── Fail fast if no registry — before spawning an unregistered thread ──
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "subagent_start requires a subagent_registry in ToolContext".to_string()
-            ))?;
-
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can
         // push a completion event the instant the thread exits, but the registry
@@ -151,10 +173,17 @@ impl Tool for SubagentStartTool {
             Some(steer_tx),
             Some(shutdown_tx),
             Some(result_rx),
-        );
+        )
+        .with_authorization(&decision);
         {
             let mut reg = registry.lock().unwrap();
             reg.register(handle);
+        }
+
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&handle_id) {
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
         }
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
@@ -169,9 +198,9 @@ impl Tool for SubagentStartTool {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
+                    Err(_) => {
                         state_t.write().unwrap().status =
-                            SubagentStatus::Failed(format!("tokio runtime: {}", e));
+                            SubagentStatus::Failed("runtime initialization failed".into());
                         return;
                     }
                 };
@@ -189,7 +218,7 @@ impl Tool for SubagentStartTool {
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND
@@ -300,7 +329,7 @@ impl Tool for SubagentStartTool {
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
+                                    crate::StreamEvent::Session(SessionEvent::Error(_)) => return Err("provider request failed".into()),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }
@@ -335,6 +364,7 @@ impl Tool for SubagentStartTool {
                                     cache_creation_5m: total_cache_5m,
                                     cache_creation_1h: total_cache_1h,
                                     tool_count,
+                                timed_out: true,
                                 });
                             }
                         }
@@ -350,6 +380,7 @@ impl Tool for SubagentStartTool {
                         cache_creation_5m: total_cache_5m,
                         cache_creation_1h: total_cache_1h,
                         tool_count,
+                    timed_out: false,
                     })
                 });
 
@@ -419,12 +450,32 @@ impl Tool for SubagentStartTool {
             );
         });
 
-        // ── Wire thread handle into the already-registered entry ─────────────
+        // ── Attach the already-persisted handle to the started thread ──────────
         {
             let mut reg = registry.lock().unwrap();
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
+        }
+        if let Err(error) = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .unwrap()
+            .mark_running(&handle_id)
+        {
+            let thread = {
+                let mut reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get_mut(&handle_id) {
+                    handle.cancel();
+                }
+                reg.remove(&handle_id)
+            };
+            if let Some(handle) = thread {
+                let _ = handle.collect().await;
+            }
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
         }
 
         Ok(json!({
@@ -473,7 +524,7 @@ mod tests {
             "agent": "",
             "system_prompt": "You are a concise test subagent. Reply with only: ok",
             "task": "Say ok",
-            "model": "claude-sonnet-4-6",
+            "model": "anthropic/claude-sonnet-4-6",
             "timeout": 1
         });
 

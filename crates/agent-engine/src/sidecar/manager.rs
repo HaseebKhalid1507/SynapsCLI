@@ -39,10 +39,7 @@ pub enum SidecarLifecycleEvent {
         label: Option<String>,
     },
     /// Sidecar wants text applied to the input buffer.
-    InsertText {
-        text: String,
-        mode: InsertTextMode,
-    },
+    InsertText { text: String, mode: InsertTextMode },
     /// Sidecar reported an error message.
     Error(String),
     /// Sidecar process exited (clean or otherwise).
@@ -105,14 +102,8 @@ impl SidecarManager {
             source,
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(SidecarError::PipesUnavailable)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(SidecarError::PipesUnavailable)?;
+        let stdin = child.stdin.take().ok_or(SidecarError::PipesUnavailable)?;
+        let stdout = child.stdout.take().ok_or(SidecarError::PipesUnavailable)?;
         let stderr = child.stderr.take();
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -196,12 +187,12 @@ impl SidecarManager {
         // The sidecar must announce its protocol version first so we can
         // reject incompatible versions before committing to the handshake.
         // Timeout: 10s — if the sidecar can't say Hello in 10s, it's broken.
-        let hello_timeout = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            manager.rx.recv(),
-        )
-        .await
-        .map_err(|_| SidecarError::Protocol("sidecar did not send Hello within 10s".to_string()))?;
+        let hello_timeout =
+            tokio::time::timeout(std::time::Duration::from_secs(10), manager.rx.recv())
+                .await
+                .map_err(|_| {
+                    SidecarError::Protocol("sidecar did not send Hello within 10s".to_string())
+                })?;
 
         match hello_timeout {
             Some(SidecarLifecycleEvent::Ready { .. }) => {
@@ -212,11 +203,14 @@ impl SidecarManager {
             }
             Some(other) => {
                 return Err(SidecarError::Protocol(format!(
-                    "expected Hello from sidecar, got: {:?}", other
+                    "expected Hello from sidecar, got: {:?}",
+                    other
                 )));
             }
             None => {
-                return Err(SidecarError::Protocol("sidecar exited before sending Hello".to_string()));
+                return Err(SidecarError::Protocol(
+                    "sidecar exited before sending Hello".to_string(),
+                ));
             }
         }
 
@@ -226,12 +220,20 @@ impl SidecarManager {
 
     /// Send a trigger press command.
     pub async fn press(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::Trigger { name: "press".into(), payload: None }).await
+        self.send(SidecarCommand::Trigger {
+            name: "press".into(),
+            payload: None,
+        })
+        .await
     }
 
     /// Send a trigger release command.
     pub async fn release(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::Trigger { name: "release".into(), payload: None }).await
+        self.send(SidecarCommand::Trigger {
+            name: "release".into(),
+            payload: None,
+        })
+        .await
     }
 
     /// Send a graceful `shutdown` command and reap the child process.

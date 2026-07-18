@@ -1,15 +1,17 @@
+use super::super::{resolve_agent_prompt, Tool, ToolContext, NEXT_SUBAGENT_ID};
+pub use crate::runtime::subagent::SubagentResult;
+use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentTool {
-    fn name(&self) -> &str { "subagent" }
+    fn name(&self) -> &str {
+        "subagent"
+    }
 
     fn description(&self) -> &str {
         "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
@@ -31,9 +33,14 @@ impl Tool for SubagentTool {
                     "type": "string",
                     "description": "The task/prompt to send to the subagent."
                 },
-                "model": {
-                    "type": "string",
-                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
+                "model": {"type": "string", "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."},
+                "role": {"type": "string", "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"]},
+                "write_policy": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
+                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
+                    ]
                 },
                 "timeout": {
                     "type": "integer",
@@ -45,7 +52,8 @@ impl Tool for SubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let task = params["task"].as_str()
+        let task = params["task"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
@@ -63,28 +71,40 @@ impl Tool for SubagentTool {
             .as_str()
             .map(|s| s.to_string())
             .filter(|s| !is_blank(s));
-        let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
-
+        let requested_model = params["model"].as_str();
         let system_prompt = match (&agent_name, &inline_prompt) {
-            (Some(name), _) => {
-                resolve_agent_prompt(name)
-                    .map_err(RuntimeError::Tool)?
-            }
+            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
             (None, Some(prompt)) => prompt.clone(),
             (None, None) => {
                 return Err(RuntimeError::Tool(
-                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither."
+                        .to_string(),
                 ));
             }
         };
+        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
+        let orchestration_id = format!("sa_{}", subagent_id);
+        let decision = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .resolve_and_authorize(&orchestration_id, requested_model)
+            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+        let model = decision.model.as_str().to_owned();
+        let timeout_secs = params["timeout"]
+            .as_u64()
+            .unwrap_or(ctx.limits.subagent_timeout);
 
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
-        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
         let task_preview: String = task.chars().take(80).collect();
-        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
 
-        tracing::info!("Dispatching subagent '{}' (id={}) with model {}", label, subagent_id, model);
+        tracing::info!(
+            "Dispatching subagent '{}' (id={}) with model {}",
+            label,
+            subagent_id,
+            model
+        );
 
         if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentStart {
@@ -96,22 +116,28 @@ impl Tool for SubagentTool {
 
         let start_time = std::time::Instant::now();
 
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
+        let (result_tx, result_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
         let label_inner = label.clone();
         let model_inner = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&orchestration_id) {
+            orchestration.rollback(&orchestration_id);
+            return Err(RuntimeError::Tool(error));
+        }
 
-        let _thread_handle = std::thread::spawn(move || {
+        let thread_handle = match std::thread::Builder::new().spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                    Err(_) => {
+                        let _ = result_tx.send(Err("runtime initialization failed".into()));
                         return;
                     }
                 };
@@ -121,7 +147,7 @@ impl Tool for SubagentTool {
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND
@@ -293,6 +319,7 @@ impl Tool for SubagentTool {
                                 cache_creation_5m: total_cache_5m,
                                 cache_creation_1h: total_cache_1h,
                                 tool_count,
+                                timed_out: true,
                             });
                         }
                     }
@@ -308,6 +335,7 @@ impl Tool for SubagentTool {
                     cache_creation_5m: total_cache_5m,
                     cache_creation_1h: total_cache_1h,
                     tool_count,
+                    timed_out: false,
                 })
             });
 
@@ -326,12 +354,40 @@ impl Tool for SubagentTool {
                 // result_tx is consumed inside the closure, so we can't send here —
                 // the oneshot receiver will see a RecvError, handled below.
             }
-        });
+        }) {
+            Ok(handle) => handle,
+            Err(_) => {
+                orchestration.rollback(&orchestration_id);
+                return Err(RuntimeError::Tool("worker thread initialization failed".into()));
+            }
+        };
+        if let Err(error) = orchestration.mark_running(&orchestration_id) {
+            drop(shutdown_tx);
+            let _ = thread_handle.join();
+            orchestration.rollback(&orchestration_id);
+            return Err(RuntimeError::Tool(error));
+        }
 
         let result = result_rx.await;
         let elapsed = start_time.elapsed().as_secs_f64();
 
         drop(shutdown_tx);
+        let _ = thread_handle.join();
+
+        // One-shot workers have no separate collect call: every outcome must pass
+        // through terminal, collected, and reconciled before this tool exits.
+        if let Some(policy) = &ctx.capabilities.orchestration {
+            let terminal = match &result {
+                Ok(Ok(result)) if result.timed_out => {
+                    agent_core::orchestration::WorkerTerminal::TimedOut
+                }
+                Ok(Ok(_)) => agent_core::orchestration::WorkerTerminal::Completed,
+                Ok(Err(_)) | Err(_) => agent_core::orchestration::WorkerTerminal::Failed,
+            };
+            policy
+                .finish_one_shot(&orchestration_id, terminal)
+                .map_err(RuntimeError::Tool)?;
+        }
 
         let log_dir = crate::config::base_dir().join("logs").join("subagents");
         let _ = tokio::fs::create_dir_all(&log_dir).await;
@@ -384,7 +440,14 @@ impl Tool for SubagentTool {
                     }));
                 }
                 let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
-                let _ = tokio::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e)).await;
+                let _ = tokio::fs::write(
+                    &log_path,
+                    format!(
+                        "# Subagent ERROR: {}\nTask: {}\nError: {}\n",
+                        label, task_preview, e
+                    ),
+                )
+                .await;
                 Ok(format!("[subagent:{} ERROR] {}", label, e))
             }
             Err(_) => {
@@ -396,12 +459,14 @@ impl Tool for SubagentTool {
                         duration_secs: elapsed,
                     }));
                 }
-                Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
+                Ok(format!(
+                    "[subagent:{} ERROR] Subagent task panicked or was dropped",
+                    label
+                ))
             }
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -430,11 +495,14 @@ mod tests {
             "agent": "",
             "system_prompt": "You are a concise test subagent. Reply with only: ok",
             "task": "Say ok",
-            "model": "claude-sonnet-4-6",
+            "model": "anthropic/claude-sonnet-4-6",
             "timeout": 1
         });
 
         let result = tool.execute(params, ctx).await;
-        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+        assert!(
+            result.is_ok(),
+            "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}"
+        );
     }
 }

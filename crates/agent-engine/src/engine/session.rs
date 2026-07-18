@@ -3,9 +3,9 @@
 //! Owns the conversation state that both TUI and headless modes need:
 //! messages, token counts, cost, abort context.
 
-use crate::{Session, Runtime};
 use crate::pricing::calculate_cost_optional_split;
 use crate::SharedMessage;
+use crate::{Runtime, Session};
 
 /// Conversation state tracked by the engine.
 pub struct ConversationState {
@@ -115,8 +115,13 @@ impl ConversationState {
         self.total_cache_creation_tokens += cache_creation;
 
         self.session_cost += calculate_cost_optional_split(
-            model, input_tokens, output_tokens, cache_read,
-            cache_creation, cache_creation_5m, cache_creation_1h,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
         );
     }
 

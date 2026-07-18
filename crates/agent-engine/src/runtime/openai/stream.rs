@@ -11,6 +11,103 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+/// Persistent retry posture for the Codex transport, mirroring the Anthropic
+/// OAuth overload budget (`OAUTH_OVERLOAD_RETRIES` in `runtime/api.rs`).
+///
+/// chatgpt.com edge turbulence — 503 upstream connect errors, Cloudflare
+/// 520s, raw TCP connect/read timeouts (incident: 2026-07-16 log bursts at
+/// 14:19, 18:52, 20:21, 20:27, 20:55, 21:47) — clears on its own within a
+/// burst; a three-attempt budget risks aborting an autonomous turn mid-burst.
+pub(crate) const CODEX_PERSISTENT_RETRIES: u32 = 10;
+
+/// Exponential-backoff exponent cap shared with the Anthropic stream retry
+/// path (`stream_retry_policy`): delay = base·2^min(n−1, CAP). Without the
+/// cap a 10-deep budget would sleep 1s·2⁹ = 512s on its final attempt.
+const RETRY_BACKOFF_EXP_CAP: u32 = 6;
+
+/// Effective Codex transport retry budget: the persistent floor, unless the
+/// user configured something even larger. Pure — decided at the dispatch
+/// seam (`try_route`), never inside `send_with_retries`, so tests can still
+/// inject exact budgets.
+pub(crate) fn codex_retry_budget(configured_retries: u32) -> u32 {
+    configured_retries.max(CODEX_PERSISTENT_RETRIES)
+}
+
+/// Backoff for retry attempt *n* (1-based): 1s·2^(n−1), capped at 64s.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        1000 * 2u64.pow(attempt.saturating_sub(1).min(RETRY_BACKOFF_EXP_CAP)),
+    )
+}
+
+/// Send a provider streaming request, retrying transient failures.
+///
+/// Parity fix: the Anthropic path retries transient errors with backoff
+/// (`call_api_stream_inner`) but the provider routes were single-shot — one
+/// transport blip against e.g. `chatgpt.com` aborted an entire autonomous
+/// turn (incident: session 20260714-025948-3dab). Attempt *n* sleeps
+/// 1s·2^(n−1) capped at 2^`RETRY_BACKOFF_EXP_CAP`, mirroring the Anthropic
+/// budget semantics.
+///
+/// Retryable: transport-level send failures (timeout / connect / request)
+/// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
+/// and localhost connection refusals (Ollama/LM Studio not running — a
+/// setup problem, not a blip) fail fast. Backoff sleeps are cancel-aware.
+async fn send_with_retries(
+    label: &str,
+    url: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let mut attempt: u32 = 0;
+    loop {
+        match build().send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) => {
+                let status = resp.status();
+                let retryable =
+                    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
+                let text = resp.text().await.unwrap_or_default();
+                if !retryable || attempt >= max_retries {
+                    return Err(format!("{label} request failed: {status}: {text}").into());
+                }
+                attempt += 1;
+                let delay = retry_delay(attempt);
+                tracing::warn!(
+                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}: {}",
+                    crate::truncate_str(&text, 200)
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                }
+            }
+            Err(e) => {
+                let localhost_refusal = e.is_connect() && url.contains("localhost");
+                let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                if localhost_refusal || !transient || attempt >= max_retries {
+                    tracing::warn!(
+                        "{label} request failed (no retry): {}",
+                        crate::core::error::error_chain_string(&e)
+                    );
+                    return Err(e.into());
+                }
+                attempt += 1;
+                let delay = retry_delay(attempt);
+                tracing::warn!(
+                    "{label} transport retry {attempt}/{max_retries} after {delay:?}: {}",
+                    crate::core::error::error_chain_string(&e)
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                }
+            }
+        }
+    }
+}
+
 /// Run a single streaming request against an OpenAI-compatible endpoint.
 ///
 /// Returns the final assistant response as an Anthropic-shaped content Value
@@ -19,7 +116,7 @@ use tokio::sync::mpsc;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_oai_stream_inner(
     cfg: &ProviderConfig,
-    client: &reqwest::Client,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
     tools_schema: &[Value],
     system_prompt: &Option<String>,
     messages: &[crate::SharedMessage],
@@ -31,13 +128,19 @@ pub(crate) async fn call_oai_stream_inner(
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
-    let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
+    let tools_opt = if oai_tools.is_empty() {
+        None
+    } else {
+        Some(oai_tools)
+    };
 
     // Google's OpenAI-compat endpoint rejects stream_options
     let stream_options = if cfg.base_url.contains("googleapis.com") {
         None
     } else {
-        Some(StreamOptions { include_usage: true })
+        Some(StreamOptions {
+            include_usage: true,
+        })
     };
 
     let mut body = serde_json::Map::new();
@@ -45,7 +148,10 @@ pub(crate) async fn call_oai_stream_inner(
     body.insert("messages".to_string(), serde_json::to_value(oai_messages)?);
     body.insert("stream".to_string(), json!(true));
     if let Some(stream_options) = stream_options {
-        body.insert("stream_options".to_string(), serde_json::to_value(stream_options)?);
+        body.insert(
+            "stream_options".to_string(),
+            serde_json::to_value(stream_options)?,
+        );
     }
     if let Some(max_tokens) = max_tokens {
         body.insert("max_tokens".to_string(), json!(max_tokens));
@@ -64,43 +170,26 @@ pub(crate) async fn call_oai_stream_inner(
     );
     let body = Value::Object(body);
 
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    tracing::debug!(provider=%cfg.provider, model=%cfg.model, "openai stream request via broker proxy");
 
-    tracing::debug!(url=%url, model=%cfg.model, "openai stream request");
-
-    let resp = match client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
+    // The broker owns the API key and executes/signs the request; this path
+    // never resolves or attaches a credential.
+    let mut stream = broker
+        .proxy_stream(crate::auth::ProxyRequest {
+            provider: cfg.provider.clone(),
+            method: crate::auth::ProxyMethod::Post,
+            path: "/chat/completions".to_string(),
+            body: Some(body),
+            stream: true,
+        })
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            if e.is_connect() && url.contains("localhost") {
-                return Err(format!(
-                    "Can't reach local endpoint at {} — is Ollama/LM Studio running?",
-                    url
-                ).into());
-            }
-            return Err(e.into());
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("openai request failed: {status}: {text}").into());
-    }
+        .map_err(|e| format!("openai request failed: {e}"))?;
 
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
     let mut tool_use_blocks: Vec<Value> = Vec::new();
     let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
     let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
-    let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = tokio::select! {
         chunk = stream.next() => chunk,
@@ -118,7 +207,13 @@ pub(crate) async fn call_oai_stream_inner(
 
             sink.clear();
             decoder.push_line(line, &mut sink);
-            handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+            handle_events(
+                &sink,
+                tx,
+                &mut accumulated_text,
+                &mut tool_use_blocks,
+                &name_map,
+            );
         }
     }
 
@@ -127,11 +222,23 @@ pub(crate) async fn call_oai_stream_inner(
         let line = std::str::from_utf8(&buf).unwrap_or("");
         sink.clear();
         decoder.push_line(line, &mut sink);
-        handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+        handle_events(
+            &sink,
+            tx,
+            &mut accumulated_text,
+            &mut tool_use_blocks,
+            &name_map,
+        );
     }
     sink.clear();
     decoder.finish(&mut sink);
-    handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
+    handle_events(
+        &sink,
+        tx,
+        &mut accumulated_text,
+        &mut tool_use_blocks,
+        &name_map,
+    );
 
     // Build Anthropic-shaped final response
     let mut content: Vec<Value> = Vec::new();
@@ -150,38 +257,80 @@ pub(crate) async fn call_oai_stream_inner(
 pub(crate) async fn call_codex_stream_inner(
     cfg: &ProviderConfig,
     client: &reqwest::Client,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
     tools_schema: &[Value],
     system_prompt: &Option<String>,
     messages: &[crate::SharedMessage],
     tx: &mpsc::UnboundedSender<StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     cancel: &tokio_util::sync::CancellationToken,
-    source: &crate::auth::CredentialSource,
-    cache: &crate::auth::TokenCache,
+    max_retries: u32,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    // Resolve the codex access token honoring the credential source: Remote
-    // fetches from the broker, Local refreshes the openai-codex auth.json. (#158 C4)
-    let (access, account_id) = if !cfg.api_key.is_empty() {
-        (cfg.api_key.clone(), crate::auth::extract_codex_account_id(&cfg.api_key))
-    } else {
-        match source {
-            crate::auth::CredentialSource::Remote { .. } => {
-                let access = crate::auth::resolve_access_token("openai-codex", source, cache, client).await?;
-                let acct = crate::auth::extract_codex_account_id(&access);
-                (access, acct)
+    // Build the exact provider-qualified plan before any credential or network
+    // access. Logical Ultra is lowered here, never in the generic level enum.
+    use crate::runtime::openai::catalog::plan_codex_execution;
+    let qualified_model = format!("{}/{}", cfg.provider, cfg.model);
+    let plan =
+        match plan_codex_execution(&qualified_model, reasoning_level, codex_request_role, None) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::debug!(
+                    event = "codex_mode_plan",
+                    qualified_model = %qualified_model,
+                    requested_level = %reasoning_level,
+                    runtime_role = codex_request_role.as_str(),
+                    decision = "deny",
+                    deny_code = error.code().as_str(),
+                    network_attempted = false,
+                    "Codex execution plan denied"
+                );
+                return Err(Box::new(error));
             }
-            crate::auth::CredentialSource::Local => {
-                let creds = crate::auth::ensure_fresh_provider_token(client, "openai-codex").await?;
-                let acct = creds
-                    .account_id
-                    .clone()
-                    .or_else(|| crate::auth::extract_codex_account_id(&creds.access));
-                (creds.access, acct)
-            }
-        }
-    };
-    let account_id = account_id.ok_or("Failed to extract ChatGPT account id from Codex token")?;
+        };
+    if plan.automatic_delegation() && !codex_has_required_delegation_tools(tools_schema) {
+        tracing::debug!(
+            event = "codex_mode_plan",
+            qualified_model = %qualified_model,
+            requested_level = %reasoning_level,
+            runtime_role = codex_request_role.as_str(),
+            decision = "deny",
+            deny_code = "ultra_requires_subagent_tools",
+            network_attempted = false,
+            "Codex execution plan denied"
+        );
+        return Err(
+            "Ultra requires subagent_start, subagent_status, and subagent_collect tools".into(),
+        );
+    }
+    tracing::debug!(
+        event = "codex_mode_plan",
+        qualified_model = %plan.qualified_model,
+        requested_level = %plan.selected_level,
+        execution_mode = plan.mode.as_str(),
+        wire_effort = plan.wire_effort_label(),
+        capability_source = plan.capability_source.map_or("none", |source| source.as_str()),
+        multi_agent_version = plan.multi_agent_version_label(),
+        runtime_role = plan.request_role.as_str(),
+        multi_agent_mode = plan.multi_agent_mode_label(),
+        automatic_delegation = plan.automatic_delegation(),
+        decision = "allow",
+        network_attempted = false,
+        "Codex execution plan allowed"
+    );
+    // Every Codex credential, local or remote, crosses the broker boundary:
+    // the broker vends an access token + expiry only (refresh tokens are
+    // broker-owned), and this path never opens auth.json.
+    let access = broker
+        .access_token(crate::auth::OAuthProviderId::OpenAiCodex)
+        .await
+        .map_err(|e| e.to_string())?
+        .token;
+    // Account id is provider-owned metadata carried inside the Codex JWT.
+    let account_id = crate::auth::extract_codex_account_id(&access)
+        .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
 
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -197,50 +346,52 @@ pub(crate) async fn call_codex_stream_inner(
         })
         .collect();
 
-    let mut body = json!({
-        "model": cfg.model,
-        "store": false,
-        "stream": true,
-        "instructions": codex_instructions(system_prompt),
-        "input": codex_input_messages(oai_messages),
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"],
-        "text": { "verbosity": "medium" },
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-    }
-    if let Some(temp) = temperature {
-        body["temperature"] = json!(temp);
-    }
-    if let Some(max) = max_tokens {
-        body["max_output_tokens"] = json!(max);
-    }
+    // Use the shared pure helper so production and unit tests exercise identical
+    // body construction — no duplication between call_codex_stream_inner and tests.
+    let instructions = codex_instructions(system_prompt);
+    let mut input_items = codex_input_messages(oai_messages);
+    // Key on the pre-insertion head: the mode item varies with the execution
+    // plan (level/role switches) and must not churn the routing key.
+    let prompt_cache_key = codex_prompt_cache_key(&instructions, input_items.first());
+    insert_codex_multi_agent_mode(&mut input_items, &plan);
+    let input = serde_json::Value::Array(input_items);
+    let body = build_codex_body(
+        &cfg.model,
+        &plan,
+        input,
+        instructions,
+        tools,
+        temperature,
+        max_tokens,
+        &prompt_cache_key,
+    );
 
     let url = format!(
         "{}/codex/responses",
-        cfg.base_url.trim_end_matches('/').trim_end_matches("/codex")
+        cfg.base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/codex")
     );
     tracing::debug!(url=%url, model=%cfg.model, "codex stream request");
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(&access)
-        .header("chatgpt-account-id", account_id)
-        .header("originator", "synaps")
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("codex request failed: {status}: {text}").into());
-    }
+    let resp = send_with_retries(
+        "codex",
+        &url,
+        || {
+            client
+                .post(&url)
+                .bearer_auth(&access)
+                .header("chatgpt-account-id", account_id.as_str())
+                .header("originator", "synaps")
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+        },
+        cancel,
+        max_retries,
+    )
+    .await?;
 
     let mut accumulated_text = String::new();
     let mut parser = CodexSseDecoder::default();
@@ -271,12 +422,152 @@ pub(crate) async fn call_codex_stream_inner(
     if !accumulated_text.is_empty() {
         content.push(json!({"type": "text", "text": accumulated_text}));
     }
-    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools, &name_map));
+    content.extend(translate::tool_calls_to_content_blocks(
+        &parser.completed_tools,
+        &name_map,
+    ));
 
     Ok(json!({
         "role": "assistant",
         "content": content,
     }))
+}
+
+/// Stable prompt-cache routing key for this conversation.
+///
+/// The Codex backend routes prefix-cache lookups by `prompt_cache_key`
+/// (upstream codex-rs sends its conversation UUID on every request). Synaps
+/// doesn't thread a session id down to the transport, so derive a
+/// deterministic key from the stable head of the prompt: the instructions
+/// plus the first input item. Identical heads hash to the same key — which
+/// is exactly right, since those requests share the very prefix the cache
+/// stores — and a /compact rewrite changes the key together with the prefix
+/// it invalidates. Without this key, cache lookups are at the mercy of
+/// load-balancer routing and long conversations re-pay their full prefix.
+pub(crate) fn codex_prompt_cache_key(instructions: &str, first_item: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    if let Some(item) = first_item {
+        hasher.update(item.to_string().as_bytes());
+    }
+    format!("synaps-{:x}", hasher.finalize())
+}
+
+/// Pure body construction for Codex Responses-API requests.
+///
+/// Separated from the async function so it can be unit-tested without
+/// any credential access or network I/O.
+///
+/// # Arguments
+/// - `model`: the Codex model id (already validated by the caller)
+/// - `plan`: reasoning plan (must already be validated against model capability)
+/// - `input`: pre-built input items (from `codex_input_messages`)
+/// - `instructions`: pre-built instructions string (from `codex_instructions`)
+/// - `tools`: pre-built tool array
+/// - `temperature`: optional temperature override
+/// - `max_tokens`: optional max_output_tokens override
+/// - `prompt_cache_key`: pre-computed routing key; computed on the
+///   pre-insertion input head by the caller, so it cannot be derived here
+#[allow(clippy::too_many_arguments)] // pure builder mirroring the wire body; grouping would obscure the 1:1 field mapping
+pub(crate) fn build_codex_body(
+    model: &str,
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
+    input: serde_json::Value,
+    instructions: String,
+    tools: Vec<serde_json::Value>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    prompt_cache_key: &str,
+) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "store": false,
+        "stream": true,
+        "instructions": instructions,
+        "input": input,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "include": ["reasoning.encrypted_content"],
+        "text": { "verbosity": "medium" },
+        "prompt_cache_key": prompt_cache_key,
+    });
+    if let Some(effort) = plan.wire_effort {
+        body["reasoning"] = json!({ "effort": effort.as_str() });
+    }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+    }
+    if let Some(temp) = temperature {
+        body["temperature"] = json!(temp);
+    }
+    if let Some(max) = max_tokens {
+        body["max_output_tokens"] = json!(max);
+    }
+    body
+}
+
+const CODEX_MULTI_AGENT_MODE_OPEN: &str = "<multi_agent_mode>";
+const CODEX_MULTI_AGENT_MODE_CLOSE: &str = "</multi_agent_mode>";
+const CODEX_EXPLICIT_REQUEST_ONLY_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const CODEX_PROACTIVE_MULTI_AGENT_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
+
+fn codex_multi_agent_mode_item(
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
+) -> Option<Value> {
+    use crate::runtime::openai::catalog::CodexMultiAgentMode;
+    let body = match plan.multi_agent_mode? {
+        CodexMultiAgentMode::ExplicitRequestOnly => CODEX_EXPLICIT_REQUEST_ONLY_TEXT,
+        CodexMultiAgentMode::Proactive => CODEX_PROACTIVE_MULTI_AGENT_TEXT,
+    };
+    Some(json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": format!("{CODEX_MULTI_AGENT_MODE_OPEN}{body}{CODEX_MULTI_AGENT_MODE_CLOSE}"),
+        }],
+    }))
+}
+
+fn is_codex_multi_agent_mode_item(item: &Value) -> bool {
+    item.pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.trim_start().starts_with(CODEX_MULTI_AGENT_MODE_OPEN)
+                && text.trim_end().ends_with(CODEX_MULTI_AGENT_MODE_CLOSE)
+        })
+}
+
+fn insert_codex_multi_agent_mode(
+    input: &mut Vec<Value>,
+    plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
+) {
+    input.retain(|item| !is_codex_multi_agent_mode_item(item));
+    let Some(item) = codex_multi_agent_mode_item(plan) else {
+        return;
+    };
+    // Prefix-cache stability: the mode item goes at a FIXED position (head of
+    // input), never relative to the latest user message. The previous
+    // placement (before the last user item) moved every user turn, so the
+    // prompt prefix diverged at the prior turn's user message and the entire
+    // preceding agentic turn — often the bulk of the context — was re-billed
+    // uncached (incident: 2026-07-16 codex cache investigation). At index 0
+    // the item is byte-stable across turns; it only changes when the
+    // execution plan's mode changes, which legitimately invalidates the
+    // prefix once.
+    input.insert(0, item);
+}
+
+fn codex_has_required_delegation_tools(tools_schema: &[Value]) -> bool {
+    ["subagent_start", "subagent_status", "subagent_collect"]
+        .into_iter()
+        .all(|required| {
+            tools_schema.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some(required)
+                    || tool.pointer("/function/name").and_then(Value::as_str) == Some(required)
+            })
+        })
 }
 
 const CODEX_AUTONOMOUS_LOOP_POLICY: &str = "\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]";
@@ -400,7 +691,10 @@ impl CodexSseDecoder {
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
             return;
         };
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -412,13 +706,22 @@ impl CodexSseDecoder {
             }
             "response.output_item.added" => {
                 if let Some(item) = event.get("item") {
-                    let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
                     self.add_tool_from_item(idx, item, tx);
                 }
             }
             "response.function_call_arguments.delta" => {
-                let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let idx = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if !delta.is_empty() {
                     let tool = self.ensure_tool(idx);
                     tool.arguments.push_str(delta);
@@ -433,7 +736,10 @@ impl CodexSseDecoder {
             }
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
-                    let idx = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
@@ -539,13 +845,11 @@ impl CodexSseDecoder {
             // Anthropic path in `runtime/api.rs` which emits the same
             // event on tool-use content_block_stop.
             let input = parse_tool_arguments(&call.function.arguments);
-            let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUse {
-                    tool_name: call.function.name.clone(),
-                    tool_id: call.id.clone(),
-                    input,
-                },
-            ));
+            let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::ToolUse {
+                tool_name: call.function.name.clone(),
+                tool_id: call.id.clone(),
+                input,
+            }));
             self.completed_tools.push(ToolCall {
                 id: call.id,
                 kind: call.kind,
@@ -567,16 +871,29 @@ impl CodexSseDecoder {
             .and_then(|u| u.get("output_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // Responses-API usage nests cache hits under input_tokens_details;
+        // input_tokens INCLUDES them. Downstream accounting uses Anthropic
+        // semantics (context = input + cache_read + cache_creation, hit% =
+        // cache_read/total), so report the cached slice separately and
+        // subtract it from input — otherwise cache hits are invisible
+        // (reported 0) and the context total double-counts.
+        let cached = usage
+            .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(input);
         if input > 0 || output > 0 {
-            let _ = tx.send(StreamEvent::Session(crate::runtime::types::SessionEvent::Usage {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_creation_5m: None,
-                cache_creation_1h: None,
-                model: None,
-            }));
+            let _ = tx.send(StreamEvent::Session(
+                crate::runtime::types::SessionEvent::Usage {
+                    input_tokens: input - cached,
+                    output_tokens: output,
+                    cache_read_input_tokens: cached,
+                    cache_creation_input_tokens: 0,
+                    cache_creation_5m: None,
+                    cache_creation_1h: None,
+                    model: None,
+                },
+            ));
         }
     }
 
@@ -636,8 +953,8 @@ mod codex_input_messages_tests {
     //! correlate the eventual `function_call_output`. We elect not to
     //! emit `id` unless we actually have a real `fc_…` value to send.
 
-    use super::*;
     use super::super::types::{ChatMessage, FunctionCall, ToolCall};
+    use super::*;
 
     fn sample_tool_call() -> ToolCall {
         ToolCall {
@@ -656,7 +973,9 @@ mod codex_input_messages_tests {
         assert!(instructions.contains("Project-specific rules."));
         assert!(instructions.contains("Do not stop at phase boundaries"));
         assert!(instructions.contains("Do not ask the user whether to continue"));
-        assert!(instructions.contains("continue autonomously until the full requested job is complete"));
+        assert!(
+            instructions.contains("continue autonomously until the full requested job is complete")
+        );
     }
 
     #[test]
@@ -665,7 +984,10 @@ mod codex_input_messages_tests {
         let out = codex_input_messages(messages);
         assert_eq!(out.len(), 1, "one tool_call → one input item");
         let item = &out[0];
-        assert_eq!(item.get("type").and_then(Value::as_str), Some("function_call"));
+        assert_eq!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call")
+        );
         assert!(
             item.get("id").is_none(),
             "must not echo a non-`fc_` id back; got {:?}",
@@ -688,7 +1010,10 @@ mod codex_input_messages_tests {
         let out = codex_input_messages(messages);
         let item = &out[0];
         assert_eq!(item.get("id").and_then(Value::as_str), Some("fc_abc123"));
-        assert_eq!(item.get("call_id").and_then(Value::as_str), Some("fc_abc123"));
+        assert_eq!(
+            item.get("call_id").and_then(Value::as_str),
+            Some("fc_abc123")
+        );
     }
 
     #[test]
@@ -835,7 +1160,8 @@ mod codex_decoder_tests {
         let (decoder, _text, _events) = drive(&lines);
 
         assert_eq!(decoder.completed_tools.len(), 2);
-        let mut by_id: std::collections::BTreeMap<&str, &ToolCall> = std::collections::BTreeMap::new();
+        let mut by_id: std::collections::BTreeMap<&str, &ToolCall> =
+            std::collections::BTreeMap::new();
         for tool in &decoder.completed_tools {
             by_id.insert(tool.id.as_str(), tool);
         }
@@ -866,13 +1192,19 @@ mod codex_decoder_tests {
         let tool_uses: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                    Some((tool_name.as_str(), tool_id.as_str(), input.clone()))
-                }
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name,
+                    tool_id,
+                    input,
+                }) => Some((tool_name.as_str(), tool_id.as_str(), input.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(tool_uses.len(), 1, "expected exactly one ToolUse finalize event");
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "expected exactly one ToolUse finalize event"
+        );
         assert_eq!(tool_uses[0].0, "bash");
         assert_eq!(tool_uses[0].1, "call_abc");
         assert_eq!(
@@ -902,9 +1234,11 @@ mod codex_decoder_tests {
         let tool_uses: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                    Some((tool_name.clone(), tool_id.clone(), input.clone()))
-                }
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name,
+                    tool_id,
+                    input,
+                }) => Some((tool_name.clone(), tool_id.clone(), input.clone())),
                 _ => None,
             })
             .collect();
@@ -961,6 +1295,34 @@ mod codex_decoder_tests {
         assert_eq!(usage, Some((42, 17)));
     }
 
+    /// Responses-API usage nests cache hits under input_tokens_details, and
+    /// input_tokens INCLUDES them. The decoder must surface the cached slice
+    /// as cache_read (Anthropic semantics) and subtract it from input —
+    /// dropping it (the old hardcoded 0) made every codex turn look 100%
+    /// uncached (incident: 2026-07-16 codex cache investigation).
+    #[test]
+    fn response_completed_surfaces_cached_tokens_without_double_count() {
+        let lines = [
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":900},"output_tokens":17}}}"#,
+            "",
+        ];
+        let (_decoder, _text, events) = drive(&lines);
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                ..
+            }) => Some((*input_tokens, *output_tokens, *cache_read_input_tokens)),
+            _ => None,
+        });
+        assert_eq!(
+            usage,
+            Some((100, 17, 900)),
+            "input must exclude the cached slice; cache_read must carry it"
+        );
+    }
+
     #[test]
     fn response_completed_with_zero_usage_emits_nothing() {
         let lines = [
@@ -968,7 +1330,9 @@ mod codex_decoder_tests {
             "",
         ];
         let (_decoder, _text, events) = drive(&lines);
-        let any_usage = events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
+        let any_usage = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
         assert!(!any_usage, "zero-token usage should be suppressed");
     }
 
@@ -1037,5 +1401,1099 @@ mod codex_decoder_tests {
         ];
         let (_decoder, text_acc, _events) = drive(&lines);
         assert_eq!(text_acc, "hi");
+    }
+}
+
+#[cfg(test)]
+mod broker_stream_tests {
+    //! Broker-boundary streaming tests: the OpenAI-compatible stream path is
+    //! driven end-to-end through an in-process `LocalBroker` against a fake
+    //! upstream. The runtime side supplies NO credential — the broker applies
+    //! it — and SSE deltas are forwarded to the event channel in real time.
+
+    use super::*;
+    use crate::auth::{CredentialBroker, LocalBroker};
+    use std::sync::Arc;
+
+    async fn spawn_fake_openai_sse() -> (String, Arc<std::sync::Mutex<String>>) {
+        use axum::routing::post;
+        let seen_auth = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = seen_auth.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    ([("content-type", "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen_auth)
+    }
+
+    #[tokio::test]
+    async fn oai_stream_flows_through_broker_and_forwards_deltas() {
+        let (upstream, seen_auth) = spawn_fake_openai_sse().await;
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            upstream,
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result =
+            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
+                .await
+                .expect("stream must complete");
+
+        // Final Anthropic-shaped value carries the accumulated text.
+        assert_eq!(result["content"][0]["text"], "Hello");
+
+        // Deltas were forwarded in real time on the event channel.
+        drop(tx);
+        let mut streamed = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(t)) = ev {
+                streamed.push_str(&t);
+            }
+        }
+        assert_eq!(streamed, "Hello");
+
+        // The credential was applied by the broker, not by this call site.
+        assert_eq!(&*seen_auth.lock().unwrap(), "Bearer local");
+    }
+
+    /// Broker errors surface as typed failures without opening a stream and
+    /// without any credential material in the message.
+    #[tokio::test]
+    async fn oai_stream_broker_error_fails_closed() {
+        // Unconfigured static provider → NotConfigured, no upstream contact.
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::new(reqwest::Client::new()));
+        let cfg = ProviderConfig {
+            base_url: String::new(),
+            model: "m".to_string(),
+            provider: "definitely-not-a-provider".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let err =
+            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("unknown provider"), "got: {err}");
+        assert!(!err.to_lowercase().contains("bearer"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_responses_stream_inner(
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (oai_tools, names) = translate::tools_to_oai(tools_schema);
+    let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
+    let tools: Vec<Value> = oai_tools
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.function.name,
+                "description": tool.function.description.unwrap_or_default(),
+                "parameters": tool.function.parameters,
+            })
+        })
+        .collect();
+    // Pure, validated body construction — rejects unsupported reasoning
+    // combinations BEFORE any broker credential access or network I/O.
+    let body = build_xai_body(
+        &cfg.model,
+        reasoning_level,
+        serde_json::to_value(input)?,
+        tools,
+        max_tokens,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let mut stream = broker
+        .proxy_stream(crate::auth::ProxyRequest {
+            provider: "xai-auth".into(),
+            method: crate::auth::ProxyMethod::Post,
+            path: "/responses".into(),
+            body: Some(body),
+            stream: true,
+        })
+        .await?;
+    let mut text = String::new();
+    let mut parser = CodexSseDecoder::default();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = tokio::select! { c=stream.next()=>c, _=cancel.cancelled()=>return Err("request canceled".into()) }
+    {
+        buf.extend_from_slice(&chunk?);
+        while let Some(n) = memchr::memchr(b'\n', &buf) {
+            let line = buf.split_to(n + 1);
+            parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
+        }
+    }
+    if !buf.is_empty() {
+        parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
+    }
+    parser.finish();
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({"type":"text","text":text}));
+    }
+    content.extend(translate::tool_calls_to_content_blocks(
+        &parser.completed_tools,
+        &names,
+    ));
+    Ok(json!({"role":"assistant","content":content}))
+}
+
+/// Pure, validated body construction for the xAI Responses API.
+///
+/// Enforces the exact-model reasoning matrix from
+/// `docs/anthropic-xai-reasoning-modes-spec.md` BEFORE any credential or
+/// network access, via the shared per-provider validator:
+/// - `Off` is rejected (never silently omitted) on models whose reasoning
+///   cannot be disabled; on the non-reasoning model it is trivially omission.
+/// - `Adaptive` omits the `reasoning` field → documented provider default.
+/// - Named levels are emitted as exact `reasoning:{effort:"..."}` only when
+///   the exact model id documents them; otherwise `Err` (fail closed).
+pub(crate) fn build_xai_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: Value,
+    tools: Vec<Value>,
+    max_tokens: Option<u32>,
+) -> Result<Value, String> {
+    use agent_core::reasoning::ReasoningLevel;
+    crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+        &format!("xai-auth/{model}"),
+        level,
+    )?;
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("input".into(), input);
+    body.insert("stream".into(), json!(true));
+    if !tools.is_empty() {
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(max) = max_tokens {
+        body.insert("max_output_tokens".into(), json!(max));
+    }
+    match level {
+        // Off (validated: only reachable where reasoning is absent/disableable)
+        // and Adaptive: omit `reasoning` — provider default applies.
+        ReasoningLevel::Off | ReasoningLevel::Adaptive => {}
+        l => {
+            body.insert("reasoning".into(), json!({ "effort": l.as_str() }));
+        }
+    }
+    Ok(Value::Object(body))
+}
+
+#[cfg(test)]
+mod xai_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    #[test]
+    fn xai_fixture_is_public_responses_shape() {
+        let fixture = serde_json::json!({"type":"response.output_text.delta","delta":"hello"});
+        assert_eq!(fixture["type"], "response.output_text.delta");
+        assert_eq!(fixture["delta"], "hello");
+    }
+
+    fn body_for(model: &str, level: ReasoningLevel) -> Result<Value, String> {
+        build_xai_body(model, level, json!([]), Vec::new(), Some(1024))
+    }
+
+    // ── Exact Responses wire (spec: anthropic-xai-reasoning-modes) ───────────
+
+    #[test]
+    fn grok45_emits_exact_documented_efforts() {
+        for (level, effort) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+        ] {
+            let body = body_for("grok-4.5", level).expect("supported effort");
+            assert_eq!(body["reasoning"], json!({"effort": effort}), "{level}");
+            assert_eq!(body["model"], "grok-4.5");
+            assert_eq!(body["stream"], json!(true));
+            assert_eq!(body["max_output_tokens"], json!(1024));
+        }
+    }
+
+    #[test]
+    fn adaptive_omits_reasoning_field_provider_default() {
+        for model in [
+            "grok-4.5",
+            "grok-4.5-latest",
+            "grok-4.3",
+            "grok-4.20-0309-non-reasoning",
+        ] {
+            let body = body_for(model, ReasoningLevel::Adaptive).expect("adaptive is omission");
+            assert!(body.get("reasoning").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn off_is_rejected_pre_network_when_reasoning_cannot_be_disabled() {
+        for model in [
+            "grok-4.5",
+            "grok-4.5-latest",
+            "grok-4.20-multi-agent-0309",
+            "grok-4.3",
+        ] {
+            let err = body_for(model, ReasoningLevel::Off).unwrap_err();
+            assert!(err.contains(model), "{model}: {err}");
+        }
+        // Non-reasoning model: Off is trivially satisfied by omission.
+        let body = body_for("grok-4.20-0309-non-reasoning", ReasoningLevel::Off).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn unsupported_named_efforts_are_rejected_pre_network() {
+        // 4.5 has no documented xhigh; max/ultra never exist on xAI.
+        for level in [
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(body_for("grok-4.5", level).is_err(), "{level}");
+        }
+        // Intrinsic-reasoning models have no documented effort control.
+        assert!(body_for("grok-4.3", ReasoningLevel::Medium).is_err());
+        // Non-reasoning models reject named reasoning outright.
+        assert!(body_for("grok-4.20-0309-non-reasoning", ReasoningLevel::Medium).is_err());
+        // Unknown exact ids fail closed.
+        assert!(body_for("grok-9000", ReasoningLevel::Medium).is_err());
+    }
+
+    #[test]
+    fn multi_agent_xhigh_is_exact_agent_count_control() {
+        let body = body_for("grok-4.20-multi-agent-0309", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort": "xhigh"}));
+    }
+
+    #[test]
+    fn responses_wire_shape_tools_flat_and_no_chat_completions_fields() {
+        let tools = vec![json!({
+            "type": "function",
+            "name": "get_weather",
+            "description": "d",
+            "parameters": {"type": "object"}
+        })];
+        let body =
+            build_xai_body("grok-4.5", ReasoningLevel::High, json!([]), tools, None).unwrap();
+        // Responses API: flat tool objects + `input`, never chat-completions
+        // `messages`/nested function wrappers.
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert!(body["tools"][0].get("function").is_none());
+        assert!(body.get("input").is_some());
+        assert!(body.get("messages").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+}
+
+// ─── Codex wire body tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod codex_wire_tests {
+    use crate::runtime::openai::catalog::{
+        plan_codex_execution, CodexMultiAgentMode, CodexRequestRole,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn plan(
+        level: ReasoningLevel,
+        role: CodexRequestRole,
+    ) -> crate::runtime::openai::catalog::CodexExecutionPlan {
+        plan_codex_execution("openai-codex/gpt-5.6-sol", level, role, None)
+            .expect("Sol request plan")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn body_for_level(
+        model: &str,
+        level: ReasoningLevel,
+        input: serde_json::Value,
+        instructions: String,
+        tools: Vec<serde_json::Value>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> serde_json::Value {
+        let qualified = format!("openai-codex/{model}");
+        let plan = plan_codex_execution(&qualified, level, CodexRequestRole::Foreground, None)
+            .expect("request plan");
+        super::build_codex_body(
+            model,
+            &plan,
+            input,
+            instructions,
+            tools,
+            temperature,
+            max_tokens,
+            "synaps-test-cache-key",
+        )
+    }
+
+    /// Validate → emit exact reasoning.effort shape for known levels.
+    fn codex_effort_for(model_id: &str, level: ReasoningLevel) -> Result<String, String> {
+        let qualified = format!("openai-codex/{model_id}");
+        let plan = plan_codex_execution(&qualified, level, CodexRequestRole::Foreground, None)
+            .map_err(|error| error.to_string())?;
+        plan.wire_effort
+            .map(|effort| effort.as_str().to_string())
+            .ok_or_else(|| "reasoning effort omitted".to_string())
+    }
+
+    #[test]
+    fn sol_lowers_ultra_to_max_for_requests() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::Ultra).unwrap();
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn sol_emits_max_exact() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::Max).unwrap();
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn sol_emits_xhigh_exact() {
+        let effort = codex_effort_for("gpt-5.6-sol", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn luna_emits_max_exact() {
+        let effort = codex_effort_for("gpt-5.6-luna", ReasoningLevel::Max).unwrap();
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn luna_rejects_ultra_before_network() {
+        // Validation must fail before any credential/network access.
+        let err = codex_effort_for("gpt-5.6-luna", ReasoningLevel::Ultra).unwrap_err();
+        assert!(err.contains("ultra"), "{err}");
+        assert!(err.contains("gpt-5.6-luna"), "{err}");
+    }
+
+    #[test]
+    fn gpt55_emits_xhigh_exact() {
+        let effort = codex_effort_for("gpt-5.5", ReasoningLevel::XHigh).unwrap();
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn gpt55_rejects_max_before_network() {
+        assert!(codex_effort_for("gpt-5.5", ReasoningLevel::Max).is_err());
+        assert!(codex_effort_for("gpt-5.5", ReasoningLevel::Ultra).is_err());
+    }
+
+    #[test]
+    fn off_and_adaptive_omit_reasoning_field() {
+        // Off/Adaptive: build_codex_body must NOT emit a "reasoning" key.
+        for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
+            let body = body_for_level(
+                "gpt-5.6-sol",
+                level,
+                serde_json::json!([]),
+                "sys".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            assert!(
+                body.get("reasoning").is_none(),
+                "{level:?} must not emit reasoning field, body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_as_str_is_not_xhigh() {
+        assert_ne!(ReasoningLevel::Max.as_str(), ReasoningLevel::XHigh.as_str());
+        assert_eq!(ReasoningLevel::Max.as_str(), "max");
+    }
+
+    #[test]
+    fn ultra_mode_context_is_exact_proactive_developer_item() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        assert_eq!(plan.multi_agent_mode, Some(CodexMultiAgentMode::Proactive));
+        let item = super::codex_multi_agent_mode_item(&plan).expect("Ultra context item");
+        assert_eq!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("message")
+        );
+        assert_eq!(
+            item.get("role").and_then(serde_json::Value::as_str),
+            Some("developer")
+        );
+        assert_eq!(
+            item.pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some(concat!(
+                "<multi_agent_mode>",
+                "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.",
+                "</multi_agent_mode>"
+            ))
+        );
+    }
+
+    #[test]
+    fn max_and_xhigh_mode_context_is_exact_explicit_only_item() {
+        for level in [ReasoningLevel::Max, ReasoningLevel::XHigh] {
+            let plan = plan(level, CodexRequestRole::Foreground);
+            assert_eq!(
+                plan.multi_agent_mode,
+                Some(CodexMultiAgentMode::ExplicitRequestOnly)
+            );
+            let item = super::codex_multi_agent_mode_item(&plan).expect("v2 context item");
+            assert_eq!(
+                item.pointer("/content/0/text")
+                    .and_then(serde_json::Value::as_str),
+                Some(concat!(
+                    "<multi_agent_mode>",
+                    "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
+                    "</multi_agent_mode>"
+                )),
+                "{level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_context_is_inserted_once_at_stable_head_position() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        let mut input = vec![
+            serde_json::json!({"role":"user","content":"first"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+            serde_json::json!({"role":"user","content":"current"}),
+        ];
+        super::insert_codex_multi_agent_mode(&mut input, &plan);
+        let mode_positions = input
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.pointer("/content/0/text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.starts_with("<multi_agent_mode>"))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(mode_positions, vec![0]);
+        assert_eq!(
+            input[3].get("content").and_then(serde_json::Value::as_str),
+            Some("current")
+        );
+    }
+
+    /// Prefix-cache stability: as the conversation grows across user turns,
+    /// the already-sent items must remain a byte-identical prefix of the next
+    /// request's input. The old before-last-user placement moved the mode
+    /// item every turn, invalidating the cached prefix at the prior user
+    /// message and re-billing the entire previous agentic turn uncached.
+    #[test]
+    fn mode_context_placement_preserves_prompt_prefix_across_turns() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Foreground);
+        let turn1 = vec![
+            serde_json::json!({"role":"user","content":"first"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+        ];
+        let mut turn2 = turn1.clone();
+        turn2.push(serde_json::json!({"role":"user","content":"follow-up"}));
+        let mut input1 = turn1;
+        let mut input2 = turn2;
+        super::insert_codex_multi_agent_mode(&mut input1, &plan);
+        super::insert_codex_multi_agent_mode(&mut input2, &plan);
+        assert_eq!(
+            &input2[..input1.len()],
+            &input1[..],
+            "turn N's input must be a strict prefix of turn N+1's input"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_for_the_same_conversation_head() {
+        let first = serde_json::json!({"role":"user","content":"hello"});
+        let a = super::codex_prompt_cache_key("sys", Some(&first));
+        let b = super::codex_prompt_cache_key("sys", Some(&first));
+        assert_eq!(a, b);
+        assert!(a.starts_with("synaps-"), "{a}");
+    }
+
+    #[test]
+    fn prompt_cache_key_differs_across_conversations() {
+        let first = serde_json::json!({"role":"user","content":"hello"});
+        let other = serde_json::json!({"role":"user","content":"different task"});
+        assert_ne!(
+            super::codex_prompt_cache_key("sys", Some(&first)),
+            super::codex_prompt_cache_key("sys", Some(&other)),
+        );
+        assert_ne!(
+            super::codex_prompt_cache_key("sys", Some(&first)),
+            super::codex_prompt_cache_key("other-sys", Some(&first)),
+        );
+    }
+
+    #[test]
+    fn body_carries_prompt_cache_key() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::Medium,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            body.get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str),
+            Some("synaps-test-cache-key")
+        );
+    }
+
+    #[test]
+    fn worker_ultra_has_no_mode_context_item() {
+        let plan = plan(ReasoningLevel::Ultra, CodexRequestRole::Worker);
+        assert!(super::codex_multi_agent_mode_item(&plan).is_none());
+    }
+
+    // ── Pure body construction tests (zero network) ──────────────────────────
+
+    #[test]
+    fn body_lowers_ultra_reasoning_effort_to_max() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::Ultra,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for Ultra");
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_max() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::Max,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for Max");
+        assert_eq!(effort, "max");
+        // max must NOT be xhigh (critical invariant)
+        assert_ne!(effort, "xhigh");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_xhigh() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::XHigh,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let effort = body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("reasoning.effort must be present for XHigh");
+        assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn body_contains_reasoning_effort_for_low_medium_high() {
+        for (level, expected) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+        ] {
+            let body = body_for_level(
+                "gpt-5.6-sol",
+                level,
+                serde_json::json!([]),
+                "sys".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            let effort = body
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{level:?} must emit reasoning.effort"));
+            assert_eq!(effort, expected, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn body_always_sets_model_and_stream_and_include() {
+        let body = body_for_level(
+            "gpt-5.5",
+            ReasoningLevel::XHigh,
+            serde_json::json!([]),
+            "instructions".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            body.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let includes = body.get("include").expect("include must be present");
+        assert!(
+            includes.as_array().map_or(false, |a| {
+                a.iter()
+                    .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
+            }),
+            "include must contain reasoning.encrypted_content"
+        );
+        assert_eq!(
+            body.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn body_omits_temperature_and_max_tokens_when_none() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::Medium,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn body_includes_temperature_and_max_tokens_when_some() {
+        let body = body_for_level(
+            "gpt-5.6-sol",
+            ReasoningLevel::High,
+            serde_json::json!([]),
+            "sys".to_string(),
+            vec![],
+            Some(0.7),
+            Some(2048),
+        );
+        let temp = body
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap();
+        assert!((temp - 0.7f64).abs() < 0.01, "temperature={temp}");
+        assert_eq!(
+            body.get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048)
+        );
+    }
+}
+
+#[cfg(test)]
+mod send_retry_tests {
+    //! Regression tests for transient-failure retry on the codex send path
+    //! (incident: session 20260714-025948-3dab — a single transport failure
+    //! against chatgpt.com aborted a whole autonomous turn because the codex
+    //! route was single-shot while the Anthropic route retried).
+    //!
+    //! Mirrors the `on401_tests` mock-server pattern in `runtime/api.rs`.
+    //! Credentials cross the broker boundary: a stub broker vends a
+    //! JWT-shaped token carrying the ChatGPT account-id claim.
+
+    use super::*;
+    use agent_core::auth::{
+        AccessToken, BrokerError, ProxyByteStream, ProxyRequest, ProxyResponse,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+    use async_trait::async_trait;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post as axum_post, Router};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::mpsc;
+
+    /// Minimal Responses-API SSE success body: one text delta + completed.
+    const CODEX_SSE_SUCCESS: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// JWT-shaped token whose payload carries the ChatGPT account-id claim
+    /// `extract_codex_account_id` looks for. Signature is irrelevant — the
+    /// mock server never validates it.
+    fn fake_codex_token() -> String {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_test" }
+        });
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(payload.to_string()))
+    }
+
+    /// Stub broker that vends the fake codex token. Everything else is
+    /// unreachable in these tests and fails closed.
+    struct TokenOnlyBroker;
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for TokenOnlyBroker {
+        async fn access_token(
+            &self,
+            _p: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            Ok(AccessToken {
+                token: fake_codex_token(),
+                expires: u64::MAX,
+            })
+        }
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn proxy_stream(
+            &self,
+            _request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    struct DenyingCountingBroker {
+        access_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for DenyingCountingBroker {
+        async fn access_token(
+            &self,
+            _provider: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            self.access_calls.fetch_add(1, Ordering::SeqCst);
+            Err(BrokerError::Denied(
+                "credential access must not occur".into(),
+            ))
+        }
+
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
+        async fn proxy_stream(
+            &self,
+            _request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Spawn a mock Codex endpoint. First `fail_count` POSTs → `fail_status`;
+    /// subsequent → SSE success. Returns (base_url, call_counter).
+    async fn spawn_mock_codex(
+        fail_count: usize,
+        fail_status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_count {
+                        (
+                            fail_status,
+                            [("content-type", "application/json")],
+                            "{\"error\":{\"message\":\"transient upstream sadness\"}}".to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            CODEX_SSE_SUCCESS.to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter)
+    }
+
+    async fn run_codex(
+        base_url: &str,
+        max_retries: u32,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = ProviderConfig {
+            base_url: base_url.to_string(),
+            // The incident model — validated against the static catalog ladder.
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        let client = reqwest::Client::new();
+        let broker: std::sync::Arc<dyn crate::auth::CredentialBroker> =
+            std::sync::Arc::new(TokenOnlyBroker);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        call_codex_stream_inner(
+            &cfg,
+            &client,
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            agent_core::reasoning::ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            max_retries,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_ultra_tool_guard_precedes_broker_access() {
+        let access_calls = Arc::new(AtomicUsize::new(0));
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(DenyingCountingBroker {
+            access_calls: Arc::clone(&access_calls),
+        });
+        let cfg = ProviderConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::Ultra,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+        )
+        .await
+        .expect_err("foreground Ultra without delegation tools must fail closed");
+
+        assert!(error.to_string().contains("subagent_start"), "{error}");
+        assert_eq!(
+            access_calls.load(Ordering::SeqCst),
+            0,
+            "preflight denial must happen before broker credential access"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_codex_path_rejects_provider_identity_before_broker_access() {
+        let access_calls = Arc::new(AtomicUsize::new(0));
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(DenyingCountingBroker {
+            access_calls: Arc::clone(&access_calls),
+        });
+        let cfg = ProviderConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openrouter".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+        )
+        .await
+        .expect_err("the Codex seam must validate provider-qualified identity");
+
+        assert!(error.to_string().contains("openrouter"), "{error}");
+        assert_eq!(
+            access_calls.load(Ordering::SeqCst),
+            0,
+            "provider identity denial must precede broker credential access"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_retries_transient_500_then_succeeds() {
+        let (base_url, counter) = spawn_mock_codex(1, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let result = run_codex(&base_url, 2)
+            .await
+            .expect("one transient 500 with retries available must not abort the turn");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expected exactly one retry"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn codex_retries_429_then_succeeds() {
+        let (base_url, counter) = spawn_mock_codex(1, StatusCode::TOO_MANY_REQUESTS).await;
+        run_codex(&base_url, 2)
+            .await
+            .expect("429 is transient — must retry");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_zero_retries_fails_fast_with_status_error() {
+        let (base_url, counter) =
+            spawn_mock_codex(usize::MAX, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "no retries budgeted");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 500"),
+            "status must survive for classification: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_retry_client_errors() {
+        let (base_url, counter) = spawn_mock_codex(usize::MAX, StatusCode::BAD_REQUEST).await;
+        let err = run_codex(&base_url, 3).await.expect_err("must fail");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "400 is deterministic — retrying it never helps"
+        );
+        assert!(err.to_string().starts_with("codex request failed: 400"));
+    }
+
+    #[tokio::test]
+    async fn codex_exhausted_retries_reports_last_status() {
+        let (base_url, counter) =
+            spawn_mock_codex(usize::MAX, StatusCode::SERVICE_UNAVAILABLE).await;
+        let err = run_codex(&base_url, 1).await.expect_err("must fail");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "initial attempt + 1 retry"
+        );
+        assert!(err.to_string().starts_with("codex request failed: 503"));
+    }
+
+    /// The dispatch seam lifts the generic three-attempt budget to the
+    /// persistent posture adopted for Anthropic OAuth overloads (10 retries)
+    /// — incident: 2026-07-16 chatgpt.com 503/520/timeout bursts.
+    #[test]
+    fn codex_retry_budget_lifts_configured_default_to_persistent_floor() {
+        assert_eq!(codex_retry_budget(3), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(0), CODEX_PERSISTENT_RETRIES);
+        assert_eq!(codex_retry_budget(10), 10);
+    }
+
+    /// A user who explicitly configured an even larger budget keeps it —
+    /// the floor only ever raises, never lowers.
+    #[test]
+    fn codex_retry_budget_honors_larger_user_configuration() {
+        assert_eq!(codex_retry_budget(15), 15);
+    }
+
+    /// Backoff doubles per attempt but caps at 2^6 — a 10-deep budget must
+    /// never sleep 512s on its final attempt.
+    #[test]
+    fn retry_delay_is_exponential_with_a_capped_tail() {
+        assert_eq!(retry_delay(1).as_secs(), 1);
+        assert_eq!(retry_delay(2).as_secs(), 2);
+        assert_eq!(retry_delay(4).as_secs(), 8);
+        assert_eq!(retry_delay(7).as_secs(), 64);
+        assert_eq!(retry_delay(10).as_secs(), 64);
     }
 }

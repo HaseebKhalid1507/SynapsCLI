@@ -9,7 +9,6 @@ pub const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assi
 use super::Runtime;
 use crate::error::Result;
 
-
 const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -122,10 +121,14 @@ pub async fn compact_conversation(
                     for block in content {
                         if block["type"].as_str() == Some("tool_result") {
                             let id = block["tool_use_id"].as_str().unwrap_or("?");
-                            let text = block["content"].as_str()
-                                .or_else(|| block["content"].as_array()
-                                    .and_then(|a| a.first())
-                                    .and_then(|b| b["text"].as_str()))
+                            let text = block["content"]
+                                .as_str()
+                                .or_else(|| {
+                                    block["content"]
+                                        .as_array()
+                                        .and_then(|a| a.first())
+                                        .and_then(|b| b["text"].as_str())
+                                })
                                 .unwrap_or("");
                             let truncated: String = text.chars().take(2000).collect();
                             if !truncated.is_empty() {
@@ -156,9 +159,15 @@ pub async fn compact_conversation(
                                 let input = &block["input"];
                                 if let Some(path) = input["path"].as_str() {
                                     match name {
-                                        "read" => { file_ops.read.insert(path.to_string()); }
-                                        "write" => { file_ops.written.insert(path.to_string()); }
-                                        "edit" => { file_ops.edited.insert(path.to_string()); }
+                                        "read" => {
+                                            file_ops.read.insert(path.to_string());
+                                        }
+                                        "write" => {
+                                            file_ops.written.insert(path.to_string());
+                                        }
+                                        "edit" => {
+                                            file_ops.edited.insert(path.to_string());
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -201,7 +210,8 @@ pub async fn compact_conversation(
 
     // Iterative compaction — if the first user message already contains a
     // summary wrapper, we're compacting on top of a previous compaction.
-    let has_previous_summary = api_messages.first()
+    let has_previous_summary = api_messages
+        .first()
         .and_then(|m| m["content"].as_str())
         .is_some_and(|c| c.contains("<context-summary>"));
 
@@ -213,7 +223,10 @@ pub async fn compact_conversation(
 
     let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
     if let Some(instructions) = custom_instructions {
-        prompt_text.push_str(&format!("{}\n\nAdditional focus: {}", base_prompt, instructions));
+        prompt_text.push_str(&format!(
+            "{}\n\nAdditional focus: {}",
+            base_prompt, instructions
+        ));
     } else {
         prompt_text.push_str(base_prompt);
     }

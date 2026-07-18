@@ -365,8 +365,18 @@ mod tests {
         assert_eq!(m.name, "web-tools");
         assert_eq!(m.version.as_deref(), Some("1.0.0"));
         assert_eq!(m.description.as_deref(), Some("Web tools"));
-        assert_eq!(m.compatibility.as_ref().unwrap().synaps.as_deref(), Some(">=0.1.0"));
-        assert_eq!(m.compatibility.as_ref().unwrap().extension_protocol.as_deref(), Some("1"));
+        assert_eq!(
+            m.compatibility.as_ref().unwrap().synaps.as_deref(),
+            Some(">=0.1.0")
+        );
+        assert_eq!(
+            m.compatibility
+                .as_ref()
+                .unwrap()
+                .extension_protocol
+                .as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
@@ -397,8 +407,14 @@ mod tests {
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.help_entries.len(), 1);
         assert_eq!(m.help_entries[0].command, "/web:search");
-        assert_eq!(m.help_entries[0].usage.as_deref(), Some("/web:search <query>"));
-        assert_eq!(m.help_entries[0].examples[0].command, "/web:search rust serde");
+        assert_eq!(
+            m.help_entries[0].usage.as_deref(),
+            Some("/web:search <query>")
+        );
+        assert_eq!(
+            m.help_entries[0].examples[0].command,
+            "/web:search rust serde"
+        );
     }
 
     #[test]
@@ -509,7 +525,9 @@ mod tests {
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         let provides = m.provides.expect("provides should deserialize");
-        let sidecar = provides.sidecar.expect("canonical `sidecar` field should deserialize");
+        let sidecar = provides
+            .sidecar
+            .expect("canonical `sidecar` field should deserialize");
         assert_eq!(sidecar.command, "bin/ocr-sidecar");
         assert_eq!(sidecar.protocol_version, 1);
     }
@@ -573,13 +591,7 @@ mod tests {
             }
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
-        let lc = m
-            .provides
-            .unwrap()
-            .sidecar
-            .unwrap()
-            .lifecycle
-            .unwrap();
+        let lc = m.provides.unwrap().sidecar.unwrap().lifecycle.unwrap();
         assert_eq!(lc.command, "capture");
         assert!(lc.settings_category.is_none());
         assert!(lc.display_name.is_none());
@@ -647,7 +659,6 @@ mod tests {
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert!(m.provides.is_none());
     }
-
 
     #[test]
     fn plugin_manifest_parses_interactive_command() {
@@ -779,7 +790,10 @@ mod tests {
         assert_eq!(m.name, "pi-skills");
         assert_eq!(m.categories, vec!["productivity"]);
         assert_eq!(m.keywords, vec!["local-first"]);
-        assert_eq!(m.trust.as_ref().unwrap().publisher.as_deref(), Some("Maha Media"));
+        assert_eq!(
+            m.trust.as_ref().unwrap().publisher.as_deref(),
+            Some("Maha Media")
+        );
         assert_eq!(m.plugins.len(), 2);
         assert_eq!(m.plugins[0].name, "web-tools");
         assert_eq!(m.plugins[0].source.as_deref(), Some("./web-tools-plugin"));

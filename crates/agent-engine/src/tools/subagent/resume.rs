@@ -10,15 +10,24 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
 use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
-use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
+use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
+use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
 
 pub struct SubagentResumeTool;
 
+fn expired_context_error(handle_id: &str) -> RuntimeError {
+    RuntimeError::Tool(format!(
+        "Subagent '{}' has expired resumable context; call subagent_collect with reconciled=true to reconcile its retained tombstone.",
+        handle_id
+    ))
+}
+
 #[async_trait::async_trait]
 impl Tool for SubagentResumeTool {
-    fn name(&self) -> &str { "subagent_resume" }
+    fn name(&self) -> &str {
+        "subagent_resume"
+    }
 
     fn description(&self) -> &str {
         "Resume a finished or timed-out reactive subagent with new instructions. \
@@ -47,26 +56,29 @@ impl Tool for SubagentResumeTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let prior_handle_id = params["handle_id"].as_str()
+        let prior_handle_id = params["handle_id"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let instructions = params["instructions"].as_str()
+        let instructions = params["instructions"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'instructions' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
+        })?;
 
         // Extract prior state under the lock, release immediately.
         let (agent_name, model, prior_context, prior_system_prompt, prior_timeout) = {
             let reg = registry.lock().unwrap();
-            let handle = reg.get(&prior_handle_id)
-                .ok_or_else(|| RuntimeError::Tool(
-                    format!("No subagent found with handle_id '{}'", prior_handle_id)
-                ))?;
+            let handle = reg.get(&prior_handle_id).ok_or_else(|| {
+                RuntimeError::Tool(format!(
+                    "No subagent found with handle_id '{}'",
+                    prior_handle_id
+                ))
+            })?;
 
             if handle.status() == SubagentStatus::Running {
                 return Err(RuntimeError::Tool(format!(
@@ -74,6 +86,9 @@ impl Tool for SubagentResumeTool {
                      or wait until it finishes.",
                     prior_handle_id
                 )));
+            }
+            if handle.is_tombstone() {
+                return Err(expired_context_error(&prior_handle_id));
             }
 
             let prior = {
@@ -85,8 +100,17 @@ impl Tool for SubagentResumeTool {
                 }
             };
 
-            (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
+            (
+                handle.agent_name.clone(),
+                handle.model.clone(),
+                prior,
+                handle.system_prompt.clone(),
+                handle.timeout_secs,
+            )
         };
+
+        // The inherited prior model is still re-authorized as an explicit exact
+        // identity; a stale handle cannot bypass current session policy.
 
         // ── Build resumed task: new instructions → separator → prior context.
         let resumed_task = format!(
@@ -104,10 +128,21 @@ impl Tool for SubagentResumeTool {
         let task_full = resumed_task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
+        let decision = ctx
+            .capabilities
+            .orchestration
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .resolve_and_authorize(&handle_id, Some(&model))
+            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+        let model = decision.model.as_str().to_owned();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
-            label, handle_id, prior_handle_id, model
+            label,
+            handle_id,
+            prior_handle_id,
+            model
         );
 
         let state = Arc::new(RwLock::new(SubagentState::new()));
@@ -124,13 +159,13 @@ impl Tool for SubagentResumeTool {
             }));
         }
 
-        let state_t         = Arc::clone(&state);
-        let task_full_a     = task_full.clone();
-        let label_inner     = label.clone();
-        let model_inner     = model.clone();
+        let state_t = Arc::clone(&state);
+        let task_full_a = task_full.clone();
+        let label_inner = label.clone();
+        let model_inner = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
-        let start_time      = std::time::Instant::now();
-        let parent_queue    = ctx.capabilities.event_queue.clone();
+        let start_time = std::time::Instant::now();
+        let parent_queue = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
 
@@ -148,12 +183,18 @@ impl Tool for SubagentResumeTool {
             Some(steer_tx),
             Some(shutdown_tx),
             Some(result_rx),
-        );
+        )
+        .with_authorization(&decision);
         {
             let mut reg = registry.lock().unwrap();
             reg.register(handle);
         }
 
+        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        if let Err(error) = orchestration.mark_starting(&handle_id) {
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
+        }
         // ── Spawn subagent thread ──────────────────────────────────────────────
         let thread_handle = std::thread::spawn(move || {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
@@ -166,27 +207,27 @@ impl Tool for SubagentResumeTool {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
+                    Err(_) => {
                         state_t.write().unwrap().status =
-                            SubagentStatus::Failed(format!("tokio runtime: {}", e));
+                            SubagentStatus::Failed("runtime initialization failed".into());
                         return;
                     }
                 };
 
-                let state_a           = Arc::clone(&state_t);
-                let label_a           = label_inner.clone();
-                let model_a           = model_inner.clone();
-                let tx_events_a       = tx_events_inner.clone();
-                let task_for_timeout  = task_full_a.clone();
+                let state_a = Arc::clone(&state_t);
+                let label_a = label_inner.clone();
+                let model_a = model_inner.clone();
+                let tx_events_a = tx_events_inner.clone();
+                let task_for_timeout = task_full_a.clone();
                 let task_for_complete = task_full_a.clone();
-                let task_for_stream   = task_full_a;
+                let task_for_stream = task_full_a;
 
                 let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
                     use futures::StreamExt;
 
                     let mut runtime = match crate::Runtime::new().await {
                         Ok(r) => r,
-                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                        Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
                     // Apply subagent spawn policy: inherit credential source AND
@@ -303,7 +344,7 @@ impl Tool for SubagentResumeTool {
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
                                         crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
+                                    crate::StreamEvent::Session(SessionEvent::Error(_)) => return Err("provider request failed".into()),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }
@@ -338,6 +379,7 @@ impl Tool for SubagentResumeTool {
                                     cache_creation_5m: total_cache_5m,
                                     cache_creation_1h: total_cache_1h,
                                     tool_count,
+                                timed_out: true,
                                 });
                             }
                         }
@@ -353,6 +395,7 @@ impl Tool for SubagentResumeTool {
                         cache_creation_5m: total_cache_5m,
                         cache_creation_1h: total_cache_1h,
                         tool_count,
+                    timed_out: false,
                     })
                 });
 
@@ -404,7 +447,8 @@ impl Tool for SubagentResumeTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Resumed subagent thread panicked: {}", msg);
-                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status =
+                    SubagentStatus::Failed(format!("panic: {}", msg));
             }
 
             // ── Terminal finalizer — exactly once, outside catch_unwind ────────
@@ -428,12 +472,94 @@ impl Tool for SubagentResumeTool {
                 h.set_thread_handle(thread_handle);
             }
         }
+        if let Err(error) = orchestration.mark_running(&handle_id) {
+            let mut handle = registry.lock().unwrap().remove(&handle_id);
+            if let Some(handle) = handle.as_mut() {
+                handle.cancel();
+            }
+            if let Some(handle) = handle {
+                let _ = handle.collect().await;
+            }
+            orchestration.rollback(&handle_id);
+            return Err(RuntimeError::Tool(error));
+        }
 
         Ok(json!({
             "handle_id":    handle_id,
             "resumed_from": prior_handle_id,
             "agent_name":   label,
             "status":       "running"
-        }).to_string())
+        })
+        .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::subagent::{reap_finished_with_ttl, SubagentRegistry};
+    use crate::tools::test_helpers::create_tool_context;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn tombstone_resume_reports_expired_context_without_side_effects() {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        {
+            let mut state = state.write().unwrap();
+            state.status = SubagentStatus::Completed;
+            state.partial_text = "terminal output".into();
+            state.conversation_state = vec![json!({"role": "assistant", "content": "context"})];
+            state.finished_at = Some(std::time::Instant::now());
+        }
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let (_result_tx, result_rx) = oneshot::channel();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        registry.lock().unwrap().register(SubagentHandle::new(
+            "sa_expired".into(),
+            1,
+            "test".into(),
+            "task".into(),
+            "anthropic/claude-sonnet-4-6".into(),
+            "system".into(),
+            30,
+            state,
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        ));
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6").unwrap();
+        let orchestration = Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64).unwrap(),
+        );
+        orchestration
+            .authorize("sa_expired", "anthropic/claude-sonnet-4-6")
+            .unwrap();
+        let gate_before = orchestration.completion_gate();
+        reap_finished_with_ttl(&registry, Some(orchestration.as_ref()), Duration::ZERO);
+        assert!(registry
+            .lock()
+            .unwrap()
+            .get("sa_expired")
+            .unwrap()
+            .is_tombstone());
+        let count_before = registry.lock().unwrap().list_active().len();
+
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx.capabilities.orchestration = Some(orchestration.clone());
+        let error = SubagentResumeTool
+            .execute(
+                json!({"handle_id": "sa_expired", "instructions": "continue"}),
+                ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expired resumable context"));
+        assert!(!error.contains("No subagent found"));
+        assert_eq!(registry.lock().unwrap().list_active().len(), count_before);
+        assert_eq!(orchestration.completion_gate(), gate_before);
     }
 }

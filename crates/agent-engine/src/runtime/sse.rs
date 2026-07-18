@@ -30,7 +30,10 @@ pub(super) struct SseLineBuffer {
 
 impl SseLineBuffer {
     pub(super) fn new() -> Self {
-        Self { buf: Vec::with_capacity(8192), pos: 0 }
+        Self {
+            buf: Vec::with_capacity(8192),
+            pos: 0,
+        }
     }
 
     /// Append a raw chunk from the network.
@@ -48,8 +51,17 @@ impl SseLineBuffer {
         // buffer without bound (hostile/buggy endpoint). Discard the in-progress
         // line and resync rather than OOM. 8 MiB is far above any real SSE frame.
         const MAX_LINE: usize = 8 * 1024 * 1024;
-        if self.buf.len().saturating_sub(self.pos).saturating_add(chunk.len()) > MAX_LINE {
-            tracing::warn!("SSE line exceeded {} bytes — discarding buffer to resync", MAX_LINE);
+        if self
+            .buf
+            .len()
+            .saturating_sub(self.pos)
+            .saturating_add(chunk.len())
+            > MAX_LINE
+        {
+            tracing::warn!(
+                "SSE line exceeded {} bytes — discarding buffer to resync",
+                MAX_LINE
+            );
             self.buf.clear();
             self.pos = 0;
             return;
@@ -80,10 +92,16 @@ impl SseLineBuffer {
         if self.pos >= self.buf.len() {
             return None;
         }
-        let rest = String::from_utf8_lossy(&self.buf[self.pos..]).trim().to_string();
+        let rest = String::from_utf8_lossy(&self.buf[self.pos..])
+            .trim()
+            .to_string();
         self.buf.clear();
         self.pos = 0;
-        if rest.is_empty() { None } else { Some(rest) }
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest)
+        }
     }
 }
 
@@ -98,7 +116,9 @@ mod tests {
         let mut out = Vec::new();
         let (a, b) = input.split_at(split_at.min(input.len()));
         for chunk in [a, b] {
-            if chunk.is_empty() { continue; }
+            if chunk.is_empty() {
+                continue;
+            }
             buf.extend(chunk);
             while let Some(line) = buf.next_line() {
                 out.push(line.to_string());
@@ -169,10 +189,15 @@ mod tests {
     #[test]
     fn exhaustive_rechunking_preserves_event_stream() {
         // Realistic SSE sample with multi-byte UTF-8, CRLF mix, keepalive
-        let input = "event: message\ndata: {\"text\":\"héllo ✨\"}\r\n: ping\ndata: [DONE]\n".as_bytes();
+        let input =
+            "event: message\ndata: {\"text\":\"héllo ✨\"}\r\n: ping\ndata: [DONE]\n".as_bytes();
         let baseline = lines_with_chunking(input, input.len());
         for split in 1..input.len() {
-            assert_eq!(lines_with_chunking(input, split), baseline, "split at {split}");
+            assert_eq!(
+                lines_with_chunking(input, split),
+                baseline,
+                "split at {split}"
+            );
         }
     }
 

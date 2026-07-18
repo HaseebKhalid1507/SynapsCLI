@@ -1,22 +1,41 @@
-use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
-use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{EditorKind, visible_categories};
 use super::draw::current_value_for;
+use super::schema::{visible_categories, EditorKind};
+use super::{ActiveEditor, Focus, RuntimeSnapshot, SettingsState};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(crate) enum InputOutcome {
     None,
     Close,
-    Apply { key: &'static str, value: String },
+    Apply {
+        key: &'static str,
+        value: String,
+    },
     /// Apply a plugin-declared settings field. Written to the plugin's
     /// own namespaced config (`~/.synaps-cli/plugins/<id>/config`).
-    PluginApply { plugin_id: String, key: String, value: String },
+    PluginApply {
+        plugin_id: String,
+        key: String,
+        value: String,
+    },
     /// User requested to open a plugin-declared custom editor.
     /// The async upper layer calls `settings.editor.open` and installs
     /// `ActiveEditor::PluginCustom` with the returned render payload.
-    PluginCustomOpen { plugin_id: String, category: String, key: String },
-    SetProviderKey { provider_id: String, value: String },
-    TogglePlugin { name: String, enabled: bool },
-    PreviewTheme { name: String },
+    PluginCustomOpen {
+        plugin_id: String,
+        category: String,
+        key: String,
+    },
+    SetProviderKey {
+        provider_id: String,
+        value: String,
+    },
+    TogglePlugin {
+        name: String,
+        enabled: bool,
+    },
+    PreviewTheme {
+        name: String,
+    },
     RevertTheme,
     OpenPluginsMarketplace,
     PingModels,
@@ -32,7 +51,10 @@ pub(crate) fn handle_event(
         if key.code == KeyCode::Esc {
             let revert = matches!(
                 &state.edit_mode,
-                Some(ActiveEditor::Picker { setting_key: "theme", .. })
+                Some(ActiveEditor::Picker {
+                    setting_key: "theme",
+                    ..
+                })
             ) && state.original_theme_name.is_some();
             state.edit_mode = None;
             if revert {
@@ -57,9 +79,7 @@ pub(crate) fn handle_event(
                 match key.code {
                     KeyCode::Enter => {
                         state.row_error = None;
-                        let current_url = snap.provider_keys.get("local.url")
-                            .cloned()
-                            .unwrap_or_default();
+                        let current_url = snap.local_url_explicit.clone().unwrap_or_default();
                         state.edit_mode = Some(ActiveEditor::ApiKey {
                             provider_id: "local.url".to_string(),
                             buffer: current_url,
@@ -67,7 +87,7 @@ pub(crate) fn handle_event(
                         return InputOutcome::None;
                     }
                     KeyCode::Delete | KeyCode::Char('d') => {
-                        if snap.provider_keys.contains_key("local.url") {
+                        if snap.local_url_explicit.is_some() {
                             state.row_error = None;
                             return InputOutcome::SetProviderKey {
                                 provider_id: "local.url".to_string(),
@@ -91,7 +111,10 @@ pub(crate) fn handle_event(
                             return InputOutcome::None;
                         }
                         KeyCode::Delete | KeyCode::Char('d') => {
-                            let has_key = snap.provider_keys.get(p.key).map(|v| !v.is_empty()).unwrap_or(false);
+                            let has_key = snap
+                                .provider_key_status
+                                .get(p.key)
+                                .is_some_and(|status| status.is_configured());
                             if has_key {
                                 state.row_error = None;
                                 return InputOutcome::SetProviderKey {
@@ -155,8 +178,20 @@ pub(crate) fn handle_event(
                     let current = plugin_field_current_value(&plugin_id, &field);
                     let idx = options.iter().position(|o| *o == current).unwrap_or(0);
                     let new_idx = match key.code {
-                        KeyCode::Left => if idx > 0 { idx - 1 } else { idx },
-                        KeyCode::Right => if idx + 1 < options.len() { idx + 1 } else { idx },
+                        KeyCode::Left => {
+                            if idx > 0 {
+                                idx - 1
+                            } else {
+                                idx
+                            }
+                        }
+                        KeyCode::Right => {
+                            if idx + 1 < options.len() {
+                                idx + 1
+                            } else {
+                                idx
+                            }
+                        }
                         _ => idx,
                     };
                     if new_idx != idx {
@@ -185,10 +220,8 @@ pub(crate) fn handle_event(
                     // Picker options are not declarable in the manifest
                     // today (only Cycler carries inline options); show a
                     // note rather than opening an empty picker.
-                    state.row_error = Some((
-                        field.key.clone(),
-                        "picker editor not yet wired".to_string(),
-                    ));
+                    state.row_error =
+                        Some((field.key.clone(), "picker editor not yet wired".to_string()));
                     return InputOutcome::None;
                 }
                 (KeyCode::Enter, PE::Cycler { options }) if !options.is_empty() => {
@@ -236,7 +269,9 @@ pub(crate) fn handle_event(
                     }
                 }
                 Focus::Right => {
-                    if state.setting_idx > 0 { state.setting_idx -= 1; }
+                    if state.setting_idx > 0 {
+                        state.setting_idx -= 1;
+                    }
                 }
             }
             state.row_error = None;
@@ -245,7 +280,8 @@ pub(crate) fn handle_event(
         (KeyCode::Down, _) => {
             match state.focus {
                 Focus::Left => {
-                    let total_categories = visible_categories(&snap.lifecycle_claims).len() + snap.plugin_categories.len();
+                    let total_categories = visible_categories(&snap.lifecycle_claims).len()
+                        + snap.plugin_categories.len();
                     if state.category_idx + 1 < total_categories {
                         state.category_idx += 1;
                         state.setting_idx = 0;
@@ -253,7 +289,9 @@ pub(crate) fn handle_event(
                 }
                 Focus::Right => {
                     let n = row_count(state, snap);
-                    if state.setting_idx + 1 < n { state.setting_idx += 1; }
+                    if state.setting_idx + 1 < n {
+                        state.setting_idx += 1;
+                    }
                 }
             }
             state.row_error = None;
@@ -261,21 +299,44 @@ pub(crate) fn handle_event(
         }
         (KeyCode::Left, _) | (KeyCode::Right, _) if state.focus == Focus::Right => {
             if let Some(def) = state.current_setting(snap) {
-                if let EditorKind::Cycler(options) = def.editor {
-                    let current = cycler_current_value(def.key, snap);
-                    let idx = options.iter().position(|o| *o == current).unwrap_or(0);
-                    let new_idx = match key.code {
-                        KeyCode::Left => if idx > 0 { idx - 1 } else { idx },
-                        KeyCode::Right => if idx + 1 < options.len() { idx + 1 } else { idx },
-                        _ => idx,
-                    };
-                    if new_idx != idx {
-                        state.row_error = None;
-                        return InputOutcome::Apply {
-                            key: def.key,
-                            value: options[new_idx].to_string(),
-                        };
+                let dyn_opts: Vec<String>;
+                let opts_ref: &[&str];
+                let dyn_strs: Vec<&str>;
+                let options: &[&str] = match &def.editor {
+                    EditorKind::Cycler(opts) => opts,
+                    EditorKind::DynamicCycler => {
+                        dyn_opts = snap.thinking_options.clone();
+                        dyn_strs = dyn_opts.iter().map(|s| s.as_str()).collect();
+                        opts_ref = &dyn_strs;
+                        opts_ref
                     }
+                    _ => return InputOutcome::None,
+                };
+                let current = cycler_current_value(def.key, snap);
+                let idx = options.iter().position(|o| *o == current).unwrap_or(0);
+                let new_idx = match key.code {
+                    KeyCode::Left => {
+                        if idx > 0 {
+                            idx - 1
+                        } else {
+                            idx
+                        }
+                    }
+                    KeyCode::Right => {
+                        if idx + 1 < options.len() {
+                            idx + 1
+                        } else {
+                            idx
+                        }
+                    }
+                    _ => idx,
+                };
+                if new_idx != idx {
+                    state.row_error = None;
+                    return InputOutcome::Apply {
+                        key: def.key,
+                        value: options[new_idx].to_string(),
+                    };
                 }
             }
             InputOutcome::None
@@ -294,36 +355,32 @@ pub(crate) fn handle_event(
                     }
                     EditorKind::ModelPicker => {
                         state.row_error = None;
-                        // Anthropic models
-                        let mut opts: Vec<String> = vec!["── Anthropic ──".to_string()];
-                        opts.extend(synaps_cli::models::KNOWN_MODELS
-                            .iter().map(|(id, desc)| format!("  {}  — {}", id, desc)));
-
-                        // Provider models (only for configured providers)
-                        let registry = synaps_cli::runtime::openai::registry::providers();
-                        for spec in registry {
-                            let has_config_key = snap.provider_keys.contains_key(spec.key);
-                            let has_env_key = spec.env_vars.iter()
-                                .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
-                            if !has_config_key && !has_env_key { continue; }
-                            opts.push(format!("── {} ──", spec.name));
-                            for (id, label, tier) in spec.models {
-                                let full = format!("{}/{}", spec.key, id);
-                                let health = snap.model_health.get(&full)
-                                    .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
-                                    .unwrap_or_default();
-                                opts.push(format!("  {}{}  — {} [{}]", health, full, label, tier));
-                            }
+                        // Shared row source with the /models modal: same
+                        // section builder, availability/login data, and live
+                        // catalog overrides — exact provider-qualified values.
+                        let rows = crate::tui::models::settings_model_picker_rows(
+                            &snap.model,
+                            &snap.catalog_overrides,
+                            &snap.model_health,
+                        );
+                        let mut opts: Vec<String> = Vec::with_capacity(rows.len() + 1);
+                        let mut values: Vec<String> = Vec::with_capacity(rows.len() + 1);
+                        for (display, value) in rows {
+                            opts.push(display);
+                            values.push(value);
                         }
                         opts.push("Custom…".to_string());
+                        values.push(String::new());
 
                         let current = current_value_for(def, snap);
-                        let cursor = opts.iter()
-                            .position(|o| o.trim_start().starts_with(&current))
+                        let cursor = values
+                            .iter()
+                            .position(|v| !v.is_empty() && *v == current)
                             .unwrap_or(0);
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: def.key,
                             options: opts,
+                            values,
                             cursor,
                         });
                     }
@@ -334,6 +391,7 @@ pub(crate) fn handle_event(
                         state.original_theme_name = Some(snap.theme_name.clone());
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: "theme",
+                            values: opts.clone(),
                             options: opts,
                             cursor,
                         });
@@ -350,29 +408,44 @@ pub(crate) fn handle_event(
 fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
     let editor = state.edit_mode.as_mut().expect("caller checks");
     match editor {
-        ActiveEditor::Text { buffer, setting_key, numeric, error } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if *numeric && buffer.parse::<u64>().is_err() {
-                        *error = Some("must be a number".to_string());
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::Apply { key: setting_key, value: buffer.clone() }
+        ActiveEditor::Text {
+            buffer,
+            setting_key,
+            numeric,
+            error,
+        } => match key.code {
+            KeyCode::Enter => {
+                if *numeric && buffer.parse::<u64>().is_err() {
+                    *error = Some("must be a number".to_string());
+                    return InputOutcome::None;
                 }
-                KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
-                KeyCode::Char(c) => {
-                    if *numeric && !c.is_ascii_digit() {
-                        *error = Some("digits only".to_string());
-                        return InputOutcome::None;
-                    }
-                    buffer.push(c);
-                    *error = None;
-                    InputOutcome::None
+                InputOutcome::Apply {
+                    key: setting_key,
+                    value: buffer.clone(),
                 }
-                _ => InputOutcome::None,
             }
-        }
-        ActiveEditor::Picker { setting_key, options, cursor } => {
+            KeyCode::Backspace => {
+                buffer.pop();
+                *error = None;
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                if *numeric && !c.is_ascii_digit() {
+                    *error = Some("digits only".to_string());
+                    return InputOutcome::None;
+                }
+                buffer.push(c);
+                *error = None;
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::Picker {
+            setting_key,
+            options,
+            values,
+            cursor,
+        } => {
             match key.code {
                 KeyCode::Up => {
                     if *cursor > 0 {
@@ -383,7 +456,9 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         }
                     }
                     if *setting_key == "theme" {
-                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                        return InputOutcome::PreviewTheme {
+                            name: options[*cursor].clone(),
+                        };
                     }
                     InputOutcome::None
                 }
@@ -391,12 +466,15 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     if *cursor + 1 < options.len() {
                         *cursor += 1;
                         // Skip header rows
-                        while *cursor + 1 < options.len() && options[*cursor].starts_with("──") {
+                        while *cursor + 1 < options.len() && options[*cursor].starts_with("──")
+                        {
                             *cursor += 1;
                         }
                     }
                     if *setting_key == "theme" {
-                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                        return InputOutcome::PreviewTheme {
+                            name: options[*cursor].clone(),
+                        };
                     }
                     InputOutcome::None
                 }
@@ -406,25 +484,22 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     if selection.starts_with("──") {
                         return InputOutcome::None;
                     }
-                    if (*setting_key == "model" || *setting_key == "compaction_model") && selection == "Custom…" {
-                        state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new(), setting_key });
+                    if (*setting_key == "model" || *setting_key == "compaction_model")
+                        && selection == "Custom…"
+                    {
+                        state.edit_mode = Some(ActiveEditor::CustomModel {
+                            buffer: String::new(),
+                            setting_key,
+                        });
                         return InputOutcome::None;
                     }
-                    let raw = selection.split("  —").next().unwrap_or(&selection).trim();
-                    // Strip health prefix (e.g. "✅  79ms  groq/..." or "✅  1304ms  nvidia/...")
-                    // Find the model ID by looking for known provider prefixes or "claude-"
-                    let value = if let Some(pos) = raw.find("claude-") {
-                        raw[pos..].to_string()
-                    } else if let Some(pos) = raw.find('/') {
-                        // Find start of provider key before the slash (e.g. "groq/", "nvidia/")
-                        let before = &raw[..pos];
-                        let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                            .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
-                            .unwrap_or(0);
-                        raw[key_start..].to_string()
-                    } else {
-                        raw.to_string()
-                    };
+                    // Exact-value application: the parallel `values` column
+                    // carries the provider-qualified id verbatim — no display
+                    // string parsing. Empty value = non-selectable row.
+                    let value = values.get(*cursor).cloned().unwrap_or_default();
+                    if value.is_empty() {
+                        return InputOutcome::None;
+                    }
                     let key = *setting_key;
                     if key == "theme" {
                         state.original_theme_name = None;
@@ -434,58 +509,81 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
-        ActiveEditor::CustomModel { buffer, setting_key } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if buffer.trim().is_empty() {
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::Apply { key: setting_key, value: buffer.trim().to_string() }
+        ActiveEditor::CustomModel {
+            buffer,
+            setting_key,
+        } => match key.code {
+            KeyCode::Enter => {
+                if buffer.trim().is_empty() {
+                    return InputOutcome::None;
                 }
-                KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
-                KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }
-                _ => InputOutcome::None,
+                InputOutcome::Apply {
+                    key: setting_key,
+                    value: buffer.trim().to_string(),
+                }
             }
-        }
-        ActiveEditor::ApiKey { provider_id, buffer } => {
-            match key.code {
-                KeyCode::Enter => {
-                    InputOutcome::SetProviderKey {
-                        provider_id: provider_id.clone(),
-                        value: buffer.trim().to_string(),
-                    }
-                }
-                KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
-                KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }
-                _ => InputOutcome::None,
+            KeyCode::Backspace => {
+                buffer.pop();
+                InputOutcome::None
             }
-        }
-        ActiveEditor::PluginText { plugin_id, key: field_key, buffer, numeric, error } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if *numeric && buffer.parse::<i64>().is_err() {
-                        *error = Some("must be a number".to_string());
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::PluginApply {
-                        plugin_id: plugin_id.clone(),
-                        key: field_key.clone(),
-                        value: buffer.clone(),
-                    }
-                }
-                KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
-                KeyCode::Char(c) => {
-                    if *numeric && !(c.is_ascii_digit() || c == '-') {
-                        *error = Some("digits only".to_string());
-                        return InputOutcome::None;
-                    }
-                    buffer.push(c);
-                    *error = None;
-                    InputOutcome::None
-                }
-                _ => InputOutcome::None,
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                InputOutcome::None
             }
-        }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::ApiKey {
+            provider_id,
+            buffer,
+        } => match key.code {
+            KeyCode::Enter => InputOutcome::SetProviderKey {
+                provider_id: provider_id.clone(),
+                value: buffer.trim().to_string(),
+            },
+            KeyCode::Backspace => {
+                buffer.pop();
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::PluginText {
+            plugin_id,
+            key: field_key,
+            buffer,
+            numeric,
+            error,
+        } => match key.code {
+            KeyCode::Enter => {
+                if *numeric && buffer.parse::<i64>().is_err() {
+                    *error = Some("must be a number".to_string());
+                    return InputOutcome::None;
+                }
+                InputOutcome::PluginApply {
+                    plugin_id: plugin_id.clone(),
+                    key: field_key.clone(),
+                    value: buffer.clone(),
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                *error = None;
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                if *numeric && !(c.is_ascii_digit() || c == '-') {
+                    *error = Some("digits only".to_string());
+                    return InputOutcome::None;
+                }
+                buffer.push(c);
+                *error = None;
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
         ActiveEditor::PluginCustom { .. } => InputOutcome::None,
     }
 }
@@ -508,7 +606,8 @@ pub(crate) fn plugin_field_current_value(
     plugin_id: &str,
     field: &synaps_cli::skills::registry::PluginSettingsField,
 ) -> String {
-    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(plugin_id, &field.key) {
+    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(plugin_id, &field.key)
+    {
         return v;
     }
     match &field.default {
@@ -542,17 +641,6 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     }
 }
 
-fn fmt_latency(status: synaps_cli::runtime::openai::ping::PingStatus, ms: u64) -> String {
-    use synaps_cli::runtime::openai::ping::PingStatus;
-    match status {
-        PingStatus::Online => {
-            if ms >= 1000 { format!("{:.1}s", ms as f64 / 1000.0) }
-            else { format!("{}ms", ms) }
-        }
-        other => other.label().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,21 +659,39 @@ mod tests {
             api_retries: 0,
             theme_name: "t".into(),
             plugins: vec![
-                super::super::PluginRow { name: "p1".into(), skill_count: 1 },
-                super::super::PluginRow { name: "p2".into(), skill_count: 2 },
+                super::super::PluginRow {
+                    name: "p1".into(),
+                    skill_count: 1,
+                },
+                super::super::PluginRow {
+                    name: "p2".into(),
+                    skill_count: 2,
+                },
             ],
             disabled_plugins: vec!["p2".into()],
-            provider_keys: std::collections::BTreeMap::new(),
+            provider_key_status: std::collections::BTreeMap::new(),
+            local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: Vec::new(),
+            thinking_options: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "adaptive".into(),
+            ],
+            catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: "budget (legacy)".into(),
         }
     }
 
     fn plugins_state_at(idx: usize) -> SettingsState {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES
-            .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
+            .iter()
+            .position(|c| *c == super::super::schema::Category::Plugins)
+            .unwrap();
         state.set_focus(Focus::Right);
         state.setting_idx = idx;
         state
@@ -594,7 +700,11 @@ mod tests {
     #[test]
     fn enter_on_marketplace_row_opens_plugins_marketplace() {
         let mut state = plugins_state_at(0);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::OpenPluginsMarketplace));
     }
 
@@ -602,7 +712,11 @@ mod tests {
     fn enter_on_plugin_row_is_noop() {
         // Enter on a plugin row should NOT toggle — only Space does.
         let mut state = plugins_state_at(1);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::None));
     }
 
@@ -610,7 +724,11 @@ mod tests {
     fn space_on_plugin_row_toggles_off() {
         // Row 1 is the first plugin (p1).
         let mut state = plugins_state_at(1);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &snap(),
+        );
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p1");
@@ -624,7 +742,11 @@ mod tests {
     fn enter_on_disabled_plugin_is_noop() {
         // Enter on a disabled plugin row should NOT toggle.
         let mut state = plugins_state_at(2);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::None));
     }
 
@@ -632,13 +754,162 @@ mod tests {
     fn space_on_disabled_plugin_toggles_on() {
         // Row 2 is the second plugin (p2, disabled).
         let mut state = plugins_state_at(2);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &snap(),
+        );
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p2");
                 assert!(enabled);
             }
             _ => panic!("expected TogglePlugin"),
+        }
+    }
+
+    #[test]
+    fn settings_anthropic_picker_emits_provider_qualified_id() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  anthropic/claude-sonnet-4-6  — Claude Sonnet".to_string()],
+            values: vec!["anthropic/claude-sonnet-4-6".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "anthropic/claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    fn settings_copilot_claude_picker_keeps_copilot_provider() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  github-copilot/claude-sonnet-4.6  — Claude Sonnet".to_string()],
+            values: vec!["github-copilot/claude-sonnet-4.6".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "github-copilot/claude-sonnet-4.6"
+        ));
+    }
+
+    // ---- Slice A: settings model picker reuses /models section data ------
+
+    /// Enter must apply the EXACT provider-qualified value carried in the
+    /// parallel `values` column — no display-string parsing.
+    #[test]
+    fn model_picker_enter_emits_exact_value_from_values_column() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  ✅  79ms  confusing claude-like display text".to_string()],
+            values: vec!["openai-codex/gpt-5.6-sol".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "openai-codex/gpt-5.6-sol"
+        ));
+    }
+
+    /// Header rows carry an empty value and must never apply.
+    #[test]
+    fn model_picker_enter_on_header_row_is_noop() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["── OpenAI Codex ──".to_string()],
+            values: vec![String::new()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputOutcome::None
+        ));
+    }
+
+    /// Enter on the Model row must open a picker whose rows come from the
+    /// shared /models section builder: parallel display/value columns of the
+    /// same length, with the trailing "Custom…" escape hatch preserved.
+    #[test]
+    fn enter_on_model_row_builds_picker_from_shared_sections() {
+        let mut state = SettingsState::new();
+        state.set_focus(Focus::Right);
+        state.setting_idx = 0; // "model" is the first Model-category setting
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
+        assert!(matches!(out, InputOutcome::None));
+        match &state.edit_mode {
+            Some(ActiveEditor::Picker {
+                setting_key,
+                options,
+                values,
+                ..
+            }) => {
+                assert_eq!(*setting_key, "model");
+                assert_eq!(
+                    options.len(),
+                    values.len(),
+                    "display and value columns must stay parallel"
+                );
+                assert_eq!(options.last().unwrap(), "Custom…");
+                // Every non-header, non-custom row must carry a non-empty
+                // exact value; headers carry the empty string.
+                for (display, value) in options.iter().zip(values.iter()) {
+                    if display.starts_with("──") {
+                        assert!(value.is_empty(), "header row must have empty value");
+                    }
+                }
+            }
+            other => panic!("expected model Picker edit mode, got {:?}", other.is_some()),
+        }
+    }
+
+    // ---- Slice B: dynamic reasoning type row (display-only) --------------
+
+    /// The Model category exposes a display-only "Reasoning" row whose value
+    /// comes straight from the snapshot (recomputed per event from the exact
+    /// active model). It must not open an editor or emit Apply.
+    #[test]
+    fn reasoning_type_row_is_display_only() {
+        let mut s = snap();
+        s.reasoning_type = "effort".into();
+        let mut state = SettingsState::new();
+        state.set_focus(Focus::Right);
+        let idx = state
+            .current_settings(&s)
+            .iter()
+            .position(|d| d.key == "reasoning_type")
+            .expect("reasoning_type row must exist in the Model category");
+        state.setting_idx = idx;
+        let def = state.current_setting(&s).unwrap();
+        assert!(matches!(def.editor, EditorKind::Display));
+        assert_eq!(current_value_for(def, &s), "effort");
+
+        // Enter must not open any editor.
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
+        assert!(matches!(out, InputOutcome::None));
+        assert!(state.edit_mode.is_none());
+
+        // Left/Right must not cycle/apply anything.
+        for code in [KeyCode::Left, KeyCode::Right] {
+            let out = handle_event(&mut state, KeyEvent::new(code, KeyModifiers::NONE), &s);
+            assert!(matches!(out, InputOutcome::None));
         }
     }
 
@@ -683,17 +954,27 @@ mod tests {
             fields: vec![plugin_field(
                 "speed",
                 "Speed",
-                PluginSettingsEditor::Cycler { options: vec!["slow".into(), "fast".into()] },
+                PluginSettingsEditor::Cycler {
+                    options: vec!["slow".into(), "fast".into()],
+                },
             )],
         }]);
         let mut state = SettingsState::new();
         // Down across all built-ins, then once into plugin category.
         for _ in 0..super::super::schema::CATEGORIES.len() {
-            handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+            handle_event(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &s,
+            );
         }
         assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
         // One more Down should NOT advance past the last plugin category.
-        handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &s,
+        );
         assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
     }
 
@@ -712,9 +993,17 @@ mod tests {
             )],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginApply { plugin_id, key, value } => {
+            InputOutcome::PluginApply {
+                plugin_id,
+                key,
+                value,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(key, "speed");
                 assert_eq!(value, "fast");
@@ -736,15 +1025,38 @@ mod tests {
             )],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         assert!(matches!(out, InputOutcome::None));
-        assert!(matches!(state.edit_mode, Some(ActiveEditor::PluginText { .. })));
+        assert!(matches!(
+            state.edit_mode,
+            Some(ActiveEditor::PluginText { .. })
+        ));
         // Type "hi" then Enter.
-        handle_event(&mut state, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &s);
-        handle_event(&mut state, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            &s,
+        );
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &s,
+        );
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginApply { plugin_id, key, value } => {
+            InputOutcome::PluginApply {
+                plugin_id,
+                key,
+                value,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(key, "label");
                 assert_eq!(value, "hi");
@@ -762,17 +1074,30 @@ mod tests {
             fields: vec![plugin_field("body", "Body", PluginSettingsEditor::Custom)],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+            InputOutcome::PluginCustomOpen {
+                plugin_id,
+                category,
+                key,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(category, "capture");
                 assert_eq!(key, "body");
             }
-            other => panic!("expected PluginCustomOpen, got {:?}",
-                std::mem::discriminant(&other)),
+            other => panic!(
+                "expected PluginCustomOpen, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
-        assert!(state.edit_mode.is_none(), "async upper layer opens the editor after RPC returns");
+        assert!(
+            state.edit_mode.is_none(),
+            "async upper layer opens the editor after RPC returns"
+        );
     }
 
     #[test]

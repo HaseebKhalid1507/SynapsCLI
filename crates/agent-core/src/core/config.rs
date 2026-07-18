@@ -260,6 +260,10 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
+    /// Named reasoning level, parsed from the same `thinking = …` key.
+    /// When `Some`, this is the authoritative level. When `None`, fall back
+    /// to `thinking_budget` for legacy numeric-only values.
+    pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>,   // override auto-detected context window (tokens)
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     pub max_tool_output: usize,        // default 30000
@@ -306,6 +310,7 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
+            thinking_level: None,
             context_window: None,
             compaction_model: None,
             max_tool_output: 30000,
@@ -374,16 +379,7 @@ fn did_you_mean(key: &str) -> Option<&'static str> {
 }
 
 
-fn parse_thinking_budget(val: &str) -> Option<u32> {
-    match val {
-        "low" => Some(2048),
-        "medium" => Some(4096),
-        "high" => Some(16384),
-        "xhigh" => Some(32768),
-        "adaptive" => Some(0), // sentinel: model decides depth
-        _ => val.parse::<u32>().ok(),
-    }
-}
+// parse_thinking_budget replaced by ThinkingSpec::parse in apply_config_content.
 
 fn parse_comma_list(val: &str) -> Vec<String> {
     val.split(',')
@@ -578,9 +574,21 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => {
-                config.thinking_budget = parse_thinking_budget(val);
-                if config.thinking_budget.is_none() {
-                    config.warnings.push(format!("thinking = {val} — expected low|medium|high|xhigh|adaptive or a token count; thinking disabled"));
+                use crate::core::reasoning::ThinkingSpec;
+                match ThinkingSpec::parse(val) {
+                    Some(ThinkingSpec::Named(level)) => {
+                        config.thinking_level = Some(level);
+                        config.thinking_budget = level.to_legacy_budget();
+                    }
+                    Some(ThinkingSpec::Budget(budget)) => {
+                        // Preserve exact legacy budgets; do not make the derived
+                        // bucket authoritative over the user's token count.
+                        config.thinking_level = None;
+                        config.thinking_budget = Some(budget);
+                    }
+                    None => {
+                        config.warnings.push(format!("thinking = {val} — expected off|adaptive|low|medium|high|xhigh|max|ultra|ultracode or a token count; thinking disabled"));
+                    }
                 }
             }
             "compaction_model" => config.compaction_model = Some(val.to_string()),
@@ -973,12 +981,17 @@ mod tests {
 
     #[test]
     fn test_parse_thinking_budget() {
-        assert_eq!(parse_thinking_budget("low"), Some(2048));
-        assert_eq!(parse_thinking_budget("medium"), Some(4096));
-        assert_eq!(parse_thinking_budget("high"), Some(16384));
-        assert_eq!(parse_thinking_budget("xhigh"), Some(32768));
-        assert_eq!(parse_thinking_budget("8192"), Some(8192));
-        assert_eq!(parse_thinking_budget("invalid"), None);
+        use crate::core::reasoning::ThinkingSpec;
+        // ThinkingSpec::parse replaced parse_thinking_budget; verify budget values.
+        assert_eq!(ThinkingSpec::parse("low").unwrap().to_budget(), Some(2048));
+        assert_eq!(ThinkingSpec::parse("medium").unwrap().to_budget(), Some(4096));
+        assert_eq!(ThinkingSpec::parse("high").unwrap().to_budget(), Some(16384));
+        assert_eq!(ThinkingSpec::parse("xhigh").unwrap().to_budget(), Some(32768));
+        assert_eq!(ThinkingSpec::parse("8192").unwrap().to_budget(), Some(8192));
+        let config = load_config_from_str("thinking = 8192\n");
+        assert_eq!(config.thinking_level, None);
+        assert_eq!(config.thinking_budget, Some(8192));
+        assert_eq!(ThinkingSpec::parse("invalid"), None);
     }
 
     #[test]
@@ -1453,4 +1466,14 @@ api_retries = 5
             crate::core::auth::CredentialSource::Remote { endpoint: "https://env-host".into(), machine_token: "env-tok".into() }
         );
     }
+    #[test]
+    fn config_parses_ultracode_as_distinct_canonical_level() {
+        let cfg = load_config_from_str("thinking = ultracode\n");
+        assert_eq!(cfg.thinking_level, Some(crate::reasoning::ReasoningLevel::UltraCode));
+        assert_eq!(cfg.thinking_budget, None);
+        for other in [crate::reasoning::ReasoningLevel::Ultra, crate::reasoning::ReasoningLevel::Max, crate::reasoning::ReasoningLevel::XHigh] {
+            assert_ne!(cfg.thinking_level, Some(other));
+        }
+    }
+
 }

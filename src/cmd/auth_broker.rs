@@ -24,28 +24,39 @@
 //! token per request and never store the credential on their own disk.
 //!
 //! Endpoints:
-//!   GET /healthz            -> { status }                 (no secret, non-200 if cred missing)
-//!   GET /token?provider=X   -> { access_token, expires }  (machine-auth required, allowlisted)
+//!   GET  /healthz            -> { status }                 (no secret, non-200 if cred missing)
+//!   GET  /token?provider=X   -> { access_token, expires }  (machine-auth, OAuth providers ONLY)
+//!   POST /proxy              -> typed broker proxy         (machine-auth, static-key providers;
+//!                               the key is applied broker-side and never vended)
+//!   GET  /usage              -> Anthropic usage JSON       (machine-auth, typed operation; the
+//!                               OAuth token is resolved broker-side and never vended)
+//!   GET  /capabilities       -> provider status list       (machine-auth, no secret values)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use synaps_cli::auth;
 
-/// Providers the broker will vend. Anything else is rejected before any work or
-/// logging — prevents probing for configured providers and log injection via an
-/// arbitrary provider string. (#158 B4)
-const ALLOWED_PROVIDERS: &[&str] = &["anthropic", "openai-codex"];
+/// OAuth providers whose descriptors permit access-token vending. Static-key
+/// strategies are intentionally not served by this endpoint.
+fn broker_provider(value: &str) -> Option<auth::OAuthProviderId> {
+    let id: auth::OAuthProviderId = value.try_into().ok()?;
+    let descriptor = auth::provider::registry().get(id).copied()?;
+    (descriptor.broker_strategy == auth::BrokerCredentialStrategy::OAuthAccessToken).then_some(id)
+}
 
 // ── TLS config types ─────────────────────────────────────────────────────────
 
@@ -101,17 +112,12 @@ pub fn check_bind_policy(is_loopback: bool, has_tls: bool, insecure_http: bool) 
 
 /// Read and validate a cert+key PEM pair. Fails fast with a human-readable error
 /// so the broker never starts with a broken TLS config.
-pub fn load_and_validate_tls(
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
-) -> anyhow::Result<TlsConfig> {
+pub fn load_and_validate_tls(cert_path: &PathBuf, key_path: &PathBuf) -> anyhow::Result<TlsConfig> {
     // Read files first — surface "file not found" before doing any parsing.
-    let cert_pem = std::fs::read(cert_path).map_err(|e| {
-        anyhow::anyhow!("--tls-cert '{}': {e}", cert_path.display())
-    })?;
-    let key_pem = std::fs::read(key_path).map_err(|e| {
-        anyhow::anyhow!("--tls-key '{}': {e}", key_path.display())
-    })?;
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("--tls-cert '{}': {e}", cert_path.display()))?;
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| anyhow::anyhow!("--tls-key '{}': {e}", key_path.display()))?;
 
     // Parse to catch garbage PEM / wrong file type before binding.
     validate_pem_pair(&cert_pem, &key_pem)?;
@@ -126,19 +132,17 @@ pub fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<()> 
     use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     // Validate cert chain — must have at least one cert.
-    let certs: Vec<CertificateDer<'_>> =
-        CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("TLS cert PEM is malformed: {e}"))?;
+    let certs: Vec<CertificateDer<'_>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS cert PEM is malformed: {e}"))?;
     if certs.is_empty() {
         anyhow::bail!("TLS cert PEM contains no certificates (empty or wrong format)");
     }
 
     // Validate private key — must parse as one of the known key types.
-    let keys: Vec<PrivateKeyDer<'_>> =
-        PrivateKeyDer::pem_slice_iter(key_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("TLS key PEM is malformed: {e}"))?;
+    let keys: Vec<PrivateKeyDer<'_>> = PrivateKeyDer::pem_slice_iter(key_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS key PEM is malformed: {e}"))?;
     if keys.is_empty() {
         anyhow::bail!("TLS key PEM contains no private key (empty or wrong format)");
     }
@@ -158,6 +162,22 @@ struct BrokerState {
     machine_token: Option<String>,
     /// HTTP client used for the (central, single) token refresh to the provider.
     client: reqwest::Client,
+    /// The in-process broker that owns static keys and executes proxied
+    /// requests. Raw keys never leave this boundary.
+    local: Arc<auth::LocalBroker>,
+}
+
+/// Constant-time machine-auth check shared by every credential endpoint.
+fn machine_auth_ok(st: &BrokerState, headers: &HeaderMap) -> bool {
+    let Some(ref expected) = st.machine_token else {
+        return true; // auth disabled (loopback / explicit insecure opt-in)
+    };
+    let got = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let expected_header = format!("Bearer {expected}");
+    ct_eq(got.as_bytes(), expected_header.as_bytes())
 }
 
 #[derive(Deserialize)]
@@ -212,7 +232,12 @@ pub async fn run(
         None => match machine_token_file {
             Some(ref path) => Some(
                 std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("could not read --machine-token-file {}: {e}", path.display()))?
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "could not read --machine-token-file {}: {e}",
+                            path.display()
+                        )
+                    })?
                     .trim()
                     .to_string(),
             ),
@@ -268,7 +293,11 @@ pub async fn run(
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let state = BrokerState { machine_token: machine_token.clone(), client: client.clone() };
+    let state = BrokerState {
+        machine_token: machine_token.clone(),
+        client: client.clone(),
+        local: Arc::new(auth::LocalBroker::new(client.clone())),
+    };
 
     // Proactive refresh, SUPERVISED.
     {
@@ -295,18 +324,20 @@ pub async fn run(
         BindDecision::Tls => {
             eprintln!(
                 "synaps auth-broker listening on https://{addr}  (machine auth: {}, TLS: ON)",
-                if machine_token.is_some() { "ON" } else { "OFF — loopback/insecure only!" }
+                if machine_token.is_some() {
+                    "ON"
+                } else {
+                    "OFF — loopback/insecure only!"
+                }
             );
             let tls_cfg = tls.expect("Tls decision requires tls config");
             // rustls 0.23 requires an explicit CryptoProvider when multiple backends
             // are compiled in; install ring as the default (idempotent — Err means already set).
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-                tls_cfg.cert_pem,
-                tls_cfg.key_pem,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to build TLS config from PEM: {e}"))?;
+            let rustls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem(tls_cfg.cert_pem, tls_cfg.key_pem)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to build TLS config from PEM: {e}"))?;
 
             // Handle<SocketAddr> — matches addr type for bind_rustls.
             let handle = axum_server::Handle::<SocketAddr>::new();
@@ -326,12 +357,19 @@ pub async fn run(
         BindDecision::Http { .. } => {
             eprintln!(
                 "synaps auth-broker listening on http://{addr}  (machine auth: {})",
-                if machine_token.is_some() { "ON" } else { "OFF — loopback/insecure only!" }
+                if machine_token.is_some() {
+                    "ON"
+                } else {
+                    "OFF — loopback/insecure only!"
+                }
             );
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         BindDecision::Refuse(_) => unreachable!("Refuse is handled above"),
     }
@@ -339,11 +377,37 @@ pub async fn run(
     Ok(())
 }
 
+/// Build the production auth-broker router with an injected typed cloud backend.
+/// This is the supported construction seam for unattended production-router tests;
+/// credentials and signing remain behind `CloudBackend`.
+#[cfg(test)]
+fn build_router_with_cloud_backend(
+    machine_token: Option<String>,
+    backend: Arc<dyn auth::broker::CloudBackend>,
+) -> Router {
+    let client = reqwest::Client::new();
+    let local = auth::LocalBroker::new(client.clone()).with_cloud_backend(backend);
+    build_router(BrokerState {
+        machine_token,
+        client,
+        local: Arc::new(local),
+    })
+}
+
 /// Build the shared axum Router. Extracted so tests can reuse it.
 fn build_router(state: BrokerState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/token", get(token))
+        .route("/proxy", post(proxy))
+        .route("/usage", get(usage))
+        .route("/cloud/catalog", post(cloud_catalog))
+        .route("/cloud/invoke", post(cloud_invoke))
+        .route("/capabilities", get(capabilities))
+        // Bound inbound request bodies to the broker's typed proxy limit.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            auth::MAX_PROXY_REQUEST_BYTES,
+        ))
         // B7: cap concurrent in-flight requests.
         .layer(tower::limit::ConcurrencyLimitLayer::new(64))
         .with_state(state)
@@ -357,7 +421,9 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => { sig.recv().await; }
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
             Err(_) => std::future::pending::<()>().await,
         }
     };
@@ -376,8 +442,14 @@ async fn shutdown_signal() {
 async fn healthz() -> impl IntoResponse {
     match auth::load_auth() {
         Ok(Some(_)) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
-        Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "no_credential" }))),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "status": "error" }))),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "no_credential" })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error" })),
+        ),
     }
 }
 
@@ -389,30 +461,34 @@ async fn token(
     Query(q): Query<TokenQuery>,
 ) -> impl IntoResponse {
     // ── machine auth (constant-time) ──
-    if let Some(ref expected) = st.machine_token {
-        let got = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let expected_header = format!("Bearer {expected}");
-        if !ct_eq(got.as_bytes(), expected_header.as_bytes()) {
-            eprintln!("[auth-broker] DENIED from {} (bad machine auth)", peer.ip());
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "bad machine auth" })))
-                .into_response();
-        }
+    if !machine_auth_ok(&st, &headers) {
+        eprintln!("[auth-broker] DENIED from {} (bad machine auth)", peer.ip());
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
     }
 
     // ── provider allowlist ──
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
-    if !ALLOWED_PROVIDERS.contains(&provider.as_str()) {
-        eprintln!("[auth-broker] DENIED from {} (provider not allowed, {} chars)", peer.ip(), provider.len());
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown provider" }))).into_response();
-    }
+    let Some(provider_id) = broker_provider(&provider) else {
+        eprintln!(
+            "[auth-broker] DENIED from {} (provider not allowed, {} chars)",
+            peer.ip(),
+            provider.len()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
 
-    let creds = if provider == "anthropic" {
+    let creds = if provider_id == auth::OAuthProviderId::Anthropic {
         auth::ensure_fresh_token(&st.client).await
     } else {
-        auth::ensure_fresh_provider_token(&st.client, &provider).await
+        auth::ensure_fresh_provider_token(&st.client, provider_id).await
     };
 
     match creds {
@@ -422,16 +498,217 @@ async fn token(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let ttl_ms = c.expires.saturating_sub(now);
-            eprintln!("[auth-broker] issued {provider} token to {} (expires {})", peer.ip(), c.expires);
-            (StatusCode::OK, Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })))
+            eprintln!(
+                "[auth-broker] issued {provider} token to {} (expires {})",
+                peer.ip(),
+                c.expires
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })),
+            )
                 .into_response()
         }
         Err(e) => {
-            eprintln!("[auth-broker] refresh failed for {provider} from {}: {}", peer.ip(), e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "token refresh failed" })))
+            eprintln!(
+                "[auth-broker] refresh failed for {provider} from {}: {}",
+                peer.ip(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "token refresh failed" })),
+            )
                 .into_response()
         }
     }
+}
+
+/// Typed broker proxy: execute a static-key provider request broker-side.
+///
+/// OAuth providers are structurally excluded (`ProxyRequest::validate`), so
+/// this endpoint can never become a second token-vending path, and no raw
+/// static key ever appears in a response — the broker attaches it upstream.
+async fn proxy(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<auth::ProxyRequest>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    if let Err(e) = request.validate() {
+        // BrokerError Display is secret-free by contract.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    if request.stream {
+        match st.local.proxy_stream(request).await {
+            Ok(stream) => {
+                let body = axum::body::Body::from_stream(
+                    stream.map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
+                );
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => broker_error_response(e),
+        }
+    } else {
+        match st.local.proxy(request).await {
+            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+            Err(e) => broker_error_response(e),
+        }
+    }
+}
+
+/// Typed usage operation: the local broker resolves the Anthropic OAuth token
+/// behind the boundary and calls the pinned usage URL; clients receive usage
+/// JSON only. No token, refresh token, or URL choice ever crosses this
+/// endpoint — it is deliberately not a general OAuth proxy.
+async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st.local.anthropic_usage().await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudCatalogRequest {
+    provider: auth::CloudProviderId,
+    context_ref: String,
+    #[serde(default)]
+    allow_stale: bool,
+}
+
+async fn cloud_catalog(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<CloudCatalogRequest>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"bad machine auth"})),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st
+        .local
+        .cloud_catalog(request.provider, &request.context_ref, request.allow_stale)
+        .await
+    {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(error) => broker_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudInvokeRequest {
+    provider: auth::CloudProviderId,
+    context_ref: String,
+    model_id: String,
+    request: auth::InvokeRequest,
+}
+
+async fn cloud_invoke(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<CloudInvokeRequest>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"bad machine auth"})),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st
+        .local
+        .cloud_invoke(
+            request.provider,
+            &request.context_ref,
+            &request.model_id,
+            request.request,
+        )
+        .await
+    {
+        Ok(stream) => {
+            // NDJSON framing survives arbitrary HTTP chunk boundaries.
+            let body = axum::body::Body::from_stream(stream.map(|event| {
+                event
+                    .and_then(|event| {
+                        serde_json::to_vec(&event)
+                            .map(|mut bytes| {
+                                bytes.push(b'\n');
+                                bytes::Bytes::from(bytes)
+                            })
+                            .map_err(|e| auth::BrokerError::Transport(e.to_string()))
+                    })
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }));
+            (
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson")],
+                body,
+            )
+                .into_response()
+        }
+        Err(error) => broker_error_response(error),
+    }
+}
+
+/// Non-secret provider capability/status list.
+async fn capabilities(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st.local.capabilities().await {
+        Ok(caps) => (StatusCode::OK, Json(caps)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+/// Map a broker error to an HTTP response. Messages are secret-free.
+fn broker_error_response(e: auth::BrokerError) -> axum::response::Response {
+    let status = match e {
+        auth::BrokerError::UnknownProvider(_) | auth::BrokerError::Denied(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        auth::BrokerError::NotConfigured(_) => StatusCode::FORBIDDEN,
+        auth::BrokerError::Unauthorized => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(json!({ "error": e.to_string() }))).into_response()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -439,6 +716,9 @@ async fn token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── ct_eq (preserved) ────────────────────────────────────────────────────
@@ -457,13 +737,19 @@ mod tests {
 
     #[test]
     fn policy_loopback_no_tls_is_plain_http() {
-        assert_eq!(check_bind_policy(true, false, false), BindDecision::Http { warn: false });
+        assert_eq!(
+            check_bind_policy(true, false, false),
+            BindDecision::Http { warn: false }
+        );
     }
 
     #[test]
     fn policy_loopback_insecure_flag_is_still_plain_http_no_warn() {
         // loopback + insecure flag → still HTTP, no warning (flag is irrelevant on loopback)
-        assert_eq!(check_bind_policy(true, false, true), BindDecision::Http { warn: false });
+        assert_eq!(
+            check_bind_policy(true, false, true),
+            BindDecision::Http { warn: false }
+        );
     }
 
     #[test]
@@ -476,15 +762,27 @@ mod tests {
         let d = check_bind_policy(false, false, false);
         assert!(matches!(d, BindDecision::Refuse(_)));
         if let BindDecision::Refuse(msg) = d {
-            assert!(msg.contains("non-loopback"), "message should mention non-loopback: {msg}");
-            assert!(msg.contains("--tls-cert"), "message should mention --tls-cert: {msg}");
-            assert!(msg.contains("--insecure-http"), "message should mention --insecure-http: {msg}");
+            assert!(
+                msg.contains("non-loopback"),
+                "message should mention non-loopback: {msg}"
+            );
+            assert!(
+                msg.contains("--tls-cert"),
+                "message should mention --tls-cert: {msg}"
+            );
+            assert!(
+                msg.contains("--insecure-http"),
+                "message should mention --insecure-http: {msg}"
+            );
         }
     }
 
     #[test]
     fn policy_nonloopback_no_tls_insecure_flag_warns() {
-        assert_eq!(check_bind_policy(false, false, true), BindDecision::Http { warn: true });
+        assert_eq!(
+            check_bind_policy(false, false, true),
+            BindDecision::Http { warn: true }
+        );
     }
 
     #[test]
@@ -553,7 +851,10 @@ mod tests {
         let err = load_and_validate_tls(&cert_path, &key_path);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("--tls-cert"), "error should mention --tls-cert flag: {msg}");
+        assert!(
+            msg.contains("--tls-cert"),
+            "error should mention --tls-cert flag: {msg}"
+        );
     }
 
     #[test]
@@ -566,7 +867,10 @@ mod tests {
         let err = load_and_validate_tls(&cert_path, &key_path);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("--tls-key"), "error should mention --tls-key flag: {msg}");
+        assert!(
+            msg.contains("--tls-key"),
+            "error should mention --tls-key flag: {msg}"
+        );
     }
 
     #[test]
@@ -601,7 +905,10 @@ mod tests {
     fn build_test_router(machine_token: Option<String>) -> Router {
         let tok = machine_token.clone();
         Router::new()
-            .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({ "status": "ok" })) }),
+            )
             .route(
                 "/token",
                 get(move |headers: HeaderMap| {
@@ -683,7 +990,11 @@ mod tests {
     async fn tls_healthz_returns_200() {
         let (addr, handle) = spawn_tls_server(None).await;
         let url = format!("https://{addr}/healthz");
-        let resp = insecure_client().get(&url).send().await.expect("GET /healthz over TLS");
+        let resp = insecure_client()
+            .get(&url)
+            .send()
+            .await
+            .expect("GET /healthz over TLS");
         assert_eq!(resp.status(), 200, "/healthz should return 200 over TLS");
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "ok");
@@ -694,8 +1005,16 @@ mod tests {
     async fn tls_token_no_auth_returns_401() {
         let (addr, handle) = spawn_tls_server(Some("secret123".to_string())).await;
         let url = format!("https://{addr}/token");
-        let resp = insecure_client().get(&url).send().await.expect("GET /token no auth");
-        assert_eq!(resp.status(), 401, "/token without bearer should 401 over TLS");
+        let resp = insecure_client()
+            .get(&url)
+            .send()
+            .await
+            .expect("GET /token no auth");
+        assert_eq!(
+            resp.status(),
+            401,
+            "/token without bearer should 401 over TLS"
+        );
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
     }
 
@@ -709,7 +1028,11 @@ mod tests {
             .send()
             .await
             .expect("GET /token with correct auth");
-        assert_eq!(resp.status(), 200, "/token with correct bearer should 200 over TLS");
+        assert_eq!(
+            resp.status(),
+            200,
+            "/token with correct bearer should 200 over TLS"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["access_token"], "test-tok");
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
@@ -725,8 +1048,417 @@ mod tests {
             .send()
             .await
             .expect("GET /token with wrong auth");
-        assert_eq!(resp.status(), 401, "/token with wrong bearer should 401 over TLS");
+        assert_eq!(
+            resp.status(),
+            401,
+            "/token with wrong bearer should 401 over TLS"
+        );
         handle.graceful_shutdown(Some(Duration::from_millis(200)));
+    }
+
+    // ── Broker service: /proxy, /capabilities, /token isolation ─────────────
+
+    // ── Genuine authenticated cloud production-router E2E ────────────────────
+
+    struct TypedCloudFixture {
+        invokes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl auth::broker::CloudBackend for TypedCloudFixture {
+        async fn catalog(
+            &self,
+            provider: auth::CloudProviderId,
+            context: &str,
+            _: bool,
+        ) -> Result<Vec<auth::broker::CloudCatalogEntry>, auth::BrokerError> {
+            assert_eq!(context, "ctx-opaque-route");
+            Ok(vec![auth::broker::CloudCatalogEntry {
+                provider,
+                id: "model-x".into(),
+                display_name: "Model X".into(),
+                context_ref: context.into(),
+                context_label: "sandbox".into(),
+                stale: false,
+                fetched_at: 7,
+            }])
+        }
+        async fn invoke(
+            &self,
+            _: auth::CloudProviderId,
+            context: &str,
+            model: &str,
+            _: auth::InvokeRequest,
+        ) -> Result<auth::broker::CloudEventStream, auth::BrokerError> {
+            assert_eq!((context, model), ("ctx-opaque-route", "model-x"));
+            self.invokes.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(auth::broker::CloudEvent::TextDelta {
+                    delta: "frag".into(),
+                }),
+                Ok(auth::broker::CloudEvent::TextDelta {
+                    delta: "mented".into(),
+                }),
+                Ok(auth::broker::CloudEvent::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_broker_catalog_then_fragmented_invoke_uses_real_auth_router() {
+        use auth::CredentialBroker;
+        let backend = Arc::new(TypedCloudFixture {
+            invokes: AtomicUsize::new(0),
+        });
+        let app = build_router_with_cloud_backend(Some("machine-only".into()), backend.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        let endpoint = format!("http://{addr}");
+        let remote = auth::RemoteBroker::new(
+            &endpoint,
+            "machine-only",
+            reqwest::Client::new(),
+            auth::TokenCache::new(),
+        );
+        let provider = auth::CloudProviderId::AwsBedrock;
+        let catalog = remote
+            .cloud_catalog(provider, "ctx-opaque-route", false)
+            .await
+            .unwrap();
+        assert_eq!(catalog[0].context_ref, "ctx-opaque-route");
+        let request: auth::InvokeRequest =
+            serde_json::from_value(json!({"messages":[],"tools":[],"stream":true,"options":{}}))
+                .unwrap();
+        let mut events = remote
+            .cloud_invoke(
+                provider,
+                &catalog[0].context_ref,
+                &catalog[0].id,
+                request.clone(),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(event) = events.next().await {
+            seen.push(event.unwrap());
+        }
+        assert_eq!(
+            seen,
+            vec![
+                auth::broker::CloudEvent::TextDelta {
+                    delta: "frag".into()
+                },
+                auth::broker::CloudEvent::TextDelta {
+                    delta: "mented".into()
+                },
+                auth::broker::CloudEvent::Done
+            ]
+        );
+        assert_eq!(backend.invokes.load(Ordering::SeqCst), 1);
+
+        for token in [None, Some("invalid")] {
+            let client = reqwest::Client::new();
+            let mut call = client.post(format!("{endpoint}/cloud/invoke")).json(&json!({"provider":"aws-bedrock","context_ref":"ctx-opaque-route","model_id":"model-x","request":request}));
+            if let Some(token) = token {
+                call = call.bearer_auth(token);
+            }
+            let response = call.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let wire = response.text().await.unwrap();
+            assert!(!wire.contains("machine-only") && !wire.contains("ctx-opaque-route"));
+        }
+        assert_eq!(backend.invokes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Spawn the REAL router (real handlers/state) on an ephemeral loopback
+    /// port. `local_upstream` pins the `local` provider at a fake endpoint so
+    /// no real provider or credential file is touched.
+    async fn spawn_broker_service(
+        machine_token: Option<String>,
+        local_upstream: Option<String>,
+    ) -> String {
+        let client = reqwest::Client::new();
+        let local = match local_upstream {
+            Some(url) => auth::LocalBroker::with_local_base_url(client.clone(), url),
+            None => auth::LocalBroker::new(client.clone()),
+        };
+        let state = BrokerState {
+            machine_token,
+            client,
+            local: Arc::new(local),
+        };
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Fake OpenAI-compatible upstream that records the Authorization header
+    /// it receives and serves an SSE body.
+    async fn spawn_sse_upstream(seen_auth: Arc<std::sync::Mutex<String>>) -> String {
+        use axum::routing::post as axum_post;
+        let app = Router::new().route(
+            "/chat/completions",
+            axum_post(move |headers: HeaderMap| {
+                let seen = seen_auth.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    (
+                        [("content-type", "text/event-stream")],
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn proxy_body(stream: bool) -> serde_json::Value {
+        json!({
+            "provider": "local",
+            "method": "post",
+            "path": "/chat/completions",
+            "body": {"model": "m", "messages": []},
+            "stream": stream,
+        })
+    }
+
+    /// Proxy authorization: no bearer and a wrong bearer are both 401, and the
+    /// denial body contains no credential material.
+    #[tokio::test]
+    async fn proxy_requires_machine_auth() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/proxy"))
+            .json(&proxy_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "missing bearer must be denied");
+
+        let resp = client
+            .post(format!("{base}/proxy"))
+            .bearer_auth("wrong-token")
+            .json(&proxy_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "wrong bearer must be denied");
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("machine-secret"),
+            "denial must not echo the expected token"
+        );
+    }
+
+    /// The typed /usage operation is a credential endpoint: it requires
+    /// machine auth, and denials carry no token material.
+    #[tokio::test]
+    async fn usage_requires_machine_auth_and_denials_are_secret_free() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("{base}/usage")).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "missing bearer must be denied");
+
+        let resp = client
+            .get(format!("{base}/usage"))
+            .bearer_auth("wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "wrong bearer must be denied");
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("machine-secret") && !body.contains("access"),
+            "denial must not echo credentials: {body}"
+        );
+    }
+
+    /// Capabilities also require machine auth (they reveal configured-ness).
+    #[tokio::test]
+    async fn capabilities_require_machine_auth_and_expose_no_secrets() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{base}/capabilities"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let resp = client
+            .get(format!("{base}/capabilities"))
+            .bearer_auth("machine-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let caps: serde_json::Value = resp.json().await.unwrap();
+        for row in caps.as_array().expect("array") {
+            let obj = row.as_object().unwrap();
+            let mut fields: Vec<&str> = obj.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            assert_eq!(
+                fields,
+                vec!["configured", "key", "kind", "name"],
+                "capability rows carry status only — no credential fields"
+            );
+            assert!(obj["configured"].is_boolean());
+        }
+    }
+
+    /// Remote non-disclosure / cross-provider isolation: the /token endpoint
+    /// refuses to vend anything for a static-key provider — static keys are
+    /// proxy-only and never leave the broker.
+    #[tokio::test]
+    async fn token_endpoint_denies_static_key_providers() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+        for provider in ["groq", "openrouter", "local", "definitely-unknown"] {
+            let resp = client
+                .get(format!("{base}/token"))
+                .query(&[("provider", provider)])
+                .bearer_auth("machine-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                400,
+                "static/unknown provider '{provider}' must never be vended a token"
+            );
+            let body = resp.text().await.unwrap();
+            assert!(
+                !body.contains("access_token"),
+                "no token material for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_copilot_is_oauth_token_vending_allowlisted() {
+        // Descriptor strategy permits /token for github-copilot (session token only).
+        let id = broker_provider("github-copilot").expect("github-copilot must be allowlisted");
+        assert_eq!(id, auth::OAuthProviderId::GitHubCopilot);
+        assert_eq!(id.as_str(), "github-copilot");
+        // Aliases are not canonical broker ids
+        assert!(broker_provider("copilot").is_none());
+        assert!(broker_provider("gh-copilot").is_none());
+    }
+
+    /// Proxy validation fails closed: OAuth providers and absolute/escaping
+    /// paths are rejected before any upstream contact.
+    #[tokio::test]
+    async fn proxy_rejects_oauth_providers_and_bad_paths() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+
+        for (provider, path) in [
+            ("anthropic", "/v1/messages"),
+            ("openai-codex", "/responses"),
+            // `/v1/messages` is advertised by Anthropic-vendor Copilot rows but
+            // the broker does not currently route it — must fail closed.
+            ("github-copilot", "/v1/messages"),
+            ("github-copilot", "/models/gpt-5.4/policy"),
+            ("local", "https://evil.example/steal"),
+            ("local", "/../../etc/passwd"),
+        ] {
+            let resp = client
+                .post(format!("{base}/proxy"))
+                .bearer_auth("machine-secret")
+                .json(&json!({
+                    "provider": provider,
+                    "method": "post",
+                    "path": path,
+                    "stream": false,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{provider} {path} must be rejected");
+        }
+    }
+
+    /// Streaming forwarding: an authenticated /proxy stream call reaches the
+    /// upstream with the BROKER-applied credential and the SSE bytes flow back
+    /// to the client unmodified. The client never supplied a provider key.
+    #[tokio::test]
+    async fn proxy_streams_sse_and_applies_key_broker_side() {
+        let seen_auth = Arc::new(std::sync::Mutex::new(String::new()));
+        let upstream = spawn_sse_upstream(seen_auth.clone()).await;
+        let base = spawn_broker_service(Some("machine-secret".into()), Some(upstream)).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/proxy"))
+            .bearer_auth("machine-secret")
+            .json(&proxy_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("data: {\"choices\""),
+            "SSE payload forwarded: {body}"
+        );
+        assert!(body.contains("[DONE]"));
+        // The upstream saw the broker-owned credential, not the machine token.
+        assert_eq!(&*seen_auth.lock().unwrap(), "Bearer local");
+    }
+
+    /// Non-streaming proxy returns the JSON envelope RemoteBroker expects.
+    #[tokio::test]
+    async fn proxy_non_streaming_returns_status_envelope() {
+        let seen_auth = Arc::new(std::sync::Mutex::new(String::new()));
+        let upstream = spawn_sse_upstream(seen_auth.clone()).await;
+        let base = spawn_broker_service(None, Some(upstream)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/proxy"))
+            .json(&proxy_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let envelope: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(envelope["status"], 200);
+        assert!(envelope["body"].as_str().unwrap().contains("[DONE]"));
     }
 
     // ── Helper: rcgen self-signed cert ────────────────────────────────────────
@@ -736,8 +1468,7 @@ mod tests {
     pub(super) fn generate_test_cert_key() -> (Vec<u8>, Vec<u8>) {
         use rcgen::generate_simple_self_signed;
         let san = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        let cert = generate_simple_self_signed(san)
-            .expect("rcgen cert generation should succeed");
+        let cert = generate_simple_self_signed(san).expect("rcgen cert generation should succeed");
         let cert_pem = cert.cert.pem().into_bytes();
         let key_pem = cert.signing_key.serialize_pem().into_bytes();
         (cert_pem, key_pem)

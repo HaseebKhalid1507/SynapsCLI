@@ -1,7 +1,10 @@
 // src/events/socket.rs
 // Unix socket listener for per-session event delivery
 
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
@@ -74,10 +77,8 @@ pub fn listen_session_socket(
             }
 
             // Poll accept with a timeout so we can check shutdown periodically
-            let accept = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                listener.accept(),
-            );
+            let accept =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept());
 
             match accept.await {
                 Ok(Ok((mut stream, _addr))) => {
@@ -87,7 +88,8 @@ pub fn listen_session_socket(
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             handle_connection(&mut stream, &queue),
-                        ).await;
+                        )
+                        .await;
                     });
                 }
                 Ok(Err(e)) => {
@@ -104,10 +106,7 @@ pub fn listen_session_socket(
     })
 }
 
-async fn handle_connection(
-    stream: &mut tokio::net::UnixStream,
-    queue: &EventQueue,
-) {
+async fn handle_connection(stream: &mut tokio::net::UnixStream, queue: &EventQueue) {
     // Read up to MAX_PAYLOAD + 1 so we can detect oversized payloads
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];

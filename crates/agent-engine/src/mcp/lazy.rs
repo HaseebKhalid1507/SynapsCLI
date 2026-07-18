@@ -1,13 +1,13 @@
 //! Lazy MCP connection — the mcp_connect tool that connects to servers on-demand.
+use crate::Tool;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::Tool;
 
-use super::McpServerConfig;
 use super::connection::McpConnection;
 use super::tool::McpTool;
+use super::McpServerConfig;
 
 /// A tool that lazily connects to MCP servers on demand.
 /// Instead of spawning all servers at startup (burning tokens on 65 tool schemas),
@@ -22,9 +22,7 @@ pub struct McpConnectTool {
 }
 
 impl McpConnectTool {
-    pub fn new(
-        configs: HashMap<String, McpServerConfig>,
-    ) -> Self {
+    pub fn new(configs: HashMap<String, McpServerConfig>) -> Self {
         Self {
             configs,
             connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -34,7 +32,9 @@ impl McpConnectTool {
 
 #[async_trait::async_trait]
 impl Tool for McpConnectTool {
-    fn name(&self) -> &str { "connect_mcp_server" }
+    fn name(&self) -> &str {
+        "connect_mcp_server"
+    }
 
     fn description(&self) -> &str {
         "Connect to an MCP server and load its tools. Call this before using tools from an external MCP server. Available servers are listed in the description below. Once connected, the server's tools become available for the rest of the session."
@@ -56,7 +56,8 @@ impl Tool for McpConnectTool {
     }
 
     async fn execute(&self, params: Value, ctx: crate::ToolContext) -> crate::Result<String> {
-        let server_name = params["server"].as_str()
+        let server_name = params["server"]
+            .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'server' parameter".to_string()))?;
 
         // Atomically check-and-mark to prevent double-connect from parallel calls
@@ -69,13 +70,14 @@ impl Tool for McpConnectTool {
             connected.insert(server_name.to_string());
         }
 
-        let config = self.configs.get(server_name)
-            .ok_or_else(|| {
-                let available: Vec<&str> = self.configs.keys().map(|s| s.as_str()).collect();
-                crate::RuntimeError::Tool(format!(
-                    "Unknown MCP server '{}'. Available: {}", server_name, available.join(", ")
-                ))
-            })?;
+        let config = self.configs.get(server_name).ok_or_else(|| {
+            let available: Vec<&str> = self.configs.keys().map(|s| s.as_str()).collect();
+            crate::RuntimeError::Tool(format!(
+                "Unknown MCP server '{}'. Available: {}",
+                server_name,
+                available.join(", ")
+            ))
+        })?;
 
         tracing::info!(server = %server_name, "Lazy-connecting to MCP server");
 
@@ -85,7 +87,8 @@ impl Tool for McpConnectTool {
                 // Unmark on failure so retry is possible
                 self.connected.lock().await.remove(server_name);
                 return Err(crate::RuntimeError::Tool(format!(
-                    "Failed to connect to MCP server '{}': {}", server_name, e
+                    "Failed to connect to MCP server '{}': {}",
+                    server_name, e
                 )));
             }
         };
@@ -95,7 +98,8 @@ impl Tool for McpConnectTool {
             Err(e) => {
                 self.connected.lock().await.remove(server_name);
                 return Err(crate::RuntimeError::Tool(format!(
-                    "Failed to list tools from '{}': {}", server_name, e
+                    "Failed to list tools from '{}': {}",
+                    server_name, e
                 )));
             }
         };
@@ -107,8 +111,11 @@ impl Tool for McpConnectTool {
 
         for tool_def in tools {
             let prefixed_name = format!("ext__{}__{}", server_name, tool_def.name);
-            tool_names.push(format!("{} — {}", tool_def.name,
-                tool_def.description.chars().take(60).collect::<String>()));
+            tool_names.push(format!(
+                "{} — {}",
+                tool_def.name,
+                tool_def.description.chars().take(60).collect::<String>()
+            ));
 
             let mcp_tool = McpTool {
                 tool_name: prefixed_name,

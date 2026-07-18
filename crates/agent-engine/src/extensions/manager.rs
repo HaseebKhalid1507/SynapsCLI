@@ -4,14 +4,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::capability::{
+    ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry,
+};
 use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
-use super::info::PluginInfo;
 use super::hooks::HookBus;
+use super::info::PluginInfo;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
-use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
-use super::capability::{ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry};
+use super::runtime::{ExtensionHandler, ExtensionHealth};
 use serde_json::{Map, Value};
 
 fn project_plugins_disabled() -> bool {
@@ -22,7 +24,6 @@ fn project_plugins_disabled() -> bool {
         })
         .unwrap_or(false)
 }
-
 
 fn installed_plugin_setup_failure_in(
     state: &crate::skills::state::PluginsState,
@@ -178,11 +179,7 @@ impl ExtensionManager {
     }
 
     /// Load and start an extension from its manifest.
-    pub async fn load(
-        &mut self,
-        id: &str,
-        manifest: &ExtensionManifest,
-    ) -> Result<(), String> {
+    pub async fn load(&mut self, id: &str, manifest: &ExtensionManifest) -> Result<(), String> {
         self.load_with_cwd(id, manifest, None).await
     }
 
@@ -194,7 +191,8 @@ impl ExtensionManager {
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
         let config = Self::resolve_config(id, &manifest.config)?;
-        self.load_with_cwd_and_config(id, manifest, cwd, config).await
+        self.load_with_cwd_and_config(id, manifest, cwd, config)
+            .await
     }
 
     async fn load_with_cwd_and_config(
@@ -217,7 +215,9 @@ impl ExtensionManager {
         let subscriptions = validated.subscriptions;
 
         // Spawn the extension process only after the manifest is known-good.
-        let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
+        let process =
+            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone())
+                .await?;
         // Publish permissions to the inbound-request dispatcher so memory.*
         // calls during initialize can be authorized correctly.
         process.set_permissions(permissions.clone()).await;
@@ -235,14 +235,18 @@ impl ExtensionManager {
             || !registered_providers.is_empty()
             || !capability_declarations.is_empty();
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
-        if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
+        if !registered_tools.is_empty()
+            && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister)
+        {
             handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered tools but lacks permission 'tools.register'",
                 id
             ));
         }
-        if !registered_providers.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ProvidersRegister) {
+        if !registered_providers.is_empty()
+            && !permissions.has(crate::extensions::permissions::Permission::ProvidersRegister)
+        {
             handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered providers but lacks permission 'providers.register'",
@@ -250,7 +254,9 @@ impl ExtensionManager {
             ));
         }
         for decl in &capability_declarations {
-            if let Err(err) = crate::extensions::runtime::process::validate_capability(decl, &permissions) {
+            if let Err(err) =
+                crate::extensions::runtime::process::validate_capability(decl, &permissions)
+            {
                 handler.shutdown().await;
                 return Err(format!(
                     "Extension '{}' capability '{}' invalid: {}",
@@ -261,12 +267,17 @@ impl ExtensionManager {
         if !registered_providers.is_empty() {
             let mut registered_ids = Vec::new();
             for provider in registered_providers {
-                if let Err(error) = Self::validate_provider_config_requirements(id, &provider, &config) {
+                if let Err(error) =
+                    Self::validate_provider_config_requirements(id, &provider, &config)
+                {
                     self.providers.unregister_plugin(id);
                     handler.shutdown().await;
                     return Err(error);
                 }
-                match self.providers.register_with_handler(id, provider, Some(handler.clone())) {
+                match self
+                    .providers
+                    .register_with_handler(id, provider, Some(handler.clone()))
+                {
                     Ok(runtime_id) => registered_ids.push(runtime_id),
                     Err(error) => {
                         self.providers.unregister_plugin(id);
@@ -305,7 +316,11 @@ impl ExtensionManager {
             };
             let mut registry = tools.write().await;
             for spec in registered_tools {
-                registry.register(Arc::new(crate::tools::ExtensionTool::new(id, spec, handler.clone())));
+                registry.register(Arc::new(crate::tools::ExtensionTool::new(
+                    id,
+                    spec,
+                    handler.clone(),
+                )));
             }
         }
 
@@ -341,7 +356,13 @@ impl ExtensionManager {
         // Register hook subscriptions
         for (kind, tool_filter, matcher) in subscriptions {
             self.hook_bus
-                .subscribe(kind, handler.clone(), tool_filter, matcher, permissions.clone())
+                .subscribe(
+                    kind,
+                    handler.clone(),
+                    tool_filter,
+                    matcher,
+                    permissions.clone(),
+                )
                 .await?;
         }
 
@@ -372,7 +393,8 @@ impl ExtensionManager {
             .config_schema
             .as_ref()
             .and_then(|schema| schema.get("required"))
-            .and_then(Value::as_array) else {
+            .and_then(Value::as_array)
+        else {
             return Ok(());
         };
         for key in required {
@@ -410,7 +432,11 @@ impl ExtensionManager {
                 ));
             }
             let config_key = format!("extension.{}.{}", id, key);
-            if let Ok(value) = std::env::var(format!("SYNAPS_EXTENSION_{}_{}", id.replace('-', "_").to_ascii_uppercase(), key.replace('-', "_").to_ascii_uppercase())) {
+            if let Ok(value) = std::env::var(format!(
+                "SYNAPS_EXTENSION_{}_{}",
+                id.replace('-', "_").to_ascii_uppercase(),
+                key.replace('-', "_").to_ascii_uppercase()
+            )) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
@@ -434,11 +460,17 @@ impl ExtensionManager {
             }
             if entry.required {
                 let hint = if let Some(secret_env) = &entry.secret_env {
-                    format!("set environment variable '{}' or config key '{}'", secret_env, config_key)
+                    format!(
+                        "set environment variable '{}' or config key '{}'",
+                        secret_env, config_key
+                    )
                 } else {
                     format!("set config key '{}'", config_key)
                 };
-                return Err(format!("Extension '{}' missing required config '{}': {}", id, key, hint));
+                return Err(format!(
+                    "Extension '{}' missing required config '{}': {}",
+                    id, key, hint
+                ));
             }
         }
         Ok(Value::Object(out))
@@ -503,7 +535,9 @@ impl ExtensionManager {
     /// This is intended for process exit: the UI should not hang waiting for
     /// extension child processes to acknowledge shutdown. Dropping the join handle
     /// lets Tokio abort remaining work when the runtime exits.
-    pub fn shutdown_all_detached(manager: Arc<tokio::sync::RwLock<Self>>) -> tokio::task::JoinHandle<()> {
+    pub fn shutdown_all_detached(
+        manager: Arc<tokio::sync::RwLock<Self>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             manager.write().await.shutdown_all().await;
         })
@@ -613,7 +647,9 @@ impl ExtensionManager {
             .get(id)
             .ok_or_else(|| format!("unknown extension '{}'", id))?
             .clone();
-        handler.invoke_command(command, args, request_id, sink).await
+        handler
+            .invoke_command(command, args, request_id, sink)
+            .await
     }
 
     pub async fn settings_editor_open(
@@ -792,7 +828,8 @@ impl ExtensionManager {
             Err(e) => {
                 tracing::warn!("trust.json corrupt or unreadable, failing closed (all providers disabled): {e}");
                 // Return all providers as disabled
-                return self.providers
+                return self
+                    .providers
                     .list()
                     .into_iter()
                     .map(|p| (p.runtime_id.clone(), false))
@@ -803,8 +840,7 @@ impl ExtensionManager {
             .list()
             .into_iter()
             .map(|p| {
-                let enabled =
-                    crate::extensions::trust::is_provider_enabled(&trust, &p.runtime_id);
+                let enabled = crate::extensions::trust::is_provider_enabled(&trust, &p.runtime_id);
                 (p.runtime_id.clone(), enabled)
             })
             .collect()
@@ -838,7 +874,8 @@ impl ExtensionManager {
         provider_required.sort_by(|a, b| a.0.cmp(&b.0));
 
         let env_lookup = |name: &str| std::env::var(name).ok();
-        let plugin_config_lookup = |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
+        let plugin_config_lookup =
+            |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
         let legacy_config_lookup = |key: &str| crate::config::read_config_value(key);
 
         Some(diagnose_extension_config(
@@ -883,7 +920,10 @@ impl ExtensionManager {
     /// Discover and load all extensions, invoking `progress` after each load
     /// attempt. Used by the async UI loader to update startup toasts without
     /// blocking first paint.
-    pub async fn discover_and_load_with_progress<F>(&mut self, mut progress: F) -> (Vec<String>, Vec<ExtensionLoadFailure>)
+    pub async fn discover_and_load_with_progress<F>(
+        &mut self,
+        mut progress: F,
+    ) -> (Vec<String>, Vec<ExtensionLoadFailure>)
     where
         F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
     {
@@ -1009,27 +1049,34 @@ impl ExtensionManager {
             #[allow(clippy::if_same_then_else)]
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
-            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR) && !ext_manifest.command.contains('/') {
+            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
+                && !ext_manifest.command.contains('/')
+            {
                 ext_manifest.command.clone()
             } else {
-                plugin_dir.join(&ext_manifest.command)
-                    .to_string_lossy().to_string()
+                plugin_dir
+                    .join(&ext_manifest.command)
+                    .to_string_lossy()
+                    .to_string()
             };
 
-            let args: Vec<String> = ext_manifest.args.iter().map(|arg| {
-                let arg_path = plugin_dir.join(arg);
-                if arg_path.exists() {
-                    if let (Ok(canonical), Ok(plugin_canonical)) = (
-                        arg_path.canonicalize(),
-                        plugin_dir.canonicalize(),
-                    ) {
-                        if canonical.starts_with(&plugin_canonical) {
-                            return canonical.to_string_lossy().to_string();
+            let args: Vec<String> = ext_manifest
+                .args
+                .iter()
+                .map(|arg| {
+                    let arg_path = plugin_dir.join(arg);
+                    if arg_path.exists() {
+                        if let (Ok(canonical), Ok(plugin_canonical)) =
+                            (arg_path.canonicalize(), plugin_dir.canonicalize())
+                        {
+                            if canonical.starts_with(&plugin_canonical) {
+                                return canonical.to_string_lossy().to_string();
+                            }
                         }
                     }
-                }
-                arg.clone()
-            }).collect();
+                    arg.clone()
+                })
+                .collect();
 
             let resolved = ExtensionManifest {
                 theme_tokens: Default::default(),
@@ -1038,7 +1085,10 @@ impl ExtensionManager {
                 ..ext_manifest
             };
 
-            match self.load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone())).await {
+            match self
+                .load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone()))
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(plugin = %plugin_name, path = %plugin_dir.display(), "Extension loaded from plugins/");
                     loaded.push(plugin_name.clone());
@@ -1053,14 +1103,13 @@ impl ExtensionManager {
                     let setup_script = json
                         .pointer("/extension/setup")
                         .and_then(|v| v.as_str())
-                        .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
+                        .or_else(|| {
+                            json.pointer("/provides/sidecar/setup")
+                                .and_then(|v| v.as_str())
+                        });
                     let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
-                    let failure = ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        e,
-                        hint,
-                    );
+                    let failure =
+                        ExtensionLoadFailure::new(plugin_name, Some(manifest_path), e, hint);
                     failed.push(failure.clone());
                     progress(crate::extensions::loader::ExtensionLoaderEvent::Failed {
                         failure,
@@ -1222,7 +1271,11 @@ mod tests {
             command: "python3".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
-            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-test.log".to_string()],
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-reload-test.log".to_string(),
+            ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
@@ -1253,7 +1306,11 @@ mod tests {
             command: "python3".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
-            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-failure-test.log".to_string()],
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-reload-failure-test.log".to_string(),
+            ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
@@ -1271,7 +1328,10 @@ mod tests {
         };
 
         mgr.load("reload-failure-test", &good).await.unwrap();
-        let err = mgr.reload("reload-failure-test", &bad, None).await.unwrap_err();
+        let err = mgr
+            .reload("reload-failure-test", &bad, None)
+            .await
+            .unwrap_err();
 
         assert!(err.contains("Failed to spawn extension"), "{err}");
         assert_eq!(mgr.count(), 0);
@@ -1307,8 +1367,12 @@ mod tests {
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::extensions::config_store::write_plugin_config("sample-sidecar", "backend", "cpu")
-                .unwrap();
+            crate::extensions::config_store::write_plugin_config(
+                "sample-sidecar",
+                "backend",
+                "cpu",
+            )
+            .unwrap();
             crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
@@ -1324,7 +1388,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+            assert_eq!(
+                resolved["backend"],
+                serde_json::Value::String("cpu".to_string())
+            );
         });
     }
 
@@ -1348,7 +1415,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
+            assert_eq!(
+                resolved["backend"],
+                serde_json::Value::String("auto".to_string())
+            );
         });
     }
 
@@ -1422,7 +1492,9 @@ mod tests {
 
     #[tokio::test]
     async fn provider_tool_use_runtime_ids_lists_only_tool_use_capable() {
-        use crate::extensions::runtime::process::{RegisteredProviderModelSpec, RegisteredProviderSpec};
+        use crate::extensions::runtime::process::{
+            RegisteredProviderModelSpec, RegisteredProviderSpec,
+        };
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus);
         // Tool-use capable provider.

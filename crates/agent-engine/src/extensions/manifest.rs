@@ -133,8 +133,14 @@ impl ExtensionManifest {
         let has_capability_permission = self.permissions.iter().any(|permission| {
             matches!(
                 permission.as_str(),
-                "tools.register" | "providers.register" | "memory.read" | "memory.write"
-                    | "config.write" | "config.subscribe" | "audio.input" | "audio.output"
+                "tools.register"
+                    | "providers.register"
+                    | "memory.read"
+                    | "memory.write"
+                    | "config.write"
+                    | "config.subscribe"
+                    | "audio.input"
+                    | "audio.output"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {
@@ -237,7 +243,10 @@ impl HookMatcher {
     pub const SUPPORTED_KEYS: &'static [&'static str] = &["input_contains", "input_equals"];
 
     pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
-        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
+        let input = event
+            .tool_input
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null);
         if let Some(expected) = &self.input_equals {
             if input != expected {
                 return false;
@@ -317,7 +326,10 @@ mod tests {
         assert_eq!(entry.key, "backend");
         assert_eq!(entry.value_type, Some(ExtensionConfigValueKind::String));
         assert_eq!(entry.description.as_deref(), Some("Backend selector"));
-        assert_eq!(entry.default, Some(serde_json::Value::String("auto".to_string())));
+        assert_eq!(
+            entry.default,
+            Some(serde_json::Value::String("auto".to_string()))
+        );
     }
 
     #[test]
@@ -506,10 +518,11 @@ mod tests {
             "bash",
             serde_json::json!({"command": "echo safe"}),
         );
-        let equals_but_missing_contains = crate::extensions::hooks::events::HookEvent::before_tool_call(
-            "bash",
-            serde_json::json!({"command": "echo ok"}),
-        );
+        let equals_but_missing_contains =
+            crate::extensions::hooks::events::HookEvent::before_tool_call(
+                "bash",
+                serde_json::json!({"command": "echo ok"}),
+            );
 
         assert!(matcher.matches(&matching));
         assert!(!matcher.matches(&equals_but_missing_contains));
@@ -568,7 +581,10 @@ mod tests {
         // Missing sha256 must error — no silent acceptance of unverified assets.
         let json = r#"{ "url": "https://example.com/x.tar.gz" }"#;
         let res: Result<PrebuiltAsset, _> = serde_json::from_str(json);
-        assert!(res.is_err(), "PrebuiltAsset without sha256 must fail to parse");
+        assert!(
+            res.is_err(),
+            "PrebuiltAsset without sha256 must fail to parse"
+        );
     }
 
     // ── Theme tokens (P19.2, additive-optional per STABILITY.md §1) ─────────
@@ -584,8 +600,14 @@ mod tests {
             "permissions": ["tools.register"]
         }"#;
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
-        assert!(m.theme_tokens.is_empty(), "absent theme_tokens must default to empty");
-        assert!(m.validate("legacy-ext").is_ok(), "legacy manifests must validate unchanged");
+        assert!(
+            m.theme_tokens.is_empty(),
+            "absent theme_tokens must default to empty"
+        );
+        assert!(
+            m.validate("legacy-ext").is_ok(),
+            "legacy manifests must validate unchanged"
+        );
     }
 
     #[test]
@@ -597,7 +619,10 @@ mod tests {
             "theme_tokens": { "accent": "#22d3ee", "warn": "#fa0" }
         }"##;
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(m.theme_tokens.get("accent").map(String::as_str), Some("#22d3ee"));
+        assert_eq!(
+            m.theme_tokens.get("accent").map(String::as_str),
+            Some("#22d3ee")
+        );
         assert_eq!(m.theme_tokens.get("warn").map(String::as_str), Some("#fa0"));
         assert!(m.validate("themed-ext").is_ok());
     }
@@ -615,7 +640,10 @@ mod tests {
             );
             let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
             let err = m.validate("bad-ext").unwrap_err();
-            assert!(err.contains("theme token"), "'{bad}' must be rejected: {err}");
+            assert!(
+                err.contains("theme token"),
+                "'{bad}' must be rejected: {err}"
+            );
         }
     }
 
@@ -632,7 +660,10 @@ mod tests {
             );
             let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
             let err = m.validate("bad-ext").unwrap_err();
-            assert!(err.contains("invalid color"), "'{bad}' must be rejected: {err}");
+            assert!(
+                err.contains("invalid color"),
+                "'{bad}' must be rejected: {err}"
+            );
         }
     }
 

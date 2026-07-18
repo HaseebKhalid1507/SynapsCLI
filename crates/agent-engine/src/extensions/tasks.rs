@@ -64,7 +64,10 @@ impl TaskEvent {
 
 /// Returns true if `method` is one of the recognised task notifications.
 pub fn is_task_method(method: &str) -> bool {
-    matches!(method, "task.start" | "task.update" | "task.log" | "task.done")
+    matches!(
+        method,
+        "task.start" | "task.update" | "task.log" | "task.done"
+    )
 }
 
 /// Parse a `task.*` notification given the JSON-RPC method and params.
@@ -130,7 +133,9 @@ pub fn parse_task_event(method: &str, params: &Value) -> Result<TaskEvent, Strin
                     }
                 }
                 Some(other) => {
-                    return Err(format!("task.done 'error' must be string or null, got {other}"));
+                    return Err(format!(
+                        "task.done 'error' must be string or null, got {other}"
+                    ));
                 }
             };
             Ok(TaskEvent::Done { id, error })
@@ -166,17 +171,17 @@ mod tests {
         let ev = parse_task_event("task.start", &json!({"id":"x","label":"y"})).unwrap();
         assert!(matches!(
             ev,
-            TaskEvent::Start { kind: TaskKind::Generic, .. }
+            TaskEvent::Start {
+                kind: TaskKind::Generic,
+                ..
+            }
         ));
     }
 
     #[test]
     fn parses_task_update_partial() {
-        let ev = parse_task_event(
-            "task.update",
-            &json!({"id":"dl","current":50,"total":100}),
-        )
-        .unwrap();
+        let ev =
+            parse_task_event("task.update", &json!({"id":"dl","current":50,"total":100})).unwrap();
         assert_eq!(
             ev,
             TaskEvent::Update {
@@ -193,14 +198,23 @@ mod tests {
         let ev = parse_task_event("task.log", &json!({"id":"r","line":"compiling..."})).unwrap();
         assert_eq!(
             ev,
-            TaskEvent::Log { id: "r".into(), line: "compiling...".into() }
+            TaskEvent::Log {
+                id: "r".into(),
+                line: "compiling...".into()
+            }
         );
     }
 
     #[test]
     fn parses_task_done_no_error() {
         let ev = parse_task_event("task.done", &json!({"id":"r"})).unwrap();
-        assert_eq!(ev, TaskEvent::Done { id: "r".into(), error: None });
+        assert_eq!(
+            ev,
+            TaskEvent::Done {
+                id: "r".into(),
+                error: None
+            }
+        );
     }
 
     #[test]
@@ -222,11 +236,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_kind() {
-        let err = parse_task_event(
-            "task.start",
-            &json!({"id":"x","label":"y","kind":"alien"}),
-        )
-        .unwrap_err();
+        let err = parse_task_event("task.start", &json!({"id":"x","label":"y","kind":"alien"}))
+            .unwrap_err();
         assert!(err.contains("unknown kind"));
     }
 

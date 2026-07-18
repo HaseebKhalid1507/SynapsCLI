@@ -14,7 +14,8 @@ fn is_valid_name(s: &str) -> bool {
         && !s.contains('/')
         && !s.contains('\\')
         && !s.contains("..")
-        && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Resolve an agent name to a system prompt.
@@ -26,7 +27,8 @@ pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
     if name.chars().all(|c| c.is_whitespace() || c.is_control()) {
         return Err(
             "Empty 'agent' parameter. Pass a non-empty agent name, omit the field entirely, \
-             or provide 'system_prompt' inline instead.".to_string()
+             or provide 'system_prompt' inline instead."
+                .to_string(),
         );
     }
 
@@ -58,8 +60,12 @@ pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
             ));
         }
         // Verify resolved path is still under plugins_dir (path traversal guard)
-        let canonical_plugins = plugins_dir.canonicalize().unwrap_or_else(|_| plugins_dir.clone());
-        let canonical_plugin = plugin_dir.canonicalize().unwrap_or_else(|_| plugin_dir.clone());
+        let canonical_plugins = plugins_dir
+            .canonicalize()
+            .unwrap_or_else(|_| plugins_dir.clone());
+        let canonical_plugin = plugin_dir
+            .canonicalize()
+            .unwrap_or_else(|_| plugin_dir.clone());
         if !canonical_plugin.starts_with(&canonical_plugins) {
             return Err(format!("Invalid plugin name: '{}'", plugin));
         }
@@ -124,7 +130,11 @@ fn resolve_namespaced_agent(
             "Ambiguous agent '{}': found in {} skills. Use the full path instead.\n  {}",
             agent,
             n,
-            matches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
         )),
     }
 }
@@ -146,11 +156,7 @@ mod tests {
     #[test]
     fn resolve_namespaced_agent_finds_plugin_agent() {
         let tmp = tempfile::tempdir().unwrap();
-        let agents_dir = tmp
-            .path()
-            .join("skills")
-            .join("bbe")
-            .join("agents");
+        let agents_dir = tmp.path().join("skills").join("bbe").join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("sage.md"),
@@ -210,8 +216,16 @@ mod tests {
         let result = resolve_namespaced_agent("sage", tmp.path());
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Ambiguous"), "Expected ambiguity error, got: {}", err);
-        assert!(err.contains("2 skills"), "Expected '2 skills' in error, got: {}", err);
+        assert!(
+            err.contains("Ambiguous"),
+            "Expected ambiguity error, got: {}",
+            err
+        );
+        assert!(
+            err.contains("2 skills"),
+            "Expected '2 skills' in error, got: {}",
+            err
+        );
     }
 
     #[test]

@@ -27,8 +27,12 @@ fn main() {
 /// different/unrelated repository).
 fn synaps_repo_hash() -> Option<String> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?; // .../crates/agent-tui
-    // Our workspace root is two levels up from this crate dir.
-    let ws_root = Path::new(&manifest).parent()?.parent()?.canonicalize().ok()?;
+                                                              // Our workspace root is two levels up from this crate dir.
+    let ws_root = Path::new(&manifest)
+        .parent()?
+        .parent()?
+        .canonicalize()
+        .ok()?;
 
     // Where does git think the repo root is, starting from here?
     let toplevel = Command::new("git")
@@ -55,7 +59,13 @@ fn synaps_repo_hash() -> Option<String> {
         .filter(|s| !s.is_empty())?;
 
     let dirty = Command::new("git")
-        .args(["-C", &manifest, "status", "--porcelain", "--untracked-files=no"])
+        .args([
+            "-C",
+            &manifest,
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ])
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())

@@ -276,8 +276,12 @@ fn default_log_path() -> Option<std::path::PathBuf> {
 /// File is created 0600 with O_NOFOLLOW (CWE-59 hardening, matching
 /// `HelperMethods::log_usage`).
 pub fn write_record(record: &TelemetryRecord) {
-    let Some(path) = default_log_path() else { return };
-    let Ok(line) = serde_json::to_string(record) else { return };
+    let Some(path) = default_log_path() else {
+        return;
+    };
+    let Ok(line) = serde_json::to_string(record) else {
+        return;
+    };
 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -391,9 +395,18 @@ mod tests {
     #[test]
     fn ratelimit_parses_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("anthropic-ratelimit-requests-limit", "5000".parse().unwrap());
-        headers.insert("anthropic-ratelimit-requests-remaining", "4900".parse().unwrap());
-        headers.insert("anthropic-ratelimit-tokens-reset", "2026-06-11T01:46:00Z".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            "5000".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            "4900".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-tokens-reset",
+            "2026-06-11T01:46:00Z".parse().unwrap(),
+        );
         let r = ratelimit_from_headers(&headers);
         assert_eq!(r.requests_limit, Some(5000));
         assert_eq!(r.requests_remaining, Some(4900));
@@ -404,7 +417,10 @@ mod tests {
     #[test]
     fn ratelimit_ignores_malformed_values() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("anthropic-ratelimit-requests-limit", "not-a-number".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            "not-a-number".parse().unwrap(),
+        );
         let r = ratelimit_from_headers(&headers);
         assert_eq!(r.requests_limit, None);
     }
@@ -446,7 +462,11 @@ mod retry_delay_tests {
         let mut h = reqwest::header::HeaderMap::new();
         h.insert("anthropic-ratelimit-tokens-reset", ts.parse().unwrap());
         let (d, from_hdr) = retry_delay_from_headers(&h, 1);
-        assert!(d.as_secs() >= 28 && d.as_secs() <= 32, "unexpected delay: {:?}", d);
+        assert!(
+            d.as_secs() >= 28 && d.as_secs() <= 32,
+            "unexpected delay: {:?}",
+            d
+        );
         assert!(from_hdr);
     }
 
@@ -504,14 +524,26 @@ mod retry_delay_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let tokens_dt = chrono::DateTime::<chrono::Utc>::from_timestamp((now + 15) as i64, 0).unwrap();
-        let requests_dt = chrono::DateTime::<chrono::Utc>::from_timestamp((now + 45) as i64, 0).unwrap();
+        let tokens_dt =
+            chrono::DateTime::<chrono::Utc>::from_timestamp((now + 15) as i64, 0).unwrap();
+        let requests_dt =
+            chrono::DateTime::<chrono::Utc>::from_timestamp((now + 45) as i64, 0).unwrap();
 
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert("anthropic-ratelimit-tokens-reset", tokens_dt.to_rfc3339().parse().unwrap());
-        h.insert("anthropic-ratelimit-requests-reset", requests_dt.to_rfc3339().parse().unwrap());
+        h.insert(
+            "anthropic-ratelimit-tokens-reset",
+            tokens_dt.to_rfc3339().parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-requests-reset",
+            requests_dt.to_rfc3339().parse().unwrap(),
+        );
         let (d, from_hdr) = retry_delay_from_headers(&h, 1);
-        assert!(d.as_secs() >= 13 && d.as_secs() <= 17, "should be ~15s, got {:?}", d);
+        assert!(
+            d.as_secs() >= 13 && d.as_secs() <= 17,
+            "should be ~15s, got {:?}",
+            d
+        );
         assert!(from_hdr);
     }
 }

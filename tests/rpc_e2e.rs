@@ -52,6 +52,17 @@ impl RpcChild {
     /// `setup` is called with the HOME path **before** the child is spawned,
     /// so callers can plant config files or plugin manifests.
     async fn spawn(args: &[&str], setup: impl FnOnce(&Path)) -> anyhow::Result<Self> {
+        Self::spawn_with_env(args, setup, &[]).await
+    }
+
+    /// Spawn with explicit non-secret runtime configuration. This is the test
+    /// injection seam for dependencies such as a credential broker; production
+    /// credential resolution remains fail-closed.
+    async fn spawn_with_env(
+        args: &[&str],
+        setup: impl FnOnce(&Path),
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
         let home = TempDir::new()?;
         setup(home.path());
 
@@ -100,18 +111,32 @@ impl RpcChild {
             .env_remove("PPLX_API_KEY")
             .env_remove("MISTRAL_API_KEY")
             .env_remove("XAI_API_KEY")
-            .env_remove("DEEPSEEK_API_KEY")
-            .stdin(std::process::Stdio::piped())
+            .env_remove("DEEPSEEK_API_KEY");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()) // keep test output clean
             .kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout_raw = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         let stdout = BufReader::new(stdout_raw);
 
-        Ok(RpcChild { child, stdin, stdout, _home: home })
+        Ok(RpcChild {
+            child,
+            stdin,
+            stdout,
+            _home: home,
+        })
     }
 
     /// Spawn `synaps rpc` reusing an existing HOME directory.
@@ -168,11 +193,22 @@ impl RpcChild {
             .kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout_raw = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         let stdout = BufReader::new(stdout_raw);
 
-        Ok(RpcChild { child, stdin, stdout, _home: dummy_home })
+        Ok(RpcChild {
+            child,
+            stdin,
+            stdout,
+            _home: dummy_home,
+        })
     }
 
     /// Read one line from the child's stdout and parse it as a JSON Value.
@@ -405,9 +441,18 @@ mod tier1 {
         assert_eq!(resp["type"], "response");
         assert_eq!(resp["command"], "get_session_stats");
         assert_eq!(resp["id"], "gss1");
-        assert!(resp["input_tokens"].is_number(), "input_tokens must be number");
-        assert!(resp["output_tokens"].is_number(), "output_tokens must be number");
-        assert!(resp["message_count"].is_number(), "message_count must be number");
+        assert!(
+            resp["input_tokens"].is_number(),
+            "input_tokens must be number"
+        );
+        assert!(
+            resp["output_tokens"].is_number(),
+            "output_tokens must be number"
+        );
+        assert!(
+            resp["message_count"].is_number(),
+            "message_count must be number"
+        );
         assert!(resp["model"].is_string(), "model must be string");
         assert!(resp["session_id"].is_string(), "session_id must be string");
 
@@ -473,7 +518,10 @@ mod tier1 {
         assert_eq!(resp["type"], "response");
         assert_eq!(resp["command"], "abort");
         assert_eq!(resp["id"], "ab1");
-        assert_eq!(resp["ok"], true, "abort with no stream must return ok: true");
+        assert_eq!(
+            resp["ok"], true,
+            "abort with no stream must return ok: true"
+        );
 
         child.shutdown().await.expect("clean shutdown");
     }
@@ -520,12 +568,19 @@ mod tier1 {
 
         // ── Session A ────────────────────────────────────────────────────────
         let dummy_a = TempDir::new().expect("dummy TempDir A");
-        let mut child_a =
-            RpcChild::spawn_with_home(&[], &home_path, dummy_a).await.expect("spawn A");
+        let mut child_a = RpcChild::spawn_with_home(&[], &home_path, dummy_a)
+            .await
+            .expect("spawn A");
         let ready_a = child_a.recv().await.expect("Ready A");
-        assert_eq!(ready_a["type"], "ready", "first frame from A must be 'ready'");
+        assert_eq!(
+            ready_a["type"], "ready",
+            "first frame from A must be 'ready'"
+        );
 
-        let session_id = ready_a["session_id"].as_str().expect("session_id in Ready A").to_string();
+        let session_id = ready_a["session_id"]
+            .as_str()
+            .expect("session_id in Ready A")
+            .to_string();
 
         // Change to a non-default model so we can verify persistence.
         let chosen_model = "claude-opus-4-5";
@@ -580,11 +635,16 @@ mod tier1 {
                 .await
                 .expect("spawn B");
         let ready_b = child_b.recv().await.expect("Ready B");
-        assert_eq!(ready_b["type"], "ready", "first frame from B must be 'ready'");
+        assert_eq!(
+            ready_b["type"], "ready",
+            "first frame from B must be 'ready'"
+        );
 
         // 1. Session identity is preserved.
         assert_eq!(
-            ready_b["session_id"].as_str().expect("session_id in Ready B"),
+            ready_b["session_id"]
+                .as_str()
+                .expect("session_id in Ready B"),
             session_id,
             "session_id must match across --continue restart"
         );
@@ -606,7 +666,10 @@ mod tier1 {
         assert_eq!(gm_resp["command"], "get_messages");
 
         let messages = gm_resp["messages"].as_array().expect("messages array");
-        assert!(!messages.is_empty(), "resumed session must have at least one message");
+        assert!(
+            !messages.is_empty(),
+            "resumed session must have at least one message"
+        );
 
         let has_user_msg = messages.iter().any(|m| {
             m["role"] == "user"
@@ -625,7 +688,6 @@ mod tier1 {
         // shared_home dropped here — after both children are gone.
         drop(shared_home);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -673,8 +735,7 @@ mod tier2 {
 }}
 "#
         );
-        std::fs::write(plugin_dir.join("plugin.json"), manifest)
-            .expect("write plugin.json");
+        std::fs::write(plugin_dir.join("plugin.json"), manifest).expect("write plugin.json");
 
         // Config: activate the extension provider model. The runtime model ID
         // for an extension-backed model is `plugin_id:provider_id:model_id`
@@ -687,14 +748,63 @@ mod tier2 {
         .expect("write config");
     }
 
+    /// Start a minimal authenticated broker fake. The RPC child must cross the
+    /// real HTTP broker boundary before it can reach the extension provider.
+    async fn fake_broker() -> anyhow::Result<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let Ok(n) = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await
+                    else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    let authorized = request.lines().any(|line| {
+                        line.eq_ignore_ascii_case("authorization: Bearer rpc-e2e-machine")
+                    });
+                    let (status, body) = if authorized
+                        && request.starts_with("GET /token?provider=anthropic ")
+                    {
+                        (
+                            "200 OK",
+                            r#"{"access_token":"broker-issued-rpc-e2e-token","expires":4102444800000,"ttl_ms":3600000}"#,
+                        )
+                    } else if !authorized {
+                        ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+                    } else {
+                        ("404 Not Found", r#"{"error":"not found"}"#)
+                    };
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
     /// Spawn a child with the stream-echo provider planted and return (child, ready_frame).
     async fn spawn_with_echo_provider() -> anyhow::Result<(RpcChild, Value)> {
         let fixture = slow_provider_fixture();
-        let mut child = RpcChild::spawn(&[], move |home_path| {
-            let base_dir = home_path.join(".synaps-cli");
-            std::fs::create_dir_all(&base_dir).expect("create base dir");
-            plant_stream_echo_plugin(&base_dir, &fixture);
-        })
+        let broker = fake_broker().await?;
+        let mut child = RpcChild::spawn_with_env(
+            &[],
+            move |home_path| {
+                let base_dir = home_path.join(".synaps-cli");
+                std::fs::create_dir_all(&base_dir).expect("create base dir");
+                plant_stream_echo_plugin(&base_dir, &fixture);
+            },
+            &[
+                ("SYNAPS_AUTH_ENDPOINT", broker.as_str()),
+                ("SYNAPS_MACHINE_TOKEN", "rpc-e2e-machine"),
+            ],
+        )
         .await?;
         let ready = child.recv_timeout(Duration::from_secs(10)).await?;
         Ok((child, ready))
@@ -898,9 +1008,7 @@ mod tier2 {
     #[tokio::test]
     async fn new_session_rejected_while_streaming() {
         if !python3_available() {
-            eprintln!(
-                "skipping tier2::new_session_rejected_while_streaming: python3 unavailable"
-            );
+            eprintln!("skipping tier2::new_session_rejected_while_streaming: python3 unavailable");
             return;
         }
 
@@ -1073,7 +1181,11 @@ mod tier2 {
             .await
             .ok();
         for _ in 0..10 {
-            if child.recv_timeout(Duration::from_millis(300)).await.is_err() {
+            if child
+                .recv_timeout(Duration::from_millis(300))
+                .await
+                .is_err()
+            {
                 break;
             }
         }

@@ -2,10 +2,10 @@
 //! Centralized so the settings dropdown, defaults, and subagent hints agree.
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
-    ("claude-sonnet-4-6",         "Sonnet 4.6 — balanced (default)"),
-    ("claude-fable-5",            "Fable 5 — latest"),
-    ("claude-opus-4-7",           "Opus 4.7 — most capable"),
-    ("claude-opus-4-6",           "Opus 4.6 — previous flagship"),
+    ("claude-sonnet-4-6", "Sonnet 4.6 — balanced (default)"),
+    ("claude-fable-5", "Fable 5 — latest"),
+    ("claude-opus-4-7", "Opus 4.7 — most capable"),
+    ("claude-opus-4-6", "Opus 4.6 — previous flagship"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
 ];
 
@@ -37,7 +37,11 @@ pub fn model_supports_adaptive_thinking(model: &str) -> bool {
         return true;
     }
     // 5.x and beyond — assume adaptive by default.
-    if m.contains("opus-5") || m.contains("sonnet-5") || m.contains("haiku-5") || m.contains("fable-5") {
+    if m.contains("opus-5")
+        || m.contains("sonnet-5")
+        || m.contains("haiku-5")
+        || m.contains("fable-5")
+    {
         return true;
     }
     false
@@ -105,10 +109,13 @@ pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
 pub fn model_supports_1m(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported.
-    m.contains("opus-4-6") || m.contains("opus-4-7")
-        || m.contains("opus-4-8") || m.contains("opus-4-9")
+    m.contains("opus-4-6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4-8")
+        || m.contains("opus-4-9")
         || m.contains("sonnet-4")
-        || m.contains("opus-5") || m.contains("sonnet-5")
+        || m.contains("opus-5")
+        || m.contains("sonnet-5")
         || m.contains("fable-5")
 }
 
@@ -157,7 +164,12 @@ mod tests {
     fn budget_for_thinking_level_round_trips() {
         for budget in [0u32, 2048, 4096, 16384, 32768] {
             let level = thinking_level_for_budget(budget);
-            assert_eq!(budget_for_thinking_level(level), Some(budget), "level {}", level);
+            assert_eq!(
+                budget_for_thinking_level(level),
+                Some(budget),
+                "level {}",
+                level
+            );
         }
         assert_eq!(budget_for_thinking_level("off"), Some(0));
         assert_eq!(budget_for_thinking_level("custom(8192)"), None);
@@ -169,8 +181,14 @@ mod tests {
         assert_eq!(context_window_for_model("claude-opus-4-7"), 200_000);
         assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
         assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for_model("claude-opus-4-5-20251101"), 200_000);
-        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-opus-4-5-20251101"),
+            200_000
+        );
+        assert_eq!(
+            context_window_for_model("claude-haiku-4-5-20251001"),
+            200_000
+        );
     }
 
     #[test]
@@ -202,12 +220,18 @@ mod tests {
 
     #[test]
     fn context_window_haiku_is_200k() {
-        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-haiku-4-5-20251001"),
+            200_000
+        );
     }
 
     #[test]
     fn context_window_opus3_is_200k() {
-        assert_eq!(context_window_for_model("claude-opus-3-5-20250101"), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-opus-3-5-20250101"),
+            200_000
+        );
     }
 
     #[test]
@@ -242,7 +266,9 @@ mod tests {
     fn adaptive_thinking_not_for_older_models() {
         assert!(!model_supports_adaptive_thinking("claude-opus-4-5"));
         assert!(!model_supports_adaptive_thinking("claude-sonnet-4-5"));
-        assert!(!model_supports_adaptive_thinking("claude-haiku-4-5-20251001"));
+        assert!(!model_supports_adaptive_thinking(
+            "claude-haiku-4-5-20251001"
+        ));
         assert!(!model_supports_adaptive_thinking("claude-opus-3-5"));
     }
 

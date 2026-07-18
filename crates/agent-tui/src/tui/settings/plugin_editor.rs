@@ -4,8 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use synaps_cli::extensions::settings_editor::{
-    SettingsEditorCloseParams, SettingsEditorKeyParams,
-    SettingsEditorOpenParams, SettingsEditorRenderParams,
+    SettingsEditorCloseParams, SettingsEditorKeyParams, SettingsEditorOpenParams,
+    SettingsEditorRenderParams,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,8 +20,16 @@ pub(crate) struct PluginEditorSession {
 #[allow(dead_code)]
 pub(crate) enum PluginEditorEffect {
     None,
-    ConfigWrite { plugin_id: String, key: String, value: String },
-    InvokeCommand { plugin_id: String, command: String, args: Vec<String> },
+    ConfigWrite {
+        plugin_id: String,
+        key: String,
+        value: String,
+    },
+    InvokeCommand {
+        plugin_id: String,
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 #[allow(dead_code)]
@@ -34,7 +42,9 @@ pub(crate) fn open_params(category: &str, field: &str) -> SettingsEditorOpenPara
 
 #[allow(dead_code)]
 pub(crate) fn key_params(key: KeyEvent) -> SettingsEditorKeyParams {
-    SettingsEditorKeyParams { key: key_to_wire(key) }
+    SettingsEditorKeyParams {
+        key: key_to_wire(key),
+    }
 }
 
 pub(crate) fn key_to_wire(key: KeyEvent) -> String {
@@ -71,23 +81,32 @@ pub(crate) fn key_to_wire(key: KeyEvent) -> String {
         base
     } else {
         let mut mods = Vec::new();
-        if key.modifiers.contains(KeyModifiers::CONTROL) { mods.push("Ctrl"); }
-        if key.modifiers.contains(KeyModifiers::ALT) { mods.push("Alt"); }
-        if key.modifiers.contains(KeyModifiers::SHIFT) { mods.push("Shift"); }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            mods.push("Ctrl");
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            mods.push("Alt");
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            mods.push("Shift");
+        }
         format!("{}+{}", mods.join("+"), base)
     }
 }
 
 pub(crate) fn render_from_open_result(value: Value) -> Result<SettingsEditorRenderParams, String> {
-    let render = value
-        .get("render")
-        .cloned()
-        .unwrap_or(value);
+    let render = value.get("render").cloned().unwrap_or(value);
     serde_json::from_value(render).map_err(|e| format!("invalid settings.editor.open render: {e}"))
 }
 
-pub(crate) fn render_from_key_result(value: Value) -> Result<Option<SettingsEditorRenderParams>, String> {
-    if value.get("committed").and_then(Value::as_bool).unwrap_or(false) {
+pub(crate) fn render_from_key_result(
+    value: Value,
+) -> Result<Option<SettingsEditorRenderParams>, String> {
+    if value
+        .get("committed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
     let Some(render) = value.get("render").cloned() else {
@@ -223,14 +242,20 @@ pub(crate) fn effect_from_commit_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
+    use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
 
     #[test]
     fn key_to_wire_encodes_navigation_and_modifiers() {
-        assert_eq!(key_to_wire(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), "Down");
-        assert_eq!(key_to_wire(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)), "Ctrl+Char(j)");
+        assert_eq!(
+            key_to_wire(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            "Down"
+        );
+        assert_eq!(
+            key_to_wire(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            "Ctrl+Char(j)"
+        );
     }
 
     #[test]
@@ -239,7 +264,8 @@ mod tests {
             "category": "capture",
             "field": "model_path",
             "render": {"rows": [{"label": "tiny", "data": "download:tiny"}], "cursor": 0}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(render.rows[0].label, "tiny");
         assert_eq!(render.cursor, Some(0));
     }
@@ -249,13 +275,18 @@ mod tests {
         let effect = effect_from_commit(
             "sample-sidecar",
             "model_path",
-            SettingsEditorCommitParams { value: json!("download:base.en") },
+            SettingsEditorCommitParams {
+                value: json!("download:base.en"),
+            },
         );
-        assert_eq!(effect, PluginEditorEffect::InvokeCommand {
-            plugin_id: "sample-sidecar".into(),
-            command: "sample-sidecar".into(),
-            args: vec!["download".into(), "base.en".into()],
-        });
+        assert_eq!(
+            effect,
+            PluginEditorEffect::InvokeCommand {
+                plugin_id: "sample-sidecar".into(),
+                command: "sample-sidecar".into(),
+                args: vec!["download".into(), "base.en".into()],
+            }
+        );
     }
 
     #[test]
@@ -263,12 +294,17 @@ mod tests {
         let effect = effect_from_commit(
             "sample-sidecar",
             "model_path",
-            SettingsEditorCommitParams { value: json!({"kind":"select", "path":"/tmp/ggml.bin"}) },
+            SettingsEditorCommitParams {
+                value: json!({"kind":"select", "path":"/tmp/ggml.bin"}),
+            },
         );
-        assert_eq!(effect, PluginEditorEffect::ConfigWrite {
-            plugin_id: "sample-sidecar".into(),
-            key: "model_path".into(),
-            value: "/tmp/ggml.bin".into(),
-        });
+        assert_eq!(
+            effect,
+            PluginEditorEffect::ConfigWrite {
+                plugin_id: "sample-sidecar".into(),
+                key: "model_path".into(),
+                value: "/tmp/ggml.bin".into(),
+            }
+        );
     }
 }

@@ -1,12 +1,14 @@
-use serde_json::{json, Value};
+use super::{expand_path, Tool, ToolContext};
 use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, expand_path};
+use serde_json::{json, Value};
 
 pub struct ReadTool;
 
 #[async_trait::async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &str { "read" }
+    fn name(&self) -> &str {
+        "read"
+    }
 
     fn description(&self) -> &str {
         "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections."
@@ -34,13 +36,15 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let raw_path = params["path"].as_str()
+        let raw_path = params["path"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
         let path = expand_path(raw_path);
 
         // Read raw bytes first to detect binary files
-        let bytes = tokio::fs::read(&path).await
-            .map_err(|e| RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e)))?;
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
+        })?;
 
         let content = match String::from_utf8(bytes) {
             Ok(s) => s,
@@ -54,7 +58,10 @@ impl Tool for ReadTool {
         let total_lines = lines.len();
 
         let offset = params["offset"].as_u64().unwrap_or(0) as usize;
-        let limit = params["limit"].as_u64().map(|l| l as usize).unwrap_or(500.min(total_lines));
+        let limit = params["limit"]
+            .as_u64()
+            .map(|l| l as usize)
+            .unwrap_or(500.min(total_lines));
 
         let start = offset.min(total_lines);
         let end = (start + limit).min(total_lines);
@@ -73,8 +80,8 @@ impl Tool for ReadTool {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::create_tool_context;
+    use super::*;
     use crate::tools::Tool;
     use serde_json::json;
 

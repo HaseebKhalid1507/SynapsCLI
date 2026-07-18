@@ -1,0 +1,1226 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-fable-5",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-fable-5",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": false,
+      "name": "Claude Fable 5",
+      "object": "model",
+      "policy": {
+        "state": "disabled",
+        "terms": "Enable access to the latest Claude Fable 5 model from Anthropic. [Learn more about how GitHub Copilot serves Claude Fable 5](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-fable-5"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-opus-4.7",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.7",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": false,
+      "name": "Claude Opus 4.7",
+      "object": "model",
+      "policy": {
+        "state": "disabled",
+        "terms": "Enable access to the latest Claude Opus 4.7 model from Anthropic. [Learn more about how GitHub Copilot serves Claude Opus 4.7](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.7"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-opus-4.8-fast",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.8-fast",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": false,
+      "name": "Claude Opus 4.8 (fast mode)",
+      "object": "model",
+      "policy": {
+        "state": "disabled",
+        "terms": "Enable access to the latest Claude Opus 4.8 fast model from Anthropic. [Learn more about how GitHub Copilot serves Claude Opus 4.8 fast](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": true,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.8-fast"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-opus-4.8",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.8",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": false,
+      "name": "Claude Opus 4.8",
+      "object": "model",
+      "policy": {
+        "state": "disabled",
+        "terms": "Enable access to the latest Claude Opus 4.8 model from Anthropic. [Learn more about how GitHub Copilot serves Claude Opus 4.8](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.8"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "individual_trial",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-sonnet-4.6",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-sonnet-4.6",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Claude Sonnet 4.6",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Claude Sonnet 4.6 model from Anthropic. [Learn more about how GitHub Copilot serves Claude Sonnet 4.6](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-sonnet-4.6"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "claude-sonnet-5",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-sonnet-5",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Claude Sonnet 5",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Claude model from Anthropic. [Learn more about how GitHub Copilot serves Claude](https://gh.io/copilot-claude-opus)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-sonnet-5"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "edu",
+          "pro",
+          "pro_plus",
+          "individual_trial",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gemini-3.1-pro-preview",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3.1-pro-preview",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Gemini 3.1 Pro",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Gemini 3 Pro model from Google. [Learn more about how GitHub Copilot serves Gemini 3 Pro](https://docs.github.com/en/copilot/reference/ai-models/model-hosting#google-models)."
+      },
+      "preview": true,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Google",
+      "version": "gemini-3.1-pro-preview"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gemini-3.5-flash",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 24000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3.5-flash",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Gemini 3.5 Flash",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Gemini 3.5 Flash model from Google. [Learn more about how GitHub Copilot serves Gemini 3.5 Flash](https://docs.github.com/en/copilot/reference/ai-models/model-hosting#google-models)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Google",
+      "version": "gemini-3.5-flash"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "edu",
+          "pro_plus",
+          "individual_trial",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.3-codex",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.3-codex",
+      "is_chat_default": false,
+      "is_chat_fallback": true,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.3-Codex",
+      "object": "model",
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.3-codex"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "individual_trial",
+          "edu",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.4-mini",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.4-mini",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5.4 mini",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest GPT-5.4 mini model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.4 mini](https://gh.io/copilot-openai)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.4-mini"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "individual_trial",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.4",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.4",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.4",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest GPT-5.4 model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.4](https://gh.io/copilot-openai)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "/chat/completions",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.4"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.5",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.5",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "powerful",
+      "model_picker_enabled": false,
+      "name": "GPT-5.5",
+      "object": "model",
+      "policy": {
+        "state": "disabled",
+        "terms": "Enable access to the latest GPT-5.5 model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.5](https://gh.io/copilot-openai)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.5"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.6-luna",
+        "limits": {
+          "max_context_window_tokens": 328000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.6-luna",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5.6 Luna",
+      "object": "model",
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.6-luna"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "business",
+          "enterprise",
+          "max"
+        ]
+      },
+      "capabilities": {
+        "family": "gpt-5.6-terra",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.6-terra",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "GPT-5.6 Terra",
+      "object": "model",
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.6-terra"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1
+      },
+      "capabilities": {
+        "family": "trajectory-compaction",
+        "limits": {
+          "max_context_window_tokens": 262144,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 245760
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "trajectory-compaction",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_enabled": false,
+      "name": "Trajectory Compaction",
+      "object": "model",
+      "preview": true,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Experimental",
+      "version": "trajectory-compaction"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1
+      },
+      "capabilities": {
+        "family": "gpt-5-mini",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5-mini",
+      "is_chat_default": true,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5 mini",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest GPT-5 mini model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5 mini](https://gh.io/copilot-openai)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "Azure OpenAI",
+      "version": "gpt-5-mini"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1
+      },
+      "capabilities": {
+        "family": "text-embedding-3-small",
+        "limits": {
+          "max_inputs": 512
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "dimensions": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "embeddings"
+      },
+      "id": "text-embedding-3-small",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_enabled": false,
+      "name": "Embedding V3 small",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "text-embedding-3-small"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1
+      },
+      "capabilities": {
+        "family": "claude-haiku-4.5",
+        "limits": {
+          "max_context_window_tokens": 200000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 32000,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-haiku-4.5",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Claude Haiku 4.5",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Claude Haiku 4.5 model from Anthropic. [Learn more about how GitHub Copilot serves Claude Haiku 4.5](https://gh.io/copilot-anthropic)."
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-haiku-4.5"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1,
+        "restricted_to": [
+          "pro",
+          "pro_plus",
+          "max",
+          "business",
+          "enterprise",
+          "individual_trial",
+          "edu"
+        ]
+      },
+      "capabilities": {
+        "family": "gemini-3-flash",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3-flash-preview",
+      "info_messages": [
+        {
+          "code": "model_pending_deprecation",
+          "message": "Gemini 3 Flash (Preview) has a planned deprecation date of 2026-07-31."
+        }
+      ],
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Gemini 3 Flash (Preview)",
+      "object": "model",
+      "policy": {
+        "state": "enabled",
+        "terms": "Enable access to the latest Gemini 3 Flash model from Google. [Learn more about how GitHub Copilot serves Gemini 3 Flash](https://docs.github.com/en/copilot/reference/ai-models/model-hosting#google-models)"
+      },
+      "preview": true,
+      "vendor": "Google",
+      "version": "gemini-3-flash-preview"
+    },
+    {
+      "billing": {
+        "is_premium": true,
+        "multiplier": 1
+      },
+      "capabilities": {
+        "family": "gpt-4.1",
+        "object": "model_capabilities",
+        "supports": {
+          "streaming": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "completion"
+      },
+      "id": "gpt-41-copilot",
+      "is_chat_default": false,
+      "is_chat_fallback": false,
+      "model_picker_category": "versatile",
+      "model_picker_enabled": false,
+      "name": "GPT-4.1 Copilot",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-41-copilot"
+    }
+  ]
+}

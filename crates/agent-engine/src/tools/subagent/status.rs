@@ -62,6 +62,9 @@ impl Tool for SubagentStatusTool {
         let status_str = status.as_str().to_string();
         let elapsed = handle.elapsed_secs();
         let tool_count = handle.tool_log().len();
+        let model = handle.model.clone();
+        let terminal = handle.terminal_diagnostic();
+        let authorization = handle.authorization.clone();
         let _ = handle;
         drop(reg);
 
@@ -72,13 +75,24 @@ impl Tool for SubagentStatusTool {
             full
         };
 
+        let output_length = partial_output.chars().count();
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            orchestration
+                .poll(&handle_id, &format!("{}:{}", status_str, tool_count))
+                .map_err(RuntimeError::Tool)?;
+        }
+
         let mut resp = json!({
             "handle_id":      handle_id,
             "agent_name":     agent_name,
             "status":         status_str,
             "partial_output": partial_output,
             "elapsed_secs":   (elapsed * 10.0).round() / 10.0,
-            "tool_count":     tool_count
+            "tool_count":     tool_count,
+            "model":          model,
+            "terminal_cause": terminal,
+            "authorization":   authorization,
+            "output_length":  output_length
         });
         if let Some(reason) = status.failure_reason() {
             resp["error"] = json!(reason);

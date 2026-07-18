@@ -6,18 +6,32 @@ use std::process::Command;
 use synaps_cli::{auth, config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthKind {
-    OAuth,
-    ApiKey,
+struct StaticProviderId(&'static str);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginTarget {
+    OAuth(auth::OAuthProviderId),
+    Cloud(auth::CloudProviderId),
+    Static(StaticProviderId),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LoginProvider {
-    key: &'static str,
+    target: LoginTarget,
     name: &'static str,
     description: &'static str,
-    auth_kind: AuthKind,
     recommended: bool,
+}
+
+impl LoginProvider {
+    fn key(self) -> &'static str {
+        match self.target {
+            LoginTarget::OAuth(auth::OAuthProviderId::Anthropic) => "claude",
+            LoginTarget::OAuth(id) => id.as_str(),
+            LoginTarget::Cloud(id) => id.as_str(),
+            LoginTarget::Static(StaticProviderId(key)) => key,
+        }
+    }
 }
 
 const LOGIN_BANNER: &[&str] = &[
@@ -29,7 +43,7 @@ const LOGIN_BANNER: &[&str] = &[
 ];
 const LOGIN_PICKER_PADDING: &str = "  ";
 
-pub async fn run(profile: Option<String>, provider_key: Option<String>) {
+pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Result<(), String> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
@@ -44,9 +58,9 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
                 eprintln!("error: unknown provider '{}'", key);
                 eprintln!("valid provider keys:");
                 for p in &providers {
-                    eprintln!("  {}", p.key);
+                    eprintln!("  {}", p.key());
                 }
-                std::process::exit(1);
+                return Err(format!("unknown provider '{}'", key));
             }
         }
     } else {
@@ -54,18 +68,23 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
             Ok(provider) => provider,
             Err(e) => {
                 eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-                std::process::exit(1);
+                return Err(e);
             }
         }
     };
 
-    match selected.auth_kind {
-        AuthKind::OAuth => run_oauth_login(selected, profile).await,
-        AuthKind::ApiKey => run_api_key_login(selected, profile),
+    match selected.target {
+        LoginTarget::OAuth(id) => run_oauth_login(selected, id, profile).await,
+        LoginTarget::Cloud(id) => run_cloud_login(selected, id, profile).await,
+        LoginTarget::Static(_) => run_api_key_login(selected, profile),
     }
 }
 
-async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
+async fn run_oauth_login(
+    provider: LoginProvider,
+    id: auth::OAuthProviderId,
+    profile: Option<String>,
+) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
@@ -83,11 +102,7 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
         }
     }
 
-    let result = match provider.key {
-        "claude" => auth::login().await,
-        "openai-codex" => auth::login_openai_codex().await,
-        _ => Err(format!("No OAuth login handler for {}", provider.name)),
-    };
+    let result = auth::provider::login(id).await;
 
     match result {
         Ok(creds) => {
@@ -96,23 +111,117 @@ async fn run_oauth_login(provider: LoginProvider, profile: Option<String>) {
             eprintln!("  Expires: {}", format_expiry(creds.expires));
             eprintln!("\n  You can now use SynapsCLI.\n");
             continue_to_main_app(profile);
+            Ok(())
         }
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             eprintln!("  Please try again.\n");
-            std::process::exit(1);
+            Err(e)
         }
     }
 }
 
 fn oauth_storage_key(provider: LoginProvider) -> &'static str {
-    match provider.key {
-        "claude" => "anthropic",
-        other => other,
+    match provider.target {
+        LoginTarget::OAuth(id) => id.as_str(),
+        _ => provider.key(),
     }
 }
 
-fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
+struct TerminalCloudLoginUi;
+
+impl auth::cloud_login::CloudLoginUi for TerminalCloudLoginUi {
+    fn present_challenge(&mut self, challenge: auth::cloud_login::CloudLoginChallenge) {
+        match challenge {
+            auth::cloud_login::CloudLoginChallenge::DeviceCode {
+                verification_uri,
+                user_code,
+            } => eprintln!("Open {verification_uri} and enter code {user_code}"),
+            auth::cloud_login::CloudLoginChallenge::AuthorizationUrl { url } => {
+                eprintln!("Open this URL to authorize:\n{url}")
+            }
+        }
+    }
+
+    fn prompt_config(
+        &mut self,
+        variable: &'static str,
+        label: &'static str,
+    ) -> Result<String, String> {
+        if !io::stdin().is_terminal() {
+            return Err(format!(
+                "non-interactive AWS login requires {variable} or saved broker cloud config"
+            ));
+        }
+        eprint!("{label} ({variable}): ");
+        io::stderr().flush().map_err(|e| e.to_string())?;
+        let mut value = String::new();
+        io::stdin()
+            .read_line(&mut value)
+            .map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    fn select(
+        &mut self,
+        kind: auth::cloud_login::CloudSelectionKind,
+        choices: &[auth::cloud_login::CloudLoginChoice],
+    ) -> Result<String, String> {
+        let name = match kind {
+            auth::cloud_login::CloudSelectionKind::Account => "account",
+            auth::cloud_login::CloudSelectionKind::Role => "role",
+        };
+        if !io::stdin().is_terminal() {
+            return Err(format!(
+                "multiple {name}s; set SYNAPS_AWS_{}",
+                if matches!(kind, auth::cloud_login::CloudSelectionKind::Account) {
+                    "ACCOUNT_ID"
+                } else {
+                    "ROLE_NAME"
+                }
+            ));
+        }
+        eprintln!("Select {name}:");
+        for (i, choice) in choices.iter().enumerate() {
+            eprintln!("  {}. {} {}", i + 1, choice.id, choice.label);
+        }
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        let i: usize = line.trim().parse().map_err(|_| "invalid selection")?;
+        choices
+            .get(i.saturating_sub(1))
+            .map(|v| v.id.clone())
+            .ok_or_else(|| "invalid selection".into())
+    }
+}
+
+async fn run_cloud_login(
+    provider: LoginProvider,
+    id: auth::CloudProviderId,
+    profile: Option<String>,
+) -> Result<(), String> {
+    let mut ui = TerminalCloudLoginUi;
+    let result = auth::cloud_login::login(id, &mut ui).await;
+    match result {
+        Ok(()) => {
+            eprintln!("\n\x1b[32m✓ {} login successful\x1b[0m", provider.name);
+            eprintln!("  Credentials saved to the broker credential store.");
+            continue_to_main_app(profile);
+            Ok(())
+        }
+        Err(message) => {
+            eprintln!(
+                "\n\x1b[31m✗ {} login failed: {}\x1b[0m",
+                provider.name, message
+            );
+            Err(message)
+        }
+    }
+}
+
+fn run_api_key_login(provider: LoginProvider, profile: Option<String>) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
@@ -120,11 +229,14 @@ fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
     eprintln!("║  OpenAI-compatible endpoint          ║");
     eprintln!("╚══════════════════════════════════════╝");
 
-    let config_key = format!("provider.{}", provider.key);
-    if let Some(existing) = config::load_config().provider_keys.get(provider.key) {
+    let config_key = format!("provider.{}", provider.key());
+    if let Some(existing) = config::load_config().provider_keys.get(provider.key()) {
         if !existing.is_empty() {
-            eprintln!("\n\x1b[33m⚠ API key already configured for {}.\x1b[0m", provider.name);
-            eprintln!("  Continuing will replace provider.{}.\n", provider.key);
+            eprintln!(
+                "\n\x1b[33m⚠ API key already configured for {}.\x1b[0m",
+                provider.name
+            );
+            eprintln!("  Continuing will replace provider.{}.\n", provider.key());
         }
     }
 
@@ -136,18 +248,19 @@ fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
         Ok(api_key) => api_key,
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-            std::process::exit(1);
+            return Err(e);
         }
     };
 
     let api_key = api_key.trim();
     if api_key.is_empty() {
         eprintln!("\n\x1b[31m✗ Login failed: API key cannot be empty\x1b[0m");
-        std::process::exit(1);
+        return Err("API key cannot be empty".into());
     }
 
-    save_api_key(&config_key, provider, api_key);
+    save_api_key(&config_key, provider, api_key)?;
     continue_to_main_app(profile);
+    Ok(())
 }
 
 fn read_secret_line() -> Result<String, String> {
@@ -260,49 +373,72 @@ fn launch_main_app_or_exit(profile: Option<String>) -> ! {
     }
 }
 
-fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
-    match config::write_config_value(config_key, api_key) {
+fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) -> Result<(), String> {
+    // Static keys are broker-owned: persist into the broker's credential
+    // store (auth.json, 0600, atomic merge write) rather than the plaintext
+    // config file. Legacy `provider.<key>` config entries keep working via
+    // broker-side discovery/migration.
+    match auth::save_static_key(provider.key(), api_key) {
         Ok(()) => {
             eprintln!("\n\x1b[32m✓ API key saved!\x1b[0m");
-            eprintln!("  Config key: {}", config_key);
-            eprintln!("  Config file: {}", config::resolve_write_path("config").display());
-            eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key);
+            eprintln!("  Provider: {}", provider.key());
+            eprintln!(
+                "  Broker credential store: {}",
+                auth::auth_file_path().display()
+            );
+            eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key());
+            Ok(())
         }
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-            std::process::exit(1);
+            Err(e)
         }
     }
 }
 
 fn find_provider(providers: &[LoginProvider], key: &str) -> Option<LoginProvider> {
     let key_lower = key.to_lowercase();
-    providers.iter().find(|p| p.key.to_lowercase() == key_lower).copied()
+    providers
+        .iter()
+        .find(|p| p.key().to_lowercase() == key_lower)
+        .copied()
 }
 
 fn login_providers() -> Vec<LoginProvider> {
-    let mut providers = vec![LoginProvider {
-        key: "claude",
-        name: "Claude",
-        description: "Claude account OAuth",
-        auth_kind: AuthKind::OAuth,
-        recommended: true,
-    }, LoginProvider {
-        key: "openai-codex",
-        name: "OpenAI Codex",
-        description: "ChatGPT Plus/Pro OAuth",
-        auth_kind: AuthKind::OAuth,
-        recommended: false,
-    }];
+    let mut oauth: Vec<_> = auth::provider::registry().iter().copied().collect();
+    oauth.sort_by_key(|provider| !provider.recommended);
+    let mut providers: Vec<_> = oauth
+        .into_iter()
+        .map(|provider| LoginProvider {
+            target: LoginTarget::OAuth(provider.id),
+            name: provider.display_name,
+            description: provider.description,
+            recommended: provider.recommended,
+        })
+        .collect();
+
+    providers.extend(
+        synaps_cli::auth::cloud::cloud_provider_descriptors()
+            .iter()
+            .map(|provider| LoginProvider {
+                target: LoginTarget::Cloud(provider.id),
+                name: provider.display_name,
+                description: if provider.registration_required {
+                    "typed broker OAuth (registration required)"
+                } else {
+                    "IAM Identity Center + broker-side SigV4"
+                },
+                recommended: false,
+            }),
+    );
 
     providers.extend(
         synaps_cli::runtime::openai::registry::providers()
             .iter()
             .map(|provider| LoginProvider {
-                key: provider.key,
+                target: LoginTarget::Static(StaticProviderId(provider.key)),
                 name: provider.name,
                 description: "API key",
-                auth_kind: AuthKind::ApiKey,
                 recommended: false,
             }),
     );
@@ -375,8 +511,13 @@ fn filtered_provider_indices(providers: &[LoginProvider], query: &str) -> Vec<us
         .iter()
         .enumerate()
         .filter_map(|(idx, provider)| {
-            let haystack =
-                format!("{} {} {}", provider.key, provider.name, provider.description).to_lowercase();
+            let haystack = format!(
+                "{} {} {}",
+                provider.key(),
+                provider.name,
+                provider.description
+            )
+            .to_lowercase();
             haystack.contains(&query).then_some(idx)
         })
         .collect()
@@ -408,19 +549,19 @@ fn render_provider_picker(
     for (row, provider_idx) in visible.iter().enumerate() {
         let provider = providers[*provider_idx];
         let marker = if row == selected { "●" } else { "○" };
-        let suffix = if provider.recommended { " (recommended)" } else { "" };
-        let auth = match provider.auth_kind {
-            AuthKind::OAuth => "oauth",
-            AuthKind::ApiKey => "api key",
+        let suffix = if provider.recommended {
+            " (recommended)"
+        } else {
+            ""
+        };
+        let auth = match provider.target {
+            LoginTarget::OAuth(_) => "oauth",
+            LoginTarget::Cloud(_) => "cloud broker",
+            LoginTarget::Static(_) => "api key",
         };
         eprint!(
             "{}│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
-            LOGIN_PICKER_PADDING,
-            marker,
-            provider.name,
-            suffix,
-            auth,
-            provider.description
+            LOGIN_PICKER_PADDING, marker, provider.name, suffix, auth, provider.description
         );
     }
     eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
@@ -473,8 +614,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_providers_include_all_typed_cloud_descriptors() {
+        let providers = login_providers();
+        for descriptor in auth::cloud::cloud_provider_descriptors() {
+            let provider = find_provider(&providers, descriptor.id.as_str())
+                .expect("cloud descriptor missing");
+            assert_eq!(provider.target, LoginTarget::Cloud(descriptor.id));
+            assert!(auth::cloud_login::supports_login(descriptor.id));
+        }
+    }
+
+    #[test]
     fn relaunch_args_preserve_profile() {
-        assert_eq!(main_app_args(Some("work".to_string())), vec!["--profile", "work"]);
+        assert_eq!(
+            main_app_args(Some("work".to_string())),
+            vec!["--profile", "work"]
+        );
     }
 
     #[test]
@@ -491,7 +646,10 @@ mod tests {
 
     #[test]
     fn relaunch_targets_fallback_to_path_synaps_without_current_exe() {
-        assert_eq!(main_app_launch_targets(None), vec![std::path::PathBuf::from("synaps")]);
+        assert_eq!(
+            main_app_launch_targets(None),
+            vec![std::path::PathBuf::from("synaps")]
+        );
     }
 
     #[test]
@@ -504,11 +662,26 @@ mod tests {
     fn login_providers_include_claude_oauth_first() {
         let providers = login_providers();
 
-        assert_eq!(providers[0].key, "claude");
-        assert_eq!(providers[0].auth_kind, AuthKind::OAuth);
+        assert_eq!(providers[0].key(), "claude");
+        assert_eq!(
+            providers[0].target,
+            LoginTarget::OAuth(auth::OAuthProviderId::Anthropic)
+        );
         assert!(providers[0].recommended);
-        assert_eq!(providers[1].key, "openai-codex");
-        assert_eq!(providers[1].auth_kind, AuthKind::OAuth);
+        // Non-recommended OAuth providers follow; HashMap registry order is not stable.
+        assert!(
+            providers.iter().any(|p| matches!(
+                p.target,
+                LoginTarget::OAuth(auth::OAuthProviderId::OpenAiCodex)
+            )),
+            "openai-codex must remain in the OAuth login list"
+        );
+        assert!(
+            providers
+                .iter()
+                .any(|p| matches!(p.target, LoginTarget::OAuth(auth::OAuthProviderId::Xai))),
+            "xai-auth must remain in the OAuth login list"
+        );
     }
 
     #[test]
@@ -517,10 +690,10 @@ mod tests {
 
         assert!(providers
             .iter()
-            .any(|provider| provider.key == "openrouter" && provider.auth_kind == AuthKind::ApiKey));
-        assert!(providers
-            .iter()
-            .any(|provider| provider.key == "google" && provider.auth_kind == AuthKind::ApiKey));
+            .any(|provider| provider.key() == "openrouter"
+                && matches!(provider.target, LoginTarget::Static(_))));
+        assert!(providers.iter().any(|provider| provider.key() == "google"
+            && matches!(provider.target, LoginTarget::Static(_))));
     }
 
     #[test]
@@ -529,13 +702,71 @@ mod tests {
         let found = find_provider(&providers, "openai-codex");
         assert!(found.is_some());
         let p = found.unwrap();
-        assert_eq!(p.key, "openai-codex");
-        assert_eq!(p.auth_kind, AuthKind::OAuth);
+        assert_eq!(p.key(), "openai-codex");
+        assert_eq!(
+            p.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::OpenAiCodex)
+        );
 
         // case-insensitive
         assert!(find_provider(&providers, "OpenAI-Codex").is_some());
 
         // unknown key returns None
         assert!(find_provider(&providers, "totally-bogus-xyz").is_none());
+    }
+
+    #[test]
+    fn login_providers_include_github_copilot_from_descriptor() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "github-copilot")
+            .expect("descriptor-driven login must surface github-copilot");
+        assert_eq!(found.key(), "github-copilot");
+        assert_eq!(
+            found.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::GitHubCopilot)
+        );
+        assert_eq!(found.name, "GitHub Copilot");
+        assert!(!found.recommended);
+        // Storage key is canonical, not the claude-style alias rewrite.
+        assert_eq!(oauth_storage_key(found), "github-copilot");
+        // CLI aliases resolve through parse_cli_provider; picker key stays canonical.
+        assert!(find_provider(&providers, "copilot").is_none());
+        assert_eq!(
+            auth::provider::parse_cli_provider("copilot")
+                .unwrap()
+                .as_str(),
+            "github-copilot"
+        );
+    }
+
+    #[test]
+    fn login_providers_include_google_gemini_from_descriptor() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "google-gemini")
+            .expect("descriptor-driven login must surface google-gemini");
+        assert_eq!(found.key(), "google-gemini");
+        assert_eq!(
+            found.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::GoogleGemini)
+        );
+        assert_eq!(found.name, "Google Gemini (Code Assist)");
+        assert!(!found.recommended);
+        // Storage key is canonical.
+        assert_eq!(oauth_storage_key(found), "google-gemini");
+        // The static Google AI Studio API-key entry stays reachable at "google".
+        let ai_studio = find_provider(&providers, "google")
+            .expect("Google AI Studio API-key entry must remain reachable");
+        assert_eq!(
+            ai_studio.target,
+            LoginTarget::Static(StaticProviderId("google"))
+        );
+        // CLI aliases route to google-gemini except the reserved "google".
+        assert_eq!(
+            auth::provider::parse_cli_provider("gemini")
+                .unwrap()
+                .as_str(),
+            "google-gemini"
+        );
+        assert!(auth::provider::parse_cli_provider("google").is_err());
     }
 }

@@ -12,14 +12,14 @@
     clippy::await_holding_lock,
     clippy::useless_format,
     clippy::cmp_owned,
-    clippy::items_after_test_module,
+    clippy::items_after_test_module
 )]
 
 use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
-mod watcher;
 mod cmd;
+mod watcher;
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +40,10 @@ struct Cli {
     /// System prompt: a string or path to a file (TUI only).
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
+
+    /// Typed modular prompt manifest (validated offline before session start).
+    #[arg(long = "prompt-manifest", value_name = "PATH")]
+    prompt_manifest: Option<std::path::PathBuf>,
 
     /// Disable all extensions for this session.
     #[arg(long)]
@@ -189,6 +193,11 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Offline modular prompt validation and inspection.
+    Prompt {
+        #[command(subcommand)]
+        action: cmd::prompt::PromptAction,
+    },
     /// Tool-surface utilities (schema export, etc.)
     Tools {
         #[command(subcommand)]
@@ -209,37 +218,100 @@ enum AuthAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Prompt { .. })) {
+        if let Some(Command::Prompt { action }) = cli.command {
+            return cmd::prompt::run(action);
+        }
+        unreachable!();
+    }
     if let Some(ref prof) = cli.profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
     match cli.command {
         None => {
-            tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            tui::run(
+                cli.continue_session,
+                cli.system,
+                cli.prompt_manifest,
+                cli.profile,
+                cli.no_extensions,
+            )
+            .await?;
         }
-        Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
+        Some(Command::Chat {
+            continue_session,
+            system,
+            agent,
+            profile,
+            no_extensions,
+        }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
-        Some(Command::Server { port, host, system, continue_session, token, auto_approve_confirms, allowed_origins }) => {
-            cmd::server::run(port, host, system, continue_session, cli.profile, token, auto_approve_confirms, allowed_origins).await?;
+        Some(Command::Server {
+            port,
+            host,
+            system,
+            continue_session,
+            token,
+            auto_approve_confirms,
+            allowed_origins,
+        }) => {
+            cmd::server::run(
+                port,
+                host,
+                system,
+                continue_session,
+                cli.profile,
+                token,
+                auto_approve_confirms,
+                allowed_origins,
+            )
+            .await?;
         }
-        Some(Command::Agent { config, trigger_context }) => {
+        Some(Command::Agent {
+            config,
+            trigger_context,
+        }) => {
             cmd::agent::run(config, trigger_context).await;
         }
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
         Some(Command::Login { provider }) => {
-            cmd::login::run(cli.profile, provider).await;
+            cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
         Some(Command::Auth { action }) => match action {
-            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider).await,
+            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status) => {
-            cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            cmd::status::run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http }) => {
-            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http).await?;
+        Some(Command::AuthBroker {
+            bind,
+            machine_token,
+            machine_token_file,
+            insecure_no_auth,
+            tls_cert,
+            tls_key,
+            insecure_http,
+        }) => {
+            cmd::auth_broker::run(
+                bind,
+                machine_token,
+                machine_token_file,
+                insecure_no_auth,
+                tls_cert,
+                tls_key,
+                insecure_http,
+            )
+            .await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
@@ -247,14 +319,39 @@ async fn main() -> anyhow::Result<()> {
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
+        Some(Command::Prompt { .. }) => {
+            unreachable!("prompt dispatched before profile initialization")
+        }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
         }
-        Some(Command::Rpc { continue_id, system, model, profile }) => {
+        Some(Command::Rpc {
+            continue_id,
+            system,
+            model,
+            profile,
+        }) => {
             cmd::rpc::run(continue_id, system, model, profile).await?;
         }
-        Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
-            cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
+        Some(Command::Send {
+            message,
+            source,
+            severity,
+            channel,
+            content_type,
+            session,
+            broadcast,
+        }) => {
+            cmd::send::run(
+                message,
+                source,
+                severity,
+                channel,
+                content_type,
+                session,
+                broadcast,
+            )
+            .await?;
         }
     }
     Ok(())

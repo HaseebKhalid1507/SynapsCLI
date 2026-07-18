@@ -74,8 +74,13 @@ pub struct CachedPluginIndexMetadata {
 pub enum SetupStatus {
     #[default]
     NotRequired,
-    Succeeded { log_path: Option<String> },
-    Failed { message: String, log_path: Option<String> },
+    Succeeded {
+        log_path: Option<String>,
+    },
+    Failed {
+        message: String,
+        log_path: Option<String>,
+    },
 }
 
 impl SetupStatus {

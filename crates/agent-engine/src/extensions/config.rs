@@ -195,10 +195,7 @@ mod tests {
     #[test]
     fn redact_long() {
         assert_eq!(redact_secret_value("abc12345"), "***2345");
-        assert_eq!(
-            redact_secret_value("abcdefghijklmnopqrst"),
-            "***qrst"
-        );
+        assert_eq!(redact_secret_value("abcdefghijklmnopqrst"), "***qrst");
         // sanity: never contains the full value beyond the tail
         let s = redact_secret_value("supersecretvalue1234");
         assert!(s.starts_with("***"));
@@ -254,7 +251,11 @@ mod tests {
     fn classify_plugin_config() {
         let e = entry("api-key");
         let plugin = |k: &str| {
-            if k == "api-key" { Some("v".to_string()) } else { None }
+            if k == "api-key" {
+                Some("v".to_string())
+            } else {
+                None
+            }
         };
         let status = classify_config_entry("my-ext", &e, &empty_lookup, &plugin, &empty_lookup);
         assert_eq!(status.source, ConfigSource::PluginConfig);
@@ -283,7 +284,8 @@ mod tests {
     fn classify_default() {
         let mut e = entry("region");
         e.default = Some(Value::String("us-east-1".to_string()));
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
+        let status =
+            classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Default);
         assert!(status.has_value);
     }
@@ -292,7 +294,8 @@ mod tests {
     fn classify_missing() {
         let mut e = entry("api-key");
         e.required = true;
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
+        let status =
+            classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Missing);
         assert!(!status.has_value);
         assert!(status.required);
@@ -348,7 +351,8 @@ mod tests {
     fn default_only_when_no_env_or_config() {
         let mut e = entry("region");
         e.default = Some(Value::String("us-east-1".to_string()));
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
+        let status =
+            classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Default);
     }
 

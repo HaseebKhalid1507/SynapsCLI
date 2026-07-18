@@ -49,9 +49,7 @@ pub(super) fn setup_terminal(caps: Option<&TermCaps>) -> synaps_cli::Result<Term
         EnableMouseCapture,
         EnableBracketedPaste
     )
-    .map_err(|e| {
-        synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e))
-    })?;
+    .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     // Best-effort: enable the kitty keyboard protocol so modifier-heavy
     // chords (Ctrl+Alt+V, Ctrl+Shift+letter, etc.) report correctly on
     // terminals that support it (kitty, wezterm, foot, iterm2, alacritty).
@@ -122,18 +120,32 @@ mod kitty_gate_tests {
         // Default caps carry no DA1 fence ⇒ still push (= today).
         let caps = TermCaps::default();
         assert!(!caps.da1_answered);
-        assert!(kitty_push_enabled(Some(&caps)), "no fence ⇒ blind push (= today)");
+        assert!(
+            kitty_push_enabled(Some(&caps)),
+            "no fence ⇒ blind push (= today)"
+        );
     }
 
     #[test]
     fn negotiated_kitty_support_pushes() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: true, ..TermCaps::default() };
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: true,
+            ..TermCaps::default()
+        };
         assert!(kitty_push_enabled(Some(&caps)));
     }
 
     #[test]
     fn negotiated_no_kitty_skips_push() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: false, ..TermCaps::default() };
-        assert!(!kitty_push_enabled(Some(&caps)), "kitty negotiated off ⇒ no push");
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: false,
+            ..TermCaps::default()
+        };
+        assert!(
+            !kitty_push_enabled(Some(&caps)),
+            "kitty negotiated off ⇒ no push"
+        );
     }
 }

@@ -2,14 +2,14 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
+use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
-use std::sync::LazyLock;
 
+use super::text_metrics::{char_width, width as display_width};
 use super::theme::THEME;
-use super::text_metrics::{width as display_width, char_width};
 
 /// Clamp a `Line` to fit within `width` terminal columns.
 /// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
@@ -116,7 +116,8 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
 
-    let syntax = ss.find_syntax_by_token(lang)
+    let syntax = ss
+        .find_syntax_by_token(lang)
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
     let mut h = HighlightLines::new(syntax, theme);
@@ -133,7 +134,10 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
             let content = text.trim_end_matches('\n').to_string();
             if !content.is_empty() {
-                spans.push(Span::styled(content, Style::default().fg(fg).bg(THEME.load().code_bg)));
+                spans.push(Span::styled(
+                    content,
+                    Style::default().fg(fg).bg(THEME.load().code_bg),
+                ));
             }
         }
         lines.push(Line::from(spans));
@@ -143,13 +147,20 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
 
 /// Try to syntax-highlight a single tool output line.
 /// Highlight code lines for tool params (write content, edit old/new) — clean style matching read output
-pub(crate) fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, marker_color: Color) -> Vec<Line<'static>> {
+pub(crate) fn highlight_tool_code(
+    lines: &[&str],
+    ext: &str,
+    margin: &str,
+    marker: &str,
+    marker_color: Color,
+) -> Vec<Line<'static>> {
     note_highlight_call();
     let ss = &*SYNTAX_SET;
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
 
-    let syntax = ss.find_syntax_by_extension(ext)
+    let syntax = ss
+        .find_syntax_by_extension(ext)
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
     let mut h = HighlightLines::new(syntax, theme);
@@ -157,21 +168,19 @@ pub(crate) fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marke
 
     // Determine tint based on marker (red for old, green for new, neutral for content)
     let tint = match marker {
-        "−" => (40i16, -60i16, -60i16),     // shift toward red: boost red, crush green/blue
-        "+" => (-15i16, 10i16, -15i16),      // shift toward green: reduce red/blue
-        _ => (0i16, 0i16, 0i16),             // neutral for write content
+        "−" => (40i16, -60i16, -60i16), // shift toward red: boost red, crush green/blue
+        "+" => (-15i16, 10i16, -15i16), // shift toward green: reduce red/blue
+        _ => (0i16, 0i16, 0i16),        // neutral for write content
     };
 
     for (i, line) in lines.iter().enumerate() {
         let code_with_nl = format!("{}\n", line);
         let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
 
-        let mut spans = vec![
-            Span::styled(
-                format!("{}    {:>3} {} ", margin, i + 1, marker),
-                Style::default().fg(marker_color),
-            ),
-        ];
+        let mut spans = vec![Span::styled(
+            format!("{}    {:>3} {} ", margin, i + 1, marker),
+            Style::default().fg(marker_color),
+        )];
         for (sty, text) in ranges {
             let r = (sty.foreground.r as i16 + tint.0).clamp(0, 255) as u8;
             let g = (sty.foreground.g as i16 + tint.1).clamp(0, 255) as u8;
@@ -196,9 +205,10 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         // Replace tabs with spaces — ratatui doesn't handle \t correctly and causes overlap artifacts
         let line = raw_line.replace('\t', "    ");
         let trimmed = line.trim();
-        let mut spans = vec![
-            Span::styled(format!("{}       ", margin), Style::default().fg(THEME.load().tool_result_color)),
-        ];
+        let mut spans = vec![Span::styled(
+            format!("{}       ", margin),
+            Style::default().fg(THEME.load().tool_result_color),
+        )];
 
         if trimmed.is_empty() {
             result.push(Line::from(spans));
@@ -209,14 +219,28 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         let lc = trimmed.to_ascii_lowercase();
         if lc.starts_with("error") || lc.starts_with("fatal") {
             // Errors → red
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().error_color)));
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(THEME.load().error_color),
+            ));
         } else if lc.starts_with("warning") || lc.starts_with("warn") {
             // Warnings → yellow
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().warning_color)));
-        } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")
-            || trimmed.starts_with("done") || trimmed.starts_with("Done") || trimmed.starts_with("success") {
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(THEME.load().warning_color),
+            ));
+        } else if trimmed.starts_with("✅")
+            || trimmed.starts_with("ok")
+            || trimmed.starts_with("OK")
+            || trimmed.starts_with("done")
+            || trimmed.starts_with("Done")
+            || trimmed.starts_with("success")
+        {
             // Success → green with blue tint
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().tool_result_ok)));
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(THEME.load().tool_result_ok),
+            ));
         } else {
             // Default: blue-tinted with smart coloring
             let mut remaining = line.as_str();
@@ -227,7 +251,8 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                     if slash_pos > 0 {
                         let before = &remaining[..slash_pos];
                         // Find the start of the path (walk back to whitespace)
-                        let path_start = before.rfind(|c: char| c.is_whitespace())
+                        let path_start = before
+                            .rfind(|c: char| c.is_whitespace())
                             .map(|p| p + before[p..].chars().next().unwrap().len_utf8())
                             .unwrap_or(0);
                         if path_start > 0 {
@@ -238,11 +263,16 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         }
                         // Path portion
                         let after_slash = &remaining[path_start..];
-                        let path_end = after_slash.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
+                        let path_end = after_slash
+                            .find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
                             .unwrap_or(after_slash.len());
                         // Guard: if path_end is 0, we'd loop forever — consume at least 1 char
                         if path_end == 0 {
-                            let first_char_len = after_slash.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            let first_char_len = after_slash
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(1);
                             spans.push(Span::styled(
                                 after_slash[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
@@ -256,11 +286,13 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                             remaining = &after_slash[path_end..];
                         }
                     } else {
-                        let path_end = remaining.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
+                        let path_end = remaining
+                            .find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
                             .unwrap_or(remaining.len());
                         // Guard: if path_end is 0, consume at least 1 char to avoid infinite loop
                         if path_end == 0 {
-                            let first_char_len = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            let first_char_len =
+                                remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                             spans.push(Span::styled(
                                 remaining[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
@@ -313,16 +345,32 @@ pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Sp
     }
 
     let sep_char = rest.as_bytes()[second_sep] as char;
-    let content = if second_sep + 1 < rest.len() { &rest[second_sep + 1..] } else { "" };
+    let content = if second_sep + 1 < rest.len() {
+        &rest[second_sep + 1..]
+    } else {
+        ""
+    };
 
     let is_context = sep_char == '-';
 
     Some(vec![
-        Span::styled(format!("{}       ", margin), Style::default().fg(THEME.load().tool_result_color)),
-        Span::styled(filepath.to_string(), Style::default().fg(THEME.load().tool_label)),
+        Span::styled(
+            format!("{}       ", margin),
+            Style::default().fg(THEME.load().tool_result_color),
+        ),
+        Span::styled(
+            filepath.to_string(),
+            Style::default().fg(THEME.load().tool_label),
+        ),
         Span::styled(":", Style::default().fg(THEME.load().muted)),
-        Span::styled(linenum.to_string(), Style::default().fg(THEME.load().list_bullet_color)),
-        Span::styled(format!("{}", sep_char), Style::default().fg(THEME.load().muted)),
+        Span::styled(
+            linenum.to_string(),
+            Style::default().fg(THEME.load().list_bullet_color),
+        ),
+        Span::styled(
+            format!("{}", sep_char),
+            Style::default().fg(THEME.load().muted),
+        ),
         Span::styled(
             content.to_string(),
             if is_context {
@@ -336,15 +384,21 @@ pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Sp
 
 /// Check if tool output looks like read tool output (line-numbered with tabs)
 pub(crate) fn is_read_tool_output(lines: &[&str]) -> bool {
-    if lines.is_empty() { return false; }
+    if lines.is_empty() {
+        return false;
+    }
     // Check first few non-empty lines for "number\tcontent" pattern
     let mut checked = 0;
     let mut matches = 0;
     for line in lines.iter().take(10) {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         checked += 1;
         if let Some(tab_idx) = line.find('\t') {
-            if line[..tab_idx].trim().chars().all(|c| c.is_ascii_digit()) && !line[..tab_idx].trim().is_empty() {
+            if line[..tab_idx].trim().chars().all(|c| c.is_ascii_digit())
+                && !line[..tab_idx].trim().is_empty()
+            {
                 matches += 1;
             }
         }
@@ -353,14 +407,19 @@ pub(crate) fn is_read_tool_output(lines: &[&str]) -> bool {
 }
 
 /// Highlight read tool output as a code block using syntect
-pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> Option<Vec<Line<'static>>> {
+pub(crate) fn highlight_read_output(
+    lines: &[&str],
+    ext: &str,
+    margin: &str,
+) -> Option<Vec<Line<'static>>> {
     note_highlight_call();
     let ss = &*SYNTAX_SET;
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
 
     let syntax = if !ext.is_empty() {
-        ss.find_syntax_by_extension(ext).unwrap_or_else(|| ss.find_syntax_plain_text())
+        ss.find_syntax_by_extension(ext)
+            .unwrap_or_else(|| ss.find_syntax_plain_text())
     } else {
         ss.find_syntax_plain_text()
     };
@@ -385,12 +444,10 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
         let code_with_nl = format!("{}\n", code);
         let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
 
-        let mut spans = vec![
-            Span::styled(
-                format!("{}     {:>4} \u{2502} ", margin, line_num),
-                Style::default().fg(THEME.load().muted),
-            ),
-        ];
+        let mut spans = vec![Span::styled(
+            format!("{}     {:>4} \u{2502} ", margin, line_num),
+            Style::default().fg(THEME.load().muted),
+        )];
         for (sty, text) in ranges {
             // Slight cool tint for read output to differentiate from edit
             let r = (sty.foreground.r as i16 - 5).clamp(0, 255) as u8;
@@ -408,11 +465,13 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
     Some(result)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{style::Style, text::{Line, Span}};
+    use ratatui::{
+        style::Style,
+        text::{Line, Span},
+    };
 
     #[test]
     fn clamp_line_truncates_by_display_width_not_char_count() {

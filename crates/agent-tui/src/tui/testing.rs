@@ -445,6 +445,7 @@ impl TestHarness {
         match self.app.modal_stack.top() {
             PaneId::Chat => "chat",
             PaneId::HelpFind => "help-find",
+            PaneId::Effort => "effort",
             PaneId::Models => "models",
             PaneId::Plugins => "plugins",
             PaneId::Settings => "settings",
@@ -565,7 +566,8 @@ impl TestHarness {
     /// Begin a streaming tool call — drives the store's real
     /// `on_tool_use_start` routing, exactly as the stream handler does.
     pub fn tool_use_start(&mut self, tool_id: &str, tool_name: &str) -> &mut Self {
-        self.app.on_tool_use_start(tool_id.to_string(), tool_name.to_string());
+        self.app
+            .on_tool_use_start(tool_id.to_string(), tool_name.to_string());
         self
     }
 
@@ -589,8 +591,8 @@ impl TestHarness {
     /// Publish a toast with an explicit TTL (seconds) through the same
     /// provider the app uses. Expiry is governed by the frozen clock.
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
-        let toast = super::toast::Toast::new(id, text)
-            .ttl(Some(std::time::Duration::from_secs(ttl_secs)));
+        let toast =
+            super::toast::Toast::new(id, text).ttl(Some(std::time::Duration::from_secs(ttl_secs)));
         self.app.toasts.upsert(toast);
         self
     }
@@ -616,6 +618,13 @@ impl TestHarness {
     /// Number of currently-live toasts.
     pub fn toast_count(&self) -> usize {
         self.app.toasts.visible().count()
+    }
+
+    /// Force the app's streaming flag — lets scenarios exercise the
+    /// streaming-input command refusal path without a live engine stream.
+    pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {
+        self.app.streaming = streaming;
+        self
     }
 
     // ── Bounded async slash drive (P6.3) ─────────────────────────────────────
@@ -687,6 +696,18 @@ impl TestHarness {
                 ));
                 self.app.modal_stack.push(super::focus::PaneId::HelpFind);
             }
+            CommandAction::OpenEffort => {
+                // Mirrors the dispatch OpenEffort arm (idle path — the
+                // harness has no live stream; streaming refusal is exercised
+                // via the streaming-input route).
+                if !self.app.streaming {
+                    self.app.effort = Some(super::effort::EffortModalState::new(
+                        self.runtime.model(),
+                        self.runtime.thinking_level(),
+                    ));
+                    self.app.modal_stack.push(super::focus::PaneId::Effort);
+                }
+            }
             CommandAction::OpenModels => {
                 self.app.models = Some(super::models::ModelsModalState::new());
                 self.app.modal_stack.push(super::focus::PaneId::Models);
@@ -728,7 +749,8 @@ impl TestHarness {
     }
 
     fn record_unexecuted(&mut self, name: &str) {
-        self.actions.push(format!("command-action-unexecuted:{name}"));
+        self.actions
+            .push(format!("command-action-unexecuted:{name}"));
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
@@ -751,11 +773,19 @@ impl TestHarness {
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
+            InputAction::EffortApply(apply) => format!(
+                "effort-apply:{}:{}:{}",
+                apply.model, apply.generation, apply.value
+            ),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),
-            InputAction::PluginEditorOpen { plugin_id, category, field } => {
+            InputAction::PluginEditorOpen {
+                plugin_id,
+                category,
+                field,
+            } => {
                 format!("plugin-editor-open:{plugin_id}:{category}:{field}")
             }
             InputAction::PluginEditorKey { plugin_id, .. } => {

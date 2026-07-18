@@ -83,10 +83,7 @@ pub fn append_audit_entry(entry: &ProviderAuditEntry) -> Result<(), String> {
 }
 
 /// Append an entry under an explicit base dir.
-pub(crate) fn append_audit_entry_to(
-    base: &Path,
-    entry: &ProviderAuditEntry,
-) -> Result<(), String> {
+pub(crate) fn append_audit_entry_to(base: &Path, entry: &ProviderAuditEntry) -> Result<(), String> {
     let path = audit_file_path_for(base);
     let parent = path
         .parent()
@@ -204,9 +201,7 @@ pub fn read_audit_entries() -> Result<Vec<ProviderAuditEntry>, String> {
 }
 
 /// Read entries under an explicit base dir.
-pub(crate) fn read_audit_entries_from(
-    base: &Path,
-) -> Result<Vec<ProviderAuditEntry>, String> {
+pub(crate) fn read_audit_entries_from(base: &Path) -> Result<Vec<ProviderAuditEntry>, String> {
     let path = audit_file_path_for(base);
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -375,7 +370,10 @@ mod tests {
         assert_eq!(entry.observed_len, 45_000);
         assert_eq!(entry.replacement_len, 6_080);
         // Privacy: the record carries sizes, never tool content.
-        assert!(!raw.contains("tool_output"), "audit line must not carry content");
+        assert!(
+            !raw.contains("tool_output"),
+            "audit line must not carry content"
+        );
     }
 
     #[test]
@@ -419,16 +417,7 @@ mod tests {
 
     #[test]
     fn new_audit_entry_produces_rfc3339_timestamp() {
-        let e = new_audit_entry(
-            "plug",
-            "prov",
-            "model",
-            true,
-            0,
-            false,
-            "ok",
-            None,
-        );
+        let e = new_audit_entry("plug", "prov", "model", true, 0, false, "ok", None);
         // Year-4-digits + 'T' separator + tz suffix ('Z' or '+'/'-' offset).
         let ts = &e.timestamp;
         assert!(ts.len() >= 20, "timestamp too short: {ts}");

@@ -24,14 +24,22 @@ impl PluginUpdateDiff {
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some((old, new)) = &self.version_change {
-            lines.push(format!("version: {} -> {}", old.as_deref().unwrap_or("unspecified"), new.as_deref().unwrap_or("unspecified")));
+            lines.push(format!(
+                "version: {} -> {}",
+                old.as_deref().unwrap_or("unspecified"),
+                new.as_deref().unwrap_or("unspecified")
+            ));
         }
         push_list(&mut lines, "added permissions", &self.added_permissions);
         push_list(&mut lines, "removed permissions", &self.removed_permissions);
         push_list(&mut lines, "added hooks", &self.added_hooks);
         push_list(&mut lines, "removed hooks", &self.removed_hooks);
         if let Some((old, new)) = &self.extension_command_change {
-            lines.push(format!("extension command: {} -> {}", old.as_deref().unwrap_or("none"), new.as_deref().unwrap_or("none")));
+            lines.push(format!(
+                "extension command: {} -> {}",
+                old.as_deref().unwrap_or("none"),
+                new.as_deref().unwrap_or("none")
+            ));
         }
         push_list(&mut lines, "added config keys", &self.added_config_keys);
         push_list(&mut lines, "removed config keys", &self.removed_config_keys);
@@ -56,8 +64,16 @@ pub fn diff_plugin_manifests(old: &PluginManifest, new: &PluginManifest) -> Plug
         diff.version_change = Some((old.version.clone(), new.version.clone()));
     }
 
-    let old_permissions = old.extension.as_ref().map(|e| e.permissions.clone()).unwrap_or_default();
-    let new_permissions = new.extension.as_ref().map(|e| e.permissions.clone()).unwrap_or_default();
+    let old_permissions = old
+        .extension
+        .as_ref()
+        .map(|e| e.permissions.clone())
+        .unwrap_or_default();
+    let new_permissions = new
+        .extension
+        .as_ref()
+        .map(|e| e.permissions.clone())
+        .unwrap_or_default();
     diff.added_permissions = added(&old_permissions, &new_permissions);
     diff.removed_permissions = added(&new_permissions, &old_permissions);
 
@@ -138,7 +154,8 @@ mod tests {
 
     #[test]
     fn reports_permission_hook_command_config_and_version_changes() {
-        let old = manifest(r#"{
+        let old = manifest(
+            r#"{
           "name":"policy-test",
           "version":"0.1.0",
           "commands":[{"name":"old-cmd","command":"printf"}],
@@ -151,8 +168,10 @@ mod tests {
             "hooks":[{"hook":"before_tool_call"}],
             "config":[{"key":"endpoint"}]
           }
-        }"#);
-        let new = manifest(r#"{
+        }"#,
+        );
+        let new = manifest(
+            r#"{
           "name":"policy-test",
           "version":"0.2.0",
           "commands":[{"name":"new-cmd","command":"printf"}],
@@ -165,13 +184,20 @@ mod tests {
             "hooks":[{"hook":"before_tool_call"},{"hook":"on_message_complete"}],
             "config":[{"key":"api_key"}]
           }
-        }"#);
+        }"#,
+        );
 
         let diff = diff_plugin_manifests(&old, &new);
-        assert_eq!(diff.version_change, Some((Some("0.1.0".into()), Some("0.2.0".into()))));
+        assert_eq!(
+            diff.version_change,
+            Some((Some("0.1.0".into()), Some("0.2.0".into())))
+        );
         assert_eq!(diff.added_permissions, vec!["privacy.llm_content"]);
         assert_eq!(diff.added_hooks, vec!["on_message_complete"]);
-        assert_eq!(diff.extension_command_change, Some((Some("python3 old.py".into()), Some("python3 new.py".into()))));
+        assert_eq!(
+            diff.extension_command_change,
+            Some((Some("python3 old.py".into()), Some("python3 new.py".into())))
+        );
         assert_eq!(diff.added_config_keys, vec!["api_key"]);
         assert_eq!(diff.removed_config_keys, vec!["endpoint"]);
         assert_eq!(diff.added_commands, vec!["new-cmd"]);

@@ -247,9 +247,7 @@ fn extract_throughput(rest: &str) -> Option<String> {
 /// since git uses `\r` to overwrite the same line.
 #[cfg(test)]
 pub fn split_progress_chunks(buf: &str) -> Vec<&str> {
-    buf.split(['\r', '\n'])
-        .filter(|s| !s.is_empty())
-        .collect()
+    buf.split(['\r', '\n']).filter(|s| !s.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -267,8 +265,7 @@ mod tests {
 
     #[test]
     fn parses_compressing_done_line() {
-        let p =
-            parse_progress_line("remote: Compressing objects: 100% (258/258), done.").unwrap();
+        let p = parse_progress_line("remote: Compressing objects: 100% (258/258), done.").unwrap();
         assert_eq!(p.phase, ClonePhase::Compressing);
         assert_eq!(p.percent, Some(100));
         assert_eq!(p.counts, Some((258, 258)));

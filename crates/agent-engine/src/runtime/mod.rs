@@ -17,6 +17,8 @@ mod auth;
 #[cfg(test)]
 mod body_golden;
 pub mod compaction;
+pub mod google_gemini;
+pub mod google_vertex;
 pub(crate) mod helpers;
 pub mod openai;
 mod request;
@@ -198,13 +200,38 @@ pub async fn emit_after_tool_call(
 
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
+#[derive(Clone)]
+struct PromptReloadSource {
+    manifest: PathBuf,
+    context: agent_core::prompt::SelectionContext,
+    user_module: Option<agent_core::prompt::PromptModule>,
+    delegation_policy_digest: Option<String>,
+}
+
 pub struct Runtime {
     client: Client,
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
+    /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
+    effective_prompt: Option<agent_core::prompt::PromptStack>,
+    prompt_generation: u64,
+    /// Inputs retained from boot so callable reloads compile the same manifest selection.
+    prompt_reload_source: Option<PromptReloadSource>,
     thinking_budget: u32,
+    /// Named reasoning level — canonical for Codex and future providers.
+    /// When set, overrides what `thinking_level()` returns. For legacy
+    /// Anthropic models this is derived from `thinking_budget` at read time.
+    named_level: Option<agent_core::reasoning::ReasoningLevel>,
+    /// True when the user has explicitly chosen a reasoning level (via command
+    /// or config). False for derived/default values applied by set_model or
+    /// session restore. Controls whether set_model overwrites the level with
+    /// the new model's default.
+    explicit_reasoning: bool,
+    /// Foreground by default; central subagent construction marks Worker so
+    /// logical Ultra can never recursively activate proactive orchestration.
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     /// User override for context window size (tokens). When set, takes
     /// precedence over the model's auto-detected window from
     /// `models::context_window_for_model`. Lets users cap context at e.g.
@@ -214,6 +241,8 @@ pub struct Runtime {
     compaction_model: Option<String>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    /// Session-scoped orchestration enforcement installed during boot.
+    orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     /// Shared event queue — for Event Bus tooling.
     event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
@@ -259,18 +288,62 @@ pub struct Runtime {
     /// In-memory cache of broker-fetched access tokens (Remote source only).
     /// Cheap to clone (Arc inside). Never persisted to disk.
     token_cache: crate::auth::TokenCache,
+    /// Exact operator-trusted worker identities loaded from `favorite_models`.
+    /// These seed the session policy and are replayed when a manifestless
+    /// foreground model change replaces that policy snapshot.
+    trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+}
+
+/// Idle timeout for the runtime HTTP client: how long a request may go
+/// without receiving *any* bytes (headers or body chunks) before it is
+/// killed. Resets on every received chunk, so healthy long-running streams
+/// are never interrupted.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Build the runtime's shared HTTP client.
+///
+/// Timeout design (incident: session 20260714-025948-3dab):
+/// * `connect_timeout(10s)` — connection-establishment ceiling.
+/// * `read_timeout` — **idle** detector; resets after each successful read
+///   (reqwest `ReadTimeoutBody`). A hung request surfaces in seconds
+///   instead of minutes, while an actively-streaming turn can run
+///   indefinitely.
+/// * Deliberately **no** total `.timeout(…)`: that was a wall-clock
+///   deadline that kept ticking while bytes flowed, killing any healthy
+///   stream longer than 300s and taking 300s to notice a dead connection.
+///   Turn-level lifecycle is owned by cancellation tokens, not the client.
+fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .build()
+}
+
+/// Preserve compatibility with favorite IDs written before Anthropic used its
+/// runtime-qualified provider name. Authorization always stores the canonical
+/// exact identity; unrelated bare values remain invalid and are ignored.
+fn canonical_trusted_worker_model(model: &str) -> String {
+    let model = model.trim();
+    if let Some(id) = model.strip_prefix("claude/") {
+        format!("anthropic/{id}")
+    } else if model.starts_with("claude-") {
+        format!("anthropic/{model}")
+    } else {
+        model.to_owned()
+    }
 }
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
-        let (auth_token, auth_type, refresh_token, token_expires) = AuthMethods::get_auth_token()?;
+        // Runtime construction is credential-blind. Credentials are acquired
+        // lazily through the broker abstraction after configuration is applied;
+        // this layer never opens auth.json or consults a secret environment var.
+        let (auth_token, auth_type, refresh_token, token_expires) =
+            (String::new(), "oauth".to_string(), None, Some(0));
 
-        let client = Client::builder()
-            .tls_built_in_webpki_certs(true)
-            .tls_built_in_native_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
+        let client = build_http_client(HTTP_READ_TIMEOUT)
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
         let session_manager = {
@@ -294,12 +367,19 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
+            effective_prompt: None,
+            prompt_generation: 0,
+            prompt_reload_source: None,
             thinking_budget: 4096,
+            named_level: None,
+            explicit_reasoning: false,
+            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
+            orchestration: None,
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -320,6 +400,7 @@ impl Runtime {
             reaper_cancel: Some(cancel),
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
+            trusted_worker_models: Vec::new(),
         })
     }
 
@@ -335,12 +416,7 @@ impl Runtime {
     /// which is the correct behavior for a harness that only drives the UI.
     #[cfg(any(test, feature = "testing"))]
     pub fn new_headless() -> Self {
-        let client = Client::builder()
-            .tls_built_in_webpki_certs(true)
-            .tls_built_in_native_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
+        let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
 
         let session_manager = {
@@ -359,12 +435,19 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
+            effective_prompt: None,
+            prompt_generation: 0,
+            prompt_reload_source: None,
             thinking_budget: 4096,
+            named_level: None,
+            explicit_reasoning: false,
+            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
+            orchestration: None,
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -385,6 +468,7 @@ impl Runtime {
             reaper_cancel: None,
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
+            trusted_worker_models: Vec::new(),
         }
     }
 
@@ -396,27 +480,246 @@ impl Runtime {
         self.system_prompt.as_deref()
     }
 
-    pub fn set_model(&mut self, model: String) {
-        // Strip any health/status prefix (e.g. "✅  339ms  groq/..." → "groq/...")
-        let cleaned = if let Some(pos) = model.find("claude-") {
-            model[pos..].to_string()
-        } else if let Some(pos) = model.find('/') {
-            let before = &model[..pos];
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                .map(|i| {
-                    i + before[i..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(1)
-                })
-                .unwrap_or(0);
-            model[key_start..].to_string()
-        } else {
-            model
+    /// The system prompt that actually goes on the wire for the next
+    /// request: the configured base plus any builtin orchestration adapter
+    /// (see [`agent_core::prompt::builtin_orchestration_adapters`]) selected
+    /// by the *current* model identity, so the doctrine follows mid-session
+    /// model switches. Composition is skipped when:
+    /// - a typed prompt manifest is active — the manifest author owns the
+    ///   full stack;
+    /// - the runtime exposes no subagent tools (worker runtimes) — the
+    ///   doctrine would be unactionable noise;
+    /// - the model identity cannot be canonicalized — fail closed to the
+    ///   unmodified base.
+    pub async fn effective_system_prompt(&self) -> Option<String> {
+        if self.effective_prompt.is_some() {
+            return self.system_prompt.clone();
+        }
+        if self.tools.read().await.get("subagent_start").is_none() {
+            return self.system_prompt.clone();
+        }
+        let Ok(model) = crate::orchestration::canonical_foreground_identity(&self.model) else {
+            return self.system_prompt.clone();
         };
-        self.model = cleaned;
+        let workflow_mode = match self.reasoning_level() {
+            agent_core::reasoning::ReasoningLevel::UltraCode => {
+                Some(agent_core::prompt::WorkflowMode::UltraCode)
+            }
+            agent_core::reasoning::ReasoningLevel::Max => {
+                Some(agent_core::prompt::WorkflowMode::Max)
+            }
+            agent_core::reasoning::ReasoningLevel::XHigh => {
+                Some(agent_core::prompt::WorkflowMode::XHigh)
+            }
+            _ => None,
+        };
+        let Ok(context) = agent_core::prompt::SelectionContext::new(model, None)
+            .map(|context| context.with_workflow_mode(workflow_mode))
+        else {
+            return self.system_prompt.clone();
+        };
+        agent_core::prompt::compose_orchestration_prompt(self.system_prompt.as_deref(), &context)
+    }
+
+    pub fn effective_prompt(&self) -> Option<&agent_core::prompt::PromptStack> {
+        self.effective_prompt.as_ref()
+    }
+
+    pub fn prompt_generation(&self) -> u64 {
+        self.prompt_generation
+    }
+
+    pub fn retain_prompt_reload_source(
+        &mut self,
+        manifest: PathBuf,
+        context: agent_core::prompt::SelectionContext,
+        user_module: Option<agent_core::prompt::PromptModule>,
+        delegation_policy_digest: Option<String>,
+    ) {
+        self.prompt_reload_source = Some(PromptReloadSource {
+            manifest,
+            context,
+            user_module,
+            delegation_policy_digest,
+        });
+    }
+
+    /// Recompile retained manifest inputs, validate, then atomically install the candidate.
+    pub fn reload_prompt(&mut self) -> std::result::Result<u64, agent_core::prompt::PromptError> {
+        let source = self.prompt_reload_source.clone().ok_or_else(|| {
+            agent_core::prompt::PromptError::Invalid("no prompt manifest is active".into())
+        })?;
+        let raw = std::fs::read_to_string(&source.manifest).map_err(|_| {
+            agent_core::prompt::PromptError::Invalid("prompt manifest is unavailable".into())
+        })?;
+        let manifest = agent_core::prompt::PromptManifest::parse(&raw)?;
+        let reload_catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            source.context.model(),
+            manifest.delegation_catalog_candidates(),
+        )
+        .map_err(|error| agent_core::prompt::PromptError::Invalid(error.into()))?;
+        let candidate_policy_digest = manifest
+            .delegation_policy(source.context.model().clone(), &reload_catalog)?
+            .map(|policy| policy.digest());
+        if candidate_policy_digest != source.delegation_policy_digest {
+            return Err(agent_core::prompt::PromptError::Invalid(
+                "hot reload cannot safely change delegation policy".into(),
+            ));
+        }
+        let registry = manifest.registry(source.manifest.parent())?;
+        let candidate = agent_core::prompt::compile_prompt_stack(
+            &manifest,
+            &registry,
+            &source.context,
+            source.user_module,
+        )?;
+        self.apply_prompt_stack(candidate)
+    }
+
+    /// Atomically validate and install a compiled stack. Failed validation leaves all state intact.
+    pub fn apply_prompt_stack(
+        &mut self,
+        candidate: agent_core::prompt::PromptStack,
+    ) -> std::result::Result<u64, agent_core::prompt::PromptError> {
+        if let Some(current) = &self.effective_prompt {
+            current.validate_hot_reload(&candidate)?;
+        }
+        let composed = candidate.composed().to_owned();
+        self.effective_prompt = Some(candidate);
+        self.system_prompt = Some(composed);
+        self.prompt_generation = self.prompt_generation.saturating_add(1);
+        Ok(self.prompt_generation)
+    }
+
+    pub fn prompt_inspection_json(&self) -> Option<String> {
+        let mode = self
+            .orchestration
+            .as_ref()
+            .map(|runtime| runtime.enforcement_mode())
+            .unwrap_or(agent_core::orchestration::EnforcementMode::Off);
+        self.effective_prompt.as_ref().and_then(|stack| {
+            serde_json::to_string(&serde_json::json!({
+                "generation": self.prompt_generation,
+                "effective": stack.inspect(mode),
+                "token_estimate": stack.composed().len().div_ceil(4),
+            }))
+            .ok()
+        })
+    }
+
+    pub fn install_orchestration(
+        &mut self,
+        runtime: Arc<crate::orchestration::OrchestrationRuntime>,
+    ) {
+        for model in &self.trusted_worker_models {
+            if let Err(error) = runtime.grant_worker_model(model.as_str()) {
+                tracing::warn!(
+                    model = model.as_str(),
+                    error = %error,
+                    "failed to apply configured worker-model trust"
+                );
+            }
+        }
+        self.orchestration = Some(runtime);
+    }
+
+    pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
+        self.orchestration.as_ref()
+    }
+
+    /// Extends the live session delegation policy with one explicitly
+    /// user-trusted worker model (e.g. favorited mid-session in the models
+    /// picker). Mid-session trust grants were always meant to be honored;
+    /// the policy snapshot is not pinned against user decisions.
+    pub fn grant_worker_model(&self, model: &str) -> std::result::Result<(), String> {
+        self.orchestration
+            .as_ref()
+            .ok_or_else(|| "delegation policy unavailable".to_string())?
+            .grant_worker_model(model)
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        let _ = self.try_set_model(model);
+    }
+
+    /// Apply a model change while preserving orchestration lifecycle invariants.
+    /// Returns an error instead of mutating either model or policy when active
+    /// workers still require collection/reconciliation or when the replacement
+    /// foreground cannot produce a trusted manifestless policy snapshot.
+    pub fn try_set_model(&mut self, model: String) -> std::result::Result<(), String> {
+        // Older model pickers passed the rendered health row back here, e.g.
+        // `✅  339ms  groq/llama-3.3-70b`. Remove that exact decoration shape,
+        // rather than searching inside the ID: provider-qualified IDs may
+        // legitimately contain `claude-` after their slash.
+        let trimmed = model.trim();
+        let cleaned = trimmed
+            .split_once(char::is_whitespace)
+            .and_then(|(_, rest)| {
+                let rest = rest.trim_start();
+                let (latency, candidate) = rest.split_once(char::is_whitespace)?;
+                let millis = latency.strip_suffix("ms")?;
+                if !millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()) {
+                    let candidate = candidate.trim();
+                    if !candidate.is_empty() && !candidate.chars().any(char::is_whitespace) {
+                        return Some(candidate);
+                    }
+                }
+                None
+            })
+            .unwrap_or(trimmed);
+        // Manifestless orchestration snapshots are tied to the exact foreground
+        // identity. Refuse the model mutation while a policy worker remains
+        // unreconciled; replacing its registry would erase the completion-gate
+        // remediation path, while changing only the runtime model would create a
+        // stale authorization snapshot.
+        if self.prompt_reload_source.is_none()
+            && self
+                .orchestration
+                .as_ref()
+                .is_some_and(|current| !current.unreconciled_runtime_handles().is_empty())
+        {
+            return Err("model change blocked: workers require collection/reconciliation".into());
+        }
+        let orchestration_replacement = if self.prompt_reload_source.is_none()
+            && self.orchestration.is_some()
+        {
+            let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
+                .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
+            let replacement = crate::orchestration::OrchestrationRuntime::baseline(
+                foreground, 8, 64,
+            )
+            .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
+            for trusted in &self.trusted_worker_models {
+                replacement
+                    .grant_worker_model(trusted.as_str())
+                    .map_err(|_| {
+                        "model change blocked: configured worker trust invalid".to_string()
+                    })?;
+            }
+            Some(Arc::new(replacement))
+        } else {
+            None
+        };
+        self.model = cleaned.to_owned();
+        // Replace the manifestless policy atomically after a safe model change so
+        // inheritance and exact same-provider choices follow the new foreground.
+        // Typed manifest policies are immutable and are not rewritten here.
+        if let Some(replacement) = orchestration_replacement {
+            self.orchestration = Some(replacement);
+        }
+        // Apply the new model's default reasoning level from exact capability
+        // metadata (Codex catalog default, xAI documented default/Adaptive)
+        // unless the user has explicitly chosen a level (explicit_reasoning is
+        // true — set via command, config, or explicit session restore).
+        // Derived/default levels are overwritten by the new model's default.
+        if !self.explicit_reasoning {
+            if let Some(level) =
+                crate::runtime::openai::catalog::validation::default_level_for_model(cleaned)
+            {
+                self.set_reasoning_level(level);
+            }
+        }
+        Ok(())
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
@@ -450,6 +753,333 @@ impl Runtime {
     }
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
+        // Sync named_level from budget so the two fields stay consistent.
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
+            budget,
+        ));
+        // Config/restore path — not an explicit user choice.
+        self.explicit_reasoning = false;
+    }
+
+    /// Set the named reasoning level (config/restore path). Updates
+    /// `thinking_budget` from the level's canonical budget when one exists;
+    /// for Max/Ultra (no numeric budget), leaves `thinking_budget` unchanged.
+    /// Marks `explicit_reasoning = false` — use `set_reasoning_level_explicit`
+    /// for user commands and settings.
+    pub fn set_reasoning_level(&mut self, level: agent_core::reasoning::ReasoningLevel) {
+        self.named_level = Some(level);
+        if let Some(budget) = level.to_legacy_budget() {
+            self.thinking_budget = budget;
+        }
+        // Max/Ultra: do NOT overwrite thinking_budget with u32::MAX.
+        self.explicit_reasoning = false;
+    }
+
+    /// Set the named reasoning level as an **explicit user choice** (slash
+    /// commands, settings panel). Identical to `set_reasoning_level` but sets
+    /// `explicit_reasoning = true` so that a subsequent `set_model` call does
+    /// not overwrite the level with the new model's default.
+    pub fn set_reasoning_level_explicit(&mut self, level: agent_core::reasoning::ReasoningLevel) {
+        self.set_reasoning_level(level);
+        self.explicit_reasoning = true;
+    }
+
+    /// Set a custom numeric thinking budget as an **explicit user choice**
+    /// (e.g. `/thinking 8192`). Retains the exact budget in `thinking_budget`
+    /// while syncing `named_level` to the nearest named level for display.
+    /// Sets `explicit_reasoning = true`.
+    pub fn set_thinking_budget_explicit(&mut self, budget: u32) {
+        self.thinking_budget = budget;
+        self.named_level = Some(agent_core::reasoning::ReasoningLevel::from_legacy_budget(
+            budget,
+        ));
+        self.explicit_reasoning = true;
+    }
+
+    /// Expose the `explicit_reasoning` provenance flag (test/introspection).
+    pub fn is_reasoning_explicit(&self) -> bool {
+        self.explicit_reasoning
+    }
+
+    /// Raw thinking budget value (for testing and legacy request building).
+    pub fn thinking_budget_raw(&self) -> u32 {
+        self.thinking_budget
+    }
+
+    /// Validate `level` against the current model's capability metadata via
+    /// the shared per-provider validator (cache then exact static tables),
+    /// then apply it. Returns `Err(user-facing message)` and leaves runtime
+    /// state unchanged if the level is unsupported.
+    pub fn set_reasoning_level_checked(
+        &mut self,
+        level: agent_core::reasoning::ReasoningLevel,
+    ) -> std::result::Result<(), String> {
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+            &self.model,
+            level,
+        )?;
+        if self.model.starts_with("anthropic/")
+            && level == agent_core::reasoning::ReasoningLevel::UltraCode
+        {
+            if self.codex_request_role()
+                != crate::runtime::openai::catalog::ExecutionRole::Foreground
+            {
+                return Err("ultracode_requires_foreground".into());
+            }
+            if self.effective_prompt.is_some() {
+                return Err("typed_prompt_manifest_blocks_required_doctrine".into());
+            }
+            if self.orchestration.is_none() {
+                return Err("ultracode_requires_orchestration".into());
+            }
+            let tools = self.tools.try_read().map_err(|_| {
+                "ultracode prerequisite state is busy; refusing mutation".to_string()
+            })?;
+            let required = ["subagent_start", "subagent_status", "subagent_collect"];
+            if !required.iter().all(|name| {
+                tools
+                    .get(name)
+                    .is_some_and(|tool| tool.extension_id().is_none())
+            }) {
+                return Err("ultracode_requires_lifecycle_tools".into());
+            }
+        }
+        self.set_reasoning_level_explicit(level);
+        Ok(())
+    }
+
+    /// Validate then apply a custom numeric thinking budget (`/thinking <N>`).
+    /// The budget's derived `ReasoningLevel` runs through the same exact-model
+    /// mutation validator as named levels (Anthropic fixed-budget models pass:
+    /// derived levels never exceed XHigh and thinking-capable descriptors
+    /// accept them). On `Ok` the exact budget is retained — never downgraded
+    /// to a named-level canonical budget. On `Err` state is unchanged.
+    pub fn set_thinking_budget_checked(&mut self, budget: u32) -> std::result::Result<(), String> {
+        let level = agent_core::reasoning::ReasoningLevel::from_legacy_budget(budget);
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+            &self.model,
+            level,
+        )?;
+        self.set_thinking_budget_explicit(budget);
+        Ok(())
+    }
+
+    pub fn reasoning_level(&self) -> agent_core::reasoning::ReasoningLevel {
+        self.named_level.unwrap_or_else(|| {
+            agent_core::reasoning::ReasoningLevel::from_legacy_budget(self.thinking_budget)
+        })
+    }
+
+    pub(crate) fn set_codex_request_role(
+        &mut self,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) {
+        self.codex_request_role = role;
+    }
+
+    pub(crate) fn codex_request_role(&self) -> crate::runtime::openai::catalog::CodexRequestRole {
+        self.codex_request_role
+    }
+
+    async fn authorized_anthropic_plan(
+        &self,
+    ) -> Result<Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>> {
+        if !self.model.starts_with("anthropic/") {
+            return Ok(None);
+        }
+        let tools = self.tools.read().await;
+        let builtin = |name: &str| {
+            tools
+                .get(name)
+                .is_some_and(|tool| tool.extension_id().is_none())
+        };
+        let readiness = self
+            .orchestration
+            .as_ref()
+            .and_then(|runtime| runtime.ultracode_readiness(&self.model).ok());
+        let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
+            orchestration_policy: self.orchestration.is_some(),
+            foreground_worker_authorized: readiness.is_some(),
+            concurrent_limit: readiness.map_or(0, |limits| limits.0),
+            total_limit: readiness.map_or(0, |limits| limits.1),
+            lifecycle_start: builtin("subagent_start"),
+            lifecycle_status: builtin("subagent_status"),
+            lifecycle_steer: builtin("subagent_steer"),
+            lifecycle_collect: builtin("subagent_collect"),
+            lifecycle_resume: builtin("subagent_resume"),
+        };
+        crate::runtime::openai::catalog::plan_anthropic_execution(
+            &self.model,
+            self.reasoning_level(),
+            self.codex_request_role(),
+            prerequisites,
+            crate::runtime::openai::catalog::capability_cache::get(&self.model).and_then(|entry| {
+                match entry.reasoning {
+                    crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                        adaptive,
+                    } => Some(adaptive),
+                    crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                    _ => None,
+                }
+            }),
+        )
+        .map(Some)
+        .map_err(|error| RuntimeError::Config(error.to_string()))
+    }
+
+    /// Validate exact-model reasoning and Ultra orchestration prerequisites
+    /// before refresh, broker access, or provider network work.
+    async fn validate_request_preflight(&self) -> Result<()> {
+        self.validate_request_preflight_for(&self.model, self.codex_request_role)
+            .await
+    }
+
+    async fn validate_request_preflight_for(
+        &self,
+        model: &str,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) -> Result<()> {
+        let level = self.reasoning_level();
+        if model.starts_with("anthropic/")
+            && level == agent_core::reasoning::ReasoningLevel::UltraCode
+            && self.effective_prompt.is_some()
+        {
+            return Err(RuntimeError::Config(
+                "Anthropic execution plan rejected: typed_prompt_manifest_blocks_required_doctrine"
+                    .into(),
+            ));
+        }
+        if model.starts_with("anthropic/")
+            && matches!(
+                level,
+                agent_core::reasoning::ReasoningLevel::Max
+                    | agent_core::reasoning::ReasoningLevel::UltraCode
+                    | agent_core::reasoning::ReasoningLevel::Ultra
+            )
+        {
+            let tools = self.tools.read().await;
+            let builtin = |name: &str| {
+                tools
+                    .get(name)
+                    .is_some_and(|tool| tool.extension_id().is_none())
+            };
+            let readiness = self
+                .orchestration
+                .as_ref()
+                .and_then(|runtime| runtime.ultracode_readiness(model).ok());
+            let prerequisites = crate::runtime::openai::catalog::AnthropicPlanPrerequisites {
+                orchestration_policy: self.orchestration.is_some(),
+                foreground_worker_authorized: readiness.is_some(),
+                concurrent_limit: readiness.map_or(0, |limits| limits.0),
+                total_limit: readiness.map_or(0, |limits| limits.1),
+                lifecycle_start: builtin("subagent_start"),
+                lifecycle_status: builtin("subagent_status"),
+                lifecycle_steer: builtin("subagent_steer"),
+                lifecycle_collect: builtin("subagent_collect"),
+                lifecycle_resume: builtin("subagent_resume"),
+            };
+            drop(tools);
+            let result = crate::runtime::openai::catalog::plan_anthropic_execution(
+                model,
+                level,
+                role,
+                prerequisites,
+                crate::runtime::openai::catalog::capability_cache::get(model).and_then(|entry| {
+                    match entry.reasoning {
+                        crate::runtime::openai::catalog::ReasoningSupport::AnthropicAdaptive {
+                            adaptive,
+                        } => Some(adaptive),
+                        crate::runtime::openai::catalog::ReasoningSupport::None => Some(false),
+                        _ => None,
+                    }
+                }),
+            );
+            match result {
+                Ok(plan) => {
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), execution_mode = ?plan.mode, wire_effort = plan.wire_effort.map_or("omitted", |effort| effort.as_str()), workflow = ?plan.workflow, credentials_attempted = false, network_attempted = false);
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::debug!(event = "anthropic_mode_plan", qualified_model = %model, requested_level = %level, runtime_role = role.as_str(), decision = "deny", deny_code = error.code().as_str(), credentials_attempted = false, network_attempted = false);
+                    return Err(RuntimeError::Config(error.to_string()));
+                }
+            }
+        }
+        if model.starts_with("openai-codex/") {
+            let plan =
+                crate::runtime::openai::catalog::plan_codex_execution(model, level, role, None)
+                    .map_err(|error| {
+                        tracing::debug!(
+                            event = "codex_mode_plan",
+                            qualified_model = %model,
+                            requested_level = %level,
+                            runtime_role = role.as_str(),
+                            decision = "deny",
+                            deny_code = error.code().as_str(),
+                            network_attempted = false,
+                            "Codex request preflight denied"
+                        );
+                        RuntimeError::Config(error.to_string())
+                    })?;
+
+            if plan.automatic_delegation() {
+                if self.orchestration.is_none() {
+                    tracing::debug!(
+                        event = "codex_mode_plan",
+                        qualified_model = %model,
+                        requested_level = %level,
+                        runtime_role = role.as_str(),
+                        decision = "deny",
+                        deny_code = "ultra_requires_orchestration",
+                        network_attempted = false,
+                        "Codex request preflight denied"
+                    );
+                    return Err(RuntimeError::Config(
+                        "Ultra requires an installed orchestration policy".to_string(),
+                    ));
+                }
+
+                let tools = self.tools.read().await;
+                let required = ["subagent_start", "subagent_status", "subagent_collect"];
+                let tools_ready = required.iter().all(|name| {
+                    tools
+                        .get(name)
+                        .is_some_and(|tool| tool.extension_id().is_none())
+                });
+                if !tools_ready {
+                    tracing::debug!(
+                        event = "codex_mode_plan",
+                        qualified_model = %model,
+                        requested_level = %level,
+                        runtime_role = role.as_str(),
+                        decision = "deny",
+                        deny_code = "ultra_requires_subagent_tools",
+                        network_attempted = false,
+                        "Codex request preflight denied"
+                    );
+                    return Err(RuntimeError::Config(
+                        "Ultra requires built-in subagent_start, subagent_status, and subagent_collect tools"
+                            .to_string(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        crate::runtime::openai::catalog::validation::validate_reasoning_mutation(model, level)
+            .map_err(|error| {
+                tracing::debug!(
+                    event = "codex_mode_plan",
+                    qualified_model = %model,
+                    requested_level = %level,
+                    runtime_role = role.as_str(),
+                    decision = "deny",
+                    deny_code = "unsupported_reasoning_level",
+                    network_attempted = false,
+                    "request preflight denied"
+                );
+                RuntimeError::Config(error)
+            })
     }
 
     pub fn set_compaction_model(&mut self, model: Option<String>) {
@@ -478,8 +1108,12 @@ impl Runtime {
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
-        if let Some(budget) = config.thinking_budget {
-            self.set_thinking_budget(budget);
+        // Named level takes priority over raw budget.
+        // Config-specified thinking is an explicit user choice — preserve across model switches.
+        if let Some(level) = config.thinking_level {
+            self.set_reasoning_level_explicit(level);
+        } else if let Some(budget) = config.thinking_budget {
+            self.set_thinking_budget_explicit(budget);
         }
         self.context_window_override = config.context_window;
         self.compaction_model = config.compaction_model.clone();
@@ -493,6 +1127,36 @@ impl Runtime {
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.trusted_worker_models = config
+            .favorite_models
+            .iter()
+            .filter_map(|model| {
+                let canonical = canonical_trusted_worker_model(model);
+                match agent_core::prompt::QualifiedModelId::parse(canonical) {
+                    Ok(model) => Some(model),
+                    Err(_) => {
+                        tracing::warn!(
+                            model = model.as_str(),
+                            "ignoring invalid favorite worker-model identity"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        self.trusted_worker_models.sort();
+        self.trusted_worker_models.dedup();
+        if let Some(orchestration) = &self.orchestration {
+            for model in &self.trusted_worker_models {
+                if let Err(error) = orchestration.grant_worker_model(model.as_str()) {
+                    tracing::warn!(
+                        model = model.as_str(),
+                        error = %error,
+                        "failed to apply configured worker-model trust"
+                    );
+                }
+            }
+        }
         self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
@@ -523,6 +1187,15 @@ impl Runtime {
                 AuthMethods::scrub_for_remote(&mut auth);
             }
         }
+        // Install the process-wide credential broker matching this source so
+        // every request path (streams, pings, catalog, TUI status) resolves
+        // credentials through the same boundary. Local sources get the
+        // in-process broker — no separately launched daemon required.
+        crate::auth::set_global_broker(crate::auth::broker_from_source(
+            &self.credential_source,
+            &self.token_cache,
+            self.client.clone(),
+        ));
     }
 
     pub fn thinking_budget(&self) -> u32 {
@@ -597,14 +1270,23 @@ impl Runtime {
     }
 
     pub fn thinking_level(&self) -> &str {
-        crate::core::models::thinking_level_for_budget(self.thinking_budget)
+        // For Max/Ultra the named_level wins; for legacy budget-only levels
+        // we fall through to the legacy bucketing.
+        match self.named_level {
+            Some(level) => level.as_str(),
+            None => crate::core::models::thinking_level_for_budget(self.thinking_budget),
+        }
     }
 
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
+        self.refresh_if_needed_for_model(&self.model).await
+    }
+
+    async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {
         // Non-Anthropic models resolve their own provider auth in the OpenAI
         // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
-        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+        if !crate::runtime::auth::model_is_anthropic(model) {
             return Ok(());
         }
         AuthMethods::refresh_if_needed(
@@ -622,16 +1304,23 @@ impl Runtime {
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
     pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
-        self.refresh_if_needed().await?;
+        let model = self.compaction_model();
+        self.validate_request_preflight_for(
+            model,
+            crate::runtime::openai::catalog::CodexRequestRole::Internal,
+        )
+        .await?;
+        self.refresh_if_needed_for_model(model).await?;
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
 
         ApiMethods::call_api_simple(
             &self.auth,
             &self.client,
-            self.compaction_model(),
+            model,
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
+            self.reasoning_level(),
             &messages,
             self.api_retries,
         )
@@ -641,11 +1330,15 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
-        // Refresh OAuth token if expired
+        self.validate_request_preflight().await?;
+        let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
+        // Refresh OAuth token if expired only after capability preflight.
         self.refresh_if_needed().await?;
 
-        let mut messages: Vec<crate::SharedMessage> =
-            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))];
+        let mut messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": prompt}),
+        )];
+        let system_prompt = self.effective_system_prompt().await;
 
         loop {
             let response = ApiMethods::call_api(
@@ -653,8 +1346,9 @@ impl Runtime {
                 &self.client,
                 &self.model,
                 &*self.tools.read().await,
-                &self.system_prompt,
+                &system_prompt,
                 self.thinking_budget,
+                self.reasoning_level(),
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
@@ -665,6 +1359,8 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
+                    anthropic_execution_plan: anthropic_execution_plan.clone(),
+                    codex_request_role: self.codex_request_role(),
                 },
             )
             .await?;
@@ -691,6 +1387,17 @@ impl Runtime {
 
                 // If no tool uses, return the text response
                 if tool_uses.is_empty() {
+                    if let Some(orchestration) = &self.orchestration {
+                        if let agent_core::orchestration::CompletionGate::Blocked { workers } =
+                            orchestration.completion_gate()
+                        {
+                            return Err(crate::RuntimeError::Tool(format!(
+                                "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
+                                workers.len(),
+                                workers.join(", ")
+                            )));
+                        }
+                    }
                     return Ok(response_text);
                 }
 
@@ -735,6 +1442,7 @@ impl Runtime {
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
+                                        orchestration: self.orchestration.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -802,6 +1510,7 @@ impl Runtime {
                     let cfg_subagent_registry = self.subagent_registry.clone();
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
+                    let cfg_orchestration = self.orchestration.clone();
 
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -821,6 +1530,7 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let orchestration_inner = cfg_orchestration.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -865,6 +1575,7 @@ impl Runtime {
                                                     subagent_registry: Some(registry_inner),
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
+                                                    orchestration: orchestration_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -948,7 +1659,9 @@ impl Runtime {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(
-            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))],
+            vec![std::sync::Arc::new(
+                json!({"role": "user", "content": prompt}),
+            )],
             cancel,
             None,
             None,
@@ -970,7 +1683,22 @@ impl Runtime {
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Refresh OAuth token if expired before starting the stream.
+        if let Err(error) = self.validate_request_preflight().await {
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+            return Box::pin(UnboundedReceiverStream::new(rx));
+        }
+
+        let anthropic_execution_plan = match self.authorized_anthropic_plan().await {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+                return Box::pin(UnboundedReceiverStream::new(rx));
+            }
+        };
+
+        // Refresh OAuth token if expired after capability preflight.
         if let Err(e) = self.refresh_if_needed().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
@@ -985,8 +1713,9 @@ impl Runtime {
         let token_cache = self.token_cache.clone();
         let model = self.model.clone();
         let tools = self.tools.clone();
-        let system_prompt = self.system_prompt.clone();
+        let system_prompt = self.effective_system_prompt().await;
         let thinking_budget = self.thinking_budget;
+        let reasoning_level = self.reasoning_level();
         let watcher_exit_path = self.watcher_exit_path.clone();
         let max_tool_output = self.max_tool_output;
         let bash_timeout = self.bash_timeout;
@@ -1002,6 +1731,7 @@ impl Runtime {
         // Extra Arc clone for the reaper hook — session takes ownership of the
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
+        let reaper_orchestration = self.orchestration.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -1011,6 +1741,8 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_execution_plan,
+            codex_request_role: self.codex_request_role(),
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -1025,6 +1757,7 @@ impl Runtime {
             tools,
             system_prompt,
             thinking_budget,
+            reasoning_level,
             tx: tx.clone(),
             cancel,
             steering_rx,
@@ -1040,6 +1773,7 @@ impl Runtime {
             hook_bus: self.hook_bus.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
+            orchestration: self.orchestration.clone(),
         };
 
         tokio::spawn(async move {
@@ -1049,7 +1783,10 @@ impl Runtime {
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.
-            crate::runtime::subagent::reap_finished(&reaper_registry);
+            crate::runtime::subagent::reap_finished(
+                &reaper_registry,
+                reaper_orchestration.as_deref(),
+            );
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
@@ -1065,10 +1802,17 @@ impl Clone for Runtime {
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
+            effective_prompt: self.effective_prompt.clone(),
+            prompt_generation: self.prompt_generation,
+            prompt_reload_source: self.prompt_reload_source.clone(),
             thinking_budget: self.thinking_budget,
+            named_level: self.named_level,
+            explicit_reasoning: self.explicit_reasoning,
+            codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),
+            orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
@@ -1094,6 +1838,7 @@ impl Clone for Runtime {
             reaper_cancel: None, // Cloned runtimes don't own the reaper
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
+            trusted_worker_models: self.trusted_worker_models.clone(),
         }
     }
 }
@@ -1101,6 +1846,250 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_rejects_policy_change_without_partial_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.yaml");
+        let manifest = |total: &str, content: &str| {
+            format!(
+            "schema: synaps-prompt/1\nkernel: kernel\nmodules:\n  - id: kernel\n    version: v1\n    source: builtin\n    priority: 0\n    selectors: {{}}\n    mutability: mutable_guidance\n    content: {content}\npolicies:\n  delegation:\n    mode: enforced\n    allowed_models: [anthropic/claude-sonnet-4-6]\n    max_concurrent_workers: 1\n    max_total_workers: {total}\n"
+        )
+        };
+        std::fs::write(&path, manifest("1", "before")).unwrap();
+        let parsed =
+            agent_core::prompt::PromptManifest::parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap();
+        let model =
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6").unwrap();
+        let context = agent_core::prompt::SelectionContext::new(model.clone(), None).unwrap();
+        let stack = agent_core::prompt::compile_prompt_stack(
+            &parsed,
+            &parsed.registry(path.parent()).unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
+        let catalog = crate::orchestration::OrchestrationRuntime::trusted_catalog(
+            &model,
+            parsed.delegation_catalog_candidates(),
+        )
+        .unwrap();
+        let digest = parsed
+            .delegation_policy(model, &catalog)
+            .unwrap()
+            .map(|p| p.digest());
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_prompt_stack(stack).unwrap();
+        runtime.retain_prompt_reload_source(path.clone(), context, None, digest.clone());
+        let generation = runtime.prompt_generation();
+        let composed = runtime.effective_prompt().unwrap().composed().to_owned();
+
+        std::fs::write(&path, manifest("2", "after")).unwrap();
+        let error = runtime.reload_prompt().unwrap_err().to_string();
+        assert!(error.contains("cannot safely change delegation policy"));
+        assert_eq!(runtime.prompt_generation(), generation);
+        assert_eq!(runtime.effective_prompt().unwrap().composed(), composed);
+        assert_eq!(
+            runtime
+                .prompt_reload_source
+                .as_ref()
+                .unwrap()
+                .delegation_policy_digest,
+            digest
+        );
+    }
+
+    #[test]
+    fn configured_favorite_models_seed_session_worker_choices() {
+        let mut runtime = Runtime::new_headless();
+        let config = crate::config::SynapsConfig {
+            favorite_models: vec![
+                "openai-codex/gpt-5.6-luna".to_owned(),
+                "anthropic/claude-opus-4-6".to_owned(),
+                // Legacy favorite spelling must retain its existing compatibility.
+                "claude/claude-fable-5".to_owned(),
+                // Malformed persisted values must fail closed without bricking boot.
+                "not-qualified".to_owned(),
+            ],
+            ..Default::default()
+        };
+        runtime.apply_config(&config);
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap(),
+        ));
+
+        let orchestration = runtime.orchestration().unwrap();
+        for trusted in [
+            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-luna",
+            "anthropic/claude-opus-4-6",
+            "anthropic/claude-fable-5",
+        ] {
+            assert!(
+                orchestration
+                    .effective_choices()
+                    .contains(&trusted.to_owned()),
+                "missing configured worker choice {trusted}: {:?}",
+                orchestration.effective_choices()
+            );
+        }
+        let authorized = orchestration
+            .resolve_and_authorize("sa_cross_provider", Some("anthropic/claude-opus-4-6"))
+            .expect("an explicitly favorited cross-provider model must be authorized");
+        assert_eq!(authorized.model.as_str(), "anthropic/claude-opus-4-6");
+        assert!(!orchestration
+            .effective_choices()
+            .contains(&"not-qualified".to_owned()));
+    }
+
+    #[test]
+    fn configured_worker_choices_survive_manifestless_foreground_changes() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&crate::config::SynapsConfig {
+            favorite_models: vec!["anthropic/claude-opus-4-6".to_owned()],
+            ..Default::default()
+        });
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap(),
+        ));
+
+        runtime
+            .try_set_model("xai-auth/grok-4.5-latest".to_owned())
+            .unwrap();
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(orchestration.foreground_model(), "xai-auth/grok-4.5-latest");
+        assert!(orchestration
+            .effective_choices()
+            .contains(&"anthropic/claude-opus-4-6".to_owned()));
+        orchestration
+            .resolve_and_authorize("sa_after_switch", Some("anthropic/claude-opus-4-6"))
+            .expect("configured worker trust must survive policy replacement");
+    }
+
+    #[test]
+    fn set_model_replaces_manifestless_orchestration_foreground_snapshot() {
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        ));
+
+        runtime.set_model("openrouter/deepseek/deepseek-v4-pro".to_owned());
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(
+            orchestration.foreground_model(),
+            "openrouter/deepseek/deepseek-v4-pro"
+        );
+        assert!(orchestration
+            .effective_choices()
+            .contains(&"openrouter/moonshotai/kimi-k2.7-code".to_owned()));
+        assert!(orchestration
+            .resolve_and_authorize("sa_kimi", Some("openrouter/moonshotai/kimi-k2.7-code"))
+            .is_ok());
+    }
+
+    #[test]
+    fn set_model_refuses_to_orphan_unreconciled_policy_workers() {
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        );
+        orchestration
+            .resolve_and_authorize("sa_active", None)
+            .unwrap();
+        runtime.install_orchestration(orchestration.clone());
+        runtime.model = "openrouter/z-ai/glm-5.2".to_owned();
+
+        let error = runtime
+            .try_set_model("openrouter/deepseek/deepseek-v4-pro".to_owned())
+            .unwrap_err();
+
+        assert!(error.contains("collection/reconciliation"));
+        assert_eq!(runtime.model(), "openrouter/z-ai/glm-5.2");
+        assert!(std::sync::Arc::ptr_eq(
+            runtime.orchestration().unwrap(),
+            &orchestration
+        ));
+        assert!(orchestration.is_unreconciled("sa_active"));
+    }
+
+    #[test]
+    fn set_model_keeps_active_typed_manifest_orchestration_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("prompt.yaml");
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let mut runtime = Runtime::new_headless();
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm.clone(), 3, 8).unwrap(),
+        );
+        runtime.install_orchestration(orchestration.clone());
+        runtime.retain_prompt_reload_source(
+            manifest_path,
+            agent_core::prompt::SelectionContext::new(glm, None).unwrap(),
+            None,
+            None,
+        );
+
+        runtime.set_model("openrouter/deepseek/deepseek-v4-pro".to_owned());
+
+        assert!(std::sync::Arc::ptr_eq(
+            runtime.orchestration().unwrap(),
+            &orchestration
+        ));
+        assert_eq!(
+            runtime.orchestration().unwrap().foreground_model(),
+            "openrouter/z-ai/glm-5.2"
+        );
+    }
+
+    #[test]
+    fn set_model_preserves_qualified_provider_ids_and_bare_claude() {
+        let cases = [
+            (
+                "github-copilot/claude-opus-4.8",
+                "github-copilot/claude-opus-4.8",
+            ),
+            ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+            ("google/gemini-2.5-pro", "google/gemini-2.5-pro"),
+            ("openai/gpt-5", "openai/gpt-5"),
+            ("claude-opus-4-8", "claude-opus-4-8"),
+        ];
+
+        for (input, expected) in cases {
+            let mut runtime = Runtime::new_headless();
+            runtime.set_model(input.to_owned());
+            assert_eq!(runtime.model(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn set_model_strips_only_legacy_health_status_decoration() {
+        let cases = [
+            ("✅  339ms  groq/llama-3.3-70b", "groq/llama-3.3-70b"),
+            (
+                "✅  339ms  github-copilot/claude-opus-4.8",
+                "github-copilot/claude-opus-4.8",
+            ),
+            (
+                "⚠️  1200ms  anthropic/claude-sonnet-4-6",
+                "anthropic/claude-sonnet-4-6",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let mut runtime = Runtime::new_headless();
+            runtime.set_model(input.to_owned());
+            assert_eq!(runtime.model(), expected, "input: {input}");
+        }
+    }
 
     #[tokio::test]
     async fn confirm_without_prompt_fails_closed() {
@@ -1299,5 +2288,554 @@ mod tests {
         assert_eq!(thinking_level_for_budget(16385), "xhigh");
         assert_eq!(thinking_level_for_budget(32768), "xhigh");
         assert_eq!(thinking_level_for_budget(100000), "xhigh");
+    }
+}
+
+#[cfg(test)]
+mod effective_prompt_tests {
+    use super::*;
+
+    fn headless(model: &str, base: &str) -> Runtime {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model(model.to_string());
+        runtime.set_system_prompt(base.to_string());
+        runtime
+    }
+
+    #[tokio::test]
+    async fn anthropic_foreground_ultracode_composes_standing_doctrine_once() {
+        let mut runtime = headless("anthropic/claude-fable-5", "BASE.");
+        runtime.named_level = Some(agent_core::reasoning::ReasoningLevel::UltraCode);
+        let prompt = runtime.effective_system_prompt().await.expect("doctrine");
+        assert_eq!(prompt.matches("<anthropic-ultracode-workflow>").count(), 1);
+        assert!(prompt.contains("subagent_start"));
+        assert!(prompt.contains("subagent_resume"));
+    }
+
+    #[tokio::test]
+    async fn codex_foreground_with_subagent_tools_composes_doctrine() {
+        let runtime = headless("openai-codex/gpt-5.6-sol", "BASE.");
+        let prompt = runtime
+            .effective_system_prompt()
+            .await
+            .expect("prompt must compose");
+        assert!(prompt.starts_with("BASE."), "base must lead");
+        assert!(prompt.contains("## Subagent supervision"));
+        assert!(prompt.contains("NEVER end your turn"));
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_without_subagent_tools_stays_clean() {
+        let mut runtime = headless("openai-codex/gpt-5.6-sol", "WORKER.");
+        runtime.set_tools(ToolRegistry::without_subagent());
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("WORKER."),
+            "workers have no subagent tools; doctrine would be unactionable noise"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_codex_foreground_stays_clean() {
+        let runtime = headless("xai-auth/grok-4.5-latest", "BASE.");
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_prompt_is_returned_verbatim() {
+        let mut runtime = headless("openai-codex/gpt-5.6-sol", "IGNORED.");
+        let module = agent_core::prompt::PromptModule::new(
+            agent_core::prompt::PromptModuleId::parse("kernel.test").unwrap(),
+            "1.0.0",
+            agent_core::prompt::PromptModuleSource::User,
+            0,
+            agent_core::prompt::PromptSelectors::default(),
+            agent_core::prompt::ModuleMutability::MutableGuidance,
+            "KERNEL.",
+        )
+        .unwrap();
+        let context = agent_core::prompt::SelectionContext::new(
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap(),
+            None,
+        )
+        .unwrap();
+        let stack = agent_core::prompt::PromptStack::new(vec![module], context).unwrap();
+        runtime.apply_prompt_stack(stack).unwrap();
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("KERNEL."),
+            "manifest authors own the full stack; no builtin injection on top"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolvable_model_identity_fails_closed_to_base() {
+        let runtime = headless("definitely-not-a-model", "BASE.");
+        assert_eq!(
+            runtime.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_reasoning_level_checked_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn codex_runtime(model_id: &str) -> Runtime {
+        let mut rt = Runtime::new_headless();
+        rt.set_model(format!("openai-codex/{model_id}"));
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        rt
+    }
+
+    fn provisioned_fable_runtime() -> Runtime {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("anthropic/claude-fable-5".into());
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-fable-5").unwrap();
+        let orchestration =
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8).unwrap();
+        rt.install_orchestration(Arc::new(orchestration));
+        rt
+    }
+
+    fn install_typed_manifest(rt: &mut Runtime) {
+        let module = agent_core::prompt::PromptModule::new(
+            agent_core::prompt::PromptModuleId::parse("kernel.test").unwrap(),
+            "1.0.0",
+            agent_core::prompt::PromptModuleSource::User,
+            0,
+            agent_core::prompt::PromptSelectors::default(),
+            agent_core::prompt::ModuleMutability::MutableGuidance,
+            "KERNEL.",
+        )
+        .unwrap();
+        let context = agent_core::prompt::SelectionContext::new(
+            agent_core::prompt::QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+            None,
+        )
+        .unwrap();
+        rt.apply_prompt_stack(agent_core::prompt::PromptStack::new(vec![module], context).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn provisioned_fable_accepts_max_and_ultracode() {
+        for level in [ReasoningLevel::Max, ReasoningLevel::UltraCode] {
+            let mut rt = provisioned_fable_runtime();
+            rt.set_reasoning_level_checked(level).unwrap();
+            assert_eq!(rt.reasoning_level(), level);
+        }
+    }
+
+    #[test]
+    fn fable_ultracode_prerequisites_fail_without_mutation() {
+        let mut missing_orchestration = Runtime::new_headless();
+        missing_orchestration.set_model("anthropic/claude-fable-5".into());
+        missing_orchestration.set_reasoning_level(ReasoningLevel::Low);
+        assert!(missing_orchestration
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(missing_orchestration.reasoning_level(), ReasoningLevel::Low);
+
+        let mut missing_tools = provisioned_fable_runtime();
+        missing_tools.set_tools(ToolRegistry::without_subagent());
+        assert!(missing_tools
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(missing_tools.reasoning_level(), ReasoningLevel::Low);
+
+        let mut worker = provisioned_fable_runtime();
+        worker.set_codex_request_role(crate::runtime::openai::catalog::ExecutionRole::Worker);
+        assert!(worker
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(worker.reasoning_level(), ReasoningLevel::Low);
+
+        let mut internal = provisioned_fable_runtime();
+        internal.set_codex_request_role(crate::runtime::openai::catalog::ExecutionRole::Internal);
+        assert!(internal
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(internal.reasoning_level(), ReasoningLevel::Low);
+
+        let mut manifest = provisioned_fable_runtime();
+        install_typed_manifest(&mut manifest);
+        assert!(manifest
+            .set_reasoning_level_checked(ReasoningLevel::UltraCode)
+            .is_err());
+        assert_eq!(manifest.reasoning_level(), ReasoningLevel::Low);
+    }
+
+    #[test]
+    fn checked_accepts_client_omission_modes_for_codex() {
+        for level in [ReasoningLevel::Off, ReasoningLevel::Adaptive] {
+            let mut rt = codex_runtime("gpt-5.6-sol");
+            rt.set_reasoning_level_checked(level).unwrap();
+            assert_eq!(rt.reasoning_level(), level);
+        }
+    }
+
+    /// luna does not support Ultra; checked must reject and leave level unchanged.
+    #[test]
+    fn checked_rejects_ultra_for_luna_no_mutation() {
+        let mut rt = codex_runtime("gpt-5.6-luna");
+        let before = rt.reasoning_level();
+        let err = rt
+            .set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .unwrap_err();
+        assert!(
+            err.contains("ultra"),
+            "error must name the rejected level; got: {err}"
+        );
+        assert_eq!(
+            rt.reasoning_level(),
+            before,
+            "runtime must not be mutated when validation fails"
+        );
+    }
+
+    /// gpt-5.5 does not support Max; checked must reject and not mutate.
+    #[test]
+    fn checked_rejects_max_for_gpt55_no_mutation() {
+        let mut rt = codex_runtime("gpt-5.5");
+        rt.set_reasoning_level(ReasoningLevel::Medium);
+        let err = rt
+            .set_reasoning_level_checked(ReasoningLevel::Max)
+            .unwrap_err();
+        assert!(
+            err.contains("max"),
+            "error must name the rejected level; got: {err}"
+        );
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Medium);
+    }
+
+    /// sol supports Ultra; checked must accept and mutate.
+    #[test]
+    fn checked_accepts_ultra_for_sol_and_mutates() {
+        let mut rt = codex_runtime("gpt-5.6-sol");
+        rt.set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .expect("sol must accept ultra");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Ultra);
+    }
+
+    /// Providers without exact metadata must not gain Max/Ultra.
+    #[test]
+    fn checked_rejects_extended_levels_without_metadata() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("claude-opus-4-7".to_string());
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+            assert!(rt.set_reasoning_level_checked(level).is_err());
+            assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+        }
+    }
+
+    /// Gap fix: unknown Codex ids (no cache, no static metadata) must reject
+    /// the extended Max/Ultra modes at mutation time, fail closed.
+    #[test]
+    fn checked_rejects_max_ultra_for_unknown_codex_model() {
+        let mut rt = codex_runtime("gpt-unknown-future");
+        rt.set_reasoning_level(ReasoningLevel::Low);
+        for level in [ReasoningLevel::Max, ReasoningLevel::Ultra] {
+            let err = rt.set_reasoning_level_checked(level).unwrap_err();
+            assert!(err.contains("no capability metadata"), "{err}");
+            assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+        }
+    }
+
+    /// xAI: Off is rejected (not silently omitted) on models whose reasoning
+    /// cannot be disabled; unsupported named efforts are rejected exactly.
+    #[test]
+    fn checked_enforces_xai_capability_matrix_no_mutation_on_err() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        // Model default (not explicit) applied on switch: documented high.
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        for level in [
+            ReasoningLevel::Off,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Ultra,
+        ] {
+            let before = rt.reasoning_level();
+            assert!(rt.set_reasoning_level_checked(level).is_err(), "{level}");
+            assert_eq!(rt.reasoning_level(), before);
+        }
+        rt.set_reasoning_level_checked(ReasoningLevel::Low)
+            .expect("grok-4.5 supports low");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+    }
+
+    /// xAI models without documented effort control reject explicit named
+    /// levels; model switch applies the Adaptive provider-default.
+    #[test]
+    fn checked_rejects_named_on_intrinsic_xai_model_and_defaults_adaptive() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.3".to_string());
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Adaptive);
+        assert!(rt
+            .set_reasoning_level_checked(ReasoningLevel::Medium)
+            .is_err());
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Adaptive);
+        rt.set_reasoning_level_checked(ReasoningLevel::Adaptive)
+            .unwrap();
+    }
+
+    /// Explicit user choice survives an xAI model switch (no default overwrite).
+    #[test]
+    fn explicit_level_survives_xai_model_switch() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.5".to_string());
+        rt.set_reasoning_level_checked(ReasoningLevel::Low).unwrap();
+        rt.set_model("xai-auth/grok-4.5-latest".to_string());
+        assert_eq!(
+            rt.reasoning_level(),
+            ReasoningLevel::Low,
+            "explicit level must not be overwritten by the model default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod codex_execution_preflight_tests {
+    use super::*;
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use agent_core::prompt::QualifiedModelId;
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn ultra_runtime() -> Runtime {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model("openai-codex/gpt-5.6-sol".to_string());
+        runtime.set_reasoning_level_explicit(ReasoningLevel::Ultra);
+        runtime
+    }
+
+    fn install_baseline(runtime: &mut Runtime) {
+        let foreground =
+            QualifiedModelId::parse("openai-codex/gpt-5.6-sol").expect("qualified model");
+        let orchestration = crate::orchestration::OrchestrationRuntime::baseline(foreground, 3, 8)
+            .expect("baseline orchestration");
+        runtime.install_orchestration(Arc::new(orchestration));
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_requires_orchestration() {
+        let runtime = ultra_runtime();
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("Ultra without orchestration must fail closed");
+        assert!(error.to_string().contains("orchestration"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_requires_actionable_subagent_tools() {
+        let mut runtime = ultra_runtime();
+        install_baseline(&mut runtime);
+        runtime.set_tools(ToolRegistry::without_subagent());
+
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("Ultra without subagent tools must fail closed");
+        assert!(error.to_string().contains("subagent"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn foreground_ultra_preflight_accepts_exact_model_policy_and_tools() {
+        let mut runtime = ultra_runtime();
+        install_baseline(&mut runtime);
+        runtime
+            .validate_request_preflight()
+            .await
+            .expect("fully provisioned Ultra must pass preflight");
+    }
+
+    #[tokio::test]
+    async fn worker_ultra_preflight_never_requires_or_enables_orchestration() {
+        let mut runtime = ultra_runtime();
+        runtime.set_codex_request_role(CodexRequestRole::Worker);
+        runtime.set_tools(ToolRegistry::without_subagent());
+        runtime
+            .validate_request_preflight()
+            .await
+            .expect("worker Ultra is underlying max without proactive orchestration");
+        assert_eq!(runtime.codex_request_role(), CodexRequestRole::Worker);
+    }
+
+    #[tokio::test]
+    async fn non_codex_ultra_preflight_fails_before_provider_work() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_model("anthropic/claude-opus-4-7".to_string());
+        runtime.set_reasoning_level_explicit(ReasoningLevel::Ultra);
+        let error = runtime
+            .validate_request_preflight()
+            .await
+            .expect_err("non-Codex Ultra must fail closed");
+        assert!(
+            error.to_string().contains("unsupported_reasoning_level"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_preflight_validates_target_before_credentials() {
+        let mut runtime = ultra_runtime();
+        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        {
+            let mut auth = runtime.auth.write().await;
+            auth.auth_token.clear();
+            auth.auth_type = "none".to_string();
+            auth.refresh_token = None;
+            auth.token_expires = None;
+        }
+
+        let error = runtime
+            .compact_call(Vec::new())
+            .await
+            .expect_err("Codex Ultra cannot silently cross into Anthropic compaction");
+        assert!(
+            error.to_string().contains("authoritative exact-model"),
+            "preflight must reject the target before auth access: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod http_client_timeout_tests {
+    //! Regression tests for the runtime HTTP client's timeout semantics.
+    //!
+    //! The client used to set `.timeout(300s)` — a **total wall-clock
+    //! deadline** that keeps ticking even while a streaming response is
+    //! actively delivering bytes (reqwest `TotalTimeoutBody` never resets).
+    //! Two failure modes: a dead connection took a full 5 minutes to
+    //! surface (incident: session 20260714-025948-3dab), and any healthy
+    //! stream longer than 300s was killed mid-flight. The fix is an
+    //! idle-based `read_timeout` that resets on every received chunk.
+    //!
+    //! Servers here are raw TCP writing chunked HTTP/1.1 — full control
+    //! over inter-chunk delays with no framework buffering in the way.
+
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    const CHUNKED_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+
+    fn chunk(data: &str) -> Vec<u8> {
+        format!("{:x}\r\n{}\r\n", data.len(), data).into_bytes()
+    }
+
+    /// Spawn a raw server: writes headers, then `n_chunks` chunks spaced
+    /// `gap` apart, then (optionally) the terminating chunk.
+    async fn spawn_chunked_server(n_chunks: usize, gap: Duration, terminate: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head (we don't care about its contents).
+            let mut buf = [0u8; 4096];
+            use tokio::io::AsyncReadExt;
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(CHUNKED_HEAD).await.unwrap();
+            for i in 0..n_chunks {
+                sock.write_all(&chunk(&format!("data {i}\n")))
+                    .await
+                    .unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(gap).await;
+            }
+            if terminate {
+                sock.write_all(b"0\r\n\r\n").await.unwrap();
+            } else {
+                // Stall forever (until the client gives up and drops us).
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        format!("http://{addr}/stream")
+    }
+
+    async fn drain(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = client.get(url).send().await?;
+        let mut stream = resp.bytes_stream();
+        let mut total = 0usize;
+        while let Some(c) = stream.next().await {
+            total += c?.len();
+        }
+        Ok(total)
+    }
+
+    /// A healthy stream that keeps delivering bytes must NOT be killed,
+    /// even when its total duration exceeds the read timeout — received
+    /// data resets the idle clock. (This is the property the old total
+    /// deadline violated at 300s.)
+    #[tokio::test]
+    async fn active_stream_outliving_read_timeout_survives() {
+        // 15 chunks × 100ms ≈ 1.5s total, read_timeout = 400ms.
+        let url = spawn_chunked_server(15, Duration::from_millis(100), true).await;
+        let client = super::build_http_client(Duration::from_millis(400)).expect("client builds");
+        let total = drain(&client, &url)
+            .await
+            .expect("active stream must never be killed by the idle timeout");
+        assert!(total > 0);
+    }
+
+    /// A stream that stalls (bytes stop arriving) must be killed within
+    /// the read timeout — not after a 300s total deadline.
+    #[tokio::test]
+    async fn stalled_stream_is_killed_by_read_timeout() {
+        // 2 quick chunks then permanent stall, read_timeout = 300ms.
+        let url = spawn_chunked_server(2, Duration::from_millis(10), false).await;
+        let client = super::build_http_client(Duration::from_millis(300)).expect("client builds");
+        let start = std::time::Instant::now();
+        let err = drain(&client, &url)
+            .await
+            .expect_err("stalled stream must be detected");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "stall must be detected promptly, took {:?}",
+            start.elapsed()
+        );
+        let msg = crate::core::error::error_chain_string(err.as_ref());
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "must be a timeout error: {msg}"
+        );
+    }
+
+    /// A server that accepts but never sends response headers must be
+    /// killed by the read timeout too (the incident's failure mode —
+    /// previously took the full 300s total deadline to surface).
+    #[tokio::test]
+    async fn hung_headers_are_killed_by_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = super::build_http_client(Duration::from_millis(300)).expect("client builds");
+        let start = std::time::Instant::now();
+        let err = client
+            .get(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("hung request must be detected");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hung headers must be detected promptly, took {:?}",
+            start.elapsed()
+        );
+        assert!(err.is_timeout(), "must be a timeout: {err:?}");
     }
 }

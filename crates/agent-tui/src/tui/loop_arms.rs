@@ -540,8 +540,16 @@ pub(crate) fn handle_model_list_arm(
     result: Option<(String, std::result::Result<Vec<models::ExpandedModelEntry>, String>)>,
 ) {
                 if let Some((provider_key, models_result)) = result {
+                    // App-level catalog cache: shared by the /models modal and
+                    // the /settings model picker (live/static reuse).
+                    if let Ok(models_list) = &models_result {
+                        let rows = models::catalog_override_rows(&provider_key, models_list);
+                        if !rows.is_empty() {
+                            app.catalog_overrides.insert(provider_key.clone(), rows);
+                        }
+                    }
                     if let Some(state) = app.models.as_mut() {
-                        models::set_expanded_models(state, &provider_key, models_result);
+                        models::apply_model_list_result(state, &provider_key, models_result);
                     }
                     app.request_redraw();
                 }

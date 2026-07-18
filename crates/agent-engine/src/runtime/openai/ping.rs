@@ -3,13 +3,13 @@
 //! Sends a minimal chat completion (`max_tokens: 1`, message `"hi"`) to each
 //! configured model in parallel and classifies the response.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use super::registry;
 use super::types::ProviderConfig;
+use agent_core::auth::broker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PingStatus {
@@ -55,12 +55,7 @@ pub struct PingResult {
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn ping_model(
-    client: &reqwest::Client,
-    cfg: &ProviderConfig,
-    provider_key: &str,
-) -> PingResult {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+pub async fn ping_model(cfg: &ProviderConfig, provider_key: &str) -> PingResult {
     let body = json!({
         "model": cfg.model,
         "messages": [{"role": "user", "content": "hi"}],
@@ -69,25 +64,26 @@ pub async fn ping_model(
     });
 
     let start = Instant::now();
-    let fut = client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send();
+    // Credential applied broker-side; the ping path never sees a key.
+    let broker_handle = broker::global_broker();
+    let fut = broker_handle.proxy(broker::ProxyRequest {
+        provider: cfg.provider.clone(),
+        method: broker::ProxyMethod::Post,
+        path: "/chat/completions".to_string(),
+        body: Some(body),
+        stream: false,
+    });
 
     let status = match tokio::time::timeout(TIMEOUT, fut).await {
         Err(_) => PingStatus::Timeout,
         Ok(Err(_)) => PingStatus::Error,
-        Ok(Ok(resp)) => {
-            let code = resp.status().as_u16();
-            match code {
-                200..=299 => PingStatus::Online,
-                401 | 403 => PingStatus::Unauthorized,
-                404 => PingStatus::NotFound,
-                429 => PingStatus::RateLimited,
-                _ => PingStatus::Error,
-            }
-        }
+        Ok(Ok(resp)) => match resp.status {
+            200..=299 => PingStatus::Online,
+            401 | 403 => PingStatus::Unauthorized,
+            404 => PingStatus::NotFound,
+            429 => PingStatus::RateLimited,
+            _ => PingStatus::Error,
+        },
     };
 
     PingResult {
@@ -101,29 +97,25 @@ pub async fn ping_model(
 /// Ping every model of every configured provider in parallel.
 /// Results are sent through `tx` as they arrive (not batched).
 pub async fn ping_all_configured(
-    client: &reqwest::Client,
-    overrides: &BTreeMap<String, String>,
     tx: tokio::sync::mpsc::UnboundedSender<(String, PingStatus, u64)>,
 ) {
     let specs = registry::providers();
     let mut handles = Vec::new();
 
     for spec in specs {
-        let Some(base_cfg) = registry::resolve_provider_model(spec.key, spec.default_model, overrides) else {
+        let Some(base_cfg) = registry::resolve_provider_model(spec.key, spec.default_model) else {
             continue;
         };
         for (model_id, _label, _tier) in spec.models {
             let cfg = ProviderConfig {
                 base_url: base_cfg.base_url.clone(),
-                api_key: base_cfg.api_key.clone(),
                 model: (*model_id).to_string(),
                 provider: base_cfg.provider.clone(),
             };
-            let client = client.clone();
             let key = spec.key.to_string();
             let tx = tx.clone();
             handles.push(tokio::spawn(async move {
-                let result = ping_model(&client, &cfg, &key).await;
+                let result = ping_model(&cfg, &key).await;
                 let full_key = format!("{}/{}", result.provider_key, result.model_id);
                 let _ = tx.send((full_key, result.status, result.latency_ms));
             }));

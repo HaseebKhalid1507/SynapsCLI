@@ -406,6 +406,15 @@ fn live_reactive_subagent_end_to_end() {
     rt.block_on(async move {
         let queue = Arc::new(EventQueue::new(1000));
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        // Manifestless baseline: the exact foreground identity is the only
+        // authorized worker choice; the omitted model below inherits it.
+        // Shared across start + collect so the policy lifecycle is coherent.
+        let foreground = agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6")
+            .expect("test foreground is qualified");
+        let orchestration = Arc::new(
+            agent_engine::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
+                .expect("test foreground is routable"),
+        );
 
         let ctx = ToolContext {
             channels: ToolChannels {
@@ -419,6 +428,7 @@ fn live_reactive_subagent_end_to_end() {
                 subagent_registry: Some(Arc::clone(&registry)),
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
+                orchestration: Some(Arc::clone(&orchestration)),
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -470,6 +480,7 @@ fn live_reactive_subagent_end_to_end() {
                 subagent_registry: Some(Arc::clone(&registry)),
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
+                orchestration: Some(Arc::clone(&orchestration)),
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -525,7 +536,7 @@ fn c2_reap_finished_engine_seam_headless() {
         reg.register(make_h("sa_c2_running", Arc::clone(&running_state)));
     }
 
-    reap_finished(&registry);
+    reap_finished(&registry, None);
 
     let reg = registry.lock().unwrap();
     assert!(reg.get("sa_c2_done").is_none(), "collected+finished handle must be reaped by engine seam");
@@ -546,7 +557,7 @@ fn c2_reap_finished_poison_safe() {
         panic!("poison");
     });
     // Must not panic
-    reap_finished(&registry);
+    reap_finished(&registry, None);
 }
 
 // ── C3: agent idle_should_wait reactive wait ──────────────────────────────────

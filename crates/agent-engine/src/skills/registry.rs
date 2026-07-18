@@ -1,9 +1,9 @@
 //! Slash command registry: built-ins + dynamically registered skills.
 
+use crate::help::HelpEntry;
+use crate::skills::{LoadedSkill, Plugin};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::skills::{LoadedSkill, Plugin};
-use crate::help::HelpEntry;
 
 #[derive(Debug, Clone)]
 pub struct PluginSummary {
@@ -13,18 +13,33 @@ pub struct PluginSummary {
 
 #[derive(Clone, Debug)]
 pub enum RegisteredPluginCommandBackend {
-    Shell { command: String, args: Vec<String> },
-    ExtensionTool { tool: String, input: serde_json::Value },
-    SkillPrompt { skill: String, prompt: String },
-    Interactive { plugin_extension_id: String },
+    Shell {
+        command: String,
+        args: Vec<String>,
+    },
+    ExtensionTool {
+        tool: String,
+        input: serde_json::Value,
+    },
+    SkillPrompt {
+        skill: String,
+        prompt: String,
+    },
+    Interactive {
+        plugin_extension_id: String,
+    },
 }
 
 /// Editor kind for a plugin-declared settings field, normalised from the
 /// manifest into a form the settings UI can consume directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PluginSettingsEditor {
-    Text { numeric: bool },
-    Cycler { options: Vec<String> },
+    Text {
+        numeric: bool,
+    },
+    Cycler {
+        options: Vec<String>,
+    },
     Picker,
     /// Editor body rendered by the plugin via the
     /// `settings.editor.*` JSON-RPC contract.
@@ -132,7 +147,11 @@ impl CommandRegistry {
         Self::new_with_plugins(builtins, skills, vec![])
     }
 
-    pub fn new_with_plugins(builtins: &[&'static str], skills: Vec<LoadedSkill>, plugins: Vec<Plugin>) -> Self {
+    pub fn new_with_plugins(
+        builtins: &[&'static str],
+        skills: Vec<LoadedSkill>,
+        plugins: Vec<Plugin>,
+    ) -> Self {
         let r = CommandRegistry {
             builtins: builtins.to_vec(),
             inner: RwLock::new(Inner {
@@ -156,8 +175,7 @@ impl CommandRegistry {
 
     /// Atomically replace the skill and plugin-command set. Built-ins are unchanged.
     pub fn rebuild_with_plugins(&self, skills: Vec<LoadedSkill>, plugins: Vec<Plugin>) {
-        let builtins_set: std::collections::HashSet<&str> =
-            self.builtins.iter().copied().collect();
+        let builtins_set: std::collections::HashSet<&str> = self.builtins.iter().copied().collect();
         let mut new_skills: HashMap<String, Vec<Arc<LoadedSkill>>> = HashMap::new();
         let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
         let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
@@ -167,10 +185,12 @@ impl CommandRegistry {
         let mut new_lifecycle_collisions: Vec<(String, String, String)> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
-                new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(|mut entry| {
-                    entry.source = Some(manifest.name.clone());
-                    entry
-                }));
+                new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(
+                    |mut entry| {
+                        entry.source = Some(manifest.name.clone());
+                        entry
+                    },
+                ));
                 // Phase 8 slice 8A: harvest lifecycle claims from
                 // provides.sidecar.lifecycle. First-loaded wins on
                 // collision; the loser is recorded for surfacing in
@@ -189,9 +209,11 @@ impl CommandRegistry {
                             if builtins_set.contains(claim.command.as_str()) {
                                 tracing::warn!(
                                     "plugin '{}' attempted to claim builtin command '{}'; rejected",
-                                    claim.plugin, claim.command,
+                                    claim.plugin,
+                                    claim.command,
                                 );
-                            } else if let Some(existing) = new_lifecycle_claims.get(&claim.command) {
+                            } else if let Some(existing) = new_lifecycle_claims.get(&claim.command)
+                            {
                                 new_lifecycle_collisions.push((
                                     claim.plugin.clone(),
                                     claim.command.clone(),
@@ -248,17 +270,26 @@ impl CommandRegistry {
                         crate::skills::manifest::ManifestCommand::Shell(cmd) => (
                             cmd.name,
                             cmd.description,
-                            RegisteredPluginCommandBackend::Shell { command: cmd.command, args: cmd.args },
+                            RegisteredPluginCommandBackend::Shell {
+                                command: cmd.command,
+                                args: cmd.args,
+                            },
                         ),
                         crate::skills::manifest::ManifestCommand::ExtensionTool(cmd) => (
                             cmd.name,
                             cmd.description,
-                            RegisteredPluginCommandBackend::ExtensionTool { tool: cmd.tool, input: cmd.input },
+                            RegisteredPluginCommandBackend::ExtensionTool {
+                                tool: cmd.tool,
+                                input: cmd.input,
+                            },
                         ),
                         crate::skills::manifest::ManifestCommand::SkillPrompt(cmd) => (
                             cmd.name,
                             cmd.description,
-                            RegisteredPluginCommandBackend::SkillPrompt { skill: cmd.skill, prompt: cmd.prompt },
+                            RegisteredPluginCommandBackend::SkillPrompt {
+                                skill: cmd.skill,
+                                prompt: cmd.prompt,
+                            },
                         ),
                         crate::skills::manifest::ManifestCommand::Interactive(cmd) => {
                             if !cmd.interactive {
@@ -275,24 +306,28 @@ impl CommandRegistry {
                                         .unwrap_or_else(|| plugin.name.clone()),
                                 },
                             )
-                        },
+                        }
                     };
                     let q = format!("{}:{}", manifest.name, name);
                     // Block plugins from registering commands that match builtin names
                     if builtins_set.contains(name.as_str()) {
                         tracing::warn!(
                             "plugin '{}' command '{}' shadows builtin; skipping",
-                            manifest.name, name,
+                            manifest.name,
+                            name,
                         );
                         continue;
                     }
-                    new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
-                        plugin: manifest.name.clone(),
-                        name,
-                        description,
-                        backend,
-                        plugin_root: plugin.root.clone(),
-                    }));
+                    new_plugin_commands.insert(
+                        q,
+                        Arc::new(RegisteredPluginCommand {
+                            plugin: manifest.name.clone(),
+                            name,
+                            description,
+                            backend,
+                            plugin_root: plugin.root.clone(),
+                        }),
+                    );
                 }
             }
         }
@@ -307,7 +342,10 @@ impl CommandRegistry {
                     arc.name
                 );
             } else {
-                new_skills.entry(arc.name.clone()).or_default().push(arc.clone());
+                new_skills
+                    .entry(arc.name.clone())
+                    .or_default()
+                    .push(arc.clone());
             }
             // Qualified entry
             if let Some(ref p) = arc.plugin {
@@ -406,7 +444,10 @@ impl CommandRegistry {
     /// plugin-owned command that also has extension subcommands
     /// builtin and a plugin command name) and we need to bypass the
     /// builtin check to reach the plugin.
-    pub fn find_plugin_command_unqualified(&self, name: &str) -> Option<Arc<RegisteredPluginCommand>> {
+    pub fn find_plugin_command_unqualified(
+        &self,
+        name: &str,
+    ) -> Option<Arc<RegisteredPluginCommand>> {
         let r = self.inner.read().unwrap();
         let mut matches = r.plugin_commands.values().filter(|c| c.name == name);
         let first = matches.next()?.clone();
@@ -428,7 +469,10 @@ impl CommandRegistry {
         // disambiguate. Mirrors `resolve()`'s bare-resolution logic.
         let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
         for (qkey, c) in r.plugin_commands.iter() {
-            by_name.entry(c.name.as_str()).or_default().push(qkey.as_str());
+            by_name
+                .entry(c.name.as_str())
+                .or_default()
+                .push(qkey.as_str());
         }
         for (name, qkeys) in by_name {
             if qkeys.len() == 1 {
@@ -457,20 +501,31 @@ impl CommandRegistry {
     /// Used by `/extensions` to render the active claims and by the
     /// pill renderer to enumerate sidecars.
     pub fn lifecycle_claims(&self) -> Vec<LifecycleClaim> {
-        self.inner.read().unwrap().lifecycle_claims.values().cloned().collect()
+        self.inner
+            .read()
+            .unwrap()
+            .lifecycle_claims
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Plugins that lost a lifecycle-claim collision during the most
     /// recent rebuild. Each entry is `(losing_plugin, command,
     /// winning_plugin)`. Surfaced in `/extensions`.
     pub fn lifecycle_claim_collisions(&self) -> Vec<(String, String, String)> {
-        self.inner.read().unwrap().lifecycle_claim_collisions.clone()
+        self.inner
+            .read()
+            .unwrap()
+            .lifecycle_claim_collisions
+            .clone()
     }
 
     pub fn plugins(&self) -> Vec<PluginSummary> {
         let r = self.inner.read().unwrap();
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for c in r.plugin_commands.values() {
             let key = (c.plugin.clone(), c.name.clone());
             if seen.insert(key) {
@@ -485,7 +540,8 @@ impl CommandRegistry {
                 }
             }
         }
-        counts.into_iter()
+        counts
+            .into_iter()
             .map(|(name, skill_count)| PluginSummary { name, skill_count })
             .collect()
     }
@@ -498,7 +554,11 @@ impl CommandRegistry {
     /// plugin discovery order. The settings UI calls this on each open
     /// to merge plugin categories with the built-in ones.
     pub fn plugin_settings_categories(&self) -> Vec<PluginSettingsCategory> {
-        self.inner.read().unwrap().plugin_settings_categories.clone()
+        self.inner
+            .read()
+            .unwrap()
+            .plugin_settings_categories
+            .clone()
     }
 
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
@@ -509,12 +569,16 @@ impl CommandRegistry {
         for list in r.skills.values() {
             for s in list {
                 let key = (s.plugin.clone(), s.name.clone());
-                if seen.insert(key) { out.push(s.clone()); }
+                if seen.insert(key) {
+                    out.push(s.clone());
+                }
             }
         }
         for s in r.qualified.values() {
             let key = (s.plugin.clone(), s.name.clone());
-            if seen.insert(key) { out.push(s.clone()); }
+            if seen.insert(key) {
+                out.push(s.clone());
+            }
         }
         out
     }
@@ -523,8 +587,8 @@ impl CommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::skills::manifest::{ManifestCommand, ManifestShellCommand};
+    use std::path::PathBuf;
 
     fn mk_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
         Plugin {
@@ -554,7 +618,6 @@ mod tests {
         }
     }
 
-
     fn mk_interactive_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
         Plugin {
             name: plugin.to_string(),
@@ -569,12 +632,14 @@ mod tests {
                 description: None,
                 keybinds: vec![],
                 compatibility: None,
-                commands: vec![ManifestCommand::Interactive(crate::skills::manifest::ManifestInteractiveCommand {
-                    name: name.to_string(),
-                    description: Some("interactive desc".to_string()),
-                    interactive: true,
-                    subcommands: vec!["help".to_string()],
-                })],
+                commands: vec![ManifestCommand::Interactive(
+                    crate::skills::manifest::ManifestInteractiveCommand {
+                        name: name.to_string(),
+                        description: Some("interactive desc".to_string()),
+                        interactive: true,
+                        subcommands: vec!["help".to_string()],
+                    },
+                )],
                 extension: None,
                 help_entries: vec![],
                 provides: None,
@@ -588,12 +653,18 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_interactive_cmd("demo-plugin", "demo", PathBuf::from("/tmp/demo"))],
+            vec![mk_interactive_cmd(
+                "demo-plugin",
+                "demo",
+                PathBuf::from("/tmp/demo"),
+            )],
         );
 
         match reg.resolve("demo-plugin:demo") {
             Resolution::PluginCommand(cmd) => match &cmd.backend {
-                RegisteredPluginCommandBackend::Interactive { plugin_extension_id } => {
+                RegisteredPluginCommandBackend::Interactive {
+                    plugin_extension_id,
+                } => {
                     assert_eq!(plugin_extension_id, "demo-plugin");
                     assert_eq!(cmd.name, "demo");
                 }
@@ -614,31 +685,35 @@ mod tests {
         }
     }
 
-
     #[test]
     fn plugin_help_entries_are_tagged_with_manifest_name() {
         let root = PathBuf::from("/tmp/plugin-root");
         let mut plugin = mk_cmd("acme-tools", "sync", root);
-        plugin.manifest.as_mut().unwrap().help_entries.push(HelpEntry {
-            id: "acme-sync".to_string(),
-            command: "/acme:sync".to_string(),
-            title: "Acme Sync".to_string(),
-            summary: "Sync Acme workspace state.".to_string(),
-            category: "Plugin".to_string(),
-            topic: crate::help::HelpTopicKind::Command,
-            protected: false,
-            common: false,
-            aliases: vec![],
-            keywords: vec![],
-            lines: vec![],
-            usage: Some("/acme:sync [workspace]".to_string()),
-            examples: vec![crate::help::HelpExample {
-                command: "/acme:sync docs".to_string(),
-                description: "Sync docs.".to_string(),
-            }],
-            related: vec![],
-            source: None,
-        });
+        plugin
+            .manifest
+            .as_mut()
+            .unwrap()
+            .help_entries
+            .push(HelpEntry {
+                id: "acme-sync".to_string(),
+                command: "/acme:sync".to_string(),
+                title: "Acme Sync".to_string(),
+                summary: "Sync Acme workspace state.".to_string(),
+                category: "Plugin".to_string(),
+                topic: crate::help::HelpTopicKind::Command,
+                protected: false,
+                common: false,
+                aliases: vec![],
+                keywords: vec![],
+                lines: vec![],
+                usage: Some("/acme:sync [workspace]".to_string()),
+                examples: vec![crate::help::HelpExample {
+                    command: "/acme:sync docs".to_string(),
+                    description: "Sync docs.".to_string(),
+                }],
+                related: vec![],
+                source: None,
+            });
 
         let registry = CommandRegistry::new_with_plugins(&[], vec![], vec![plugin]);
         let entries = registry.plugin_help_entries();
@@ -672,10 +747,10 @@ mod tests {
 
     #[test]
     fn resolve_ambiguous() {
-        let r = CommandRegistry::new(&[], vec![
-            mk("search", Some("p1")),
-            mk("search", Some("p2")),
-        ]);
+        let r = CommandRegistry::new(
+            &[],
+            vec![mk("search", Some("p1")), mk("search", Some("p2"))],
+        );
         match r.resolve("search") {
             Resolution::Ambiguous(v) => {
                 assert_eq!(v.len(), 2);
@@ -688,10 +763,10 @@ mod tests {
 
     #[test]
     fn resolve_qualified() {
-        let r = CommandRegistry::new(&[], vec![
-            mk("search", Some("p1")),
-            mk("search", Some("p2")),
-        ]);
+        let r = CommandRegistry::new(
+            &[],
+            vec![mk("search", Some("p1")), mk("search", Some("p2"))],
+        );
         match r.resolve("p1:search") {
             Resolution::Skill(s) => assert_eq!(s.plugin.as_deref(), Some("p1")),
             _ => panic!(),
@@ -712,10 +787,10 @@ mod tests {
 
     #[test]
     fn all_commands_sorted_and_deduped() {
-        let r = CommandRegistry::new(&["clear", "model"], vec![
-            mk("search", Some("p")),
-            mk("help-me", None),
-        ]);
+        let r = CommandRegistry::new(
+            &["clear", "model"],
+            vec![mk("search", Some("p")), mk("help-me", None)],
+        );
         let cmds = r.all_commands();
         assert_eq!(cmds, vec!["clear", "help-me", "model", "search"]);
     }
@@ -766,7 +841,11 @@ mod tests {
 
     #[test]
     fn resolve_qualified_plugin_command() {
-        let r = CommandRegistry::new_with_plugins(&[], vec![], vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))]);
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))],
+        );
         match r.resolve("p:hello") {
             Resolution::PluginCommand(cmd) => {
                 assert_eq!(cmd.plugin, "p");
@@ -787,7 +866,11 @@ mod tests {
         // a sole plugin command is now surfaced bare ("hello"), not
         // qualified ("p:hello"). Ambiguous names stay qualified — see
         // `all_commands_ambiguous_plugin_commands_stay_qualified`.
-        let r = CommandRegistry::new_with_plugins(&["help"], vec![], vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))]);
+        let r = CommandRegistry::new_with_plugins(
+            &["help"],
+            vec![],
+            vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))],
+        );
         let cmds = r.all_commands();
         assert!(cmds.contains(&"help".to_string()));
         assert!(cmds.contains(&"hello".to_string()));
@@ -852,12 +935,15 @@ mod tests {
 
     #[test]
     fn plugins_summary_groups_by_plugin_name() {
-        let r = CommandRegistry::new(&[], vec![
-            mk("a", Some("p1")),
-            mk("b", Some("p1")),
-            mk("c", Some("p2")),
-            mk("loose", None),
-        ]);
+        let r = CommandRegistry::new(
+            &[],
+            vec![
+                mk("a", Some("p1")),
+                mk("b", Some("p1")),
+                mk("c", Some("p2")),
+                mk("loose", None),
+            ],
+        );
         let mut plugins = r.plugins();
         plugins.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(plugins.len(), 2);
@@ -869,8 +955,7 @@ mod tests {
 
     fn mk_plugin_with_settings(plugin: &str, root: PathBuf) -> Plugin {
         use crate::skills::manifest::{
-            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
-            ManifestSettingsField,
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory, ManifestSettingsField,
         };
         Plugin {
             name: plugin.to_string(),
@@ -924,7 +1009,10 @@ mod tests {
         let r = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+            vec![mk_plugin_with_settings(
+                "demo-plugin",
+                PathBuf::from("/tmp/demo"),
+            )],
         );
         let cats = r.plugin_settings_categories();
         assert_eq!(cats.len(), 1, "expected one plugin settings category");
@@ -962,7 +1050,10 @@ mod tests {
         let r = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+            vec![mk_plugin_with_settings(
+                "demo-plugin",
+                PathBuf::from("/tmp/demo"),
+            )],
         );
         assert_eq!(r.plugin_settings_categories().len(), 1);
         r.rebuild_with_plugins(vec![], vec![]);
@@ -976,19 +1067,22 @@ mod tests {
         let r = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_settings("totally-unrelated", PathBuf::from("/tmp/x"))],
+            vec![mk_plugin_with_settings(
+                "totally-unrelated",
+                PathBuf::from("/tmp/x"),
+            )],
         );
         let cats = r.plugin_settings_categories();
         assert_eq!(cats[0].plugin, "totally-unrelated");
         assert_eq!(cats[0].id, "demo");
-        assert!(cats[0].fields.iter().any(|f| matches!(
-            f.editor,
-            PluginSettingsEditor::Cycler { .. }
-        )));
-        assert!(cats[0].fields.iter().any(|f| matches!(
-            f.editor,
-            PluginSettingsEditor::Text { .. }
-        )));
+        assert!(cats[0]
+            .fields
+            .iter()
+            .any(|f| matches!(f.editor, PluginSettingsEditor::Cycler { .. })));
+        assert!(cats[0]
+            .fields
+            .iter()
+            .any(|f| matches!(f.editor, PluginSettingsEditor::Text { .. })));
     }
 
     // ---- Phase 8 slice 8A: lifecycle claims ----
@@ -1077,7 +1171,13 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_lifecycle("sample-sidecar", "capture", None, 0, None)],
+            vec![mk_plugin_with_lifecycle(
+                "sample-sidecar",
+                "capture",
+                None,
+                0,
+                None,
+            )],
         );
         assert!(reg.all_commands().contains(&"capture".to_string()));
     }
@@ -1098,11 +1198,14 @@ mod tests {
         assert_eq!(claim.plugin, "alpha-sidecar");
         let collisions = reg.lifecycle_claim_collisions();
         assert_eq!(collisions.len(), 1);
-        assert_eq!(collisions[0], (
-            "beta-sidecar".to_string(),
-            "capture".to_string(),
-            "alpha-sidecar".to_string(),
-        ));
+        assert_eq!(
+            collisions[0],
+            (
+                "beta-sidecar".to_string(),
+                "capture".to_string(),
+                "alpha-sidecar".to_string(),
+            )
+        );
     }
 
     #[test]
@@ -1132,7 +1235,13 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_lifecycle("sample-sidecar", "capture", None, 0, None)],
+            vec![mk_plugin_with_lifecycle(
+                "sample-sidecar",
+                "capture",
+                None,
+                0,
+                None,
+            )],
         );
         assert!(reg.lifecycle_for_command("capture").is_some());
         // Rebuild without the plugin: the claim must vanish.
@@ -1150,9 +1259,8 @@ mod tests {
         category_ids: &[&str],
     ) -> Plugin {
         use crate::skills::manifest::{
-            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
-            ManifestSettingsField, PluginManifest, PluginProvides, SidecarLifecycle,
-            SidecarManifest,
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory, ManifestSettingsField,
+            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
         };
         Plugin {
             name: plugin.to_string(),
@@ -1250,11 +1358,19 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_lifecycle_plus_settings("p", "ocr", None, &["capture"])],
+            vec![mk_plugin_lifecycle_plus_settings(
+                "p",
+                "ocr",
+                None,
+                &["capture"],
+            )],
         );
         let cats = reg.plugin_settings_categories();
         let capture = cats.iter().find(|c| c.id == "capture").expect("category");
-        assert!(capture.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+        assert!(capture
+            .fields
+            .iter()
+            .all(|f| f.key != "_lifecycle_toggle_key"));
     }
 
     #[test]
@@ -1287,12 +1403,7 @@ mod tests {
                     Some("capture"),
                     &["capture"],
                 ),
-                mk_plugin_lifecycle_plus_settings(
-                    "ocr-plugin",
-                    "ocr",
-                    Some("ocr"),
-                    &["ocr"],
-                ),
+                mk_plugin_lifecycle_plus_settings("ocr-plugin", "ocr", Some("ocr"), &["ocr"]),
             ],
         );
         let cats = reg.plugin_settings_categories();

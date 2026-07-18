@@ -66,8 +66,11 @@ fn iter_tools_sorted_returns_alphabetical_order() {
     let tools = registry.iter_tools_sorted();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
-    assert_eq!(names, vec!["alpha", "banana", "mango", "zebra"],
-        "iter_tools_sorted() must return tools in ascending lexicographic order");
+    assert_eq!(
+        names,
+        vec!["alpha", "banana", "mango", "zebra"],
+        "iter_tools_sorted() must return tools in ascending lexicographic order"
+    );
 }
 
 // ─── 2. Stable across multiple calls (deterministic — not HashMap-order) ────
@@ -80,11 +83,21 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
         registry.register(Arc::new(StubTool::new(name)));
     }
 
-    let first_call: Vec<&str> = registry.iter_tools_sorted().iter().map(|t| t.name()).collect();
-    let second_call: Vec<&str> = registry.iter_tools_sorted().iter().map(|t| t.name()).collect();
+    let first_call: Vec<&str> = registry
+        .iter_tools_sorted()
+        .iter()
+        .map(|t| t.name())
+        .collect();
+    let second_call: Vec<&str> = registry
+        .iter_tools_sorted()
+        .iter()
+        .map(|t| t.name())
+        .collect();
 
-    assert_eq!(first_call, second_call,
-        "iter_tools_sorted() must be byte-identical across repeated calls on the same registry");
+    assert_eq!(
+        first_call, second_call,
+        "iter_tools_sorted() must be byte-identical across repeated calls on the same registry"
+    );
 
     // Verify it's actually sorted (not just consistent).
     let mut expected = first_call.clone();
@@ -92,15 +105,18 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
     assert_eq!(first_call, expected, "order must be ascending alphabetical");
 }
 
-// ─── 3. Builtin registry (ToolRegistry::new) — 16 tools in sorted order ─────
+// ─── 3. Builtin registry (ToolRegistry::new) — 18 tools in sorted order ─────
 
 #[test]
-fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
+fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
     let registry = ToolRegistry::new();
     let tools = registry.iter_tools_sorted();
 
-    assert_eq!(tools.len(), 16,
-        "default registry must contain exactly 16 builtin tools");
+    assert_eq!(
+        tools.len(),
+        18,
+        "default registry must contain exactly 18 builtin tools"
+    );
 
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -117,6 +133,8 @@ fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
         "shell_start",
         "subagent",
         "subagent_collect",
+        "subagent_model_authorize",
+        "subagent_models",
         "subagent_resume",
         "subagent_start",
         "subagent_status",
@@ -125,7 +143,7 @@ fn iter_tools_sorted_on_default_registry_has_16_tools_in_order() {
     ];
 
     assert_eq!(names, expected,
-        "iter_tools_sorted() on ToolRegistry::new() must yield the 16 builtin tools in alphabetical order");
+        "iter_tools_sorted() on ToolRegistry::new() must yield the 18 builtin tools in alphabetical order");
 }
 
 // ─── 4. Each tool has non-empty name, description, well-formed parameters ────
@@ -135,10 +153,15 @@ fn iter_tools_sorted_all_tools_have_nonempty_name_and_description() {
     let registry = ToolRegistry::new();
 
     for tool in registry.iter_tools_sorted() {
-        assert!(!tool.name().is_empty(),
-            "every tool must have a non-empty name");
-        assert!(!tool.description().is_empty(),
-            "tool '{}' has an empty description — that's a bug, not a feature", tool.name());
+        assert!(
+            !tool.name().is_empty(),
+            "every tool must have a non-empty name"
+        );
+        assert!(
+            !tool.description().is_empty(),
+            "tool '{}' has an empty description — that's a bug, not a feature",
+            tool.name()
+        );
     }
 }
 
@@ -150,19 +173,28 @@ fn iter_tools_sorted_all_parameters_are_object_type_json_schema() {
         let params = tool.parameters();
 
         // parameters() must return a JSON object (not null, not array, not primitive)
-        assert!(params.is_object(),
+        assert!(
+            params.is_object(),
             "tool '{}': parameters() must return a JSON object, got: {:?}",
-            tool.name(), params);
+            tool.name(),
+            params
+        );
 
         // Must have a "type" field (JSON Schema root requirement)
-        let schema_type = params.get("type")
-            .and_then(|v| v.as_str());
-        assert_eq!(schema_type, Some("object"),
-            "tool '{}': parameters schema must have {{\"type\": \"object\"}}", tool.name());
+        let schema_type = params.get("type").and_then(|v| v.as_str());
+        assert_eq!(
+            schema_type,
+            Some("object"),
+            "tool '{}': parameters schema must have {{\"type\": \"object\"}}",
+            tool.name()
+        );
 
         // Must have a "properties" field (all builtins are object-shaped)
-        assert!(params.get("properties").is_some(),
-            "tool '{}': parameters schema must have a 'properties' key", tool.name());
+        assert!(
+            params.get("properties").is_some(),
+            "tool '{}': parameters schema must have a 'properties' key",
+            tool.name()
+        );
     }
 }
 
@@ -173,21 +205,26 @@ fn iter_tools_sorted_all_required_fields_exist_in_properties() {
     for tool in registry.iter_tools_sorted() {
         let params = tool.parameters();
 
-        let required = params.get("required")
+        let required = params
+            .get("required")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
 
-        let properties = params.get("properties")
+        let properties = params
+            .get("properties")
             .and_then(|p| p.as_object())
             .cloned()
             .unwrap_or_default();
 
         for req in &required {
             let field_name = req.as_str().expect("required entries must be strings");
-            assert!(properties.contains_key(field_name),
+            assert!(
+                properties.contains_key(field_name),
                 "tool '{}': required field '{}' is not present in 'properties'",
-                tool.name(), field_name);
+                tool.name(),
+                field_name
+            );
         }
     }
 }
@@ -198,8 +235,10 @@ fn iter_tools_sorted_all_required_fields_exist_in_properties() {
 fn iter_tools_sorted_on_empty_registry_returns_empty_vec() {
     let registry = ToolRegistry::empty();
     let tools = registry.iter_tools_sorted();
-    assert!(tools.is_empty(),
-        "iter_tools_sorted() on an empty registry must return an empty vec, not panic");
+    assert!(
+        tools.is_empty(),
+        "iter_tools_sorted() on an empty registry must return an empty vec, not panic"
+    );
 }
 
 // ─── 6. Export JSON shape: {name, description, parameters} per tool ──────────
@@ -214,33 +253,52 @@ fn export_shape_has_name_description_parameters_per_tool() {
     let manifest: Vec<serde_json::Value> = registry
         .iter_tools_sorted()
         .into_iter()
-        .map(|tool| serde_json::json!({
-            "name":        tool.name(),
-            "description": tool.description(),
-            "parameters":  tool.parameters(),
-        }))
+        .map(|tool| {
+            serde_json::json!({
+                "name":        tool.name(),
+                "description": tool.description(),
+                "parameters":  tool.parameters(),
+            })
+        })
         .collect();
 
     for entry in &manifest {
-        let obj = entry.as_object()
+        let obj = entry
+            .as_object()
             .expect("each manifest entry must be a JSON object");
 
         // Must have exactly {name, description, parameters} — no extra keys, no missing keys.
-        assert!(obj.contains_key("name"),        "manifest entry missing 'name'");
-        assert!(obj.contains_key("description"), "manifest entry missing 'description'");
-        assert!(obj.contains_key("parameters"),  "manifest entry missing 'parameters'");
+        assert!(obj.contains_key("name"), "manifest entry missing 'name'");
+        assert!(
+            obj.contains_key("description"),
+            "manifest entry missing 'description'"
+        );
+        assert!(
+            obj.contains_key("parameters"),
+            "manifest entry missing 'parameters'"
+        );
 
         let name = obj["name"].as_str().unwrap_or("");
         assert!(!name.is_empty(), "manifest entry 'name' must not be empty");
 
         let desc = obj["description"].as_str().unwrap_or("");
-        assert!(!desc.is_empty(), "manifest entry 'description' for tool '{}' must not be empty", name);
+        assert!(
+            !desc.is_empty(),
+            "manifest entry 'description' for tool '{}' must not be empty",
+            name
+        );
 
-        assert!(obj["parameters"].is_object(),
-            "manifest entry 'parameters' for tool '{}' must be a JSON object", name);
+        assert!(
+            obj["parameters"].is_object(),
+            "manifest entry 'parameters' for tool '{}' must be a JSON object",
+            name
+        );
     }
 
-    // Full manifest must contain all 16 tools.
-    assert_eq!(manifest.len(), 16,
-        "export manifest must contain exactly 16 builtin tools");
+    // Full manifest must contain all 18 tools.
+    assert_eq!(
+        manifest.len(),
+        18,
+        "export manifest must contain exactly 18 builtin tools"
+    );
 }

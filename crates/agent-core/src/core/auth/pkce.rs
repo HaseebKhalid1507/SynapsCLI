@@ -1,6 +1,6 @@
-use rand::Rng;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use sha2::{Sha256, Digest};
+use rand::Rng;
+use sha2::{Digest, Sha256};
 
 use super::{AUTHORIZE_URL, CLIENT_ID, SCOPES};
 

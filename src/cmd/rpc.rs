@@ -17,7 +17,6 @@
 //!   goes to the log file / stderr.
 
 use anyhow::Context;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, Mutex, oneshot};
@@ -640,8 +639,7 @@ async fn handle_set_model(
 
 /// Handle the `GetAvailableModels` command.
 async fn handle_get_available_models(id: String, writer_tx: mpsc::Sender<RpcEvent>) {
-    let overrides: BTreeMap<String, String> = BTreeMap::new();
-    let providers = list_providers(&overrides);
+    let providers = list_providers();
 
     let mut models_list: Vec<serde_json::Value> = Vec::new();
     for (provider_key, _provider_name, _has_key, _count) in &providers {
@@ -809,6 +807,7 @@ pub async fn run(
     let boot = setup::boot(EngineOpts {
         continue_session: continue_id.map(Some),
         system,
+        prompt_manifest: None,
         profile,
         no_extensions: false,
     })

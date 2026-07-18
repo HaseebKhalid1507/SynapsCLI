@@ -84,10 +84,7 @@ impl Permission {
     }
     /// Whether this permission is reserved for a future implementation.
     pub fn is_reserved(&self) -> bool {
-        matches!(
-            self,
-            Self::ToolsOverride
-        )
+        matches!(self, Self::ToolsOverride)
     }
 }
 
@@ -162,9 +159,18 @@ mod tests {
 
     #[test]
     fn parse_valid_permissions() {
-        assert_eq!(Permission::parse("tools.intercept"), Some(Permission::ToolsIntercept));
-        assert_eq!(Permission::parse("privacy.llm_content"), Some(Permission::LlmContent));
-        assert_eq!(Permission::parse("session.lifecycle"), Some(Permission::SessionLifecycle));
+        assert_eq!(
+            Permission::parse("tools.intercept"),
+            Some(Permission::ToolsIntercept)
+        );
+        assert_eq!(
+            Permission::parse("privacy.llm_content"),
+            Some(Permission::LlmContent)
+        );
+        assert_eq!(
+            Permission::parse("session.lifecycle"),
+            Some(Permission::SessionLifecycle)
+        );
     }
 
     #[test]
@@ -215,8 +221,14 @@ mod tests {
 
     #[test]
     fn memory_permissions_parse_and_are_not_reserved() {
-        assert_eq!(Permission::parse("memory.read"), Some(Permission::MemoryRead));
-        assert_eq!(Permission::parse("memory.write"), Some(Permission::MemoryWrite));
+        assert_eq!(
+            Permission::parse("memory.read"),
+            Some(Permission::MemoryRead)
+        );
+        assert_eq!(
+            Permission::parse("memory.write"),
+            Some(Permission::MemoryWrite)
+        );
         assert!(!Permission::MemoryRead.is_reserved());
         assert!(!Permission::MemoryWrite.is_reserved());
         let perms = PermissionSet::try_from_strings(&[
@@ -230,8 +242,14 @@ mod tests {
 
     #[test]
     fn audio_permissions_parse_and_are_not_reserved() {
-        assert_eq!(Permission::parse("audio.input"), Some(Permission::AudioInput));
-        assert_eq!(Permission::parse("audio.output"), Some(Permission::AudioOutput));
+        assert_eq!(
+            Permission::parse("audio.input"),
+            Some(Permission::AudioInput)
+        );
+        assert_eq!(
+            Permission::parse("audio.output"),
+            Some(Permission::AudioOutput)
+        );
         assert!(!Permission::AudioInput.is_reserved());
         assert!(!Permission::AudioOutput.is_reserved());
         let perms = PermissionSet::try_from_strings(&[

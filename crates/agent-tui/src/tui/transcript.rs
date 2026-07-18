@@ -817,7 +817,11 @@ impl TranscriptStore {
     /// Idempotent: safe to call even when already clamped.
     #[allow(dead_code)] // Slice 3 activates; tests use via cfg(test)
     #[inline]
-    pub(crate) fn clamp_scroll_back(scroll_back: usize, total_height: usize, content_height: usize) -> usize {
+    pub(crate) fn clamp_scroll_back(
+        scroll_back: usize,
+        total_height: usize,
+        content_height: usize,
+    ) -> usize {
         total_height.saturating_sub(content_height).min(scroll_back)
     }
 
@@ -849,12 +853,8 @@ impl TranscriptStore {
         // We use the viewport stored from the last visible_window call.
         // If no viewport yet, use 40 as a safe placeholder (the anchor will
         // be re-captured on the next frame with the real height).
-        let content_height = self
-            .viewport
-            .map(|r| r.height as usize)
-            .unwrap_or(40);
-        self.scroll_anchor =
-            Self::capture_anchor(cache, self.scroll_back as usize, content_height);
+        let content_height = self.viewport.map(|r| r.height as usize).unwrap_or(40);
+        self.scroll_anchor = Self::capture_anchor(cache, self.scroll_back as usize, content_height);
     }
 
     /// Scroll up (away from bottom) by `lines`. Unpins the viewport.
@@ -1272,7 +1272,8 @@ impl TranscriptStore {
         if self.scroll_back == 0 {
             self.scroll_anchor = None;
         } else if let Some(cache) = self.cache.line_cache() {
-            self.scroll_anchor = Self::capture_anchor(cache, self.scroll_back as usize, content_height);
+            self.scroll_anchor =
+                Self::capture_anchor(cache, self.scroll_back as usize, content_height);
         }
         // ── T241 Slice 3: promote the viewport + halo to exact ──
         // Every frame, idempotent (§4.4): exact-render any Estimated slot
@@ -1413,8 +1414,7 @@ impl TranscriptStore {
             } else {
                 Self::scroll_back_to_stop(self.scroll_back as usize, total, content_height)
             };
-            let Some((first, last)) =
-                Self::window_msg_range(cache, s_top, s_top + content_height)
+            let Some((first, last)) = Self::window_msg_range(cache, s_top, s_top + content_height)
             else {
                 return;
             };
@@ -1468,9 +1468,7 @@ impl TranscriptStore {
                     // stays at the same screen row (§4.3). Without an anchor
                     // (defensive), just clamp (I-CLAMP).
                     let sb = match &self.scroll_anchor {
-                        Some(anchor) => {
-                            Self::anchor_to_scroll_back(anchor, cache, content_height)
-                        }
+                        Some(anchor) => Self::anchor_to_scroll_back(anchor, cache, content_height),
                         None => Self::clamp_scroll_back(
                             self.scroll_back as usize,
                             new_total,
@@ -1927,11 +1925,27 @@ impl TranscriptStore {
             let a = self.selection_anchor.as_ref()?;
             let b = self.selection_end.as_ref()?;
             if (a.msg_idx, a.line_in_msg, a.col) <= (b.msg_idx, b.line_in_msg, b.col) {
-                (a.msg_idx, a.line_in_msg, a.col, a.src_byte,
-                 b.msg_idx, b.line_in_msg, b.col, b.src_byte)
+                (
+                    a.msg_idx,
+                    a.line_in_msg,
+                    a.col,
+                    a.src_byte,
+                    b.msg_idx,
+                    b.line_in_msg,
+                    b.col,
+                    b.src_byte,
+                )
             } else {
-                (b.msg_idx, b.line_in_msg, b.col, b.src_byte,
-                 a.msg_idx, a.line_in_msg, a.col, a.src_byte)
+                (
+                    b.msg_idx,
+                    b.line_in_msg,
+                    b.col,
+                    b.src_byte,
+                    a.msg_idx,
+                    a.line_in_msg,
+                    a.col,
+                    a.src_byte,
+                )
             }
         };
         // Slice 5: promote-on-touch — ensure meta is present for every slot
@@ -1939,10 +1953,20 @@ impl TranscriptStore {
         self.promote_range_for_copy(s_msg, e_msg);
 
         let _ = self.line_cache()?; // guard: cache must exist after promote
-        // Re-synthesize the normalized SelPos pair from the extracted scalars
-        // (avoid re-borrowing self.selection_anchor / selection_end).
-        let s = SelPos { msg_idx: s_msg, line_in_msg: s_line, col: s_col, src_byte: s_src };
-        let e = SelPos { msg_idx: e_msg, line_in_msg: e_line, col: e_col, src_byte: e_src };
+                                    // Re-synthesize the normalized SelPos pair from the extracted scalars
+                                    // (avoid re-borrowing self.selection_anchor / selection_end).
+        let s = SelPos {
+            msg_idx: s_msg,
+            line_in_msg: s_line,
+            col: s_col,
+            src_byte: s_src,
+        };
+        let e = SelPos {
+            msg_idx: e_msg,
+            line_in_msg: e_line,
+            col: e_col,
+            src_byte: e_src,
+        };
         let cache = self.line_cache()?;
 
         let mut parts: Vec<String> = Vec::new();
@@ -2909,7 +2933,7 @@ mod slice3_lazy_ratchets {
     /// I-RENDER bound (scope §2): `V_msgs + 2·HALO` where `V_msgs` ≤ viewport
     /// rows (MIN_MSG_HEIGHT = 1) and HALO = `PROMOTE_HALO_MSGS` = 16.
     const RENDER_BOUND: usize = VIEWPORT_ROWS + 2 * TranscriptStore::PROMOTE_HALO_MSGS; // 72
-    // Outer rect adds 2 border rows/cols each side.
+                                                                                        // Outer rect adds 2 border rows/cols each side.
     fn msg_area(rows: usize, cols: usize) -> Rect {
         Rect {
             x: 0,
@@ -3042,7 +3066,10 @@ mod slice3_lazy_ratchets {
             "I-RENDER (T1): first frame from Missing at n={TOTAL} must perform \
              ≤ {RENDER_BOUND} exact renders, performed {renders}"
         );
-        assert!(renders > 0, "sanity: cold frame must render the visible tail");
+        assert!(
+            renders > 0,
+            "sanity: cold frame must render the visible tail"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3271,13 +3298,10 @@ mod scroll_anchor_tests {
         );
         assert_eq!(s_top_before, 17);
 
-        let anchor = TranscriptStore::capture_anchor(
-            &cache_before,
-            scroll_back_before,
-            content_height,
-        )
-        .expect("capture must succeed");
-        assert_eq!(anchor.msg_idx, 3);   // cum[3]=15, 17-15=2
+        let anchor =
+            TranscriptStore::capture_anchor(&cache_before, scroll_back_before, content_height)
+                .expect("capture must succeed");
+        assert_eq!(anchor.msg_idx, 3); // cum[3]=15, 17-15=2
         assert_eq!(anchor.row_in_msg, 2);
 
         // Apply +10 to message 7 (index 7 > anchor.msg_idx=3 → below anchor).
@@ -3285,11 +3309,8 @@ mod scroll_anchor_tests {
         heights[7] = 15; // was 5, now 15: delta +10
         let cache_after = cache_from_heights(&heights); // total=60
 
-        let sb_after = TranscriptStore::anchor_to_scroll_back(
-            &anchor,
-            &cache_after,
-            content_height,
-        );
+        let sb_after =
+            TranscriptStore::anchor_to_scroll_back(&anchor, &cache_after, content_height);
 
         // S_top must still be 17: scroll_back = 60 - 10 - 17 = 33
         let s_top_after = TranscriptStore::scroll_back_to_stop(
@@ -3319,23 +3340,17 @@ mod scroll_anchor_tests {
         let content_height = 10usize;
         let scroll_back_before = 23usize;
 
-        let anchor = TranscriptStore::capture_anchor(
-            &cache_before,
-            scroll_back_before,
-            content_height,
-        )
-        .expect("capture must succeed");
+        let anchor =
+            TranscriptStore::capture_anchor(&cache_before, scroll_back_before, content_height)
+                .expect("capture must succeed");
 
         // Apply +10 to message 1 (index 1 < anchor.msg_idx=3 → above anchor).
         let mut heights: Vec<usize> = vec![5; 10];
         heights[1] = 15; // delta +10
         let cache_after = cache_from_heights(&heights); // total=60
 
-        let sb_after = TranscriptStore::anchor_to_scroll_back(
-            &anchor,
-            &cache_after,
-            content_height,
-        );
+        let sb_after =
+            TranscriptStore::anchor_to_scroll_back(&anchor, &cache_after, content_height);
 
         // anchor msg still at same distance from top of viewport.
         // new cum[3] = 5+15+5+5 = 25 (accumulated: cum[0]=0,cum[1]=5,cum[2]=20,cum[3]=25).
@@ -3374,12 +3389,9 @@ mod scroll_anchor_tests {
         let content_height = 10usize;
         let scroll_back_before = 23usize; // S_top = 17
 
-        let anchor = TranscriptStore::capture_anchor(
-            &cache_before,
-            scroll_back_before,
-            content_height,
-        )
-        .expect("capture must succeed");
+        let anchor =
+            TranscriptStore::capture_anchor(&cache_before, scroll_back_before, content_height)
+                .expect("capture must succeed");
         assert_eq!(anchor.msg_idx, 3);
         assert_eq!(anchor.row_in_msg, 2);
 
@@ -3388,18 +3400,18 @@ mod scroll_anchor_tests {
         heights[3] = 2; // shrink: total becomes 47
         let cache_after = cache_from_heights(&heights);
 
-        let sb_after = TranscriptStore::anchor_to_scroll_back(
-            &anchor,
-            &cache_after,
-            content_height,
-        );
+        let sb_after =
+            TranscriptStore::anchor_to_scroll_back(&anchor, &cache_after, content_height);
         let s_top_after = TranscriptStore::scroll_back_to_stop(
             sb_after,
             cache_after.total_height(),
             content_height,
         );
         // row_in_msg clamped to min(2, 2-1) = 1. S_top = 15+1 = 16.
-        assert_eq!(s_top_after, 16, "shrunk anchor msg: S_top must clamp to 16 (got {s_top_after})");
+        assert_eq!(
+            s_top_after, 16,
+            "shrunk anchor msg: S_top must clamp to 16 (got {s_top_after})"
+        );
         // Motion is exactly 1 row — bounded to within the anchor message.
         assert!(
             (17i64 - s_top_after as i64).abs() <= 5,
@@ -3413,17 +3425,26 @@ mod scroll_anchor_tests {
         // Empty cache.
         let empty = cache_from_heights(&[]);
         let anchor_result = TranscriptStore::capture_anchor(&empty, 0, 40);
-        assert!(anchor_result.is_none(), "empty cache capture must return None");
+        assert!(
+            anchor_result.is_none(),
+            "empty cache capture must return None"
+        );
 
         // Stale anchor (msg_idx past the end after drain).
         let small = cache_from_heights(&[5, 5]); // only 2 msgs
-        let stale = ScrollAnchor { msg_idx: 99, row_in_msg: 3 };
+        let stale = ScrollAnchor {
+            msg_idx: 99,
+            row_in_msg: 3,
+        };
         // Must not panic; clamps to last msg.
         let _ = TranscriptStore::anchor_to_scroll_back(&stale, &small, 10);
 
         // Zero viewport.
         let cache = uniform_cache(5, 5);
-        let anchor = ScrollAnchor { msg_idx: 2, row_in_msg: 0 };
+        let anchor = ScrollAnchor {
+            msg_idx: 2,
+            row_in_msg: 0,
+        };
         let sb = TranscriptStore::anchor_to_scroll_back(&anchor, &cache, 0);
         assert_eq!(sb, 0, "zero viewport → scroll_back 0");
 
@@ -3466,22 +3487,15 @@ mod scroll_anchor_tests {
 
         // Test several scroll positions.
         for sb in [10usize, 25, 50, 70, 85] {
-            let anchor = TranscriptStore::capture_anchor(
-                &cache,
-                sb,
-                content_height,
-            );
+            let anchor = TranscriptStore::capture_anchor(&cache, sb, content_height);
             match anchor {
                 None => {
                     // Only valid when sb == 0.
                     assert_eq!(sb, 0, "capture returns None only for sb==0");
                 }
                 Some(ref a) => {
-                    let sb_restored = TranscriptStore::anchor_to_scroll_back(
-                        a,
-                        &cache,
-                        content_height,
-                    );
+                    let sb_restored =
+                        TranscriptStore::anchor_to_scroll_back(a, &cache, content_height);
                     // The restored scroll_back must equal the original when
                     // the cache is unchanged (no height corrections).
                     assert_eq!(
@@ -3518,12 +3532,17 @@ mod scroll_anchor_tests {
         let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
         // Push 30 text messages — each renders to a few rows.
         for i in 0..30 {
-            store.push_msg(ChatMessage::Text(format!("Message {i}: some content here.")));
+            store.push_msg(ChatMessage::Text(format!(
+                "Message {i}: some content here."
+            )));
         }
 
         // Warm the cache via visible_window so heights are available.
         let msg_area = ratatui::layout::Rect {
-            x: 0, y: 0, width: 82, height: 12, // content: 80 wide, 10 high
+            x: 0,
+            y: 0,
+            width: 82,
+            height: 12, // content: 80 wide, 10 high
         };
         let _ = store.visible_window(msg_area, &test_ctx());
 
@@ -3556,7 +3575,10 @@ mod scroll_anchor_tests {
 
         // scroll_to_bottom → anchor is None.
         store.scroll_up(3);
-        assert!(store.scroll_anchor().is_some(), "after scroll_up: anchor Some");
+        assert!(
+            store.scroll_anchor().is_some(),
+            "after scroll_up: anchor Some"
+        );
         store.scroll_to_bottom();
         assert!(
             store.scroll_anchor().is_none(),
@@ -3585,18 +3607,34 @@ mod slice4_stream_resize {
     const HALO: usize = TranscriptStore::PROMOTE_HALO_MSGS;
 
     fn ctx() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: true, agent_name: "synaps" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: true,
+            agent_name: "synaps",
+        }
     }
     fn ctx_idle() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
     }
 
     fn msg_area(rows: usize, cols: usize) -> Rect {
-        Rect { x: 0, y: 0, width: (cols + 2) as u16, height: (rows + 2) as u16 }
+        Rect {
+            x: 0,
+            y: 0,
+            width: (cols + 2) as u16,
+            height: (rows + 2) as u16,
+        }
     }
 
     fn to_strs(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
-        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
     }
 
     // ── T5: streaming append while estimated history above ───────────────────
@@ -3642,7 +3680,9 @@ mod slice4_stream_resize {
             let vw = store.visible_window(area, &ctx());
 
             // The cache must exist.
-            let cache = store.line_cache().expect("cache must exist during streaming");
+            let cache = store
+                .line_cache()
+                .expect("cache must exist during streaming");
             let n = cache.per_msg.len();
 
             // Assert: the tail slot (the freshly appended message) is Exact.
@@ -3662,7 +3702,10 @@ mod slice4_stream_resize {
                 !vw.lines.is_empty(),
                 "T5: visible window must not be empty during streaming (frame {i})"
             );
-            assert_eq!(vw.scroll_back, 0, "T5: pinned during streaming → scroll_back must be 0");
+            assert_eq!(
+                vw.scroll_back, 0,
+                "T5: pinned during streaming → scroll_back must be 0"
+            );
 
             // Assert total height grows monotonically (each message adds rows).
             let total = cache.total_height();
@@ -3674,9 +3717,7 @@ mod slice4_stream_resize {
 
             // Assert halo around tail is Exact (I-STREAM: tail window is Exact).
             let tail_lo = n.saturating_sub(HALO + 1);
-            let all_exact_in_tail = cache.per_msg[tail_lo..]
-                .iter()
-                .all(|s| s.height.is_exact());
+            let all_exact_in_tail = cache.per_msg[tail_lo..].iter().all(|s| s.height.is_exact());
             assert!(
                 all_exact_in_tail,
                 "T5: all slots in halo around tail must be Exact during streaming (frame {i})"
@@ -3831,11 +3872,20 @@ mod slice5_copy_promote_on_touch {
     use ratatui::layout::Rect;
 
     fn ctx() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
     }
 
     fn msg_area_40x120() -> Rect {
-        Rect { x: 0, y: 0, width: 122, height: 42 }
+        Rect {
+            x: 0,
+            y: 0,
+            width: 122,
+            height: 42,
+        }
     }
 
     /// Build a store with `n` messages of known source text.
@@ -3923,7 +3973,8 @@ mod slice5_copy_promote_on_touch {
         store.probe_reset();
 
         // Call selected_text — promote-on-touch promotes SEL_LO..=SEL_HI.
-        let copied = store.selected_text()
+        let copied = store
+            .selected_text()
             .expect("T7: selected_text must return Some for msgs 100..=300");
 
         let renders_after_copy = store.probe_render_count();
@@ -3959,7 +4010,8 @@ mod slice5_copy_promote_on_touch {
             copied.starts_with(&sel_lo_src[..sel_lo_src_len]),
             "T7: copied text must start with full source of msg {SEL_LO}\n\
              expected prefix: {sel_lo_src:?}\n\
-             got start: {:?}", &copied[..copied.len().min(100)]
+             got start: {:?}",
+            &copied[..copied.len().min(100)]
         );
 
         // Verify render count: ≈ SEL_HI - SEL_LO + 1 = 201 (within a factor of 2).
@@ -4020,7 +4072,8 @@ mod slice5_copy_promote_on_touch {
 
         // First copy — promotes the range.
         store.probe_reset();
-        let first = store.selected_text()
+        let first = store
+            .selected_text()
             .expect("T8: first selected_text must return Some");
         let renders_first = store.probe_render_count();
 
@@ -4043,7 +4096,8 @@ mod slice5_copy_promote_on_touch {
 
         // Second copy — meta already present, must be free.
         store.probe_reset();
-        let second = store.selected_text()
+        let second = store
+            .selected_text()
             .expect("T8: second selected_text must return Some");
         let renders_second = store.probe_render_count();
 
@@ -4052,10 +4106,7 @@ mod slice5_copy_promote_on_touch {
             "T8: second copy of same range must render 0 messages (meta retained), \
              rendered {renders_second}"
         );
-        assert_eq!(
-            first, second,
-            "T8: both copies must produce identical text"
-        );
+        assert_eq!(first, second, "T8: both copies must produce identical text");
 
         eprintln!(
             "[T8] second copy: renders={renders_second} (expected 0); \
