@@ -381,9 +381,14 @@ impl ToolRegistry {
     }
 
     /// Atomically register a whole batch (Task 19 boot-time dormant MCP
-    /// entries): the FULL candidate registry is built first (per-tool
-    /// catalog mutations plus a single schema rebuild) and committed only
-    /// on complete success. Any duplicate-identity or generation failure
+    /// entries). STRICTLY ADDITIVE: before any mutation, every member's
+    /// runtime name AND capability identity is preflighted against both the
+    /// live registry and the rest of the batch — an existing tool can never
+    /// be replaced through a batch, and two members whose distinct
+    /// identities collapse onto one runtime name (e.g. `ext__` separator
+    /// collisions) are rejected typed. Only after preflight is the FULL
+    /// candidate registry built (per-tool catalog mutations plus a single
+    /// schema rebuild) and committed on complete success. Any failure
     /// rejects the ENTIRE batch and leaves the live registry — tools,
     /// schema, catalog entries, and generation — byte-identically
     /// unchanged; no partial batch can ever be observed. Never invokes any
@@ -394,6 +399,20 @@ impl ToolRegistry {
     ) -> Result<usize, CatalogError> {
         if tool_list.is_empty() {
             return Ok(0);
+        }
+        let mut batch_names: HashSet<String> = HashSet::new();
+        let mut batch_ids: HashSet<crate::tools::catalog::ToolId> = HashSet::new();
+        for tool in &tool_list {
+            let name = tool.name();
+            if self.tools.contains_key(name) || !batch_names.insert(name.to_string()) {
+                return Err(CatalogError::DuplicateRuntimeName(
+                    agent_core::BoundedText::new(name, 128).text,
+                ));
+            }
+            let id = tool_id_for(tool.as_ref());
+            if self.catalog.get(&id).is_some() || !batch_ids.insert(id.clone()) {
+                return Err(CatalogError::DuplicateToolId(id));
+            }
         }
         let count = tool_list.len();
         let mut candidate = self.clone();

@@ -337,6 +337,12 @@ fn identity_for_tool(tool: &dyn Tool) -> (ToolId, CapabilitySource, TrustProvena
 pub enum CatalogError {
     #[error("duplicate tool id in catalog: {0}")]
     DuplicateToolId(ToolId),
+    /// A batch registration collided on a RUNTIME name — against a tool
+    /// already live in the registry or another batch member. Boot batches
+    /// are strictly additive: replacement is never permitted through them.
+    /// The echoed name is bounded, never raw hostile input.
+    #[error("duplicate runtime tool name in additive batch: {0}")]
+    DuplicateRuntimeName(String),
     #[error("invalid tool id: {0}")]
     InvalidToolId(#[from] ToolIdError),
     #[error("catalog mutation rejected: {0}")]

@@ -499,3 +499,114 @@ async fn deferred_execute_without_lease_manager_fails_typed_and_spawns_nothing()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── strictly-additive batch preflight (Commit A review fix) ─────────────────
+
+/// Minimal batch member with a chosen runtime name and MCP identity.
+struct NamedMcpTool {
+    runtime_name: String,
+    server: String,
+    tool: String,
+}
+
+#[async_trait::async_trait]
+impl agent_engine::tools::Tool for NamedMcpTool {
+    fn name(&self) -> &str {
+        &self.runtime_name
+    }
+    fn description(&self) -> &str {
+        "batch preflight fixture"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Mcp {
+            server_id: self.server.clone(),
+            server_tool_name: self.tool.clone(),
+        }
+    }
+    async fn execute(&self, _p: Value, _c: ToolContext) -> agent_engine::Result<String> {
+        Ok(String::new())
+    }
+}
+
+fn named(runtime: &str, server: &str, tool: &str) -> Arc<dyn agent_engine::tools::Tool> {
+    Arc::new(NamedMcpTool {
+        runtime_name: runtime.to_string(),
+        server: server.to_string(),
+        tool: tool.to_string(),
+    })
+}
+
+/// Snapshot (generation, catalog len, exposed schema bytes) for unchanged
+/// assertions after every rejected batch.
+fn registry_snapshot(registry: &ToolRegistry) -> (u64, usize, Vec<u8>) {
+    (
+        registry.catalog().generation().value(),
+        registry.catalog().len(),
+        serde_json::to_vec(registry.tools_schema().as_ref()).unwrap(),
+    )
+}
+
+#[test]
+fn batch_rejects_same_runtime_name_and_identity_duplicate() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .try_register_batch(vec![named("ext__a__t", "a", "t")])
+        .unwrap();
+    let before = registry_snapshot(&registry);
+
+    // Re-registering the SAME runtime name + identity must be rejected —
+    // batches are strictly additive, never a replacement path.
+    let err = registry
+        .try_register_batch(vec![named("ext__a__t", "a", "t")])
+        .expect_err("duplicate must be rejected");
+    assert!(matches!(
+        err,
+        agent_engine::tools::catalog::CatalogError::DuplicateRuntimeName(_)
+    ));
+    assert_eq!(registry_snapshot(&registry), before);
+}
+
+#[test]
+fn batch_rejects_distinct_identities_colliding_on_runtime_name() {
+    let mut registry = ToolRegistry::new();
+    let before = registry_snapshot(&registry);
+
+    // server "a", tool "b__c" and server "a__b", tool "c" are DIFFERENT
+    // capability identities whose ext__{server}__{tool} runtime strings
+    // collide via the separator scheme. Silently dropping one identity
+    // (count 2, one catalog record) must be impossible.
+    let batch = vec![
+        named("ext__a__b__c", "a", "b__c"),
+        named("ext__a__b__c", "a__b", "c"),
+    ];
+    let err = registry
+        .try_register_batch(batch)
+        .expect_err("separator collision must be rejected");
+    assert!(matches!(
+        err,
+        agent_engine::tools::catalog::CatalogError::DuplicateRuntimeName(_)
+    ));
+    assert_eq!(registry_snapshot(&registry), before);
+}
+
+#[test]
+fn batch_rejects_collision_with_existing_registry_tool() {
+    let mut registry = ToolRegistry::new();
+    let before = registry_snapshot(&registry);
+
+    // "bash" is a live builtin: a batch must never replace it, whatever
+    // origin the incoming tool claims.
+    let err = registry
+        .try_register_batch(vec![named("bash", "srv", "bash")])
+        .expect_err("existing runtime tool must not be replaceable via batch");
+    assert!(matches!(
+        err,
+        agent_engine::tools::catalog::CatalogError::DuplicateRuntimeName(_)
+    ));
+    assert_eq!(registry_snapshot(&registry), before);
+    // The live builtin is untouched.
+    assert!(registry.get("bash").is_some());
+}
