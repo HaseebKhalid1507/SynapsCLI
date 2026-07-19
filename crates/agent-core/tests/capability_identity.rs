@@ -77,8 +77,8 @@ fn tool_id_rejects_alias_prone_and_malformed_segments() {
 #[test]
 fn catalog_generation_increments_monotonically() {
     let g0 = CatalogGeneration::initial();
-    let g1 = g0.next();
-    let g2 = g1.next();
+    let g1 = g0.checked_next().expect("no overflow at 0");
+    let g2 = g1.checked_next().expect("no overflow at 1");
     assert_eq!(g0.value(), 0);
     assert_eq!(g1.value(), 1);
     assert_eq!(g2.value(), 2);
@@ -113,7 +113,7 @@ fn schema_digest_is_deterministic_and_content_sensitive() {
 #[test]
 fn activation_grant_binds_exact_session_tool_generation_and_digest() {
     let tool_id = ToolId::parse("builtin:bash").unwrap();
-    let generation = CatalogGeneration::initial().next();
+    let generation = CatalogGeneration::initial().checked_next().unwrap();
     let digest = SchemaDigest::of_schema(&serde_json::json!({"type": "object"}));
     let grant =
         SessionActivationGrant::new("session-1", tool_id.clone(), generation, digest.clone())
@@ -125,7 +125,12 @@ fn activation_grant_binds_exact_session_tool_generation_and_digest() {
     let other_digest = SchemaDigest::of_schema(&serde_json::json!({"type": "string"}));
     assert!(!grant.covers("session-2", &tool_id, generation, &digest));
     assert!(!grant.covers("session-1", &other_tool, generation, &digest));
-    assert!(!grant.covers("session-1", &tool_id, generation.next(), &digest));
+    assert!(!grant.covers(
+        "session-1",
+        &tool_id,
+        generation.checked_next().unwrap(),
+        &digest
+    ));
     assert!(!grant.covers("session-1", &tool_id, generation, &other_digest));
 }
 

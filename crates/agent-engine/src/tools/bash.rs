@@ -74,6 +74,10 @@ pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
 
 #[async_trait::async_trait]
 impl Tool for BashTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "bash"
     }

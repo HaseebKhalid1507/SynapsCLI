@@ -16,6 +16,10 @@ pub struct SubagentSteerTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentSteerTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "subagent_steer"
     }

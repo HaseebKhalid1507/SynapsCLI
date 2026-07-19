@@ -57,6 +57,51 @@ fn is_canonical_segment(segment: &str, max_bytes: usize) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
 }
 
+/// Reserved marker for hex-encoded segments. Verbatim segments never start
+/// with it, so encoded and verbatim forms cannot collide.
+const ENCODED_SEGMENT_PREFIX: &str = "enc-";
+/// Reserved marker for digest-compressed oversized segments.
+const DIGEST_SEGMENT_PREFIX: &str = "sha-";
+/// Hex characters kept from the SHA-256 of an oversized segment (160 bits).
+const DIGEST_SEGMENT_HEX_LEN: usize = 40;
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Deterministic alias-safe canonical encoding of one raw runtime segment.
+///
+/// - Already-canonical segments that do not spell a reserved prefix pass
+///   through verbatim, so existing canonical identities are unchanged.
+/// - Anything else (uppercase, Unicode, whitespace, `:`, empty, reserved
+///   spellings) becomes `enc-<lowercase hex of the raw bytes>`, which is
+///   injective: two distinct raw spellings can never collapse.
+/// - Segments whose hex form exceeds the byte budget compress to
+///   `sha-<truncated sha256 hex>` (deterministic, 160-bit collision
+///   resistant, always within budget).
+fn encode_segment(raw: &str, max_bytes: usize) -> String {
+    debug_assert!(max_bytes >= DIGEST_SEGMENT_PREFIX.len() + DIGEST_SEGMENT_HEX_LEN);
+    if is_canonical_segment(raw, max_bytes)
+        && !raw.starts_with(ENCODED_SEGMENT_PREFIX)
+        && !raw.starts_with(DIGEST_SEGMENT_PREFIX)
+    {
+        return raw.to_string();
+    }
+    let encoded = format!("{ENCODED_SEGMENT_PREFIX}{}", hex_lower(raw.as_bytes()));
+    if encoded.len() <= max_bytes {
+        return encoded;
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut hex = hex_lower(&digest);
+    hex.truncate(DIGEST_SEGMENT_HEX_LEN);
+    format!("{DIGEST_SEGMENT_PREFIX}{hex}")
+}
+
 impl ToolId {
     /// Parse an untrusted string into a canonical `ToolId`, failing closed on
     /// anything malformed, oversized, or non-canonical.
@@ -78,6 +123,58 @@ impl ToolId {
             return Err(ToolIdError::InvalidName);
         }
         Ok(Self(raw.to_string()))
+    }
+
+    /// Namespace-family prefixes used by the source-aware constructors below.
+    /// They are pairwise non-overlapping, so identities from different
+    /// sources cannot collide even for identical raw names.
+    const BUILTIN_NAMESPACE: &'static str = "builtin";
+    const UNKNOWN_NAMESPACE: &'static str = "unknown";
+    const EXTENSION_NAMESPACE_PREFIX: &'static str = "ext.";
+    const MCP_NAMESPACE_PREFIX: &'static str = "mcp.";
+    const PLUGIN_NAMESPACE_PREFIX: &'static str = "plugin.";
+
+    fn from_source(namespace: String, raw_name: &str) -> Self {
+        debug_assert!(namespace.len() <= TOOL_ID_NAMESPACE_MAX_BYTES);
+        let name = encode_segment(raw_name, TOOL_ID_NAME_MAX_BYTES);
+        Self(format!("{namespace}:{name}"))
+    }
+
+    fn from_prefixed_source(prefix: &str, raw_source: &str, raw_name: &str) -> Self {
+        let budget = TOOL_ID_NAMESPACE_MAX_BYTES - prefix.len();
+        let namespace = format!("{prefix}{}", encode_segment(raw_source, budget));
+        Self::from_source(namespace, raw_name)
+    }
+
+    /// Identity of a capability compiled into this runtime.
+    pub fn builtin(runtime_name: &str) -> Self {
+        Self::from_source(Self::BUILTIN_NAMESPACE.to_string(), runtime_name)
+    }
+
+    /// Identity of a capability declared by a locally installed extension.
+    /// The extension id and tool name are encoded independently, so existing
+    /// uppercase/Unicode/colon-bearing runtime identities are representable
+    /// exactly without alias collapse.
+    pub fn extension(extension_id: &str, tool_name: &str) -> Self {
+        Self::from_prefixed_source(Self::EXTENSION_NAMESPACE_PREFIX, extension_id, tool_name)
+    }
+
+    /// Identity of a capability served by a configured MCP server, keyed by
+    /// the server id and the tool name as the server knows it.
+    pub fn mcp(server_id: &str, server_tool_name: &str) -> Self {
+        Self::from_prefixed_source(Self::MCP_NAMESPACE_PREFIX, server_id, server_tool_name)
+    }
+
+    /// Identity of a capability declared by a plugin definition.
+    pub fn plugin(plugin_id: &str, tool_name: &str) -> Self {
+        Self::from_prefixed_source(Self::PLUGIN_NAMESPACE_PREFIX, plugin_id, tool_name)
+    }
+
+    /// Identity of a dynamically registered capability with no declared
+    /// origin. Kept in an explicit `unknown` namespace so it can never be
+    /// mistaken for a trusted builtin.
+    pub fn unclassified(runtime_name: &str) -> Self {
+        Self::from_source(Self::UNKNOWN_NAMESPACE.to_string(), runtime_name)
     }
 
     pub fn as_str(&self) -> &str {
@@ -107,14 +204,32 @@ impl std::fmt::Display for ToolId {
 #[serde(transparent)]
 pub struct CatalogGeneration(u64);
 
+/// Typed failure for exhausting the generation counter. Mutations observing
+/// this must fail closed: no mutation may succeed without a new generation.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("catalog generation counter exhausted at u64::MAX")]
+pub struct CatalogGenerationOverflow;
+
 impl CatalogGeneration {
     pub const fn initial() -> Self {
         Self(0)
     }
 
-    #[must_use = "next() returns the advanced generation without mutating self"]
-    pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+    /// Construct a generation at an explicit value (boundary tests, resuming
+    /// persisted counters). Constructing a generation grants nothing.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Fail-closed advancement: at `u64::MAX` there is no new generation, so
+    /// the caller must abort its mutation instead of wrapping or sticking
+    /// (either of which could let stale grants keep validating).
+    #[must_use = "checked_next() returns the advanced generation without mutating self"]
+    pub fn checked_next(self) -> Result<Self, CatalogGenerationOverflow> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(CatalogGenerationOverflow)
     }
 
     pub const fn value(self) -> u64 {
@@ -124,18 +239,80 @@ impl CatalogGeneration {
 
 /// Deterministic SHA-256 digest (lowercase hex) of a tool's full JSON schema.
 ///
-/// `serde_json::Value` objects are key-sorted maps in this workspace (the
-/// `preserve_order` feature is off), so semantically equal schemas serialize
-/// to identical bytes and digest identically.
+/// The digest hashes a canonical structural encoding — explicit type tags,
+/// length framing, and lexicographically sorted object keys — computed
+/// iteratively. It is therefore independent of serde_json's `preserve_order`
+/// feature and map insertion order, never allocates a serialized copy of the
+/// schema, performs no fallible serialization (`expect`-free on external
+/// data), and cannot overflow the stack on deeply nested values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SchemaDigest(String);
 
+const DIGEST_TAG_NULL: u8 = 0;
+const DIGEST_TAG_BOOL: u8 = 1;
+const DIGEST_TAG_NUMBER: u8 = 2;
+const DIGEST_TAG_STRING: u8 = 3;
+const DIGEST_TAG_ARRAY: u8 = 4;
+const DIGEST_TAG_OBJECT: u8 = 5;
+const DIGEST_TAG_KEY: u8 = 6;
+
 impl SchemaDigest {
     pub fn of_schema(schema: &serde_json::Value) -> Self {
-        let encoded =
-            serde_json::to_vec(schema).expect("JSON value with string keys is serializable");
-        Self(format!("{:x}", Sha256::digest(encoded)))
+        use serde_json::Value;
+
+        enum Task<'a> {
+            Value(&'a Value),
+            Key(&'a str),
+        }
+
+        let mut hasher = Sha256::new();
+        let mut stack: Vec<Task<'_>> = vec![Task::Value(schema)];
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Key(key) => {
+                    hasher.update([DIGEST_TAG_KEY]);
+                    hasher.update((key.len() as u64).to_le_bytes());
+                    hasher.update(key.as_bytes());
+                }
+                Task::Value(value) => match value {
+                    Value::Null => hasher.update([DIGEST_TAG_NULL]),
+                    Value::Bool(b) => hasher.update([DIGEST_TAG_BOOL, u8::from(*b)]),
+                    Value::Number(n) => {
+                        let repr = n.to_string();
+                        hasher.update([DIGEST_TAG_NUMBER]);
+                        hasher.update((repr.len() as u64).to_le_bytes());
+                        hasher.update(repr.as_bytes());
+                    }
+                    Value::String(s) => {
+                        hasher.update([DIGEST_TAG_STRING]);
+                        hasher.update((s.len() as u64).to_le_bytes());
+                        hasher.update(s.as_bytes());
+                    }
+                    Value::Array(items) => {
+                        hasher.update([DIGEST_TAG_ARRAY]);
+                        hasher.update((items.len() as u64).to_le_bytes());
+                        for item in items.iter().rev() {
+                            stack.push(Task::Value(item));
+                        }
+                    }
+                    Value::Object(map) => {
+                        hasher.update([DIGEST_TAG_OBJECT]);
+                        hasher.update((map.len() as u64).to_le_bytes());
+                        // Sort explicitly: with `preserve_order` enabled the
+                        // map iterates in insertion order, which must not
+                        // change the digest.
+                        let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        for (key, child) in entries.into_iter().rev() {
+                            stack.push(Task::Value(child));
+                            stack.push(Task::Key(key));
+                        }
+                    }
+                },
+            }
+        }
+        Self(format!("{:x}", hasher.finalize()))
     }
 
     pub fn as_hex(&self) -> &str {

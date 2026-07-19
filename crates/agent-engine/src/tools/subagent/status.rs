@@ -12,6 +12,10 @@ pub struct SubagentStatusTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentStatusTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str { "subagent_status" }
 
     fn description(&self) -> &str {

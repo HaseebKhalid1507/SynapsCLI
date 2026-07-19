@@ -18,6 +18,10 @@ pub struct SubagentStartTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentStartTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str { "subagent_start" }
 
     fn description(&self) -> &str {

@@ -594,7 +594,14 @@ impl StreamMethods {
                 while let Ok(new_tools) = tool_reg_rx.try_recv() {
                     let mut registry = tools.write().await;
                     for tool in new_tools {
-                        registry.register(tool);
+                        let name = tool.name().to_string();
+                        if let Err(e) = registry.try_register(tool) {
+                            tracing::warn!(
+                                tool = %name,
+                                error = %e,
+                                "Refusing to expose dynamic tool the capability catalog could not record"
+                            );
+                        }
                     }
                 }
 

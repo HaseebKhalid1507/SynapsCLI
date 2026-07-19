@@ -47,6 +47,7 @@ fn spy_record(id: &str, constructions: Arc<AtomicUsize>) -> CapabilityRecord {
         ToolId::parse(id).expect("fixture id is canonical"),
         CapabilitySource::Mcp {
             server_id: "server-1".to_string(),
+            server_tool_name: id.rsplit(':').next().unwrap_or(id).to_string(),
         },
         "a spy capability",
         vec!["spy".to_string()],
@@ -130,12 +131,19 @@ fn from_registry_digests_are_deterministic_across_rebuilds() {
 }
 
 #[test]
-fn from_registry_fails_closed_on_non_canonical_tool_names() {
+fn from_registry_encodes_non_canonical_tool_names_without_alias_collapse() {
+    // Fix 1 (Task 14): actual runtime names may be non-canonical
+    // (uppercase, spaces, punctuation). They are represented exactly via
+    // deterministic alias-safe encoding under conservative unknown
+    // provenance — not rejected and not collapsed into one identity.
     let mut registry = ToolRegistry::empty();
     registry.register(Arc::new(FixtureTool { name: "Bad Name!" }));
-    let err = ToolCatalog::from_registry(&registry)
-        .expect_err("non-canonical runtime name must not be silently aliased");
-    assert!(matches!(err, CatalogError::InvalidToolId(_)));
+    registry.register(Arc::new(FixtureTool { name: "Bad_Name_" }));
+    let catalog = ToolCatalog::from_registry(&registry).expect("names are representable");
+    assert_eq!(catalog.len(), 2, "alias-prone spellings stay distinct");
+    for record in catalog.iter() {
+        assert_eq!(record.provenance(), &TrustProvenance::Unverified);
+    }
 }
 
 // ── Generation and collision behavior ───────────────────────────────────────
@@ -198,6 +206,7 @@ fn summaries_and_tags_are_byte_bounded_against_adversarial_input() {
         ToolId::parse("mcp.server-1:huge").unwrap(),
         CapabilitySource::Mcp {
             server_id: "server-1".to_string(),
+            server_tool_name: "huge".to_string(),
         },
         &huge,
         vec![huge.clone(); 64],

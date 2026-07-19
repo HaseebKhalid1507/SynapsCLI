@@ -7,6 +7,10 @@ pub struct WatcherExitTool;
 
 #[async_trait::async_trait]
 impl Tool for WatcherExitTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "watcher_exit"
     }

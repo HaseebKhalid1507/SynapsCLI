@@ -107,6 +107,34 @@ pub struct ToolContext {
     pub limits: ToolLimits,
 }
 
+/// Explicit runtime-origin identity of a registered tool implementation.
+///
+/// This is the metadata boundary the capability catalog trusts for
+/// provenance. The default is conservative: a tool that declares nothing is
+/// [`ToolOrigin::Unknown`] (or [`ToolOrigin::Extension`] when it already
+/// declares an owning extension via [`Tool::extension_id`]) — never builtin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOrigin {
+    /// Compiled into this binary.
+    Builtin,
+    /// Registered by a locally installed extension (`<extension_id>:<tool>`
+    /// runtime names).
+    Extension { extension_id: String },
+    /// Bridged from an MCP server; identifies the server and the tool name
+    /// as the server knows it (not the prefixed runtime name).
+    Mcp {
+        server_id: String,
+        server_tool_name: String,
+    },
+    /// Declared by a plugin definition.
+    Plugin {
+        plugin_id: String,
+        tool_name: String,
+    },
+    /// No declared origin. Cataloged conservatively, never as builtin.
+    Unknown,
+}
+
 /// The core trait for all tools. Implement this to add a new tool.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -125,6 +153,19 @@ pub trait Tool: Send + Sync {
     /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
     fn extension_id(&self) -> Option<&str> {
         None
+    }
+
+    /// Runtime-origin identity used for catalog provenance. Conservative by
+    /// default: tools that declare nothing are `Unknown` (fail-closed source
+    /// trust), and tools that declare an owning extension classify as
+    /// extension-provided. Built-in implementations override this explicitly.
+    fn origin(&self) -> ToolOrigin {
+        match self.extension_id() {
+            Some(extension_id) => ToolOrigin::Extension {
+                extension_id: extension_id.to_string(),
+            },
+            None => ToolOrigin::Unknown,
+        }
     }
 }
 

@@ -20,6 +20,13 @@ pub struct McpTool {
 
 #[async_trait::async_trait]
 impl Tool for McpTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Mcp {
+            server_id: self.server_name.clone(),
+            server_tool_name: self.server_tool_name.clone(),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }

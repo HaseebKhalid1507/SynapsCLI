@@ -9,6 +9,10 @@ pub struct SubagentTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "subagent"
     }

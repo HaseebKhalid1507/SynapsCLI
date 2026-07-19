@@ -1,4 +1,5 @@
 //! Tool registry — maintains name→tool map and cached JSON schema for the API.
+use crate::tools::catalog::{tool_id_for, CapabilityRecord, CatalogError, ToolCatalog};
 use crate::tools::Tool;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,10 @@ pub struct ToolRegistry {
     api_to_runtime_names: HashMap<String, String>,
     /// Per-tool mapping from API-safe input property names back to runtime names.
     input_name_maps: HashMap<String, SchemaNameMap>,
+    /// Passive capability inventory kept truthful across every construction
+    /// and mutation path. Reads never change the exposed schema; mutations
+    /// advance the catalog generation fail-closed (Task 14).
+    catalog: ToolCatalog,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,7 +68,11 @@ impl ToolRegistry {
     }
 
     /// Remove built-in tools by runtime name (config `disabled_tools`), then
-    /// rebuild the cached schema and name maps. Unknown names are ignored.
+    /// rebuild the cached schema, name maps, and capability catalog. Unknown
+    /// names are ignored; a call that removes nothing is a no-op and does
+    /// not advance the catalog generation. A call that removes tools
+    /// advances the catalog generation strictly past its prior value, so
+    /// grants issued against removed capabilities cannot stay valid.
     pub fn disable(&mut self, names: &[String]) {
         if names.is_empty() {
             return;
@@ -74,7 +83,14 @@ impl ToolRegistry {
             .filter(|t| !names.iter().any(|n| n == t.name()))
             .cloned()
             .collect();
+        if remaining.len() == self.tools.len() {
+            return;
+        }
+        let prior = self.catalog.generation();
         *self = Self::from_tools(remaining);
+        self.catalog
+            .rebase_past(prior)
+            .expect(GENERATION_EXHAUSTED_MSG);
     }
 
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
@@ -105,7 +121,9 @@ impl ToolRegistry {
         let mut combined = Self::without_subagent();
         for tool in extension_tools.tools.values() {
             if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
-                combined.tools.insert(tool.name().to_string(), tool.clone());
+                combined
+                    .insert_tool_with_catalog(tool.clone())
+                    .expect(GENERATION_EXHAUSTED_MSG);
             }
         }
         combined.rebuild_schema();
@@ -118,6 +136,7 @@ impl ToolRegistry {
             cached_schema: Arc::new(Vec::new()),
             api_to_runtime_names: HashMap::new(),
             input_name_maps: HashMap::new(),
+            catalog: ToolCatalog::empty(),
         };
         // Insert all tools first, then rebuild schema once.
         // Calling register() in a loop would rebuild_schema() on every
@@ -125,6 +144,18 @@ impl ToolRegistry {
         for tool in tool_list {
             let name = tool.name().to_string();
             registry.tools.insert(name, tool);
+        }
+        // Catalog the constructed set in deterministic name order. Purely
+        // passive: reads in-process metadata only, invokes no factory,
+        // starts no process, exposes no schema, issues no grant.
+        let sorted: Vec<Arc<dyn Tool>> =
+            registry.iter_tools_sorted().into_iter().cloned().collect();
+        for tool in sorted {
+            let record = CapabilityRecord::for_registered_tool(&tool);
+            registry
+                .catalog
+                .upsert(None, record)
+                .expect(GENERATION_EXHAUSTED_MSG);
         }
         registry.rebuild_schema();
         registry
@@ -290,10 +321,47 @@ impl ToolRegistry {
 
     /// Register an additional tool at runtime (e.g. MCP tools, custom tools).
     /// If a tool with the same name exists, it is replaced.
+    ///
+    /// Compatibility wrapper over [`Self::try_register`]. The only failure
+    /// mode is catalog generation exhaustion (a `u64` mutation counter),
+    /// which is unreachable in practice; if it ever occurs this wrapper
+    /// fails closed by panicking rather than exposing a tool the catalog
+    /// could not record. Callers that can surface errors should prefer
+    /// [`Self::try_register`].
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        self.try_register(tool).expect(GENERATION_EXHAUSTED_MSG);
+    }
+
+    /// Fallible registration: catalog the tool first (fail-closed — on error
+    /// nothing is mutated and no schema is exposed), then insert it into the
+    /// live map and rebuild the exposed schema. Replacing a tool whose
+    /// capability identity changes drops the stale catalog entry in the same
+    /// generation advance.
+    pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
+        self.insert_tool_with_catalog(tool)?;
         self.rebuild_schema();
+        Ok(())
+    }
+
+    /// Shared fail-closed mutation core: catalog mutation happens before the
+    /// tools-map mutation, so a catalog failure leaves the registry (and the
+    /// exposed schema) untouched. Never invokes the tool, its factory, any
+    /// extension handler, or any MCP connection method.
+    fn insert_tool_with_catalog(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
+        let record = CapabilityRecord::for_registered_tool(&tool);
+        let replaced = self
+            .tools
+            .get(tool.name())
+            .map(|old| tool_id_for(old.as_ref()));
+        self.catalog.upsert(replaced.as_ref(), record)?;
+        self.tools.insert(tool.name().to_string(), tool);
+        Ok(())
+    }
+
+    /// Read-only view of the capability catalog. Reading never mutates
+    /// registry state; the exposed `tools_schema()` stays byte-identical.
+    pub fn catalog(&self) -> &ToolCatalog {
+        &self.catalog
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -345,6 +413,13 @@ impl ToolRegistry {
         tools
     }
 }
+
+/// Catalog generation exhaustion message for infallible compatibility paths.
+/// The counter is a `u64` advanced once per mutation, so exhaustion is
+/// unreachable in practice; panicking here fails closed (no mutation without
+/// a new generation) instead of silently preserving stale grants.
+const GENERATION_EXHAUSTED_MSG: &str =
+    "tool catalog generation exhausted: refusing mutation without a new generation";
 
 fn is_recursive_subagent_tool_name(name: &str) -> bool {
     let api_name = ToolRegistry::api_safe_name(name, &HashSet::new());

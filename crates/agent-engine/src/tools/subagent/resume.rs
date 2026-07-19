@@ -25,6 +25,10 @@ fn expired_context_error(handle_id: &str) -> RuntimeError {
 
 #[async_trait::async_trait]
 impl Tool for SubagentResumeTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "subagent_resume"
     }

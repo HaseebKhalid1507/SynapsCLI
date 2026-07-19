@@ -316,11 +316,19 @@ impl ExtensionManager {
             };
             let mut registry = tools.write().await;
             for spec in registered_tools {
-                registry.register(Arc::new(crate::tools::ExtensionTool::new(
+                let tool_name = spec.name.clone();
+                if let Err(e) = registry.try_register(Arc::new(crate::tools::ExtensionTool::new(
                     id,
                     spec,
                     handler.clone(),
-                )));
+                ))) {
+                    tracing::warn!(
+                        extension = %id,
+                        tool = %tool_name,
+                        error = %e,
+                        "Refusing to expose extension tool the capability catalog could not record"
+                    );
+                }
             }
         }
 

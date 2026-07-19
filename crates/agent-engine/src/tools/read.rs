@@ -6,6 +6,10 @@ pub struct ReadTool;
 
 #[async_trait::async_trait]
 impl Tool for ReadTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "read"
     }

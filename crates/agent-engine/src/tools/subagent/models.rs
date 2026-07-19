@@ -7,6 +7,10 @@ pub struct SubagentModelsTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentModelsTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "subagent_models"
     }

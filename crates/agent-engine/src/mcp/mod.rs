@@ -77,6 +77,7 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
                             // Prefix tool names with server name to avoid collisions
                             // e.g. "filesystem__read_file" for server "filesystem"
                             let prefixed_name = format!("ext__{}__{}", server_name, tool_def.name);
+                            let tool_name_for_log = prefixed_name.clone();
 
                             let mcp_tool = McpTool {
                                 tool_name: prefixed_name,
@@ -90,7 +91,15 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
                                 connection: Arc::clone(&connection),
                             };
 
-                            registry.register(Arc::new(mcp_tool));
+                            if let Err(e) = registry.try_register(Arc::new(mcp_tool)) {
+                                tracing::warn!(
+                                    server = %server_name,
+                                    tool = %tool_name_for_log,
+                                    error = %e,
+                                    "Refusing to expose MCP tool the capability catalog could not record"
+                                );
+                                continue;
+                            }
                             total_tools += 1;
                         }
 
@@ -133,7 +142,10 @@ pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegist
 
     let connect_tool = McpConnectTool::new(config.mcp_servers);
 
-    registry.write().await.register(Arc::new(connect_tool));
+    if let Err(e) = registry.write().await.try_register(Arc::new(connect_tool)) {
+        tracing::warn!(error = %e, "Refusing to expose MCP gateway the capability catalog could not record");
+        return 0;
+    }
 
     server_count
 }

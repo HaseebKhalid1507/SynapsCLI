@@ -1,19 +1,27 @@
 //! `ToolCatalog` — all locally known capabilities (spec §7.1, Task 14).
 //!
-//! The catalog is a passive, additive inventory: it records what capabilities
-//! exist locally (stable ID, source, compact descriptor, schema + digest,
-//! implementation factory, trust provenance, side-effect placeholder) without
-//! changing what is exposed or executable. [`super::ToolRegistry`] remains the
+//! The catalog is a passive inventory integrated into [`super::ToolRegistry`]:
+//! every registry construction and mutation path (initial construction,
+//! subagent variants, dynamic registration, replacement, extension merge,
+//! disable) keeps exactly one truthful catalog alongside the exposed schema
+//! without changing what is exposed or executable. The registry remains the
 //! active behavior projection until later tasks introduce `DiscoveryIndex`,
 //! `SessionToolSet`, and `ExecutionGate`.
 //!
 //! Insertion invariants (spec §4.2):
 //! - no implementation is constructed (factories are stored, never invoked);
 //! - no process is started and no network is touched;
+//! - no extension handler or MCP connection method is called;
 //! - no schema is exposed to the model;
 //! - no execution grant is issued.
+//!
+//! Mutation invariants:
+//! - every successful mutation advances the generation by checked (never
+//!   saturating) arithmetic — a mutation cannot succeed without a new
+//!   generation, so stale activation grants can never keep validating;
+//! - duplicate and no-op failures do not advance the generation.
 
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{Tool, ToolOrigin};
 use agent_core::BoundedText;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,21 +29,45 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub use agent_core::orchestration::capability::{
-    CatalogGeneration, SchemaDigest, SessionActivationGrant, ToolId, ToolIdError,
+    CatalogGeneration, CatalogGenerationOverflow, SchemaDigest, SessionActivationGrant, ToolId,
+    ToolIdError,
 };
 
 /// Deferred implementation constructor. Stored at insertion, invoked only by
 /// explicit later acquisition (execution-gate territory, not catalog).
 pub type ToolFactory = Arc<dyn Fn() -> Arc<dyn Tool> + Send + Sync>;
 
-/// Where a capability comes from. Drives the ID namespace and, later,
-/// per-source permission policy.
+/// Byte budget for raw identity fragments retained inside
+/// [`CapabilitySource`] (extension/plugin/server ids and tool names).
+const SOURCE_IDENTITY_MAX_BYTES: usize = 256;
+
+fn bounded_identity(raw: &str) -> String {
+    BoundedText::new(raw, SOURCE_IDENTITY_MAX_BYTES).text
+}
+
+/// Where a capability comes from, carrying the exact runtime identities
+/// (extension/plugin/server ids and per-source tool names). Drives the ID
+/// namespace and, later, per-source permission policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapabilitySource {
     Builtin,
-    Extension { extension_id: String },
-    Mcp { server_id: String },
-    Plugin { plugin_id: String },
+    Extension {
+        extension_id: String,
+        tool_name: String,
+    },
+    Mcp {
+        server_id: String,
+        server_tool_name: String,
+    },
+    Plugin {
+        plugin_id: String,
+        tool_name: String,
+    },
+    /// Dynamically registered with no declared origin. Kept explicit and
+    /// conservative — never classified as builtin.
+    Unknown {
+        runtime_name: String,
+    },
 }
 
 /// Permission/trust provenance recorded at catalog time. Evaluated (not
@@ -50,6 +82,9 @@ pub enum TrustProvenance {
     McpConfig { server_id: String },
     /// Declared by a plugin definition.
     PluginConfig { plugin_id: String },
+    /// No verifiable provenance. Conservative fail-closed default for
+    /// unclassified dynamic registrations.
+    Unverified,
 }
 
 /// Side-effect classification placeholder until Phase 4 (spec §8) introduces
@@ -129,6 +164,30 @@ impl CapabilityRecord {
         }
     }
 
+    /// Catalog an already-constructed registry tool passively from its
+    /// declared [`ToolOrigin`]. Reads only in-process metadata (`name`,
+    /// `description`, `parameters`, `origin`): no execution, no extension
+    /// handler call, no MCP connection/process/network activity, no grant.
+    ///
+    /// Runtime identities are encoded through the source-aware [`ToolId`]
+    /// constructors, so existing uppercase/Unicode/colon-bearing names are
+    /// represented exactly rather than rejected, and undeclared origins are
+    /// cataloged conservatively as unknown — never invented as builtin.
+    pub fn for_registered_tool(tool: &Arc<dyn Tool>) -> Self {
+        let (id, source, provenance) = identity_for_tool(tool.as_ref());
+        let implementation = Arc::clone(tool);
+        let factory: ToolFactory = Arc::new(move || Arc::clone(&implementation));
+        Self::new(
+            id,
+            source,
+            tool.description(),
+            Vec::new(),
+            SchemaLocator::Inline(tool.parameters()),
+            factory,
+            provenance,
+        )
+    }
+
     pub fn id(&self) -> &ToolId {
         &self.id
     }
@@ -182,19 +241,87 @@ impl std::fmt::Debug for CapabilityRecord {
     }
 }
 
+/// Catalog identity of a registered tool: its exact runtime name for
+/// extension tools is `<extension_id>:<tool_name>`, so the extension prefix
+/// is stripped before encoding to keep the id keyed on (extension, tool).
+pub(crate) fn tool_id_for(tool: &dyn Tool) -> ToolId {
+    identity_for_tool(tool).0
+}
+
+fn identity_for_tool(tool: &dyn Tool) -> (ToolId, CapabilitySource, TrustProvenance) {
+    match tool.origin() {
+        ToolOrigin::Builtin => (
+            ToolId::builtin(tool.name()),
+            CapabilitySource::Builtin,
+            TrustProvenance::BuiltinRuntime,
+        ),
+        ToolOrigin::Extension { extension_id } => {
+            let runtime_name = tool.name();
+            let tool_name = runtime_name
+                .strip_prefix(&format!("{extension_id}:"))
+                .unwrap_or(runtime_name);
+            (
+                ToolId::extension(&extension_id, tool_name),
+                CapabilitySource::Extension {
+                    extension_id: bounded_identity(&extension_id),
+                    tool_name: bounded_identity(tool_name),
+                },
+                TrustProvenance::ExtensionManifest {
+                    extension_id: bounded_identity(&extension_id),
+                },
+            )
+        }
+        ToolOrigin::Mcp {
+            server_id,
+            server_tool_name,
+        } => (
+            ToolId::mcp(&server_id, &server_tool_name),
+            CapabilitySource::Mcp {
+                server_id: bounded_identity(&server_id),
+                server_tool_name: bounded_identity(&server_tool_name),
+            },
+            TrustProvenance::McpConfig {
+                server_id: bounded_identity(&server_id),
+            },
+        ),
+        ToolOrigin::Plugin {
+            plugin_id,
+            tool_name,
+        } => (
+            ToolId::plugin(&plugin_id, &tool_name),
+            CapabilitySource::Plugin {
+                plugin_id: bounded_identity(&plugin_id),
+                tool_name: bounded_identity(&tool_name),
+            },
+            TrustProvenance::PluginConfig {
+                plugin_id: bounded_identity(&plugin_id),
+            },
+        ),
+        ToolOrigin::Unknown => (
+            ToolId::unclassified(tool.name()),
+            CapabilitySource::Unknown {
+                runtime_name: bounded_identity(tool.name()),
+            },
+            TrustProvenance::Unverified,
+        ),
+    }
+}
+
 /// Typed catalog mutation failures. All fail closed without advancing the
-/// catalog generation.
+/// catalog generation or partially applying the mutation.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CatalogError {
     #[error("duplicate tool id in catalog: {0}")]
     DuplicateToolId(ToolId),
     #[error("invalid tool id: {0}")]
     InvalidToolId(#[from] ToolIdError),
+    #[error("catalog mutation rejected: {0}")]
+    GenerationExhausted(#[from] CatalogGenerationOverflow),
 }
 
 /// Inventory of all locally known capabilities, keyed by stable [`ToolId`]
 /// in deterministic order, with a generation that advances on every mutation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ToolCatalog {
     entries: BTreeMap<ToolId, CapabilityRecord>,
     generation: CatalogGeneration,
@@ -208,45 +335,24 @@ impl ToolCatalog {
         }
     }
 
-    /// Catalog every tool already constructed by an existing registry
-    /// construction path (`ToolRegistry::new()` and variants). Purely reads
-    /// in-process metadata: no process start, no network, no schema exposure,
-    /// no execution grant. Non-canonical runtime names fail closed rather
-    /// than being sanitized into alias-prone IDs.
-    pub fn from_registry(registry: &ToolRegistry) -> Result<Self, CatalogError> {
-        let mut catalog = Self::empty();
-        for tool in registry.iter_tools_sorted() {
-            let (source, provenance, id_raw) = match tool.extension_id() {
-                Some(extension_id) => (
-                    CapabilitySource::Extension {
-                        extension_id: extension_id.to_string(),
-                    },
-                    TrustProvenance::ExtensionManifest {
-                        extension_id: extension_id.to_string(),
-                    },
-                    format!("extension.{extension_id}:{}", tool.name()),
-                ),
-                None => (
-                    CapabilitySource::Builtin,
-                    TrustProvenance::BuiltinRuntime,
-                    format!("builtin:{}", tool.name()),
-                ),
-            };
-            let id = ToolId::parse(&id_raw)?;
-            let implementation = Arc::clone(tool);
-            let factory: ToolFactory = Arc::new(move || Arc::clone(&implementation));
-            let record = CapabilityRecord::new(
-                id,
-                source,
-                tool.description(),
-                Vec::new(),
-                SchemaLocator::Inline(tool.parameters()),
-                factory,
-                provenance,
-            );
-            catalog.insert(record)?;
+    /// Boundary-test support: an empty catalog resumed at an explicit
+    /// generation. Not used by production paths.
+    #[doc(hidden)]
+    pub fn resume_at_generation_for_tests(generation: CatalogGeneration) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            generation,
         }
-        Ok(catalog)
+    }
+
+    /// Read-only snapshot of the catalog integrated into a live registry.
+    ///
+    /// Kept as a compatibility shim over [`super::ToolRegistry::catalog`];
+    /// the registry maintains its catalog through every construction and
+    /// mutation path, so this is a pure read with no process start, network
+    /// access, schema exposure, or execution grant.
+    pub fn from_registry(registry: &super::ToolRegistry) -> Result<Self, CatalogError> {
+        Ok(registry.catalog().clone())
     }
 
     pub fn generation(&self) -> CatalogGeneration {
@@ -271,15 +377,49 @@ impl ToolCatalog {
     }
 
     /// Insert one capability. Duplicate IDs fail closed (no silent
-    /// replacement, no generation advance). On success the catalog
-    /// generation increments by exactly one. The record's factory is stored,
-    /// never invoked.
+    /// replacement, no generation advance); generation exhaustion fails
+    /// closed (no entry change). On success the catalog generation advances
+    /// by exactly one. The record's factory is stored, never invoked.
     pub fn insert(&mut self, record: CapabilityRecord) -> Result<(), CatalogError> {
         if self.entries.contains_key(&record.id) {
             return Err(CatalogError::DuplicateToolId(record.id.clone()));
         }
+        let next = self.generation.checked_next()?;
         self.entries.insert(record.id.clone(), record);
-        self.generation = self.generation.next();
+        self.generation = next;
+        Ok(())
+    }
+
+    /// Insert-or-replace one capability as a single mutation, optionally
+    /// dropping the entry it shadows (registry replacement by runtime name
+    /// can change the capability identity; the stale identity must not
+    /// linger and keep validating old grants). Fails closed without touching
+    /// entries when no new generation is available.
+    pub fn upsert(
+        &mut self,
+        replaced: Option<&ToolId>,
+        record: CapabilityRecord,
+    ) -> Result<(), CatalogError> {
+        let next = self.generation.checked_next()?;
+        if let Some(stale) = replaced {
+            if stale != &record.id {
+                self.entries.remove(stale);
+            }
+        }
+        self.entries.insert(record.id.clone(), record);
+        self.generation = next;
+        Ok(())
+    }
+
+    /// Advance strictly past both this catalog's generation and a prior
+    /// registry generation. Used when a mutation rebuilds the catalog from
+    /// scratch (e.g. `disable`): the rebuilt catalog must not reuse
+    /// generation values already observed, or stale grants could survive.
+    pub fn rebase_past(
+        &mut self,
+        prior: CatalogGeneration,
+    ) -> Result<(), CatalogGenerationOverflow> {
+        self.generation = self.generation.max(prior).checked_next()?;
         Ok(())
     }
 }
