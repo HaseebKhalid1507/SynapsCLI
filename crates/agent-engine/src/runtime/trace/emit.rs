@@ -49,6 +49,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// non-blocking: they run inline on the request path.
 pub trait TraceSink: Send + Sync + std::fmt::Debug {
     fn emit(&self, record: RequestTrace);
+    /// Update a previously emitted request record with execution metadata.
+    /// Default sinks cannot mutate and therefore ignore enrichment; collecting
+    /// and writer sinks replace in place so one logical transport attempt
+    /// remains exactly one trace record.
+    fn enrich_execution_events(
+        &self,
+        _request_id: &TraceId,
+        _events: Vec<super::types::ToolExecutionEvent>,
+    ) {
+    }
     /// Optional latest record snapshot used to append execution-enriched
     /// copies after the provider request has completed.
     fn snapshot_for_request(&self, _request_id: &TraceId) -> Option<RequestTrace> {
@@ -97,6 +107,23 @@ impl TraceSink for CollectingTraceSink {
             .lock()
             .expect("trace sink poisoned")
             .push(record);
+    }
+
+    fn enrich_execution_events(
+        &self,
+        request_id: &TraceId,
+        events: Vec<super::types::ToolExecutionEvent>,
+    ) {
+        if let Some(record) = self
+            .records
+            .lock()
+            .expect("trace sink poisoned")
+            .iter_mut()
+            .rev()
+            .find(|record| &record.request_id == request_id)
+        {
+            record.execution_events = events;
+        }
     }
 
     fn snapshot_for_request(&self, request_id: &TraceId) -> Option<RequestTrace> {
@@ -170,11 +197,8 @@ impl TraceContext {
     /// snapshot. Sinks that persist append-only records may retain both; the
     /// latest snapshot is authoritative for the request ID.
     pub fn emit_execution_enriched(&self, request_id: &TraceId) {
-        let Some(mut record) = self.sink.snapshot_for_request(request_id) else {
-            return;
-        };
-        record.execution_events = self.execution_events(request_id);
-        self.sink.emit(record);
+        self.sink
+            .enrich_execution_events(request_id, self.execution_events(request_id));
     }
 
     /// Session identity shared by all request/tool events in this context.

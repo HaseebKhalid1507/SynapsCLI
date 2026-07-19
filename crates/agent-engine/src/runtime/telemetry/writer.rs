@@ -235,6 +235,7 @@ struct WorkerCfg {
     trace_path: Option<PathBuf>,
     max_file_bytes: u64,
     write_delay: Option<Duration>,
+    latest_traces: Arc<Shared>,
 }
 
 impl TelemetryWriter {
@@ -255,6 +256,7 @@ impl TelemetryWriter {
             trace_path: options.trace_path.or_else(default_trace_log_path),
             max_file_bytes: options.max_file_bytes,
             write_delay: options.write_delay,
+            latest_traces: Arc::clone(&shared),
         };
         let worker_shared = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
@@ -275,6 +277,17 @@ impl TelemetryWriter {
         lock_recover(&self.shared.latest_traces)
             .insert(record.request_id.as_str().to_string(), record.clone());
         self.enqueue(Job::Trace(Box::new(record)));
+    }
+
+    pub fn enrich_trace(
+        &self,
+        request_id: &crate::runtime::trace::TraceId,
+        events: Vec<crate::runtime::trace::ToolExecutionEvent>,
+    ) {
+        if let Some(record) = lock_recover(&self.shared.latest_traces).get_mut(request_id.as_str())
+        {
+            record.execution_events = events;
+        }
     }
 
     pub fn trace_snapshot(
@@ -398,7 +411,13 @@ fn worker_loop(rx: Receiver<Job>, cfg: WorkerCfg, shared: Arc<Shared>) {
 fn process_job(job: Job, cfg: &WorkerCfg, c: &Counters) {
     let (serialized, path) = match &job {
         Job::Telemetry(r) => (serde_json::to_string(r), cfg.telemetry_path.as_deref()),
-        Job::Trace(r) => (serde_json::to_string(r), cfg.trace_path.as_deref()),
+        Job::Trace(r) => {
+            let latest = lock_recover(&cfg.latest_traces.latest_traces)
+                .get(r.request_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| (**r).clone());
+            (serde_json::to_string(&latest), cfg.trace_path.as_deref())
+        }
     };
     let line = match serialized {
         Ok(line) => line,
@@ -510,6 +529,14 @@ impl WriterTraceSink {
 impl TraceSink for WriterTraceSink {
     fn emit(&self, record: RequestTrace) {
         self.writer.enqueue_trace(record);
+    }
+
+    fn enrich_execution_events(
+        &self,
+        request_id: &crate::runtime::trace::TraceId,
+        events: Vec<crate::runtime::trace::ToolExecutionEvent>,
+    ) {
+        self.writer.enrich_trace(request_id, events);
     }
 
     fn snapshot_for_request(
