@@ -187,11 +187,34 @@ pub fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> 
     let dir = memory_dir_in(base);
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, &record.namespace);
-    let mut f =
-        crate::core::private_fs::open_private_append(&path).map_err(std::io::Error::from)?;
-    let mut line = serde_json::to_string(record)?;
-    line.push('\n');
-    f.write_all(line.as_bytes())?;
+    let line = serde_json::to_string(record)?;
+    append_jsonl_line(&path, &line)
+}
+
+/// Append one JSONL line with torn-tail healing: if a previous writer
+/// crashed mid-line (file does not end in a newline), a leading newline
+/// isolates the torn fragment on its own line — lenient readers skip the
+/// fragment and every subsequent record stays parseable.
+fn append_jsonl_line(path: &Path, line: &str) -> Result<(), MemoryError> {
+    let needs_heal = match fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = fs::File::open(path)?;
+            f.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            f.read_exact(&mut last)?;
+            last[0] != b'\n'
+        }
+        _ => false,
+    };
+    let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
+    let mut out = String::with_capacity(line.len() + 2);
+    if needs_heal {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    f.write_all(out.as_bytes())?;
     Ok(())
 }
 
@@ -569,15 +592,16 @@ pub fn forget_in(base: &Path, scope: &ProjectScope, id: &str) -> Result<(), Memo
     let dir = memory_dir_in(base);
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, &scope.namespace());
-    let mut f =
-        crate::core::private_fs::open_private_append(&path).map_err(std::io::Error::from)?;
-    let mut line = serde_json::to_string(&TombstoneLine {
+    let line = serde_json::to_string(&TombstoneLine {
         tombstone: id.to_string(),
         timestamp_ms: now_ms(),
     })?;
-    line.push('\n');
-    f.write_all(line.as_bytes())?;
-    Ok(())
+    append_jsonl_line(&path, &line)
+}
+
+/// Path of a project namespace's JSONL store file (index-module seam).
+pub(crate) fn namespace_file(base: &Path, namespace: &str) -> PathBuf {
+    namespace_path(&memory_dir_in(base), namespace)
 }
 
 #[cfg(test)]
