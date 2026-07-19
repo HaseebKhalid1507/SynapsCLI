@@ -10,8 +10,16 @@ impl Tool for WriteTool {
         crate::tools::catalog::ToolEffect::IdempotentWrite
     }
 
-    fn concurrency_key(&self, validated_input: &serde_json::Value) -> Option<String> {
-        super::util::canonical_path_key(validated_input["path"].as_str()?)
+    fn concurrency_key(
+        &self,
+        validated_input: &serde_json::Value,
+    ) -> Option<super::ConcurrencyKey> {
+        Some(
+            match super::util::canonical_path_key(validated_input["path"].as_str()?) {
+                Some(key) => super::ConcurrencyKey::Key(key),
+                None => super::ConcurrencyKey::Serialize,
+            },
+        )
     }
 
     fn origin(&self) -> crate::tools::ToolOrigin {

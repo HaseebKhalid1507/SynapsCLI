@@ -837,8 +837,8 @@ impl StreamMethods {
                                                 }
                                                 crate::tools::catalog::ToolEffect::IdempotentWrite => {
                                                     match implementation.concurrency_key(input) {
-                                                        Some(key) => LaneKind::Keyed(key),
-                                                        None => LaneKind::Serial,
+                                                        Some(crate::tools::ConcurrencyKey::Key(key)) => LaneKind::Keyed(key),
+                                                        Some(crate::tools::ConcurrencyKey::Serialize) | None => LaneKind::Serial,
                                                     }
                                                 }
                                                 crate::tools::catalog::ToolEffect::NonIdempotent => {

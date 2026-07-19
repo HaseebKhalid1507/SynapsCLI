@@ -24,7 +24,7 @@ use serial_test::serial;
 use support::*;
 use synaps_cli::runtime::{Runtime, SessionEvent, StreamEvent};
 use synaps_cli::tools::catalog::{ToolEffect, ToolId};
-use synaps_cli::tools::{Tool, ToolContext, ToolOrigin, ToolRegistry};
+use synaps_cli::tools::{ConcurrencyKey, Tool, ToolContext, ToolOrigin, ToolRegistry};
 use synaps_cli::{Result, Value};
 
 // ── SSE fixtures ────────────────────────────────────────────────────────────
@@ -54,10 +54,84 @@ fn sse_two_calls(name_a: &str, id_a: &str, name_b: &str, id_b: &str) -> String {
     )
 }
 
+fn sse_two_calls_with_inputs(
+    name_a: &str,
+    id_a: &str,
+    input_a: &str,
+    name_b: &str,
+    id_b: &str,
+    input_b: &str,
+) -> String {
+    format!(
+        concat!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_e1\",\"type\":\"message\",",
+            "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+            "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+            "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":0,",
+            "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id_a}\",\"name\":\"{name_a}\",\"input\":{input_a}}}}}\n\n",
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":1,",
+            "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id_b}\",\"name\":\"{name_b}\",\"input\":{input_b}}}}}\n\n",
+            "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",",
+            "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+            "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        id_a = id_a,
+        name_a = name_a,
+        input_a = input_a,
+        id_b = id_b,
+        name_b = name_b,
+        input_b = input_b,
+    )
+}
+
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 /// Event log recording execution interleaving: `start:<tag>` / `end:<tag>`.
 type EventLog = Arc<Mutex<Vec<String>>>;
+
+/// The production write tool, wrapped only to record start/end timing while
+/// retaining its real effect + symlink-aware concurrency-key implementation.
+struct ObservedWrite {
+    name: String,
+    tag: String,
+    path: String,
+    log: EventLog,
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ObservedWrite {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    fn description(&self) -> &str {
+        "observed production write"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::IdempotentWrite
+    }
+    fn concurrency_key(&self, input: &Value) -> Option<ConcurrencyKey> {
+        let production = synaps_cli::tools::WriteTool;
+        production.concurrency_key(input)
+    }
+    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+        self.log.lock().unwrap().push(format!("start:{}", self.tag));
+        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        std::fs::write(&self.path, &self.tag).unwrap();
+        self.log.lock().unwrap().push(format!("end:{}", self.tag));
+        Ok(format!("wrote:{}", self.tag))
+    }
+}
 
 /// Mutating fixture with a FIXED concurrency key: the first call sleeps
 /// (reordering pressure), so interleaved execution would show
@@ -86,8 +160,8 @@ impl Tool for KeyedWriteFixture {
     fn effect(&self) -> ToolEffect {
         ToolEffect::IdempotentWrite
     }
-    fn concurrency_key(&self, _input: &Value) -> Option<String> {
-        Some("/same/canonical/target".to_string())
+    fn concurrency_key(&self, _input: &Value) -> Option<ConcurrencyKey> {
+        Some(ConcurrencyKey::Key("/same/canonical/target".to_string()))
     }
     async fn execute(&self, _p: Value, _c: ToolContext) -> Result<String> {
         self.log.lock().unwrap().push(format!("start:{}", self.tag));
@@ -141,7 +215,10 @@ impl Tool for OverlapFixture {
         self.effect
     }
     async fn execute(&self, _p: Value, _c: ToolContext) -> Result<String> {
-        self.log.lock().unwrap().push(format!("start:{}", self.name));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
         let now = self.gauge.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.gauge.peak.fetch_max(now, Ordering::SeqCst);
         // Bounded observation window: wait for a concurrent sibling to
@@ -149,9 +226,7 @@ impl Tool for OverlapFixture {
         // enter until we exit, so the peak stays at 1 and we report SERIAL;
         // a real overlap raises the peak to 2 and is seen deterministically.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
-        while self.gauge.peak.load(Ordering::SeqCst) < 2
-            && tokio::time::Instant::now() < deadline
-        {
+        while self.gauge.peak.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let overlapped = self.gauge.peak.load(Ordering::SeqCst) >= 2;
@@ -278,15 +353,75 @@ async fn same_key_writes_execute_serially_in_model_order() {
     assert_eq!(results[1].0, "toolu_w2");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn real_path_and_directory_symlink_alias_serialize_under_reordering_pressure() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = HomeGuard::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let real_dir = tmp.path().join("real");
+    std::fs::create_dir(&real_dir).unwrap();
+    let alias_dir = tmp.path().join("alias");
+    symlink(&real_dir, &alias_dir).unwrap();
+    let real_path = real_dir.join("new.txt");
+    let alias_path = alias_dir.join("new.txt");
+    let input_a = serde_json::json!({"path":real_path,"content":"A"}).to_string();
+    let input_b = serde_json::json!({"path":alias_path,"content":"B"}).to_string();
+    let body: &'static str = Box::leak(
+        sse_two_calls_with_inputs(
+            "observed_write_a",
+            "toolu_s1",
+            &input_a,
+            "observed_write_b",
+            "toolu_s2",
+            &input_b,
+        )
+        .into_boxed_str(),
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
+    let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_with(vec![
+        Arc::new(ObservedWrite {
+            name: "observed_write_a".into(),
+            tag: "A".into(),
+            path: real_path.to_string_lossy().into_owned(),
+            log: Arc::clone(&log),
+            delay_ms: 300,
+        }),
+        Arc::new(ObservedWrite {
+            name: "observed_write_b".into(),
+            tag: "B".into(),
+            path: alias_path.to_string_lossy().into_owned(),
+            log: Arc::clone(&log),
+            delay_ms: 0,
+        }),
+    ])
+    .await;
+    let _events = drive_runtime_turn(&rt, "write through alias", false).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["start:A", "end:A", "start:B", "end:B"],
+        "symlink aliases of one create target must share a scheduler lane"
+    );
+    assert_eq!(
+        std::fs::read_to_string(real_dir.join("new.txt")).unwrap(),
+        "B"
+    );
+}
+
 /// Independent read-only tools OVERLAP: both sides reach the shared
 /// barrier while the other is still executing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn independent_read_only_tools_overlap() {
     let _guard = HomeGuard::new();
-    let body: &'static str = Box::leak(
-        sse_two_calls("ro_alpha", "toolu_r1", "ro_beta", "toolu_r2").into_boxed_str(),
-    );
+    let body: &'static str =
+        Box::leak(sse_two_calls("ro_alpha", "toolu_r1", "ro_beta", "toolu_r2").into_boxed_str());
     let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
     let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -322,9 +457,8 @@ async fn independent_read_only_tools_overlap() {
 #[serial]
 async fn unclassified_tools_serialize_by_default() {
     let _guard = HomeGuard::new();
-    let body: &'static str = Box::leak(
-        sse_two_calls("unc_alpha", "toolu_u1", "unc_beta", "toolu_u2").into_boxed_str(),
-    );
+    let body: &'static str =
+        Box::leak(sse_two_calls("unc_alpha", "toolu_u1", "unc_beta", "toolu_u2").into_boxed_str());
     let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
     let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -371,9 +505,8 @@ async fn unclassified_tools_serialize_by_default() {
 #[serial]
 async fn result_order_matches_model_order_despite_completion_order() {
     let _guard = HomeGuard::new();
-    let body: &'static str = Box::leak(
-        sse_two_calls("slow_read", "toolu_s1", "fast_read", "toolu_s2").into_boxed_str(),
-    );
+    let body: &'static str =
+        Box::leak(sse_two_calls("slow_read", "toolu_s1", "fast_read", "toolu_s2").into_boxed_str());
     let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
     let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -408,9 +541,7 @@ async fn result_order_matches_model_order_despite_completion_order() {
 /// Built-in classification + catalog recording + dynamic defaults.
 #[tokio::test]
 async fn builtin_classification_and_dynamic_defaults() {
-    use synaps_cli::tools::{
-        BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool,
-    };
+    use synaps_cli::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
     let write = WriteTool;
     let edit = EditTool;
     assert_eq!(ReadTool.effect(), ToolEffect::ReadOnly);

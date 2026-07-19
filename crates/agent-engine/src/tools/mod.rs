@@ -163,6 +163,12 @@ pub enum ToolOrigin {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrencyKey {
+    Key(String),
+    Serialize,
+}
+
 /// The core trait for all tools. Implement this to add a new tool.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -203,11 +209,10 @@ pub trait Tool: Send + Sync {
         crate::tools::catalog::ToolEffect::NonIdempotent
     }
 
-    /// Optional concurrency key derived from the VALIDATED input (Task 24):
-    /// mutating calls with the same key run serially in model order;
-    /// keyed calls with distinct keys are proven non-conflicting. `None`
-    /// (default) joins the global serialized mutation lane.
-    fn concurrency_key(&self, _validated_input: &Value) -> Option<String> {
+    /// Key resolution derived from validated input. `Serialize` explicitly
+    /// fails closed into the global mutation lane; `None` is the conservative
+    /// default for tools with no key support.
+    fn concurrency_key(&self, _validated_input: &Value) -> Option<ConcurrencyKey> {
         None
     }
 }
