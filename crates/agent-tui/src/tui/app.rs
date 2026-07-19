@@ -119,8 +119,14 @@ pub(crate) struct App {
     /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
     pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
-    pub(crate) compact_task:
-        Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
+    pub(crate) compact_task: Option<
+        tokio::task::JoinHandle<
+            Result<
+                synaps_cli::runtime::compaction::CompactionOutcome,
+                synaps_cli::error::RuntimeError,
+            >,
+        >,
+    >,
     /// Events buffered during streaming — injected into api_messages after stream completes
     pub(crate) pending_events: Vec<String>,
     /// Consecutive auto-triggered model turns since the last real user send.

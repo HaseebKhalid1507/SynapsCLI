@@ -22,7 +22,9 @@ use synaps_cli::engine::reactor::{
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::runtime::compaction::compact_conversation;
+use synaps_cli::runtime::compaction::{
+    apply_compaction, compact_conversation, CompactionPolicy, CompactionTransition,
+};
 use synaps_cli::{flush_stdout, CancellationToken};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
@@ -224,19 +226,40 @@ pub async fn run(
                                 custom_instructions,
                             } => {
                                 eprintln!("compacting...");
-                                if let Ok(summary) = compact_conversation(
+                                match compact_conversation(
                                     &conv.api_messages,
                                     &runtime,
                                     custom_instructions.as_deref(),
                                 )
                                 .await
                                 {
-                                    conv.api_messages = vec![std::sync::Arc::new(json!({
-                                        "role": "user",
-                                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                                    }))];
-                                    let after = runtime.assess_context(&conv.api_messages).await;
-                                    eprintln!("compacted → ~{} tokens", after.used_tokens());
+                                    Ok(outcome) => match apply_compaction(
+                                        &runtime,
+                                        &conv.session,
+                                        &conv.api_messages,
+                                        &outcome,
+                                        CompactionTransition {
+                                            policy: CompactionPolicy::InPlace,
+                                            pending_events: Vec::new(),
+                                            queued_message: None,
+                                            hook_source: "manual".to_string(),
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(applied) => {
+                                            conv.session = applied.session;
+                                            conv.api_messages = applied.api_messages;
+                                            let after =
+                                                runtime.assess_context(&conv.api_messages).await;
+                                            eprintln!(
+                                                "compacted → ~{} tokens",
+                                                after.used_tokens()
+                                            );
+                                        }
+                                        Err(e) => eprintln!("compaction failed: {}", e),
+                                    },
+                                    Err(e) => eprintln!("compaction failed: {}", e),
                                 }
                             }
                             CommandResult::Error(e) => eprintln!("error: {}", e),
@@ -461,17 +484,33 @@ pub async fn run(
                     "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
                     assessment.used_tokens()
                 );
-                if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await
-                {
-                    conv.api_messages = vec![std::sync::Arc::new(json!({
-                        "role": "user",
-                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                    }))];
-                    let after = runtime.assess_context(&conv.api_messages).await;
-                    eprintln!(
-                        "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
-                        after.used_tokens()
-                    );
+                match compact_conversation(&conv.api_messages, &runtime, None).await {
+                    Ok(outcome) => match apply_compaction(
+                        &runtime,
+                        &conv.session,
+                        &conv.api_messages,
+                        &outcome,
+                        CompactionTransition {
+                            policy: CompactionPolicy::InPlace,
+                            pending_events: Vec::new(),
+                            queued_message: None,
+                            hook_source: "auto".to_string(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(applied) => {
+                            conv.session = applied.session;
+                            conv.api_messages = applied.api_messages;
+                            let after = runtime.assess_context(&conv.api_messages).await;
+                            eprintln!(
+                                "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
+                                after.used_tokens()
+                            );
+                        }
+                        Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
+                    },
+                    Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
                 }
             }
 

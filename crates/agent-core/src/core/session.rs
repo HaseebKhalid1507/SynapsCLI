@@ -126,59 +126,6 @@ impl Session {
         }
     }
 
-    /// Legacy successor constructor kept ONLY until every frontend routes
-    /// through the unified engine compaction transition (T30). Embeds the
-    /// parent system prompt in user text — superseded by
-    /// [`Session::from_compaction_record`]; do not add callers.
-    pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
-        let now = Utc::now();
-        let id = format!(
-            "{}-{}",
-            now.format("%Y%m%d-%H%M%S"),
-            &uuid::Uuid::new_v4().to_string()[..4]
-        );
-        let name = parent.name.clone();
-        let mut summary_parts = String::new();
-        if let Some(ref sp) = parent.system_prompt {
-            summary_parts.push_str(&format!("<system-prompt>\n{}\n</system-prompt>\n\n", sp));
-        }
-        summary_parts.push_str(&format!(
-            "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary and system prompt above contain all the context you need.",
-            summary
-        ));
-        Session {
-            id,
-            title: format!(
-                "↳ {}",
-                if parent.title.is_empty() {
-                    &parent.id
-                } else {
-                    &parent.title
-                }
-            ),
-            name,
-            model: parent.model.clone(),
-            thinking_level: parent.thinking_level.clone(),
-            system_prompt: parent.system_prompt.clone(),
-            created_at: now,
-            updated_at: now,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            session_cost: 0.0,
-            api_messages: vec![
-                SharedMessage::new(serde_json::json!({"role": "user", "content": summary_parts})),
-                SharedMessage::new(
-                    serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
-                ),
-            ],
-            abort_context: None,
-            parent_session: Some(parent.id.clone()),
-            compacted_into: None,
-            prompt_provenance: None,
-            compaction: None,
-        }
-    }
-
     /// Set title from the first user message if not already set
     pub fn auto_title(&mut self) {
         if !self.title.is_empty() {
