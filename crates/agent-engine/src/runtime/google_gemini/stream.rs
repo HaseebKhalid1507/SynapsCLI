@@ -307,6 +307,7 @@ mod tests {
                     .saturating_sub(before.forwarded_events),
             )
             .saturating_sub(stalled.dropped_events.saturating_sub(before.dropped_events));
+        assert!(retained_delta > 0, "stalled consumer must retain queued events");
         assert!(retained_delta <= GEMINI_EVENT_CHANNEL_CAPACITY as u64);
         let active_before = before.active_producers;
         drop(stream);

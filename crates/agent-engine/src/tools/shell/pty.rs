@@ -22,14 +22,17 @@ use crate::{Result, RuntimeError};
 const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 const PTY_OUTPUT_MAX_CHUNK_BYTES: usize = 4096;
 static PTY_PRODUCED_BYTES: AtomicU64 = AtomicU64::new(0);
-static PTY_FORWARDED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PTY_ACCEPTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PTY_CONSUMED_BYTES: AtomicU64 = AtomicU64::new(0);
 static PTY_DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 static PTY_ACTIVE_READERS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct PtyOutputSnapshot {
     pub produced_bytes: u64,
-    pub forwarded_bytes: u64,
+    /// Chunks/bytes accepted into the bounded handoff. This is not consumer
+    /// delivery; queued bytes remain retained until `try_read_output` drains.
+    pub accepted_bytes: u64,
     pub dropped_bytes: u64,
     pub retained_bytes: u64,
     pub active_readers: u64,
@@ -37,13 +40,14 @@ pub struct PtyOutputSnapshot {
 
 pub fn pty_output_snapshot() -> PtyOutputSnapshot {
     let produced = PTY_PRODUCED_BYTES.load(Ordering::Relaxed);
-    let forwarded = PTY_FORWARDED_BYTES.load(Ordering::Relaxed);
+    let accepted = PTY_ACCEPTED_BYTES.load(Ordering::Relaxed);
+    let consumed = PTY_CONSUMED_BYTES.load(Ordering::Relaxed);
     let dropped = PTY_DROPPED_BYTES.load(Ordering::Relaxed);
     PtyOutputSnapshot {
         produced_bytes: produced,
-        forwarded_bytes: forwarded,
+        accepted_bytes: accepted,
         dropped_bytes: dropped,
-        retained_bytes: produced.saturating_sub(forwarded).saturating_sub(dropped),
+        retained_bytes: produced.saturating_sub(consumed).saturating_sub(dropped),
         active_readers: PTY_ACTIVE_READERS.load(Ordering::SeqCst),
     }
 }
@@ -62,6 +66,10 @@ pub struct PtyHandle {
     _reader_task: JoinHandle<()>,
     /// Receiving end of the output channel fed by the reader task.
     output_rx: mpsc::Receiver<Vec<u8>>,
+    /// Per-handle accepted/consumed byte counts used to account queued bytes
+    /// exactly when cancellation drops the receiver.
+    accepted_bytes: Arc<AtomicU64>,
+    consumed_bytes: Arc<AtomicU64>,
     /// Child process handle — used for try_wait / kill.
     child: Box<dyn Child + Send + Sync>,
     /// Cached alive flag — once the child exits, this stays false.
@@ -140,6 +148,9 @@ impl PtyHandle {
 
         // 5. Spawn a blocking reader task that pushes chunks into the channel.
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(PTY_OUTPUT_CHANNEL_CAPACITY);
+        let accepted_bytes = Arc::new(AtomicU64::new(0));
+        let consumed_bytes = Arc::new(AtomicU64::new(0));
+        let reader_accepted = Arc::clone(&accepted_bytes);
         let alive = Arc::new(AtomicBool::new(true));
         let reader_alive = alive.clone();
 
@@ -163,7 +174,8 @@ impl PtyHandle {
                         PTY_PRODUCED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         match output_tx.blocking_send(buf[..n].to_vec()) {
                             Ok(()) => {
-                                PTY_FORWARDED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                                reader_accepted.fetch_add(n as u64, Ordering::Relaxed);
+                                PTY_ACCEPTED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                             }
                             Err(_) => {
                                 PTY_DROPPED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
@@ -188,6 +200,8 @@ impl PtyHandle {
             writer,
             _reader_task: reader_task,
             output_rx,
+            accepted_bytes,
+            consumed_bytes,
             child,
             alive,
             killer,
@@ -218,6 +232,9 @@ impl PtyHandle {
 
         // Phase 1: non-blocking drain of everything already queued.
         while let Ok(chunk) = self.output_rx.try_recv() {
+            self.consumed_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            PTY_CONSUMED_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             collected.extend_from_slice(&chunk);
         }
 
@@ -225,6 +242,9 @@ impl PtyHandle {
         if collected.is_empty() {
             match tokio::time::timeout(timeout, self.output_rx.recv()).await {
                 Ok(Some(chunk)) => {
+                    self.consumed_bytes
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    PTY_CONSUMED_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     collected.extend_from_slice(&chunk);
                 }
                 Ok(None) | Err(_) => {
@@ -235,6 +255,9 @@ impl PtyHandle {
 
             // Phase 3: drain any additional chunks that arrived while we waited.
             while let Ok(chunk) = self.output_rx.try_recv() {
+                self.consumed_bytes
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                PTY_CONSUMED_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 collected.extend_from_slice(&chunk);
             }
         }
@@ -279,6 +302,13 @@ impl PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
+        let accepted = self.accepted_bytes.load(Ordering::Relaxed);
+        let consumed = self.consumed_bytes.load(Ordering::Relaxed);
+        let queued = accepted.saturating_sub(consumed);
+        if queued > 0 {
+            PTY_DROPPED_BYTES.fetch_add(queued, Ordering::Relaxed);
+            self.consumed_bytes.store(accepted, Ordering::Relaxed);
+        }
         if self.alive.load(Ordering::SeqCst) {
             let _ = self.killer.kill();
             // Reap the child after kill — without a wait(), the SIGKILL'd
@@ -317,17 +347,13 @@ mod tests {
         .expect("spawn producer");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stalled = pty_output_snapshot();
-        let retained = stalled
-            .produced_bytes
-            .saturating_sub(before.produced_bytes)
-            .saturating_sub(
-                stalled
-                    .forwarded_bytes
-                    .saturating_sub(before.forwarded_bytes),
-            )
-            .saturating_sub(stalled.dropped_bytes.saturating_sub(before.dropped_bytes));
+        let retained = stalled.retained_bytes.saturating_sub(before.retained_bytes);
         assert!(
-            retained <= (PTY_OUTPUT_CHANNEL_CAPACITY * PTY_OUTPUT_MAX_CHUNK_BYTES) as u64,
+            retained > 0,
+            "stalled consumer must retain queued PTY bytes"
+        );
+        assert!(
+            retained <= ((PTY_OUTPUT_CHANNEL_CAPACITY + 1) * PTY_OUTPUT_MAX_CHUNK_BYTES) as u64,
             "retained {retained}"
         );
         let readers_before = before.active_readers;
@@ -339,6 +365,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(pty_output_snapshot().active_readers <= readers_before);
+        assert_eq!(
+            pty_output_snapshot().retained_bytes,
+            before.retained_bytes,
+            "drop must conserve queued bytes as cancellation drops"
+        );
     }
 
     #[tokio::test]

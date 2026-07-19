@@ -6,7 +6,9 @@ use zeroize::Zeroize;
 const BASH_INTERMEDIARY_CHANNEL_CAPACITY: usize = 64;
 static BASH_INTERMEDIARY_PRODUCED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-static BASH_INTERMEDIARY_FORWARDED_BYTES: std::sync::atomic::AtomicU64 =
+static BASH_INTERMEDIARY_ACCEPTED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_CONSUMED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static BASH_INTERMEDIARY_DROPPED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -14,7 +16,8 @@ static BASH_INTERMEDIARY_DROPPED_BYTES: std::sync::atomic::AtomicU64 =
 #[derive(Debug, Clone, Copy)]
 pub struct BashIntermediarySnapshot {
     pub produced_bytes: u64,
-    pub forwarded_bytes: u64,
+    pub accepted_bytes: u64,
+    pub consumed_bytes: u64,
     pub dropped_bytes: u64,
     pub retained_bytes: u64,
 }
@@ -22,13 +25,15 @@ pub struct BashIntermediarySnapshot {
 pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
     use std::sync::atomic::Ordering;
     let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(Ordering::Relaxed);
-    let forwarded = BASH_INTERMEDIARY_FORWARDED_BYTES.load(Ordering::Relaxed);
+    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(Ordering::Relaxed);
+    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(Ordering::Relaxed);
     let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(Ordering::Relaxed);
     BashIntermediarySnapshot {
         produced_bytes: produced,
-        forwarded_bytes: forwarded,
+        accepted_bytes: accepted,
+        consumed_bytes: consumed,
         dropped_bytes: dropped,
-        retained_bytes: produced.saturating_sub(forwarded).saturating_sub(dropped),
+        retained_bytes: produced.saturating_sub(consumed).saturating_sub(dropped),
     }
 }
 
@@ -205,7 +210,7 @@ impl Tool for BashTool {
                                 .fetch_add(msg.len() as u64, Ordering::Relaxed);
                             let len = msg.len();
                             if tx_o.send((false, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_FORWARDED_BYTES
+                                BASH_INTERMEDIARY_ACCEPTED_BYTES
                                     .fetch_add(len as u64, Ordering::Relaxed);
                             } else {
                                 BASH_INTERMEDIARY_DROPPED_BYTES
@@ -235,7 +240,7 @@ impl Tool for BashTool {
                                 .fetch_add(msg.len() as u64, Ordering::Relaxed);
                             let len = msg.len();
                             if tx_e.send((true, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_FORWARDED_BYTES
+                                BASH_INTERMEDIARY_ACCEPTED_BYTES
                                     .fetch_add(len as u64, Ordering::Relaxed);
                             } else {
                                 BASH_INTERMEDIARY_DROPPED_BYTES
@@ -262,6 +267,8 @@ impl Tool for BashTool {
             let mut redactions: Vec<String> = Vec::new();
 
             while let Some((is_stderr, mut msg)) = rx_inter.recv().await {
+                BASH_INTERMEDIARY_CONSUMED_BYTES
+                    .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 if is_stderr {
                     stderr_tail.push_str(&msg);
                     if stderr_tail.len() > 512 {
@@ -416,9 +423,11 @@ mod tests {
         assert!(result.contains("output truncated"));
         let after = bash_intermediary_snapshot();
         let produced = after.produced_bytes - before.produced_bytes;
-        let forwarded = after.forwarded_bytes - before.forwarded_bytes;
+        let consumed = after.consumed_bytes - before.consumed_bytes;
+        let accepted = after.accepted_bytes - before.accepted_bytes;
         let dropped = after.dropped_bytes - before.dropped_bytes;
-        assert_eq!(produced, forwarded + dropped);
+        assert_eq!(produced, consumed + dropped);
+        assert!(accepted >= consumed);
         assert_eq!(after.retained_bytes, before.retained_bytes);
         assert!(produced >= 64 * 1024);
     }
