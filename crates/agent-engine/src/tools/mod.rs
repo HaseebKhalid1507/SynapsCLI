@@ -24,6 +24,7 @@ pub mod activation;
 mod agent;
 pub mod catalog;
 pub mod discovery;
+pub mod ledger;
 mod registry;
 pub mod respond;
 pub mod send_channel;

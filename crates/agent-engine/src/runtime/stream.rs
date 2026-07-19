@@ -495,6 +495,14 @@ impl StreamMethods {
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
                 let mut canceled = false;
+                // ═══ TOOL-CALL LEDGER (Task 25, spec §8.3) ═══
+                // If cancellation lands while a NonIdempotent call has
+                // STARTED (side effect possible, result not recorded) this
+                // holds its call_id so the turn surfaces a typed
+                // `InterruptedAfterSideEffect` and the call is NEVER auto-
+                // rerun. Read-only/idempotent interruptions stay plain
+                // cancellations.
+                let mut interrupted_side_effect: Option<String> = None;
 
                 // ═══ TURN BUDGET: exact tool-call allowance (Task 23) ═══
                 // Calls beyond the remaining allowance are NEVER executed;
@@ -635,6 +643,21 @@ impl StreamMethods {
                                         }
                                         _ = cancel.cancelled() => {
                                             canceled = true;
+                                            // Ledger: this call STARTED but
+                                            // never recorded a result. A
+                                            // NonIdempotent call is now an
+                                            // interrupted side effect (unknown
+                                            // commit status) and must not be
+                                            // auto-rerun (Task 25, §8.3).
+                                            if crate::tools::ledger::CallLedger::interrupted_started(
+                                                &tool_id,
+                                                tool.effect(),
+                                            )
+                                            .outcome
+                                            .is_some()
+                                            {
+                                                interrupted_side_effect = Some(tool_id.clone());
+                                            }
                                             "Canceled by user".to_string()
                                         }
                                     }
@@ -808,7 +831,7 @@ impl StreamMethods {
                         );
 
                         join_set.spawn(async move {
-                            let mut lane_results: Vec<(String, bool, String)> = Vec::new();
+                            let mut lane_results: Vec<(String, bool, Option<String>, String)> = Vec::new();
                             for (tool_id, tool_name, prepared) in lane {
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
@@ -816,7 +839,7 @@ impl StreamMethods {
                                         tool_id: tool_id.clone(),
                                         result: err.clone(),
                                     }));
-                                    lane_results.push((tool_id, false, err));
+                                    lane_results.push((tool_id, false, None, err));
                                     continue;
                                 }
                                 PreparedCall::Gate(gate_outcome) => gate_outcome,
@@ -825,6 +848,7 @@ impl StreamMethods {
                             let result = match gate_outcome {
                                 Ok((authorized, input)) => {
                                     let t = authorized.implementation();
+                                    let call_effect = t.effect();
                                     let runtime_name_for_hook =
                                         authorized.runtime_name().to_string();
                                     let decision = resolve_before_tool_call_decision(
@@ -839,7 +863,7 @@ impl StreamMethods {
                                         auto_approve_inner,
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
-                                        (false, format!("Tool call blocked by extension: {}", reason))
+                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason))
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
@@ -873,26 +897,42 @@ impl StreamMethods {
                                                 output,
                                                 max_tool_output,
                                             ).await;
-                                            (false, output)
+                                            (false, Some(call_effect), output)
                                         }
                                         _ = cancel_token.cancelled() => {
-                                            (true, "Canceled by user".to_string())
+                                            (true, Some(call_effect), "Canceled by user".to_string())
                                         }
                                     }
                                     } // close else from Block check
                                 }
                                 // Typed, bounded, metadata-only gate denial —
                                 // no implementation lookup, no hook emission.
-                                Err(denial) => (false, denial.to_string()),
+                                Err(denial) => (false, None, denial.to_string()),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                 tool_id: tool_id.clone(),
-                                result: result.1.clone(),
+                                result: result.2.clone(),
                             }));
 
                             let was_canceled = result.0;
-                            lane_results.push((tool_id, was_canceled, result.1));
+                            // Ledger (Task 25, §8.3): a canceled NonIdempotent
+                            // call STARTED but never recorded a result — an
+                            // interrupted side effect that must not be auto-
+                            // rerun. Read-only/idempotent stay plain cancels.
+                            let interrupted = match (was_canceled, result.1) {
+                                (true, Some(effect))
+                                    if crate::tools::ledger::CallLedger::interrupted_started(
+                                        &tool_id, effect,
+                                    )
+                                    .outcome
+                                    .is_some() =>
+                                {
+                                    Some(tool_id.clone())
+                                }
+                                _ => None,
+                            };
+                            lane_results.push((tool_id, was_canceled, interrupted, result.2));
                             if was_canceled {
                                 // Cancellation stops the lane; the ordered
                                 // assembly below synthesizes cancel results
@@ -909,9 +949,12 @@ impl StreamMethods {
                     while let Some(res) = join_set.join_next().await {
                         match res {
                             Ok(lane_results) => {
-                                for (tool_id, was_canceled, result) in lane_results {
+                                for (tool_id, was_canceled, interrupted, result) in lane_results {
                                     if was_canceled {
                                         canceled = true;
+                                    }
+                                    if let Some(call_id) = interrupted {
+                                        interrupted_side_effect = Some(call_id);
                                     }
                                     results_map.insert(tool_id, result);
                                 }
@@ -981,6 +1024,15 @@ impl StreamMethods {
                 if canceled {
                     // Send final history on cancellation so session can be saved
                     let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    // Ledger (Task 25, §8.3): a NonIdempotent call interrupted
+                    // after a possible side effect surfaces a typed
+                    // `InterruptedAfterSideEffect` outcome (and was never
+                    // auto-rerun). Plain cancellations surface no error.
+                    if let Some(call_id) = interrupted_side_effect {
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                            agent_core::TurnError::interrupted_after_side_effect(call_id),
+                        )));
+                    }
                     return Ok(());
                 }
 

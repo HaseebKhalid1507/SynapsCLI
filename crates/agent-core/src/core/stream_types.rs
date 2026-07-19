@@ -176,6 +176,21 @@ impl TurnError {
         }
     }
 
+    /// Interrupted after a possible-but-unconfirmed side effect (spec §8.3):
+    /// cancellation or transport failure landed with a call that had started
+    /// (side effect possible) but not recorded a result. Metadata only — the
+    /// static message names the interrupted call, never its content. The
+    /// operation is never automatically rerun.
+    pub fn interrupted_after_side_effect(call_id: impl Into<String>) -> Self {
+        let call_id = call_id.into();
+        Self {
+            message: format!(
+                "tool call interrupted after a possible side effect (call {call_id}); not rerun"
+            ),
+            outcome: TurnOutcome::InterruptedAfterSideEffect { call_id },
+        }
+    }
+
     /// Uniform terminal-category suffix shared by every frontend, e.g.
     /// `provider_failed code=auth_error correlation=turn-123-0`. Metadata
     /// only — never includes message content.
