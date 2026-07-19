@@ -18,6 +18,7 @@ use synaps_cli::tools::ledger::CallLedger;
 use synaps_cli::tools::output::{
     active_ui_forwarder_count, delta_channel_with_budgets, spawn_ui_forwarder, OutputBudgets,
 };
+use synaps_cli::tools::{bash_intermediary_snapshot, BashTool, Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
 
 fn model(id: &str) -> agent_core::prompt::QualifiedModelId {
@@ -93,6 +94,55 @@ async fn synthetic_one_gib_slow_consumer_stays_under_fixed_retention_ceiling() {
     assert!(
         output.counters().snapshot().retained_bytes() <= OutputBudgets::max_ui_retained_bytes()
     );
+}
+
+#[tokio::test]
+async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
+    let before = bash_intermediary_snapshot();
+    let tool = BashTool;
+    let ctx = ToolContext {
+        channels: synaps_cli::tools::ToolChannels {
+            tx_delta: None,
+            tx_events: None,
+        },
+        capabilities: synaps_cli::tools::ToolCapabilities {
+            watcher_exit_path: None,
+            tool_register_tx: None,
+            session_manager: None,
+            subagent_registry: None,
+            event_queue: None,
+            delegation_parent: None,
+            secret_prompt: None,
+            orchestration: None,
+            tool_activation: None,
+            mcp_leases: None,
+            extension_leases: None,
+        },
+        limits: synaps_cli::tools::ToolLimits {
+            max_tool_output: 4096,
+            max_tool_buffer: 64 * 1024,
+            bash_timeout: 30,
+            bash_max_timeout: 60,
+            subagent_timeout: 30,
+        },
+    };
+    let output = tool
+        .execute(
+            serde_json::json!({
+                "command": "python3 -c \"import sys; sys.stdout.write('x' * 1048576)\"",
+                "timeout": 30
+            }),
+            ctx,
+        )
+        .await
+        .expect("production bash path");
+    assert!(output.contains("output truncated"));
+    let after = bash_intermediary_snapshot();
+    let produced = after.produced_bytes - before.produced_bytes;
+    let consumed = after.consumed_bytes - before.consumed_bytes;
+    let dropped = after.dropped_bytes - before.dropped_bytes;
+    assert_eq!(produced, consumed + dropped);
+    assert_eq!(after.retained_bytes, before.retained_bytes);
 }
 
 #[test]

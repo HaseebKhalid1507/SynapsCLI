@@ -40,7 +40,7 @@ pub use crate::runtime::subagent::{
     SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
-pub use bash::BashTool;
+pub use bash::{bash_intermediary_snapshot, BashIntermediarySnapshot, BashTool};
 pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
 pub use extension::ExtensionTool;
