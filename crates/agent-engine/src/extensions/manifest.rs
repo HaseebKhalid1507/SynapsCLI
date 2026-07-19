@@ -63,6 +63,13 @@ pub struct ExtensionManifest {
     /// identical to pre-P19.2 manifests.
     #[serde(default)]
     pub theme_tokens: std::collections::BTreeMap<String, String>,
+    /// OPTIONAL (additive, protocol v1-compatible): passive `deferred`
+    /// lifecycle declarations (Task 20, spec 7.5). Absent => legacy eager
+    /// lifecycle, byte-for-byte compatible. Present declarations are
+    /// trusted local manifest expectations validated BEFORE any spawn and
+    /// matched EXACTLY against runtime initialize declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<super::lifecycle::DeferredDeclarations>,
 }
 
 /// Per-host-triple prebuilt distribution asset for an extension. Lives
@@ -119,6 +126,11 @@ pub struct ValidatedExtensionManifest {
 impl ExtensionManifest {
     /// Validate manifest fields and derive typed permissions/subscriptions.
     pub fn validate(&self, id: &str) -> Result<ValidatedExtensionManifest, String> {
+        if let Some(deferred) = &self.deferred {
+            super::lifecycle::validate_deferred(deferred).map_err(|reason| {
+                format!("Extension '{id}' deferred declarations invalid: {reason}")
+            })?;
+        }
         if self.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
             return Err(format!(
                 "Extension '{}' uses unsupported protocol_version {} (supported: {})",
@@ -392,6 +404,7 @@ mod tests {
     fn validate_rejects_unsupported_protocol_version() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 999,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -415,6 +428,7 @@ mod tests {
     fn validate_allows_hookless_provider_registration_extensions() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -433,6 +447,7 @@ mod tests {
     fn validate_rejects_tool_filter_on_non_tool_hook() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -458,6 +473,7 @@ mod tests {
     fn serialize_roundtrip() {
         let original = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),

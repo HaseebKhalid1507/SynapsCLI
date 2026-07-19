@@ -22,6 +22,7 @@ pub mod config;
 pub mod config_store;
 pub mod hooks;
 pub mod info;
+pub mod lifecycle;
 pub mod loader;
 pub mod manager;
 pub mod manifest;

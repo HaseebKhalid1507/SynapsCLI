@@ -144,6 +144,23 @@ pub struct ExtensionManager {
     /// `ext.<plugin-id>.<token>` without re-reading manifests. Extensions
     /// that declare none simply have no entry.
     manifest_theme_tokens: HashMap<String, std::collections::BTreeMap<String, String>>,
+    /// Task 20: when true (progressive disclosure), tool-only manifests
+    /// with validated passive declarations are NOT spawned at load — their
+    /// dormant deferred tools are cataloged instead and the launch record
+    /// is retained for exact-activation lease acquisition.
+    progressive_deferral: bool,
+    /// Launch records for deferred tool-only extensions (manifest + cwd +
+    /// resolved config), keyed by plugin id. Consumed by the extension
+    /// runtime lease lifecycle.
+    deferred_tool_only: HashMap<String, DeferredExtensionRecord>,
+}
+
+/// Retained launch expectation for a spawn-deferred tool-only extension.
+#[derive(Clone)]
+pub struct DeferredExtensionRecord {
+    pub manifest: ExtensionManifest,
+    pub cwd: Option<std::path::PathBuf>,
+    pub config: Value,
 }
 
 impl ExtensionManager {
@@ -158,6 +175,8 @@ impl ExtensionManager {
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
+            progressive_deferral: false,
+            deferred_tool_only: HashMap::new(),
         }
     }
 
@@ -175,6 +194,8 @@ impl ExtensionManager {
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
+            progressive_deferral: false,
+            deferred_tool_only: HashMap::new(),
         }
     }
 
@@ -195,6 +216,18 @@ impl ExtensionManager {
             .await
     }
 
+    /// Enable Task 20 progressive spawn deferral (set at engine boot from
+    /// the progressive-disclosure flag; default false keeps every legacy
+    /// eager path byte-for-byte).
+    pub fn set_progressive_deferral(&mut self, enabled: bool) {
+        self.progressive_deferral = enabled;
+    }
+
+    /// Retained launch records of spawn-deferred tool-only extensions.
+    pub fn deferred_tool_only(&self, id: &str) -> Option<&DeferredExtensionRecord> {
+        self.deferred_tool_only.get(id)
+    }
+
     async fn load_with_cwd_and_config(
         &mut self,
         id: &str,
@@ -213,6 +246,45 @@ impl ExtensionManager {
         let validated = manifest.validate(id)?;
         let permissions = validated.permissions;
         let subscriptions = validated.subscriptions;
+
+        // Task 20: under progressive disclosure, a TOOL-ONLY manifest with
+        // validated passive declarations defers its spawn entirely — its
+        // dormant descriptor tools are cataloged (zero process, zero
+        // network) and the launch record is retained for exact-activation
+        // lease acquisition. Every other class (legacy eager, provider,
+        // hook, sidecar, mixed) continues on the existing eager path in
+        // this commit.
+        if self.progressive_deferral
+            && crate::extensions::lifecycle::classify(manifest)
+                == crate::extensions::lifecycle::ExtensionClass::ToolOnly
+        {
+            let dormant = crate::extensions::lifecycle::dormant_extension_tools(id, manifest);
+            let Some(tools) = &self.tools else {
+                return Err(format!(
+                    "Extension '{}' declares deferred tools but no tool registry is available",
+                    id
+                ));
+            };
+            let count = dormant.len();
+            tools
+                .write()
+                .await
+                .try_register_batch(dormant)
+                .map_err(|e| format!("Extension '{}' deferred tool catalog rejected: {}", id, e))?;
+            self.deferred_tool_only.insert(
+                id.to_string(),
+                DeferredExtensionRecord {
+                    manifest: manifest.clone(),
+                    cwd,
+                    config,
+                },
+            );
+            self.manifest_configs
+                .insert(id.to_string(), manifest.config.clone());
+            tracing::info!(extension = %id, tools = count,
+                "Tool-only extension deferred: dormant descriptors cataloged, no process started");
+            return Ok(());
+        }
 
         // Spawn the extension process only after the manifest is known-good.
         let process =
@@ -1101,6 +1173,7 @@ impl ExtensionManager {
 
             let resolved = ExtensionManifest {
                 theme_tokens: Default::default(),
+                deferred: None,
                 command,
                 args,
                 ..ext_manifest
@@ -1162,6 +1235,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1203,6 +1277,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1287,6 +1362,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1322,6 +1398,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let good = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1342,6 +1419,7 @@ mod tests {
         };
         let bad = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             command: "/definitely/not/a/real/extension-binary".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
@@ -1457,6 +1535,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus);
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),

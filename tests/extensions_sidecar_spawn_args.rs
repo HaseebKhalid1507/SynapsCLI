@@ -31,6 +31,7 @@ fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
     }
     ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),

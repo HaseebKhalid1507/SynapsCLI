@@ -22,6 +22,7 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),

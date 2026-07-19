@@ -70,6 +70,7 @@ fn test_context() -> ToolContext {
             secret_prompt: None,
             orchestration: None,
             tool_activation: None,
+                    mcp_leases: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,

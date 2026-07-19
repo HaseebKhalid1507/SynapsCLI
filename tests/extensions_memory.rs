@@ -36,6 +36,7 @@ fn manifest_with_perms_and_args(perms: Vec<&str>, extra_args: Vec<&str>) -> Exte
     args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),

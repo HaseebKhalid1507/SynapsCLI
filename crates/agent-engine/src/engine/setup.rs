@@ -254,10 +254,13 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     }
 
     // Extension manager
-    let ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
+    let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
         Arc::clone(runtime.hook_bus()),
         runtime.tools_shared(),
     );
+    // Task 20: progressive disclosure defers tool-only extension spawns
+    // (dormant descriptors only); flag-off keeps the legacy eager loads.
+    ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
     let ext_manager = Arc::new(RwLock::new(ext_mgr));
     crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 

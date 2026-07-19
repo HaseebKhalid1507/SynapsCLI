@@ -105,7 +105,11 @@
     "tools": {
       "permission": "tools.register",
       "spec": {
-        "required": ["name", "description", "input_schema"],
+        "required": [
+          "name",
+          "description",
+          "input_schema"
+        ],
         "validation": [
           "name must be non-empty and unique per extension",
           "description must be non-empty",
@@ -128,5 +132,20 @@
       },
       "spec": "docs/specs/extension-providers.md"
     }
+  },
+  "deferred_lifecycle": {
+    "manifest_key": "extension.deferred",
+    "status": "optional",
+    "compatibility": "additive optional field within extension_protocol_version 1 (no version bump): manifests WITHOUT it keep the documented legacy EAGER lifecycle byte-for-byte, in every host mode; hosts that predate it ignore it",
+    "shape": "object { tools?: [{name, description?, input_schema}], providers?: [RegisteredProviderSpec-compatible {id, display_name, description?, models: [{id, display_name?, capabilities?, context_window?}], config_schema?}], lifecycle?: \"hook\"|\"user\" }",
+    "semantics": [
+      "declarations are trusted LOCAL manifest expectations, validated (bounded names/descriptions/schemas, unique ids, no ':' in tool/provider ids, capability flags boolean) BEFORE any spawn; any violation fails the whole manifest closed",
+      "under progressive tool disclosure, a tool-only manifest defers its process entirely: dormant descriptor tools are cataloged (searchable, exactly activatable, execution-gated) with zero process/network; the spawn happens only after gate-authorized execution",
+      "at initialize, the runtime's registered tools must match the declarations EXACTLY (same name set, canonical schema digest, description); any mismatch shuts the child down and fails closed before registration or grant",
+      "lifecycle=\"user\" declares user-triggered-only and CONFLICTS (fails validation) with declared tools/providers; lifecycle=\"hook\" defers start to the first authorized subscribed event",
+      "classification: no declarations => legacy_eager; tools => tool_only; providers => provider; hooks/lifecycle=hook => hook_lifecycle; lifecycle=user => ui_sidecar; multiple => mixed",
+      "mixed manifests start on the EARLIEST legitimately required trigger (hook event, then provider selection, then exact tool activation); tool SEARCH alone never starts a process"
+    ],
+    "flag_off": "when progressive tool disclosure is off, every manifest — with or without deferred — loads on the legacy eager path unchanged"
   }
 }

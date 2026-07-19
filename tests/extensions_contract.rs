@@ -216,6 +216,7 @@ async fn manager_rejects_bad_manifest_before_spawning_process() {
     let mut manager = ExtensionManager::new(bus);
     let manifest = ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: 1,
         runtime: ExtensionRuntime::Process,
         command: "/definitely/not/a/real/extension-binary".to_string(),
