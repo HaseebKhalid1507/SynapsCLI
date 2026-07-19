@@ -304,8 +304,12 @@ fn compaction_triggers_before_provider_exhaustion_on_every_fixture_class() {
 
             // INVARIANT: every state the trigger lets through must still fit
             // the provider window at honest tokenizer rates, with the hard
-            // reserves AND at least a 10% window margin intact.
-            let hard_reserves = THINKING_RESERVE + OUTPUT_RESERVE + TOOL_RESULT_BYTES.div_ceil(3);
+            // reserves (as the WIRE-SEMANTIC reserve model computes them —
+            // thinking counted exactly once on inside-output wires) AND at
+            // least a 10% window margin intact.
+            let hard_reserves = assessment.reserves.thinking_tokens
+                + assessment.reserves.output_tokens
+                + assessment.reserves.tool_result_tokens;
             assert!(
                 reference_history_tokens + hard_reserves + WINDOW / 10 <= WINDOW,
                 "{}: non-triggering state at round {} would exhaust the \

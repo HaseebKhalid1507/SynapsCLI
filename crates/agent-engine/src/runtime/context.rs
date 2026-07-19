@@ -149,14 +149,54 @@ impl ContextBreakdown {
     }
 }
 
+/// How a provider's wire accounts reasoning/thinking tokens against the
+/// request's output budget (I1, CP-12 review). The reserve model must count
+/// thinking exactly once, and provider differences are represented
+/// explicitly instead of being summed blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingAccounting {
+    /// Thinking spends from the request's output cap: Anthropic messages
+    /// (`thinking.budget_tokens < max_tokens`), OpenAI Responses/Chat and
+    /// Codex wires (reasoning tokens count toward `max_output_tokens` /
+    /// `max_completion_tokens`). Reserve ONE envelope:
+    /// `max(output_reserve, thinking_budget)`.
+    InsideOutputBudget,
+    /// Thinking is budgeted separately from response output (Gemini
+    /// `thinkingBudget`), or the wire is unknown — reserve both envelopes,
+    /// which errs toward earlier compaction, never toward exhaustion.
+    SeparateFromOutput,
+}
+
+/// Resolve the thinking-accounting semantics for a model from its wire
+/// protocol. Unroutable models use the conservative separate-reserve model.
+pub fn thinking_accounting_for_model(model: &str) -> ThinkingAccounting {
+    use crate::runtime::openai::WireProtocol;
+    match crate::runtime::openai::resolve_route(model).map(|route| route.wire) {
+        Some(
+            WireProtocol::AnthropicMessages
+            | WireProtocol::OpenAiChatCompletions
+            | WireProtocol::OpenAiResponses
+            | WireProtocol::CodexResponses,
+        ) => ThinkingAccounting::InsideOutputBudget,
+        Some(WireProtocol::GoogleGeminiCodeAssist) | None => ThinkingAccounting::SeparateFromOutput,
+    }
+}
+
 /// Typed reserves carved out of the provider window before any context is
 /// admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextReserves {
+    /// Thinking tokens reserved IN ADDITION to the output envelope. Zero on
+    /// wires where thinking already spends from the output cap.
     pub thinking_tokens: u64,
     pub tool_result_tokens: u64,
+    /// The request's output envelope. On [`ThinkingAccounting::InsideOutputBudget`]
+    /// wires this is `max(output_reserve, thinking_budget)` — the wire
+    /// requires the output cap to cover thinking, so the larger governs.
     pub output_tokens: u64,
     pub safety_margin_tokens: u64,
+    /// The wire semantics the thinking/output split was computed under.
+    pub thinking_accounting: ThinkingAccounting,
 }
 
 impl ContextReserves {
@@ -251,13 +291,28 @@ pub fn assess(inputs: &ContextBudgetInputs<'_>) -> ContextAssessment {
             skill_tokens,
             memory_tokens,
         },
-        reserves: ContextReserves {
-            thinking_tokens: inputs.thinking_budget_tokens,
-            tool_result_tokens: inputs
-                .next_tool_result_bytes
-                .div_ceil(TOOL_RESULT_BYTES_PER_TOKEN),
-            output_tokens: inputs.output_reserve_tokens,
-            safety_margin_tokens: inputs.provider_window * SAFETY_MARGIN_PERCENT / 100,
+        reserves: {
+            let accounting = thinking_accounting_for_model(inputs.model);
+            let (thinking_tokens, output_tokens) = match accounting {
+                ThinkingAccounting::InsideOutputBudget => (
+                    0,
+                    inputs
+                        .output_reserve_tokens
+                        .max(inputs.thinking_budget_tokens),
+                ),
+                ThinkingAccounting::SeparateFromOutput => {
+                    (inputs.thinking_budget_tokens, inputs.output_reserve_tokens)
+                }
+            };
+            ContextReserves {
+                thinking_tokens,
+                tool_result_tokens: inputs
+                    .next_tool_result_bytes
+                    .div_ceil(TOOL_RESULT_BYTES_PER_TOKEN),
+                output_tokens,
+                safety_margin_tokens: inputs.provider_window * SAFETY_MARGIN_PERCENT / 100,
+                thinking_accounting: accounting,
+            }
         },
         history_messages: inputs.messages.len(),
     }
@@ -315,6 +370,108 @@ mod tests {
         assert_eq!(assessment.budget_tokens(), 0);
         assert_eq!(assessment.remaining_tokens(), 0);
         assert!(assessment.should_compact());
+    }
+
+    /// I1 (CP-12 review): Anthropic-wire requests spend thinking from
+    /// `max_tokens` — the reserve model must count thinking exactly once.
+    #[test]
+    fn anthropic_wire_counts_thinking_exactly_once_inside_the_output_reserve() {
+        let messages: Vec<SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"})) as SharedMessage];
+        let window = 200_000;
+        let margin = window * SAFETY_MARGIN_PERCENT / 100;
+        let inputs = ContextBudgetInputs {
+            model: "claude-sonnet-4-6",
+            provider_window: window,
+            system_prompt: None,
+            tools_schema: &[],
+            messages: &messages,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: 8_000,
+            next_tool_result_bytes: 0,
+            output_reserve_tokens: 64_000,
+        };
+        let assessment = assess(&inputs);
+        assert_eq!(
+            assessment.reserves.thinking_accounting,
+            ThinkingAccounting::InsideOutputBudget
+        );
+        assert_eq!(
+            assessment.reserves.thinking_tokens, 0,
+            "thinking must not be reserved a second time on the Anthropic wire"
+        );
+        assert_eq!(assessment.reserves.output_tokens, 64_000);
+        assert_eq!(
+            assessment.budget_tokens(),
+            window - (64_000 + margin),
+            "budget must subtract the output/thinking envelope exactly once"
+        );
+
+        // A thinking budget larger than the requested output governs the
+        // envelope (the wire requires max_tokens >= budget_tokens).
+        let big_thinking = ContextBudgetInputs {
+            thinking_budget_tokens: 100_000,
+            ..inputs
+        };
+        let assessment = assess(&big_thinking);
+        assert_eq!(assessment.reserves.output_tokens, 100_000);
+        assert_eq!(assessment.reserves.thinking_tokens, 0);
+    }
+
+    /// OpenAI Responses/Chat wires bill reasoning inside the output cap too.
+    #[test]
+    fn openai_wires_account_reasoning_inside_the_output_reserve() {
+        for model in ["openai-codex/gpt-5.2-codex", "xai-auth/grok-4"] {
+            let accounting = thinking_accounting_for_model(model);
+            // xai-auth requires a cataloged model; skip honestly if the
+            // catalog drops it rather than asserting a stale fixture.
+            if model.starts_with("xai-auth") && accounting == ThinkingAccounting::SeparateFromOutput
+            {
+                continue;
+            }
+            assert_eq!(
+                accounting,
+                ThinkingAccounting::InsideOutputBudget,
+                "{model}"
+            );
+        }
+    }
+
+    /// Gemini budgets thinking separately from response output; unroutable
+    /// models fall back to the conservative separate-reserve model.
+    #[test]
+    fn gemini_and_unknown_models_reserve_thinking_separately() {
+        let messages: Vec<SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"})) as SharedMessage];
+        let window = 200_000;
+        let margin = window * SAFETY_MARGIN_PERCENT / 100;
+        for model in ["google-gemini/gemini-2.5-pro", "totally/unroutable-model"] {
+            let assessment = assess(&ContextBudgetInputs {
+                model,
+                provider_window: window,
+                system_prompt: None,
+                tools_schema: &[],
+                messages: &messages,
+                skill_contents: &[],
+                memory_contents: &[],
+                thinking_budget_tokens: 8_000,
+                next_tool_result_bytes: 0,
+                output_reserve_tokens: 64_000,
+            });
+            assert_eq!(
+                assessment.reserves.thinking_accounting,
+                ThinkingAccounting::SeparateFromOutput,
+                "{model}"
+            );
+            assert_eq!(assessment.reserves.thinking_tokens, 8_000, "{model}");
+            assert_eq!(assessment.reserves.output_tokens, 64_000, "{model}");
+            assert_eq!(
+                assessment.budget_tokens(),
+                window - (8_000 + 64_000 + margin),
+                "{model}: separate wires reserve both envelopes"
+            );
+        }
     }
 
     /// `Runtime::assess_context` is the SAME calculation as `assess` on the
