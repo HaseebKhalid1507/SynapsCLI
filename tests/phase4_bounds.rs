@@ -79,7 +79,11 @@ async fn synthetic_one_gib_slow_consumer_stays_under_fixed_retention_ceiling() {
     );
     let output = channel.output_handle();
     let chunk = "x".repeat(CHUNK);
-    // Slow/absent consumer: only one fixed chunk is generated and reused.
+    // This is an exact retained-byte oracle over the production channel, not
+    // a process-RSS measurement. The allocator, Tokio, and test harness add
+    // nondeterministic resident memory outside this component invariant.
+    // Only one fixed 64 KiB chunk is allocated and reused; no 1 GiB file or
+    // String is ever materialized.
     for _ in 0..GIB / CHUNK as u64 {
         channel.sender.send(chunk.clone());
     }

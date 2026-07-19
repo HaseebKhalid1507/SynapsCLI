@@ -906,9 +906,11 @@ mod tests {
         assert_eq!(history.retained_bytes, 11);
     }
 
-    /// A synthetic 1 GiB producer uses fixed-size generated chunks (never a
-    /// real 1 GiB file/string); retained model history stays at its budget
-    /// and every cut byte/chunk is reported exactly.
+    /// Honest memory oracle: this exercises the production bounded output
+    /// channel and asserts its exact retained-byte ceiling. It does NOT claim
+    /// process RSS; allocator/runtime overhead is outside this deterministic
+    /// in-process test. The generator reuses one 64 KiB chunk and never
+    /// creates a 1 GiB file or String.
     #[tokio::test]
     async fn synthetic_one_gib_production_is_bounded_without_materializing_full_output() {
         const GIB: u64 = 1024 * 1024 * 1024;
