@@ -139,6 +139,11 @@ impl Tool for MemorySearchTool {
             scope.key()
         );
         for d in descriptors {
+            let snippet_display = if d.sensitivity == MemorySensitivity::Secret {
+                "[withheld: secret-class body]".to_string()
+            } else {
+                d.snippet.clone()
+            };
             out.push_str(&format!(
                 "\n- {} [ts {}] tags={:?} bytes={} sensitivity={} retention={}{}\n  snippet: {}",
                 d.id,
@@ -152,7 +157,7 @@ impl Tool for MemorySearchTool {
                 } else {
                     ""
                 },
-                d.snippet
+                snippet_display
             ));
         }
         Ok(out)
@@ -557,6 +562,24 @@ mod tests {
     async fn secret_bodies_never_reach_model_context() {
         let _base = BaseDirGuard::new();
         let id = store_body("secret").await;
+
+        // Search descriptors must not leak the secret body either (CP-13
+        // fix1 I1): no snippet text, and content probes find nothing.
+        let search = MemorySearchTool
+            .execute(json!({}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(
+            !search.contains(BODY_SENTINEL) && !search.contains(TAIL_SENTINEL),
+            "secret body leaked through search: {search}"
+        );
+        assert!(search.contains("[withheld: secret-class body]"));
+        let probe = MemorySearchTool
+            .execute(json!({"query": "full body"}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(probe.contains("no matching memory records"));
+
         let fetch = MemoryFetchTool
             .execute(json!({"ids": [id]}), create_tool_context())
             .await

@@ -518,6 +518,7 @@ pub fn search_project_in(
 
     let mut records = load_live_project_records(base, scope)?;
     records.retain(|rec| {
+        let secret = rec.sensitivity == Some(MemorySensitivity::Secret);
         if let Some(since) = q.since_ms {
             if rec.timestamp_ms < since {
                 return false;
@@ -529,7 +530,9 @@ pub fn search_project_in(
             }
         }
         if let Some(needle) = &needle {
-            if !rec.content.to_lowercase().contains(needle) {
+            // Secret bodies never participate in content matching — a
+            // substring probe must not confirm secret content.
+            if secret || !rec.content.to_lowercase().contains(needle) {
                 return false;
             }
         }
@@ -546,16 +549,24 @@ pub fn search_project_in(
     Ok(records
         .into_iter()
         .map(|rec| {
-            let bounded = crate::text::BoundedText::new(&rec.content, snippet_bytes);
+            let sensitivity = rec.sensitivity.unwrap_or(MemorySensitivity::Normal);
+            // Secret descriptors carry NO body-derived snippet text (spec
+            // §9.5: secret bodies are visible locally only).
+            let (snippet, truncated) = if sensitivity == MemorySensitivity::Secret {
+                (String::new(), false)
+            } else {
+                let bounded = crate::text::BoundedText::new(&rec.content, snippet_bytes);
+                (bounded.text, bounded.truncated)
+            };
             MemoryDescriptor {
                 id: rec.id.clone().unwrap_or_default(),
                 project: scope.key().to_string(),
                 timestamp_ms: rec.timestamp_ms,
                 tags: rec.tags,
-                snippet: bounded.text,
-                truncated: bounded.truncated,
+                snippet,
+                truncated,
                 content_bytes: rec.content.len(),
-                sensitivity: rec.sensitivity.unwrap_or(MemorySensitivity::Normal),
+                sensitivity,
                 retention: rec.retention.unwrap_or(MemoryRetention::Standard),
             }
         })

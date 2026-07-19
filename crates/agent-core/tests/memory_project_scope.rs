@@ -234,3 +234,46 @@ fn project_scope_is_canonical_over_path_spellings() {
     );
     assert!(direct.namespace().starts_with("project-"));
 }
+
+#[test]
+fn secret_records_never_leak_body_content_through_search_descriptors() {
+    let tmp = TempDir::new().unwrap();
+    let scope = scope_for(&tmp, "proj-a");
+    let mut record = new_record(
+        "SECRET-BODY-SENTINEL-11cd credential hint with details",
+        &["creds"],
+    );
+    record.sensitivity = MemorySensitivity::Secret;
+    let stored = store_record_in(tmp.path(), &scope, record).unwrap();
+
+    let hits = search_project_in(tmp.path(), &scope, &ProjectMemoryQuery::default()).unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "secret records stay discoverable by descriptor"
+    );
+    let descriptor = &hits[0];
+    assert_eq!(descriptor.id, stored.id.unwrap());
+    assert!(
+        !descriptor.snippet.contains("SECRET-BODY-SENTINEL-11cd"),
+        "secret bodies must not leak through snippets: {}",
+        descriptor.snippet
+    );
+    assert!(
+        descriptor.snippet.is_empty(),
+        "secret descriptors carry NO body-derived snippet text"
+    );
+    assert_eq!(descriptor.sensitivity, MemorySensitivity::Secret);
+
+    // Content matching over the body would also disclose (an attacker can
+    // probe substrings) — secret records must not match content queries.
+    let probe = ProjectMemoryQuery {
+        content_contains: Some("SECRET-BODY".into()),
+        ..Default::default()
+    };
+    let hits = search_project_in(tmp.path(), &scope, &probe).unwrap();
+    assert!(
+        hits.is_empty(),
+        "content probes must not confirm secret body substrings"
+    );
+}
