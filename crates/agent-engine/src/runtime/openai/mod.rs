@@ -193,6 +193,7 @@ pub async fn try_route(
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     trace: &crate::runtime::trace::TraceContext,
+    suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
@@ -253,6 +254,7 @@ pub async fn try_route(
                 cancel,
                 trace,
                 exact_wire_bytes,
+                suppress_stream_deltas,
             )
             .await,
         ),
@@ -465,6 +467,7 @@ mod tests {
             None,
             None,
             &trace,
+            false,
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -533,6 +536,7 @@ mod tests {
                 None,
                 None,
                 &crate::runtime::trace::TraceContext::disabled(),
+                false,
             )
             .await
             .expect("xai-auth must route through try_route");

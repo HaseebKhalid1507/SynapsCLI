@@ -783,6 +783,11 @@ pub struct ApiOptions {
     /// transport starts and consumed by both RequestTracer and the stream's
     /// tool lifecycle recorder.
     pub request_correlation: Option<crate::runtime::trace::RequestCorrelation>,
+    /// Internal sync routes can suppress high-volume display-only deltas at
+    /// the producer boundary; final text/tool results are still returned in
+    /// the normal response value.
+    #[doc(hidden)]
+    pub suppress_stream_deltas: bool,
     /// Bounded background writer for legacy telemetry records (Task 11).
     /// `None` (default) drops records; production sets the Runtime's shared
     /// session writer whenever the telemetry level is Basic/Full. Enqueue
@@ -1008,6 +1013,7 @@ impl ApiMethods {
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
             &options.trace,
+            options.suppress_stream_deltas,
         )
         .await
         {

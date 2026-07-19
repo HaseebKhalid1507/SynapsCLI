@@ -96,9 +96,12 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
-        // Route through OpenAI-compat provider if model resolves to one
+        // Route through OpenAI-compat provider if model resolves to one.
+        // This synchronous facade consumes only the final response value, so
+        // high-volume display deltas are suppressed at the provider boundary.
         let tools_schema = tools.tools_schema();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         if let Some(result) = crate::runtime::openai::try_route(
             model,
             client,
@@ -118,11 +121,12 @@ impl ApiMethods {
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
             &options.trace,
+            options.suppress_stream_deltas,
         )
         .await
         {
             drop(tx);
-            while rx.recv().await.is_some() {}
+            let _ = drain.await;
             return result.map_err(crate::runtime::openai::net::provider_error_to_runtime);
         }
         let qualified_model = model;
@@ -526,6 +530,7 @@ impl ApiMethods {
     ) -> Result<String> {
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let routed_system_prompt = Some(system_prompt.to_string());
         if let Some(result) = crate::runtime::openai::try_route(
             model,
@@ -552,11 +557,12 @@ impl ApiMethods {
             None,
             None,
             &options.trace,
+            options.suppress_stream_deltas,
         )
         .await
         {
             drop(tx);
-            while rx.recv().await.is_some() {}
+            let _ = drain.await;
             let response =
                 result.map_err(crate::runtime::openai::net::provider_error_to_runtime)?;
             return Ok(Self::concat_response_text(&response));

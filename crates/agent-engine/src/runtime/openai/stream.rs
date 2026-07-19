@@ -206,6 +206,7 @@ pub(crate) async fn call_oai_stream_inner(
     cancel: &tokio_util::sync::CancellationToken,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+    suppress_stream_deltas: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -362,6 +363,7 @@ pub(crate) async fn call_oai_stream_inner(
                 &mut accumulated_text,
                 &mut tool_use_blocks,
                 &name_map,
+                suppress_stream_deltas,
             );
         }
     }
@@ -378,6 +380,7 @@ pub(crate) async fn call_oai_stream_inner(
             &mut accumulated_text,
             &mut tool_use_blocks,
             &name_map,
+            suppress_stream_deltas,
         );
     }
     sink.clear();
@@ -389,6 +392,7 @@ pub(crate) async fn call_oai_stream_inner(
         &mut accumulated_text,
         &mut tool_use_blocks,
         &name_map,
+        suppress_stream_deltas,
     );
 
     // Normalized stop reason: only when a finish_reason was actually
@@ -1163,6 +1167,7 @@ fn handle_events(
     text_acc: &mut String,
     tool_blocks: &mut Vec<Value>,
     name_map: &translate::ToolNameMap,
+    suppress_stream_deltas: bool,
 ) {
     for ev in events {
         if let OaiEvent::TextDelta(t) = ev {
@@ -1171,8 +1176,10 @@ fn handle_events(
         if let OaiEvent::ToolCallsComplete { calls, .. } = ev {
             tool_blocks.extend(translate::tool_calls_to_content_blocks(calls, name_map));
         }
-        if let Some(se) = translate::oai_event_to_llm(ev) {
-            let _ = tx.send(se);
+        if !suppress_stream_deltas {
+            if let Some(se) = translate::oai_event_to_llm(ev) {
+                let _ = tx.send(se);
+            }
         }
     }
 }
@@ -1715,6 +1722,7 @@ mod broker_stream_tests {
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            false,
         )
         .await
         .expect("stream must complete");
@@ -1739,6 +1747,43 @@ mod broker_stream_tests {
     /// Broker errors surface as typed failures without opening a stream and
     /// without any credential material in the message.
     #[tokio::test]
+    async fn suppressed_sync_route_does_not_enqueue_display_deltas() {
+        let (upstream, _seen_auth) = spawn_fake_openai_sse().await;
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            upstream,
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            true,
+        )
+        .await
+        .expect("stream must complete");
+        assert_eq!(result["content"][0]["text"], "Hello");
+        assert!(
+            rx.try_recv().is_err(),
+            "sync route must suppress display deltas at production"
+        );
+    }
+
+    #[tokio::test]
     async fn oai_stream_broker_error_fails_closed() {
         // Unconfigured static provider → NotConfigured, no upstream contact.
         let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::new(reqwest::Client::new()));
@@ -1762,6 +1807,7 @@ mod broker_stream_tests {
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            false,
         )
         .await
         .unwrap_err()
@@ -1826,6 +1872,7 @@ mod broker_stream_tests {
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            false,
         )
         .await
         .expect_err("500 must fail")

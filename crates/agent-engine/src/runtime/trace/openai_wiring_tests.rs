@@ -161,6 +161,7 @@ async fn drive_chat(
         cancel,
         trace,
         exact,
+        false,
     )
     .await
 }

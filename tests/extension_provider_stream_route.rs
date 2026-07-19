@@ -61,6 +61,7 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
+        false,
     )
     .await
     .expect("extension route")

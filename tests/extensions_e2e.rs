@@ -809,6 +809,7 @@ async fn extension_provider_complete_routes_to_process() {
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
+        false,
     )
     .await
     .expect("extension route")
@@ -910,6 +911,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
+        false,
     )
     .await
     .expect("route returned Some");
@@ -1001,6 +1003,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
+        false,
     )
     .await
     .expect("extension route")
@@ -1449,6 +1452,7 @@ async fn audit_log_records_disabled_route() {
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
+        false,
     )
     .await
     .expect("route returned Some");
