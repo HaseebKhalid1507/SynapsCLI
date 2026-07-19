@@ -300,6 +300,11 @@ impl OrchestrationRuntime {
         Ok(depth)
     }
 
+    /// Release one reserved tree edge. Descendants are recursively removed
+    /// because a live child cannot outlive its parent lineage. The caller-
+    /// supplied `parent` is intentionally ignored: ownership is taken from the
+    /// reservation recorded under the tree lock, so a stale or hostile caller
+    /// cannot decrement another parent's fanout.
     pub fn release_delegation(&self, worker_id: &str, _parent: Option<&str>) {
         let mut tree = self.tree.lock().unwrap();
         let mut stack = vec![worker_id.to_string()];
@@ -954,10 +959,42 @@ mod tests {
         );
     }
 
-    /// A child receives tree lineage only, never a policy/grant mutation:
-    /// cross-provider dispatch remains denied unless the session was granted.
+    /// Active reservation count is exact when a live worker completes while
+    /// its parent is cancelled and recursively releases the same subtree.
     #[test]
-    fn descendant_lineage_does_not_inherit_new_model_grants() {
+    fn parent_cancel_racing_child_completion_releases_every_lease() {
+        let foreground = model("anthropic/foreground");
+        let rt = Arc::new(OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            8,
+            16,
+        )));
+        rt.reserve_delegation("parent", None).unwrap();
+        rt.reserve_delegation("child", Some("parent")).unwrap();
+        rt.reserve_delegation("grandchild", Some("child")).unwrap();
+        let cancel = Arc::clone(&rt);
+        let complete = Arc::clone(&rt);
+        let t1 = std::thread::spawn(move || cancel.release_delegation("parent", None));
+        let t2 = std::thread::spawn(move || complete.release_delegation("child", Some("parent")));
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(rt.delegation_descendants(), 0);
+        assert_eq!(
+            rt.reserve_delegation("orphan", Some("grandchild")),
+            Err(DelegationTreeDenied::UnknownParent)
+        );
+        assert_eq!(rt.reserve_delegation("replacement", None), Ok(1));
+        rt.release_delegation("replacement", None);
+        assert_eq!(rt.delegation_descendants(), 0);
+    }
+
+    /// A child receives tree lineage only, never a new policy/grant mutation:
+    /// even when the session already has one explicit cross-provider grant,
+    /// child lineage cannot use that fact to authorize a different identity.
+    #[test]
+    fn descendant_lineage_cannot_mint_or_broaden_session_model_grants() {
         let foreground = model("anthropic/foreground");
         let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
             foreground.clone(),
@@ -965,10 +1002,19 @@ mod tests {
             4,
             8,
         ));
+        rt.grant_worker_model("openai-codex/gpt-5.6-sol").unwrap();
         rt.reserve_delegation("parent", None).unwrap();
         rt.reserve_delegation("child", Some("parent")).unwrap();
-        assert!(rt.preflight("openrouter/ungranted").is_err());
-        rt.release_delegation("child", Some("parent"));
+
+        assert!(rt.preflight("openai-codex/gpt-5.6-sol").is_ok());
+        assert!(
+            rt.preflight("openai-codex/gpt-5.6-luna").is_err(),
+            "a child lineage must not broaden one exact session grant to a sibling model"
+        );
+        assert!(
+            rt.preflight("openrouter/ungranted").is_err(),
+            "tree lineage must never mint a cross-provider grant"
+        );
         rt.release_delegation("parent", None);
         assert_eq!(rt.delegation_descendants(), 0);
     }

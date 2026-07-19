@@ -257,7 +257,9 @@ impl Tool for SubagentStartTool {
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
                     runtime.set_tools(super::subagent_tools().await);
-                    runtime.install_orchestration(Arc::clone(&orchestration_for_runtime));
+                    runtime.install_worker_orchestration(Arc::clone(
+                        &orchestration_for_runtime,
+                    ));
                     runtime.set_delegation_parent(Some(child_parent_id.clone()));
 
                     let cancel = crate::CancellationToken::new();

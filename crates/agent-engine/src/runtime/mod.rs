@@ -776,6 +776,18 @@ impl Runtime {
         self.orchestration = Some(runtime);
     }
 
+    /// A runtime spawned for a worker shares only this session's bounded
+    /// dispatch/tree authority. It must not replay process-global favorite
+    /// models: doing so would turn a child construction into a fresh grant
+    /// source. The child can dispatch only identities already authorized by
+    /// this installed session policy.
+    pub fn install_worker_orchestration(
+        &mut self,
+        runtime: Arc<crate::orchestration::OrchestrationRuntime>,
+    ) {
+        self.orchestration = Some(runtime);
+    }
+
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
     }
@@ -2642,7 +2654,35 @@ mod tests {
     }
 
     #[test]
-    fn configured_favorite_models_seed_session_worker_choices() {
+    fn worker_install_does_not_replay_process_global_favorite_grants() {
+        let foreground =
+            crate::orchestration::canonical_foreground_identity("anthropic/claude-fable-5")
+                .unwrap();
+        let session = Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 4, 8).unwrap(),
+        );
+        let favorite = "openai-codex/gpt-5.6-sol";
+        assert!(
+            session.preflight(favorite).is_err(),
+            "precondition: the parent session did not grant this identity"
+        );
+
+        let mut worker = Runtime::new_headless();
+        worker.apply_config(&crate::config::SynapsConfig {
+            favorite_models: vec![favorite.to_owned()],
+            ..Default::default()
+        });
+        worker.install_worker_orchestration(Arc::clone(&session));
+
+        assert!(
+            session.preflight(favorite).is_err(),
+            "constructing a child must not mint/replay a favorite-model grant"
+        );
+        assert!(!session.effective_choices().contains(&favorite.to_owned()));
+    }
+
+    #[test]
+    fn host_install_may_apply_explicit_operator_favorites() {
         let mut runtime = Runtime::new_headless();
         let config = crate::config::SynapsConfig {
             favorite_models: vec![
