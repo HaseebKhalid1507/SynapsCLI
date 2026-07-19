@@ -18,6 +18,7 @@ mod body_golden;
 pub mod budget;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
+pub mod context;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
@@ -1277,6 +1278,37 @@ impl Runtime {
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
+    }
+
+    /// Task 29 (spec §9.1): the ONE request-aware context assessment every
+    /// frontend consumes on its compaction trigger path. Reads the segments
+    /// the next request will actually carry — the effective system prompt,
+    /// the exposed tool-schema set, the supplied history — and the runtime's
+    /// configured reserves (thinking budget, tool-result cap, model output
+    /// reserve, provider window with the documented safety margin).
+    ///
+    /// Skill and memory bodies that reach the request do so through the
+    /// system prompt or history today, so they are already accounted there;
+    /// the separate breakdown lanes are fed once loaders hand the engine
+    /// distinct segments.
+    pub async fn assess_context(
+        &self,
+        messages: &[crate::SharedMessage],
+    ) -> context::ContextAssessment {
+        let system = self.effective_system_prompt().await;
+        let schema = self.tools.read().await.tools_schema();
+        context::assess(&context::ContextBudgetInputs {
+            model: &self.model,
+            provider_window: self.context_window(),
+            system_prompt: system.as_deref(),
+            tools_schema: &schema,
+            messages,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: self.thinking_budget as u64,
+            next_tool_result_bytes: self.max_tool_output as u64,
+            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
+        })
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
