@@ -44,6 +44,21 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
              dispatch site"
         );
     }
+
+    // The RPC frontend must additionally EMIT the disclosure to the client
+    // as a dedicated pre-dispatch frame (command "compact.disclosure"),
+    // before the summarization dispatch; the wire shape is pinned by
+    // tests/rpc_protocol.rs. TUI and server surface it client-visibly as a
+    // pre-dispatch System message/broadcast (asserted above by position).
+    let rpc = read("src/cmd/rpc.rs");
+    let frame_pos = rpc
+        .find("compact.disclosure")
+        .expect("rpc must emit the pre-dispatch disclosure frame");
+    let rpc_dispatch_pos = rpc.find("compact_conversation(").unwrap();
+    assert!(
+        frame_pos < rpc_dispatch_pos,
+        "rpc: the compact.disclosure frame must be sent before dispatch"
+    );
 }
 
 #[test]

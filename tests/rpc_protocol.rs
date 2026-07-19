@@ -10,8 +10,7 @@
 //!   * At least one golden-string test per category (exact byte-sequence check)
 
 use synaps_cli::core::rpc_protocol::{
-    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
-    RPC_PROTOCOL_VERSION,
+    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,8 +154,7 @@ mod rpc_command {
         };
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"prompt","id":"x","message":"hi","attachments":[]}"#,
+            got, r#"{"type":"prompt","id":"x","message":"hi","attachments":[]}"#,
             "RpcCommand::Prompt golden JSON mismatch"
         );
     }
@@ -166,8 +164,7 @@ mod rpc_command {
         let cmd = RpcCommand::Shutdown;
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"shutdown"}"#,
+            got, r#"{"type":"shutdown"}"#,
             "RpcCommand::Shutdown golden JSON mismatch"
         );
     }
@@ -180,8 +177,7 @@ mod rpc_command {
         };
         let got = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"set_model","id":"m1","model":"claude-sonnet-4-5"}"#,
+            got, r#"{"type":"set_model","id":"m1","model":"claude-sonnet-4-5"}"#,
             "RpcCommand::SetModel golden JSON mismatch"
         );
     }
@@ -199,7 +195,9 @@ mod rpc_event {
     #[test]
     fn message_update_round_trip() {
         let ev = RpcEvent::MessageUpdate {
-            event: AssistantEvent::TextDelta { delta: "hello".into() },
+            event: AssistantEvent::TextDelta {
+                delta: "hello".into(),
+            },
         };
         assert_eq!(round_trip_event(&ev), ev);
     }
@@ -314,8 +312,7 @@ mod rpc_event {
         };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"error","message":"bad"}"#,
+            got, r#"{"type":"error","message":"bad"}"#,
             "RpcEvent::Error (no id) golden JSON mismatch"
         );
     }
@@ -341,8 +338,7 @@ mod rpc_event {
         );
         // Full golden check.
         assert_eq!(
-            got,
-            r#"{"type":"response","id":"x","command":"get_messages","messages":[]}"#,
+            got, r#"{"type":"response","id":"x","command":"get_messages","messages":[]}"#,
             "RpcEvent::Response golden JSON mismatch"
         );
     }
@@ -380,13 +376,17 @@ mod assistant_event {
 
     #[test]
     fn text_delta_round_trip() {
-        let ev = AssistantEvent::TextDelta { delta: "chunk".into() };
+        let ev = AssistantEvent::TextDelta {
+            delta: "chunk".into(),
+        };
         assert_eq!(round_trip_assistant(&ev), ev);
     }
 
     #[test]
     fn thinking_delta_round_trip() {
-        let ev = AssistantEvent::ThinkingDelta { delta: "hmm".into() };
+        let ev = AssistantEvent::ThinkingDelta {
+            delta: "hmm".into(),
+        };
         assert_eq!(round_trip_assistant(&ev), ev);
     }
 
@@ -433,8 +433,7 @@ mod assistant_event {
         let ev = AssistantEvent::TextDelta { delta: "hi".into() };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"text_delta","delta":"hi"}"#,
+            got, r#"{"type":"text_delta","delta":"hi"}"#,
             "AssistantEvent::TextDelta golden JSON mismatch"
         );
     }
@@ -447,9 +446,60 @@ mod assistant_event {
         };
         let got = serde_json::to_string(&ev).unwrap();
         assert_eq!(
-            got,
-            r#"{"type":"toolcall_start","tool_id":"id1","tool_name":"bash"}"#,
+            got, r#"{"type":"toolcall_start","tool_id":"id1","tool_name":"bash"}"#,
             "AssistantEvent::ToolcallStart golden JSON mismatch"
         );
+    }
+}
+
+/// CP-12 M4 — the RPC frontend surfaces the §9.4 compaction disclosure as a
+/// client-visible `Response` frame (command `"compact.disclosure"`) BEFORE
+/// the summarization dispatch. This pins the wire shape clients consume.
+mod compact_disclosure_frame {
+    use synaps_cli::core::rpc_protocol::RpcEvent;
+
+    #[test]
+    fn pre_dispatch_disclosure_frame_round_trips_with_flattened_fields() {
+        // The body carries the engine's serialized CompactionDisclosure.
+        use synaps_cli::core::compaction::{CompactionMode, ContentClass};
+        let disclosure = synaps_cli::runtime::compaction::CompactionDisclosure {
+            mode: CompactionMode::Remote,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            approx_conversation_bytes: 2_048,
+            message_count: 6,
+            included_classes: vec![ContentClass::UserText, ContentClass::AssistantText],
+            excluded_classes: vec![ContentClass::Thinking],
+        };
+
+        let frame = RpcEvent::Response {
+            id: "42".into(),
+            command: "compact.disclosure".into(),
+            body: serde_json::to_value(&disclosure).unwrap(),
+        };
+        let wire = serde_json::to_string(&frame).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&wire).unwrap();
+
+        assert_eq!(parsed["type"], "response");
+        assert_eq!(parsed["command"], "compact.disclosure");
+        assert_eq!(parsed["id"], "42");
+        // Flattened disclosure fields are client-visible at the top level.
+        assert_eq!(parsed["mode"], "remote");
+        assert_eq!(parsed["provider"], "anthropic");
+        assert!(parsed["model"].is_string());
+        assert!(parsed["approx_conversation_bytes"].is_u64());
+        assert!(parsed["included_classes"].is_array());
+        assert_eq!(parsed["excluded_classes"][0], "thinking");
+
+        // And the frame round-trips through the typed enum.
+        let round: RpcEvent = serde_json::from_str(&wire).unwrap();
+        match round {
+            RpcEvent::Response { id, command, body } => {
+                assert_eq!(id, "42");
+                assert_eq!(command, "compact.disclosure");
+                assert_eq!(body["provider"], "anthropic");
+            }
+            other => panic!("expected Response frame, got {other:?}"),
+        }
     }
 }
