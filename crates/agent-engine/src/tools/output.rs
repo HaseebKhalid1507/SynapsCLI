@@ -932,6 +932,73 @@ mod tests {
         assert!(snap.retained_bytes() <= OutputBudgets::max_ui_retained_bytes());
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn optional_spill_is_0600_under_umask_000() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct Umask(libc::mode_t);
+        impl Drop for Umask {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+        let guard = Umask(unsafe { libc::umask(0) });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let channel = delta_channel_with_budgets(
+            OutputBudgets::for_limits(8),
+            Some(SpillPolicy {
+                dir: tmp.path().join("spill"),
+            }),
+        );
+        let output = channel.output_handle();
+        channel.sender.send("secret".into());
+        let report = output.spill_report().unwrap();
+        assert!(!report.failed);
+        assert_eq!(
+            std::fs::metadata(&report.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(report.path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_spill_refuses_planted_symlink_without_writing_victim() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("spill");
+        std::fs::create_dir(&dir).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        let channel =
+            delta_channel_with_budgets(OutputBudgets::for_limits(8), Some(SpillPolicy { dir }));
+        let output = channel.output_handle();
+        let target = output.spill_report().unwrap().path;
+        symlink(&victim, &target).unwrap();
+        channel.sender.send("must-not-write".into());
+        let report = output.spill_report().unwrap();
+        assert!(report.failed);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+
     /// Spill is opt-in, captures the exact full production stream before
     /// truncation/drop, and T4 creates both directory and artifact privately.
     #[cfg(unix)]

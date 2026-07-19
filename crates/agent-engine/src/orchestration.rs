@@ -640,6 +640,7 @@ impl OrchestrationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     fn model(s: &str) -> QualifiedModelId {
         QualifiedModelId::parse(s).unwrap()
     }
@@ -888,6 +889,45 @@ mod tests {
         assert_eq!(rt.delegation_descendants(), 3);
         rt.release_delegation("c", Some("a"));
         assert_eq!(rt.delegation_descendants(), 2);
+    }
+
+    /// Active reservation count is exact across reserve/release races.
+    #[test]
+    fn delegation_release_is_idempotent_under_completion_cancel_race() {
+        let foreground = model("anthropic/foreground");
+        let rt = Arc::new(OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            4,
+            8,
+        )));
+        rt.reserve_delegation("child", None).unwrap();
+        let a = Arc::clone(&rt);
+        let b = Arc::clone(&rt);
+        let t1 = std::thread::spawn(move || a.release_delegation("child", None));
+        let t2 = std::thread::spawn(move || b.release_delegation("child", None));
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(rt.delegation_descendants(), 0);
+    }
+
+    /// A child receives tree lineage only, never a policy/grant mutation:
+    /// cross-provider dispatch remains denied unless the session was granted.
+    #[test]
+    fn descendant_lineage_does_not_inherit_new_model_grants() {
+        let foreground = model("anthropic/foreground");
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            4,
+            8,
+        ));
+        rt.reserve_delegation("parent", None).unwrap();
+        rt.reserve_delegation("child", Some("parent")).unwrap();
+        assert!(rt.preflight("openrouter/ungranted").is_err());
+        rt.release_delegation("child", Some("parent"));
+        rt.release_delegation("parent", None);
+        assert_eq!(rt.delegation_descendants(), 0);
     }
 
     #[test]

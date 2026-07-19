@@ -175,6 +175,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_serialization_never_contains_result_secret_sentinel() {
+        const SECRET: &str = "PH4-EXECUTION-SECRET-SENTINEL-c14d";
+        let sink = CollectingTraceSink::new();
+        let trace = TraceContext::with_sink(sink);
+        let request = trace.reserve_request_correlation().unwrap();
+        let correlation = ExecutionCorrelation::from_request(&trace, &request);
+        correlation.record(
+            "toolu_1",
+            &ToolId::builtin("bash"),
+            "bash",
+            ExecutionPhase::ResultRecorded,
+            Instant::now(),
+            SECRET.len(),
+            8,
+            ActivationBasis::Core,
+            ToolEffect::NonIdempotent,
+            ExecutionCommitStatus::ResultRecorded,
+            0,
+        );
+        let encoded = serde_json::to_string(&trace.execution_events(&request.request_id)).unwrap();
+        assert!(!encoded.contains(SECRET));
+    }
+
+    #[test]
     fn hostile_unbounded_call_id_is_omitted() {
         let sink = CollectingTraceSink::new();
         let trace = TraceContext::with_sink(sink);
