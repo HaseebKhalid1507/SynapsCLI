@@ -57,6 +57,8 @@ pub(super) struct StreamSession {
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
+    /// Opt-in Task 18 policy. False preserves the full-schema request path.
+    pub(super) progressive_tool_disclosure: bool,
     /// Runtime-scoped tool-session identity the execution gate scopes the
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
@@ -114,6 +116,7 @@ impl StreamMethods {
             telemetry_level,
             orchestration,
             turn_correlation_id,
+            progressive_tool_disclosure,
             tool_session_id,
         } = session;
         let mut messages = initial_messages;
@@ -128,12 +131,18 @@ impl StreamMethods {
         // DENIED (`StaleSessionSet`), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            std::sync::Arc::new(std::sync::RwLock::new(
+            let set = if progressive_tool_disclosure {
+                crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+                    tool_session_id.clone(),
+                    registry.catalog(),
+                )
+            } else {
                 crate::tools::activation::SessionToolSet::default_core_for_catalog(
                     tool_session_id.clone(),
                     registry.catalog(),
-                ),
-            ))
+                )
+            };
+            std::sync::Arc::new(std::sync::RwLock::new(set))
         };
         // Thread the RETAINED handle into the extension-provider route so
         // its interior tool loop consumes the same set/generation as stream
@@ -190,10 +199,17 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                            tool_session_id.clone(),
-                            registry.catalog(),
-                        );
+                        *set = if progressive_tool_disclosure {
+                            crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+                                tool_session_id.clone(),
+                                registry.catalog(),
+                            )
+                        } else {
+                            crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                                tool_session_id.clone(),
+                                registry.catalog(),
+                            )
+                        };
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -246,6 +262,26 @@ impl StreamMethods {
                 false
             };
             let _ = did_inject;
+
+            let mut options = options.clone();
+            if progressive_tool_disclosure {
+                let session_set = session_tool_set
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let projection =
+                    tools_snapshot
+                        .session_tools_schema(&session_set)
+                        .map_err(|err| {
+                            RuntimeError::Tool(format!(
+                                "failed to project the authorized session tool set: {err}"
+                            ))
+                        })?;
+                options.request_tools_schema = Some(std::sync::Arc::new(projection));
+            } else {
+                // Preserve the legacy path exactly: the API layer clones the
+                // registry's existing cached Arc, with no projection work.
+                options.request_tools_schema = None;
+            }
 
             let response = match ApiMethods::call_api_stream_inner(
                 &auth,

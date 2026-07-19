@@ -290,6 +290,11 @@ pub struct SynapsConfig {
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
+    /// Opt-in progressive tool disclosure (Task 18). When false, providers
+    /// receive the existing full tool schema byte-for-byte. When true, each
+    /// stream starts with the small essential local core plus discovery and
+    /// authorization gateways; exact activations are added per session.
+    pub progressive_tool_disclosure: bool,
     /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
     /// from the registry at boot so they're never offered to the model.
     pub disabled_tools: Vec<String>,
@@ -330,6 +335,7 @@ impl Default for SynapsConfig {
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
+            progressive_tool_disclosure: false,
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
@@ -349,6 +355,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries", "refusal_retries",
     "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "scroll_lines", "theme", "agent_name", "identity",
     "disabled_plugins", "favorite_models", "disabled_skills", "disabled_tools",
+    "progressive_tool_disclosure",
 ];
 
 /// Simple Levenshtein distance for did-you-mean suggestions.
@@ -681,6 +688,9 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             }
             "disabled_skills" => {
                 config.disabled_skills = parse_comma_list(val);
+            }
+            "progressive_tool_disclosure" => {
+                config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
@@ -1030,6 +1040,7 @@ mod tests {
         assert!(config.disabled_plugins.is_empty());
         assert!(config.favorite_models.is_empty());
         assert!(config.disabled_skills.is_empty());
+        assert!(!config.progressive_tool_disclosure);
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
@@ -1041,6 +1052,22 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_progressive_tool_disclosure_is_opt_in() {
+        let home = make_test_home("progressive-tool-disclosure");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "progressive_tool_disclosure = true\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert!(config.progressive_tool_disclosure);
+            assert!(config.warnings.is_empty());
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

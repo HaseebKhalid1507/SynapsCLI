@@ -160,6 +160,14 @@ impl ToolRegistry {
         Self::try_from_tools(tool_list).expect(CATALOG_REJECTED_MSG)
     }
 
+    /// Integration-test construction seam: build one registry in a single
+    /// deterministic pass so dormant-catalog scaling tests do not exercise
+    /// the intentionally compatibility-oriented per-registration rebuild.
+    #[doc(hidden)]
+    pub fn from_tools_for_tests(tool_list: Vec<Arc<dyn Tool>>) -> Self {
+        Self::from_tools(tool_list)
+    }
+
     fn try_from_tools(tool_list: Vec<Arc<dyn Tool>>) -> Result<Self, CatalogError> {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),

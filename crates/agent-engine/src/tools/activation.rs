@@ -172,6 +172,34 @@ impl SessionToolSet {
             .expect("core ids are drawn from the catalog itself and must all resolve")
     }
 
+    /// Deterministic minimal core for Task 18 progressive disclosure. Only
+    /// essential local operations plus discovery/authorization gateways are
+    /// eligible; missing/disabled gateways are skipped rather than invented.
+    /// Specialized subagent lifecycle, extension, MCP, shell-session, and
+    /// dynamically registered tools remain deferred until exact activation.
+    pub fn progressive_core_for_catalog(session: SessionId, catalog: &ToolCatalog) -> Self {
+        const ESSENTIAL_BUILTINS: &[&str] = &[
+            "bash",
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "find",
+            "ls",
+            "search_tools",
+            "activate_tools",
+            "search_skills",
+            "load_skill",
+        ];
+        let core = ESSENTIAL_BUILTINS
+            .iter()
+            .map(|name| ToolId::builtin(name))
+            .filter(|id| catalog.get(id).is_some())
+            .collect::<Vec<_>>();
+        Self::new(session, core, catalog)
+            .expect("progressive core ids are filtered through the catalog")
+    }
+
     /// The catalog generation this set snapshot was built against.
     pub fn catalog_generation(&self) -> CatalogGeneration {
         self.catalog_generation

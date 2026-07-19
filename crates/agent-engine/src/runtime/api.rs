@@ -790,6 +790,11 @@ pub struct ApiOptions {
     /// route fall back to a locally minted default-core set; a STALE
     /// retained set is denied there, never silently replaced.
     pub session_tool_set: Option<crate::tools::activation::SharedSessionToolSet>,
+    /// Optional provider-neutral Task 18 schema projection for this request.
+    /// `None` preserves the legacy registry-cached Arc and therefore the
+    /// flag-off request bytes exactly. Stream rounds set `Some` only when the
+    /// progressive-disclosure flag is enabled.
+    pub request_tools_schema: Option<std::sync::Arc<Vec<Value>>>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -929,6 +934,13 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
+        // One provider-neutral schema source for every transport. The opt-in
+        // progressive path supplies a per-round session projection; flag-off
+        // keeps cloning the registry's existing cached Arc byte-for-byte.
+        let tools_schema = options
+            .request_tools_schema
+            .clone()
+            .unwrap_or_else(|| tools.tools_schema());
         // Cloud models always dispatch through the typed credential broker.
         // Text-only pre-flight, invocation, cancellation, and Task 10B trace
         // wiring live in `runtime::cloud_invoke` (extracted for testability).
@@ -940,7 +952,7 @@ impl ApiMethods {
                     model,
                     cloud_model,
                     cloud_context,
-                    !tools.tools_schema().is_empty(),
+                    !tools_schema.is_empty(),
                     || {
                         crate::auth::broker_from_source(
                             &options.credential_source,
@@ -958,7 +970,6 @@ impl ApiMethods {
             }
         }
         // Route to OpenAI-compat provider if the model id resolves to one.
-        let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
             model,
             client,

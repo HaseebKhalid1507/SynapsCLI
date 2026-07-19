@@ -319,6 +319,10 @@ pub struct Runtime {
     /// These seed the session policy and are replayed when a manifestless
     /// foreground model change replaces that policy snapshot.
     trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+    /// True when this stream should expose only its session projection rather
+    /// than the legacy full tool schema. Opt-in and false by default so the
+    /// flag-off request bytes stay unchanged (Task 18).
+    progressive_tool_disclosure: bool,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -457,6 +461,7 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            progressive_tool_disclosure: false,
             host_tool_session: fresh_host_tool_session(),
         })
     }
@@ -530,6 +535,7 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            progressive_tool_disclosure: false,
             host_tool_session: fresh_host_tool_session(),
         }
     }
@@ -1197,6 +1203,7 @@ impl Runtime {
         self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.progressive_tool_disclosure = config.progressive_tool_disclosure;
         self.trusted_worker_models = config
             .favorite_models
             .iter()
@@ -1709,6 +1716,7 @@ impl Runtime {
                     // the extension route falls back per its documented
                     // policy (fresh default-core, zero activations).
                     session_tool_set: None,
+                    request_tools_schema: None,
                 },
             )
             .await?;
@@ -2109,8 +2117,10 @@ impl Runtime {
             // provider interior tool loops (Task 16).
             tool_session_id: Some(self.host_tool_session.clone()),
             // Placeholder: the stream loop installs its RETAINED shared
-            // session tool set handle before the first provider round.
+            // session tool set handle and request schema projection before
+            // the first provider round.
             session_tool_set: None,
+            request_tools_schema: None,
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -2143,6 +2153,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
+            progressive_tool_disclosure: self.progressive_tool_disclosure,
             tool_session_id: self.host_tool_session.clone(),
         };
 
@@ -2218,6 +2229,7 @@ impl Clone for Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
+            progressive_tool_disclosure: self.progressive_tool_disclosure,
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and
