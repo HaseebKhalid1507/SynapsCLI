@@ -277,3 +277,61 @@ fn secret_records_never_leak_body_content_through_search_descriptors() {
         "content probes must not confirm secret body substrings"
     );
 }
+
+#[test]
+fn project_root_discovery_is_stable_across_nested_cwds() {
+    let tmp = TempDir::new().unwrap();
+
+    // Ordinary repo: `.git` DIRECTORY marks the root.
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src/deep/nested")).unwrap();
+    let from_root = ProjectScope::discover_with_override(&repo, None).unwrap();
+    let from_nested =
+        ProjectScope::discover_with_override(&repo.join("src/deep/nested"), None).unwrap();
+    assert_eq!(
+        from_root.key(),
+        from_nested.key(),
+        "every cwd inside a repo must resolve to ONE project identity"
+    );
+    assert_eq!(from_root.root(), repo.canonicalize().unwrap());
+
+    // Worktree: `.git` FILE marks the root (no spawning, no gitdir parsing
+    // — the worktree itself is the stable project identity).
+    let worktree = tmp.path().join("wt");
+    std::fs::create_dir_all(worktree.join("crates/x")).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/wt\n",
+    )
+    .unwrap();
+    let wt_root = ProjectScope::discover_with_override(&worktree, None).unwrap();
+    let wt_nested = ProjectScope::discover_with_override(&worktree.join("crates/x"), None).unwrap();
+    assert_eq!(wt_root.key(), wt_nested.key());
+    assert_eq!(wt_root.root(), worktree.canonicalize().unwrap());
+    assert_ne!(
+        wt_root.key(),
+        from_root.key(),
+        "distinct roots, distinct scopes"
+    );
+
+    // Explicit marker file also anchors a root.
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(plain.join("sub")).unwrap();
+    std::fs::write(plain.join(".synaps-project"), "").unwrap();
+    let plain_scope = ProjectScope::discover_with_override(&plain.join("sub"), None).unwrap();
+    assert_eq!(plain_scope.root(), plain.canonicalize().unwrap());
+
+    // No marker anywhere: fall back to the start directory itself.
+    let bare = tmp.path().join("bare/somewhere");
+    std::fs::create_dir_all(&bare).unwrap();
+    let bare_scope = ProjectScope::discover_with_override(&bare, None).unwrap();
+    assert_eq!(bare_scope.root(), bare.canonicalize().unwrap());
+
+    // Explicit override outranks every marker.
+    let override_root = tmp.path().join("override-root");
+    std::fs::create_dir_all(&override_root).unwrap();
+    let forced =
+        ProjectScope::discover_with_override(&repo.join("src/deep"), Some(&override_root)).unwrap();
+    assert_eq!(forced.root(), override_root.canonicalize().unwrap());
+}

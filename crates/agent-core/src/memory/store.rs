@@ -361,6 +361,46 @@ impl ProjectScope {
         &self.key
     }
 
+    /// Discover the stable project root for a starting directory (CP-13
+    /// fix1 I2): the `SYNAPS_PROJECT_ROOT` env override wins; otherwise a
+    /// bounded upward walk finds the nearest directory containing a `.git`
+    /// entry (DIRECTORY or FILE — worktree-safe, no process spawning, no
+    /// gitdir parsing) or a `.synaps-project` marker; with no marker the
+    /// start directory itself is the root.
+    pub fn discover(start: &Path) -> Result<Self, MemoryError> {
+        let override_root = std::env::var_os("SYNAPS_PROJECT_ROOT").map(std::path::PathBuf::from);
+        Self::discover_with_override(start, override_root.as_deref())
+    }
+
+    /// [`Self::discover`] with an explicit override (env-free seam).
+    pub fn discover_with_override(
+        start: &Path,
+        override_root: Option<&Path>,
+    ) -> Result<Self, MemoryError> {
+        if let Some(root) = override_root {
+            return Self::for_root(root);
+        }
+        const MARKERS: [&str; 2] = [".git", ".synaps-project"];
+        const MAX_ASCENT: usize = 64;
+        let canonical_start = start
+            .canonicalize()
+            .map_err(|e| MemoryError::InvalidProjectRoot(format!("{}: {e}", start.display())))?;
+        let mut dir = canonical_start.as_path();
+        for _ in 0..MAX_ASCENT {
+            if MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).symlink_metadata().is_ok())
+            {
+                return Self::for_root(dir);
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent,
+                None => break,
+            }
+        }
+        Self::for_root(&canonical_start)
+    }
+
     /// The canonical workspace root.
     pub fn root(&self) -> &Path {
         &self.root
