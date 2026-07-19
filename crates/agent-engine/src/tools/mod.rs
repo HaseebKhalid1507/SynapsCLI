@@ -15,6 +15,7 @@ mod extension;
 mod find;
 mod grep;
 mod ls;
+pub mod memory;
 mod read;
 mod secret_prompt;
 mod subagent;

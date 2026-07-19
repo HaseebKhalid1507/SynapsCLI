@@ -63,6 +63,13 @@ impl ToolRegistry {
             // runtimes cannot gain broader authorization surfaces.
             Arc::new(crate::tools::discovery::SearchToolsTool),
             Arc::new(crate::tools::discovery::ActivateToolsTool),
+            // Task 32 project-scoped memory primitives (spec §9.5). Not in
+            // the progressive essential core — deferred until exact
+            // activation under progressive disclosure.
+            Arc::new(crate::tools::memory::MemorySearchTool),
+            Arc::new(crate::tools::memory::MemoryFetchTool),
+            Arc::new(crate::tools::memory::MemoryStoreTool),
+            Arc::new(crate::tools::memory::MemoryForgetTool),
         ];
         Self::from_tools(tools)
     }
@@ -774,8 +781,10 @@ mod tests {
         let registry = ToolRegistry::new();
 
         // Includes read-only model discovery plus session authorization
-        // (Task 17 adds `search_tools` + `activate_tools`).
-        assert_eq!(registry.tools_schema().len(), 20);
+        // (Task 17 adds `search_tools` + `activate_tools`) and the Task 32
+        // project-scoped memory primitives (4 tools, deferred under
+        // progressive disclosure).
+        assert_eq!(registry.tools_schema().len(), 24);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());
