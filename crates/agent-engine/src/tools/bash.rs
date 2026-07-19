@@ -3,6 +3,35 @@ use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
+const BASH_INTERMEDIARY_CHANNEL_CAPACITY: usize = 64;
+static BASH_INTERMEDIARY_PRODUCED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_FORWARDED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_DROPPED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct BashIntermediarySnapshot {
+    pub produced_bytes: u64,
+    pub forwarded_bytes: u64,
+    pub dropped_bytes: u64,
+    pub retained_bytes: u64,
+}
+
+pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
+    use std::sync::atomic::Ordering;
+    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(Ordering::Relaxed);
+    let forwarded = BASH_INTERMEDIARY_FORWARDED_BYTES.load(Ordering::Relaxed);
+    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(Ordering::Relaxed);
+    BashIntermediarySnapshot {
+        produced_bytes: produced,
+        forwarded_bytes: forwarded,
+        dropped_bytes: dropped,
+        retained_bytes: produced.saturating_sub(forwarded).saturating_sub(dropped),
+    }
+}
+
 pub struct BashTool;
 
 const READ_CHUNK_SIZE: usize = 1024;
@@ -157,7 +186,8 @@ impl Tool for BashTool {
             .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stdin".to_string()))?;
 
-        let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+        let (tx_inter, mut rx_inter) =
+            tokio::sync::mpsc::channel::<(bool, String)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
 
         let tx_o = tx_inter.clone();
         tokio::spawn(async move {
@@ -170,7 +200,18 @@ impl Tool for BashTool {
                     Ok(n) => {
                         let msg = sanitize_output(&buf[..n]);
                         if !msg.is_empty() {
-                            let _ = tx_o.send((false, msg));
+                            use std::sync::atomic::Ordering;
+                            BASH_INTERMEDIARY_PRODUCED_BYTES
+                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
+                            let len = msg.len();
+                            if tx_o.send((false, msg)).await.is_ok() {
+                                BASH_INTERMEDIARY_FORWARDED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                            } else {
+                                BASH_INTERMEDIARY_DROPPED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
                     Err(_) => break,
@@ -189,7 +230,18 @@ impl Tool for BashTool {
                     Ok(n) => {
                         let msg = sanitize_output(&buf[..n]);
                         if !msg.is_empty() {
-                            let _ = tx_e.send((true, msg));
+                            use std::sync::atomic::Ordering;
+                            BASH_INTERMEDIARY_PRODUCED_BYTES
+                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
+                            let len = msg.len();
+                            if tx_e.send((true, msg)).await.is_ok() {
+                                BASH_INTERMEDIARY_FORWARDED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                            } else {
+                                BASH_INTERMEDIARY_DROPPED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
                     Err(_) => break,
@@ -344,6 +396,32 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bash_intermediary_handoff_conserves_bytes_under_large_output() {
+        let before = bash_intermediary_snapshot();
+        let tool = BashTool;
+        let mut ctx = create_tool_context();
+        ctx.limits.max_tool_buffer = 64 * 1024;
+        let result = tool
+            .execute(
+                json!({
+                    "command": "python3 -c \"import sys; sys.stdout.write('x' * 1048576)\"",
+                    "timeout": 30
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("output truncated"));
+        let after = bash_intermediary_snapshot();
+        let produced = after.produced_bytes - before.produced_bytes;
+        let forwarded = after.forwarded_bytes - before.forwarded_bytes;
+        let dropped = after.dropped_bytes - before.dropped_bytes;
+        assert_eq!(produced, forwarded + dropped);
+        assert_eq!(after.retained_bytes, before.retained_bytes);
+        assert!(produced >= 64 * 1024);
+    }
 
     #[test]
     fn detects_sudo_password_prompt_without_newline() {

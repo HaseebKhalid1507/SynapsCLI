@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,35 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::{Result, RuntimeError};
+
+const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
+const PTY_OUTPUT_MAX_CHUNK_BYTES: usize = 4096;
+static PTY_PRODUCED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PTY_FORWARDED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PTY_DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PTY_ACTIVE_READERS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct PtyOutputSnapshot {
+    pub produced_bytes: u64,
+    pub forwarded_bytes: u64,
+    pub dropped_bytes: u64,
+    pub retained_bytes: u64,
+    pub active_readers: u64,
+}
+
+pub fn pty_output_snapshot() -> PtyOutputSnapshot {
+    let produced = PTY_PRODUCED_BYTES.load(Ordering::Relaxed);
+    let forwarded = PTY_FORWARDED_BYTES.load(Ordering::Relaxed);
+    let dropped = PTY_DROPPED_BYTES.load(Ordering::Relaxed);
+    PtyOutputSnapshot {
+        produced_bytes: produced,
+        forwarded_bytes: forwarded,
+        dropped_bytes: dropped,
+        retained_bytes: produced.saturating_sub(forwarded).saturating_sub(dropped),
+        active_readers: PTY_ACTIVE_READERS.load(Ordering::SeqCst),
+    }
+}
 
 /// Async-friendly wrapper around a PTY master/child pair.
 ///
@@ -32,7 +61,7 @@ pub struct PtyHandle {
     /// Handle to the blocking reader task (for cleanup tracking).
     _reader_task: JoinHandle<()>,
     /// Receiving end of the output channel fed by the reader task.
-    output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
     /// Child process handle — used for try_wait / kill.
     child: Box<dyn Child + Send + Sync>,
     /// Cached alive flag — once the child exits, this stays false.
@@ -110,12 +139,20 @@ impl PtyHandle {
             .map_err(|e| RuntimeError::Tool(format!("Failed to clone PTY reader: {e}")))?;
 
         // 5. Spawn a blocking reader task that pushes chunks into the channel.
-        let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(PTY_OUTPUT_CHANNEL_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
         let reader_alive = alive.clone();
 
+        PTY_ACTIVE_READERS.fetch_add(1, Ordering::SeqCst);
         let reader_task = tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 4096];
+            struct ReaderGauge;
+            impl Drop for ReaderGauge {
+                fn drop(&mut self) {
+                    PTY_ACTIVE_READERS.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _gauge = ReaderGauge;
+            let mut buf = [0u8; PTY_OUTPUT_MAX_CHUNK_BYTES];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
@@ -123,9 +160,15 @@ impl PtyHandle {
                         break;
                     }
                     Ok(n) => {
-                        if output_tx.send(buf[..n].to_vec()).is_err() {
-                            // Receiver dropped — no one is listening anymore.
-                            break;
+                        PTY_PRODUCED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        match output_tx.blocking_send(buf[..n].to_vec()) {
+                            Ok(()) => {
+                                PTY_FORWARDED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                PTY_DROPPED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
                     Err(_) => {
@@ -257,6 +300,46 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::collections::HashMap;
+
+    /// A fast PTY producer with a deliberately stalled consumer is bounded
+    /// at the reader-thread handoff, and dropping the handle releases it.
+    #[tokio::test]
+    #[serial]
+    async fn pty_slow_consumer_retention_is_bounded_and_drop_releases_reader() {
+        let before = pty_output_snapshot();
+        let handle = PtyHandle::spawn(
+            "bash -c 'yes x | head -c 10485760'",
+            None,
+            HashMap::new(),
+            24,
+            80,
+        )
+        .expect("spawn producer");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stalled = pty_output_snapshot();
+        let retained = stalled
+            .produced_bytes
+            .saturating_sub(before.produced_bytes)
+            .saturating_sub(
+                stalled
+                    .forwarded_bytes
+                    .saturating_sub(before.forwarded_bytes),
+            )
+            .saturating_sub(stalled.dropped_bytes.saturating_sub(before.dropped_bytes));
+        assert!(
+            retained <= (PTY_OUTPUT_CHANNEL_CAPACITY * PTY_OUTPUT_MAX_CHUNK_BYTES) as u64,
+            "retained {retained}"
+        );
+        let readers_before = before.active_readers;
+        drop(handle);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while pty_output_snapshot().active_readers > readers_before
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pty_output_snapshot().active_readers <= readers_before);
+    }
 
     #[tokio::test]
     #[serial]
