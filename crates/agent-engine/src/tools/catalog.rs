@@ -466,3 +466,314 @@ impl ToolCatalog {
         Ok(())
     }
 }
+
+// ── DiscoveryIndex (Task 15, spec §7.1) ─────────────────────────────────────
+
+/// Maximum UTF-8 byte length of a discovery query.
+pub const QUERY_MAX_BYTES: usize = 256;
+/// Hard cap on the per-search result count budget.
+pub const SEARCH_MAX_RESULTS_CAP: usize = 64;
+/// Hard cap on the per-search serialized byte budget (64 KiB).
+pub const SEARCH_MAX_RESULT_BYTES_CAP: usize = 64 * 1024;
+
+/// Typed failure for boundary parsing of a [`DiscoveryQuery`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DiscoveryQueryError {
+    #[error("discovery query is empty")]
+    Empty,
+    #[error("discovery query is oversized: {actual} bytes exceeds limit {limit}")]
+    Oversized { actual: usize, limit: usize },
+}
+
+/// A validated, bounded, case-folded discovery query. Parse-at-boundary:
+/// empty (or whitespace-only) and oversized input fails typed before any
+/// search runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveryQuery {
+    needle: String,
+}
+
+impl DiscoveryQuery {
+    pub fn parse(raw: &str) -> Result<Self, DiscoveryQueryError> {
+        if raw.len() > QUERY_MAX_BYTES {
+            return Err(DiscoveryQueryError::Oversized {
+                actual: raw.len(),
+                limit: QUERY_MAX_BYTES,
+            });
+        }
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(DiscoveryQueryError::Empty);
+        }
+        Ok(Self {
+            needle: trimmed.to_lowercase(),
+        })
+    }
+
+    /// The case-folded needle actually matched against descriptors.
+    pub fn needle(&self) -> &str {
+        &self.needle
+    }
+}
+
+/// Typed failure for constructing [`SearchLimits`]. Zero budgets would make
+/// every search vacuous; over-cap budgets would defeat the bound.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SearchLimitsError {
+    #[error("search result count budget must be positive")]
+    ZeroResults,
+    #[error("search byte budget must be positive")]
+    ZeroBytes,
+    #[error("search result count budget {actual} exceeds cap {cap}")]
+    ResultsOverCap { actual: usize, cap: usize },
+    #[error("search byte budget {actual} exceeds cap {cap}")]
+    BytesOverCap { actual: usize, cap: usize },
+}
+
+/// Validated positive, capped search budgets. The byte budget covers full
+/// serialized entries (JSON structure and metadata included), not merely
+/// descriptor text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchLimits {
+    max_results: usize,
+    max_result_bytes: usize,
+}
+
+impl SearchLimits {
+    pub fn new(max_results: usize, max_result_bytes: usize) -> Result<Self, SearchLimitsError> {
+        if max_results == 0 {
+            return Err(SearchLimitsError::ZeroResults);
+        }
+        if max_result_bytes == 0 {
+            return Err(SearchLimitsError::ZeroBytes);
+        }
+        if max_results > SEARCH_MAX_RESULTS_CAP {
+            return Err(SearchLimitsError::ResultsOverCap {
+                actual: max_results,
+                cap: SEARCH_MAX_RESULTS_CAP,
+            });
+        }
+        if max_result_bytes > SEARCH_MAX_RESULT_BYTES_CAP {
+            return Err(SearchLimitsError::BytesOverCap {
+                actual: max_result_bytes,
+                cap: SEARCH_MAX_RESULT_BYTES_CAP,
+            });
+        }
+        Ok(Self {
+            max_results,
+            max_result_bytes,
+        })
+    }
+
+    pub fn max_results(&self) -> usize {
+        self.max_results
+    }
+
+    pub fn max_result_bytes(&self) -> usize {
+        self.max_result_bytes
+    }
+}
+
+/// Serializable source-class label. A label only — no raw runtime identity
+/// strings, handlers, or process data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceClass {
+    Builtin,
+    Extension,
+    Mcp,
+    Plugin,
+    Unknown,
+}
+
+impl SourceClass {
+    fn of(source: &CapabilitySource) -> Self {
+        match source {
+            CapabilitySource::Builtin => Self::Builtin,
+            CapabilitySource::Extension { .. } => Self::Extension,
+            CapabilitySource::Mcp { .. } => Self::Mcp,
+            CapabilitySource::Plugin { .. } => Self::Plugin,
+            CapabilitySource::Unknown { .. } => Self::Unknown,
+        }
+    }
+}
+
+/// One compact, serializable discovery descriptor. By construction it holds
+/// no schema locator, no factory, no extension/MCP handler or process data,
+/// and no raw unbounded source strings — only the stable id, bounded
+/// summary/tags (already bounded at catalog time), a source-class label, and
+/// digest metadata.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DiscoveryEntry {
+    id: ToolId,
+    source_class: SourceClass,
+    summary: String,
+    tags: Vec<String>,
+    schema_digest: SchemaDigest,
+}
+
+impl DiscoveryEntry {
+    pub fn id(&self) -> &ToolId {
+        &self.id
+    }
+
+    pub fn source_class(&self) -> SourceClass {
+        self.source_class
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    pub fn schema_digest(&self) -> &SchemaDigest {
+        &self.schema_digest
+    }
+}
+
+/// Typed failure for building a [`DiscoveryIndex`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DiscoveryIndexError {
+    #[error("failed to serialize compact descriptor for {id}: {detail}")]
+    DescriptorSerialization { id: ToolId, detail: String },
+}
+
+/// Prebuilt search row: the compact entry, its exact serialized byte cost
+/// (computed once at build so budget accounting includes JSON metadata
+/// overhead), and its case-folded haystack.
+#[derive(Clone, Debug)]
+struct IndexRow {
+    entry: DiscoveryEntry,
+    serialized_bytes: usize,
+    haystack: String,
+}
+
+/// Deterministic search outcome. `truncated` is true whenever any matching
+/// entry was withheld by the count or byte budget, so callers never mistake
+/// a bounded result for the complete one.
+#[derive(Debug)]
+pub struct SearchResults<'a> {
+    generation: CatalogGeneration,
+    hits: Vec<&'a DiscoveryEntry>,
+    serialized_bytes: usize,
+    truncated: bool,
+}
+
+impl<'a> SearchResults<'a> {
+    /// The catalog generation this index snapshot was built from.
+    pub fn generation(&self) -> CatalogGeneration {
+        self.generation
+    }
+
+    pub fn hits(&self) -> &[&'a DiscoveryEntry] {
+        &self.hits
+    }
+
+    /// Total serialized bytes of the returned entries (≤ the byte budget).
+    pub fn serialized_bytes(&self) -> usize {
+        self.serialized_bytes
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// Bounded searchable snapshot of catalog compact descriptors (spec §7.1).
+///
+/// Building and searching are local and pure: no implementation acquisition,
+/// no execution, no process start, no network, no full-schema read beyond
+/// the digest already computed at catalog time, and no registry exposure
+/// change. The snapshot pins the catalog generation; callers detect drift
+/// with [`DiscoveryIndex::is_stale`] and rebuild instead of silently serving
+/// stale records.
+#[derive(Clone, Debug)]
+pub struct DiscoveryIndex {
+    generation: CatalogGeneration,
+    rows: Vec<IndexRow>,
+}
+
+impl DiscoveryIndex {
+    /// Build the index from catalog compact descriptors only. Reads id,
+    /// source class, bounded summary/tags, and schema digest — never the
+    /// schema locator or the factory.
+    pub fn build(catalog: &ToolCatalog) -> Result<Self, DiscoveryIndexError> {
+        let mut rows = Vec::with_capacity(catalog.len());
+        // `catalog.iter()` is deterministic ToolId order; rows inherit it.
+        for record in catalog.iter() {
+            let entry = DiscoveryEntry {
+                id: record.id().clone(),
+                source_class: SourceClass::of(record.source()),
+                summary: record.summary().to_string(),
+                tags: record.tags().to_vec(),
+                schema_digest: record.schema_digest().clone(),
+            };
+            let serialized_bytes = serde_json::to_vec(&entry)
+                .map_err(|err| DiscoveryIndexError::DescriptorSerialization {
+                    id: entry.id.clone(),
+                    detail: err.to_string(),
+                })?
+                .len();
+            let mut haystack = entry.id.as_str().to_lowercase();
+            haystack.push('\n');
+            haystack.push_str(&entry.summary.to_lowercase());
+            for tag in &entry.tags {
+                haystack.push('\n');
+                haystack.push_str(&tag.to_lowercase());
+            }
+            rows.push(IndexRow {
+                entry,
+                serialized_bytes,
+                haystack,
+            });
+        }
+        Ok(Self {
+            generation: catalog.generation(),
+            rows,
+        })
+    }
+
+    /// The catalog generation this snapshot was built from.
+    pub fn generation(&self) -> CatalogGeneration {
+        self.generation
+    }
+
+    /// True when the catalog has mutated since this snapshot was built. A
+    /// stale index must be rebuilt, not silently served.
+    pub fn is_stale(&self, catalog: &ToolCatalog) -> bool {
+        self.generation != catalog.generation()
+    }
+
+    /// Deterministic, bounded, pure substring search over compact
+    /// descriptors. Entries are visited in ToolId order; a matching entry is
+    /// returned only if it fits both the remaining count budget and the
+    /// remaining serialized byte budget. The first match that does not fit
+    /// stops the scan (documented bounded behavior; `truncated` reports it).
+    pub fn search(&self, query: &DiscoveryQuery, limits: &SearchLimits) -> SearchResults<'_> {
+        let mut hits = Vec::new();
+        let mut used_bytes = 0usize;
+        let mut truncated = false;
+        for row in &self.rows {
+            if !row.haystack.contains(query.needle()) {
+                continue;
+            }
+            if hits.len() == limits.max_results()
+                || used_bytes + row.serialized_bytes > limits.max_result_bytes()
+            {
+                truncated = true;
+                break;
+            }
+            used_bytes += row.serialized_bytes;
+            hits.push(&row.entry);
+        }
+        SearchResults {
+            generation: self.generation,
+            hits,
+            serialized_bytes: used_bytes,
+            truncated,
+        }
+    }
+}

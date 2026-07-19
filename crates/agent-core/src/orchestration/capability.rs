@@ -320,6 +320,48 @@ impl SchemaDigest {
     }
 }
 
+/// Typed failure for boundary parsing of [`SessionId`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SessionIdError {
+    #[error("session id is empty")]
+    Empty,
+    #[error("session id is oversized: {actual} bytes exceeds limit {limit}")]
+    Oversized { actual: usize, limit: usize },
+}
+
+/// Typed, validated session identity (Task 15). Freely accepted unbounded
+/// strings must not name sessions; parse at the boundary instead. The same
+/// limits back [`SessionActivationGrant`] session validation, so a grant's
+/// session id and a `SessionId` can never diverge in what they accept.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn parse(raw: &str) -> Result<Self, SessionIdError> {
+        if raw.is_empty() {
+            return Err(SessionIdError::Empty);
+        }
+        if raw.len() > SESSION_ID_MAX_BYTES {
+            return Err(SessionIdError::Oversized {
+                actual: raw.len(),
+                limit: SESSION_ID_MAX_BYTES,
+            });
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Typed failure for constructing a [`SessionActivationGrant`].
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ActivationGrantError {
@@ -350,17 +392,16 @@ impl SessionActivationGrant {
         catalog_generation: CatalogGeneration,
         schema_digest: SchemaDigest,
     ) -> Result<Self, ActivationGrantError> {
-        if session_id.is_empty() {
-            return Err(ActivationGrantError::EmptySessionId);
-        }
-        if session_id.len() > SESSION_ID_MAX_BYTES {
-            return Err(ActivationGrantError::OversizedSessionId {
-                actual: session_id.len(),
-                limit: SESSION_ID_MAX_BYTES,
-            });
-        }
+        // Single source of truth for session identity limits: delegate to
+        // `SessionId` so grant and session parsing can never diverge.
+        let session_id = SessionId::parse(session_id).map_err(|err| match err {
+            SessionIdError::Empty => ActivationGrantError::EmptySessionId,
+            SessionIdError::Oversized { actual, limit } => {
+                ActivationGrantError::OversizedSessionId { actual, limit }
+            }
+        })?;
         Ok(Self {
-            session_id: session_id.to_string(),
+            session_id: session_id.0,
             tool_id,
             catalog_generation,
             schema_digest,

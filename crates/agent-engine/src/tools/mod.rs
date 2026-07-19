@@ -20,6 +20,7 @@ mod secret_prompt;
 mod subagent;
 mod write;
 
+pub mod activation;
 mod agent;
 pub mod catalog;
 mod registry;
