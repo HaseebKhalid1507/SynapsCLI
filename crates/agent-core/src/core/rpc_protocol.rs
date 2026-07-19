@@ -95,6 +95,11 @@ pub struct EventPayload {
     pub timestamp: String,
     /// Full `format_event_for_agent` output — XML-wrapped, injection-safe.
     pub formatted: String,
+    /// Typed disclosure class (spec §9.7) as its canonical snake_case name.
+    /// Retained through the wire so RPC/server parents can honor
+    /// persistence policy after handoff. Absent = `model_visible`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<String>,
 }
 
 /// Token-usage summary for a completed agent turn.
