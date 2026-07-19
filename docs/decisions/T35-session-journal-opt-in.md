@@ -140,13 +140,28 @@ invocation is documented in the consolidated benchmark script (T36).
 
 ## Fix iteration 1 addenda (final Judge I1 + M1)
 
-- **Confined reads (I1):** every session read path — journal state on the
-  save side, snapshot load, journal replay, and the listing meta tail —
-  resolves relative to an `O_NOFOLLOW`-opened sessions-dir handle
-  (`ConfinedDir`), verifies the opened handle is a regular file, and reads
-  at most `MAX_PERSISTED_READ_BYTES` from that handle. A symlinked root,
-  ancestor, or artifact — including one swapped in concurrently — fails
-  closed with zero victim bytes read or echoed.
+- **Confined reads (I1), strict full-path resolution (fix2):** every
+  session operation — reads (journal state, snapshot load, replay, meta
+  tail), writes (snapshot, journal append, journal reset, legacy JSON
+  save), deletion, and directory listing — first resolves the sessions
+  directory with `ConfinedDir::{open,create}_absolute_no_symlinks`: a
+  handle walk from `/` (Linux: one atomic
+  `openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` from the root handle;
+  fallback: per-component `O_NOFOLLOW|O_DIRECTORY` opens) in which EVERY
+  component — ancestors and the final `sessions` component alike — must be
+  a real directory. All artifact opens/writes/removals then happen
+  relative to that one handle with `O_NOFOLLOW` and regular-file
+  verification on the opened handle, reads bounded by
+  `MAX_PERSISTED_READ_BYTES`. There is no check-then-open race: a
+  component swapped to a symlink at any moment fails the open itself.
+
+  **Trusted-root semantics (explicit):** nothing on the sessions path is
+  trusted — there is no trusted-ancestor carve-out. The base-dir *value*
+  (`SYNAPS_BASE_DIR`/`HOME` config) is operator input, but its resolution
+  is still symlink-free by construction; operators whose base dir
+  legitimately sits behind ancestor symlinks (e.g. `/home` → `var/home`)
+  must point `SYNAPS_BASE_DIR` at the canonical path — the code fails
+  closed rather than following any link.
 - **Version enforcement (M1):** `v == JOURNAL_SCHEMA_VERSION` is enforced
   on every record. An unsupported `open` version invalidates the whole
   journal (nothing replays; the next save resnapshots); an unknown-version

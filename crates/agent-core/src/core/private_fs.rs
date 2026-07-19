@@ -312,6 +312,91 @@ impl ConfinedDir {
         Self::open_dir_nofollow_at_path(path)
     }
 
+    /// Open an EXISTING absolute directory with EVERY component — ancestors
+    /// AND the final one — resolved handle-relatively and symlink-refusing
+    /// (fix2). Unlike [`Self::open_root`], whose pathname open lets the
+    /// kernel follow symlinked ANCESTORS, this walks from `/` (which cannot
+    /// be a symlink): Linux tries one atomic `openat2` with
+    /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` from the root handle, and
+    /// the fallback opens each component `O_NOFOLLOW | O_DIRECTORY`. There
+    /// is no check-then-open race — a component swapped to a symlink at any
+    /// point fails the open itself (`ELOOP`/`ENOTDIR`).
+    ///
+    /// TRUSTED-ROOT SEMANTICS: nothing on the path is trusted; every
+    /// component must be a real directory. Operators whose base dir
+    /// legitimately sits behind ancestor symlinks (e.g. `/home` →
+    /// `var/home`) must point `SYNAPS_BASE_DIR` at the canonical path.
+    pub fn open_absolute_no_symlinks(path: &Path) -> std::io::Result<Self> {
+        let components = absolute_real_components(path)?;
+        let root = Self::open_dir_nofollow_at_path(Path::new("/"))?;
+        if components.is_empty() {
+            return Ok(root);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let joined = components.join("/");
+            match root.openat2_beneath(&joined, libc::O_RDONLY | libc::O_DIRECTORY) {
+                Ok(handle) => return Ok(Self { handle }),
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {} // fall back
+                Err(e) => return Err(confinement_error(&joined, &e)),
+            }
+        }
+        let mut dir = root;
+        for component in &components {
+            dir = dir.open_child_dir_nofollow(component)?;
+        }
+        Ok(dir)
+    }
+
+    /// Like [`Self::open_absolute_no_symlinks`], but creates missing
+    /// directory components (mode 0700) during the walk and repairs the
+    /// LEAF to 0700 via `fchmod` on the opened handle — the handle-relative
+    /// counterpart of [`ensure_private_dir`]. Every existing component,
+    /// ancestor or final, must be a real (non-symlink) directory.
+    pub fn create_absolute_no_symlinks(path: &Path) -> std::io::Result<Self> {
+        let components = absolute_real_components(path)?;
+        let mut dir = Self::open_dir_nofollow_at_path(Path::new("/"))?;
+        for component in &components {
+            dir = match dir.open_child_dir_nofollow(component) {
+                Ok(next) => next,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let c_name = validated_component_cstring(component)?;
+                    let rc = unsafe { libc::mkdirat(dir.fd(), c_name.as_ptr(), 0o700) };
+                    if rc != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::EEXIST) {
+                            return Err(err);
+                        }
+                    }
+                    dir.open_child_dir_nofollow(component)?
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        dir.fchmod_private()?;
+        Ok(dir)
+    }
+
+    /// Open one existing DIRECT child directory, `O_NOFOLLOW | O_DIRECTORY`.
+    fn open_child_dir_nofollow(&self, name: &str) -> std::io::Result<Self> {
+        let c_name = validated_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(Self {
+            handle: unsafe { File::from_raw_fd(fd) },
+        })
+    }
+
     fn open_dir_nofollow_at_path(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         let handle = OpenOptions::new()
@@ -523,6 +608,86 @@ impl ConfinedDir {
     }
 
     /// Unlink a file (validated single component) relative to this handle.
+    /// Handle-relative atomic private write (fix2): `<name>.tmp` is created
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` 0600 relative to THIS handle, written,
+    /// fsynced, and `renameat`ed over `<name>` — `renameat` never follows
+    /// the target, so a planted symlink is replaced as a link, never
+    /// written through. A pre-existing symlink at the target is refused
+    /// with a typed error (policy parity with [`write_atomic_private`]);
+    /// one planted after the check merely gets atomically replaced.
+    pub fn write_atomic(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let c_final = validated_component_cstring(name)?;
+        // Refuse a pre-existing symlink target (typed policy refusal).
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd(),
+                c_final.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            return Err(std::io::Error::other(format!(
+                "confinement violation at {name:?}: refusing symlink write target"
+            )));
+        }
+
+        let tmp_name = format!("{name}.tmp");
+        // Clear a stale temp (unlinkat removes a planted symlink itself,
+        // never its target), then create fresh with O_EXCL.
+        match self.remove_file(&tmp_name) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file = self.create_file(&tmp_name)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+
+        let c_tmp = validated_component_cstring(&tmp_name)?;
+        let rc = unsafe { libc::renameat(self.fd(), c_tmp.as_ptr(), self.fd(), c_final.as_ptr()) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = self.remove_file(&tmp_name);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Handle-relative private append (fix2): open `<name>` for appending
+    /// relative to THIS handle with `O_NOFOLLOW`, creating it 0600; a
+    /// pre-existing broader-mode file is repaired via the opened handle —
+    /// parity with [`open_private_append`], minus the pathname resolution.
+    pub fn append_file(&self, name: &str) -> std::io::Result<File> {
+        let c_name = validated_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_APPEND
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        let file = unsafe { File::from_raw_fd(fd) };
+        use std::os::unix::fs::PermissionsExt;
+        let meta = file.metadata()?;
+        if meta.permissions().mode() & 0o777 != FILE_MODE {
+            file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE))?;
+        }
+        Ok(file)
+    }
+
     pub fn remove_file(&self, name: &str) -> std::io::Result<()> {
         let c_name = validated_component_cstring(name)?;
         let rc = unsafe { libc::unlinkat(self.fd(), c_name.as_ptr(), 0) };
@@ -548,6 +713,10 @@ pub struct ConfinedEntry {
     pub name: String,
     pub is_file: bool,
     pub is_dir: bool,
+    /// Modification time (ms since epoch) from the handle-relative
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` — of the entry ITSELF, never a
+    /// symlink target.
+    pub mtime_unix_ms: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -598,10 +767,15 @@ impl ConfinedDir {
                 continue;
             }
             let kind = stat.st_mode & libc::S_IFMT;
+            #[allow(clippy::useless_conversion)]
+            let mtime_unix_ms = u64::try_from(stat.st_mtime)
+                .ok()
+                .map(|secs| secs * 1_000 + (stat.st_mtime_nsec as u64) / 1_000_000);
             entries.push(ConfinedEntry {
                 name: name.to_string(),
                 is_file: kind == libc::S_IFREG,
                 is_dir: kind == libc::S_IFDIR,
+                mtime_unix_ms,
             });
         }
         let close_rc = unsafe { libc::closedir(directory) }; // owns duplicated fd
@@ -611,6 +785,36 @@ impl ConfinedDir {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
+}
+
+/// Split an ABSOLUTE path into validated real components for the strict
+/// no-symlink walks: rejects relative paths, `.`/`..`, and non-UTF8.
+#[cfg(unix)]
+fn absolute_real_components(path: &Path) -> std::io::Result<Vec<String>> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "strict no-symlink resolution requires an absolute path, got {path:?}"
+        )));
+    }
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(os) => {
+                let name = os.to_str().ok_or_else(|| {
+                    std::io::Error::other(format!("non-UTF8 path component in {path:?}"))
+                })?;
+                let _ = validated_component_cstring(name)?;
+                out.push(name.to_string());
+            }
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-normal path component {other:?} in {path:?}"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Validate one path component: non-empty, no separators, not `.`/`..`,

@@ -42,35 +42,106 @@ const META_TAIL_WINDOW: u64 = 64 * 1024;
 /// cap is refused rather than slurped.
 pub const MAX_PERSISTED_READ_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
-// ─── confined reads (fix1 I1) ────────────────────────────────────────────────
+// ─── confined resolution (fix1 I1 + fix2) ───────────────────────────────────
 //
-// Every read path resolves `<name>` RELATIVE to an O_NOFOLLOW-opened
-// sessions-dir handle (`ConfinedDir`), verifies the opened handle is a
-// regular file, and reads a bounded number of bytes from that handle. A
-// symlink at the root, an ancestor, or the final component — including one
-// swapped in concurrently — fails closed with no victim bytes read.
+// STRICT TRUSTED-ROOT SEMANTICS (fix2): the sessions directory path is
+// resolved with EVERY component — ancestors AND the final one — opened
+// handle-relatively from `/` with symlinks refused
+// (`ConfinedDir::{open,create}_absolute_no_symlinks`; Linux uses one atomic
+// `openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` from the root handle).
+// Nothing on the path is trusted; there is no check-then-open race — a
+// component swapped to a symlink at any moment fails the open itself.
+// Artifacts inside the directory are then opened/written/removed relative
+// to that ONE handle. Operators whose base dir legitimately sits behind
+// ancestor symlinks (e.g. `/home` → `var/home`) must point
+// `SYNAPS_BASE_DIR` at the canonical path.
+//
+// Non-unix keeps the crate's documented best-effort pathname fallback
+// (final-component symlink refusal only).
 
-/// Open `<name>` inside `dir` confined + nofollow. `Ok(None)` when the
-/// directory or file does not exist; confinement violations are errors.
 #[cfg(unix)]
-fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
-    let root = match crate::core::private_fs::ConfinedDir::open_root(dir) {
-        Ok(root) => root,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    match root.open_file(&[name.to_string()]) {
+type SessionsDirHandle = crate::core::private_fs::ConfinedDir;
+
+/// Open the sessions dir strictly. `Ok(None)` when a path component does
+/// not exist; symlinks anywhere are errors.
+#[cfg(unix)]
+fn open_sessions_dir(dir: &Path) -> std::io::Result<Option<SessionsDirHandle>> {
+    match crate::core::private_fs::ConfinedDir::open_absolute_no_symlinks(dir) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create-or-open the sessions dir strictly (0700 leaf).
+#[cfg(unix)]
+fn create_sessions_dir(dir: &Path) -> std::io::Result<SessionsDirHandle> {
+    crate::core::private_fs::ConfinedDir::create_absolute_no_symlinks(dir)
+}
+
+/// Open `<name>` inside an already-strictly-opened sessions dir.
+/// `Ok(None)` when the file does not exist; a symlinked artifact errors.
+#[cfg(unix)]
+fn open_artifact(handle: &SessionsDirHandle, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    match handle.open_file(&[name.to_string()]) {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Non-unix best-effort fallback (matching the rest of `private_fs`):
-/// refuse a symlink at the final component, then open normally.
+/// One-shot strict open of `<name>` inside `dir`.
+#[cfg(unix)]
+pub(crate) fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    let Some(handle) = open_sessions_dir(dir)? else {
+        return Ok(None);
+    };
+    open_artifact(&handle, name)
+}
+
+// ── Non-unix best-effort fallbacks (documented, matching `private_fs`) ──
+
 #[cfg(not(unix))]
-fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
-    let path = dir.join(name);
+struct SessionsDirHandle {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(not(unix))]
+fn open_sessions_dir(dir: &Path) -> std::io::Result<Option<SessionsDirHandle>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    Ok(Some(SessionsDirHandle {
+        dir: dir.to_path_buf(),
+    }))
+}
+
+#[cfg(not(unix))]
+fn create_sessions_dir(dir: &Path) -> std::io::Result<SessionsDirHandle> {
+    crate::core::private_fs::ensure_private_dir(dir)?;
+    Ok(SessionsDirHandle {
+        dir: dir.to_path_buf(),
+    })
+}
+
+#[cfg(not(unix))]
+impl SessionsDirHandle {
+    fn write_atomic(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        crate::core::private_fs::write_atomic_private(&self.dir.join(name), data)
+            .map_err(std::io::Error::other)
+    }
+    fn append_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+        crate::core::private_fs::open_private_append(&self.dir.join(name))
+            .map_err(std::io::Error::other)
+    }
+    fn remove_file(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_file(self.dir.join(name))
+    }
+}
+
+#[cfg(not(unix))]
+fn open_artifact(handle: &SessionsDirHandle, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    let path = handle.dir.join(name);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -87,10 +158,18 @@ fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File
     }
 }
 
-/// Bounded read of the whole artifact from the confined handle.
-fn confined_read_bytes(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+#[cfg(not(unix))]
+pub(crate) fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    let Some(handle) = open_sessions_dir(dir)? else {
+        return Ok(None);
+    };
+    open_artifact(&handle, name)
+}
+
+/// Bounded read of a whole artifact from an already-confined handle.
+fn read_artifact_bytes(handle: &SessionsDirHandle, name: &str) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    let Some(file) = confined_open(dir, name)? else {
+    let Some(file) = open_artifact(handle, name)? else {
         return Ok(None);
     };
     let mut buf = Vec::new();
@@ -102,6 +181,59 @@ fn confined_read_bytes(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u8>
         )));
     }
     Ok(Some(buf))
+}
+
+/// One strictly-resolved directory entry for session listings.
+#[derive(Debug, Clone)]
+pub struct SessionDirEntry {
+    pub name: String,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// Enumerate the sessions dir through the SAME strict handle resolution as
+/// every other T35 operation (fix2): handle-relative `readdir` +
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` — a symlinked ancestor refuses, a
+/// missing dir lists empty, and entry mtimes are of the entries
+/// themselves, never symlink targets.
+pub fn session_dir_entries(dir: &Path) -> std::io::Result<Vec<SessionDirEntry>> {
+    #[cfg(unix)]
+    {
+        let Some(handle) = open_sessions_dir(dir)? else {
+            return Ok(Vec::new());
+        };
+        Ok(handle
+            .entries()?
+            .into_iter()
+            .filter(|e| e.is_file)
+            .map(|e| SessionDirEntry {
+                name: e.name,
+                mtime: e.mtime_unix_ms.map(|ms| {
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+                }),
+            })
+            .collect())
+    }
+    #[cfg(not(unix))]
+    {
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.path().is_file() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            out.push(SessionDirEntry {
+                name,
+                mtime: entry.metadata().and_then(|m| m.modified()).ok(),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Which on-disk persistence strategy `Session::save` uses.
@@ -267,8 +399,11 @@ struct JournalState {
     clean: bool,
 }
 
-fn read_journal_state(dir: &Path, id: &str) -> std::io::Result<Option<JournalState>> {
-    let Some(raw) = confined_read_bytes(dir, &format!("{id}.journal"))? else {
+fn read_journal_state(
+    handle: &SessionsDirHandle,
+    id: &str,
+) -> std::io::Result<Option<JournalState>> {
+    let Some(raw) = read_artifact_bytes(handle, &format!("{id}.journal"))? else {
         return Ok(None);
     };
     let bytes = raw.len() as u64;
@@ -356,32 +491,37 @@ pub fn save_session_in_dir(
     session: &Session,
     mode: SessionPersistence,
 ) -> std::io::Result<SaveReceipt> {
-    crate::core::private_fs::ensure_private_dir(dir)?;
+    // ONE strict resolution per save (fix2); every artifact operation below
+    // is relative to this handle.
+    let handle = create_sessions_dir(dir)?;
     match mode {
         SessionPersistence::Json => {
             let json = serde_json::to_string(session).map_err(std::io::Error::other)?;
-            crate::core::session::save_json_in_dir(dir, &session.id, json.as_bytes())?;
+            handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
             // Rollback fold: the snapshot now holds everything; a stale
             // journal must not shadow future legacy-only readers.
-            remove_if_exists(&journal_path(dir, &session.id))?;
+            remove_artifact_if_exists(&handle, &format!("{}.journal", session.id))?;
             Ok(SaveReceipt {
                 mode: SaveMode::FullSnapshot,
                 bytes_written: json.len() as u64,
             })
         }
-        SessionPersistence::Journal => save_journal_mode(dir, session),
+        SessionPersistence::Journal => save_journal_mode(&handle, session),
     }
 }
 
-fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveReceipt> {
-    let snap_path = dir.join(format!("{}.json", session.id));
-    let jpath = journal_path(dir, &session.id);
+fn save_journal_mode(
+    handle: &SessionsDirHandle,
+    session: &Session,
+) -> std::io::Result<SaveReceipt> {
+    let journal_name = format!("{}.journal", session.id);
 
-    let state = match read_journal_state(dir, &session.id)? {
-        Some(state) if snap_path.exists() => state,
+    let snapshot = open_artifact(handle, &format!("{}.json", session.id))?;
+    let state = match read_journal_state(handle, &session.id)? {
+        Some(state) if snapshot.is_some() => state,
         // First journal-mode save of a new or legacy session (or the
         // snapshot vanished out-of-band): full snapshot + fresh journal.
-        _ => return full_snapshot_reset(dir, session),
+        _ => return full_snapshot_reset(handle, session),
     };
 
     // Append-only tripwires — anything the journal cannot express safely
@@ -395,7 +535,7 @@ fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveRecei
                 .map_or(true, |live| live.as_ref() != m)
         });
     if rewrite_needed {
-        return full_snapshot_reset(dir, session);
+        return full_snapshot_reset(handle, session);
     }
 
     // Delta append: new messages (absolute indices) + one meta record.
@@ -417,7 +557,7 @@ fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveRecei
     buf.push(b'\n');
 
     let appended = session.api_messages.len() - state.durable_len;
-    let mut file = crate::core::private_fs::open_private_append(&jpath)?;
+    let mut file = handle.append_file(&journal_name)?;
     file.write_all(&buf)?;
     file.sync_data()?;
     drop(file);
@@ -426,9 +566,12 @@ fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveRecei
     // snapshot. Crash between the two steps leaves a stale journal whose
     // records replay idempotently (see module docs).
     let journal_bytes = state.bytes + buf.len() as u64;
-    let snapshot_bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
+    let snapshot_bytes = snapshot
+        .and_then(|f| f.metadata().ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
     if snapshot_due(journal_bytes, snapshot_bytes) {
-        let reset = full_snapshot_reset(dir, session)?;
+        let reset = full_snapshot_reset(handle, session)?;
         return Ok(SaveReceipt {
             mode: SaveMode::FullSnapshot,
             bytes_written: buf.len() as u64 + reset.bytes_written,
@@ -444,9 +587,12 @@ fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveRecei
 /// Atomic full snapshot (unchanged legacy schema) followed by an atomic
 /// journal reset to a lone `open` record. Snapshot strictly first: a crash
 /// between the two leaves a stale-but-idempotent journal, never data loss.
-fn full_snapshot_reset(dir: &Path, session: &Session) -> std::io::Result<SaveReceipt> {
+fn full_snapshot_reset(
+    handle: &SessionsDirHandle,
+    session: &Session,
+) -> std::io::Result<SaveReceipt> {
     let json = serde_json::to_string(session).map_err(std::io::Error::other)?;
-    crate::core::session::save_json_in_dir(dir, &session.id, json.as_bytes())?;
+    handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
 
     let open = JournalRecord::Open {
         v: JOURNAL_SCHEMA_VERSION,
@@ -454,7 +600,7 @@ fn full_snapshot_reset(dir: &Path, session: &Session) -> std::io::Result<SaveRec
     };
     let mut line = serde_json::to_vec(&open).map_err(std::io::Error::other)?;
     line.push(b'\n');
-    crate::core::private_fs::write_atomic_private(&journal_path(dir, &session.id), &line)?;
+    handle.write_atomic(&format!("{}.journal", session.id), &line)?;
 
     Ok(SaveReceipt {
         mode: SaveMode::FullSnapshot,
@@ -469,7 +615,15 @@ fn full_snapshot_reset(dir: &Path, session: &Session) -> std::io::Result<SaveRec
 /// a torn or stale journal recovers to its last consistent state. Both
 /// reads are confined nofollow bounded handle reads (fix1 I1).
 pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
-    let snapshot = confined_read_bytes(dir, &format!("{id}.json"))?.ok_or_else(|| {
+    // ONE strict resolution per load (fix2); both artifact reads below are
+    // relative to this handle.
+    let handle = open_sessions_dir(dir)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no sessions directory for '{id}'"),
+        )
+    })?;
+    let snapshot = read_artifact_bytes(&handle, &format!("{id}.json"))?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no session snapshot for '{id}'"),
@@ -477,7 +631,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
     })?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
 
-    let Some(raw) = confined_read_bytes(dir, &format!("{id}.journal"))? else {
+    let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
     };
     let text = String::from_utf8_lossy(&raw);
@@ -548,15 +702,26 @@ pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
 /// Remove a session's snapshot AND journal (compaction rollback, retention).
 /// Idempotent — missing files are not errors.
 pub fn delete_session_files_in_dir(dir: &Path, id: &str) -> std::io::Result<()> {
-    remove_if_exists(&dir.join(format!("{id}.json")))?;
-    remove_if_exists(&journal_path(dir, id))
+    let Some(handle) = open_sessions_dir(dir)? else {
+        return Ok(()); // no directory — idempotently nothing to delete
+    };
+    remove_artifact_if_exists(&handle, &format!("{id}.json"))?;
+    remove_artifact_if_exists(&handle, &format!("{id}.journal"))
 }
 
-fn remove_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
+fn remove_artifact_if_exists(handle: &SessionsDirHandle, name: &str) -> std::io::Result<()> {
+    match handle.remove_file(name) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+/// Strict-handle snapshot write shared with the legacy
+/// `session::save_json_in_dir` path (fix2): same root resolution and the
+/// same handle-relative atomic private write as every journal operation.
+pub(crate) fn write_json_snapshot(dir: &Path, id: &str, json: &[u8]) -> std::io::Result<()> {
+    let handle = create_sessions_dir(dir)?;
+    handle.write_atomic(&format!("{id}.json"), json)
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────

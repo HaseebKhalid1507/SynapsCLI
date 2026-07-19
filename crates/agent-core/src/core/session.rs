@@ -212,10 +212,9 @@ pub(crate) fn save_json_in_dir(
     id: &str,
     json: &[u8],
 ) -> std::io::Result<()> {
-    crate::core::private_fs::ensure_private_dir(dir)?;
-    let path = dir.join(format!("{id}.json"));
-    crate::core::private_fs::write_atomic_private(&path, json)?;
-    Ok(())
+    // fix2: the SAME strict no-symlink root resolution and handle-relative
+    // atomic write as every journal operation (see `session_journal`).
+    crate::core::session_journal::write_json_snapshot(dir, id, json)
 }
 
 /// Find a session by full or partial ID match
@@ -228,19 +227,22 @@ pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
         ));
     }
 
+    // fix2: strict handle-relative enumeration for both match phases.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+
     // Try exact match first
-    let exact = dir.join(format!("{}.json", partial_id));
-    if exact.exists() {
+    if entries
+        .iter()
+        .any(|e| e.name == format!("{partial_id}.json"))
+    {
         return Session::load(partial_id);
     }
 
     // Partial match — find all that contain the partial ID
     let mut matches: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".json") {
-            let id = name.trim_end_matches(".json");
+    for entry in &entries {
+        if entry.name.ends_with(".json") {
+            let id = entry.name.trim_end_matches(".json");
             if id.contains(partial_id) {
                 matches.push(id.to_string());
             }
@@ -276,37 +278,35 @@ pub fn latest_session() -> std::io::Result<Session> {
             "no sessions found",
         ));
     }
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    // fix2: strict handle-relative enumeration — a symlinked ancestor
+    // refuses instead of being followed.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+    let names: std::collections::HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in &entries {
         // A journal append IS a save of its session (Task 35): attribute the
         // journal's mtime to the sibling snapshot so "latest" stays exact
         // when snapshots lag behind appends.
-        let json_path = match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => path.clone(),
-            Some("journal") => {
-                let sibling = path.with_extension("json");
-                if !sibling.exists() {
-                    continue; // orphan journal — not loadable
-                }
-                sibling
+        let id = if let Some(id) = entry.name.strip_suffix(".json") {
+            id
+        } else if let Some(id) = entry.name.strip_suffix(".journal") {
+            if !names.contains(format!("{id}.json").as_str()) {
+                continue; // orphan journal — not loadable
             }
-            _ => continue,
+            id
+        } else {
+            continue;
         };
-        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+        if let Some(mtime) = entry.mtime {
             if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
-                newest = Some((mtime, json_path));
+                newest = Some((mtime, id.to_string()));
             }
         }
     }
-    let path = newest
-        .map(|(_, p)| p)
+    let id = newest
+        .map(|(_, id)| id)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found"))?;
-    let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad session filename")
-    })?;
-    Session::load(id)
+    Session::load(&id)
 }
 
 /// List all sessions, sorted by most recently updated.
@@ -321,11 +321,9 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
         return Ok(Vec::new());
     }
     let mut sessions: Vec<SessionInfo> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Some(info) = parse_session_header(&path) {
+    for entry in crate::core::session_journal::session_dir_entries(&dir)? {
+        if entry.name.ends_with(".json") {
+            if let Some(info) = parse_session_header(&dir, &entry.name) {
                 sessions.push(info);
             }
         }
@@ -344,39 +342,39 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut by_snapshot: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+    // fix2: strict handle-relative enumeration.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+    let names: std::collections::HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let mut by_snapshot: std::collections::HashMap<String, std::time::SystemTime> =
         std::collections::HashMap::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    for entry in &entries {
         // Journal mtimes attribute to their session snapshot (Task 35).
-        let json_path = match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => path.clone(),
-            Some("journal") => {
-                let sibling = path.with_extension("json");
-                if !sibling.exists() {
-                    continue;
-                }
-                sibling
+        let id = if let Some(id) = entry.name.strip_suffix(".json") {
+            id
+        } else if let Some(id) = entry.name.strip_suffix(".journal") {
+            if !names.contains(format!("{id}.json").as_str()) {
+                continue;
             }
-            _ => continue,
+            id
+        } else {
+            continue;
         };
-        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+        if let Some(mtime) = entry.mtime {
             let slot = by_snapshot
-                .entry(json_path)
+                .entry(id.to_string())
                 .or_insert(std::time::SystemTime::UNIX_EPOCH);
             if mtime > *slot {
                 *slot = mtime;
             }
         }
     }
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> =
-        by_snapshot.into_iter().map(|(p, t)| (t, p)).collect();
+    let mut files: Vec<(std::time::SystemTime, String)> =
+        by_snapshot.into_iter().map(|(id, t)| (t, id)).collect();
     files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     files.truncate(limit);
     let mut sessions: Vec<SessionInfo> = Vec::new();
-    for (_, path) in files {
-        if let Some(info) = parse_session_header(&path) {
+    for (_, id) in files {
+        if let Some(info) = parse_session_header(&dir, &format!("{id}.json")) {
             sessions.push(info);
         }
     }
@@ -386,7 +384,7 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
 /// Read + parse just the metadata header of one session file into a
 /// [`SessionInfo`] (no message history). `message_count` is left 0 — it isn't
 /// parsed in the header read; use [`Session::info`] when an exact count matters.
-fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
+fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<SessionInfo> {
     #[derive(Deserialize)]
     struct SessionMetadata {
         id: String,
@@ -400,7 +398,7 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
         #[serde(default)]
         session_cost: f64,
     }
-    let header = read_session_header(path)?;
+    let header = read_session_header(dir, file_name)?;
     let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
     let mut info = SessionInfo {
         id: meta.id,
@@ -415,12 +413,10 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
     // Journal freshness overlay (Task 35): when an opt-in journal exists,
     // its bounded meta tail is newer than the (possibly lagging) snapshot
     // header. Legacy sessions have no journal — zero extra I/O.
-    if let Some(dir) = path.parent() {
-        if let Some(tail) = crate::core::session_journal::journal_meta_tail(dir, &info.id) {
-            if tail.updated_at > info.updated_at {
-                info.updated_at = tail.updated_at;
-                info.session_cost = tail.session_cost;
-            }
+    if let Some(tail) = crate::core::session_journal::journal_meta_tail(dir, &info.id) {
+        if tail.updated_at > info.updated_at {
+            info.updated_at = tail.updated_at;
+            info.session_cost = tail.session_cost;
         }
     }
     Some(info)
@@ -433,12 +429,15 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
 /// history. Falls back to the whole file if the key isn't found (small/new
 /// sessions). This is what keeps `list_sessions()` O(#sessions) instead of
 /// O(total bytes on disk).
-fn read_session_header(path: &std::path::Path) -> Option<String> {
+fn read_session_header(dir: &std::path::Path, file_name: &str) -> Option<String> {
     use std::io::Read;
     const KEY: &[u8] = b"\"api_messages\"";
     const MAX_HEADER: usize = 256 * 1024; // safety cap if the key is never found
 
-    let mut file = std::fs::File::open(path).ok()?;
+    // fix2: confined strict open — same root resolution as every other
+    // session read; a symlinked ancestor or artifact yields None, never
+    // foreign bytes.
+    let mut file = crate::core::session_journal::confined_open(dir, file_name).ok()??;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut cut: Option<usize> = None;
@@ -502,17 +501,13 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 /// avoiding a full directory scan when the named session appears early.
 pub fn find_session_by_name(name: &str) -> std::io::Result<Session> {
     let dir = sessions_dir();
-    if dir.exists() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "json") {
-                continue;
-            }
-            if let Some(info) = parse_session_header(&path) {
-                if info.name.as_deref() == Some(name) {
-                    return Session::load(&info.id);
-                }
+    for entry in crate::core::session_journal::session_dir_entries(&dir)? {
+        if !entry.name.ends_with(".json") {
+            continue;
+        }
+        if let Some(info) = parse_session_header(&dir, &entry.name) {
+            if info.name.as_deref() == Some(name) {
+                return Session::load(&info.id);
             }
         }
     }

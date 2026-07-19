@@ -848,6 +848,156 @@ mod confined_reads {
         );
     }
 
+    /// fix2: `<tmp>/entry` is a SYMLINK to `<tmp>/secret`; the sessions
+    /// path `<tmp>/entry/sessions` therefore has a symlinked ANCESTOR.
+    /// Every read through it must refuse — resolving the ancestor would
+    /// disclose the secret tree's session content.
+    #[test]
+    fn symlinked_ancestor_above_sessions_is_refused_for_reads() {
+        let tmp = TempDir::new().unwrap();
+        // The secret tree holds a session whose body is the victim content.
+        let secret_sessions = tmp.path().join("secret").join("sessions");
+        let mut victim_session = session_with_messages(1);
+        victim_session.id = "victim-session".into();
+        victim_session.api_messages =
+            vec![Arc::new(json!({"role":"user","content": VICTIM_SENTINEL}))];
+        save_session_in_dir(&secret_sessions, &victim_session, SessionPersistence::Json).unwrap();
+
+        std::os::unix::fs::symlink(tmp.path().join("secret"), tmp.path().join("entry")).unwrap();
+        let attack_dir = tmp.path().join("entry").join("sessions");
+
+        let res = load_session_in_dir(&attack_dir, "victim-session");
+        match res {
+            Err(e) => assert!(
+                !e.to_string().contains(VICTIM_SENTINEL),
+                "refusal must not echo victim content"
+            ),
+            Ok(loaded) => panic!(
+                "a symlinked ancestor above sessions must be refused; \
+                 disclosed a session with {} messages",
+                loaded.api_messages.len()
+            ),
+        }
+        assert!(
+            journal_meta_tail(&attack_dir, "victim-session").is_none(),
+            "meta tail through a symlinked ancestor must disclose nothing"
+        );
+    }
+
+    /// fix2: writes share the same root resolution — saving through a
+    /// symlinked ancestor must refuse and leave the secret tree untouched.
+    #[test]
+    fn symlinked_ancestor_above_sessions_is_refused_for_writes() {
+        let tmp = TempDir::new().unwrap();
+        let secret_sessions = tmp.path().join("secret").join("sessions");
+        std::fs::create_dir_all(&secret_sessions).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("secret"), tmp.path().join("entry")).unwrap();
+        let attack_dir = tmp.path().join("entry").join("sessions");
+
+        let s = session_with_messages(1);
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let res = save_session_in_dir(&attack_dir, &s, mode);
+            assert!(
+                res.is_err(),
+                "{mode:?}: saving through a symlinked ancestor must refuse"
+            );
+        }
+        assert!(
+            std::fs::read_dir(&secret_sessions)
+                .unwrap()
+                .next()
+                .is_none(),
+            "no bytes may be written through the symlinked ancestor"
+        );
+
+        // Deletion shares the resolution too.
+        assert!(
+            delete_session_files_in_dir(&attack_dir, "anything").is_err(),
+            "deleting through a symlinked ancestor must refuse"
+        );
+    }
+
+    /// fix2: a legitimate DEEP real path (no symlinks anywhere) keeps
+    /// working — strictness must not over-refuse normal layouts.
+    #[test]
+    fn legitimate_deep_real_path_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c").join("sessions");
+        let mut s = session_with_messages(2);
+        save_session_in_dir(&deep, &s, SessionPersistence::Journal).unwrap();
+        push_msg(&mut s, "delta in a deep real tree");
+        s.updated_at = chrono::Utc::now();
+        save_session_in_dir(&deep, &s, SessionPersistence::Journal).unwrap();
+        assert_equivalent(&s, &load_session_in_dir(&deep, &s.id).unwrap());
+        delete_session_files_in_dir(&deep, &s.id).unwrap();
+        assert!(load_session_in_dir(&deep, &s.id).is_err());
+    }
+
+    /// fix2: concurrent ANCESTOR swap — a writer flips `<tmp>/anc` between
+    /// a real directory tree and a symlink to the secret tree while loads
+    /// run through `<tmp>/anc/sessions`. No load may ever disclose the
+    /// victim sentinel, and nothing may panic.
+    #[test]
+    fn concurrent_ancestor_swap_never_discloses_the_victim() {
+        let tmp = TempDir::new().unwrap();
+        // Secret tree with the victim session.
+        let secret_sessions = tmp.path().join("secret").join("sessions");
+        let mut victim_session = session_with_messages(1);
+        victim_session.id = "shared-id".into();
+        victim_session.api_messages =
+            vec![Arc::new(json!({"role":"user","content": VICTIM_SENTINEL}))];
+        save_session_in_dir(&secret_sessions, &victim_session, SessionPersistence::Json).unwrap();
+
+        // Legitimate tree with a benign session under the SAME id.
+        let real_root = tmp.path().join("real");
+        let mut benign = session_with_messages(1);
+        benign.id = "shared-id".into();
+        save_session_in_dir(
+            &real_root.join("sessions"),
+            &benign,
+            SessionPersistence::Json,
+        )
+        .unwrap();
+
+        let anc = tmp.path().join("anc");
+        let secret_root = tmp.path().join("secret");
+        std::fs::rename(&real_root, &anc).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = stop.clone();
+            let anc = anc.clone();
+            let real_holding = tmp.path().join("real-holding");
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // real dir out, symlink in…
+                    if std::fs::rename(&anc, &real_holding).is_ok() {
+                        let _ = std::os::unix::fs::symlink(&secret_root, &anc);
+                    }
+                    // …symlink out, real dir back.
+                    let _ = std::fs::remove_file(&anc);
+                    let _ = std::fs::rename(&real_holding, &anc);
+                }
+            })
+        };
+
+        let attack_dir = anc.join("sessions");
+        for _ in 0..300 {
+            match load_session_in_dir(&attack_dir, "shared-id") {
+                Ok(loaded) => {
+                    let dump = serde_json::to_string(&loaded.api_messages).unwrap();
+                    assert!(
+                        !dump.contains(VICTIM_SENTINEL),
+                        "an ancestor swap disclosed victim content"
+                    );
+                }
+                Err(e) => assert!(!e.to_string().contains(VICTIM_SENTINEL)),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().unwrap();
+    }
+
     /// Concurrent swap: a writer flips the journal between a real file and
     /// a symlink to the victim while readers load in a loop. No loaded
     /// state may ever contain the victim sentinel (confidentiality), and
