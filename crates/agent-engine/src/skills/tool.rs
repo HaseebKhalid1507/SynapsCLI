@@ -31,11 +31,28 @@ impl LoadSkillTool {
                 crate::BoundedText::new(&skill.name, 128).text
             )
         })?;
+        // Header fields are bounded AND control-sanitized here: discovery
+        // enforces these bounds for lazy skills, but `new_inline` is a
+        // public infallible constructor, so the header must not trust its
+        // metadata.
         Ok(format!(
             "# Skill: {} — {}\n\nFollow these guidelines for the rest of this conversation.\n\n{}",
-            skill.name, skill.description, body
+            sanitize_header_field(&skill.name, 128),
+            sanitize_header_field(&skill.description, 1024),
+            body
         ))
     }
+}
+
+/// Bounded, control-free projection of a header metadata field: control
+/// characters (which could forge markdown/ANSI structure in the tool
+/// result header) become spaces; the result is UTF-8-safe truncated.
+fn sanitize_header_field(raw: &str, max_bytes: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::BoundedText::new(&cleaned, max_bytes).text
 }
 
 #[async_trait::async_trait]
@@ -325,6 +342,44 @@ mod tests {
             PathBuf::from("/"),
             PathBuf::from("/SKILL.md"),
         )
+    }
+
+    /// Review fix: `new_inline` is public and infallible, so hostile
+    /// inline metadata must be neutralized at the output boundary — the
+    /// formatted header is bounded and control-free, and Debug renders
+    /// neither body content, nor paths, nor body-derived byte lengths.
+    #[test]
+    fn hostile_inline_metadata_is_bounded_and_redacted() {
+        let s = LoadedSkill::new_inline(
+            &format!("evil\u{7}name\u{1b}[31m{}", "n".repeat(300)),
+            &format!("desc\r\nwith\u{0}controls{}", "d".repeat(2000)),
+            "SECRET_INLINE_BODY_4242",
+            None,
+            PathBuf::from("/secret/base/dir"),
+            PathBuf::from("/secret/source/SKILL.md"),
+        );
+        let out = LoadSkillTool::format_body(&s).unwrap();
+        let header = out.lines().next().unwrap();
+        assert!(header.starts_with("# Skill: "));
+        assert!(
+            !header.chars().any(char::is_control),
+            "header must be control-free"
+        );
+        assert!(!header.contains('\u{7}') && !header.contains('\u{1b}'));
+        assert!(
+            header.len() < 1300,
+            "header bounded: {} bytes",
+            header.len()
+        );
+        // Body still delivered after the sanitized header.
+        assert!(out.contains("SECRET_INLINE_BODY_4242"));
+
+        // Debug: no body, no byte length, no paths.
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("SECRET_INLINE_BODY_4242"));
+        assert!(!rendered.contains("/secret/"));
+        assert!(!rendered.contains("bytes"), "no body-derived length");
+        assert!(!rendered.contains("23"), "no body length digits (23)");
     }
 
     #[test]

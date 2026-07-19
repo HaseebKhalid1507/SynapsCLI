@@ -96,10 +96,7 @@ pub(crate) enum SkillSource {
 impl std::fmt::Debug for SkillSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Inline(body) => f
-                .debug_struct("Inline")
-                .field("bytes", &body.len())
-                .finish(),
+            Self::Inline(_) => f.debug_struct("Inline").finish_non_exhaustive(),
             Self::Lazy { .. } => f.debug_struct("Lazy").finish_non_exhaustive(),
         }
     }
