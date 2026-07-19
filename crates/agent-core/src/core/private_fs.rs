@@ -302,7 +302,9 @@ impl ConfinedDir {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        Self::open_dir_nofollow_at_path(path)
+        let dir = Self::open_dir_nofollow_at_path(path)?;
+        dir.fchmod_private()?;
+        Ok(dir)
     }
 
     /// Open an EXISTING trusted root without creating it.
@@ -318,6 +320,17 @@ impl ConfinedDir {
             .open(path)
             .map_err(|e| confinement_error(path.to_string_lossy().as_ref(), &e))?;
         Ok(Self { handle })
+    }
+
+    /// Repair this directory's mode to 0700 via `fchmod` on the OPENED
+    /// handle (no path re-resolution; immune to umask and to pre-existing
+    /// broad modes).
+    fn fchmod_private(&self) -> std::io::Result<()> {
+        let rc = unsafe { libc::fchmod(self.fd(), 0o700) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn fd(&self) -> libc::c_int {
@@ -351,9 +364,11 @@ impl ConfinedDir {
             return Err(confinement_error(name, &err));
         }
         use std::os::unix::io::FromRawFd;
-        Ok(Self {
+        let dir = Self {
             handle: unsafe { File::from_raw_fd(fd) },
-        })
+        };
+        dir.fchmod_private()?;
+        Ok(dir)
     }
 
     /// Descend through validated relative directory components, creating
@@ -431,6 +446,61 @@ impl ConfinedDir {
         Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
     }
 
+    /// Open a descendant FILE for reading via handle-relative resolution
+    /// (CP-13 fix3): Linux tries `openat2` with `RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS` over the whole validated relative path, falling
+    /// back to the component `O_NOFOLLOW` directory walk plus a final
+    /// `openat(O_RDONLY|O_NOFOLLOW)`. The opened handle must be a regular
+    /// file by handle metadata. No full-path re-open ever happens — an
+    /// ancestor swapped to a symlink after discovery is refused here.
+    pub fn open_file(&self, components: &[String]) -> std::io::Result<File> {
+        let (name, dirs) = components
+            .split_last()
+            .ok_or_else(|| std::io::Error::other("empty confined file path"))?;
+        for component in components {
+            let _ = validated_component_cstring(component)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let joined = components.join("/");
+            match self.openat2_beneath(&joined, libc::O_RDONLY | libc::O_NOFOLLOW) {
+                Ok(file) => {
+                    let meta = file.metadata()?;
+                    if !meta.is_file() {
+                        return Err(std::io::Error::other(format!(
+                            "confined source {joined:?} is not a regular file"
+                        )));
+                    }
+                    return Ok(file);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {} // fall back
+                Err(e) => return Err(confinement_error(&joined, &e)),
+            }
+        }
+        let dir = self.open_dirs(dirs)?;
+        let c_name = validated_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                dir.fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "confined source {name:?} is not a regular file"
+            )));
+        }
+        Ok(file)
+    }
+
     /// Create a file (validated single component) `O_CREAT|O_EXCL|
     /// O_NOFOLLOW` 0600 relative to this handle. An existing entry —
     /// including any symlink, even one swapped in concurrently — fails.
@@ -466,6 +536,80 @@ impl ConfinedDir {
         Ok(Self {
             handle: self.handle.try_clone()?,
         })
+    }
+}
+
+/// One entry discovered from a held directory handle. Discovery never
+/// re-resolves the directory by path; callers still perform the authoritative
+/// open relative to the same handle, so entry replacement races fail closed.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfinedEntry {
+    pub name: String,
+    pub is_file: bool,
+    pub is_dir: bool,
+}
+
+#[cfg(unix)]
+impl ConfinedDir {
+    /// Enumerate direct children via `fdopendir(dup(dirfd))` + `readdir` and
+    /// classify each with handle-relative `fstatat(AT_SYMLINK_NOFOLLOW)`.
+    /// Symlinks are returned as neither file nor directory. Names that are
+    /// non-UTF8 or invalid confined components are omitted.
+    pub fn entries(&self) -> std::io::Result<Vec<ConfinedEntry>> {
+        let duplicated = unsafe { libc::dup(self.fd()) };
+        if duplicated < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let directory = unsafe { libc::fdopendir(duplicated) };
+        if directory.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicated) };
+            return Err(error);
+        }
+
+        let mut entries = Vec::new();
+        loop {
+            let raw = unsafe { libc::readdir(directory) };
+            if raw.is_null() {
+                break;
+            }
+            let name_bytes = unsafe { std::ffi::CStr::from_ptr((*raw).d_name.as_ptr()) };
+            let Ok(name) = name_bytes.to_str() else {
+                continue;
+            };
+            if name == "." || name == ".." || validated_component_cstring(name).is_err() {
+                continue;
+            }
+            let c_name = validated_component_cstring(name)?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    self.fd(),
+                    c_name.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                // Entry disappeared or changed during enumeration. The
+                // authoritative later open decides; there is nothing safe to
+                // report from this stale directory record.
+                continue;
+            }
+            let kind = stat.st_mode & libc::S_IFMT;
+            entries.push(ConfinedEntry {
+                name: name.to_string(),
+                is_file: kind == libc::S_IFREG,
+                is_dir: kind == libc::S_IFDIR,
+            });
+        }
+        let close_rc = unsafe { libc::closedir(directory) }; // owns duplicated fd
+        if close_rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 }
 

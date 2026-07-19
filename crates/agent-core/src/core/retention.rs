@@ -562,64 +562,6 @@ fn cache_files(cache_dir: &Path) -> Vec<PathBuf> {
     walk_regular_files(cache_dir)
 }
 
-/// Copy one artifact with no symlink surface on either side and no
-/// check/use window (CP-13 fix2): the SOURCE is opened `O_NOFOLLOW` and
-/// must be a regular file by opened-handle metadata; the DESTINATION file
-/// is created `O_CREAT|O_EXCL|O_NOFOLLOW` 0600 RELATIVE to a held
-/// [`ConfinedDir`] handle, so neither ancestor symlinks nor concurrently
-/// swapped components can redirect the write.
-#[cfg(unix)]
-fn copy_into_confined(
-    src: &Path,
-    dest_dir: &crate::private_fs::ConfinedDir,
-    name: &str,
-) -> io::Result<u64> {
-    use std::io::Read;
-
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc_nofollow());
-    }
-    let mut source = options.open(src)?;
-    let meta = source.metadata()?;
-    if !meta.is_file() {
-        return Err(io::Error::other(format!(
-            "refusing to export non-regular file {}",
-            src.display()
-        )));
-    }
-
-    let mut out = dest_dir.create_file(name)?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    loop {
-        let n = source.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        use std::io::Write;
-        out.write_all(&buf[..n])?;
-        written += n as u64;
-    }
-    Ok(written)
-}
-
-#[cfg(unix)]
-fn libc_nofollow() -> i32 {
-    // O_NOFOLLOW without a libc dependency: the constant is stable ABI on
-    // the supported unix targets.
-    #[cfg(target_os = "linux")]
-    {
-        0o400000
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x0100
-    }
-}
-
 /// Production sweep at the current clock.
 pub fn sweep(
     roots: &RetentionRoots,
@@ -717,63 +659,123 @@ pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> 
     let mut summary = ExportSummary { files: 0, bytes: 0 };
     let root = ConfinedDir::create_root(dest)?;
 
+    // Flat domains: discovery AND authoritative opens are relative to the
+    // same held trusted source-root handle. There is no full-path source
+    // reopen after discovery. A planted/swap-raced source entry is refused
+    // by open_file; a destination collision remains a hard error.
     let flat = [
         (roots.sessions_dir(), "sessions"),
         (roots.memory_dir(), "memory"),
     ];
     for (src, sub) in flat {
-        let out = root.child_dir(sub)?;
-        for file in list_files(&src) {
-            if file
-                .symlink_metadata()
-                .map(|m| m.is_symlink())
-                .unwrap_or(true)
-            {
-                continue; // source symlinks are never followed
-            }
-            let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            summary.bytes += copy_into_confined(&file, &out, name)?;
-            summary.files += 1;
-        }
-    }
-
-    // Traces: recursive under the confined cache root, preserving relative
-    // subpaths through validated components and handle-relative descents.
-    let traces_root = root.child_dir("traces")?;
-    for file in walk_regular_files(&roots.cache_dir) {
-        let rel = file
-            .strip_prefix(&roots.cache_dir)
-            .map_err(|_| io::Error::other("cache walk escaped its root"))?;
-        let rel_str = rel
-            .to_str()
-            .ok_or_else(|| io::Error::other("non-UTF8 cache path"))?;
-        let mut components = crate::private_fs::validated_relative_components(rel_str)?;
-        let name = components
-            .pop()
-            .ok_or_else(|| io::Error::other("empty cache relative path"))?;
-        let dir = traces_root.create_dirs(&components)?;
-        summary.bytes += copy_into_confined(&file, &dir, &name)?;
-        summary.files += 1;
-    }
-
-    let logs_out = root.child_dir("logs")?;
-    for file in log_files(&roots.config_dir) {
-        if file
-            .symlink_metadata()
-            .map(|m| m.is_symlink())
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
-            continue;
+        let Ok(src_root) = ConfinedDir::open_root(&src) else {
+            continue; // absent domain — nothing to export
         };
-        summary.bytes += copy_into_confined(&file, &logs_out, name)?;
-        summary.files += 1;
+        let out = root.child_dir(sub)?;
+        for entry in src_root.entries()? {
+            if !entry.is_file {
+                continue; // source symlink/non-regular entries are omitted
+            }
+            let components = [entry.name.clone()];
+            match src_root.open_file(&components) {
+                Ok(source) => {
+                    let bytes = copy_opened_into_confined(source, &out, &entry.name)?;
+                    summary.bytes += bytes;
+                    summary.files += 1;
+                }
+                // Entry changed after enumeration (including a swap to a
+                // symlink): refuse/skip it, never follow it.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    // Traces: recursively walk entirely through source directory handles.
+    if let Ok(cache_root) = ConfinedDir::open_root(&roots.cache_dir) {
+        let traces_root = root.child_dir("traces")?;
+        export_tree_from_handles(&cache_root, &traces_root, &mut summary, 0)?;
+    }
+
+    // Logs: enumerate the config root through its handle, filter the
+    // handle-returned names, and open relative to the same handle.
+    if let Ok(logs_root) = ConfinedDir::open_root(&roots.config_dir) {
+        let logs_out = root.child_dir("logs")?;
+        for entry in logs_root.entries()? {
+            if !entry.is_file || !entry.name.starts_with("synaps.log") {
+                continue;
+            }
+            match logs_root.open_file(&[entry.name.clone()]) {
+                Ok(source) => {
+                    let bytes = copy_opened_into_confined(source, &logs_out, &entry.name)?;
+                    summary.bytes += bytes;
+                    summary.files += 1;
+                }
+                Err(_) => continue,
+            }
+        }
     }
     Ok(summary)
+}
+
+/// Copy an ALREADY-CONFINED opened regular source handle into a destination
+/// created relative to a held destination directory handle.
+#[cfg(unix)]
+fn copy_opened_into_confined(
+    mut source: fs::File,
+    dest_dir: &crate::private_fs::ConfinedDir,
+    name: &str,
+) -> io::Result<u64> {
+    use std::io::{Read, Write};
+    if !source.metadata()?.is_file() {
+        return Err(io::Error::other("confined export source is not regular"));
+    }
+    let mut out = dest_dir.create_file(name)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = source.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        written += n as u64;
+    }
+    Ok(written)
+}
+
+/// Recursive source traversal using held source and destination directory
+/// handles only. Symlink entries are never opened; a directory swapped after
+/// enumeration fails child `open_dirs` and is skipped. Bounded depth.
+#[cfg(unix)]
+fn export_tree_from_handles(
+    source: &crate::private_fs::ConfinedDir,
+    destination: &crate::private_fs::ConfinedDir,
+    summary: &mut ExportSummary,
+    depth: usize,
+) -> io::Result<()> {
+    if depth > 32 {
+        return Err(io::Error::other("confined export source depth exceeds 32"));
+    }
+    for entry in source.entries()? {
+        if entry.is_file {
+            match source.open_file(&[entry.name.clone()]) {
+                Ok(opened) => {
+                    let bytes = copy_opened_into_confined(opened, destination, &entry.name)?;
+                    summary.bytes += bytes;
+                    summary.files += 1;
+                }
+                Err(_) => continue,
+            }
+        } else if entry.is_dir {
+            let source_child = match source.open_dirs(&[entry.name.clone()]) {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            let dest_child = destination.child_dir(&entry.name)?;
+            export_tree_from_handles(&source_child, &dest_child, summary, depth + 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// Non-unix: confined export is unavailable — fail closed.

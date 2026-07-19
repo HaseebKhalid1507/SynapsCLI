@@ -874,3 +874,121 @@ fn trace_forget_handles_nested_relative_ids_confined() {
         "symlinked cache ancestors must never be traversed for deletion"
     );
 }
+
+// ─── CP-13 fix3: SOURCE-side confinement ─────────────────────────────────────
+
+/// CP-13 fix3: the authoritative source open happens RELATIVE to the held
+/// source-root handle — a deterministic ancestor swap between discovery
+/// and open (the exact race window) is refused, and the outside victim is
+/// never read.
+#[cfg(unix)]
+#[test]
+fn source_opens_are_confined_against_deterministic_ancestor_swaps() {
+    use agent_core::private_fs::ConfinedDir;
+    let h = harness();
+
+    // Real nested source file, discovered legitimately…
+    std::fs::create_dir_all(h.roots.cache_dir.join("sub")).unwrap();
+    std::fs::write(h.roots.cache_dir.join("sub/t.jsonl"), "legit\n").unwrap();
+    let root = ConfinedDir::open_root(&h.roots.cache_dir).unwrap();
+
+    // …then the attacker swaps the ANCESTOR for a symlink to a victim dir
+    // holding same-named bait, in the window between discovery and open.
+    let victim_dir = h.roots.base_dir.join("victim-src");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::write(victim_dir.join("t.jsonl"), "OUTSIDE-SOURCE-SECRET\n").unwrap();
+    std::fs::remove_file(h.roots.cache_dir.join("sub/t.jsonl")).unwrap();
+    std::fs::remove_dir(h.roots.cache_dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, h.roots.cache_dir.join("sub")).unwrap();
+
+    let err = root
+        .open_file(&["sub".to_string(), "t.jsonl".to_string()])
+        .unwrap_err();
+    let _ = err; // refused — the swapped ancestor is never traversed
+
+    // A symlinked FINAL component is refused the same way.
+    let victim_file = h.roots.base_dir.join("victim-src-file");
+    std::fs::write(&victim_file, "OUTSIDE-FILE-SECRET\n").unwrap();
+    std::os::unix::fs::symlink(&victim_file, h.roots.cache_dir.join("planted.jsonl")).unwrap();
+    assert!(root.open_file(&["planted.jsonl".to_string()]).is_err());
+}
+
+/// CP-13 fix3: a full export over a source tree with planted symlinks
+/// (ancestor dir and final file) never reads or exports outside-victim
+/// content, and no full-path re-open bypasses the held root handles.
+#[cfg(unix)]
+#[test]
+fn export_never_reads_outside_victims_through_planted_source_symlinks() {
+    let h = harness();
+    write_session(&h.roots, "s1", 50 * DAY_MS, None);
+    std::fs::create_dir_all(h.roots.cache_dir.join("real")).unwrap();
+    std::fs::write(h.roots.cache_dir.join("real/keep.jsonl"), "keep\n").unwrap();
+
+    let victim_dir = h.roots.base_dir.join("victim-src2");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::write(victim_dir.join("bait.jsonl"), "OUTSIDE-SOURCE-SECRET\n").unwrap();
+    // Planted ancestor symlink inside the cache tree.
+    std::os::unix::fs::symlink(&victim_dir, h.roots.cache_dir.join("linkdir")).unwrap();
+    // Planted final-component symlink in a flat source dir.
+    std::os::unix::fs::symlink(
+        victim_dir.join("bait.jsonl"),
+        h.roots.config_dir.join("sessions/planted.json"),
+    )
+    .unwrap();
+
+    let dest = h.roots.base_dir.join("export-src-confined");
+    let summary = export(&h.roots, &dest).unwrap();
+    assert!(summary.files >= 2, "legit artifacts still export");
+
+    // NOTHING under dest may carry outside-victim bytes.
+    fn assert_no_secret(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                assert_no_secret(&path);
+            } else {
+                let body = std::fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    !body.contains("OUTSIDE-SOURCE-SECRET"),
+                    "outside victim content exported via {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert_no_secret(&dest);
+    assert!(dest.join("traces/real/keep.jsonl").exists());
+}
+
+/// CP-13 fix3: destination root and child directory modes are repaired to
+/// 0700 via fchmod on the OPENED handles — pre-existing broad modes do not
+/// survive an export.
+#[cfg(unix)]
+#[test]
+fn export_repairs_preexisting_destination_directory_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness();
+    write_session(&h.roots, "s1", 50 * DAY_MS, None);
+
+    let dest = h.roots.base_dir.join("export-modes");
+    std::fs::create_dir_all(dest.join("sessions")).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        dest.join("sessions"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    export(&h.roots, &dest).unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&dest),
+        0o700,
+        "pre-existing root mode must be repaired"
+    );
+    assert_eq!(
+        mode(&dest.join("sessions")),
+        0o700,
+        "pre-existing child mode must be repaired"
+    );
+}
