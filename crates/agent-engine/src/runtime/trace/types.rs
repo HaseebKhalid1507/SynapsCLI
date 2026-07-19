@@ -475,7 +475,57 @@ pub struct PrefixMeta {
     pub digest: ComponentDigest,
 }
 
-/// Cache boundaries and stable-prefix digests (spec §6.6 seeds).
+/// Previous-turn comparison state for one cache segment (spec §6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentChange {
+    /// Keyed digest identical to the previous emitted request in this
+    /// session — the provider can reuse its cached prefix.
+    Unchanged,
+    /// Keyed digest differs from the previous emitted request.
+    Changed,
+    /// No previous request in this session (or the segment appeared/vanished).
+    New,
+}
+
+/// Per-segment previous-turn change report plus changed-tool detail and
+/// reuse estimates (spec §6.6). Every field is bounded metadata: enums,
+/// validated tool IDs, and byte counts — never content. All fields are
+/// optional/defaulted so `synaps-request-trace/1` records written before
+/// this struct existed still deserialize.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSegmentDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<SegmentChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SegmentChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_tail: Option<SegmentChange>,
+    /// Stable IDs of tools whose schema digest changed, or that were added
+    /// or removed, relative to the previous emitted request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_tool_ids: Vec<TraceId>,
+    /// True when the same tool set was sent in a different order — an
+    /// intentional-looking prefix invalidation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_order_changed: bool,
+    /// Estimated bytes the provider can reuse from its cached prefix
+    /// (sum of unchanged-segment canonical byte lengths). An estimate over
+    /// canonical component bytes, not provider-internal token accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_reused_bytes: Option<u64>,
+    /// Estimated bytes the provider must recompute (changed/new segments +
+    /// the history tail when it changed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_recomputed_bytes: Option<u64>,
+}
+
+/// Cache boundaries, stable-prefix digests, and previous-turn segment
+/// deltas (spec §6.6). The prefix/tail digests are keyed HMAC over
+/// **canonical component bytes** (see `trace::diagnostics` for the exact
+/// canonicalization and its documented approximations) — never a
+/// re-serialization passed off as exact wire bytes. All diagnostic fields
+/// are optional for backward-compatible deserialization.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheMeta {
     pub boundaries: Vec<CacheBoundaryMeta>,
@@ -483,6 +533,14 @@ pub struct CacheMeta {
     pub tools_prefix: Option<PrefixMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prefix: Option<PrefixMeta>,
+    /// History tail: the canonical bytes of the messages *after* the last
+    /// message-level cache boundary (the segment the provider recomputes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_tail: Option<PrefixMeta>,
+    /// Previous-turn per-segment comparison, when a session snapshot was
+    /// available to compare against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<CacheSegmentDelta>,
 }
 
 /// What a provider adapter did to a non-representable element.

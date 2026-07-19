@@ -93,6 +93,17 @@ pub(super) async fn cloud_invoke_stream(
         stream: true,
         options: Default::default(),
     };
+    // One-shot explicit content capture (`/trace next content`): the exact
+    // provider wire bytes live behind the broker boundary, but this
+    // serialized broker request body IS the full pre-send request content
+    // this process hands over — body only (normalized messages/options),
+    // never credentials or transport headers, which the broker attaches
+    // out of process.
+    if let Some(request_id) = attempt.request_id() {
+        if let Ok(body) = serde_json::to_vec(&request) {
+            trace.capture_request_content(request_id, &body);
+        }
+    }
     let context_ref = cloud_context.unwrap_or(provider.as_str());
     let mut stream = match broker
         .cloud_invoke(provider, context_ref, cloud_model, request)

@@ -271,6 +271,12 @@ pub(crate) async fn call_google_gemini_stream_inner(
         tools_schema,
     )
     .await;
+    // One-shot explicit content capture: `body_bytes` is the serialized
+    // envelope this process built pre-send (exact wire bytes on the local
+    // broker) — body only, never headers or credentials.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
     let mut attempt = tro::StreamAttempt::new(tracer);
 
     let mut stream = {

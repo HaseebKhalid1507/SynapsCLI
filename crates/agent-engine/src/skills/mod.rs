@@ -77,6 +77,8 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "extensions",
     "status",
     "stats",
+    "context",
+    "trace",
     "ping",
     "keybinds",
     "sidecar",

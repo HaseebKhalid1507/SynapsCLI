@@ -29,28 +29,40 @@
 //! to `None`. Struct field order is the deterministic serialization order.
 
 pub mod anthropic;
+pub mod controls;
+pub mod diagnostics;
 pub mod emit;
+pub mod export;
 pub mod extension;
 pub mod google;
 mod key;
 pub mod openai;
 mod types;
 
+pub use controls::{
+    default_capture_dir, ContentCapture, TraceArm, TraceControls, TraceStatusReport,
+    CAPTURE_MAX_BYTES, CAPTURE_TTL, CONTENT_CAPTURE_SCHEMA,
+};
+pub use diagnostics::{CacheActivity, CacheSnapshotStore, ContextReport, ReportValue};
 pub use emit::{
     wire_meta_from_sent_bytes, AttemptClock, CollectingTraceSink, NoopTraceSink, RequestStructure,
     RequestTracer, TraceContext, TraceSink,
+};
+pub use export::{
+    export_content, export_metadata, redact_value, sweep_expired_captures, ContentExport,
+    ExportError, MetadataExportStats, CONTENT_EXPORT_SCHEMA,
 };
 pub use key::{
     default_digest_key_path, keyed_digest, load_or_create_digest_key, load_or_create_digest_key_at,
     ComponentDigest, DigestDomain, TraceDigestKey, TraceKeyError,
 };
 pub use types::{
-    BlockKind, BlockMeta, CacheBoundaryLocation, CacheBoundaryMeta, CacheMeta, CacheTtlClass,
-    EndpointMeta, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy, RequestTrace, RetryClass,
-    RetryMeta, StopReason, SystemSegmentKind, SystemSegmentMeta, TimingStages, ToolMeta, TraceId,
-    TraceSchemaVersion, TranslationAction, TranslationElement, TranslationLoss, TransportKind,
-    TransportOutcome, UsageMeta, UsageProvenance, WireMeta, WireName, TRACE_ID_MAX_BYTES,
-    TRACE_SCHEMA, WIRE_NAME_MAX_BYTES,
+    BlockKind, BlockMeta, CacheBoundaryLocation, CacheBoundaryMeta, CacheMeta, CacheSegmentDelta,
+    CacheTtlClass, EndpointMeta, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy,
+    RequestTrace, RetryClass, RetryMeta, SegmentChange, StopReason, SystemSegmentKind,
+    SystemSegmentMeta, TimingStages, ToolMeta, TraceId, TraceSchemaVersion, TranslationAction,
+    TranslationElement, TranslationLoss, TransportKind, TransportOutcome, UsageMeta,
+    UsageProvenance, WireMeta, WireName, TRACE_ID_MAX_BYTES, TRACE_SCHEMA, WIRE_NAME_MAX_BYTES,
 };
 
 #[cfg(test)]

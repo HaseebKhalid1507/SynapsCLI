@@ -180,6 +180,7 @@ pub async fn begin_extension_tracer(
         false,
         false,
         translation,
+        None,
     );
     // The JSON-RPC sidecar transport owns framing/serialization — this
     // process never holds the exact bytes, so no wire digest is ever claimed.
@@ -187,6 +188,15 @@ pub async fn begin_extension_tracer(
     // cache_control annotations on the internal messages are not a wire
     // contract with the extension; reporting boundaries would fabricate them.
     structure.cache = Default::default();
+    // Content capture (`/trace next content`) is statically unsupported
+    // here for the same reason: no exact serialized request body exists in
+    // this process, and a re-serialization of the params would masquerade
+    // as wire content. Fail the arm explicitly (metadata warning + degraded
+    // counter) — never silently consume it with no artifact.
+    trace.capture_unsupported(
+        "extension provider: the sidecar owns request serialization; \
+         no exact request body exists in this process",
+    );
     RequestTracer::begin(trace, model, TransportKind::Extension, endpoint, structure)
 }
 

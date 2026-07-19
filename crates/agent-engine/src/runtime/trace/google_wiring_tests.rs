@@ -320,6 +320,96 @@ async fn gemini_429_retry_emits_one_record_per_attempt() {
     assert_schema_valid_and_content_free(&records);
 }
 
+/// B1 (Task 12): a one-shot-gated armed context covers exactly one
+/// *logical* request. Two actual sequential transport calls run through the
+/// SAME context (as tool-loop continuations share one `ApiOptions`); the
+/// first request retries (429 → success) and every one of its attempts
+/// emits a record, while the second request emits nothing at all.
+#[tokio::test(start_paused = true)]
+async fn one_shot_gate_covers_first_logical_request_with_all_retries_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let key_path = tmp.path().join("trace").join("digest.key");
+    let capture_dir = tmp.path().join("trace").join("capture");
+    let sink = CollectingTraceSink::new();
+    let trace = TraceContext::with_sink(sink.clone())
+        .with_key_path(key_path.clone())
+        .with_one_shot_request_gate()
+        .with_content_capture(Arc::new(super::ContentCapture::new(capture_dir.clone())));
+    let h = Harness {
+        sink: sink.clone(),
+        trace,
+        key_path,
+        _tmp: tmp,
+    };
+
+    // Request 1: one failed attempt (429), then success — two actual sends.
+    // Request 2: immediate success — one actual send.
+    let stub = GeminiBroker::new(vec![
+        Err(RATE_LIMIT_429.to_string()),
+        Ok(success_chunks()),
+        Ok(success_chunks()),
+    ]);
+    let broker: Arc<dyn CredentialBroker> = stub.clone();
+
+    run_gemini(
+        &h,
+        &broker,
+        &[],
+        &None,
+        &messages(),
+        &CancellationToken::new(),
+        true,
+    )
+    .await
+    .expect("first request recovers after 429");
+
+    run_gemini(
+        &h,
+        &broker,
+        &[],
+        &None,
+        &messages(),
+        &CancellationToken::new(),
+        true,
+    )
+    .await
+    .expect("second request succeeds");
+
+    assert_eq!(stub.stream_calls(), 3, "three actual transport sends");
+    let records = h.sink.records();
+    assert_eq!(
+        records.len(),
+        2,
+        "records only for the first logical request (both of its attempts)"
+    );
+    assert_eq!(
+        records[0].request_id, records[1].request_id,
+        "both records belong to the first request"
+    );
+    assert_eq!(records[0].attempt, 1);
+    assert_eq!(records[1].attempt, 2);
+    assert_eq!(records[1].outcome.terminal, TurnOutcome::Completed);
+    assert!(
+        !h.trace.enabled(),
+        "consumed gate reports the context disabled for later requests"
+    );
+    // Content-capture one-shot stays aligned with the first request:
+    // exactly one bundle, correlated to the first request's ID.
+    let bundles: Vec<_> = std::fs::read_dir(&capture_dir)
+        .expect("capture dir exists")
+        .flatten()
+        .collect();
+    assert_eq!(bundles.len(), 1, "exactly one capture bundle");
+    let bundle: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(bundles[0].path()).unwrap()).unwrap();
+    assert_eq!(
+        bundle["request_id"].as_str().unwrap(),
+        records[0].request_id.as_str(),
+        "capture belongs to the first (gated) request"
+    );
+    assert_schema_valid_and_content_free(&records);
+}
+
 #[tokio::test]
 async fn gemini_terminal_failure_records_status_without_provider_text() {
     let h = harness();

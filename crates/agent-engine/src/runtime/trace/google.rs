@@ -298,6 +298,7 @@ pub async fn begin_cloud_invoke_tracer(
         false,
         false,
         cloud_translation_losses(messages),
+        None,
     );
     // No exact bytes exist in this process — never claim a wire digest.
     structure.wire = None;

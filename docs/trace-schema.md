@@ -23,7 +23,7 @@ deterministic JSON serialization order.
 | `system_segments` | array | Per segment: `kind`, `byte_len`, keyed `digest`. |
 | `messages` | array | Per message: `role` + per-block `kind`/`byte_len`. |
 | `tools` | array | `stable_id` (`TraceId`), `wire_name` (`WireName`), `schema_byte_len`, keyed `schema_digest`. |
-| `cache` | object | Boundary markers (`location`, `index`, `ttl`) plus optional tools/system stable-prefix `byte_len` + keyed digest. |
+| `cache` | object | Boundary markers (`location`, `index`, `ttl`) plus optional cache-prefix diagnostics (Task 12, spec §6.6): tools/system stable-prefix and history-tail `byte_len` + keyed digest, and a per-segment previous-turn `delta`. All diagnostic fields are optional/defaulted — pre-Task-12 records still deserialize. |
 | `translation_losses` | array | See *Translation losses*. Populated by the provider adapter's `TranslationReport` (Task 9, `runtime/transport/`). |
 | `outcome` | object | `TransportOutcome`, below. |
 
@@ -134,7 +134,7 @@ the preceding failed attempt was already recorded.
 
 ## Persistence & shutdown flush (Task 11)
 
-- **Toggle semantics (until Task 12 adds explicit trace config/UI):** the
+- **Toggle semantics:** the
   `telemetry` config key gates BOTH record kinds through one bounded session
   writer. `basic`/`full` enables legacy telemetry persistence
   (`~/.cache/synaps/api-log.jsonl`) and metadata-only trace persistence
@@ -152,3 +152,62 @@ the preceding failed attempt was already recorded.
   warning (counter stats, never record content) and the exit proceeds —
   trace loss never changes an exit outcome. With telemetry `off` the flush
   returns `None` and is a true no-op.
+
+## Task 12 — cache-prefix diagnostics, `/context`, trace controls & export
+
+- **Cache diagnostics (spec §6.6):** the `cache` object may carry
+  `tools_prefix`, `system_prefix`, and `history_tail` (`byte_len` + keyed
+  digest over **canonical component bytes** — see
+  `runtime/trace/diagnostics.rs` for the exact canonicalization and its
+  documented approximations; the digests are keyed with the installation
+  HMAC key and are never re-serialized wire bytes claimed as exact) plus a
+  `delta` object: per-segment previous-turn state
+  (`unchanged`/`changed`/`new`), `changed_tool_ids`, `tool_order_changed`,
+  and `estimated_reused_bytes`/`estimated_recomputed_bytes` (canonical-byte
+  estimates, not provider token accounting). The previous-turn snapshot
+  lives in the session `TraceContext` (bounded metadata only, one mutex,
+  compare-and-update atomic per emitted request); provider cache
+  read/write token counts remain in `outcome.usage`. Currently computed on
+  the Anthropic Messages path (the only wire that carries cache markers);
+  other transports leave the diagnostic fields absent.
+- **`/context`:** metadata-only report (system/tool/history counts+bytes,
+  latest cache component change and reuse estimates, writer/degradation
+  counters). Skills/memories and — outside history-owning surfaces —
+  history counts are reported `unavailable` with that provenance, never
+  fabricated.
+- **`/trace next` / `/trace next content` / `/trace status`:** one-shot
+  arm for exactly the next **logical** provider request (works with
+  telemetry `off` via an ephemeral writer whose handle the runtime retains
+  and drains in the shutdown epilogue; auto-disarms; never enables
+  indefinite persistence). The arm is consumed inside
+  `RequestTracer::begin`: the first request through the armed context wins,
+  all of its retry attempts emit records, and subsequent tool-loop requests
+  sharing the same options are disabled. `next content` additionally writes
+  a **redacted-at-capture**, bounded (1 MiB) capture bundle
+  (`synaps-trace-content-capture/1`, `0600`, under
+  `<synaps base dir>/trace/capture/`) of the request **body only** —
+  headers/credentials structurally never reach the capture seam. Capture is
+  supported wherever this process holds the serialized request body
+  pre-send (Anthropic, OpenAI-compatible, Codex, xAI, Gemini, and the
+  cloud-invoke broker request); on the extension sidecar path (which owns
+  serialization out of process) the arm fails explicitly — a metadata
+  warning plus a degraded-records bump visible in `/trace status`, never a
+  silent consume. Internal compaction requests never consume the arm.
+
+  **Capture expiry (documented guarantee):** expiry is *logical* — a
+  bundle older than 15 minutes can never be exported (the export path
+  checks the embedded expiry and deletes stale bundles). Physical deletion
+  is *opportunistic*: no background process survives CLI exit, so stale
+  bundles are swept on the next trace interaction (new capture,
+  `/trace status`, any `synaps trace export` invocation).
+- **`synaps trace export <id> --metadata-only --output PATH`:** validates
+  every trace-log line as a `RequestTrace`, selects the exact turn/request
+  ID, and writes re-serialized records to a fresh private file (`0600`,
+  parent `0700`, symlink and pre-existing targets refused). No network.
+- **`synaps trace export <id> --include-content --allow-content-export`:**
+  fail-closed content export. Requires both flags in one invocation plus an
+  existing unexpired capture bundle; re-redacts recursively (defense in
+  depth), writes a `synaps-trace-content-export/1` artifact (never a
+  request-trace schema), and consumes (deletes) the bundle. Expired or
+  malformed bundles are deleted and refused. Prompts are never
+  reconstructed from sessions.

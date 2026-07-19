@@ -92,6 +92,8 @@ fn sample_trace(key: &TraceDigestKey) -> RequestTrace {
                 digest: digest_of(key, DigestDomain::ToolsPrefix, &tool_schema),
             }),
             system_prefix: None,
+            history_tail: None,
+            delta: None,
         },
         translation_losses: vec![TranslationLoss {
             action: TranslationAction::Downgraded,
@@ -581,4 +583,78 @@ fn terminal_turn_outcome_round_trips_in_envelope() {
         let back: RequestTrace = serde_json::from_str(&json).unwrap();
         assert_eq!(back.outcome.terminal, outcome);
     }
+}
+
+/// Task 12 fix 4: forking an armed ephemeral context preserves the session
+/// cache snapshot store, so `/context` sees the armed request's §6.6
+/// diagnostics (and the session identity/counters stay shared).
+#[test]
+fn forked_context_shares_session_cache_snapshot_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = test_key(dir.path(), "fork-key");
+    let base = TraceContext::with_sink(CollectingTraceSink::new());
+    let fork = base.fork_with_sink(CollectingTraceSink::new());
+    let msgs: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(serde_json::json!({
+        "role": "user",
+        "content": "hi",
+    }))];
+    fork.cache_snapshots()
+        .compare_and_update(Some(&key), &[], Some("sys"), &msgs);
+    assert!(
+        base.cache_snapshots().last_activity().is_some(),
+        "armed fork must feed the same /context diagnostics store"
+    );
+}
+
+/// B1: the one-shot request gate is consumed by the first
+/// `RequestTracer::begin`; that request's retry attempts all emit, and a
+/// second logical request through the same context begins nothing.
+#[test]
+fn one_shot_gate_admits_one_tracer_with_all_its_attempts() {
+    let sink = CollectingTraceSink::new();
+    let ctx = TraceContext::with_sink(sink.clone()).with_one_shot_request_gate();
+    let model = agent_core::prompt::QualifiedModelId::parse("anthropic/claude-test").unwrap();
+    let endpoint = EndpointMeta::new("api.anthropic.com", "/v1/messages").unwrap();
+
+    let mut first = RequestTracer::begin(
+        &ctx,
+        model.clone(),
+        TransportKind::AnthropicMessages,
+        endpoint.clone(),
+        RequestStructure::default(),
+    )
+    .expect("first logical request wins the gate");
+    // Retry attempt then final attempt: both emit.
+    first.attempt_failed(
+        AttemptClock::start(),
+        RetryClass::RateLimited,
+        std::time::Duration::from_millis(1),
+        Some(429),
+        None,
+        "http_429",
+    );
+    first.finish(
+        AttemptClock::start(),
+        Some(200),
+        None,
+        Some(StopReason::EndTurn),
+        None,
+        TurnOutcome::Completed,
+    );
+
+    assert!(
+        RequestTracer::begin(
+            &ctx,
+            model,
+            TransportKind::AnthropicMessages,
+            endpoint,
+            RequestStructure::default(),
+        )
+        .is_none(),
+        "second logical request must not trace"
+    );
+    let records = sink.records();
+    assert_eq!(records.len(), 2, "both attempts of the first request emit");
+    assert_eq!(records[0].request_id, records[1].request_id);
+    assert!(!ctx.enabled(), "consumed gate disables the context");
 }

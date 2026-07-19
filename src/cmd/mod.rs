@@ -8,4 +8,5 @@ pub(crate) mod send;
 pub(crate) mod status;
 pub(crate) mod server;
 pub(crate) mod tools;
+pub(crate) mod trace;
 pub(crate) mod watcher;

@@ -284,6 +284,14 @@ pub(crate) async fn call_oai_stream_inner(
         tr::renamed_tool_losses(&name_map),
     )
     .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
     let mut attempt = tr::StreamAttempt::new(tracer);
 
     // The broker owns the API key and executes/signs the request; this path
@@ -545,6 +553,14 @@ pub(crate) async fn call_codex_stream_inner(
         tr::renamed_tool_losses(&name_map),
     )
     .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
     let mut attempt = tr::StreamAttempt::new(tracer);
 
     let resp = send_with_retries(
@@ -1886,6 +1902,14 @@ pub(crate) async fn call_xai_responses_stream_inner(
         tr::renamed_tool_losses(&names),
     )
     .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
     let mut attempt = tr::StreamAttempt::new(tracer);
     let stream = broker
         .proxy_stream(proxy_request)

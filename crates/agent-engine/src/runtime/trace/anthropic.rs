@@ -57,7 +57,11 @@ pub fn stop_reason_from_wire(raw: &str) -> StopReason {
 /// `sent_bytes` MUST be the exact buffer handed to reqwest — wire length and
 /// digest come from it directly, never from re-serialization. When `key` is
 /// `None` (digest key unavailable) all digest-bearing sections (`wire`,
-/// `system_segments`, `tools`) are omitted; counts in `anatomy` remain.
+/// `system_segments`, `tools`, cache prefixes/delta) are omitted; counts in
+/// `anatomy` remain. `snapshots`, when provided, is the session's
+/// previous-component snapshot store (Task 12, spec §6.6): the cache prefix
+/// digests and per-segment previous-turn delta are computed and the
+/// snapshot atomically advanced, once per built request structure.
 /// `translation` is the Anthropic adapter's Task 9 report entries
 /// (positional IDs only, never content).
 #[allow(clippy::too_many_arguments)]
@@ -71,6 +75,7 @@ pub fn anthropic_request_structure(
     has_tool_marker: bool,
     has_system_marker: bool,
     translation: Vec<super::types::TranslationLoss>,
+    snapshots: Option<&super::diagnostics::CacheSnapshotStore>,
 ) -> RequestStructure {
     let message_meta: Vec<MessageMeta> = messages.iter().map(|m| message_meta(m)).collect();
     let block_count: u32 = message_meta.iter().map(|m| m.blocks.len() as u32).sum();
@@ -101,19 +106,31 @@ pub fn anthropic_request_structure(
         })
         .unwrap_or_default();
 
+    let mut cache = cache_meta(
+        messages,
+        tools_schema.len(),
+        prefix_marker_ttl,
+        has_tool_marker,
+        has_system_marker,
+    );
+    // Task 12 (spec §6.6): keyed prefix/tail digests over canonical
+    // component bytes + previous-turn segment delta from the session
+    // snapshot store. Degrades to `None`s without a key or store.
+    if let Some(snapshots) = snapshots {
+        let diag = snapshots.compare_and_update(key, tools_schema, system_prompt, messages);
+        cache.tools_prefix = diag.tools_prefix;
+        cache.system_prefix = diag.system_prefix;
+        cache.history_tail = diag.history_tail;
+        cache.delta = diag.delta;
+    }
+
     RequestStructure {
         anatomy,
         wire: key.map(|key| wire_meta_from_sent_bytes(key, sent_bytes)),
         system_segments,
         messages: message_meta,
         tools,
-        cache: cache_meta(
-            messages,
-            tools_schema.len(),
-            prefix_marker_ttl,
-            has_tool_marker,
-            has_system_marker,
-        ),
+        cache,
         translation,
     }
 }
@@ -224,5 +241,7 @@ fn cache_meta(
         boundaries,
         tools_prefix: None,
         system_prefix: None,
+        history_tail: None,
+        delta: None,
     }
 }

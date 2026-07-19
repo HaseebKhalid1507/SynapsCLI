@@ -173,6 +173,7 @@ fn openai_request_structure(
         false,
         false,
         translation,
+        None,
     );
     // No exact bytes → no wire claim, ever (remote broker serializes the
     // upstream body out of process).
@@ -206,6 +207,12 @@ impl StreamAttempt {
     /// each re-send — retry clocks reset per attempt).
     pub fn restart_clock(&mut self) {
         self.clock = AttemptClock::start();
+    }
+
+    /// The trace request ID, when a tracer began (for content-capture
+    /// correlation). `None` when tracing is disabled for this request.
+    pub fn request_id(&self) -> Option<&super::TraceId> {
+        self.tracer.as_ref().map(|t| t.request_id())
     }
 
     pub fn mark_headers(&mut self) {

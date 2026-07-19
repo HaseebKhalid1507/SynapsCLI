@@ -270,6 +270,19 @@ pub struct Runtime {
     /// Shared across clones so all requests of the session carry the same
     /// session-scoped context IDs.
     trace_ctx: trace::TraceContext,
+    /// Explicit one-shot trace controls (Task 12): `/trace next` arms
+    /// exactly the next outgoing provider request, even when telemetry is
+    /// Off, then auto-disarms. Shared across clones.
+    trace_controls: std::sync::Arc<trace::TraceControls>,
+    /// Writer handle backing the most recent armed one-shot ephemeral
+    /// trace context (telemetry Off + `/trace next`). Retained here — not
+    /// only inside the request's cloned context — so the session exit
+    /// epilogue (`shutdown_observability*`) can drain the armed record
+    /// even if the process exits right after the request. Replaced on
+    /// re-arm; never touched on the request path beyond one mutex store.
+    /// Shared across clones.
+    one_shot_trace_writer:
+        std::sync::Arc<std::sync::Mutex<Option<crate::runtime::telemetry::TelemetryWriter>>>,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
@@ -405,6 +418,8 @@ impl Runtime {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
+            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -475,6 +490,8 @@ impl Runtime {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
+            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1301,6 +1318,130 @@ impl Runtime {
         self.trace_ctx.clone()
     }
 
+    /// Effective trace context for the next outgoing model request:
+    /// consumes a pending one-shot arm (`/trace next [content]`, Task 12).
+    ///
+    /// One-shot semantics (B1): the arm covers exactly one *logical
+    /// request* — the returned armed context carries a one-shot request
+    /// gate consumed inside `RequestTracer::begin`, so the first request
+    /// through it (all retry attempts included) emits records and every
+    /// subsequent request sharing the same `ApiOptions` (tool-loop
+    /// continuations) is disabled. Normal Basic/Full session contexts are
+    /// never gated.
+    ///
+    /// When the session sink is disabled the one-shot record rides an
+    /// ephemeral writer forked from the session context (same session ID,
+    /// digest key, degradation counters, and §6.6 cache snapshot store —
+    /// so `/context` sees the armed request's diagnostics). The writer
+    /// handle is retained in `one_shot_trace_writer` until replaced or
+    /// drained by the shutdown epilogue, guaranteeing the armed record
+    /// flushes on session exit. With the session sink already enabled
+    /// (telemetry Basic/Full) the arm only adds the optional content
+    /// capture.
+    pub(crate) fn effective_trace_context(&self) -> trace::TraceContext {
+        match self.trace_controls.consume() {
+            None => self.trace_ctx.clone(),
+            Some(with_content) => {
+                let base = if self.trace_ctx.enabled() {
+                    self.trace_ctx.clone()
+                } else {
+                    let writer = crate::runtime::telemetry::TelemetryWriter::new(
+                        crate::runtime::telemetry::WriterOptions::default(),
+                    );
+                    // Retain the writer for the exit epilogue (drops any
+                    // previously retained one-shot writer, whose worker
+                    // keeps draining in the background).
+                    *self
+                        .one_shot_trace_writer
+                        .lock()
+                        .expect("one-shot trace writer lock poisoned") = Some(writer.clone());
+                    self.trace_ctx
+                        .fork_with_sink(Arc::new(crate::runtime::telemetry::WriterTraceSink::new(
+                            writer,
+                        )))
+                        .with_one_shot_request_gate()
+                };
+                if with_content {
+                    base.with_content_capture(Arc::new(trace::ContentCapture::new(
+                        trace::default_capture_dir(),
+                    )))
+                } else {
+                    base
+                }
+            }
+        }
+    }
+
+    /// Arm tracing for exactly the next outgoing provider request
+    /// (`/trace next`; `with_content` adds the one-request redacted
+    /// content capture for `/trace next content`).
+    pub fn trace_arm_next(&self, with_content: bool) {
+        self.trace_controls.arm_next(with_content);
+    }
+
+    /// Metadata-only `/trace status` report: mode, persistence path,
+    /// counters. Never secrets or content. Also performs the opportunistic
+    /// expired-capture sweep (B2): status is a trace interaction, so stale
+    /// content-capture bundles are physically removed here too.
+    pub fn trace_status(&self) -> trace::TraceStatusReport {
+        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
+        trace::TraceStatusReport {
+            persistent_enabled: self.telemetry_writer.is_some(),
+            arm: self.trace_controls.peek(),
+            trace_path: crate::runtime::telemetry::default_trace_log_path(),
+            writer_stats: self.telemetry_writer.as_ref().map(|w| w.stats()),
+            degraded_records: self.trace_ctx.degraded_records(),
+        }
+    }
+
+    /// Structured `/context` report (Task 12): counts, byte lengths, cache
+    /// change/reuse estimates, and writer counters — never content.
+    ///
+    /// `history` is the conversation owned by the calling surface (TUI /
+    /// headless); when it is not provided the history lines honestly read
+    /// `unavailable` rather than fabricating zeros. Loaded skills/memories
+    /// are session-surface state the runtime cannot enumerate, so they are
+    /// reported `unavailable` with that provenance.
+    pub fn context_report(&self, history: Option<&[crate::SharedMessage]>) -> trace::ContextReport {
+        use trace::ReportValue;
+        let (history_messages, history_bytes) = match history {
+            Some(msgs) => (
+                ReportValue::Count(msgs.len() as u64),
+                ReportValue::Count(
+                    msgs.iter()
+                        .map(|m| {
+                            serde_json::to_vec(&**m)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0)
+                        })
+                        .sum(),
+                ),
+            ),
+            None => (ReportValue::Unavailable, ReportValue::Unavailable),
+        };
+        // Non-blocking view of the tool registry: if it is momentarily
+        // write-locked, report honestly instead of blocking or guessing.
+        let tool_count = match self.tools.try_read() {
+            Ok(tools) => ReportValue::Count(tools.iter_tools_sorted().len() as u64),
+            Err(_) => ReportValue::Unavailable,
+        };
+        trace::ContextReport {
+            model: self.model.clone(),
+            system_prompt_bytes: ReportValue::Count(
+                self.system_prompt().map(|s| s.len() as u64).unwrap_or(0),
+            ),
+            tool_count,
+            history_messages,
+            history_bytes,
+            loaded_skills: ReportValue::Unavailable,
+            loaded_memories: ReportValue::Unavailable,
+            cache: self.trace_ctx.cache_snapshots().last_activity(),
+            trace_enabled: self.trace_ctx.enabled(),
+            writer_stats: self.telemetry_writer.as_ref().map(|w| w.stats()),
+            degraded_records: self.trace_ctx.degraded_records(),
+        }
+    }
+
     /// The shared observability writer, when telemetry is enabled.
     pub fn telemetry_writer(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
         self.telemetry_writer.clone()
@@ -1323,7 +1464,21 @@ impl Runtime {
         &self,
         timeout: std::time::Duration,
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
-        self.telemetry_writer.as_ref().map(|w| w.shutdown(timeout))
+        // Drain a retained one-shot ephemeral writer first (Task 12 fix:
+        // an armed `/trace next` record written with telemetry Off must
+        // survive session exit). Its outcome is returned only when no
+        // session writer exists — the session writer's stats remain the
+        // primary signal.
+        let ephemeral = self
+            .one_shot_trace_writer
+            .lock()
+            .expect("one-shot trace writer lock poisoned")
+            .take();
+        let ephemeral_outcome = ephemeral.map(|w| w.shutdown(timeout));
+        self.telemetry_writer
+            .as_ref()
+            .map(|w| w.shutdown(timeout))
+            .or(ephemeral_outcome)
     }
 
     /// Async epilogue helper for every clean process/runtime exit path that
@@ -1342,9 +1497,19 @@ impl Runtime {
         &self,
         timeout: std::time::Duration,
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
-        match self.telemetry_writer.clone() {
+        // Same one-shot ephemeral drain as the sync variant.
+        let ephemeral = self
+            .one_shot_trace_writer
+            .lock()
+            .expect("one-shot trace writer lock poisoned")
+            .take();
+        let ephemeral_outcome = match ephemeral {
             Some(writer) => Some(writer.shutdown_async(timeout).await),
             None => None,
+        };
+        match self.telemetry_writer.clone() {
+            Some(writer) => Some(writer.shutdown_async(timeout).await),
+            None => ephemeral_outcome,
         }
     }
 
@@ -1438,6 +1603,8 @@ impl Runtime {
             // Default options preserve this path's historical beta gating
             // and endpoint; only the session observability seams are wired
             // (Task 11) so compaction requests trace/persist like any other.
+            // Deliberately the BASE context: an internal compaction request
+            // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
                 telemetry: self.telemetry_writer.clone(),
@@ -1481,7 +1648,11 @@ impl Runtime {
                     anthropic_base_url: None,
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
-                    trace: self.trace_ctx.clone(),
+                    // Consistent with the streaming path: a pending
+                    // `/trace next` arm covers the first request of this
+                    // loop too (the one-shot gate inside the armed context
+                    // limits it to exactly one logical request).
+                    trace: self.effective_trace_context(),
                     telemetry: self.telemetry_writer.clone(),
                 },
             )
@@ -1875,7 +2046,7 @@ impl Runtime {
             anthropic_base_url: None,
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
-            trace: self.trace_ctx.clone(),
+            trace: self.effective_trace_context(),
             telemetry: self.telemetry_writer.clone(),
         };
 
@@ -1964,6 +2135,8 @@ impl Clone for Runtime {
             // set of session-scoped context IDs per session.
             telemetry_writer: self.telemetry_writer.clone(),
             trace_ctx: self.trace_ctx.clone(),
+            trace_controls: Arc::clone(&self.trace_controls),
+            one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
             // Subagents are their own session — fresh latches so a downgrade
@@ -2100,6 +2273,29 @@ mod tests {
             "bounded epilogue must not block exit: {:?}",
             start.elapsed()
         );
+    }
+
+    /// Task 12 fix: an armed one-shot ephemeral writer (telemetry Off +
+    /// `/trace next`) is retained by the runtime and drained by the same
+    /// shutdown epilogue as the session writer, so the armed record cannot
+    /// be lost to an exit racing the background worker.
+    #[tokio::test]
+    async fn one_shot_ephemeral_writer_is_retained_and_drained_at_shutdown() {
+        let rt = Runtime::new_headless();
+        assert!(!rt.trace_context().enabled(), "telemetry off");
+        rt.trace_arm_next(false);
+        let armed = rt.effective_trace_context();
+        assert!(armed.enabled(), "armed ephemeral context traces");
+        // No session writer, but the epilogue still finds (and drains) the
+        // retained one-shot writer.
+        let budget = crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT;
+        let outcome = rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("retained one-shot writer must be drained by the epilogue");
+        assert!(outcome.is_flushed());
+        // Consumed: a second epilogue call finds nothing.
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
     }
 
     #[test]

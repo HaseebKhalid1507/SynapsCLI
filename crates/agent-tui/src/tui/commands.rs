@@ -371,6 +371,21 @@ pub(super) async fn handle_command(
     }
 
     // ── Engine-level commands (shared with headless) ──
+    // `/context` with the TUI's own conversation history: the runtime does
+    // not own session messages, so the surface passes them in. Must run
+    // before the generic engine intercept (which has no history access).
+    if cmd == "context" {
+        match synaps_cli::engine::commands::context_command(runtime, Some(&app.api_messages)) {
+            synaps_cli::engine::commands::CommandResult::Output(text) => {
+                app.push_msg(ChatMessage::System(text));
+            }
+            synaps_cli::engine::commands::CommandResult::Error(e) => {
+                app.push_msg(ChatMessage::Error(e));
+            }
+            _ => {}
+        }
+        return CommandAction::None;
+    }
     // NOTE: this intercept runs BEFORE the match below — any arm there for a
     // command the engine claims (model/thinking with args, compact, quit) is
     // unreachable for the intercepted case.
@@ -417,6 +432,10 @@ pub(super) async fn handle_command(
             },
             CommandResult::Error(e) => {
                 app.push_msg(ChatMessage::Error(e));
+                CommandAction::None
+            }
+            CommandResult::Output(text) => {
+                app.push_msg(ChatMessage::System(text));
                 CommandAction::None
             }
             _ => CommandAction::None,

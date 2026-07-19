@@ -56,6 +56,7 @@ pub enum DigestDomain {
     ToolSchema,
     ToolsPrefix,
     SystemPrefix,
+    HistoryTail,
 }
 
 impl DigestDomain {
@@ -67,6 +68,7 @@ impl DigestDomain {
             DigestDomain::ToolSchema => b"synaps-trace:tool-schema\0",
             DigestDomain::ToolsPrefix => b"synaps-trace:tools-prefix\0",
             DigestDomain::SystemPrefix => b"synaps-trace:system-prefix\0",
+            DigestDomain::HistoryTail => b"synaps-trace:history-tail\0",
         }
     }
 }

@@ -1250,6 +1250,9 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
             CommandResult::Error(msg) => {
                 let _ = broadcast.send(ServerMessage::Error { message: msg });
             }
+            CommandResult::Output(text) => {
+                let _ = broadcast.send(ServerMessage::System { message: text });
+            }
             other => {
                 tracing::debug!(?other, "engine command result not handled by server");
             }

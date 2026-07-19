@@ -113,6 +113,20 @@ pub struct TraceContext {
     /// (key unavailable, unrepresentable structural identity). Metadata only.
     degraded: Arc<AtomicU64>,
     request_seq: Arc<AtomicU64>,
+    /// Session-scoped previous-component cache snapshot (Task 12, §6.6).
+    /// Bounded metadata only; shared across clones of this context.
+    cache_snapshots: Arc<super::diagnostics::CacheSnapshotStore>,
+    /// One-request redacted content capture (`/trace next content`);
+    /// `None` in every default/session context.
+    content_capture: Option<Arc<super::controls::ContentCapture>>,
+    /// One-shot request gate (Task 12 `/trace next`): `Some` only on an
+    /// armed ephemeral context. The FIRST logical request (`RequestTracer::
+    /// begin`) through this context consumes the gate; every retry attempt
+    /// of that request still emits (the gate is per logical request, not
+    /// per attempt), and every subsequent request through the same context
+    /// (tool-loop continuation sharing the `ApiOptions`) is disabled.
+    /// `None` (Basic/Full session contexts) never gates anything.
+    one_shot_gate: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for TraceContext {
@@ -148,6 +162,88 @@ impl TraceContext {
             key_warned: Arc::new(AtomicBool::new(false)),
             degraded: Arc::new(AtomicU64::new(0)),
             request_seq: Arc::new(AtomicU64::new(0)),
+            cache_snapshots: Arc::new(super::diagnostics::CacheSnapshotStore::new()),
+            content_capture: None,
+            one_shot_gate: None,
+        }
+    }
+
+    /// Fork this context with a replacement sink, preserving the session
+    /// identity, digest-key state, degradation counters, request sequence,
+    /// and — crucially — the shared session [`CacheSnapshotStore`], so an
+    /// armed one-shot request feeds the same §6.6 diagnostics that
+    /// `/context` reads. The one-shot gate and content capture are NOT
+    /// inherited: the caller attaches them explicitly.
+    pub fn fork_with_sink(&self, sink: Arc<dyn TraceSink>) -> Self {
+        Self {
+            sink,
+            session_id: self.session_id.clone(),
+            key_path: self.key_path.clone(),
+            key: Arc::clone(&self.key),
+            key_warned: Arc::clone(&self.key_warned),
+            degraded: Arc::clone(&self.degraded),
+            request_seq: Arc::clone(&self.request_seq),
+            cache_snapshots: Arc::clone(&self.cache_snapshots),
+            content_capture: None,
+            one_shot_gate: None,
+        }
+    }
+
+    /// Attach a one-request content capture arm (see `trace::controls`).
+    pub fn with_content_capture(mut self, capture: Arc<super::controls::ContentCapture>) -> Self {
+        self.content_capture = Some(capture);
+        self
+    }
+
+    /// Arm the one-shot request gate: exactly one logical request
+    /// (`RequestTracer::begin`) traces through this context, all its retry
+    /// attempts included; subsequent requests are disabled. Only armed
+    /// ephemeral contexts carry this — normal Basic/Full contexts never do.
+    pub fn with_one_shot_request_gate(mut self) -> Self {
+        self.one_shot_gate = Some(Arc::new(AtomicBool::new(false)));
+        self
+    }
+
+    /// Pass (consume) the one-shot gate. `true` for ungated contexts and
+    /// for the first caller on a gated context; `false` afterwards.
+    fn pass_one_shot_gate(&self) -> bool {
+        match &self.one_shot_gate {
+            None => true,
+            Some(gate) => !gate.swap(true, Ordering::SeqCst),
+        }
+    }
+
+    /// The session cache snapshot store (spec §6.6 previous-turn compare).
+    pub fn cache_snapshots(&self) -> &Arc<super::diagnostics::CacheSnapshotStore> {
+        &self.cache_snapshots
+    }
+
+    /// Capture the request body for an armed one-shot content capture
+    /// (no-op in every other context). `body_bytes` must be the request
+    /// body only — never headers or credentials.
+    pub fn capture_request_content(&self, request_id: &TraceId, body_bytes: &[u8]) {
+        if let Some(capture) = &self.content_capture {
+            capture.capture(request_id, body_bytes);
+        }
+    }
+
+    /// Explicitly fail an armed content capture on a provider path that has
+    /// no capturable request body (e.g. the extension sidecar, which owns
+    /// framing/serialization out of process). Fix for silent consumption:
+    /// the arm is consumed *visibly* — one metadata-only warning plus a
+    /// bump of the degraded-records counter that `/trace status` reports —
+    /// instead of vanishing with no artifact and no signal. No-op in every
+    /// context without an armed capture.
+    pub fn capture_unsupported(&self, reason: &str) {
+        if let Some(capture) = &self.content_capture {
+            if capture.mark_unsupported() {
+                self.note_degraded();
+                tracing::warn!(
+                    reason,
+                    "trace content capture unsupported on this provider path; \
+                     no capture bundle was written (see /trace status degraded counter)"
+                );
+            }
         }
     }
 
@@ -158,7 +254,15 @@ impl TraceContext {
     }
 
     pub fn enabled(&self) -> bool {
+        // A gated context whose one shot was already taken behaves as
+        // disabled: transports skip record construction for the second and
+        // later logical requests of the tool loop.
         self.sink.enabled()
+            && self
+                .one_shot_gate
+                .as_ref()
+                .map(|gate| !gate.load(Ordering::SeqCst))
+                .unwrap_or(true)
     }
 
     /// Records degraded/dropped for internal reasons since context creation.
@@ -390,6 +494,15 @@ impl RequestTracer {
         // The transport layer has no turn knowledge yet; the turn ID shares
         // the request sequence until runtime-level correlation lands.
         let turn_id = TraceId::new(format!("turn-{pid}-{seq}")).ok()?;
+        // One-shot gate LAST (Task 12 `/trace next`): consumed only when a
+        // tracer can actually start — an identity-validation failure above
+        // returns without spending the arm, so the arm still covers the
+        // next viable request. First logical request wins; its retry
+        // attempts all emit through this tracer; later begins observe the
+        // consumed gate and return `None`.
+        if !ctx.pass_one_shot_gate() {
+            return None;
+        }
         Some(Self {
             ctx: ctx.clone(),
             session_id: ctx.session_id.clone(),

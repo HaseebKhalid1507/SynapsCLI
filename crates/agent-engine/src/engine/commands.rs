@@ -180,6 +180,15 @@ pub fn handle_engine_command(
     arg: &str,
     runtime: &mut crate::Runtime,
 ) -> Option<CommandResult> {
+    // Runtime-backed commands (Task 12): shared across TUI, headless chat,
+    // and server. `/context` here has no conversation history (the surface
+    // owns it) — the TUI intercepts `/context` earlier and passes its own
+    // history through `context_command`.
+    match cmd {
+        "context" => return Some(context_command(runtime, None)),
+        "trace" => return Some(trace_command(arg, runtime)),
+        _ => {}
+    }
     let result = evaluate_engine_command(cmd, arg)?;
     match &result {
         CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
@@ -255,6 +264,45 @@ pub fn parse_thinking_arg(arg: &str) -> Result<ThinkingSpec, String> {
 /// Returns the exact budget digits for Custom, named string for Named.
 pub fn thinking_config_value(spec: ThinkingSpec) -> String {
     spec.config_value()
+}
+
+/// `/context` (Task 12, spec §6.6 acceptance): structured metadata-only
+/// report — system/tool/history counts and bytes, latest cache component
+/// change and reuse estimates, writer counters. Surfaces that own the
+/// conversation pass it as `history`; others get honest `unavailable`.
+pub fn context_command(
+    runtime: &crate::Runtime,
+    history: Option<&[crate::SharedMessage]>,
+) -> CommandResult {
+    CommandResult::Output(runtime.context_report(history).render())
+}
+
+/// `/trace next|next content|status` (Task 12): explicit trace controls.
+pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
+    match arg.trim() {
+        "next" => {
+            runtime.trace_arm_next(false);
+            CommandResult::Output(
+                "trace armed for the next request (metadata only, then auto-disabled)".to_string(),
+            )
+        }
+        "next content" => {
+            runtime.trace_arm_next(true);
+            CommandResult::Output(
+                "trace armed for the next request WITH redacted content capture.\n\
+                 The request body (never headers/credentials) is recursively \
+                 redacted and kept in a private, short-lived capture bundle; \
+                 export it with `synaps trace export <request-id> \
+                 --include-content --allow-content-export --output PATH` \
+                 before it expires."
+                    .to_string(),
+            )
+        }
+        "" | "status" => CommandResult::Output(runtime.trace_status().render()),
+        other => CommandResult::Error(format!(
+            "unknown /trace subcommand: `{other}` (try: next, next content, status)"
+        )),
+    }
 }
 
 /// Persist a config key and return a user-visible status suffix.
@@ -588,5 +636,86 @@ mod tests {
         let spec = parse_thinking_arg("8192").unwrap();
         assert_eq!(spec.config_value(), "8192",
             "custom budget must persist as digits, not named level");
+    }
+
+    // ── Task 12: /trace and /context surfaces ──
+
+    #[test]
+    fn trace_next_enables_exactly_the_next_request_then_auto_disables() {
+        let runtime = crate::Runtime::new_headless();
+        // Telemetry off: the base session context is disabled.
+        assert!(!runtime.trace_context().enabled());
+
+        match trace_command("next", &runtime) {
+            CommandResult::Output(text) => assert!(text.contains("next request")),
+            other => panic!("expected Output, got {other:?}"),
+        }
+        let status = runtime.trace_status();
+        assert!(!status.persistent_enabled);
+        assert_eq!(status.arm, crate::runtime::trace::TraceArm::NextMetadata);
+
+        // Exactly one effective context is enabled, even with telemetry Off…
+        let armed = runtime.effective_trace_context();
+        assert!(armed.enabled(), "armed context must trace the next request");
+        // …then the arm auto-disables: the following request is untraced.
+        let after = runtime.effective_trace_context();
+        assert!(!after.enabled(), "arm must cover exactly one request");
+        assert_eq!(
+            runtime.trace_status().arm,
+            crate::runtime::trace::TraceArm::Off
+        );
+    }
+
+    #[test]
+    fn trace_status_reports_mode_path_and_counters_without_secrets() {
+        let runtime = crate::Runtime::new_headless();
+        match trace_command("status", &runtime) {
+            CommandResult::Output(text) => {
+                assert!(text.contains("trace: disabled"), "got: {text}");
+                assert!(text.contains("degraded"));
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+        runtime.trace_arm_next(true);
+        match trace_command("", &runtime) {
+            CommandResult::Output(text) => {
+                assert!(text.contains("armed for next request"), "got: {text}");
+                assert!(text.contains("content capture"));
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+        assert!(matches!(
+            trace_command("bogus", &runtime),
+            CommandResult::Error(_)
+        ));
+    }
+
+    #[test]
+    fn context_command_reports_metadata_never_content() {
+        let mut runtime = crate::Runtime::new_headless();
+        let secret = "CONTEXT-SENTINEL-5a5a";
+        runtime.set_system_prompt(format!("you are {secret}"));
+        let history = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": secret
+        }))];
+        match context_command(&runtime, Some(&history)) {
+            CommandResult::Output(text) => {
+                assert!(!text.contains(secret), "sentinel leaked: {text}");
+                assert!(text.contains("history: 1 messages"));
+                assert!(text.contains("system prompt:"));
+                assert!(text.contains("skills: unavailable"));
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+        // The engine-shared path (no history) reports honestly.
+        match handle_engine_command("context", "", &mut runtime) {
+            Some(CommandResult::Output(text)) => {
+                assert!(
+                    text.contains("history: unavailable messages"),
+                    "got: {text}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
     }
 }

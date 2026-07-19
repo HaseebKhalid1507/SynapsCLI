@@ -836,14 +836,24 @@ pub(super) async fn begin_anthropic_tracer(
         has_tool_marker,
         has_system_marker,
         translation.clone().into_losses(),
+        Some(options.trace.cache_snapshots()),
     );
-    tr::RequestTracer::begin(
+    let tracer = tr::RequestTracer::begin(
         &options.trace,
         model,
         tr::TransportKind::AnthropicMessages,
         endpoint,
         structure,
-    )
+    );
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context that does not carry the arm. Body bytes only — headers
+    // and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        options
+            .trace
+            .capture_request_content(tracer.request_id(), body_bytes);
+    }
+    tracer
 }
 
 pub(super) struct ApiMethods;
