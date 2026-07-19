@@ -24,6 +24,7 @@ pub enum DelegationTreeDenied {
 #[derive(Debug, Default)]
 struct DelegationTreeState {
     depth_by_worker: BTreeMap<String, u16>,
+    parent_by_worker: BTreeMap<String, String>,
     child_count: BTreeMap<String, usize>,
     descendants: usize,
 }
@@ -288,19 +289,35 @@ impl OrchestrationRuntime {
         {
             return Err(DelegationTreeDenied::ChildLimit);
         }
+        if tree.depth_by_worker.contains_key(worker_id) {
+            return Err(DelegationTreeDenied::ChildLimit);
+        }
         tree.depth_by_worker.insert(worker_id.to_string(), depth);
+        tree.parent_by_worker
+            .insert(worker_id.to_string(), parent_key.to_string());
         *tree.child_count.entry(parent_key.to_string()).or_default() += 1;
         tree.descendants += 1;
         Ok(depth)
     }
 
-    pub fn release_delegation(&self, worker_id: &str, parent: Option<&str>) {
+    pub fn release_delegation(&self, worker_id: &str, _parent: Option<&str>) {
         let mut tree = self.tree.lock().unwrap();
-        if tree.depth_by_worker.remove(worker_id).is_some() {
-            tree.descendants = tree.descendants.saturating_sub(1);
-            let parent_key = parent.unwrap_or("<root>");
-            if let Some(count) = tree.child_count.get_mut(parent_key) {
-                *count = count.saturating_sub(1);
+        let mut stack = vec![worker_id.to_string()];
+        while let Some(current) = stack.pop() {
+            let children = tree
+                .parent_by_worker
+                .iter()
+                .filter_map(|(child, parent)| (parent == &current).then_some(child.clone()))
+                .collect::<Vec<_>>();
+            stack.extend(children);
+            if tree.depth_by_worker.remove(&current).is_some() {
+                tree.descendants = tree.descendants.saturating_sub(1);
+                if let Some(parent_key) = tree.parent_by_worker.remove(&current) {
+                    if let Some(count) = tree.child_count.get_mut(&parent_key) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                tree.child_count.remove(&current);
             }
         }
     }
@@ -876,6 +893,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(rt.reserve_delegation("a", None), Ok(1));
+        assert_eq!(
+            rt.reserve_delegation("a", None),
+            Err(DelegationTreeDenied::ChildLimit),
+            "registration/spawn retry cannot double-reserve one handle"
+        );
         assert_eq!(rt.reserve_delegation("b", Some("a")), Ok(2));
         assert_eq!(
             rt.reserve_delegation("too-deep", Some("b")),
@@ -909,6 +931,27 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
         assert_eq!(rt.delegation_descendants(), 0);
+    }
+
+    #[test]
+    fn parent_exit_releases_entire_live_descendant_subtree() {
+        let foreground = model("anthropic/foreground");
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            8,
+            16,
+        ));
+        rt.reserve_delegation("parent", None).unwrap();
+        rt.reserve_delegation("child", Some("parent")).unwrap();
+        rt.reserve_delegation("grandchild", Some("child")).unwrap();
+        assert_eq!(rt.delegation_descendants(), 3);
+        rt.release_delegation("parent", None);
+        assert_eq!(rt.delegation_descendants(), 0);
+        assert_eq!(
+            rt.reserve_delegation("orphan", Some("child")),
+            Err(DelegationTreeDenied::UnknownParent)
+        );
     }
 
     /// A child receives tree lineage only, never a policy/grant mutation:
