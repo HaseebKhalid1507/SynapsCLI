@@ -380,6 +380,31 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Atomically register a whole batch (Task 19 boot-time dormant MCP
+    /// entries): the FULL candidate registry is built first (per-tool
+    /// catalog mutations plus a single schema rebuild) and committed only
+    /// on complete success. Any duplicate-identity or generation failure
+    /// rejects the ENTIRE batch and leaves the live registry — tools,
+    /// schema, catalog entries, and generation — byte-identically
+    /// unchanged; no partial batch can ever be observed. Never invokes any
+    /// tool, factory, extension handler, or MCP connection.
+    pub fn try_register_batch(
+        &mut self,
+        tool_list: Vec<Arc<dyn Tool>>,
+    ) -> Result<usize, CatalogError> {
+        if tool_list.is_empty() {
+            return Ok(0);
+        }
+        let count = tool_list.len();
+        let mut candidate = self.clone();
+        for tool in tool_list {
+            candidate.insert_tool_with_catalog(tool)?;
+        }
+        candidate.rebuild_schema();
+        *self = candidate;
+        Ok(count)
+    }
+
     /// Shared fail-closed mutation core: catalog mutation happens before the
     /// tools-map mutation, so a catalog failure leaves the registry (and the
     /// exposed schema) untouched. A capability identity already owned by a

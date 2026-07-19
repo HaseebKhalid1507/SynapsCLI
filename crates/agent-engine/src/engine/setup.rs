@@ -185,8 +185,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let tools_shared = runtime.tools_shared();
     let (registry, keybind_registry) = crate::skills::register(&tools_shared, &config).await;
 
-    // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
-    let mcp_server_count = crate::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
+    // Set up MCP loading (if configured in ~/.synaps-cli/mcp.json). Flag-off
+    // keeps the legacy connect gateway; progressive disclosure switches to
+    // exact descriptor-backed dormant tools (Task 19) with no gateway.
+    let mcp_server_count =
+        crate::mcp::setup_lazy_mcp(&runtime.tools_shared(), config.progressive_tool_disclosure)
+            .await;
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 

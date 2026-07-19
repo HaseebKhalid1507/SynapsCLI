@@ -1,5 +1,6 @@
 //! MCP (Model Context Protocol) integration — JSON-RPC client, tool bridging, lazy loading.
 mod connection;
+pub mod descriptors;
 mod lazy;
 mod tool;
 
@@ -124,9 +125,25 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
     total_tools
 }
 
-/// Set up lazy MCP loading: parse config, register the connect_mcp_server gateway tool.
-/// Returns the number of available (but not yet connected) servers.
-pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>) -> usize {
+/// Set up MCP loading at engine boot, before any session tool set exists.
+///
+/// Flag-off (`progressive_exact_only == false`): the legacy lazy path is
+/// preserved byte-for-byte — register the `connect_mcp_server` gateway and
+/// return the number of available servers.
+///
+/// Flag-on (Task 19, spec §7.4): NO gateway is registered (a server-wide
+/// connect would bypass exact per-tool activation), and cached descriptors
+/// become dormant deferred registry entries instead: searchable, exactly
+/// activatable, execution-gated, spawning nothing until a leased execution.
+/// A server without a fingerprint-matching cache entry contributes no
+/// capabilities — descriptors are never invented from config alone and no
+/// process is started to discover them. Returns the number of dormant tools
+/// registered. The whole dormant batch registers atomically; on failure the
+/// registry is unchanged and MCP capabilities fail closed to zero.
+pub async fn setup_lazy_mcp(
+    registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    progressive_exact_only: bool,
+) -> usize {
     let config = match load_mcp_config() {
         Some(c) => c,
         None => return 0,
@@ -135,6 +152,43 @@ pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegist
     let server_count = config.mcp_servers.len();
     if server_count == 0 {
         return 0;
+    }
+
+    if progressive_exact_only {
+        let cache = match descriptors::load_default_cache() {
+            Ok(cache) => cache,
+            Err(descriptors::DescriptorCacheError::NotFound) => {
+                descriptors::McpDescriptorCache::empty()
+            }
+            Err(err) => {
+                tracing::warn!(error = %err,
+                    "Refusing unsafe MCP descriptor cache; MCP capabilities stay undiscoverable this run");
+                descriptors::McpDescriptorCache::empty()
+            }
+        };
+        let dormant = descriptors::dormant_tools_for_config(&config, &cache);
+        if dormant.is_empty() {
+            tracing::info!(
+                servers = server_count,
+                "MCP exact mode: no valid cached descriptors; MCP tools are not discoverable this run"
+            );
+            return 0;
+        }
+        return match registry.write().await.try_register_batch(dormant) {
+            Ok(count) => {
+                tracing::info!(
+                    tools = count,
+                    servers = server_count,
+                    "MCP exact mode: dormant descriptor-backed tools registered (no process started)"
+                );
+                count
+            }
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "MCP dormant descriptor batch rejected; failing closed with zero MCP capabilities");
+                0
+            }
+        };
     }
 
     let server_names: Vec<&str> = config.mcp_servers.keys().map(|s| s.as_str()).collect();
