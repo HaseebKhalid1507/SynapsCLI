@@ -21,6 +21,7 @@ mod subagent;
 mod write;
 
 mod agent;
+pub mod catalog;
 mod registry;
 pub mod respond;
 pub mod send_channel;
