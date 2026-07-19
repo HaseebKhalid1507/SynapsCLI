@@ -3,6 +3,7 @@ pub(crate) mod auth_broker;
 pub(crate) mod chat;
 pub(crate) mod login;
 pub(crate) mod prompt;
+pub(crate) mod retention;
 pub(crate) mod rpc;
 pub(crate) mod send;
 pub(crate) mod status;

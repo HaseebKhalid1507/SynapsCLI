@@ -233,10 +233,22 @@ impl Tool for MemoryFetchTool {
             ));
             match sensitivity {
                 MemorySensitivity::Secret => {
-                    out.push_str(
-                        "[body withheld: secret-class records are visible locally only, \
-                         never in model context]",
-                    );
+                    // Unified §9.7 boundary: secret maps to local_only and
+                    // is withheld by the ONE disclosure gate.
+                    match agent_core::disclosure::gate_for_model(
+                        agent_core::disclosure::DisclosureClass::LocalOnly,
+                        &rec.content,
+                        false,
+                        None,
+                    ) {
+                        agent_core::disclosure::ModelVisibility::Withheld(_) => out.push_str(
+                            "[body withheld: secret-class records are visible locally only, \
+                             never in model context]",
+                        ),
+                        agent_core::disclosure::ModelVisibility::Visible(_) => {
+                            unreachable!("local_only never passes the model gate")
+                        }
+                    }
                 }
                 _ => out.push_str(&rec.content),
             }
