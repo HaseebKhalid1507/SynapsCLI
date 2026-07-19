@@ -425,6 +425,16 @@ fn sessions_dir() -> PathBuf {
     crate::config::get_active_config_dir().join("sessions")
 }
 
+/// Remove a persisted session file (compaction-transition rollback).
+/// A missing file is not an error — rollback must be idempotent.
+pub fn delete_session_file(id: &str) -> std::io::Result<()> {
+    let path = sessions_dir().join(format!("{}.json", id));
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 /// Validate a session or chain name: [a-z0-9-]{1,40}.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {

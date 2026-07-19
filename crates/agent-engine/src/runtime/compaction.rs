@@ -551,6 +551,17 @@ fn redaction_for(
     }
 }
 
+/// Best-effort removal of a rolled-back successor file. Idempotent; a
+/// removal failure is logged loudly — the recovery invariant (parent has no
+/// forward link, chains point at the parent) already holds, so a stray
+/// orphan file is the worst residue.
+fn rollback_successor(successor_id: &str) {
+    if let Err(e) = agent_core::session::delete_session_file(successor_id) {
+        tracing::error!(successor = %successor_id, error = %e,
+            "rollback: failed to remove the orphaned successor session file");
+    }
+}
+
 /// Typed result of a summarization call (spec §9.3): the summary text plus
 /// the provenance metadata the transition persists.
 #[derive(Debug, Clone, PartialEq)]
@@ -612,6 +623,55 @@ pub fn provider_label_for_model(model: &str) -> String {
     crate::runtime::openai::resolve_route(model)
         .map(|route| route.provider)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Deterministic failure-injection points inside the linked-successor
+/// transition (I2, CP-12 review). The enum is always available so rollback
+/// code can name the steps; the injection machinery is test-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionFailpoint {
+    /// Fail between the successor save and the parent update.
+    AfterSuccessorSave,
+    /// Fail the parent forward-link save itself.
+    AtParentSave,
+    /// Fail a named-chain advancement (the skip count selects which one).
+    AtChainAdvance,
+}
+
+#[cfg(any(test, feature = "testing"))]
+static TRANSITION_FAILPOINT: std::sync::Mutex<Option<(TransitionFailpoint, u32)>> =
+    std::sync::Mutex::new(None);
+
+/// Arm (or clear) the transition failpoint: `(point, skip)` triggers on the
+/// `skip+1`-th time `point` is consulted. Test-only.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_transition_failpoint(point: Option<(TransitionFailpoint, u32)>) {
+    *TRANSITION_FAILPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = point;
+}
+
+/// Consult the failpoint at `point`; returns an injected error when armed.
+fn transition_failpoint_error(point: TransitionFailpoint) -> Option<std::io::Error> {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let mut armed = TRANSITION_FAILPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((armed_point, skip)) = *armed {
+            if armed_point == point {
+                if skip == 0 {
+                    *armed = None;
+                    return Some(std::io::Error::other(format!(
+                        "injected transition failpoint: {point:?}"
+                    )));
+                }
+                *armed = Some((armed_point, skip - 1));
+            }
+        }
+    }
+    let _ = point;
+    None
 }
 
 /// How a successful compaction is applied to session state (spec §9.2).
@@ -707,35 +767,77 @@ pub async fn apply_compaction(
                 Session::from_compaction_record(current, &outcome.summary_text, record);
             successor.api_messages.extend(extra_messages);
 
-            // Save successor FIRST — if we crash after this but before the
-            // parent update, the successor exists and lineage is intact.
+            // Step 1: save the successor. Failure here changes nothing.
             successor.save().await.map_err(|e| {
                 crate::error::RuntimeError::Session(format!(
                     "failed to save compacted session: {e}"
                 ))
             })?;
 
-            // Persist the parent with the exact compacted range, the forward
-            // link, and its name released to the successor. Failure here is
-            // survivable (successor already exists) — warn, don't roll back.
-            let mut parent = current.clone();
-            parent.api_messages = api_messages.to_vec();
-            parent.compacted_into = Some(successor.id.clone());
-            parent.name = None;
-            parent.updated_at = chrono::Utc::now();
-            if let Err(e) = parent.save().await {
-                tracing::warn!(parent = %parent.id, error = %e,
-                    "failed to update compacted parent session");
+            // Step 2: persist the parent with the exact compacted range,
+            // the forward link, and its name released to the successor.
+            // Failure ROLLS BACK the successor — the transition never
+            // reports success with partial parent state (I2).
+            let parent_result: std::io::Result<()> =
+                match transition_failpoint_error(TransitionFailpoint::AfterSuccessorSave) {
+                    Some(e) => Err(e),
+                    None => match transition_failpoint_error(TransitionFailpoint::AtParentSave) {
+                        Some(e) => Err(e),
+                        None => {
+                            let mut parent = current.clone();
+                            parent.api_messages = api_messages.to_vec();
+                            parent.compacted_into = Some(successor.id.clone());
+                            parent.name = None;
+                            parent.updated_at = chrono::Utc::now();
+                            parent.save().await
+                        }
+                    },
+                };
+            if let Err(e) = parent_result {
+                rollback_successor(&successor.id);
+                return Err(crate::error::RuntimeError::Session(format!(
+                    "failed to update the compacted parent session (successor rolled back): {e}"
+                )));
             }
 
-            // Advance named chains that pointed at the old head.
-            let mut advanced = Vec::new();
+            // Step 3: advance every named chain that pointed at the old
+            // head. Any failure restores the already-advanced chains, the
+            // parent, and removes the successor — never a partial chain
+            // state behind an Ok (I2).
+            let mut advanced: Vec<String> = Vec::new();
+            let mut chain_failure: Option<(String, std::io::Error)> = None;
             for chain in &chains {
-                match agent_core::chain::save_chain(&chain.name, &successor.id) {
+                let result = match transition_failpoint_error(TransitionFailpoint::AtChainAdvance) {
+                    Some(e) => Err(e),
+                    None => agent_core::chain::save_chain(&chain.name, &successor.id),
+                };
+                match result {
                     Ok(()) => advanced.push(chain.name.clone()),
-                    Err(e) => tracing::warn!(chain = %chain.name, error = %e,
-                        "failed to advance chain to compacted successor"),
+                    Err(e) => {
+                        chain_failure = Some((chain.name.clone(), e));
+                        break;
+                    }
                 }
+            }
+            if let Some((failed_chain, e)) = chain_failure {
+                for name in &advanced {
+                    if let Err(re) = agent_core::chain::save_chain(name, &current.id) {
+                        tracing::error!(chain = %name, error = %re,
+                            "rollback: failed to restore chain head");
+                    }
+                }
+                let mut restore = current.clone();
+                restore.api_messages = api_messages.to_vec();
+                restore.updated_at = chrono::Utc::now();
+                if let Err(re) = restore.save().await {
+                    tracing::error!(parent = %restore.id, error = %re,
+                        "rollback: failed to restore the parent session");
+                }
+                rollback_successor(&successor.id);
+                return Err(crate::error::RuntimeError::Session(format!(
+                    "failed to advance chain '{failed_chain}' to the compacted successor \
+                     (transition rolled back): {e}"
+                )));
             }
             (successor, advanced)
         }
@@ -1048,6 +1150,157 @@ mod transition_tests {
         assert_eq!(reloaded.api_messages.len(), 4);
         assert!(reloaded.compacted_into.is_none());
         assert!(reloaded.compaction.is_none());
+    }
+
+    /// RAII guard: arm a deterministic transition failpoint, clear on drop.
+    struct FailpointGuard;
+    impl FailpointGuard {
+        fn arm(point: TransitionFailpoint, skip: u32) -> Self {
+            set_transition_failpoint(Some((point, skip)));
+            Self
+        }
+    }
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            set_transition_failpoint(None);
+        }
+    }
+
+    /// Shared harness: seed a named parent + chain, arm a failpoint, run a
+    /// linked-successor transition, and prove full rollback: Err surfaced,
+    /// no successor file, parent intact (no forward link, name kept), every
+    /// chain still pointing at the parent, and NO on_compaction hook fired.
+    async fn assert_failpoint_rolls_back(
+        base: &BaseDirGuard,
+        point: TransitionFailpoint,
+        skip: u32,
+        chain_names: &[&str],
+    ) {
+        use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Recorder {
+            hits: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Recorder {
+            fn id(&self) -> &str {
+                "rollback-recorder"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue
+            }
+            async fn shutdown(&self) {}
+        }
+
+        let runtime = crate::Runtime::new_headless();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut perms = crate::extensions::permissions::PermissionSet::new();
+        perms.grant(HookKind::OnCompaction.required_permission());
+        runtime
+            .hook_bus()
+            .subscribe(
+                HookKind::OnCompaction,
+                Arc::new(Recorder { hits: hits.clone() }),
+                None,
+                None,
+                perms,
+            )
+            .await
+            .unwrap();
+
+        let mut parent = parent_session();
+        parent.name = Some("mainline".into());
+        parent.api_messages = history();
+        parent.save().await.expect("seed parent");
+        for name in chain_names {
+            agent_core::chain::save_chain(name, &parent.id).unwrap();
+        }
+
+        let _fp = FailpointGuard::arm(point, skip);
+        let result = apply_compaction(
+            &runtime,
+            &parent,
+            &parent.api_messages.clone(),
+            &hostile_outcome(),
+            transition(CompactionPolicy::LinkedSuccessor),
+        )
+        .await;
+        drop(_fp);
+
+        assert!(result.is_err(), "{point:?}: injected failure must surface");
+
+        // Exactly the parent's session file remains.
+        let sessions = base.path().join("sessions");
+        let files: Vec<String> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec![format!("{}.json", parent.id)],
+            "{point:?}: rollback must remove the successor file"
+        );
+
+        // Parent state is consistent: no forward link, no provenance
+        // record, name retained, history intact.
+        let reloaded = Session::load(&parent.id).unwrap();
+        assert!(reloaded.compacted_into.is_none(), "{point:?}");
+        assert!(reloaded.compaction.is_none(), "{point:?}");
+        assert_eq!(reloaded.name.as_deref(), Some("mainline"), "{point:?}");
+        assert_eq!(reloaded.api_messages.len(), 4, "{point:?}");
+
+        // Every named chain still points at the parent.
+        for name in chain_names {
+            let chain = agent_core::chain::load_chain(name).unwrap();
+            assert_eq!(chain.head, parent.id, "{point:?}: chain '{name}'");
+        }
+
+        // No partial-success hook.
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "{point:?}: on_compaction must not fire on a failed transition"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failpoint_after_successor_save_rolls_back_completely() {
+        let base = BaseDirGuard::new();
+        assert_failpoint_rolls_back(
+            &base,
+            TransitionFailpoint::AfterSuccessorSave,
+            0,
+            &["mainline"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failpoint_at_parent_save_rolls_back_completely() {
+        let base = BaseDirGuard::new();
+        assert_failpoint_rolls_back(&base, TransitionFailpoint::AtParentSave, 0, &["mainline"])
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failpoint_at_chain_advance_restores_advanced_chains_and_parent() {
+        let base = BaseDirGuard::new();
+        // skip=1: the FIRST chain advances successfully and must be
+        // restored; the SECOND chain's advancement fails.
+        assert_failpoint_rolls_back(
+            &base,
+            TransitionFailpoint::AtChainAdvance,
+            1,
+            &["alpha", "beta"],
+        )
+        .await;
     }
 
     #[tokio::test]
