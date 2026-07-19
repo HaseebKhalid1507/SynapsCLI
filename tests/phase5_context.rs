@@ -434,3 +434,47 @@ fn min_history_gate_prevents_recompaction_loops() {
 // The Runtime-surface parity proof (`Runtime::assess_context` IS the engine
 // calculation, not a fork) lives in the engine unit tests next to
 // `runtime::context`, because `Runtime::new_headless` is test-gated there.
+
+// ─── 6. no frontend-local token math on the trigger path ─────────────────────
+
+/// Spec §9.1 acceptance: all frontends consume the same engine budget
+/// calculation — no per-frontend token estimation or threshold math may
+/// remain on any compaction trigger path.
+#[test]
+fn frontend_trigger_paths_contain_no_local_token_math() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let read = |rel: &str| {
+        std::fs::read_to_string(format!("{root}/{rel}"))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+
+    let chat = read("src/cmd/chat.rs");
+    for forbidden in ["estimate_tokens", "compact_threshold", "80_000"] {
+        assert!(
+            !chat.contains(forbidden),
+            "src/cmd/chat.rs still carries local trigger math ({forbidden})"
+        );
+    }
+    assert!(
+        chat.contains("assess_context"),
+        "src/cmd/chat.rs must consume the engine context assessment"
+    );
+
+    // The legacy chars/4 estimator on the engine conversation state was the
+    // source the frontend math forked from — it must be gone entirely.
+    let conv_state = read("crates/agent-engine/src/engine/session.rs");
+    assert!(
+        !conv_state.contains("fn estimate_tokens"),
+        "ConversationState::estimate_tokens (chars/4) must be removed in \
+         favor of runtime::context"
+    );
+
+    // Manual-compaction frontends must not have grown their own trigger math.
+    for rel in ["src/cmd/rpc.rs", "crates/agent-tui/src/tui/dispatch.rs"] {
+        let src = read(rel);
+        assert!(
+            !src.contains("estimate_tokens"),
+            "{rel} must not carry frontend-local token estimation"
+        );
+    }
+}

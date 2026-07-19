@@ -124,36 +124,4 @@ impl ConversationState {
             cache_creation_1h,
         );
     }
-
-    /// Estimate current token count (for compaction decisions).
-    pub fn estimate_tokens(&self) -> usize {
-        let mut total_chars = 0usize;
-        for msg in &self.api_messages {
-            if let Some(s) = msg["content"].as_str() {
-                total_chars += s.len();
-            } else if let Some(arr) = msg["content"].as_array() {
-                for block in arr {
-                    if let Some(s) = block["text"].as_str() {
-                        total_chars += s.len();
-                    }
-                    if let Some(s) = block["thinking"].as_str() {
-                        total_chars += s.len();
-                    }
-                    if let Some(s) = block["content"].as_str() {
-                        total_chars += s.len();
-                    } else if let Some(content_arr) = block["content"].as_array() {
-                        for inner in content_arr {
-                            if let Some(s) = inner["text"].as_str() {
-                                total_chars += s.len();
-                            }
-                        }
-                    }
-                    if let Some(input) = block.get("input") {
-                        total_chars += input.to_string().len();
-                    }
-                }
-            }
-        }
-        total_chars / 4
-    }
 }
