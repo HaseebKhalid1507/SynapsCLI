@@ -394,7 +394,10 @@ impl ToolRegistry {
     /// Boundary-test support: resume the catalog generation counter at an
     /// explicit value. Grants nothing, exposes nothing, and changes no
     /// tools, schema, or catalog entries; only the counter consulted by
-    /// fail-closed mutation checks is overwritten.
+    /// fail-closed mutation checks is overwritten. Doc-hidden instead of
+    /// cfg-gated: this crate's integration tests (e.g.
+    /// `tests/execution_gate.rs`) run without the `testing` feature, so
+    /// `#[cfg(any(test, feature = "testing"))]` would break their imports.
     #[doc(hidden)]
     pub fn resume_catalog_generation_for_tests(
         &mut self,

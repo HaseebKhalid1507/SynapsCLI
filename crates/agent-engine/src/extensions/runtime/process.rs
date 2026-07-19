@@ -215,6 +215,7 @@ pub fn parse_provider_stream_event(params: &Value) -> Result<ProviderStreamEvent
 
 pub async fn execute_provider_tool_use(
     registry: &crate::ToolRegistry,
+    session_tools: &crate::tools::activation::SessionToolSet,
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_use: ProviderToolUse,
     ctx: crate::ToolContext,
@@ -224,16 +225,35 @@ pub async fn execute_provider_tool_use(
     let tool_name = tool_use.name;
     let input = tool_use.input;
 
-    let Some(tool) = registry.get(&tool_name).cloned() else {
-        return serde_json::json!({
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": format!("Unknown tool: {}", tool_name),
-            "is_error": true,
-        });
+    // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
+    // The extension-provider interior tool loop passes the SAME gate as
+    // stream dispatch: resolve the provider-supplied wire name to the exact
+    // live ToolId, verify the session set snapshot generation + pinned
+    // schema digest, require core/exact-grant status, re-check source
+    // trust, and only then acquire the implementation — all against the
+    // one consistent registry borrow the caller holds (read-locked for the
+    // whole outer provider call, so the catalog cannot drift inside the
+    // loop). Denial happens BEFORE input translation, BEFORE hook
+    // emission, BEFORE execution, and returns a valid tool_result with
+    // typed bounded static content and `is_error: true`.
+    let authorized = match crate::tools::activation::ExecutionGate::authorize_wire_call(
+        registry,
+        session_tools,
+        &tool_name,
+    ) {
+        Ok(authorized) => authorized,
+        Err(denial) => {
+            return serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": denial.to_string(),
+                "is_error": true,
+            });
+        }
     };
+    let tool = authorized.implementation();
 
-    let runtime_name = registry.runtime_name_for_api(&tool_name).to_string();
+    let runtime_name = authorized.runtime_name().to_string();
     let input = registry.translate_input_for_api_tool(&tool_name, input);
     let decision = crate::runtime::resolve_before_tool_call_decision(
         input.clone(),
@@ -287,10 +307,16 @@ pub async fn execute_provider_tool_use(
     response
 }
 
+/// Interior extension-provider tool loop. `session_tools` is built ONCE by
+/// the caller (under the same registry read guard passed as `registry`) and
+/// reused for every tool call in every interior round — the registry stays
+/// read-locked for the whole outer provider call, so no catalog drift is
+/// possible inside this loop and one set snapshot governs all rounds.
 pub async fn complete_provider_with_tools<F>(
     handler: Arc<dyn ExtensionHandler>,
     mut params: ProviderCompleteParams,
     registry: &crate::ToolRegistry,
+    session_tools: &crate::tools::activation::SessionToolSet,
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     mut context_factory: F,
     max_tool_output: usize,
@@ -325,6 +351,7 @@ where
             tool_results.push(
                 execute_provider_tool_use(
                     registry,
+                    session_tools,
                     hook_bus,
                     tool_use,
                     context_factory(),

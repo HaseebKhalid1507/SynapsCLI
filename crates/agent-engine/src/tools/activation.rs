@@ -417,7 +417,11 @@ pub enum ToolAuthorizationError {
 /// 3. the session tool set snapshot must match the catalog generation;
 /// 4. the identity must be core (pinned digest intact) or hold an exact
 ///    session activation grant (session, tool, generation, digest);
-/// 5. source permission/trust is re-evaluated conservatively;
+/// 5. source trust is re-evaluated conservatively — see the honesty note
+///    on [`check_source_trust`]: this re-checks typed source/provenance
+///    consistency and denies Unknown/Unverified, but does NOT yet consult
+///    live manifest permission/revocation state (Task 20 integrates the
+///    permission/revocation policy);
 /// 6. side-effect/confirmation policy (interim: `Unclassified` is allowed
 ///    only for verified-provenance capabilities — Task 24 adds real effect
 ///    classes);
@@ -489,8 +493,10 @@ impl ExecutionGate {
             return Err(ToolAuthorizationError::NotActivated(tool_id));
         }
 
-        // Conservative source permission/trust re-evaluation immediately
-        // before acquisition.
+        // Conservative source trust re-check immediately before
+        // acquisition: typed source/provenance consistency only (see
+        // check_source_trust) — live manifest permission/revocation state
+        // is not consulted here yet (Task 20).
         check_source_trust(record)?;
 
         // Side-effect/confirmation interim policy (until Task 24): the only
@@ -522,10 +528,18 @@ impl ExecutionGate {
     }
 }
 
-/// Conservative per-source trust policy: `BuiltinRuntime` provenance is
-/// valid only for builtin-sourced records; extension/MCP/plugin provenance
-/// must match the catalog source identity exactly; `Unverified` (and any
-/// unknown source) is denied by default even if configured core.
+/// Conservative per-source trust policy — CONSISTENCY check, not a live
+/// permission lookup: `BuiltinRuntime` provenance is valid only for
+/// builtin-sourced records; extension/MCP/plugin provenance must match the
+/// catalog source identity exactly; `Unverified` (and any unknown source)
+/// is denied by default even if configured core.
+///
+/// Honesty note (Task 16): this validates the typed provenance recorded at
+/// catalog time against the record's source identity. It does NOT consult
+/// live manifest permission state or revocation — a capability whose
+/// extension permissions were revoked after cataloging still passes this
+/// check until the catalog entry is removed/rebuilt. Live
+/// permission/revocation integration is Task 20.
 fn check_source_trust(record: &CapabilityRecord) -> Result<(), ToolAuthorizationError> {
     let deny_untrusted = || ToolAuthorizationError::UntrustedSource(record.id().clone());
     let deny_mismatch = || ToolAuthorizationError::SourceProvenanceMismatch(record.id().clone());

@@ -775,6 +775,13 @@ pub struct ApiOptions {
     /// session writer whenever the telemetry level is Basic/Full. Enqueue
     /// only — never synchronous file I/O on the request path.
     pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
+    /// Runtime-scoped tool-session identity (Task 16). Scopes the execution
+    /// gate for extension-provider interior tool loops reached through
+    /// `try_route`. Stream turns (and `run_single`) thread the Runtime's
+    /// host session; `None` (internal helpers, tests) makes the extension
+    /// route fail closed to a locally minted identity with the identical
+    /// default-core policy — never to ungated execution.
+    pub tool_session_id: Option<crate::tools::activation::SessionId>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -960,6 +967,7 @@ impl ApiMethods {
             &options.token_cache,
             max_retries,
             options.codex_request_role,
+            options.tool_session_id.as_ref(),
             &options.trace,
         )
         .await

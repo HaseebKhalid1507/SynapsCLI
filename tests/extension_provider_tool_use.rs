@@ -7,7 +7,17 @@ use synaps_cli::extensions::runtime::process::{
     execute_provider_tool_use,
     ProviderToolUse,
 };
-use synaps_cli::tools::{Tool, ToolContext, ToolRegistry};
+use synaps_cli::tools::activation::{SessionId, SessionToolSet};
+use synaps_cli::tools::{Tool, ToolContext, ToolOrigin, ToolRegistry};
+
+/// Default per-session set (verified tools as core, zero activations) —
+/// what the extension route builds for the interior loop's execution gate.
+fn session_set_for(registry: &ToolRegistry) -> SessionToolSet {
+    SessionToolSet::default_core_for_catalog(
+        SessionId::parse("provider-tool-use-test-session").expect("valid session id"),
+        registry.catalog(),
+    )
+}
 
 struct EchoTool;
 
@@ -16,6 +26,8 @@ impl Tool for EchoTool {
     fn name(&self) -> &str { "echo_test" }
     fn description(&self) -> &str { "echo test tool" }
     fn parameters(&self) -> Value { json!({"type": "object"}) }
+    /// Verified-core fixture for the Task 16 execution gate.
+    fn origin(&self) -> ToolOrigin { ToolOrigin::Builtin }
     async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
         Ok(params["message"].as_str().unwrap_or_default().to_string())
     }
@@ -28,6 +40,8 @@ impl Tool for FailingTool {
     fn name(&self) -> &str { "fail_test" }
     fn description(&self) -> &str { "failing test tool" }
     fn parameters(&self) -> Value { json!({"type": "object"}) }
+    /// Verified-core fixture for the Task 16 execution gate.
+    fn origin(&self) -> ToolOrigin { ToolOrigin::Builtin }
     async fn execute(&self, _params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
         Err(synaps_cli::RuntimeError::Tool("boom".to_string()))
     }
@@ -115,6 +129,7 @@ async fn executes_provider_requested_tool_through_synaps_registry() {
 
     let result = execute_provider_tool_use(
         &registry,
+        &session_set_for(&registry),
         &hook_bus,
         tool_use,
         test_context(),
@@ -141,6 +156,7 @@ async fn provider_requested_tool_execution_failure_is_marked_as_error() {
 
     let result = execute_provider_tool_use(
         &registry,
+        &session_set_for(&registry),
         &hook_bus,
         tool_use,
         test_context(),
@@ -173,6 +189,7 @@ async fn provider_requested_tool_calls_are_blocked_by_hooks() {
 
     let result = execute_provider_tool_use(
         &registry,
+        &session_set_for(&registry),
         &hook_bus,
         tool_use,
         test_context(),

@@ -118,6 +118,21 @@ impl StreamMethods {
         } = session;
         let mut messages = initial_messages;
 
+        // One retained `SessionToolSet` per stream session (Task 16): built
+        // once here, reused for EVERY tool call in every model response, and
+        // rebuilt only at the top of a provider round when the catalog
+        // generation advanced (dynamic registration). This makes the gate's
+        // generation/digest checks load-bearing: mid-round catalog drift is
+        // DENIED (`StaleSessionSet`), never silently absorbed by a per-call
+        // rebuild.
+        let mut session_tool_set = {
+            let registry = tools.read().await;
+            crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                tool_session_id.clone(),
+                registry.catalog(),
+            )
+        };
+
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -141,7 +156,24 @@ impl StreamMethods {
                 .await?;
             }
 
-            let tools_snapshot = tools.read().await.clone();
+            // Round-top set maintenance: if dynamic registration advanced
+            // the catalog generation since the retained set was built (e.g.
+            // `connect_mcp_server` drained after the previous round),
+            // rebuild it here — explicitly, deterministically, from the
+            // currently verified capabilities, with ZERO inherited
+            // activations (Task 17 introduces real activations). This is
+            // the ONLY rebuild site; individual calls never refresh it.
+            let tools_snapshot = {
+                let registry = tools.read().await;
+                if session_tool_set.is_stale(registry.catalog()) {
+                    session_tool_set =
+                        crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                            tool_session_id.clone(),
+                            registry.catalog(),
+                        );
+                }
+                registry.clone()
+            };
 
             // ═══ HOOK: before_message ═══
             // Fire before sending messages to the LLM. Extensions can inject context.
@@ -357,24 +389,22 @@ impl StreamMethods {
                         }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
-                        // Resolve wire name → exact ToolId, verify session
-                        // snapshot generation + pinned schema digest, require
-                        // core/exact-grant status, re-check source trust, and
-                        // only then acquire the implementation — all under ONE
-                        // registry read guard (one consistent snapshot, no
-                        // TOCTOU). Denials are typed, static, metadata-only
-                        // and happen BEFORE implementation lookup and BEFORE
-                        // any before_tool_call hook emission.
+                        // Resolve wire name → exact ToolId, verify the
+                        // RETAINED session set's snapshot generation + pinned
+                        // schema digest, require core/exact-grant status,
+                        // re-check source trust, and only then acquire the
+                        // implementation — all under ONE registry read guard
+                        // (one consistent snapshot, no TOCTOU). The set is
+                        // never rebuilt here: post-round-top catalog drift
+                        // denies typed (`StaleSessionSet`). Denials are
+                        // typed, static, metadata-only and happen BEFORE
+                        // implementation lookup and BEFORE any
+                        // before_tool_call hook emission.
                         let gate_outcome = {
                             let registry = tools.read().await;
-                            let session_set =
-                                crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                                    tool_session_id.clone(),
-                                    registry.catalog(),
-                                );
                             crate::tools::activation::ExecutionGate::authorize_wire_call(
                                 &registry,
-                                &session_set,
+                                &session_tool_set,
                                 &tool_name,
                             )
                             .map(|authorized| {
@@ -472,54 +502,80 @@ impl StreamMethods {
                     // Delta streaming is per-tool so each gets its own channel
                     let mut join_set = tokio::task::JoinSet::new();
 
-                    for tool_use in &tool_uses {
-                        let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
-                        let tool_name = tool_use["name"].as_str().unwrap_or("").to_string();
-                        let input = tool_use["input"].clone();
+                    // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
+                    // Authorize ALL sibling calls of this model response
+                    // first, against ONE registry read guard and the ONE
+                    // retained session-set snapshot, translating inputs into
+                    // owned dispatch records under that same guard. Only
+                    // after the guard is released are tasks spawned, so no
+                    // registration (`connect_mcp_server`, extension load)
+                    // can change policy between sibling calls, and no lock
+                    // is held across tool execution. Denials are typed,
+                    // static, metadata-only and happen BEFORE implementation
+                    // lookup and BEFORE hook emission inside the task.
+                    enum PreparedCall {
+                        /// JSON parse error surfaced by parse_tool_input().
+                        ParseError(String),
+                        /// Gate verdict: authorized implementation + input,
+                        /// or the typed denial.
+                        Gate(
+                            std::result::Result<
+                                (crate::tools::activation::AuthorizedToolCall, Value),
+                                crate::tools::activation::ToolAuthorizationError,
+                            >,
+                        ),
+                    }
+                    let prepared_calls: Vec<(String, String, PreparedCall)> = {
+                        let registry = tools.read().await;
+                        tool_uses
+                            .iter()
+                            .filter_map(|tool_use| {
+                                let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
+                                let tool_name =
+                                    tool_use["name"].as_str().unwrap_or("").to_string();
+                                if tool_id.is_empty() || tool_name.is_empty() {
+                                    return None;
+                                }
+                                let input = tool_use["input"].clone();
+                                let prepared = if let Some(err) =
+                                    input.get("__parse_error").and_then(|v| v.as_str())
+                                {
+                                    PreparedCall::ParseError(err.to_string())
+                                } else {
+                                    PreparedCall::Gate(
+                                        crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                            &registry,
+                                            &session_tool_set,
+                                            &tool_name,
+                                        )
+                                        .map(|authorized| {
+                                            let input = registry
+                                                .translate_input_for_api_tool(&tool_name, input);
+                                            (authorized, input)
+                                        }),
+                                    )
+                                };
+                                Some((tool_id, tool_name, prepared))
+                            })
+                            .collect()
+                    };
 
-                        if tool_id.is_empty() || tool_name.is_empty() {
-                            continue;
-                        }
-
-                        // Catch JSON parse errors surfaced by parse_tool_input()
-                        if let Some(err) = input.get("__parse_error").and_then(|v| v.as_str()) {
-                            let err = err.to_string();
-                            let tid = tool_id.clone();
-                            let tx_c = tx.clone();
-                            join_set.spawn(async move {
-                                let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult {
-                                    tool_id: tid.clone(),
-                                    result: err.clone(),
-                                }));
-                                (tid, false, err)
-                            });
-                            continue;
-                        }
-
-                        // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
-                        // Same gate as the single-tool path: resolve /
-                        // verify / authorize / acquire under ONE registry
-                        // read guard before the task is spawned, so a denial
-                        // never reaches implementation lookup or hook
-                        // emission inside the task.
-                        let tools_snapshot = tools.read().await;
-                        let session_set =
-                            crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                                tool_session_id.clone(),
-                                tools_snapshot.catalog(),
-                            );
-                        let gate_outcome =
-                            crate::tools::activation::ExecutionGate::authorize_wire_call(
-                                &tools_snapshot,
-                                &session_set,
-                                &tool_name,
-                            )
-                            .map(|authorized| {
-                                let input =
-                                    tools_snapshot.translate_input_for_api_tool(&tool_name, input);
-                                (authorized, input)
-                            });
-                        drop(tools_snapshot);
+                    for (tool_id, tool_name, prepared) in prepared_calls {
+                        let gate_outcome = match prepared {
+                            PreparedCall::ParseError(err) => {
+                                let tid = tool_id;
+                                let tx_c = tx.clone();
+                                join_set.spawn(async move {
+                                    let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                        tool_id: tid.clone(),
+                                        result: err.clone(),
+                                    }));
+                                    (tid, false, err)
+                                });
+                                continue;
+                            }
+                            PreparedCall::Gate(gate_outcome) => gate_outcome,
+                        };
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();

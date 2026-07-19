@@ -1698,6 +1698,13 @@ impl Runtime {
                     // limits it to exactly one logical request).
                     trace: self.effective_trace_context(),
                     telemetry: self.telemetry_writer.clone(),
+                    // Non-stream path note (Task 16 review): threading the
+                    // host session here gates extension-provider interior
+                    // tool loops identically to stream turns. The built-in
+                    // tool dispatch below (registry.get) remains the legacy
+                    // non-stream path — tracked; the required pass gate is
+                    // all STREAM-turn execution paths.
+                    tool_session_id: Some(self.host_tool_session.clone()),
                 },
             )
             .await?;
@@ -2092,6 +2099,9 @@ impl Runtime {
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
             telemetry: self.telemetry_writer.clone(),
+            // Threads the runtime-scoped gate identity into extension-
+            // provider interior tool loops (Task 16).
+            tool_session_id: Some(self.host_tool_session.clone()),
         };
 
         let session = crate::runtime::stream::StreamSession {

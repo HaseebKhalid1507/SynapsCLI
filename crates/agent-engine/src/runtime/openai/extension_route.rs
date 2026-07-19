@@ -27,9 +27,27 @@ use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
 type RouteResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Fallback tool-session identity for callers that carry none (internal
+/// non-stream helpers). Minted fresh per call: it can never inherit or
+/// share grants, and the default-core policy it scopes is identical to the
+/// runtime-threaded one (verified capabilities only, zero activations) —
+/// failing closed is therefore "same policy, no shared identity", never an
+/// ungated registry lookup.
+fn local_gate_session() -> crate::tools::activation::SessionId {
+    crate::tools::activation::SessionId::parse(&format!(
+        "extension-route-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated local gate session id is always valid")
+}
+
 /// Route one request through an extension-hosted provider. The caller has
 /// already parsed `model` into `plugin:provider:model` and resolved the
-/// routing manager.
+/// routing manager. `tool_session_id` is the runtime-scoped tool-session
+/// identity (Task 16) scoping the execution gate inside the interior tool
+/// loop; `None` (internal/sync callers) fails closed to a locally minted
+/// identity with the same default-core policy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -45,6 +63,7 @@ pub(crate) async fn route_extension_provider(
     max_tokens: Option<u32>,
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
+    tool_session_id: Option<&crate::tools::activation::SessionId>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -253,10 +272,21 @@ pub(crate) async fn route_extension_provider(
         );
         let result = if let Some(tools) = tools_shared {
             let registry = tools.read().await;
+            // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══ ONE session tool
+            // set for the whole interior tool loop, built here under the
+            // SAME registry read guard the loop holds for the entire outer
+            // call: the catalog cannot drift between interior rounds, so
+            // one snapshot at one generation governs every tool call the
+            // extension provider requests. Zero activations are inherited.
+            let session_tools = crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                tool_session_id.cloned().unwrap_or_else(local_gate_session),
+                registry.catalog(),
+            );
             crate::extensions::runtime::process::complete_provider_with_tools(
                 handler.clone(),
                 params,
                 &registry,
+                &session_tools,
                 &hook_bus,
                 || ToolContext {
                     channels: ToolChannels {

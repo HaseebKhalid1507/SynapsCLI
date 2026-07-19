@@ -115,6 +115,7 @@ impl ApiMethods {
             &options.token_cache,
             max_retries,
             options.codex_request_role,
+            options.tool_session_id.as_ref(),
             &options.trace,
         )
         .await
@@ -543,6 +544,11 @@ impl ApiMethods {
             &crate::auth::TokenCache::new(),
             max_retries,
             crate::runtime::openai::catalog::CodexRequestRole::Internal,
+            // Internal text-only helper: no tool session identity here, so
+            // an extension route (which cannot execute tools from this
+            // empty-schema path anyway) fails closed to a local
+            // default-core gate identity — never to ungated execution.
+            None,
             &options.trace,
         )
         .await

@@ -271,6 +271,262 @@ async fn default_core_tool_still_executes_through_gate() {
     );
 }
 
+// ── Retained per-session set semantics (Task 16 review fixes) ───────────────
+
+/// Round 1: TWO parallel `ls` calls. Round 2: one `ls`. Round 3: final text.
+const SSE_PARALLEL_LS_TOOL_USE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_g4\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_s1\",\"name\":\"ls\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_s2\",\"name\":\"ls\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Round 1 (parallel): the dynamic-registration fixture AND the tool it
+/// registers, in the SAME model response.
+const SSE_DYNREG_ROUND: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_g5\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_d1\",\"name\":\"gate_dyn_reg_fixture\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_d2\",\"name\":\"gate_late_fixture\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Round 2: the freshly registered tool alone.
+const SSE_LATE_TOOL_ROUND: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_g6\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_d3\",\"name\":\"gate_late_fixture\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Builtin-origin fixture registered mid-round by the `before_message`
+/// mutator: its registration bumps the catalog generation.
+struct MidRoundRegisteredTool;
+
+#[async_trait]
+impl Tool for MidRoundRegisteredTool {
+    fn name(&self) -> &str {
+        "gate_mid_round_fixture"
+    }
+    fn description(&self) -> &str {
+        "registered mid-round to bump the catalog generation"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+        Ok("MID_OK".to_string())
+    }
+}
+
+/// `before_message` handler that mutates the live registry exactly once —
+/// AFTER the round-top session-set rebuild, BEFORE tool authorization.
+struct RegistryMutator {
+    tools: Arc<tokio::sync::RwLock<synaps_cli::ToolRegistry>>,
+    fired: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ExtensionHandler for RegistryMutator {
+    fn id(&self) -> &str {
+        "gate-registry-mutator"
+    }
+    async fn handle(&self, _event: &HookEvent) -> HookResult {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.tools
+                .write()
+                .await
+                .register(Arc::new(MidRoundRegisteredTool));
+        }
+        HookResult::Continue
+    }
+    async fn shutdown(&self) {}
+}
+
+/// Builtin-origin fixture that dynamically registers `gate_late_fixture`
+/// through the stream's `tool_register_tx` channel (the `connect_mcp_server`
+/// seam), which is drained only AFTER the round completes.
+struct DynRegFixtureTool;
+
+#[async_trait]
+impl Tool for DynRegFixtureTool {
+    fn name(&self) -> &str {
+        "gate_dyn_reg_fixture"
+    }
+    fn description(&self) -> &str {
+        "registers gate_late_fixture dynamically"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+        if let Some(tx) = &ctx.capabilities.tool_register_tx {
+            let _ = tx.send(vec![Arc::new(LateFixtureTool) as Arc<dyn Tool>]);
+        }
+        Ok("REGISTERED".to_string())
+    }
+}
+
+/// The verified (builtin-origin) tool registered dynamically mid-turn.
+struct LateFixtureTool;
+
+#[async_trait]
+impl Tool for LateFixtureTool {
+    fn name(&self) -> &str {
+        "gate_late_fixture"
+    }
+    fn description(&self) -> &str {
+        "late dynamically registered fixture"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+        Ok("LATE_OK".to_string())
+    }
+}
+
+/// A catalog mutation AFTER the round-top rebuild makes the retained
+/// session set stale: BOTH sibling calls of the same response are denied
+/// with the IDENTICAL stale-generation message (one set snapshot, one
+/// generation — never per-call silent refresh), no `before_tool_call` hook
+/// fires for them, and the NEXT round's explicit rebuild recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mid_round_catalog_mutation_denies_stale_until_next_round_rebuild() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[
+        SSE_PARALLEL_LS_TOOL_USE,
+        ANTHROPIC_SSE_TOOL_USE,
+        ANTHROPIC_SSE,
+    ]))
+    .await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let mut rt = Runtime::new().await.expect("runtime");
+    rt.set_model("claude-sonnet-4-5".to_string());
+    let seen_hooks = install_hook_spy(&rt).await;
+    rt.hook_bus()
+        .subscribe(
+            HookKind::BeforeMessage,
+            Arc::new(RegistryMutator {
+                tools: rt.tools_shared(),
+                fired: Arc::new(AtomicBool::new(false)),
+            }),
+            None,
+            None,
+            PermissionSet::from_strings(&["privacy.llm_content".to_string()]),
+        )
+        .await
+        .expect("mutator subscription");
+
+    let ev = drive_runtime_turn(&rt, "stale round fixture", false).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "denial continues the loop");
+
+    let results = tool_results(&final_history(&ev));
+    assert_eq!(results.len(), 3, "two round-1 denials plus one round-2 run");
+    assert_eq!(results[0].0, "toolu_s1");
+    assert_eq!(results[1].0, "toolu_s2");
+    assert!(
+        results[0].1.contains("stale"),
+        "post-rebuild catalog mutation must deny stale, got: {}",
+        results[0].1
+    );
+    assert_eq!(
+        results[0].1, results[1].1,
+        "sibling calls of one response must be judged against ONE set \
+         snapshot at ONE generation"
+    );
+    assert_eq!(results[2].0, "toolu_ph2");
+    assert!(
+        !results[2].1.contains("denied") && !results[2].1.contains("stale"),
+        "next-round explicit rebuild must recover, got: {}",
+        results[2].1
+    );
+    assert_eq!(
+        seen_hooks.lock().unwrap().as_slice(),
+        ["ls"],
+        "stale denials must not emit before_tool_call; only the recovered \
+         round-2 call may"
+    );
+}
+
+/// Stream dynamic registrations are drained only after a round: a sibling
+/// call to the not-yet-drained tool in the SAME response stays a typed
+/// Unknown denial, and the NEXT round's explicit rebuild exposes the newly
+/// registered verified tool as default core (no inherited activations).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn drained_registration_executes_only_after_next_round_rebuild() {
+    let _guard = HomeGuard::new();
+    let (url, _, _) = spawn_stub(Script::SeqSse(&[
+        SSE_DYNREG_ROUND,
+        SSE_LATE_TOOL_ROUND,
+        ANTHROPIC_SSE,
+    ]))
+    .await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let mut rt = Runtime::new().await.expect("runtime");
+    rt.set_model("claude-sonnet-4-5".to_string());
+    rt.tools_shared()
+        .write()
+        .await
+        .register(Arc::new(DynRegFixtureTool));
+
+    let ev = drive_runtime_turn(&rt, "dyn reg fixture", false).await;
+    let results = tool_results(&final_history(&ev));
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].0, "toolu_d1");
+    assert_eq!(results[0].1, "REGISTERED");
+    assert_eq!(results[1].0, "toolu_d2");
+    assert_eq!(
+        results[1].1, "Unknown tool: gate_late_fixture",
+        "not-yet-drained registration must stay unknown within the round"
+    );
+    assert_eq!(results[2].0, "toolu_d3");
+    assert_eq!(
+        results[2].1, "LATE_OK",
+        "next-round rebuild must expose the drained verified tool as \
+         default core"
+    );
+}
+
 /// Mixed parallel round: denial and success keep the tool_use ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]

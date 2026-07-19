@@ -361,6 +361,13 @@ impl ToolCatalog {
 
     /// Boundary-test support: an empty catalog resumed at an explicit
     /// generation. Not used by production paths.
+    ///
+    /// Deliberately NOT gated behind `#[cfg(any(test, feature = "testing"))]`:
+    /// this crate's integration tests (e.g. `tests/registry_catalog.rs`)
+    /// compile the library without `cfg(test)` and are run without the
+    /// `testing` feature (it is enabled only through `synaps-tui`/workspace
+    /// wiring), so cfg-gating would break their imports. `#[doc(hidden)]`
+    /// keeps it out of the public API surface instead.
     #[doc(hidden)]
     pub fn resume_at_generation_for_tests(generation: CatalogGeneration) -> Self {
         Self {
@@ -371,7 +378,10 @@ impl ToolCatalog {
 
     /// Boundary-test support: overwrite the generation counter in place.
     /// Grants nothing, exposes nothing, and mutates no entries; only the
-    /// counter used by fail-closed advancement checks is changed.
+    /// counter used by fail-closed advancement checks is changed. Doc-hidden
+    /// instead of cfg-gated for the same reason as
+    /// [`Self::resume_at_generation_for_tests`] (plain integration tests
+    /// must keep compiling without the `testing` feature).
     #[doc(hidden)]
     pub fn set_generation_for_tests(&mut self, generation: CatalogGeneration) {
         self.generation = generation;

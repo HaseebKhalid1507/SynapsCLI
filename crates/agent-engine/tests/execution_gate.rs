@@ -49,6 +49,13 @@ impl FixtureTool {
             origin: ToolOrigin::Unknown,
         }
     }
+
+    fn builtin(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            origin: ToolOrigin::Builtin,
+        }
+    }
 }
 
 #[async_trait]
@@ -173,6 +180,56 @@ fn default_session_set_core_is_exactly_verified_registered_tools() {
 }
 
 // ── Deferred (non-core) denial and exact activation ─────────────────────────
+
+/// Retained-set semantics the stream loop relies on (Task 16 review fix):
+/// ONE set snapshot judges every sibling call of a model response at ONE
+/// generation; a catalog mutation makes that retained set stale for ALL
+/// subsequent calls (typed denial, never a silent per-call refresh); only
+/// an explicit deterministic rebuild — the stream's round-top step —
+/// recovers, and it exposes newly registered verified tools as default
+/// core with zero inherited activations.
+#[test]
+fn retained_set_judges_siblings_at_one_generation_and_denies_after_mutation_until_rebuild() {
+    let mut registry = ToolRegistry::new();
+    let set = SessionToolSet::default_core_for_catalog(session("s-retained"), registry.catalog());
+    let built_at = set.catalog_generation();
+
+    // Sibling calls of one response: same retained set, same generation.
+    ExecutionGate::authorize_wire_call(&registry, &set, "bash").expect("sibling 1 authorizes");
+    ExecutionGate::authorize_wire_call(&registry, &set, "ls").expect("sibling 2 authorizes");
+    assert_eq!(
+        set.catalog_generation(),
+        built_at,
+        "authorization must never advance or refresh the set snapshot"
+    );
+
+    // Dynamic registration advances the catalog generation.
+    registry.register(Arc::new(FixtureTool::builtin("late-registered")));
+
+    // The retained set is now stale for EVERY call — including tools that
+    // authorized moments ago — until the explicit rebuild.
+    for wire in ["bash", "ls", "late-registered"] {
+        let err = ExecutionGate::authorize_wire_call(&registry, &set, wire)
+            .expect_err("stale retained set must deny, not silently refresh");
+        assert_eq!(
+            err,
+            ToolAuthorizationError::StaleSessionSet {
+                set: built_at,
+                catalog: registry.catalog().generation(),
+            },
+            "denial must carry the exact stale/current generation pair"
+        );
+    }
+
+    // Explicit deterministic rebuild (the stream's round-top step): fresh
+    // default core from currently verified tools, zero activations.
+    let rebuilt =
+        SessionToolSet::default_core_for_catalog(session("s-retained"), registry.catalog());
+    assert_eq!(rebuilt.activated().count(), 0, "no inherited activations");
+    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "bash").expect("rebuild recovers");
+    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "late-registered")
+        .expect("newly registered verified tool becomes default core after rebuild");
+}
 
 #[test]
 fn trusted_non_core_without_grant_is_not_activated_and_factory_untouched() {

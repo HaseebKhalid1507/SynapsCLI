@@ -14,6 +14,7 @@ use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::ExtensionHandler;
 use synaps_cli::extensions::manifest::ExtensionConfigEntry;
 use synaps_cli::{Tool, ToolContext};
+use synaps_cli::tools::ToolOrigin;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -24,6 +25,9 @@ impl Tool for EchoTestTool {
     fn name(&self) -> &str { "echo_test" }
     fn description(&self) -> &str { "echo test" }
     fn parameters(&self) -> Value { json!({"type": "object"}) }
+    /// Verified-core fixture: the Task 16 execution gate admits only
+    /// verified-provenance tools into the default core set.
+    fn origin(&self) -> ToolOrigin { ToolOrigin::Builtin }
     async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
         Ok(params["message"].as_str().unwrap_or_default().to_string())
     }
@@ -693,6 +697,7 @@ async fn extension_provider_complete_routes_to_process() {
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     ).await.expect("extension route").unwrap();
 
@@ -776,6 +781,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     )
     .await
@@ -847,6 +853,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     ).await.expect("extension route").unwrap();
 
@@ -1236,6 +1243,7 @@ async fn audit_log_records_disabled_route() {
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     )
     .await
