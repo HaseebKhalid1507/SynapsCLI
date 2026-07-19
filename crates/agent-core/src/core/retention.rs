@@ -23,6 +23,54 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+/// Typed retention failure (CP-13 fix1 I4/M2).
+#[derive(Debug)]
+pub enum RetentionError {
+    Io(io::Error),
+    /// A named-chain file could not be read or parsed: its head is UNKNOWN,
+    /// so every destructive session operation fails closed.
+    UnreadableChain(PathBuf),
+    /// The disk budget could not be met after evicting every unprotected
+    /// artifact (typed instead of a silent overshoot).
+    BudgetUnmet {
+        budget: u64,
+        remaining: u64,
+        protected_chain_heads: usize,
+    },
+}
+
+impl std::fmt::Display for RetentionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetentionError::Io(e) => write!(f, "retention io error: {e}"),
+            RetentionError::UnreadableChain(path) => write!(
+                f,
+                "unreadable named-chain file {} — refusing every destructive session \
+                 operation while chain protection is unknown",
+                path.display()
+            ),
+            RetentionError::BudgetUnmet {
+                budget,
+                remaining,
+                protected_chain_heads,
+            } => write!(
+                f,
+                "disk budget unmet: {remaining} bytes remain against a budget of \
+                 {budget} after evicting every unprotected artifact \
+                 ({protected_chain_heads} protected chain head(s) retained)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RetentionError {}
+
+impl From<io::Error> for RetentionError {
+    fn from(e: io::Error) -> Self {
+        RetentionError::Io(e)
+    }
+}
+
 /// Filesystem roots one retention pass operates over. Production callers
 /// use [`RetentionRoots::resolve`]; tests inject temp roots.
 #[derive(Debug, Clone)]
@@ -150,19 +198,22 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// Session ids protected by named chains (heads must never dangle).
-fn chain_heads(roots: &RetentionRoots) -> Vec<String> {
+/// Session ids protected by named chains (heads must never dangle). Any
+/// unreadable or unparseable chain file fails CLOSED (CP-13 fix1 M2): with
+/// an unknown head, no destructive session operation may proceed.
+fn chain_heads(roots: &RetentionRoots) -> Result<Vec<String>, RetentionError> {
     let mut heads = Vec::new();
     for path in list_files(&roots.chains_dir()) {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(head) = value["head"].as_str() {
-                    heads.push(head.to_string());
-                }
-            }
+        let raw =
+            fs::read_to_string(&path).map_err(|_| RetentionError::UnreadableChain(path.clone()))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| RetentionError::UnreadableChain(path.clone()))?;
+        match value["head"].as_str() {
+            Some(head) => heads.push(head.to_string()),
+            None => return Err(RetentionError::UnreadableChain(path.clone())),
         }
     }
-    heads
+    Ok(heads)
 }
 
 /// A session's age reference: embedded `updated_at`, mtime fallback.
@@ -246,9 +297,11 @@ pub fn sweep_at(
     roots: &RetentionRoots,
     policy: &RetentionPolicy,
     now_ms: u64,
-) -> io::Result<SweepOutcome> {
+) -> Result<SweepOutcome, RetentionError> {
     let mut outcome = SweepOutcome::default();
-    let protected: Vec<String> = chain_heads(roots);
+    // Chain protection resolves FIRST and fails closed — nothing is
+    // deleted while any chain head is unknown.
+    let protected: Vec<String> = chain_heads(roots)?;
     let age_cutoff = policy
         .max_age_days
         .map(|days| now_ms.saturating_sub(days as u64 * DAY_MS));
@@ -308,55 +361,179 @@ pub fn sweep_at(
         }
     }
 
-    // ── Disk budget: oldest-first across whole-file artifacts ──
+    // ── Disk budget (CP-13 fix1 I4): staged eviction until the final
+    // total actually fits, or a typed unmet error. Stage order minimizes
+    // data loss: (1) derived index dirs (rebuildable — free win), (2)
+    // whole-file artifacts oldest-first (never protected chain heads),
+    // (3) memory records oldest-first via atomic rewrite. ──
     if let Some(budget) = policy.max_disk_bytes {
-        let mut candidates: Vec<(u64, PathBuf, bool)> = Vec::new(); // (age_ref, path, protected)
-        for path in list_files(&roots.sessions_dir()) {
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let age = session_age_ms(&path).unwrap_or(u64::MAX);
-            candidates.push((age, path, protected.contains(&id)));
-        }
-        for path in list_files(&roots.cache_dir)
-            .into_iter()
-            .chain(log_files(&roots.config_dir))
-        {
-            let age = mtime_ms(&path).unwrap_or(u64::MAX);
-            candidates.push((age, path, false));
-        }
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let total_now = |roots: &RetentionRoots| -> u64 {
+            inspect(roots).map(|r| r.total_bytes).unwrap_or(u64::MAX)
+        };
 
-        let mut total: u64 = candidates
-            .iter()
-            .filter_map(|(_, p, _)| fs::metadata(p).ok().map(|m| m.len()))
-            .sum::<u64>()
-            + dir_bytes(&roots.index_dir())
-            + list_files(&roots.memory_dir())
-                .iter()
-                .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
-                .sum::<u64>();
-        for (_, path, is_protected) in candidates {
-            if total <= budget {
-                break;
+        // Stage 1: derived index directories.
+        if total_now(roots) > budget {
+            if let Ok(entries) = fs::read_dir(roots.index_dir()) {
+                for entry in entries.flatten() {
+                    if total_now(roots) <= budget {
+                        break;
+                    }
+                    let dir = entry.path();
+                    if dir.is_dir() {
+                        outcome.freed_bytes += dir_bytes(&dir);
+                        fs::remove_dir_all(&dir).map_err(RetentionError::Io)?;
+                        outcome.deleted_files += 1;
+                    }
+                }
             }
-            if is_protected {
-                outcome.protected_chain_heads += 1;
-                continue;
+        }
+
+        // Stage 2: whole-file artifacts, oldest-first, chain heads immune.
+        if total_now(roots) > budget {
+            let mut candidates: Vec<(u64, PathBuf, bool)> = Vec::new();
+            for path in list_files(&roots.sessions_dir()) {
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let age = session_age_ms(&path).unwrap_or(u64::MAX);
+                candidates.push((age, path, protected.contains(&id)));
             }
-            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            delete_file(&path, &mut outcome)?;
-            total = total.saturating_sub(len);
+            for path in cache_files(&roots.cache_dir)
+                .into_iter()
+                .chain(log_files(&roots.config_dir))
+            {
+                let age = mtime_ms(&path).unwrap_or(u64::MAX);
+                candidates.push((age, path, false));
+            }
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, path, is_protected) in candidates {
+                if total_now(roots) <= budget {
+                    break;
+                }
+                if is_protected {
+                    outcome.protected_chain_heads += 1;
+                    continue;
+                }
+                delete_file(&path, &mut outcome).map_err(RetentionError::Io)?;
+            }
+        }
+
+        // Stage 3: memory records, globally oldest-first.
+        if total_now(roots) > budget {
+            let over = total_now(roots) - budget;
+            let dropped = evict_oldest_memory_records(roots, over)?;
+            outcome.memory_records_dropped += dropped;
+        }
+
+        // Final enforcement: fit or typed error.
+        let remaining = total_now(roots);
+        if remaining > budget {
+            return Err(RetentionError::BudgetUnmet {
+                budget,
+                remaining,
+                protected_chain_heads: protected.len(),
+            });
         }
     }
 
     Ok(outcome)
 }
 
+/// Evict the globally oldest live memory records until at least
+/// `bytes_to_free` of line bytes are removed (atomic per-file rewrites).
+/// Returns the number of records dropped.
+fn evict_oldest_memory_records(
+    roots: &RetentionRoots,
+    bytes_to_free: u64,
+) -> Result<usize, RetentionError> {
+    // Collect (ts, file, id, line_len) for every live record.
+    let mut live: Vec<(u64, PathBuf, String, usize)> = Vec::new();
+    for path in list_files(&roots.memory_dir()) {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).map_err(RetentionError::Io)?;
+        let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut records: Vec<(u64, String, usize)> = Vec::new();
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(id) = value["tombstone"].as_str() {
+                tombstoned.insert(id.to_string());
+                continue;
+            }
+            if let Some(id) = value["id"].as_str() {
+                records.push((
+                    value["timestamp_ms"].as_u64().unwrap_or(0),
+                    id.to_string(),
+                    line.len() + 1,
+                ));
+            }
+        }
+        for (ts, id, len) in records {
+            if !tombstoned.contains(&id) {
+                live.push((ts, path.clone(), id, len));
+            }
+        }
+    }
+    live.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut freed: u64 = 0;
+    let mut victims: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut dropped = 0usize;
+    for (_, path, id, len) in live {
+        if freed >= bytes_to_free {
+            break;
+        }
+        victims.entry(path).or_default().insert(id);
+        freed += len as u64;
+        dropped += 1;
+    }
+
+    for (path, ids) in victims {
+        let raw = fs::read_to_string(&path).map_err(RetentionError::Io)?;
+        let kept: Vec<&str> = raw
+            .lines()
+            .filter(|line| {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    return false; // garbage compacts away
+                };
+                if let Some(id) = value["id"].as_str() {
+                    return !ids.contains(id);
+                }
+                // Tombstone lines for evicted ids are no longer needed;
+                // keep other tombstones.
+                if let Some(id) = value["tombstone"].as_str() {
+                    return !ids.contains(id);
+                }
+                true
+            })
+            .collect();
+        let mut body = kept.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        crate::core::private_fs::write_atomic_private(&path, body.as_bytes())
+            .map_err(io::Error::from)
+            .map_err(RetentionError::Io)?;
+    }
+    Ok(dropped)
+}
+
+/// Cache files under the confined cache root (no symlink following).
+fn cache_files(cache_dir: &Path) -> Vec<PathBuf> {
+    list_files(cache_dir)
+}
+
 /// Production sweep at the current clock.
-pub fn sweep(roots: &RetentionRoots, policy: &RetentionPolicy) -> io::Result<SweepOutcome> {
+pub fn sweep(
+    roots: &RetentionRoots,
+    policy: &RetentionPolicy,
+) -> Result<SweepOutcome, RetentionError> {
     sweep_at(roots, policy, crate::epoch_millis())
 }
 
@@ -473,7 +650,8 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
         RetentionDomain::Sessions => {
             // Sanitize BEFORE any path construction (CP-13 fix1 I5).
             let file = sanitize_file_id(id)?;
-            if chain_heads(roots).contains(&id.to_string()) {
+            let heads = chain_heads(roots).map_err(|e| io::Error::other(e.to_string()))?;
+            if heads.contains(&id.to_string()) {
                 return Err(io::Error::other(format!(
                     "session {id} is the head of a named chain — delete or repoint the \
                      chain first (retention never leaves chains dangling)"

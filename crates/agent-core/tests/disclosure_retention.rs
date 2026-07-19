@@ -495,3 +495,128 @@ fn memory_forget_requires_exact_live_record_ids() {
     let err = forget(&h.roots, RetentionDomain::Memory, "project-p33:mem-abc").unwrap_err();
     assert!(err.to_string().contains("not present"), "{err}");
 }
+
+// ─── CP-13 fix1: budget enforcement + fail-closed chains ─────────────────────
+
+#[test]
+fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+
+    // Memory-dominated corpus: 50 old records + 2 fresh ones.
+    let memory = h.roots.base_dir.join("memory").join("project-p44.jsonl");
+    let mut lines: Vec<String> = (0..50)
+        .map(|i| {
+            format!(
+                r#"{{"namespace":"project-p44","timestamp_ms":{},"content":"old bulk record {} {}","tags":[],"id":"mem-old{}","project":"p44"}}"#,
+                DAY_MS + i,
+                i,
+                "x".repeat(200),
+                i
+            )
+        })
+        .collect();
+    lines.push(format!(
+        r#"{{"namespace":"project-p44","timestamp_ms":{},"content":"fresh keep one","tags":[],"id":"mem-keep1","project":"p44"}}"#,
+        99 * DAY_MS
+    ));
+    lines.push(format!(
+        r#"{{"namespace":"project-p44","timestamp_ms":{},"content":"fresh keep two","tags":[],"id":"mem-keep2","project":"p44"}}"#,
+        99 * DAY_MS + 1
+    ));
+    std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
+
+    // A fat derived index dir — free win, evicted before any data.
+    let index_dir = h.roots.base_dir.join("memory/index/project-p44");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(index_dir.join("seg-000000.jsonl"), "z".repeat(4_000)).unwrap();
+
+    // Budget: room for roughly the two fresh records only.
+    let outcome = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: None,
+            max_disk_bytes: Some(700),
+        },
+        now,
+    )
+    .unwrap();
+
+    assert!(
+        !index_dir.exists(),
+        "derived index evicted first (no data loss)"
+    );
+    let rewritten = std::fs::read_to_string(&memory).unwrap();
+    assert!(rewritten.contains("fresh keep one") && rewritten.contains("fresh keep two"));
+    assert!(
+        !rewritten.contains("mem-old0"),
+        "oldest records evicted first"
+    );
+    assert!(outcome.memory_records_dropped >= 40);
+
+    // Final state actually satisfies the budget.
+    let total = inspect(&h.roots).unwrap().total_bytes;
+    assert!(total <= 700, "final total {total} must be <= budget");
+}
+
+#[test]
+fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "pinned", 10 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+
+    let err = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: None,
+            max_disk_bytes: Some(10),
+        },
+        now,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("budget") && msg.contains("protected"),
+        "unmet budget must surface typed, naming the protection: {msg}"
+    );
+    assert!(
+        session_exists(&h.roots, "pinned"),
+        "protected head untouched"
+    );
+}
+
+#[test]
+fn malformed_chain_files_fail_closed_without_destructive_sweep() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "old-session", 10 * DAY_MS, None);
+    // A chain file that cannot be parsed: its head is UNKNOWN, so any
+    // destructive session operation must refuse rather than risk dangling.
+    std::fs::write(h.roots.config_dir.join("chains/broken.json"), "{not json").unwrap();
+
+    let err = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+        },
+        now,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("chain"),
+        "typed chain failure: {err}"
+    );
+    assert!(
+        session_exists(&h.roots, "old-session"),
+        "no session may be deleted while chain protection is unreadable"
+    );
+
+    let err = forget(&h.roots, RetentionDomain::Sessions, "old-session").unwrap_err();
+    assert!(
+        err.to_string().contains("chain"),
+        "forget fails closed too: {err}"
+    );
+    assert!(session_exists(&h.roots, "old-session"));
+}
