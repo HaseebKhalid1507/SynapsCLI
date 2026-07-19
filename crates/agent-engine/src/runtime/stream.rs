@@ -580,6 +580,8 @@ impl StreamMethods {
                                 (authorized, input)
                             })
                         };
+                        let mut production_output: Option<crate::tools::output::OutputHandle> =
+                            None;
                         let result = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
@@ -589,7 +591,14 @@ impl StreamMethods {
                                 // preview budget and terminates on cancel,
                                 // closing the channel and releasing the
                                 // producer.
-                                let delta_channel = crate::tools::output::delta_channel();
+                                let delta_channel =
+                                    crate::tools::output::delta_channel_with_budgets(
+                                        crate::tools::output::OutputBudgets::for_limits(
+                                            max_tool_output,
+                                        ),
+                                        None,
+                                    );
+                                let output_handle = delta_channel.output_handle();
                                 let tx_k = tx.clone();
                                 let t_id = tool_id.clone();
                                 let _forwarder = crate::tools::output::spawn_ui_forwarder(
@@ -606,6 +615,7 @@ impl StreamMethods {
                                     },
                                 );
                                 let tx_d = delta_channel.sender;
+                                production_output = Some(output_handle.clone());
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = authorized.runtime_name().to_string();
@@ -677,15 +687,23 @@ impl StreamMethods {
                             Err(denial) => denial.to_string(),
                         };
 
+                        let history_result = production_output
+                            .as_ref()
+                            .map(crate::tools::output::OutputHandle::model_history)
+                            .filter(|bounded| bounded.original_bytes > 0);
+                        let ui_result = crate::tools::output::bounded_preview(
+                            &result,
+                            crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
+                        );
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.clone(),
-                            result: result.clone(),
+                            result: ui_result,
                         }));
 
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result, max_tool_output)
+                            "content": history_result.map(|bounded| bounded.text).unwrap_or_else(|| HelperMethods::truncate_tool_result(&result, max_tool_output))
                         }));
                     }
                 } else {
@@ -872,12 +890,19 @@ impl StreamMethods {
                                         auto_approve_inner,
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
-                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason))
+                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     // Bounded delta lane (Task 26, §8.4) — see the single-tool site.
-                                    let delta_channel = crate::tools::output::delta_channel();
+                                    let delta_channel =
+                                        crate::tools::output::delta_channel_with_budgets(
+                                            crate::tools::output::OutputBudgets::for_limits(
+                                                max_tool_output,
+                                            ),
+                                            None,
+                                        );
+                                    let output_handle = delta_channel.output_handle();
                                     let tx_k = tx_stream.clone();
                                     let t_id = tool_id.clone();
                                     let _forwarder = crate::tools::output::spawn_ui_forwarder(
@@ -911,22 +936,25 @@ impl StreamMethods {
                                                 output,
                                                 max_tool_output,
                                             ).await;
-                                            (false, Some(call_effect), output)
+                                            (false, Some(call_effect), output, Some(output_handle))
                                         }
                                         _ = cancel_token.cancelled() => {
-                                            (true, Some(call_effect), "Canceled by user".to_string())
+                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle))
                                         }
                                     }
                                     } // close else from Block check
                                 }
                                 // Typed, bounded, metadata-only gate denial —
                                 // no implementation lookup, no hook emission.
-                                Err(denial) => (false, None, denial.to_string()),
+                                Err(denial) => (false, None, denial.to_string(), None),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                 tool_id: tool_id.clone(),
-                                result: result.2.clone(),
+                                result: crate::tools::output::bounded_preview(
+                                    &result.2,
+                                    crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
+                                ),
                             }));
 
                             let was_canceled = result.0;
@@ -946,7 +974,12 @@ impl StreamMethods {
                                 }
                                 _ => None,
                             };
-                            lane_results.push((tool_id, was_canceled, interrupted, result.2));
+                            let history = result.3.as_ref()
+                                .map(crate::tools::output::OutputHandle::model_history)
+                                .filter(|bounded| bounded.original_bytes > 0)
+                                .map(|bounded| bounded.text)
+                                .unwrap_or_else(|| HelperMethods::truncate_tool_result(&result.2, max_tool_output));
+                            lane_results.push((tool_id, was_canceled, interrupted, history));
                             if was_canceled {
                                 // Cancellation stops the lane; the ordered
                                 // assembly below synthesizes cancel results

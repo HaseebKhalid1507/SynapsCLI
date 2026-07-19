@@ -33,7 +33,8 @@
 //! per tool call, and always equal `produced - forwarded - dropped` in the
 //! counters (coalesced bytes are informational overlap, not a third bucket).
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -53,6 +54,192 @@ pub const DELTA_COALESCE_CAP_BYTES: usize = 64 * 1024;
 /// results remain visually identical.
 pub const DEFAULT_UI_PREVIEW_BYTES: usize = 256 * 1024;
 
+// ── Budgets ─────────────────────────────────────────────────────────────────
+
+/// Independent per-call output byte budgets (spec §8.4). The UI-preview
+/// lane (streamed deltas + the final `ToolResult` event) and the
+/// model-history lane (the `tool_result` block content) are bounded
+/// SEPARATELY: tightening one never widens or narrows the other. Both are
+/// enforced through [`agent_core::BoundedText`] at the point the bounded
+/// text is produced — never by materializing the full output first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputBudgets {
+    /// Total bytes one tool call may contribute to the UI event lane.
+    pub ui_preview_bytes: usize,
+    /// Total bytes one tool call's result may occupy in model history.
+    pub model_history_bytes: usize,
+}
+
+impl OutputBudgets {
+    /// Runtime defaults: the compiled UI-preview budget alongside the
+    /// configured model-history budget (`max_tool_output`).
+    pub fn for_limits(max_tool_output: usize) -> Self {
+        Self {
+            ui_preview_bytes: DEFAULT_UI_PREVIEW_BYTES,
+            model_history_bytes: max_tool_output,
+        }
+    }
+
+    /// Hard upper bound retained by the UI delta lane itself, independent
+    /// of the consumer and configured preview budget.
+    pub const fn max_ui_retained_bytes() -> u64 {
+        (DELTA_CHANNEL_CAPACITY * DELTA_MAX_CHUNK_BYTES + DELTA_COALESCE_CAP_BYTES) as u64
+    }
+}
+
+/// Model-history production result. `text` is always a UTF-8 prefix at most
+/// the configured model-history budget; the original is represented only by
+/// exact byte accounting, never retained in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedOutput {
+    pub text: String,
+    pub original_bytes: usize,
+    pub retained_bytes: usize,
+    pub truncated: bool,
+}
+
+/// Bound a final result string for the UI event lane, appending a
+/// metadata-only truncation marker when anything was cut. UTF-8-safe and
+/// greedy via [`agent_core::BoundedText`].
+pub fn bounded_preview(s: &str, max_bytes: usize) -> String {
+    let bounded = agent_core::BoundedText::new(s, max_bytes);
+    if !bounded.truncated {
+        return bounded.text;
+    }
+    format!(
+        "{}\n\n[preview truncated — {} of {} bytes shown]",
+        bounded.text, bounded.retained_bytes, bounded.original_bytes
+    )
+}
+
+// ── Spill artifact ──────────────────────────────────────────────────────────
+
+/// Opt-in spill policy: capture the FULL produced delta stream (before any
+/// cap/coalesce/drop decision) into a private (`0600`, T4 helpers) artifact
+/// under `dir`, so bounded previews never mean lost data.
+#[derive(Debug, Clone)]
+pub struct SpillPolicy {
+    pub dir: PathBuf,
+}
+
+/// Point-in-time spill outcome. Metadata only: path, byte count, failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpillReport {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub failed: bool,
+}
+
+/// Lazily opened private spill file. First write creates the directory
+/// (`0700`) and the file (`0600`, symlink-refusing, append-only). An I/O
+/// failure degrades ONCE (warn + `failed` flag) and disables further
+/// writes; it can never fail the tool call or block the stream.
+struct SpillState {
+    path: PathBuf,
+    dir: PathBuf,
+    file: Mutex<Option<std::fs::File>>,
+    opened: AtomicBool,
+    bytes: AtomicU64,
+    failed: AtomicBool,
+}
+
+impl std::fmt::Debug for SpillState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpillState")
+            .field("path", &self.path)
+            .field("bytes", &self.bytes.load(Ordering::Relaxed))
+            .field("failed", &self.failed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl SpillState {
+    fn new(policy: SpillPolicy) -> Self {
+        static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = policy
+            .dir
+            .join(format!("tool-output-{}-{seq}.log", std::process::id()));
+        Self {
+            path,
+            dir: policy.dir,
+            file: Mutex::new(None),
+            opened: AtomicBool::new(false),
+            bytes: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn report(&self) -> SpillReport {
+        SpillReport {
+            path: self.path.clone(),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn fail(&self, action: &str, err: &dyn std::fmt::Display) {
+        if !self.failed.swap(true, Ordering::Relaxed) {
+            // Metadata only: our own artifact path and error, never content.
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %err,
+                "tool-output spill {action} failed — artifact disabled for this call"
+            );
+        }
+    }
+
+    fn write(&self, chunk: &str) {
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if file.is_none() {
+            if self.opened.swap(true, Ordering::Relaxed) {
+                return; // a previous open failed
+            }
+            if let Err(err) = agent_core::core::private_fs::ensure_private_dir(&self.dir) {
+                self.fail("dir create", &err);
+                return;
+            }
+            match agent_core::core::private_fs::open_private_append(&self.path) {
+                Ok(handle) => *file = Some(handle),
+                Err(err) => {
+                    self.fail("open", &err);
+                    return;
+                }
+            }
+        }
+        if let Some(handle) = file.as_mut() {
+            use std::io::Write as _;
+            match handle.write_all(chunk.as_bytes()) {
+                Ok(()) => {
+                    self.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    self.fail("write", &err);
+                    *file = None;
+                }
+            }
+        }
+    }
+}
+
+/// Cloneable read handle onto a call's spill artifact state.
+#[derive(Debug, Clone)]
+pub struct SpillHandle {
+    state: Arc<SpillState>,
+}
+
+impl SpillHandle {
+    pub fn report(&self) -> SpillReport {
+        self.state.report()
+    }
+}
+
 // ── Counters ────────────────────────────────────────────────────────────────
 
 /// Exact per-call output accounting. All methods are lock-free and cheap;
@@ -67,6 +254,8 @@ pub struct OutputCounters {
     coalesced_bytes: AtomicU64,
     dropped_chunks: AtomicU64,
     dropped_bytes: AtomicU64,
+    model_history_truncated_chunks: AtomicU64,
+    model_history_dropped_bytes: AtomicU64,
 }
 
 /// Point-in-time copy of [`OutputCounters`].
@@ -87,6 +276,10 @@ pub struct OutputCountersSnapshot {
     /// sends).
     pub dropped_chunks: u64,
     pub dropped_bytes: u64,
+    /// Model-history chunks that lost at least one byte and exact bytes cut
+    /// while producing the independently bounded history prefix.
+    pub model_history_truncated_chunks: u64,
+    pub model_history_dropped_bytes: u64,
 }
 
 impl OutputCountersSnapshot {
@@ -124,6 +317,13 @@ impl OutputCounters {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    fn note_model_history_truncated(&self, bytes: usize) {
+        self.model_history_truncated_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        self.model_history_dropped_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> OutputCountersSnapshot {
         OutputCountersSnapshot {
             produced_chunks: self.produced_chunks.load(Ordering::Relaxed),
@@ -134,6 +334,10 @@ impl OutputCounters {
             coalesced_bytes: self.coalesced_bytes.load(Ordering::Relaxed),
             dropped_chunks: self.dropped_chunks.load(Ordering::Relaxed),
             dropped_bytes: self.dropped_bytes.load(Ordering::Relaxed),
+            model_history_truncated_chunks: self
+                .model_history_truncated_chunks
+                .load(Ordering::Relaxed),
+            model_history_dropped_bytes: self.model_history_dropped_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -144,6 +348,51 @@ struct DeltaShared {
     overflow: Mutex<String>,
     notify: tokio::sync::Notify,
     counters: Arc<OutputCounters>,
+    spill: Option<Arc<SpillState>>,
+    model_history: Mutex<ModelHistoryState>,
+}
+
+#[derive(Debug)]
+struct ModelHistoryState {
+    text: String,
+    original_bytes: usize,
+    budget: usize,
+    truncated: bool,
+}
+
+impl ModelHistoryState {
+    fn new(budget: usize) -> Self {
+        Self {
+            text: String::with_capacity(budget.min(64 * 1024)),
+            original_bytes: 0,
+            budget,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &str, counters: &OutputCounters) {
+        self.original_bytes = self.original_bytes.saturating_add(chunk.len());
+        let room = self.budget.saturating_sub(self.text.len());
+        let bounded = agent_core::BoundedText::new(chunk, room);
+        self.text.push_str(&bounded.text);
+        if bounded.truncated {
+            self.truncated = true;
+            counters.note_model_history_truncated(
+                bounded
+                    .original_bytes
+                    .saturating_sub(bounded.retained_bytes),
+            );
+        }
+    }
+
+    fn snapshot(&self) -> BoundedOutput {
+        BoundedOutput {
+            text: self.text.clone(),
+            original_bytes: self.original_bytes,
+            retained_bytes: self.text.len(),
+            truncated: self.truncated,
+        }
+    }
 }
 
 /// Producer half handed to tools as `ToolChannels::tx_delta`. `send` never
@@ -161,26 +410,77 @@ pub struct DeltaReceiver {
     shared: Arc<DeltaShared>,
 }
 
-/// One bounded delta channel pair plus its shared counters.
+/// Cloneable observation handle for one tool call's independently bounded
+/// outputs and exact counters.
+#[derive(Clone)]
+pub struct OutputHandle {
+    shared: Arc<DeltaShared>,
+}
+
+impl OutputHandle {
+    pub fn counters(&self) -> Arc<OutputCounters> {
+        Arc::clone(&self.shared.counters)
+    }
+
+    pub fn model_history(&self) -> BoundedOutput {
+        self.shared
+            .model_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+    }
+
+    pub fn spill_report(&self) -> Option<SpillReport> {
+        self.shared.spill.as_ref().map(|state| state.report())
+    }
+}
+
+/// One bounded delta channel pair plus its shared output handle.
 pub struct ToolDeltaChannel {
     pub sender: DeltaSender,
     pub receiver: DeltaReceiver,
+    output: OutputHandle,
 }
 
-/// Construct a bounded delta channel with fresh counters.
+impl ToolDeltaChannel {
+    pub fn output_handle(&self) -> OutputHandle {
+        self.output.clone()
+    }
+}
+
+/// Construct a bounded delta channel with fresh counters and default budgets.
 pub fn delta_channel() -> ToolDeltaChannel {
+    delta_channel_with_budgets(OutputBudgets::for_limits(DEFAULT_UI_PREVIEW_BYTES), None)
+}
+
+/// Backward-compatible constructor for callers selecting only spill policy.
+pub fn delta_channel_with(spill: Option<SpillPolicy>) -> ToolDeltaChannel {
+    delta_channel_with_budgets(OutputBudgets::for_limits(DEFAULT_UI_PREVIEW_BYTES), spill)
+}
+
+/// Construct one output producer with independent UI/model-history budgets.
+pub fn delta_channel_with_budgets(
+    budgets: OutputBudgets,
+    spill: Option<SpillPolicy>,
+) -> ToolDeltaChannel {
     let (tx, rx) = tokio::sync::mpsc::channel(DELTA_CHANNEL_CAPACITY);
     let shared = Arc::new(DeltaShared {
         overflow: Mutex::new(String::new()),
         notify: tokio::sync::Notify::new(),
         counters: Arc::new(OutputCounters::default()),
+        spill: spill.map(|policy| Arc::new(SpillState::new(policy))),
+        model_history: Mutex::new(ModelHistoryState::new(budgets.model_history_bytes)),
     });
     ToolDeltaChannel {
         sender: DeltaSender {
             tx,
             shared: Arc::clone(&shared),
         },
-        receiver: DeltaReceiver { rx, shared },
+        receiver: DeltaReceiver {
+            rx,
+            shared: Arc::clone(&shared),
+        },
+        output: OutputHandle { shared },
     }
 }
 
@@ -204,8 +504,16 @@ impl DeltaSender {
         Arc::clone(&self.shared.counters)
     }
 
+    /// Read handle onto this call's spill artifact, when policy enabled one.
+    pub fn spill_handle(&self) -> Option<SpillHandle> {
+        self.shared.spill.as_ref().map(|state| SpillHandle {
+            state: Arc::clone(state),
+        })
+    }
+
     /// Non-blocking bounded send. Policy, in order:
-    /// 1. account production;
+    /// 1. account production (and spill the FULL chunk when enabled —
+    ///    before any cap/coalesce/drop decision);
     /// 2. cap the retained chunk at [`DELTA_MAX_CHUNK_BYTES`] (UTF-8-safe);
     /// 3. if the overflow buffer is non-empty, coalesce there (preserves
     ///    production order — channel items are always older than overflow
@@ -219,6 +527,14 @@ impl DeltaSender {
         if chunk.is_empty() {
             return;
         }
+        if let Some(spill) = &self.shared.spill {
+            spill.write(&chunk);
+        }
+        self.shared
+            .model_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(&chunk, counters);
         let chunk = if chunk.len() > DELTA_MAX_CHUNK_BYTES {
             let bounded = agent_core::BoundedText::new(&chunk, DELTA_MAX_CHUNK_BYTES);
             counters.note_dropped(bounded.original_bytes - bounded.retained_bytes, 1);
@@ -539,6 +855,109 @@ mod tests {
             after.dropped_bytes - before.dropped_bytes,
             "after cancel".len() as u64,
             "post-cancel sends must be released as counted drops"
+        );
+    }
+
+    /// UI and model-history are separate production-time lanes: changing
+    /// either budget cannot change the other lane's exact retained prefix.
+    #[tokio::test]
+    async fn ui_and_model_history_budgets_are_independent() {
+        let budgets = OutputBudgets {
+            ui_preview_bytes: 7,
+            model_history_bytes: 11,
+        };
+        let channel = delta_channel_with_budgets(budgets, None);
+        let output = channel.output_handle();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = spawn_ui_forwarder(
+            channel.receiver,
+            budgets.ui_preview_bytes,
+            CancellationToken::new(),
+            move |chunk| {
+                let _ = ui_tx.send(chunk);
+            },
+        );
+        channel.sender.send("abcdefgh".to_string());
+        channel.sender.send("ijklmnop".to_string());
+        drop(channel.sender);
+        forwarder.await.expect("forwarder");
+
+        let mut ui = String::new();
+        while let Ok(chunk) = ui_rx.try_recv() {
+            ui.push_str(&chunk);
+        }
+        let history = output.model_history();
+        assert_eq!(ui, "abcdefg");
+        assert_eq!(history.text, "abcdefghijk");
+        assert!(history.truncated);
+        assert_eq!(history.original_bytes, 16);
+        assert_eq!(history.retained_bytes, 11);
+    }
+
+    /// A synthetic 1 GiB producer uses fixed-size generated chunks (never a
+    /// real 1 GiB file/string); retained model history stays at its budget
+    /// and every cut byte/chunk is reported exactly.
+    #[tokio::test]
+    async fn synthetic_one_gib_production_is_bounded_without_materializing_full_output() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const CHUNK: usize = 64 * 1024;
+        let budgets = OutputBudgets {
+            ui_preview_bytes: 1024,
+            model_history_bytes: 4096,
+        };
+        let channel = delta_channel_with_budgets(budgets, None);
+        let output = channel.output_handle();
+        let chunk = "x".repeat(CHUNK);
+        for _ in 0..(GIB / CHUNK as u64) {
+            channel.sender.send(chunk.clone());
+        }
+        let history = output.model_history();
+        let snap = output.counters().snapshot();
+        assert_eq!(history.original_bytes as u64, GIB);
+        assert_eq!(history.retained_bytes, budgets.model_history_bytes);
+        assert_eq!(snap.model_history_dropped_bytes, GIB - 4096);
+        assert_eq!(snap.model_history_truncated_chunks, GIB / CHUNK as u64);
+        assert!(snap.retained_bytes() <= OutputBudgets::max_ui_retained_bytes());
+    }
+
+    /// Spill is opt-in, captures the exact full production stream before
+    /// truncation/drop, and T4 creates both directory and artifact privately.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_spill_is_exact_and_private_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("spill");
+        let channel = delta_channel_with_budgets(
+            OutputBudgets {
+                ui_preview_bytes: 2,
+                model_history_bytes: 3,
+            },
+            Some(SpillPolicy { dir: dir.clone() }),
+        );
+        let output = channel.output_handle();
+        channel.sender.send("hello".to_string());
+        channel.sender.send("🌟world".to_string());
+        let report = output.spill_report().expect("spill enabled");
+
+        assert!(!report.failed);
+        assert_eq!(report.bytes, "hello🌟world".len() as u64);
+        assert_eq!(
+            std::fs::read_to_string(&report.path).unwrap(),
+            "hello🌟world"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&report.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }
