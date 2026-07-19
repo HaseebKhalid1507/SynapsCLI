@@ -290,6 +290,7 @@ mod tests {
                 secret_prompt: None,
                 orchestration: None,
                 tool_activation: None,
+                mcp_leases: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

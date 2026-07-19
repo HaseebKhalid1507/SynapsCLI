@@ -323,6 +323,14 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// Shared exact MCP lease manager (Task 19). Installed at engine boot
+    /// when MCP exact mode is active; streams mint per-session capabilities
+    /// and RAII guards from it.
+    mcp_runtime: Option<std::sync::Arc<crate::mcp::McpRuntimeManager>>,
+    /// Durable shared session-scope guard (Task 19 review): terminates this
+    /// runtime session's MCP leases only when the LAST owner (runtime clone
+    /// or in-flight stream) drops — never per provider turn.
+    mcp_session_scope: Option<std::sync::Arc<crate::mcp::McpSessionEndGuard>>,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -462,6 +470,8 @@ impl Runtime {
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: false,
+            mcp_runtime: None,
+            mcp_session_scope: None,
             host_tool_session: fresh_host_tool_session(),
         })
     }
@@ -536,6 +546,8 @@ impl Runtime {
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: false,
+            mcp_runtime: None,
+            mcp_session_scope: None,
             host_tool_session: fresh_host_tool_session(),
         }
     }
@@ -673,6 +685,18 @@ impl Runtime {
             }))
             .ok()
         })
+    }
+
+    /// Install the shared exact MCP lease manager (Task 19, engine boot).
+    /// Also mints ONE durable session-scope guard for the runtime's tool
+    /// session, shared by every clone and stream; only the LAST owner's
+    /// drop terminates leases.
+    pub fn install_mcp_runtime(&mut self, manager: std::sync::Arc<crate::mcp::McpRuntimeManager>) {
+        self.mcp_session_scope = Some(std::sync::Arc::new(crate::mcp::McpSessionEndGuard::new(
+            self.host_tool_session.clone(),
+            std::sync::Arc::clone(&manager),
+        )));
+        self.mcp_runtime = Some(manager);
     }
 
     pub fn install_orchestration(
@@ -1800,6 +1824,7 @@ impl Runtime {
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
                                         tool_activation: None,
+                                        mcp_leases: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -1934,6 +1959,7 @@ impl Runtime {
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
                                                     tool_activation: None,
+                                                    mcp_leases: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -2155,6 +2181,8 @@ impl Runtime {
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             tool_session_id: self.host_tool_session.clone(),
+            mcp_runtime: self.mcp_runtime.clone(),
+            mcp_session_scope: self.mcp_session_scope.clone(),
         };
 
         tokio::spawn(async move {
@@ -2230,6 +2258,10 @@ impl Clone for Runtime {
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            mcp_runtime: self.mcp_runtime.clone(),
+            // Clones SHARE the durable session scope: dropping one clone or
+            // one stream can never kill a sibling's leases.
+            mcp_session_scope: self.mcp_session_scope.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and

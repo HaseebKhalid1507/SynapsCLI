@@ -23,6 +23,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
                     .expect("test foreground is routable"),
             )),
             tool_activation: None,
+            mcp_leases: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

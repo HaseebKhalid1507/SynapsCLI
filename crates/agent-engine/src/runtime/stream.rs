@@ -63,6 +63,12 @@ pub(super) struct StreamSession {
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
     pub(super) tool_session_id: crate::tools::activation::SessionId,
+    /// Shared exact MCP lease manager (Task 19); `None` when MCP exact
+    /// mode is not active.
+    pub(super) mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
+    /// Shared DURABLE session scope: held (not created) by each stream so
+    /// leases survive across turns; the last owner's drop terminates.
+    pub(super) mcp_session_scope: Option<Arc<crate::mcp::McpSessionEndGuard>>,
 }
 
 pub(super) struct StreamMethods;
@@ -118,6 +124,8 @@ impl StreamMethods {
             turn_correlation_id,
             progressive_tool_disclosure,
             tool_session_id,
+            mcp_runtime,
+            mcp_session_scope,
         } = session;
         let mut messages = initial_messages;
 
@@ -154,6 +162,16 @@ impl StreamMethods {
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
         // (explicit server auto-approve), never from model-authored JSON.
+        // Task 19: per-stream MCP lease capability + a HOLD on the durable
+        // shared session scope. This function is ONE provider turn, so it
+        // must never construct/drop a terminating guard itself — it only
+        // keeps the shared scope alive while running; leases persist across
+        // turns and terminate when the LAST owner (runtime or stream) drops.
+        let mcp_lease_capability = mcp_runtime.as_ref().map(|manager| {
+            crate::mcp::McpLeaseCapability::new(tool_session_id.clone(), Arc::clone(manager))
+        });
+        let _mcp_session_scope = mcp_session_scope;
+
         let activation_authority = if auto_approve_confirms {
             crate::tools::activation::ActivationAuthority::ModelConfirmed
         } else {
@@ -526,7 +544,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)) },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {
@@ -660,6 +678,7 @@ impl StreamMethods {
                         let prompt_inner = secret_prompt.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
+                        let mcp_leases_inner = mcp_lease_capability.clone();
                         let activation_inner = crate::tools::discovery::ActivationCapability::new(
                             catalog_snapshot.clone(),
                             std::sync::Arc::clone(&session_tool_set),
@@ -703,7 +722,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()) },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {

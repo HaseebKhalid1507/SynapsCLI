@@ -92,6 +92,10 @@ pub struct ToolCapabilities {
     /// contexts) means the discovery/activation builtins fail typed and no
     /// model-initiated activation is possible.
     pub tool_activation: Option<crate::tools::discovery::ActivationCapability>,
+    /// Session-scoped exact MCP lease capability (Task 19): exact session
+    /// identity + shared runtime manager. `None` (default for non-stream
+    /// contexts) means deferred MCP tools fail typed and start nothing.
+    pub mcp_leases: Option<crate::mcp::McpLeaseCapability>,
 }
 
 /// Configuration limits and timeouts.

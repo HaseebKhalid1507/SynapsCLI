@@ -2,6 +2,7 @@
 mod connection;
 pub mod descriptors;
 mod lazy;
+pub mod lease;
 mod tool;
 
 use crate::ToolRegistry;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub use lazy::McpConnectTool;
+pub use lease::{McpLeaseCapability, McpRuntimeManager, McpSessionEndGuard};
 pub use tool::McpTool;
 
 /// MCP server configuration — matches claude-code/gemini-cli format.
@@ -37,18 +39,31 @@ pub(crate) struct McpToolDef {
     pub(crate) input_schema: serde_json::Value,
 }
 
+/// Hard byte bound on `mcp.json`.
+pub const MCP_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Load MCP config from ~/.synaps-cli/mcp.json (or profile variant).
+///
+/// Bounded local read (Task 19): one `O_NOFOLLOW|O_NONBLOCK` handle,
+/// opened-metadata regular-file check, capped read with growth rejection —
+/// symlinks, FIFOs, and oversized files are refused. Failures log only the
+/// static file name and bounded typed metadata, never raw path or parse
+/// content. Semantics are otherwise unchanged: any rejection yields `None`.
 pub fn load_mcp_config() -> Option<McpConfig> {
     let path = crate::config::resolve_read_path("mcp.json");
-    if !path.exists() {
-        return None;
-    }
-
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = match descriptors::read_bounded_regular_file(&path, MCP_CONFIG_MAX_BYTES) {
+        Ok(content) => content,
+        Err(descriptors::DescriptorCacheError::NotFound) => return None,
+        Err(err) => {
+            tracing::warn!(file = "mcp.json", error = %err, "Refusing unsafe MCP config read");
+            return None;
+        }
+    };
     match serde_json::from_str::<McpConfig>(&content) {
         Ok(config) => Some(config),
         Err(e) => {
-            tracing::warn!("Failed to parse MCP config at {}: {}", path.display(), e);
+            // Parse position metadata only — no raw content, no full path.
+            tracing::warn!(file = "mcp.json", error = %e, "Failed to parse MCP config");
             None
         }
     }

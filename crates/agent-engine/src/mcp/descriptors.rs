@@ -145,6 +145,25 @@ fn valid_server_name(name: &str) -> bool {
 /// duplicates) are dropped deterministically; descriptions are bounded.
 /// Never spawns, never touches the network.
 pub fn load_cache_from(path: &Path) -> Result<McpDescriptorCache, DescriptorCacheError> {
+    let content = read_bounded_regular_file(path, CACHE_MAX_BYTES)?;
+    let raw: McpDescriptorCache = serde_json::from_str(&content).map_err(|err| {
+        DescriptorCacheError::Parse(BoundedText::new(&err.to_string(), ERROR_ECHO_MAX_BYTES).text)
+    })?;
+    if raw.version != CACHE_FORMAT_VERSION {
+        return Err(DescriptorCacheError::Version(raw.version));
+    }
+    sanitize_cache(raw)
+}
+
+/// Shared bounded local-file boundary (Task 19): exactly ONE handle is
+/// opened (`O_NOFOLLOW|O_NONBLOCK` on Unix — symlinks and FIFOs refused
+/// without following/blocking) and all checks run against that opened
+/// handle's metadata; the read is capped via `Read::take` with a post-read
+/// growth check. Used for both the descriptor cache and `mcp.json`.
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<String, DescriptorCacheError> {
     use std::io::Read;
 
     let map_io =
@@ -193,30 +212,27 @@ pub fn load_cache_from(path: &Path) -> Result<McpDescriptorCache, DescriptorCach
     if !meta.file_type().is_file() {
         return Err(DescriptorCacheError::NotRegularFile);
     }
-    if meta.len() > CACHE_MAX_BYTES {
+    if meta.len() > max_bytes {
         return Err(DescriptorCacheError::Oversize {
             actual: meta.len(),
-            max: CACHE_MAX_BYTES,
+            max: max_bytes,
         });
     }
     let mut content = String::new();
-    file.take(CACHE_MAX_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_string(&mut content)
         .map_err(|err| DescriptorCacheError::Io(map_io(&err)))?;
-    if content.len() as u64 > CACHE_MAX_BYTES {
+    if content.len() as u64 > max_bytes {
         // The file grew past the bound between metadata and read.
         return Err(DescriptorCacheError::Oversize {
             actual: content.len() as u64,
-            max: CACHE_MAX_BYTES,
+            max: max_bytes,
         });
     }
-    let raw: McpDescriptorCache = serde_json::from_str(&content).map_err(|err| {
-        DescriptorCacheError::Parse(BoundedText::new(&err.to_string(), ERROR_ECHO_MAX_BYTES).text)
-    })?;
-    if raw.version != CACHE_FORMAT_VERSION {
-        return Err(DescriptorCacheError::Version(raw.version));
-    }
+    Ok(content)
+}
 
+fn sanitize_cache(raw: McpDescriptorCache) -> Result<McpDescriptorCache, DescriptorCacheError> {
     let mut sanitized = McpDescriptorCache::empty();
     for (server, entry) in raw.servers {
         if !valid_server_name(&server) {
@@ -384,14 +400,27 @@ impl Tool for DeferredMcpTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, _params: Value, _ctx: ToolContext) -> crate::Result<String> {
-        // Lease-manager execution arrives with the lease lifecycle commit;
-        // until wired, a deferred tool NEVER starts a process.
-        Err(crate::RuntimeError::Tool(format!(
-            "MCP tool '{}' (server '{}') is activation-deferred and no MCP session \
-             lease manager is available in this context; no process was started",
-            self.runtime_name, self.server_name
-        )))
+    async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
+        // Runs strictly AFTER the ExecutionGate authorized this exact call.
+        // Without the typed session lease capability, a deferred tool NEVER
+        // starts a process.
+        let Some(leases) = ctx.capabilities.mcp_leases.clone() else {
+            return Err(crate::RuntimeError::Tool(format!(
+                "MCP tool '{}' (server '{}') is activation-deferred and no MCP session \
+                 lease manager is available in this context; no process was started",
+                self.runtime_name, self.server_name
+            )));
+        };
+        leases
+            .call_exact(
+                &self.server_name,
+                &self.expected_fingerprint,
+                &self.server_tool_name,
+                &self.expected_digest,
+                params,
+            )
+            .await
+            .map_err(|err| crate::RuntimeError::Tool(err.to_string()))
     }
 }
 

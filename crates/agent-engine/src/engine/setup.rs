@@ -191,6 +191,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let mcp_server_count =
         crate::mcp::setup_lazy_mcp(&runtime.tools_shared(), config.progressive_tool_disclosure)
             .await;
+    if config.progressive_tool_disclosure {
+        // Exact MCP mode: one shared lease manager for the runtime. Streams
+        // mint session capabilities/guards from it; children die with the
+        // session (RAII) or on runtime drop.
+        runtime.install_mcp_runtime(std::sync::Arc::new(crate::mcp::McpRuntimeManager::new(
+            crate::mcp::lease::config_source_from_disk(),
+            crate::mcp::lease::DEFAULT_IDLE_MAX,
+        )));
+    }
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
