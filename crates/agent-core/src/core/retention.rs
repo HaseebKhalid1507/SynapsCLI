@@ -471,37 +471,67 @@ pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> 
 pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::Result<()> {
     match domain {
         RetentionDomain::Sessions => {
+            // Sanitize BEFORE any path construction (CP-13 fix1 I5).
+            let file = sanitize_file_id(id)?;
             if chain_heads(roots).contains(&id.to_string()) {
                 return Err(io::Error::other(format!(
                     "session {id} is the head of a named chain — delete or repoint the \
                      chain first (retention never leaves chains dangling)"
                 )));
             }
-            let path = roots.sessions_dir().join(format!("{id}.json"));
+            let path = roots
+                .sessions_dir()
+                .join(format!("{}.json", file.display()));
             fs::remove_file(path)
         }
         RetentionDomain::Traces => fs::remove_file(roots.cache_dir.join(sanitize_file_id(id)?)),
         RetentionDomain::Logs => {
+            let file = sanitize_file_id(id)?;
             if !id.starts_with("synaps.log") {
-                return Err(io::Error::other("log ids start with synaps.log"));
+                return Err(io::Error::other(
+                    "invalid log id: must start with synaps.log",
+                ));
             }
-            fs::remove_file(roots.config_dir.join(sanitize_file_id(id)?))
+            fs::remove_file(roots.config_dir.join(file))
         }
         RetentionDomain::MemoryIndex => {
             let dir = roots.index_dir().join(sanitize_file_id(id)?);
             fs::remove_dir_all(dir)
         }
         RetentionDomain::Memory => {
-            let (namespace, record_id) = id
-                .split_once(':')
-                .ok_or_else(|| io::Error::other("memory ids use \"<namespace>:<record-id>\""))?;
+            let (namespace, record_id) = id.split_once(':').ok_or_else(|| {
+                io::Error::other("invalid memory id: use \"<namespace>:<record-id>\"")
+            })?;
+            let namespace = sanitize_file_id(namespace)?;
+            if record_id.is_empty() || !record_id.starts_with("mem-") {
+                return Err(io::Error::other(format!(
+                    "invalid memory record id: {record_id:?}"
+                )));
+            }
             let path = roots
                 .memory_dir()
-                .join(format!("{}.jsonl", sanitize_file_id(namespace)?.display()));
+                .join(format!("{}.jsonl", namespace.display()));
             let raw = fs::read_to_string(&path)?;
-            if !raw.contains(record_id) {
+
+            // EXACT live-id match (CP-13 fix1 M4): parse every line;
+            // substring/prefix probes and already-tombstoned ids fail
+            // closed.
+            let mut live = false;
+            let mut tombstoned = false;
+            for line in raw.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                if value["tombstone"].as_str() == Some(record_id) {
+                    tombstoned = true;
+                } else if value["id"].as_str() == Some(record_id) {
+                    live = true;
+                }
+            }
+            if !live || tombstoned {
                 return Err(io::Error::other(format!(
-                    "record {record_id} not present in namespace {namespace}"
+                    "record {record_id} not present as a live record in namespace {}",
+                    namespace.display()
                 )));
             }
             let line = serde_json::json!({

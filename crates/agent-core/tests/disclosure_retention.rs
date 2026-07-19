@@ -434,3 +434,64 @@ fn forget_deletes_by_domain_and_protects_chain_heads() {
     forget(&h.roots, RetentionDomain::Traces, "request-trace.jsonl").unwrap();
     assert!(!h.roots.cache_dir.join("request-trace.jsonl").exists());
 }
+
+// ─── CP-13 fix1: forget hardening ────────────────────────────────────────────
+
+#[test]
+fn forget_rejects_path_traversal_ids_for_every_domain() {
+    let h = harness();
+    let victim = h.roots.config_dir.join("victim.json");
+    std::fs::write(&victim, "precious").unwrap();
+
+    for id in ["../victim", "..", "a/b", "a\\b", "/etc/passwd", ""] {
+        for domain in [
+            RetentionDomain::Sessions,
+            RetentionDomain::Traces,
+            RetentionDomain::Logs,
+            RetentionDomain::MemoryIndex,
+        ] {
+            let err = forget(&h.roots, domain, id).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid"),
+                "{domain:?} id {id:?} must be rejected as invalid, got: {err}"
+            );
+        }
+        // Memory ids embed a namespace part that must be sanitized too.
+        let err = forget(&h.roots, RetentionDomain::Memory, &format!("{id}:mem-x")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid") || msg.contains("namespace"),
+            "memory namespace part {id:?} must be rejected, got: {msg}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "precious",
+        "traversal ids must never touch files outside the domain directory"
+    );
+}
+
+#[test]
+fn memory_forget_requires_exact_live_record_ids() {
+    let h = harness();
+    let memory = h.roots.base_dir.join("memory").join("project-p33.jsonl");
+    let lines = [
+        r#"{"namespace":"project-p33","timestamp_ms":100,"content":"a","tags":[],"id":"mem-abc","project":"p33"}"#,
+        r#"{"namespace":"project-p33","timestamp_ms":200,"content":"b","tags":[],"id":"mem-abcdef","project":"p33"}"#,
+    ];
+    std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
+
+    // A substring/prefix of a live id is NOT a live id.
+    let err = forget(&h.roots, RetentionDomain::Memory, "project-p33:mem-ab").unwrap_err();
+    assert!(err.to_string().contains("not present"), "{err}");
+
+    // Exact id tombstones exactly one record.
+    forget(&h.roots, RetentionDomain::Memory, "project-p33:mem-abc").unwrap();
+    let raw = std::fs::read_to_string(&memory).unwrap();
+    assert!(raw.contains(r#""tombstone":"mem-abc""#));
+    assert!(!raw.contains(r#""tombstone":"mem-abcdef""#));
+
+    // Already-tombstoned ids are no longer live — forgetting again fails.
+    let err = forget(&h.roots, RetentionDomain::Memory, "project-p33:mem-abc").unwrap_err();
+    assert!(err.to_string().contains("not present"), "{err}");
+}
