@@ -19,11 +19,13 @@ pub use core::auth;
 pub use core::chain;
 pub use core::compaction;
 pub use core::config;
+pub use core::disclosure;
 pub use core::error;
 pub use core::logging;
 pub use core::models;
 pub use core::protocol;
 pub use core::reasoning;
+pub use core::retention;
 pub use core::session;
 pub use core::watcher_types;
 
