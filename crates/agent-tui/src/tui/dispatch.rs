@@ -317,78 +317,88 @@ pub(crate) async fn handle_input_action(
                     use synaps_cli::skills::tool::LoadSkillTool;
 
                     let tool_use_id = format!("toolu_skill_{}", uuid::Uuid::new_v4().simple());
-                    let body = LoadSkillTool::format_body(&skill);
+                    // Task 21: the body is read from disk and
+                    // fingerprint-verified HERE, at user selection time;
+                    // verification failure surfaces as a bounded system
+                    // message (static reason, no paths, no hashes) and
+                    // NOTHING enters model context.
+                    match LoadSkillTool::format_body(&skill) {
+                        Err(reason) => {
+                            app.push_msg(ChatMessage::System(reason));
+                        }
+                        Ok(body) => {
+                            app.api_messages.push(std::sync::Arc::new(json!({
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": "load_skill",
+                                    "input": {"skill": skill.name.clone()}
+                                }]
+                            })));
+                            app.api_messages.push(std::sync::Arc::new(json!({
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": body
+                                }]
+                            })));
+                            let display_name = match &skill.plugin {
+                                Some(p) => format!("{}:{}", p, skill.name),
+                                None => skill.name.clone(),
+                            };
+                            app.push_msg(ChatMessage::System(format!(
+                                "loaded skill: {}",
+                                display_name
+                            )));
 
-                    app.api_messages.push(std::sync::Arc::new(json!({
-                        "role": "assistant",
-                        "content": [{
-                            "type": "tool_use",
-                            "id": tool_use_id,
-                            "name": "load_skill",
-                            "input": {"skill": skill.name.clone()}
-                        }]
-                    })));
-                    app.api_messages.push(std::sync::Arc::new(json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": body
-                        }]
-                    })));
-                    let display_name = match &skill.plugin {
-                        Some(p) => format!("{}:{}", p, skill.name),
-                        None => skill.name.clone(),
-                    };
-                    app.push_msg(ChatMessage::System(format!(
-                        "loaded skill: {}",
-                        display_name
-                    )));
-
-                    if !arg.is_empty() {
-                        app.api_messages.push(std::sync::Arc::new(
-                            json!({"role": "user", "content": arg.clone()}),
-                        ));
-                        app.push_msg(ChatMessage::User(arg));
+                            if !arg.is_empty() {
+                                app.api_messages.push(std::sync::Arc::new(
+                                    json!({"role": "user", "content": arg.clone()}),
+                                ));
+                                app.push_msg(ChatMessage::User(arg));
+                            }
+                            // Start stream — mirror InputAction::Submit stream-start pattern.
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.status_text = Some("connecting…".to_string());
+                            app.streaming = true;
+                            app.turn_baseline = app.api_messages.len();
+                            app.spinner_frame = 0;
+                            let term_size = crossterm::terminal::size()
+                                .map(|(w, h)| ratatui::layout::Size {
+                                    width: w,
+                                    height: h,
+                                })
+                                .unwrap_or_default();
+                            let built = build_render_model(
+                                &mut ViewInputs::from_app(app),
+                                runtime,
+                                registry,
+                                term_size,
+                            );
+                            if let Some((model, patch)) = built {
+                                patch.apply(app);
+                                render_handle.publish(model);
+                            }
+                            *stream = Some(
+                                runtime
+                                    .run_stream_with_messages(
+                                        app.api_messages.clone(),
+                                        ct.clone(),
+                                        Some(s_rx),
+                                        Some(secret_prompt_handle.clone()),
+                                        false,
+                                    )
+                                    .await,
+                            );
+                            app.status_text = None;
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                            *cancel_token = Some(ct);
+                            *steer_tx = Some(s_tx);
+                        }
                     }
-                    // Start stream — mirror InputAction::Submit stream-start pattern.
-                    let ct = CancellationToken::new();
-                    let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                    app.status_text = Some("connecting…".to_string());
-                    app.streaming = true;
-                    app.turn_baseline = app.api_messages.len();
-                    app.spinner_frame = 0;
-                    let term_size = crossterm::terminal::size()
-                        .map(|(w, h)| ratatui::layout::Size {
-                            width: w,
-                            height: h,
-                        })
-                        .unwrap_or_default();
-                    let built = build_render_model(
-                        &mut ViewInputs::from_app(app),
-                        runtime,
-                        registry,
-                        term_size,
-                    );
-                    if let Some((model, patch)) = built {
-                        patch.apply(app);
-                        render_handle.publish(model);
-                    }
-                    *stream = Some(
-                        runtime
-                            .run_stream_with_messages(
-                                app.api_messages.clone(),
-                                ct.clone(),
-                                Some(s_rx),
-                                Some(secret_prompt_handle.clone()),
-                                false,
-                            )
-                            .await,
-                    );
-                    app.status_text = None;
-                    app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                    *cancel_token = Some(ct);
-                    *steer_tx = Some(s_tx);
                 }
                 CommandAction::PluginCommand { command, arg } => {
                     if matches!(

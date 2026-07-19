@@ -24,14 +24,14 @@ const BODY_MARKER: &str = "SECRET-SKILL-BODY-MARKER";
 const PATH_MARKER: &str = "/secret/skill/source/path";
 
 fn skill(name: &str, plugin: Option<&str>, description: &str) -> LoadedSkill {
-    LoadedSkill {
-        name: name.to_string(),
-        description: description.to_string(),
-        body: format!("{BODY_MARKER} body of {name}"),
-        plugin: plugin.map(str::to_string),
-        base_dir: PathBuf::from(PATH_MARKER),
-        source_path: PathBuf::from(format!("{PATH_MARKER}/{name}/SKILL.md")),
-    }
+    LoadedSkill::new_inline(
+        name,
+        description,
+        &format!("{BODY_MARKER} body of {name}"),
+        plugin,
+        PathBuf::from(PATH_MARKER),
+        PathBuf::from(format!("{PATH_MARKER}/{name}/SKILL.md")),
+    )
 }
 
 fn registry() -> Arc<CommandRegistry> {

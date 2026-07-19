@@ -42,15 +42,88 @@ pub struct Plugin {
     pub manifest: Option<manifest::PluginManifest>,
 }
 
-/// A skill discovered during loading.
-#[derive(Debug, Clone)]
+/// A skill discovered during loading. Boot discovery holds ONLY bounded
+/// metadata — the body stays on disk behind an immutable fingerprint and
+/// is read, verified, substituted, and returned exclusively by
+/// [`LoadedSkill::load_body`] at exact selection time.
+#[derive(Clone)]
 pub struct LoadedSkill {
     pub name: String,
     pub description: String,
-    pub body: String,           // post-{baseDir} substitution
+    /// Body source — NEVER the body itself at boot. Private: all access
+    /// flows through [`Self::load_body`].
+    pub(crate) source: SkillSource,
     pub plugin: Option<String>, // None for loose skills
     pub base_dir: PathBuf,      // absolute
     pub source_path: PathBuf,   // absolute path to SKILL.md
+}
+
+/// Redacted Debug (Task 21 security review): bounded identity only — no
+/// source paths, no base dir, no body, no fingerprint material — so a
+/// stray debug/log rendering of boot metadata can never leak filesystem
+/// layout or content.
+impl std::fmt::Debug for LoadedSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSkill")
+            .field("name", &agent_core::BoundedText::new(&self.name, 128).text)
+            .field(
+                "plugin",
+                &self
+                    .plugin
+                    .as_deref()
+                    .map(|p| agent_core::BoundedText::new(p, 128).text),
+            )
+            .field("description_len", &self.description.len())
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a skill body comes from. Debug is redacted: no body content, no
+/// fingerprint material.
+#[derive(Clone)]
+pub(crate) enum SkillSource {
+    /// Body held in memory (test constructors; no verification needed).
+    Inline(String),
+    /// Lazy on-disk body: re-read + fingerprint-verified at selection.
+    Lazy {
+        fingerprint: loader::SkillFingerprint,
+        /// Plugin root for ${CLAUDE_PLUGIN_ROOT} substitution.
+        plugin_root: Option<PathBuf>,
+    },
+}
+
+impl std::fmt::Debug for SkillSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(body) => f
+                .debug_struct("Inline")
+                .field("bytes", &body.len())
+                .finish(),
+            Self::Lazy { .. } => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl LoadedSkill {
+    /// Test/compat constructor with an in-memory body.
+    pub fn new_inline(
+        name: &str,
+        description: &str,
+        body: &str,
+        plugin: Option<&str>,
+        base_dir: PathBuf,
+        source_path: PathBuf,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: SkillSource::Inline(body.to_string()),
+            plugin: plugin.map(str::to_string),
+            base_dir,
+            source_path,
+        }
+    }
 }
 
 // ── Stable skill identities (Task 17, spec §7.2/§7.6 boundary) ──────────────

@@ -20,12 +20,21 @@ impl LoadSkillTool {
     }
 
     /// Produce the tool-result body for a successfully loaded skill.
-    /// Shared between user-initiated (slash) and model-initiated (tool) paths.
-    pub fn format_body(skill: &LoadedSkill) -> String {
-        format!(
+    /// Shared between user-initiated (slash) and model-initiated (tool)
+    /// paths. Task 21: THIS is the single point where the body is read
+    /// from disk, fingerprint-verified, and substituted — it can
+    /// therefore fail closed with a static, path-free reason.
+    pub fn format_body(skill: &LoadedSkill) -> Result<String, String> {
+        let body = skill.load_body().map_err(|reason| {
+            format!(
+                "skill '{}' could not be loaded: {reason}",
+                crate::BoundedText::new(&skill.name, 128).text
+            )
+        })?;
+        Ok(format!(
             "# Skill: {} — {}\n\nFollow these guidelines for the rest of this conversation.\n\n{}",
-            skill.name, skill.description, skill.body
-        )
+            skill.name, skill.description, body
+        ))
     }
 }
 
@@ -48,25 +57,17 @@ impl crate::Tool for LoadSkillTool {
         crate::tools::ToolOrigin::Builtin
     }
 
+    /// CONSTANT schema (Task 21): the description never enumerates the
+    /// catalog, so the first request cannot grow with installed skills.
+    /// Discovery routes through `search_skills`; execution still accepts
+    /// legacy bare and `plugin:skill` spellings plus stable ids.
     fn parameters(&self) -> serde_json::Value {
-        let list: Vec<String> = self
-            .registry
-            .all_skills()
-            .iter()
-            .map(|s| {
-                let qualified = match &s.plugin {
-                    Some(p) => format!("{}:{} — {}", p, s.name, s.description),
-                    None => format!("{} — {}", s.name, s.description),
-                };
-                qualified
-            })
-            .collect();
         json!({
             "type": "object",
             "properties": {
                 "skill": {
                     "type": "string",
-                    "description": format!("Name of the skill to load (bare or plugin:skill). Available:\n{}", list.join("\n"))
+                    "description": "Skill to load: a stable id from search_skills, a bare name, or plugin:skill."
                 }
             },
             "required": ["skill"]
@@ -115,14 +116,14 @@ impl crate::Tool for LoadSkillTool {
                         stable_skill_id(legacy)
                     )));
                 }
-                return Ok(Self::format_body(legacy));
+                return Self::format_body(legacy).map_err(crate::RuntimeError::Tool);
             }
             return match matches.as_slice() {
                 [] => Err(crate::RuntimeError::Tool(format!(
                     "unknown skill id '{}'",
                     crate::BoundedText::new(name, 160).text
                 ))),
-                [skill] => Ok(Self::format_body(skill)),
+                [skill] => Self::format_body(skill).map_err(crate::RuntimeError::Tool),
                 _ => Err(crate::RuntimeError::Tool(format!(
                     "ambiguous skill id '{}'",
                     crate::BoundedText::new(name, 160).text
@@ -131,15 +132,27 @@ impl crate::Tool for LoadSkillTool {
         }
 
         match self.registry.resolve(name) {
-            Resolution::Skill(s) => Ok(Self::format_body(&s)),
-            Resolution::Ambiguous(opts) => Err(crate::RuntimeError::Tool(format!(
-                "ambiguous skill '{}'; specify one of: {}",
-                name,
-                opts.join(", ")
-            ))),
-            Resolution::PluginCommand(_) | Resolution::Builtin | Resolution::Unknown => Err(
-                crate::RuntimeError::Tool(format!("unknown skill '{}'", name)),
-            ),
+            Resolution::Skill(s) => Self::format_body(&s).map_err(crate::RuntimeError::Tool),
+            Resolution::Ambiguous(opts) => {
+                // Bound the echoed request and every offered option; the
+                // joined list is additionally capped as a whole.
+                let bounded: Vec<String> = opts
+                    .iter()
+                    .map(|opt| crate::BoundedText::new(opt, 128).text)
+                    .collect();
+                let list = crate::BoundedText::new(&bounded.join(", "), 1024).text;
+                Err(crate::RuntimeError::Tool(format!(
+                    "ambiguous skill '{}'; specify one of: {}",
+                    crate::BoundedText::new(name, 128).text,
+                    list
+                )))
+            }
+            Resolution::PluginCommand(_) | Resolution::Builtin | Resolution::Unknown => {
+                Err(crate::RuntimeError::Tool(format!(
+                    "unknown skill '{}'",
+                    crate::BoundedText::new(name, 128).text
+                )))
+            }
         }
     }
 }
@@ -304,27 +317,27 @@ mod tests {
     }
 
     fn mk(name: &str, plugin: Option<&str>) -> LoadedSkill {
-        LoadedSkill {
-            name: name.to_string(),
-            description: format!("desc-{name}"),
-            body: format!("body-{name}"),
-            plugin: plugin.map(str::to_string),
-            base_dir: PathBuf::from("/"),
-            source_path: PathBuf::from("/SKILL.md"),
-        }
+        LoadedSkill::new_inline(
+            name,
+            &format!("desc-{name}"),
+            &format!("body-{name}"),
+            plugin,
+            PathBuf::from("/"),
+            PathBuf::from("/SKILL.md"),
+        )
     }
 
     #[test]
     fn format_body_includes_name_and_description() {
-        let s = LoadedSkill {
-            name: "x".into(),
-            description: "y".into(),
-            body: "z".into(),
-            plugin: None,
-            base_dir: PathBuf::from("/"),
-            source_path: PathBuf::from("/SKILL.md"),
-        };
-        let out = LoadSkillTool::format_body(&s);
+        let s = LoadedSkill::new_inline(
+            "x",
+            "y",
+            "z",
+            None,
+            PathBuf::from("/"),
+            PathBuf::from("/SKILL.md"),
+        );
+        let out = LoadSkillTool::format_body(&s).unwrap();
         assert!(out.contains("x"));
         assert!(out.contains("y"));
         assert!(out.contains("z"));

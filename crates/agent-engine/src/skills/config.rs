@@ -41,14 +41,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn mk_skill(name: &str, plugin: Option<&str>) -> LoadedSkill {
-        LoadedSkill {
-            name: name.to_string(),
-            description: String::new(),
-            body: String::new(),
-            plugin: plugin.map(str::to_string),
-            base_dir: PathBuf::from("/"),
-            source_path: PathBuf::from("/SKILL.md"),
-        }
+        LoadedSkill::new_inline(
+            name,
+            "",
+            "",
+            plugin,
+            PathBuf::from("/"),
+            PathBuf::from("/SKILL.md"),
+        )
     }
 
     #[test]
