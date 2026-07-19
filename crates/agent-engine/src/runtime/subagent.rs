@@ -529,7 +529,7 @@ impl SubagentRegistry {
             .iter()
             .filter(|(_, h)| {
                 h.is_finished()
-                && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
+                    && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
                     && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
             })
             .map(|(id, h)| (id.clone(), !h.is_collected() && retain_unreconciled(id)))
@@ -1102,7 +1102,7 @@ mod cancelled_wake_tests {
         {
             let mut s = state.write().unwrap();
             s.status = SubagentStatus::Completed; // thread set Completed before cancel flag noticed
-            s.cancel_requested = true;            // cancel() was called
+            s.cancel_requested = true; // cancel() was called
         }
         let queue = Arc::new(EventQueue::new(100));
 

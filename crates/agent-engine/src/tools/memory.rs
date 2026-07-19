@@ -416,27 +416,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// RAII guard: fresh SYNAPS_BASE_DIR per test.
-    struct BaseDirGuard {
-        old: Option<String>,
-        _dir: tempfile::TempDir,
-    }
-    impl BaseDirGuard {
-        fn new() -> Self {
-            let dir = tempfile::TempDir::new().unwrap();
-            let old = std::env::var("SYNAPS_BASE_DIR").ok();
-            agent_core::config::set_base_dir_for_tests(dir.path().to_path_buf());
-            Self { old, _dir: dir }
-        }
-    }
-    impl Drop for BaseDirGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
-                None => std::env::remove_var("SYNAPS_BASE_DIR"),
-            }
-        }
-    }
+    use crate::test_env::BaseDirGuard;
 
     const BODY_SENTINEL: &str = "MEMORY-BODY-SENTINEL-4af1";
     /// Placed at the END of stored bodies — beyond any snippet budget, so
@@ -500,7 +480,7 @@ mod tests {
     /// SCHEMAS only — no stored memory body can appear in the exposed
     /// schema set.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn first_request_schemas_carry_no_memory_bodies() {
         let _base = BaseDirGuard::new();
         store_body("normal").await;
@@ -515,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn store_search_fetch_forget_round_trip_with_lower_authority_labels() {
         let _base = BaseDirGuard::new();
         let id = store_body("normal").await;
@@ -561,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn secret_bodies_never_reach_model_context() {
         let _base = BaseDirGuard::new();
         let id = store_body("secret").await;
@@ -596,11 +576,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn cross_project_ids_fail_closed_through_the_tools() {
         let base = BaseDirGuard::new();
         // Store a record under a DIFFERENT project scope directly.
-        let other_root = base._dir.path().join("other-project");
+        let other_root = base.path().join("other-project");
         std::fs::create_dir_all(&other_root).unwrap();
         let other = ProjectScope::for_root(&other_root).unwrap();
         let record = store_record_in(
@@ -634,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn model_supplied_project_argument_cannot_widen_the_scope() {
         let _base = BaseDirGuard::new();
         let err = MemoryStoreTool

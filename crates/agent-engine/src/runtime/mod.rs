@@ -294,6 +294,12 @@ pub struct Runtime {
     /// Shared across clones.
     one_shot_trace_writer:
         std::sync::Arc<std::sync::Mutex<Option<crate::runtime::telemetry::TelemetryWriter>>>,
+    /// Content-capture root, bound ONCE at construction (fix1 I2b): every
+    /// sweep — startup, status, sync and async shutdown epilogues — and the
+    /// one-shot content capture use THIS path, never a late ambient
+    /// `SYNAPS_BASE_DIR` read, so post-construction env churn (parallel
+    /// tests, profile switches) can never redirect capture I/O.
+    capture_dir: std::path::PathBuf,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
@@ -433,8 +439,10 @@ impl Runtime {
 
         // Operational retention (Task 12): physically remove expired
         // content-capture bundles at session startup — bounded, fail-soft,
-        // confined to the private capture dir.
-        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
+        // confined to the private capture dir. The root resolved here is
+        // the SAME value bound into `capture_dir` below (fix1 I2b).
+        let capture_dir = trace::default_capture_dir();
+        let _ = trace::sweep_expired_captures(&capture_dir);
 
         let session_manager = {
             let config = crate::tools::shell::ShellConfig::default();
@@ -486,6 +494,7 @@ impl Runtime {
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -571,6 +580,7 @@ impl Runtime {
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            capture_dir: trace::default_capture_dir(),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1583,7 +1593,7 @@ impl Runtime {
                 };
                 if with_content {
                     base.with_content_capture(Arc::new(trace::ContentCapture::new(
-                        trace::default_capture_dir(),
+                        self.capture_dir.clone(),
                     )))
                 } else {
                     base
@@ -1604,7 +1614,7 @@ impl Runtime {
     /// expired-capture sweep (B2): status is a trace interaction, so stale
     /// content-capture bundles are physically removed here too.
     pub fn trace_status(&self) -> trace::TraceStatusReport {
-        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
+        let _ = trace::sweep_expired_captures(&self.capture_dir);
         trace::TraceStatusReport {
             persistent_enabled: self.telemetry_writer.is_some(),
             arm: self.trace_controls.peek(),
@@ -1686,8 +1696,9 @@ impl Runtime {
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
         // Operational retention (Task 12): the exit epilogue also removes
         // expired content-capture bundles — bounded, fail-soft, so a stale
-        // bundle never has to wait for the next trace interaction.
-        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
+        // bundle never has to wait for the next trace interaction. Swept at
+        // the CONSTRUCTION-BOUND root (fix1 I2b), immune to env churn.
+        let _ = trace::sweep_expired_captures(&self.capture_dir);
         // Drain a retained one-shot ephemeral writer first (Task 12 fix:
         // an armed `/trace next` record written with telemetry Off must
         // survive session exit). Its outcome is returned only when no
@@ -1723,10 +1734,10 @@ impl Runtime {
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
         // Same operational retention sweep as the sync epilogue, off the
         // executor (bounded filesystem work, fail-soft on a failed spawn).
-        let _ = tokio::task::spawn_blocking(|| {
-            trace::sweep_expired_captures(&trace::default_capture_dir())
-        })
-        .await;
+        // Construction-bound root (fix1 I2b).
+        let capture_dir = self.capture_dir.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || trace::sweep_expired_captures(&capture_dir)).await;
         // Same one-shot ephemeral drain as the sync variant.
         let ephemeral = self
             .one_shot_trace_writer
@@ -2423,6 +2434,7 @@ impl Clone for Runtime {
             trace_ctx: self.trace_ctx.clone(),
             trace_controls: Arc::clone(&self.trace_controls),
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
+            capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
             // Subagents are their own session — fresh latches so a downgrade
@@ -2690,6 +2702,70 @@ mod tests {
             "async shutdown epilogue must remove expired capture bundles"
         );
         drop(guard);
+    }
+
+    /// fix1 I2b: the capture root binds at CONSTRUCTION. Ambient
+    /// SYNAPS_BASE_DIR churn after construction must not redirect the
+    /// sweep — each runtime keeps sweeping its own root (concurrent
+    /// roots), so a parallel test flipping env can never race the epilogue.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn capture_root_binds_at_construction_and_survives_env_churn() {
+        let base_a = tempfile::tempdir().unwrap();
+        let base_b = tempfile::tempdir().unwrap();
+        let old = std::env::var("SYNAPS_BASE_DIR").ok();
+
+        std::env::set_var("SYNAPS_BASE_DIR", base_a.path());
+        let rt_a = Runtime::new().await.expect("runtime A");
+        std::env::set_var("SYNAPS_BASE_DIR", base_b.path());
+        let rt_b = Runtime::new().await.expect("runtime B");
+
+        let cap_a = base_a.path().join("trace").join("capture");
+        let cap_b = base_b.path().join("trace").join("capture");
+        let plant = |dir: &std::path::Path, name: &str| {
+            agent_core::core::private_fs::ensure_private_dir(dir).unwrap();
+            let id = trace::TraceId::new(name).unwrap();
+            let stale = trace::controls::ContentCaptureBundle {
+                schema: trace::CONTENT_CAPTURE_SCHEMA.to_string(),
+                request_id: id.clone(),
+                created_unix_ms: 1_000,
+                expires_unix_ms: 2_000,
+                redacted: true,
+                over_budget: false,
+                body: Some(serde_json::json!({"old": true})),
+            };
+            let path = trace::controls::capture_path(dir, &id);
+            std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            path
+        };
+
+        // Point ambient env somewhere else entirely — the bound roots must win.
+        let decoy = tempfile::tempdir().unwrap();
+        std::env::set_var("SYNAPS_BASE_DIR", decoy.path());
+
+        let stale_a = plant(&cap_a, "req-stale-a");
+        let stale_b = plant(&cap_b, "req-stale-b");
+        let _ = rt_a.shutdown_observability(std::time::Duration::ZERO);
+        assert!(
+            !stale_a.exists(),
+            "runtime A must sweep the root bound at ITS construction"
+        );
+        assert!(
+            stale_b.exists(),
+            "runtime A must never sweep another runtime's root"
+        );
+        let _ = rt_b
+            .shutdown_observability_async(std::time::Duration::from_millis(100))
+            .await;
+        assert!(
+            !stale_b.exists(),
+            "runtime B must sweep the root bound at ITS construction"
+        );
+
+        match old {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub mod mcp;
 pub mod runtime;
 pub mod sidecar;
 pub mod skills;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod tools;
 
 // ── agent-core facade ──────────────────────────────────────────────────────────

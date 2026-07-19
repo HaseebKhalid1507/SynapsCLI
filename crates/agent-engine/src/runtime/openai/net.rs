@@ -52,9 +52,7 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
 ///
 /// `send().await?` boxes the `reqwest::Error` directly, but helpers may wrap
 /// it another level deep — check the whole chain, not just the top.
-fn find_reqwest_error<'a>(
-    e: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a reqwest::Error> {
+fn find_reqwest_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a reqwest::Error> {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = current {
         if let Some(re) = err.downcast_ref::<reqwest::Error>() {
@@ -116,7 +114,10 @@ mod tests {
             !display.starts_with("Config error"),
             "transient network failure must not be presented as a config problem: {display}"
         );
-        assert!(display.contains("127.0.0.1"), "must name the host: {display}");
+        assert!(
+            display.contains("127.0.0.1"),
+            "must name the host: {display}"
+        );
     }
 
     #[tokio::test]
@@ -199,7 +200,9 @@ mod tests {
             "missing key IS a config problem, got: {runtime_err:?}"
         );
         assert!(
-            runtime_err.to_string().starts_with("Config error: openai provider: "),
+            runtime_err
+                .to_string()
+                .starts_with("Config error: openai provider: "),
             "must keep the historical prefix for genuine config errors: {runtime_err}"
         );
     }

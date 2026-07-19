@@ -896,30 +896,7 @@ mod transition_tests {
     use serial_test::serial;
     use std::sync::Arc;
 
-    /// RAII guard: point SYNAPS_BASE_DIR at a fresh TempDir for the test.
-    struct BaseDirGuard {
-        old: Option<String>,
-        _dir: tempfile::TempDir,
-    }
-    impl BaseDirGuard {
-        fn new() -> Self {
-            let dir = tempfile::TempDir::new().unwrap();
-            let old = std::env::var("SYNAPS_BASE_DIR").ok();
-            agent_core::config::set_base_dir_for_tests(dir.path().to_path_buf());
-            Self { old, _dir: dir }
-        }
-        fn path(&self) -> &std::path::Path {
-            self._dir.path()
-        }
-    }
-    impl Drop for BaseDirGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
-                None => std::env::remove_var("SYNAPS_BASE_DIR"),
-            }
-        }
-    }
+    use crate::test_env::BaseDirGuard;
 
     fn parent_session() -> Session {
         let mut parent = Session::new(
@@ -979,7 +956,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn successor_and_in_place_histories_are_equivalent_and_recorded() {
         let base = BaseDirGuard::new();
         let runtime = crate::Runtime::new_headless();
@@ -1062,7 +1039,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pending_events_and_queued_messages_survive_the_transition() {
         let _base = BaseDirGuard::new();
         let runtime = crate::Runtime::new_headless();
@@ -1103,7 +1080,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn chain_heads_advance_to_the_successor() {
         let _base = BaseDirGuard::new();
         let runtime = crate::Runtime::new_headless();
@@ -1126,7 +1103,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn failed_save_rolls_back_and_leaves_prior_session_intact() {
         let base = BaseDirGuard::new();
         let runtime = crate::Runtime::new_headless();
@@ -1278,7 +1255,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn failpoint_after_successor_save_rolls_back_completely() {
         let base = BaseDirGuard::new();
         assert_failpoint_rolls_back(
@@ -1291,7 +1268,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn failpoint_at_parent_save_rolls_back_completely() {
         let base = BaseDirGuard::new();
         assert_failpoint_rolls_back(&base, TransitionFailpoint::AtParentSave, 0, &["mainline"])
@@ -1299,7 +1276,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn failpoint_at_chain_advance_restores_advanced_chains_and_parent() {
         let base = BaseDirGuard::new();
         // skip=1: the FIRST chain advances successfully and must be
@@ -1314,7 +1291,7 @@ mod transition_tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn on_compaction_hook_fires_after_successful_transition() {
         use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1657,7 +1634,7 @@ mod disclosure_tests {
     /// M7 (CP-12 review): local summaries are byte-bounded at UTF-8 char
     /// boundaries and say so when they truncate.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn local_summary_truncation_is_bounded_and_marked() {
         let mut runtime = crate::Runtime::new_headless();
         runtime.set_compaction_mode(agent_core::compaction::CompactionMode::LocalOnly);
@@ -1683,36 +1660,19 @@ mod disclosure_tests {
         );
     }
 
-    /// RAII guard for SYNAPS_ANTHROPIC_BASE_URL.
-    struct BaseUrlGuard {
-        old: Option<String>,
-    }
-    impl BaseUrlGuard {
-        fn set(url: &str) -> Self {
-            let old = std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok();
-            std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
-            Self { old }
-        }
-    }
-    impl Drop for BaseUrlGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", v),
-                None => std::env::remove_var("SYNAPS_ANTHROPIC_BASE_URL"),
-            }
-        }
-    }
-
     /// Spec §9.4: local-only compaction performs ZERO network operations.
     /// Socket spy: every Anthropic request in this process would land on the
     /// local listener; local-only compaction must never touch it.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn local_only_compaction_touches_no_socket() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        let _guard = BaseUrlGuard::set(&format!("http://{addr}"));
+        let _guard = crate::test_env::EnvVarGuard::set(
+            "SYNAPS_ANTHROPIC_BASE_URL",
+            &format!("http://{addr}"),
+        );
 
         let mut runtime = crate::Runtime::new_headless();
         runtime.set_compaction_mode(CompactionMode::LocalOnly);
@@ -1749,11 +1709,14 @@ mod disclosure_tests {
     /// compaction dispatches — proving the zero-socket assertion above is a
     /// real observation, not a blind spy.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn remote_compaction_is_observed_by_the_socket_spy() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let _guard = BaseUrlGuard::set(&format!("http://{addr}"));
+        let _guard = crate::test_env::EnvVarGuard::set(
+            "SYNAPS_ANTHROPIC_BASE_URL",
+            &format!("http://{addr}"),
+        );
 
         // Accept exactly one connection and slam it shut so the client
         // errors immediately instead of waiting out a read timeout.

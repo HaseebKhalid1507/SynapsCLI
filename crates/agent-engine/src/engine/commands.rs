@@ -347,8 +347,15 @@ mod tests {
         // Custom numeric: produces ThinkingSpec::Custom, not Named.
         let custom = parse_thinking_arg("8192").unwrap();
         assert!(
-            matches!(custom, ThinkingSpec::Custom { level: ReasoningLevel::High, budget: 8192 }),
-            "expected Custom{{High, 8192}}, got {:?}", custom
+            matches!(
+                custom,
+                ThinkingSpec::Custom {
+                    level: ReasoningLevel::High,
+                    budget: 8192
+                }
+            ),
+            "expected Custom{{High, 8192}}, got {:?}",
+            custom
         );
         assert_eq!(custom.budget(), Some(8192));
 
@@ -385,37 +392,74 @@ mod tests {
 
     #[test]
     fn thinking_config_value_is_named_for_named_levels() {
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Off)),      "off");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Adaptive)), "adaptive");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Low)),      "low");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Medium)),   "medium");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::High)),     "high");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::XHigh)),    "xhigh");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Max)),      "max");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Ultra)),    "ultra");
-        assert_eq!(thinking_config_value(ThinkingSpec::Named(ReasoningLevel::UltraCode)), "ultracode");
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Off)),
+            "off"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Adaptive)),
+            "adaptive"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Low)),
+            "low"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Medium)),
+            "medium"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::High)),
+            "high"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::XHigh)),
+            "xhigh"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Max)),
+            "max"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::Ultra)),
+            "ultra"
+        );
+        assert_eq!(
+            thinking_config_value(ThinkingSpec::Named(ReasoningLevel::UltraCode)),
+            "ultracode"
+        );
     }
 
     #[test]
     fn thinking_config_value_is_exact_digits_for_custom_budget() {
         // B3: /thinking 8192 must persist "8192", not the named level "high".
-        let spec = ThinkingSpec::Custom { level: ReasoningLevel::High, budget: 8192 };
+        let spec = ThinkingSpec::Custom {
+            level: ReasoningLevel::High,
+            budget: 8192,
+        };
         assert_eq!(thinking_config_value(spec), "8192");
-        let spec2 = ThinkingSpec::Custom { level: ReasoningLevel::Medium, budget: 3000 };
+        let spec2 = ThinkingSpec::Custom {
+            level: ReasoningLevel::Medium,
+            budget: 3000,
+        };
         assert_eq!(thinking_config_value(spec2), "3000");
     }
 
     #[test]
     fn compact_carries_custom_instructions() {
         match evaluate_engine_command("compact", "focus on auth") {
-            Some(CommandResult::Compact { custom_instructions }) => {
+            Some(CommandResult::Compact {
+                custom_instructions,
+            }) => {
                 assert_eq!(custom_instructions.as_deref(), Some("focus on auth"));
             }
             other => panic!("expected Compact, got {:?}", other),
         }
         assert!(matches!(
             evaluate_engine_command("compact", ""),
-            Some(CommandResult::Compact { custom_instructions: None })
+            Some(CommandResult::Compact {
+                custom_instructions: None
+            })
         ));
     }
 
@@ -446,7 +490,9 @@ mod tests {
     fn validate_level_codex_sol_accepts_ultra() {
         let mut rt = crate::Runtime::new_headless();
         rt.set_model("openai-codex/gpt-5.6-sol".to_string());
-        assert!(rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_ok());
+        assert!(rt
+            .set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .is_ok());
     }
 
     #[test]
@@ -454,7 +500,9 @@ mod tests {
         let mut rt = crate::Runtime::new_headless();
         rt.set_model("openai-codex/gpt-5.6-luna".to_string());
         rt.set_reasoning_level(ReasoningLevel::Low);
-        let err = rt.set_reasoning_level_checked(ReasoningLevel::Ultra).unwrap_err();
+        let err = rt
+            .set_reasoning_level_checked(ReasoningLevel::Ultra)
+            .unwrap_err();
         assert!(err.contains("ultra"));
         assert!(err.contains("gpt-5.6-luna"));
         // State must be unchanged after rejection.
@@ -463,11 +511,16 @@ mod tests {
 
     #[test]
     fn validate_level_non_codex_rejects_ultra() {
-        for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7", "groq/llama-3"] {
+        for model in [
+            "claude-sonnet-4-6",
+            "anthropic/claude-opus-4-7",
+            "groq/llama-3",
+        ] {
             let mut rt = crate::Runtime::new_headless();
             rt.set_model(model.to_string());
             assert!(
-                rt.set_reasoning_level_checked(ReasoningLevel::Ultra).is_err(),
+                rt.set_reasoning_level_checked(ReasoningLevel::Ultra)
+                    .is_err(),
                 "non-Codex {model} must not gain ultra without exact metadata"
             );
         }
@@ -480,14 +533,20 @@ mod tests {
         // set_reasoning_level (config/restore path) must NOT set explicit flag.
         let mut rt = crate::Runtime::new_headless();
         rt.set_reasoning_level(ReasoningLevel::High);
-        assert!(!rt.is_reasoning_explicit(), "set_reasoning_level must not mark explicit");
+        assert!(
+            !rt.is_reasoning_explicit(),
+            "set_reasoning_level must not mark explicit"
+        );
     }
 
     #[test]
     fn set_reasoning_level_explicit_marks_flag() {
         let mut rt = crate::Runtime::new_headless();
         rt.set_reasoning_level_explicit(ReasoningLevel::High);
-        assert!(rt.is_reasoning_explicit(), "set_reasoning_level_explicit must mark explicit");
+        assert!(
+            rt.is_reasoning_explicit(),
+            "set_reasoning_level_explicit must mark explicit"
+        );
     }
 
     #[test]
@@ -507,7 +566,10 @@ mod tests {
         rt.set_reasoning_level_explicit(ReasoningLevel::Low);
         rt.set_model("openai-codex/gpt-5.6-sol".to_string());
         // sol default is Low anyway, but let's use a level that differs from default
-        assert!(rt.is_reasoning_explicit(), "explicit flag must survive set_model");
+        assert!(
+            rt.is_reasoning_explicit(),
+            "explicit flag must survive set_model"
+        );
     }
 
     #[test]
@@ -520,12 +582,18 @@ mod tests {
             ..Default::default()
         };
         rt.apply_config(&config);
-        assert!(rt.is_reasoning_explicit(), "config thinking must be explicit");
+        assert!(
+            rt.is_reasoning_explicit(),
+            "config thinking must be explicit"
+        );
         assert_eq!(rt.reasoning_level(), ReasoningLevel::XHigh);
         // Model switch must not overwrite the explicit config level.
         rt.set_model("openai-codex/gpt-5.6-luna".to_string());
-        assert_eq!(rt.reasoning_level(), ReasoningLevel::XHigh,
-            "explicit config level must survive set_model");
+        assert_eq!(
+            rt.reasoning_level(),
+            ReasoningLevel::XHigh,
+            "explicit config level must survive set_model"
+        );
     }
 
     #[test]
@@ -533,7 +601,11 @@ mod tests {
         // B3: /thinking 8192 → set_thinking_budget_explicit(8192) must retain 8192.
         let mut rt = crate::Runtime::new_headless();
         rt.set_thinking_budget_explicit(8192);
-        assert_eq!(rt.thinking_budget_raw(), 8192, "exact budget must be retained");
+        assert_eq!(
+            rt.thinking_budget_raw(),
+            8192,
+            "exact budget must be retained"
+        );
         assert!(rt.is_reasoning_explicit());
         // Named level for display is High (4097..=16384 range).
         assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
@@ -634,8 +706,11 @@ mod tests {
     fn custom_budget_config_value_is_digits_not_named() {
         // B3: ThinkingSpec::Custom config_value() must be the digit string.
         let spec = parse_thinking_arg("8192").unwrap();
-        assert_eq!(spec.config_value(), "8192",
-            "custom budget must persist as digits, not named level");
+        assert_eq!(
+            spec.config_value(),
+            "8192",
+            "custom budget must persist as digits, not named level"
+        );
     }
 
     // ── Task 12: /trace and /context surfaces ──

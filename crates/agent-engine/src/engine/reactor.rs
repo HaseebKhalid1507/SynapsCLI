@@ -706,26 +706,7 @@ mod disclosure_persistence_tests {
     use agent_core::disclosure::DisclosureClass;
     use serial_test::serial;
 
-    struct BaseDirGuard {
-        old: Option<String>,
-        _dir: tempfile::TempDir,
-    }
-    impl BaseDirGuard {
-        fn new() -> Self {
-            let dir = tempfile::TempDir::new().unwrap();
-            let old = std::env::var("SYNAPS_BASE_DIR").ok();
-            agent_core::config::set_base_dir_for_tests(dir.path().to_path_buf());
-            Self { old, _dir: dir }
-        }
-    }
-    impl Drop for BaseDirGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
-                None => std::env::remove_var("SYNAPS_BASE_DIR"),
-            }
-        }
-    }
+    use crate::test_env::BaseDirGuard;
 
     const SENTINEL: &str = "PERSIST-BOUNDARY-SENTINEL-5e3b";
 
@@ -761,7 +742,7 @@ mod disclosure_persistence_tests {
     /// events must not cross it in ANY disposition; withheld classes cross
     /// only as their typed marker.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn all_disclosure_classes_are_honored_through_real_session_persistence() {
         let _base = BaseDirGuard::new();
 
