@@ -198,6 +198,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     event_queue: None,
                     secret_prompt: None,
             orchestration: None,
+            tool_activation: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -346,6 +347,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     event_queue: None,
                     secret_prompt: None,
             orchestration: None,
+            tool_activation: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -698,6 +700,7 @@ async fn extension_provider_complete_routes_to_process() {
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
         None,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     ).await.expect("extension route").unwrap();
 
@@ -782,6 +785,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
         None,
+        None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     )
     .await
@@ -853,6 +857,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     ).await.expect("extension route").unwrap();
@@ -1243,6 +1248,7 @@ async fn audit_log_records_disabled_route() {
         &synaps_cli::auth::TokenCache::new(),
         3,
         synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
+        None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
     )

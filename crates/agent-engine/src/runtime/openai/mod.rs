@@ -191,6 +191,7 @@ pub async fn try_route(
     max_retries: u32,
     codex_request_role: catalog::CodexRequestRole,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
+    session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
@@ -213,6 +214,7 @@ pub async fn try_route(
                     thinking_budget,
                     cancel,
                     tool_session_id,
+                    session_tool_set,
                     trace,
                 )
                 .await,
@@ -461,6 +463,7 @@ mod tests {
             0,
             catalog::CodexRequestRole::Foreground,
             None,
+            None,
             &trace,
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
@@ -527,6 +530,7 @@ mod tests {
                 &cache,
                 0,
                 catalog::CodexRequestRole::Foreground,
+                None,
                 None,
                 &crate::runtime::trace::TraceContext::disabled(),
             )

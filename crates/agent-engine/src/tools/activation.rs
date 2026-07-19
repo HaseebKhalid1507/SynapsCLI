@@ -117,6 +117,11 @@ pub struct SessionToolSet {
     catalog_generation: CatalogGeneration,
     core: BTreeMap<ToolId, SchemaDigest>,
     activated: BTreeMap<ToolId, ActivatedTool>,
+    /// Session schema-generation counter (spec §7.7): advances by exactly
+    /// one for every successful nonempty activation batch (a single
+    /// activation is a batch of one). Deterministic bookkeeping only; it
+    /// exposes nothing and grants nothing.
+    schema_generation: u64,
 }
 
 impl SessionToolSet {
@@ -141,6 +146,7 @@ impl SessionToolSet {
             catalog_generation: catalog.generation(),
             core: validated,
             activated: BTreeMap::new(),
+            schema_generation: 0,
         })
     }
 
@@ -201,17 +207,19 @@ impl SessionToolSet {
         self.activated.get(id)
     }
 
-    /// Record one exact activation. This is set/test/bootstrap plumbing, not
-    /// a model-facing activation flow: the grant must already exist and must
-    /// match this session, a cataloged tool, the CURRENT catalog generation,
-    /// and the CURRENT schema digest exactly. Any drift — foreign session,
-    /// unknown tool, stale generation, changed digest, stale set snapshot,
-    /// duplicate activation, core-set membership — fails typed before any
-    /// mutation, so a failed call leaves the set byte-for-byte unchanged. No
-    /// implementation is constructed, no process started, no schema exposed.
-    pub fn activate(
-        &mut self,
-        grant: SessionActivationGrant,
+    /// Session schema-generation counter (spec §7.7): the number of
+    /// successful nonempty activation batches applied to this set. A
+    /// deterministic bulk `activate_many` advances it by exactly one.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    /// Validate one grant against this set and the current catalog without
+    /// mutating anything. Shared by [`Self::activate`] and
+    /// [`Self::activate_many`] so single and bulk paths can never drift.
+    fn validate_grant(
+        &self,
+        grant: &SessionActivationGrant,
         catalog: &ToolCatalog,
     ) -> Result<(), ActivationError> {
         if grant.session_id() != self.session.as_str() {
@@ -255,14 +263,93 @@ impl SessionToolSet {
         if self.core.contains_key(&tool_id) {
             return Err(ActivationError::AlreadyCore(tool_id));
         }
+        Ok(())
+    }
+
+    /// Record one exact activation. This is set/test/bootstrap plumbing, not
+    /// a model-facing activation flow: the grant must already exist and must
+    /// match this session, a cataloged tool, the CURRENT catalog generation,
+    /// and the CURRENT schema digest exactly. Any drift — foreign session,
+    /// unknown tool, stale generation, changed digest, stale set snapshot,
+    /// duplicate activation, core-set membership — fails typed before any
+    /// mutation, so a failed call leaves the set byte-for-byte unchanged. No
+    /// implementation is constructed, no process started, no schema exposed.
+    /// A successful call is a nonempty batch of one: the session
+    /// schema-generation advances by exactly one.
+    pub fn activate(
+        &mut self,
+        grant: SessionActivationGrant,
+        catalog: &ToolCatalog,
+    ) -> Result<(), ActivationError> {
+        self.validate_grant(&grant, catalog)?;
         self.activated.insert(
-            tool_id,
+            grant.tool_id().clone(),
             ActivatedTool {
                 grant,
                 lease: RuntimeLease::NotAcquired,
             },
         );
+        self.schema_generation += 1;
         Ok(())
+    }
+
+    /// Deterministic atomic bulk activation (spec §7.7): validate EVERY
+    /// requested grant first — duplicates within the batch, unknown ids,
+    /// core-set ids, stale generations, digest mismatches, stale set
+    /// snapshots, and untrusted/inconsistent source provenance all fail
+    /// typed with ZERO partial mutation — then apply in stable `ToolId`
+    /// order and advance the session schema-generation by exactly one. An
+    /// empty batch is a no-op that advances nothing. Returns the number of
+    /// activations applied.
+    pub fn activate_many(
+        &mut self,
+        grants: Vec<SessionActivationGrant>,
+        catalog: &ToolCatalog,
+    ) -> Result<usize, BulkActivationError> {
+        if grants.is_empty() {
+            return Ok(0);
+        }
+        let mut seen: std::collections::BTreeSet<ToolId> = std::collections::BTreeSet::new();
+        for grant in &grants {
+            if !seen.insert(grant.tool_id().clone()) {
+                return Err(BulkActivationError::DuplicateRequest(
+                    grant.tool_id().clone(),
+                ));
+            }
+            self.validate_grant(grant, catalog)
+                .map_err(BulkActivationError::Grant)?;
+            // Source trust re-check before ANY grant is applied: an
+            // unverified or provenance-inconsistent capability rejects the
+            // whole batch (validate_grant proved the record exists).
+            let record = catalog
+                .get(grant.tool_id())
+                .expect("validate_grant verified the record exists");
+            check_source_trust(record).map_err(|err| match err {
+                ToolAuthorizationError::SourceProvenanceMismatch(id) => {
+                    BulkActivationError::SourceProvenanceMismatch(id)
+                }
+                // check_source_trust only produces UntrustedSource or
+                // SourceProvenanceMismatch; anything else maps to the
+                // conservative untrusted denial for this id.
+                _ => BulkActivationError::UntrustedSource(grant.tool_id().clone()),
+            })?;
+        }
+        // All grants validated: apply in stable ToolId order.
+        let mut ordered = grants;
+        ordered.sort_by(|a, b| a.tool_id().cmp(b.tool_id()));
+        let applied = ordered.len();
+        for grant in ordered {
+            self.activated.insert(
+                grant.tool_id().clone(),
+                ActivatedTool {
+                    grant,
+                    lease: RuntimeLease::NotAcquired,
+                },
+            );
+        }
+        // Exactly ONE schema-generation advance for the whole batch.
+        self.schema_generation += 1;
+        Ok(applied)
     }
 }
 
@@ -569,5 +656,176 @@ fn check_source_trust(record: &CapabilityRecord) -> Result<(), ToolAuthorization
             },
         ) if plugin_id == source_plugin_id => Ok(()),
         _ => Err(deny_mismatch()),
+    }
+}
+
+// ── Task 17: host grant issuance, typed confirmation authority, and the
+//    retained shared session set (spec §7.2, §7.3, §7.7) ─────────────────────
+
+/// One retained per-stream-session handle: `activate_tools` mutates the SAME
+/// set the `ExecutionGate` and the next provider round consume. Interior
+/// critical sections are short and never held across `.await`.
+pub type SharedSessionToolSet = Arc<std::sync::RwLock<SessionToolSet>>;
+
+/// Typed failure for deterministic bulk activation ([`SessionToolSet::activate_many`]).
+/// Every variant fails the WHOLE batch with zero partial mutation.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum BulkActivationError {
+    #[error("duplicate tool id in one activation batch: {0}")]
+    DuplicateRequest(ToolId),
+    #[error("activation batch rejected: {0}")]
+    Grant(#[from] ActivationError),
+    #[error("activation batch rejected: source provenance is unverified: {0}")]
+    UntrustedSource(ToolId),
+    #[error("activation batch rejected: catalog source and trust provenance disagree: {0}")]
+    SourceProvenanceMismatch(ToolId),
+}
+
+/// Host-supplied activation authority for MODEL-INITIATED activation.
+///
+/// `ModelConfirmed` may be populated ONLY by host policy (explicit server
+/// auto-approve or an interactive confirmation mechanism) — never from
+/// model-authored JSON arguments. Explicit user-requested activation goes
+/// through [`activate_exact_for_user`], a host Rust API that involves no
+/// authority value at all (PR #63 ergonomics: a user asking for an exact
+/// known tool needs no redundant prompt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationAuthority {
+    /// No confirmation authority: model-initiated activation is denied
+    /// before any grant issuance or set/schema mutation.
+    Unauthorized,
+    /// Host confirmation policy satisfied for this session/turn.
+    ModelConfirmed,
+}
+
+/// Typed failure for host grant issuance. Issuance validates the exact
+/// known `ToolId`, the current catalog generation/digest (pinned into the
+/// grant), and source trust — before any grant exists.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum GrantIssuanceError {
+    #[error("cannot issue activation grant: tool is not in the catalog: {0}")]
+    UnknownTool(ToolId),
+    #[error("cannot issue activation grant: source provenance is unverified: {0}")]
+    UntrustedSource(ToolId),
+    #[error("cannot issue activation grant: catalog source and trust provenance disagree: {0}")]
+    SourceProvenanceMismatch(ToolId),
+    #[error("cannot issue activation grant: {0}")]
+    Grant(#[from] agent_core::orchestration::capability::ActivationGrantError),
+}
+
+/// Issue one exact session-scoped activation grant against the CURRENT
+/// catalog state. Validates: the id is a known exact cataloged capability
+/// and its source trust/provenance is consistent and verified. The grant
+/// pins the current catalog generation and schema digest. Pure: no factory
+/// invocation, no process start, no network, no set mutation.
+pub fn issue_exact_grant(
+    catalog: &ToolCatalog,
+    session: &SessionId,
+    tool_id: &ToolId,
+) -> Result<SessionActivationGrant, GrantIssuanceError> {
+    let record = catalog
+        .get(tool_id)
+        .ok_or_else(|| GrantIssuanceError::UnknownTool(tool_id.clone()))?;
+    check_source_trust(record).map_err(|err| match err {
+        ToolAuthorizationError::SourceProvenanceMismatch(id) => {
+            GrantIssuanceError::SourceProvenanceMismatch(id)
+        }
+        _ => GrantIssuanceError::UntrustedSource(tool_id.clone()),
+    })?;
+    Ok(SessionActivationGrant::new(
+        session.as_str(),
+        tool_id.clone(),
+        catalog.generation(),
+        record.schema_digest().clone(),
+    )?)
+}
+
+/// Typed failure for the host activation entry points.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum HostActivationError {
+    /// Model-initiated activation without host confirmation authority.
+    /// Denied BEFORE grant issuance and before any set/schema mutation.
+    #[error(
+        "tool activation requires host confirmation authority; \
+         model-initiated activation was not confirmed"
+    )]
+    ConfirmationRequired,
+    #[error(transparent)]
+    Issuance(#[from] GrantIssuanceError),
+    #[error(transparent)]
+    Bulk(#[from] BulkActivationError),
+}
+
+/// Explicit USER-REQUESTED exact activation (spec §7.3 / PR #63 ergonomics):
+/// the host may authorize one exact known local identity without a
+/// redundant confirmation prompt. This is a host Rust API — it is never
+/// reachable from model-authored JSON and takes no confirmation boolean.
+/// Grants are session-scoped and never persisted.
+pub fn activate_exact_for_user(
+    set: &mut SessionToolSet,
+    catalog: &ToolCatalog,
+    tool_id: &ToolId,
+) -> Result<(), HostActivationError> {
+    let grant = issue_exact_grant(catalog, set.session(), tool_id)?;
+    set.activate_many(vec![grant], catalog)?;
+    Ok(())
+}
+
+/// MODEL-INITIATED exact activation: requires host-supplied
+/// [`ActivationAuthority::ModelConfirmed`]. Without it, the request is
+/// denied before any grant issuance, set mutation, or schema-generation
+/// advance. All requested ids are validated and issued first; the batch
+/// applies atomically in stable `ToolId` order with exactly one session
+/// schema-generation advance. Grants are session-scoped, never persisted.
+pub fn activate_model_initiated(
+    authority: ActivationAuthority,
+    set: &mut SessionToolSet,
+    catalog: &ToolCatalog,
+    tool_ids: &[ToolId],
+) -> Result<usize, HostActivationError> {
+    match authority {
+        ActivationAuthority::ModelConfirmed => {}
+        ActivationAuthority::Unauthorized => {
+            return Err(HostActivationError::ConfirmationRequired);
+        }
+    }
+    let session = set.session().clone();
+    let mut grants = Vec::with_capacity(tool_ids.len());
+    for tool_id in tool_ids {
+        grants.push(issue_exact_grant(catalog, &session, tool_id)?);
+    }
+    Ok(set.activate_many(grants, catalog)?)
+}
+
+/// Resolve the session tool set for the extension-provider route (Task 17,
+/// closing the Task 16 policy divergence): when the runtime threads its
+/// RETAINED per-stream set, the route consumes THAT set's current state —
+/// including exact activations — at its pinned generation. A stale retained
+/// set is DENIED typed (`StaleSessionSet`); the route must never silently
+/// mint a fresh default-core set for the same round. Only callers with no
+/// retained handle at all (internal/sync helpers) fall back to a fresh
+/// default-core set with zero activations under a locally minted session.
+pub fn route_session_set(
+    retained: Option<&SharedSessionToolSet>,
+    catalog: &ToolCatalog,
+    fallback_session: impl FnOnce() -> SessionId,
+) -> Result<SessionToolSet, ToolAuthorizationError> {
+    match retained {
+        Some(shared) => {
+            let guard = shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_stale(catalog) {
+                return Err(ToolAuthorizationError::StaleSessionSet {
+                    set: guard.catalog_generation(),
+                    catalog: catalog.generation(),
+                });
+            }
+            Ok(guard.clone())
+        }
+        None => Ok(SessionToolSet::default_core_for_catalog(
+            fallback_session(),
+            catalog,
+        )),
     }
 }

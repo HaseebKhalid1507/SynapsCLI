@@ -22,6 +22,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
                 crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
                     .expect("test foreground is routable"),
             )),
+            tool_activation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

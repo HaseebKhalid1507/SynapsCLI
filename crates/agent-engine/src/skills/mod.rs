@@ -53,6 +53,84 @@ pub struct LoadedSkill {
     pub source_path: PathBuf,   // absolute path to SKILL.md
 }
 
+// ── Stable skill identities (Task 17, spec §7.2/§7.6 boundary) ──────────────
+
+/// Byte budget for one encoded skill-id segment.
+const SKILL_ID_SEGMENT_MAX_BYTES: usize = 64;
+/// Reserved marker for hex-encoded non-canonical segments.
+const SKILL_ID_ENCODED_PREFIX: &str = "enc-";
+/// Reserved marker for digest-compressed oversized segments.
+const SKILL_ID_DIGEST_PREFIX: &str = "sha-";
+/// Hex characters kept from the SHA-256 of an oversized segment (160 bits).
+const SKILL_ID_DIGEST_HEX_LEN: usize = 40;
+
+fn skill_segment_is_canonical(segment: &str) -> bool {
+    if segment.is_empty() || segment.len() > SKILL_ID_SEGMENT_MAX_BYTES {
+        return false;
+    }
+    let mut chars = segment.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Deterministic, injective, bounded encoding of one raw identity segment
+/// (mirrors the `ToolId` segment strategy): canonical lowercase segments
+/// pass through verbatim; anything else becomes `enc-<hex>`; oversized
+/// encodings compress to `sha-<truncated sha256>`. Two distinct raw
+/// spellings can never collapse into one encoded segment.
+fn encode_skill_segment(raw: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    if skill_segment_is_canonical(raw)
+        && !raw.starts_with(SKILL_ID_ENCODED_PREFIX)
+        && !raw.starts_with(SKILL_ID_DIGEST_PREFIX)
+    {
+        return raw.to_string();
+    }
+    let mut hex = String::with_capacity(raw.len() * 2);
+    for byte in raw.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let encoded = format!("{SKILL_ID_ENCODED_PREFIX}{hex}");
+    if encoded.len() <= SKILL_ID_SEGMENT_MAX_BYTES {
+        return encoded;
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut digest_hex = String::with_capacity(SKILL_ID_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SKILL_ID_DIGEST_HEX_LEN / 2) {
+        use std::fmt::Write as _;
+        let _ = write!(digest_hex, "{byte:02x}");
+    }
+    format!("{SKILL_ID_DIGEST_PREFIX}{digest_hex}")
+}
+
+/// Stable model-facing identity of one skill (Task 17): deterministic and
+/// alias-safe per exact (plugin, name) pair, bounded, and free of source
+/// paths. Plugin skills use the `skill.<plugin>:<name>` namespace; loose
+/// skills use `skill:<name>` — the namespaces cannot collide, so a loose
+/// skill spelling a qualified name can never impersonate a plugin skill.
+pub fn stable_skill_id(skill: &LoadedSkill) -> String {
+    match &skill.plugin {
+        Some(plugin) => format!(
+            "skill.{}:{}",
+            encode_skill_segment(plugin),
+            encode_skill_segment(&skill.name)
+        ),
+        None => format!("skill:{}", encode_skill_segment(&skill.name)),
+    }
+}
+
+/// True when a `load_skill` input is spelled in the stable skill-id
+/// namespace (and should therefore resolve by exact id, not legacy names).
+pub(crate) fn looks_like_stable_skill_id(raw: &str) -> bool {
+    raw.strip_prefix("skill")
+        .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('.'))
+}
+
 /// Built-in command names. Keep in sync with the match in
 /// `src/chatui/commands.rs::handle_command`.
 pub const BUILTIN_COMMANDS: &[&str] = &[
@@ -153,7 +231,13 @@ pub async fn register(
         plugins,
     ));
     let tool = LoadSkillTool::new(registry.clone());
-    tools.write().await.register(Arc::new(tool));
+    {
+        let mut tools = tools.write().await;
+        tools.register(Arc::new(tool));
+        // Task 17: bounded skill discovery beside load_skill (stable IDs +
+        // compact descriptions only; no bodies, no source paths).
+        tools.register(Arc::new(tool::SearchSkillsTool::new(registry.clone())));
+    }
     (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
 }
 

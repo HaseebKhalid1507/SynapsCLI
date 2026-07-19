@@ -1705,6 +1705,10 @@ impl Runtime {
                     // non-stream path — tracked; the required pass gate is
                     // all STREAM-turn execution paths.
                     tool_session_id: Some(self.host_tool_session.clone()),
+                    // Non-stream legacy loop: no retained per-stream set;
+                    // the extension route falls back per its documented
+                    // policy (fresh default-core, zero activations).
+                    session_tool_set: None,
                 },
             )
             .await?;
@@ -1787,6 +1791,7 @@ impl Runtime {
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
+                                        tool_activation: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -1920,6 +1925,7 @@ impl Runtime {
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
+                                                    tool_activation: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -2102,6 +2108,9 @@ impl Runtime {
             // Threads the runtime-scoped gate identity into extension-
             // provider interior tool loops (Task 16).
             tool_session_id: Some(self.host_tool_session.clone()),
+            // Placeholder: the stream loop installs its RETAINED shared
+            // session tool set handle before the first provider round.
+            session_tool_set: None,
         };
 
         let session = crate::runtime::stream::StreamSession {

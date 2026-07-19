@@ -782,6 +782,14 @@ pub struct ApiOptions {
     /// route fail closed to a locally minted identity with the identical
     /// default-core policy — never to ungated execution.
     pub tool_session_id: Option<crate::tools::activation::SessionId>,
+    /// The RETAINED per-stream session tool set handle (Task 17). Stream
+    /// turns thread the same shared set the execution gate authorizes
+    /// against, so extension-provider interior tool loops observe the
+    /// identical set/generation — including exact activations. `None`
+    /// (internal helpers, non-stream paths, tests) makes the extension
+    /// route fall back to a locally minted default-core set; a STALE
+    /// retained set is denied there, never silently replaced.
+    pub session_tool_set: Option<crate::tools::activation::SharedSessionToolSet>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -968,6 +976,7 @@ impl ApiMethods {
             max_retries,
             options.codex_request_role,
             options.tool_session_id.as_ref(),
+            options.session_tool_set.as_ref(),
             &options.trace,
         )
         .await

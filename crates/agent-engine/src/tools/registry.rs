@@ -57,6 +57,12 @@ impl ToolRegistry {
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
+            // Task 17 discovery/authorization gateways (spec §7.2). Present
+            // in the primary runtime registry only; subagent registries
+            // (`without_subagent*`) deliberately exclude them so recursive
+            // runtimes cannot gain broader authorization surfaces.
+            Arc::new(crate::tools::discovery::SearchToolsTool),
+            Arc::new(crate::tools::discovery::ActivateToolsTool),
         ];
         Self::from_tools(tools)
     }
@@ -460,6 +466,53 @@ impl ToolRegistry {
         Arc::clone(&self.cached_schema)
     }
 
+    /// Deterministic session schema projection (Task 17, spec §7.7): select
+    /// from the EXISTING cached exposed schema exactly the entries whose
+    /// capability identity is core or exactly-activated in `session`,
+    /// preserving cached byte ordering, API-safe names, and collision
+    /// suffixes. Pure read: no catalog insertion, no schema rebuild, no
+    /// factory invocation, no process/network. Catalog generation drift or
+    /// a changed pinned schema digest fails typed instead of serving a
+    /// stale projection. Default runtime exposure (`tools_schema`) is
+    /// unaffected until Task 18 opts in.
+    pub fn session_tools_schema(
+        &self,
+        session: &crate::tools::activation::SessionToolSet,
+    ) -> Result<Vec<Value>, SessionSchemaError> {
+        if session.is_stale(&self.catalog) {
+            return Err(SessionSchemaError::StaleSessionSet {
+                set: session.catalog_generation(),
+                catalog: self.catalog.generation(),
+            });
+        }
+        let mut projected = Vec::new();
+        for entry in self.cached_schema.iter() {
+            let Some(api_name) = entry["name"].as_str() else {
+                continue;
+            };
+            let runtime_name = self.runtime_name_for_api(api_name);
+            let Some(tool) = self.tools.get(runtime_name) else {
+                continue;
+            };
+            let id = tool_id_for(tool.as_ref());
+            let pinned = session
+                .core_schema_digest(&id)
+                .or_else(|| session.activation(&id).map(|a| a.schema_digest()));
+            let Some(pinned) = pinned else {
+                continue; // not part of this session's set — absent.
+            };
+            let record = self
+                .catalog
+                .get(&id)
+                .ok_or_else(|| SessionSchemaError::NotCataloged(id.clone()))?;
+            if pinned != record.schema_digest() {
+                return Err(SessionSchemaError::SchemaDigestMismatch(id));
+            }
+            projected.push(entry.clone());
+        }
+        Ok(projected)
+    }
+
     /// Return runtime names of tools owned by the given extension id, sorted ascending.
     /// Built-in tools (which return `None` from `Tool::extension_id`) are excluded.
     pub fn tool_names_for_extension(&self, extension_id: &str) -> Vec<String> {
@@ -480,6 +533,25 @@ impl ToolRegistry {
         tools.sort_by_key(|t| t.name());
         tools
     }
+}
+
+/// Typed failure for [`ToolRegistry::session_tools_schema`]. Metadata-only:
+/// bounded identities and generation counters, never schema bytes.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SessionSchemaError {
+    #[error(
+        "session tool set generation {} is stale against catalog generation {}",
+        set.value(),
+        catalog.value()
+    )]
+    StaleSessionSet {
+        set: crate::tools::catalog::CatalogGeneration,
+        catalog: crate::tools::catalog::CatalogGeneration,
+    },
+    #[error("session member is not cataloged: {0}")]
+    NotCataloged(crate::tools::catalog::ToolId),
+    #[error("schema digest changed since the session pinned it: {0}")]
+    SchemaDigestMismatch(crate::tools::catalog::ToolId),
 }
 
 /// Fail-closed message for infallible compatibility wrappers over typed
@@ -649,8 +721,9 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Includes read-only model discovery plus session authorization.
-        assert_eq!(registry.tools_schema().len(), 18);
+        // Includes read-only model discovery plus session authorization
+        // (Task 17 adds `search_tools` + `activate_tools`).
+        assert_eq!(registry.tools_schema().len(), 20);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());

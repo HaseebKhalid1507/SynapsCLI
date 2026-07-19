@@ -118,19 +118,37 @@ impl StreamMethods {
         } = session;
         let mut messages = initial_messages;
 
-        // One retained `SessionToolSet` per stream session (Task 16): built
-        // once here, reused for EVERY tool call in every model response, and
-        // rebuilt only at the top of a provider round when the catalog
-        // generation advanced (dynamic registration). This makes the gate's
-        // generation/digest checks load-bearing: mid-round catalog drift is
-        // DENIED (`StaleSessionSet`), never silently absorbed by a per-call
-        // rebuild.
-        let mut session_tool_set = {
+        // One retained `SessionToolSet` per stream session (Task 16), held
+        // behind ONE shared handle (Task 17): the same set the execution
+        // gate authorizes against is mutated in place by confirmed
+        // `activate_tools` calls and consumed by the next provider round
+        // and the extension-provider route. Built once here, rebuilt only
+        // at the top of a provider round when the catalog generation
+        // advanced (dynamic registration). Mid-round catalog drift is
+        // DENIED (`StaleSessionSet`), never silently absorbed.
+        let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                tool_session_id.clone(),
-                registry.catalog(),
-            )
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                    tool_session_id.clone(),
+                    registry.catalog(),
+                ),
+            ))
+        };
+        // Thread the RETAINED handle into the extension-provider route so
+        // its interior tool loop consumes the same set/generation as stream
+        // dispatch (Task 17); a stale retained set denies there instead of
+        // minting a fresh set.
+        let mut options = options;
+        options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
+        let options = options;
+        // Host activation policy for MODEL-INITIATED `activate_tools`:
+        // confirmation authority comes exclusively from host configuration
+        // (explicit server auto-approve), never from model-authored JSON.
+        let activation_authority = if auto_approve_confirms {
+            crate::tools::activation::ActivationAuthority::ModelConfirmed
+        } else {
+            crate::tools::activation::ActivationAuthority::Unauthorized
         };
 
         loop {
@@ -161,18 +179,24 @@ impl StreamMethods {
             // `connect_mcp_server` drained after the previous round),
             // rebuild it here — explicitly, deterministically, from the
             // currently verified capabilities, with ZERO inherited
-            // activations (Task 17 introduces real activations). This is
-            // the ONLY rebuild site; individual calls never refresh it.
-            let tools_snapshot = {
+            // activations (catalog drift invalidates exact activations by
+            // design). This is the ONLY rebuild site; individual calls
+            // never refresh it. The catalog snapshot cloned here feeds the
+            // passive discovery/activation capability context this round.
+            let (tools_snapshot, catalog_snapshot) = {
                 let registry = tools.read().await;
-                if session_tool_set.is_stale(registry.catalog()) {
-                    session_tool_set =
-                        crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                {
+                    let mut set = session_tool_set
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if set.is_stale(registry.catalog()) {
+                        *set = crate::tools::activation::SessionToolSet::default_core_for_catalog(
                             tool_session_id.clone(),
                             registry.catalog(),
                         );
+                    }
                 }
-                registry.clone()
+                (registry.clone(), registry.catalog().clone())
             };
 
             // ═══ HOOK: before_message ═══
@@ -402,9 +426,12 @@ impl StreamMethods {
                         // before_tool_call hook emission.
                         let gate_outcome = {
                             let registry = tools.read().await;
+                            let session_set = session_tool_set
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             crate::tools::activation::ExecutionGate::authorize_wire_call(
                                 &registry,
-                                &session_tool_set,
+                                &session_set,
                                 &tool_name,
                             )
                             .map(|authorized| {
@@ -457,7 +484,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)) },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {
@@ -527,6 +554,9 @@ impl StreamMethods {
                     }
                     let prepared_calls: Vec<(String, String, PreparedCall)> = {
                         let registry = tools.read().await;
+                        let session_set = session_tool_set
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         tool_uses
                             .iter()
                             .filter_map(|tool_use| {
@@ -545,7 +575,7 @@ impl StreamMethods {
                                     PreparedCall::Gate(
                                         crate::tools::activation::ExecutionGate::authorize_wire_call(
                                             &registry,
-                                            &session_tool_set,
+                                            &session_set,
                                             &tool_name,
                                         )
                                         .map(|authorized| {
@@ -588,6 +618,11 @@ impl StreamMethods {
                         let prompt_inner = secret_prompt.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
+                        let activation_inner = crate::tools::discovery::ActivationCapability::new(
+                            catalog_snapshot.clone(),
+                            std::sync::Arc::clone(&session_tool_set),
+                            activation_authority,
+                        );
 
                         join_set.spawn(async move {
                             let result = match gate_outcome {
@@ -626,7 +661,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()) },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {

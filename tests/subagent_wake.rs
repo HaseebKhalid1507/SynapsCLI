@@ -429,6 +429,7 @@ fn live_reactive_subagent_end_to_end() {
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
                 orchestration: Some(Arc::clone(&orchestration)),
+                tool_activation: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -481,6 +482,7 @@ fn live_reactive_subagent_end_to_end() {
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
                 orchestration: Some(Arc::clone(&orchestration)),
+                tool_activation: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,

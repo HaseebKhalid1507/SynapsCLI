@@ -1,5 +1,24 @@
 [
   {
+    "description": "Request session-scoped activation of exact tool ids returned by search_tools. Activation is subject to host confirmation policy; only the exact requested tools are activated for this session.",
+    "name": "activate_tools",
+    "parameters": {
+      "properties": {
+        "tools": {
+          "description": "Exact stable tool ids (namespace:name) from search_tools. No wildcards.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tools"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model.",
     "name": "bash",
     "parameters": {
@@ -131,6 +150,22 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search locally known tools by keyword. Returns bounded compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
+    "name": "search_tools",
+    "parameters": {
+      "properties": {
+        "query": {
+          "description": "Case-insensitive keyword matched against tool ids, summaries, and tags.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
       ],
       "type": "object"
     }

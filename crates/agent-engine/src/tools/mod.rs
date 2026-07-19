@@ -23,6 +23,7 @@ mod write;
 pub mod activation;
 mod agent;
 pub mod catalog;
+pub mod discovery;
 mod registry;
 pub mod respond;
 pub mod send_channel;
@@ -38,6 +39,7 @@ pub use crate::runtime::subagent::{
 };
 pub use agent::resolve_agent_prompt;
 pub use bash::BashTool;
+pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
 pub use extension::ExtensionTool;
 pub use find::FindTool;
@@ -84,6 +86,12 @@ pub struct ToolCapabilities {
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.
     pub orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
+    /// Discovery/activation capability context (Task 17): passive catalog
+    /// snapshot + retained session-set handle + host-supplied activation
+    /// authority. `None` (default for manual fixtures and non-stream
+    /// contexts) means the discovery/activation builtins fail typed and no
+    /// model-initiated activation is possible.
+    pub tool_activation: Option<crate::tools::discovery::ActivationCapability>,
 }
 
 /// Configuration limits and timeouts.

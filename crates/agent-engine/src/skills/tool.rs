@@ -1,8 +1,11 @@
-//! `load_skill` tool — model-initiated skill activation.
+//! `load_skill` tool — model-initiated skill activation — plus the Task 17
+//! `search_skills` bounded discovery tool (stable skill IDs + compact
+//! descriptions only; no bodies, no source paths, no process/network).
 
 use crate::skills::{
+    looks_like_stable_skill_id,
     registry::{CommandRegistry, Resolution},
-    LoadedSkill,
+    stable_skill_id, LoadedSkill,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -79,6 +82,32 @@ impl crate::Tool for LoadSkillTool {
             .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'skill' parameter".to_string()))?;
 
+        // Stable-ID path first (Task 17): inputs spelled in the reserved
+        // `skill:`/`skill.<plugin>:` namespace resolve by EXACT deterministic
+        // id. Exactly one match loads that skill and nothing else; zero
+        // matches fail typed; duplicate ids fail closed as ambiguous rather
+        // than guessing. Legacy exact qualified (`plugin:skill`) and
+        // unambiguous bare names keep resolving through the registry below.
+        if looks_like_stable_skill_id(name) {
+            let matches: Vec<Arc<LoadedSkill>> = self
+                .registry
+                .all_skills()
+                .into_iter()
+                .filter(|s| stable_skill_id(s) == name)
+                .collect();
+            return match matches.as_slice() {
+                [] => Err(crate::RuntimeError::Tool(format!(
+                    "unknown skill id '{}'",
+                    crate::BoundedText::new(name, 160).text
+                ))),
+                [skill] => Ok(Self::format_body(skill)),
+                _ => Err(crate::RuntimeError::Tool(format!(
+                    "ambiguous skill id '{}'",
+                    crate::BoundedText::new(name, 160).text
+                ))),
+            };
+        }
+
         match self.registry.resolve(name) {
             Resolution::Skill(s) => Ok(Self::format_body(&s)),
             Resolution::Ambiguous(opts) => Err(crate::RuntimeError::Tool(format!(
@@ -90,6 +119,132 @@ impl crate::Tool for LoadSkillTool {
                 crate::RuntimeError::Tool(format!("unknown skill '{}'", name)),
             ),
         }
+    }
+}
+
+// ── search_skills (Task 17) ─────────────────────────────────────────────────
+
+/// Byte budget for one compact skill description in search results.
+const SKILL_DESCRIPTION_MAX_BYTES: usize = 160;
+/// Maximum number of skills returned by one search.
+const SEARCH_SKILLS_MAX_RESULTS: usize = 16;
+/// Serialized byte budget for the returned skill collection.
+const SEARCH_SKILLS_MAX_RESULT_BYTES: usize = 8 * 1024;
+
+/// Bounded, deterministic skill discovery: stable skill IDs plus compact
+/// bounded descriptions ONLY. Never returns bodies or source paths, starts
+/// no process, performs no network access, and reads only the in-memory
+/// registry snapshot.
+pub struct SearchSkillsTool {
+    registry: Arc<CommandRegistry>,
+}
+
+impl SearchSkillsTool {
+    pub fn new(registry: Arc<CommandRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Tool for SearchSkillsTool {
+    fn name(&self) -> &str {
+        "search_skills"
+    }
+
+    fn description(&self) -> &str {
+        "Search available skills by keyword. Returns bounded stable skill \
+         ids with compact descriptions. Pass a returned id to load_skill to \
+         load exactly that skill."
+    }
+
+    /// Compiled into this runtime and registered by `skills::register`.
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Case-insensitive keyword matched against skill ids, names, and descriptions."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: crate::ToolContext,
+    ) -> crate::Result<String> {
+        let raw = params["query"].as_str().ok_or_else(|| {
+            crate::RuntimeError::Tool("Missing 'query' parameter (string)".to_string())
+        })?;
+        // Reuse the discovery-query boundary parser: empty, oversized, and
+        // control-character queries fail typed and bounded.
+        let query = crate::tools::catalog::DiscoveryQuery::parse(raw)
+            .map_err(|err| crate::RuntimeError::Tool(format!("invalid skill query: {err}")))?;
+
+        // Deterministic candidate order: stable id, then plugin/name for
+        // (unexpected) duplicate ids.
+        let mut candidates: Vec<(String, Arc<LoadedSkill>)> = self
+            .registry
+            .all_skills()
+            .into_iter()
+            .map(|s| (stable_skill_id(&s), s))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.plugin.cmp(&b.1.plugin))
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
+
+        let mut hits = Vec::new();
+        // Serialized cost of `hits` as a compact JSON array: `[]` is 2
+        // bytes; each entry adds its own bytes plus a separating comma.
+        let mut used_bytes = 2usize;
+        let mut truncated = false;
+        for (id, skill) in candidates {
+            let description =
+                crate::BoundedText::new(&skill.description, SKILL_DESCRIPTION_MAX_BYTES).text;
+            let haystack = format!(
+                "{}\n{}\n{}",
+                id.to_lowercase(),
+                skill.name.to_lowercase(),
+                description.to_lowercase()
+            );
+            if !haystack.contains(query.needle()) {
+                continue;
+            }
+            let entry = json!({
+                "id": id,
+                "name": skill.name,
+                "description": description,
+            });
+            let entry_bytes = serde_json::to_vec(&entry)
+                .map_err(|err| {
+                    crate::RuntimeError::Tool(format!("failed to serialize skill entry: {err}"))
+                })?
+                .len();
+            let separator = usize::from(!hits.is_empty());
+            let next_bytes = used_bytes + separator + entry_bytes;
+            if hits.len() == SEARCH_SKILLS_MAX_RESULTS
+                || next_bytes > SEARCH_SKILLS_MAX_RESULT_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            used_bytes = next_bytes;
+            hits.push(entry);
+        }
+
+        let body = json!({"truncated": truncated, "skills": hits});
+        serde_json::to_string(&body).map_err(|err| {
+            crate::RuntimeError::Tool(format!("failed to serialize skill search results: {err}"))
+        })
     }
 }
 
@@ -112,6 +267,7 @@ mod tests {
                 event_queue: None,
                 secret_prompt: None,
                 orchestration: None,
+                tool_activation: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

@@ -116,6 +116,7 @@ impl ApiMethods {
             max_retries,
             options.codex_request_role,
             options.tool_session_id.as_ref(),
+            options.session_tool_set.as_ref(),
             &options.trace,
         )
         .await
@@ -548,6 +549,7 @@ impl ApiMethods {
             // an extension route (which cannot execute tools from this
             // empty-schema path anyway) fails closed to a local
             // default-core gate identity — never to ungated execution.
+            None,
             None,
             &options.trace,
         )

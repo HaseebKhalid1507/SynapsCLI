@@ -64,6 +64,7 @@ pub(crate) async fn route_extension_provider(
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
+    session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -272,16 +273,30 @@ pub(crate) async fn route_extension_provider(
         );
         let result = if let Some(tools) = tools_shared {
             let registry = tools.read().await;
-            // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══ ONE session tool
-            // set for the whole interior tool loop, built here under the
-            // SAME registry read guard the loop holds for the entire outer
-            // call: the catalog cannot drift between interior rounds, so
-            // one snapshot at one generation governs every tool call the
-            // extension provider requests. Zero activations are inherited.
-            let session_tools = crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                tool_session_id.cloned().unwrap_or_else(local_gate_session),
+            // ═══ EXECUTION GATE (Task 16/17, spec §7.1) ═══ ONE session
+            // tool set for the whole interior tool loop, resolved here
+            // under the SAME registry read guard the loop holds for the
+            // entire outer call: the catalog cannot drift between interior
+            // rounds, so one snapshot at one generation governs every tool
+            // call the extension provider requests. When the runtime
+            // threads its RETAINED per-stream set (Task 17), THAT set's
+            // current state — including exact activations — is consumed at
+            // its pinned generation; a stale retained set is DENIED typed,
+            // never silently replaced by a fresh default-core mint. Only
+            // callers with no retained handle at all fall back to a fresh
+            // default-core set with zero activations.
+            let session_tools = match crate::tools::activation::route_session_set(
+                session_tool_set,
                 registry.catalog(),
-            );
+                || tool_session_id.cloned().unwrap_or_else(local_gate_session),
+            ) {
+                Ok(session_tools) => session_tools,
+                Err(denial) => {
+                    attempt.finish_failed(trace_ext::EXTENSION_PROVIDER_ERROR_CODE);
+                    emit_audit(false, "error", Some("stale_session_tool_set"), 0);
+                    return Err(format!("extension provider tool loop denied: {denial}").into());
+                }
+            };
             crate::extensions::runtime::process::complete_provider_with_tools(
                 handler.clone(),
                 params,
@@ -301,6 +316,7 @@ pub(crate) async fn route_extension_provider(
                         event_queue: None,
                         secret_prompt: None,
                         orchestration: None,
+                        tool_activation: None,
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

@@ -77,6 +77,7 @@ fn tool_context(
             event_queue: None,
             secret_prompt: None,
             orchestration: Some(orchestration),
+            tool_activation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

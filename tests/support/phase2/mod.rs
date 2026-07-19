@@ -737,6 +737,7 @@ pub async fn drive_try_route(
             1,
             synaps_cli::runtime::openai::catalog::ExecutionRole::Foreground,
             None,
+            None,
             trace,
         ),
     )
