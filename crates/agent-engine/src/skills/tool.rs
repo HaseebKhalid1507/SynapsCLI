@@ -38,6 +38,13 @@ impl crate::Tool for LoadSkillTool {
          Call this when a task would benefit from a specific methodology."
     }
 
+    /// Compiled into this runtime: `skills::register` adds this tool from
+    /// core code, so its catalog identity is `builtin:load_skill` with
+    /// builtin-runtime provenance — never a conservative unknown.
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn parameters(&self) -> serde_json::Value {
         let list: Vec<String> = self
             .registry
@@ -228,5 +235,37 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["skill"]["type"], "string");
         assert_eq!(schema["required"], serde_json::json!(["skill"]));
+    }
+
+    /// Production-shaped: `skills::register` puts `load_skill` into the live
+    /// tool registry. As a compiled-in capability it must catalog as
+    /// `builtin:load_skill` with builtin-runtime provenance — never as an
+    /// unverified unknown.
+    #[test]
+    fn load_skill_catalogs_as_builtin_capability() {
+        use crate::tools::catalog::{CapabilitySource, ToolId, TrustProvenance};
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(
+            &[],
+            vec![mk("search", Some("p1"))],
+        ));
+        let mut tools = crate::tools::ToolRegistry::empty();
+        tools.register(Arc::new(LoadSkillTool::new(reg)));
+
+        let record = tools
+            .catalog()
+            .get(&ToolId::builtin("load_skill"))
+            .expect("load_skill cataloged under the builtin namespace");
+        assert_eq!(record.source(), &CapabilitySource::Builtin);
+        assert_eq!(record.provenance(), &TrustProvenance::BuiltinRuntime);
+        assert!(
+            tools
+                .catalog()
+                .get(&ToolId::unclassified("load_skill"))
+                .is_none(),
+            "load_skill must not be cataloged as unknown"
+        );
+        // Registration/exposure behavior unchanged.
+        assert!(tools.get("load_skill").is_some());
+        assert_eq!(tools.tools_schema().len(), 1);
     }
 }

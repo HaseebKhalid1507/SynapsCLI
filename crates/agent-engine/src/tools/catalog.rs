@@ -24,6 +24,7 @@
 use crate::tools::{Tool, ToolOrigin};
 use agent_core::BoundedText;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -41,8 +42,31 @@ pub type ToolFactory = Arc<dyn Fn() -> Arc<dyn Tool> + Send + Sync>;
 /// [`CapabilitySource`] (extension/plugin/server ids and tool names).
 const SOURCE_IDENTITY_MAX_BYTES: usize = 256;
 
+/// Hex characters of SHA-256 appended to a truncated identity fragment
+/// (160 bits, matching the `ToolId` digest-segment strength).
+const SOURCE_TRUNCATION_DIGEST_HEX_LEN: usize = 40;
+
+/// Bound a trust-relevant identity fragment without letting two distinct
+/// oversized identities collapse into one displayed value: when truncation
+/// occurs, an explicit `…#sha-<hex>` marker of the FULL raw bytes is
+/// appended, so the result both records that it was cut and stays distinct
+/// per original identity (up to SHA-256 collision). The source-aware
+/// [`ToolId`] is always derived from the raw identity, never this bounded
+/// form, so id collision resistance is unaffected.
 fn bounded_identity(raw: &str) -> String {
-    BoundedText::new(raw, SOURCE_IDENTITY_MAX_BYTES).text
+    let bounded = BoundedText::new(raw, SOURCE_IDENTITY_MAX_BYTES);
+    if !bounded.truncated {
+        return bounded.text;
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut hex = String::with_capacity(SOURCE_TRUNCATION_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SOURCE_TRUNCATION_DIGEST_HEX_LEN / 2) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let marker = format!("\u{2026}#sha-{hex}");
+    let keep = SOURCE_IDENTITY_MAX_BYTES.saturating_sub(marker.len());
+    format!("{}{marker}", BoundedText::new(raw, keep).text)
 }
 
 /// Where a capability comes from, carrying the exact runtime identities
@@ -345,6 +369,14 @@ impl ToolCatalog {
         }
     }
 
+    /// Boundary-test support: overwrite the generation counter in place.
+    /// Grants nothing, exposes nothing, and mutates no entries; only the
+    /// counter used by fail-closed advancement checks is changed.
+    #[doc(hidden)]
+    pub fn set_generation_for_tests(&mut self, generation: CatalogGeneration) {
+        self.generation = generation;
+    }
+
     /// Read-only snapshot of the catalog integrated into a live registry.
     ///
     /// Kept as a compatibility shim over [`super::ToolRegistry::catalog`];
@@ -393,13 +425,24 @@ impl ToolCatalog {
     /// Insert-or-replace one capability as a single mutation, optionally
     /// dropping the entry it shadows (registry replacement by runtime name
     /// can change the capability identity; the stale identity must not
-    /// linger and keep validating old grants). Fails closed without touching
-    /// entries when no new generation is available.
+    /// linger and keep validating old grants).
+    ///
+    /// Occupied-identity safety: if the incoming id is already cataloged and
+    /// it is NOT the unchanged identity of the same-runtime-name tool being
+    /// replaced (`replaced == Some(record.id)`), the mutation fails typed
+    /// with [`CatalogError::DuplicateToolId`] before any entry or generation
+    /// change — two distinct runtime names must never silently share one
+    /// capability identity, or live tools and catalog would diverge. Fails
+    /// closed without touching entries when no new generation is available.
     pub fn upsert(
         &mut self,
         replaced: Option<&ToolId>,
         record: CapabilityRecord,
     ) -> Result<(), CatalogError> {
+        let same_identity_replacement = replaced == Some(&record.id);
+        if !same_identity_replacement && self.entries.contains_key(&record.id) {
+            return Err(CatalogError::DuplicateToolId(record.id.clone()));
+        }
         let next = self.generation.checked_next()?;
         if let Some(stale) = replaced {
             if stale != &record.id {

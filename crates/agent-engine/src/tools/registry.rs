@@ -67,15 +67,30 @@ impl ToolRegistry {
         Self::from_tools(Vec::new())
     }
 
-    /// Remove built-in tools by runtime name (config `disabled_tools`), then
-    /// rebuild the cached schema, name maps, and capability catalog. Unknown
-    /// names are ignored; a call that removes nothing is a no-op and does
-    /// not advance the catalog generation. A call that removes tools
-    /// advances the catalog generation strictly past its prior value, so
-    /// grants issued against removed capabilities cannot stay valid.
+    /// Remove built-in tools by runtime name (config `disabled_tools`).
+    ///
+    /// Compatibility wrapper over [`Self::try_disable`]; the only failure
+    /// mode is catalog generation exhaustion, on which this fails closed by
+    /// panicking with the registry left fully unchanged.
     pub fn disable(&mut self, names: &[String]) {
+        self.try_disable(names).expect(CATALOG_REJECTED_MSG);
+    }
+
+    /// Fallible disable: remove built-in tools by runtime name, then rebuild
+    /// the cached schema, name maps, and capability catalog. Unknown names
+    /// are ignored; a call that removes nothing is a no-op and does not
+    /// advance the catalog generation. A call that removes tools advances
+    /// the catalog generation strictly past its prior value, so grants
+    /// issued against removed capabilities cannot stay valid.
+    ///
+    /// The rebuilt candidate is fully constructed and generation-rebased
+    /// BEFORE it is committed to `self`: on any failure the live registry
+    /// (tools, schema, catalog entries, generation) is left untouched, so a
+    /// generation-exhausted disable can never leave a generation-rewound,
+    /// partially changed registry behind a non-poisoning lock.
+    pub fn try_disable(&mut self, names: &[String]) -> Result<(), CatalogError> {
         if names.is_empty() {
-            return;
+            return Ok(());
         }
         let remaining: Vec<Arc<dyn Tool>> = self
             .tools
@@ -84,13 +99,13 @@ impl ToolRegistry {
             .cloned()
             .collect();
         if remaining.len() == self.tools.len() {
-            return;
+            return Ok(());
         }
         let prior = self.catalog.generation();
-        *self = Self::from_tools(remaining);
-        self.catalog
-            .rebase_past(prior)
-            .expect(GENERATION_EXHAUSTED_MSG);
+        let mut candidate = Self::try_from_tools(remaining)?;
+        candidate.catalog.rebase_past(prior)?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
@@ -123,14 +138,23 @@ impl ToolRegistry {
             if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
                 combined
                     .insert_tool_with_catalog(tool.clone())
-                    .expect(GENERATION_EXHAUSTED_MSG);
+                    .expect(CATALOG_REJECTED_MSG);
             }
         }
         combined.rebuild_schema();
         combined
     }
 
+    /// Infallible construction wrapper over [`Self::try_from_tools`] for
+    /// compiled-in tool lists. A typed failure here (duplicate capability
+    /// identity or generation exhaustion) means the constructed set itself
+    /// is inconsistent, so this fails closed by panicking rather than
+    /// exposing live tools the catalog could not truthfully record.
     fn from_tools(tool_list: Vec<Arc<dyn Tool>>) -> Self {
+        Self::try_from_tools(tool_list).expect(CATALOG_REJECTED_MSG)
+    }
+
+    fn try_from_tools(tool_list: Vec<Arc<dyn Tool>>) -> Result<Self, CatalogError> {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),
             cached_schema: Arc::new(Vec::new()),
@@ -147,18 +171,17 @@ impl ToolRegistry {
         }
         // Catalog the constructed set in deterministic name order. Purely
         // passive: reads in-process metadata only, invokes no factory,
-        // starts no process, exposes no schema, issues no grant.
+        // starts no process, exposes no schema, issues no grant. Distinct
+        // runtime names collapsing onto one capability identity fail typed —
+        // construction must never hide an uncataloged live tool.
         let sorted: Vec<Arc<dyn Tool>> =
             registry.iter_tools_sorted().into_iter().cloned().collect();
         for tool in sorted {
             let record = CapabilityRecord::for_registered_tool(&tool);
-            registry
-                .catalog
-                .upsert(None, record)
-                .expect(GENERATION_EXHAUSTED_MSG);
+            registry.catalog.upsert(None, record)?;
         }
         registry.rebuild_schema();
-        registry
+        Ok(registry)
     }
 
     fn api_safe_name(name: &str, used: &HashSet<String>) -> String {
@@ -329,7 +352,7 @@ impl ToolRegistry {
     /// could not record. Callers that can surface errors should prefer
     /// [`Self::try_register`].
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.try_register(tool).expect(GENERATION_EXHAUSTED_MSG);
+        self.try_register(tool).expect(CATALOG_REJECTED_MSG);
     }
 
     /// Fallible registration: catalog the tool first (fail-closed — on error
@@ -345,8 +368,12 @@ impl ToolRegistry {
 
     /// Shared fail-closed mutation core: catalog mutation happens before the
     /// tools-map mutation, so a catalog failure leaves the registry (and the
-    /// exposed schema) untouched. Never invokes the tool, its factory, any
-    /// extension handler, or any MCP connection method.
+    /// exposed schema) untouched. A capability identity already owned by a
+    /// DIFFERENT runtime name fails typed (`CatalogError::DuplicateToolId`)
+    /// instead of silently diverging live tools from the catalog; only the
+    /// same-runtime-name tool being replaced may keep its identity. Never
+    /// invokes the tool, its factory, any extension handler, or any MCP
+    /// connection method.
     fn insert_tool_with_catalog(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
         let record = CapabilityRecord::for_registered_tool(&tool);
         let replaced = self
@@ -362,6 +389,18 @@ impl ToolRegistry {
     /// registry state; the exposed `tools_schema()` stays byte-identical.
     pub fn catalog(&self) -> &ToolCatalog {
         &self.catalog
+    }
+
+    /// Boundary-test support: resume the catalog generation counter at an
+    /// explicit value. Grants nothing, exposes nothing, and changes no
+    /// tools, schema, or catalog entries; only the counter consulted by
+    /// fail-closed mutation checks is overwritten.
+    #[doc(hidden)]
+    pub fn resume_catalog_generation_for_tests(
+        &mut self,
+        generation: crate::tools::catalog::CatalogGeneration,
+    ) {
+        self.catalog.set_generation_for_tests(generation);
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -414,12 +453,13 @@ impl ToolRegistry {
     }
 }
 
-/// Catalog generation exhaustion message for infallible compatibility paths.
-/// The counter is a `u64` advanced once per mutation, so exhaustion is
-/// unreachable in practice; panicking here fails closed (no mutation without
-/// a new generation) instead of silently preserving stale grants.
-const GENERATION_EXHAUSTED_MSG: &str =
-    "tool catalog generation exhausted: refusing mutation without a new generation";
+/// Fail-closed message for infallible compatibility wrappers over typed
+/// catalog mutations. Failure means either generation exhaustion (a `u64`
+/// mutation counter, unreachable in practice) or a duplicate capability
+/// identity across distinct runtime names; both panic here rather than
+/// exposing a live tool the catalog could not truthfully record.
+const CATALOG_REJECTED_MSG: &str =
+    "tool catalog rejected mutation: refusing to expose a tool the catalog could not record";
 
 fn is_recursive_subagent_tool_name(name: &str) -> bool {
     let api_name = ToolRegistry::api_safe_name(name, &HashSet::new());
@@ -869,5 +909,42 @@ mod tests {
         assert!(merged.get("ext:custom").is_some());
         assert!(merged.get("bash").is_some());
         assert!(merged.get("bash").unwrap().extension_id().is_none());
+    }
+
+    /// Two distinct runtime names declaring the same capability identity.
+    struct McpTwin(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for McpTwin {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mcp twin"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("ok".to_string())
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Mcp {
+                server_id: "srv".to_string(),
+                server_tool_name: "shared".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "tool catalog rejected mutation")]
+    fn from_tools_with_duplicate_capability_identity_fails_closed() {
+        // Initial construction must not silently hide an uncataloged tool:
+        // two distinct runtime names collapsing to one capability identity
+        // must abort construction, never diverge live tools from the catalog.
+        let _ = ToolRegistry::from_tools(vec![
+            Arc::new(McpTwin("twin_one")),
+            Arc::new(McpTwin("twin_two")),
+        ]);
     }
 }
