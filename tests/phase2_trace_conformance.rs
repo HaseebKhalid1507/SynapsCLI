@@ -8,14 +8,14 @@
 //!
 //! | §6 acceptance bullet | Test(s) |
 //! |----------------------|---------|
-//! | All supported providers emit one schema-valid trace record for success, failure, retry, and cancellation fixtures | `s1_anthropic_success_retry_failure_cancel_records_persist_and_validate` (real `Runtime` → persisted log), `s1_openai_chat_matrix_all_provider_ids_success_failure_cancel` (every registry provider ID), `s1_openai_responses_success_failure_cancel`, `s1_gemini_success_failure_retry_cancel`, `s1_cloud_invoke_success_failure_cancel_wire_none`, `s1_extension_provider_success_and_gate_honesty`, `s1_transport_kind_table_strict_reader_accepts_all_and_fails_closed` |
+//! | All supported providers emit one schema-valid trace record for success, failure, retry, and cancellation fixtures | `s1_anthropic_success_retry_failure_cancel_records_persist_and_validate` (real `Runtime` → persisted log), `s1_openai_chat_matrix_all_provider_ids_success_failure_cancel` (every registry provider ID success-driven; failure/cancel on one representative — see the shared-transport note below), `s1_openai_responses_success_failure_cancel`, `s1_gemini_success_failure_retry_cancel`, `s1_cloud_invoke_success_failure_cancel_wire_none` (all three cloud IDs success-driven through the one `cloud_invoke` path), `s1_extension_provider_success_failure_cancel_and_gate_honesty` (failure/cancel via a real scriptable sidecar), `s1_transport_kind_table_strict_reader_accepts_all_and_fails_closed` |
 //! | Trace wire digests match sent bytes | `s2_…` half of `s1_anthropic_…` (exact bytes the loopback server received, local HTTP path); wire-`None` honesty asserts in the cloud/extension/remote-broker tests |
-//! | Default traces contain no raw content or credentials | sentinel scans inside every S1 test (`assert_record_conformant`) + `s5_trace_secret_exfiltration_probe` |
+//! | Default traces contain no raw content or credentials | sentinel scans inside every S1 test (`assert_record_conformant`) + `s5_trace_secret_exfiltration_probe` (incl. surfaced error/notice strings from the hostile echo fixture, also asserted in `s1_anthropic_…`) |
 //! | Translation fixtures either preserve normalized meaning or report each loss/rewrite | `s4_translation_losses_explicit_or_semantics_preserved` |
 //! | Timing tests independently delay headers and SSE bytes and validate the correct timing buckets | `s3_timing_buckets_headers_first_byte_model_event_are_ordered_and_distinct` (fragmented SSE included) |
-//! | Slow or broken trace storage does not delay or fail a model turn | `s6_slow_storage_never_delays_turn_and_overflow_is_counted`, `s6_broken_storage_never_fails_turn_and_warns_once` |
+//! | Slow or broken trace storage does not delay or fail a model turn | `s6_slow_storage_never_delays_turn_and_overflow_is_counted`, `s6_broken_storage_never_fails_turn_and_warns_once`, `s6_trace_writer_shutdown_deadline_is_bounded_under_slow_storage` (direct elapsed-time bound in this harness) |
 //! | `/context` explains system, tools, history, loaded skills/memories, and changed cache component without exposing content by default | `s7_context_report_is_content_free_and_names_every_section`, `s7_intentional_tool_order_change_is_flagged` |
-//! | (§6.1 controls/export) `/trace next` covers exactly one logical request incl. retries; metadata export is private + schema-valid; content export is double-opt-in | `s8_trace_next_one_shot_covers_exactly_one_logical_request_including_retries`, export-CLI half of `s1_anthropic_…` |
+//! | (§6.1 controls/export) `/trace next` covers exactly one logical request incl. retries; metadata export is private + schema-valid; content export is double-opt-in | `s8_trace_next_one_shot_covers_exactly_one_logical_request_including_retries`, `s8_tool_loop_shared_trace_context_continuation_does_not_trace` (later logical requests in the shared tool-loop `ApiOptions.trace` context stay untraced), `s8_content_export_double_opt_in_succeeds_and_consumes_capture` (successful double-opt-in export), export-CLI half of `s1_anthropic_…` (refusal half) |
 //! | Default workspace unchanged, no real provider calls | `s9_default_telemetry_off_persists_nothing_and_touches_loopback_only`; every stub asserts loopback hit counts and the env guard removes all provider keys |
 //!
 //! # Historical red evidence (documented, not re-executed)
@@ -39,10 +39,25 @@
 //!   (Codex records share `open_ai_responses`); its emission wiring stays
 //!   covered in-crate by `runtime::trace::openai_wiring_tests` (not re-run
 //!   here).
+//! - **Shared-transport equivalence (claim hygiene).** Every OpenAI Chat
+//!   registry ID resolves to `WireProtocol::OpenAiChatCompletions` and one
+//!   shared `call_oai_stream_inner` implementation, so failure/cancel are
+//!   proven once on a representative ID while success is driven per ID.
+//!   Likewise every cloud ID (`azure-openai`, `aws-bedrock`,
+//!   `google-vertex`) dispatches through the single
+//!   `cloud_invoke_stream` → `/cloud/invoke` branch; all three are
+//!   success-driven and the transport's lack of an internal retry loop is
+//!   asserted (`attempt == 1`, empty `retries`).
 //! - Chat/Responses transports define no transport-internal retry loop
 //!   (the engine issues a **new logical request** instead), so the
 //!   retry-fixture bullet is proven on the transports that do: Anthropic
-//!   (S1/S8) and Gemini (S1).
+//!   (S1/S8) and Gemini (S1). The cloud transport likewise defines no
+//!   internal retry (see above).
+//! - Extension failure/cancel are driven through a real scriptable python
+//!   sidecar (`SCRIPTED_EXTENSION_PY`) via the SAME routing manager path as
+//!   the repo success fixture — the success test is not claimed to cover
+//!   them, and no retries are fabricated (the extension transport defines
+//!   none).
 //! - The exact-wire digest (§6.2) is asserted on the local HTTP provider
 //!   path (Anthropic). Remote-broker/cloud/extension paths must NOT claim
 //!   wire bytes (serialized out of process) — asserted as `wire: None`,
@@ -53,7 +68,10 @@
 //!   base URL (crate-private constructor).
 //! - `/context` and `/trace` slash commands are thin TUI views over
 //!   `Runtime::context_report` / `trace_status` / `trace_arm_next`; S7/S8
-//!   drive those engine surfaces headlessly.
+//!   drive those engine surfaces headlessly. The S8 tool-loop test drives
+//!   the exact `ApiOptions.trace` context lifetime production tool loops
+//!   share across logical requests — it is an engine-level turn, not a
+//!   full TUI E2E.
 
 #[path = "support/phase2/mod.rs"]
 mod support;
@@ -73,6 +91,7 @@ use synaps_cli::runtime::trace::{
     TraceContext, TransportKind,
 };
 use synaps_cli::runtime::Runtime;
+use synaps_cli::runtime::{SessionEvent, StreamEvent};
 
 include!("support/phase2/cases/providers.rs");
 include!("support/phase2/cases/privacy.rs");

@@ -168,6 +168,196 @@ async fn s8_trace_next_one_shot_covers_exactly_one_logical_request_including_ret
     assert_eq!(records[1].attempt, 2);
 }
 
+/// Tool-loop one-shot lifetime: within ONE engine turn the tool loop issues
+/// several logical requests through the SAME shared `ApiOptions.trace`
+/// context (the exact `TraceContext` lifetime production tool loops use —
+/// `StreamSession.options` is shared across loop iterations). An armed
+/// `/trace next` must cover only the FIRST logical request; the tool-result
+/// continuation request in the same shared context must NOT trace. Driven
+/// through the real `Runtime` with a real local tool (`ls`, innocuous CWD
+/// listing) and a loopback tool-use → continuation stub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s8_tool_loop_shared_trace_context_continuation_does_not_trace() {
+    let guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[ANTHROPIC_SSE_TOOL_USE, ANTHROPIC_SSE])).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let mut rt = Runtime::new().await.expect("runtime");
+    rt.set_model("claude-sonnet-4-5".to_string());
+    assert_eq!(
+        rt.telemetry_level(),
+        TelemetryLevel::Off,
+        "default stays off"
+    );
+    rt.trace_arm_next(false);
+    let ev = drive_runtime_turn(&rt, "tool loop fixture", false).await;
+    assert!(turn_completed(&ev), "tool-loop turn must complete");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "tool-use request + continuation request must both reach the stub"
+    );
+    // The tool genuinely ran: the final history carries its tool_result.
+    let history = ev
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            StreamEvent::Session(SessionEvent::MessageHistory(h)) => Some(h.clone()),
+            _ => None,
+        })
+        .expect("turn must surface message history");
+    assert!(
+        history
+            .iter()
+            .any(|m| m["content"].as_array().is_some_and(|blocks| blocks
+                .iter()
+                .any(|b| b["type"] == "tool_result" && b["tool_use_id"] == "toolu_ph2"))),
+        "ls tool_result missing from history: {history:#?}"
+    );
+
+    rt.shutdown_observability_async(Duration::from_secs(10))
+        .await;
+    let records = read_traces(&guard.trace_log());
+    assert_eq!(
+        records.len(),
+        1,
+        "only the FIRST logical request of the shared-context tool loop may \
+         trace; the continuation must not: {records:#?}"
+    );
+    let r = &records[0];
+    assert_record_conformant(r);
+    assert!(is_completed(r));
+    assert_eq!(r.attempt, 1);
+    assert_eq!(
+        r.outcome.stop_reason,
+        Some(synaps_cli::runtime::trace::StopReason::ToolUse),
+        "the traced record must be the tool-use request, proving the \
+         end_turn continuation is the untraced one: {r:#?}"
+    );
+}
+
+/// Content export happy path (§6.1 double opt-in, genuine end-to-end): arm
+/// `/trace next content`, run a real turn whose prompt embeds a
+/// secret-shaped URL parameter, take the actual `request_id` from the
+/// persisted trace record AND the capture bundle, then run the REAL
+/// `synaps trace export --include-content --allow-content-export` binary.
+/// The export must succeed, be private (0600), carry the
+/// `synaps-trace-content-export/1` schema, preserve the benign prompt text,
+/// redact the secret-shaped sentinel (marker present, sentinels absent),
+/// and CONSUME the capture bundle (second export fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s8_content_export_double_opt_in_succeeds_and_consumes_capture() {
+    use synaps_cli::runtime::trace::{ContentExport, CONTENT_EXPORT_SCHEMA};
+
+    const BENIGN: &str = "ph2-benign-content-marker";
+    let guard = HomeGuard::new();
+    let (url, _, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let mut rt = Runtime::new().await.expect("runtime");
+    rt.set_model("claude-sonnet-4-5".to_string());
+    assert_eq!(rt.telemetry_level(), TelemetryLevel::Off);
+    rt.trace_arm_next(true); // `/trace next content`
+    let ev = drive_runtime_turn(
+        &rt,
+        &format!("{BENIGN} please call https://example.invalid/cb?api_key={S_NESTED}"),
+        false,
+    )
+    .await;
+    assert!(turn_completed(&ev));
+    rt.shutdown_observability_async(Duration::from_secs(10))
+        .await;
+
+    // Actual request identity from the persisted trace record…
+    let records = read_traces(&guard.trace_log());
+    assert_eq!(records.len(), 1, "one armed logical request: {records:#?}");
+    let request_id = records[0].request_id.clone();
+    // …cross-checked against the capture bundle the armed turn wrote.
+    let capture_dir = guard.base_dir().join("trace/capture");
+    let bundles: Vec<_> = std::fs::read_dir(&capture_dir)
+        .expect("capture dir exists after content-armed turn")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(bundles.len(), 1, "exactly one capture bundle: {bundles:#?}");
+    let bundle: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&bundles[0]).unwrap()).unwrap();
+    assert_eq!(
+        bundle["request_id"].as_str(),
+        Some(request_id.as_str()),
+        "capture bundle must belong to the armed request"
+    );
+
+    // Real CLI, both flags → success.
+    let out_path = guard.home.path().join("content-export.json");
+    let out = run_export_cli(
+        &guard,
+        &[
+            request_id.as_str(),
+            "--include-content",
+            "--allow-content-export",
+            "--output",
+            out_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "double-opt-in content export must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    #[cfg(unix)]
+    assert_eq!(mode_of(&out_path), 0o600, "content export must be private");
+
+    let raw = std::fs::read_to_string(&out_path).unwrap();
+    let export: ContentExport =
+        serde_json::from_str(&raw).expect("output must parse as a content export");
+    assert_eq!(export.schema, CONTENT_EXPORT_SCHEMA);
+    assert_eq!(export.request_id.as_str(), request_id.as_str());
+    assert!(export.redacted, "hard redaction marker must be set");
+    // `redactions_applied` counts the EXPORT-time defense-in-depth pass
+    // only; the secret was already scrubbed at CAPTURE time, so the marker
+    // + sentinel-absence asserts below are the meaningful redaction proof.
+    let body = serde_json::to_string(&export.body).unwrap();
+    assert!(
+        body.contains(BENIGN),
+        "genuine (benign) request content must be exported: {body}"
+    );
+    assert!(
+        raw.contains("[REDACTED]"),
+        "redaction marker must replace the secret value: {raw}"
+    );
+    for s in all_sentinels() {
+        assert!(!raw.contains(s), "sentinel {s} leaked into content export");
+    }
+
+    // Consumed: bundle gone, second export fails closed.
+    assert!(
+        !bundles[0].exists(),
+        "capture bundle must be consumed by the export"
+    );
+    let again = run_export_cli(
+        &guard,
+        &[
+            request_id.as_str(),
+            "--include-content",
+            "--allow-content-export",
+            "--output",
+            guard
+                .home
+                .path()
+                .join("content-export-2.json")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    assert!(
+        !again.status.success(),
+        "a consumed capture must not be exportable twice"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // S9 — default workspace regression: telemetry off persists nothing.
 // ─────────────────────────────────────────────────────────────────────────────

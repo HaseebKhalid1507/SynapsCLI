@@ -69,6 +69,23 @@ pub const ANTHROPIC_SSE_PREFIX: &str = concat!(
     "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
 );
 
+/// Anthropic Messages SSE turn that requests the innocuous local `ls` tool
+/// (empty input → lists the CWD) and stops with `tool_use` — the engine
+/// tool loop then executes the tool and issues a continuation request.
+pub const ANTHROPIC_SSE_TOOL_USE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_03\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_ph2\",\"name\":\"ls\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// Minimal OpenAI Chat Completions SSE success body.
 pub const OAI_CHAT_SSE: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
@@ -140,6 +157,9 @@ pub enum Script {
     AlwaysFailEcho(u16),
     /// One data frame, then an endless slow keep-alive stream (for cancel).
     Endless(&'static str),
+    /// SSE bodies answered per arrival order; the last body repeats for any
+    /// further hits (tool-loop fixtures: tool-use turn, then continuation).
+    SeqSse(&'static [&'static str]),
     /// Delay headers, then a comment first byte, then the model events, with
     /// each SSE frame fragmented into small chunks.
     Timed {
@@ -153,6 +173,13 @@ pub enum Script {
 fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
     match script {
         Script::Sse(body) => sse((*body).to_string()),
+        Script::SeqSse(bodies) => {
+            let body = bodies
+                .get(hit)
+                .or_else(|| bodies.last())
+                .expect("SeqSse requires at least one body");
+            sse((*body).to_string())
+        }
         Script::FailThen { fails, status, then } => {
             if hit < *fails {
                 (
@@ -593,19 +620,64 @@ pub async fn drive_runtime_turn(
     events
 }
 
-/// Drain a prebuilt multi-message turn (`run_stream_with_messages`).
-pub async fn drive_runtime_history_turn(rt: &Runtime, history: Vec<SharedMessage>) {
+/// Drain a prebuilt multi-message turn (`run_stream_with_messages`),
+/// returning every event observed so callers can scan the user-surfaced
+/// error/notice strings.
+pub async fn drive_runtime_history_turn(
+    rt: &Runtime,
+    history: Vec<SharedMessage>,
+) -> Vec<StreamEvent> {
     use futures::StreamExt;
     let mut s = rt
         .run_stream_with_messages(history, CancellationToken::new(), None, None, false)
         .await;
+    let mut events = Vec::new();
     while let Some(ev) = tokio::time::timeout(Duration::from_secs(30), s.next())
         .await
         .expect("history turn hung beyond 30 s")
     {
-        if matches!(ev, StreamEvent::Session(SessionEvent::Done)) {
+        let done = matches!(ev, StreamEvent::Session(SessionEvent::Done));
+        events.push(ev);
+        if done {
             break;
         }
+    }
+    events
+}
+
+/// Every user-surfaced terminal-error / notice string from a turn's events
+/// — exactly what a headless frontend would print.
+pub fn surfaced_error_strings(events: &[StreamEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Session(SessionEvent::Error(err)) => Some(err.message.clone()),
+            StreamEvent::Session(SessionEvent::Notice(n)) => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Hostile-echo honesty: the surfaced error/notice strings must exist (the
+/// failure is reported) yet contain NO sentinel and none of the
+/// provider-controlled `ECHOED:` body the hostile stub reflects back.
+pub fn assert_surfaced_errors_sentinel_free(events: &[StreamEvent]) {
+    let surfaced = surfaced_error_strings(events);
+    assert!(
+        !surfaced.is_empty(),
+        "failure fixture must surface at least one error/notice string"
+    );
+    for s in &surfaced {
+        for sentinel in all_sentinels() {
+            assert!(
+                !s.contains(sentinel),
+                "sentinel {sentinel} leaked into a surfaced error string: {s}"
+            );
+        }
+        assert!(
+            !s.contains("ECHOED:"),
+            "provider-controlled echoed body leaked into a surfaced error string: {s}"
+        );
     }
 }
 
@@ -827,6 +899,161 @@ pub async fn load_extension_fixture(
         .unwrap()
         .join("tests/fixtures/streaming_provider_extension.py");
     assert!(fixture.exists(), "fixture missing: {fixture:?}");
+    load_extension_from_script(ext_id, fixture).await
+}
+
+/// A scriptable python provider sidecar (same JSON-RPC framing as the repo
+/// fixture) whose `provider.stream` behavior is keyed off the last user
+/// message: `PH2-FAIL` → JSON-RPC error (provider failure), `PH2-STALL` →
+/// one text delta then a long stall (cancellation fixtures; the sleep is a
+/// controlled stub delay, the sidecar is killed at shutdown), anything else
+/// → the normal streamed success.
+pub const SCRIPTED_EXTENSION_PY: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+
+def read_frame():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+
+def write_frame(payload):
+    body = json.dumps(payload).encode("utf-8")
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+
+def last_user_text(params):
+    for msg in reversed(params.get("messages", [])):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        return block.get("text", "")
+            return ""
+    return ""
+
+
+while True:
+    req = read_frame()
+    if req is None:
+        break
+    method = req.get("method")
+    req_id = req.get("id")
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocol_version": 1,
+                "capabilities": {
+                    "providers": [{
+                        "id": "scripted",
+                        "display_name": "Scripted Test Provider",
+                        "description": "Failure/cancel fixture provider",
+                        "models": [{
+                            "id": "scripted-mini",
+                            "display_name": "Scripted Mini",
+                            "capabilities": {"streaming": True, "tool_use": False},
+                            "context_window": 4096
+                        }]
+                    }]
+                }
+            }
+        })
+    elif method == "provider.stream":
+        text = last_user_text(req.get("params", {}))
+        if "PH2-FAIL" in text:
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32000, "message": "scripted synthetic provider failure"}
+            })
+        elif "PH2-STALL" in text:
+            write_frame({
+                "jsonrpc": "2.0",
+                "method": "provider.stream.event",
+                "params": {"type": "text", "delta": "stall "}
+            })
+            time.sleep(30)
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": "stall"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }
+            })
+        else:
+            write_frame({
+                "jsonrpc": "2.0",
+                "method": "provider.stream.event",
+                "params": {"type": "text", "delta": "ok"}
+            })
+            write_frame({
+                "jsonrpc": "2.0",
+                "method": "provider.stream.event",
+                "params": {"type": "done"}
+            })
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }
+            })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": req_id, "result": None})
+        break
+    else:
+        write_frame({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "unknown method"}})
+"#;
+
+/// Load [`SCRIPTED_EXTENSION_PY`] (written into the plugin temp dir) as an
+/// extension provider through the SAME real routing manager path as the
+/// repo fixture.
+pub async fn load_scripted_extension_fixture(
+    ext_id: &str,
+) -> (
+    Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    TempDir,
+) {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("scripted_provider_extension.py");
+    std::fs::write(&script, SCRIPTED_EXTENSION_PY).unwrap();
+    load_extension_from_script(ext_id, script).await
+}
+
+/// Shared loader: spawn `python3 <script>` as a process extension with the
+/// `providers.register` permission and install it as the global routing
+/// manager.
+pub async fn load_extension_from_script(
+    ext_id: &str,
+    script: PathBuf,
+) -> (
+    Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    TempDir,
+) {
     let plugin_dir = TempDir::new().unwrap();
     let hook_bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
     let manager = Arc::new(tokio::sync::RwLock::new(
@@ -840,7 +1067,7 @@ pub async fn load_extension_fixture(
         command: "python3".to_string(),
         setup: None,
         prebuilt: std::collections::HashMap::new(),
-        args: vec![fixture.to_string_lossy().to_string()],
+        args: vec![script.to_string_lossy().to_string()],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
         config: vec![],
@@ -852,4 +1079,31 @@ pub async fn load_extension_fixture(
         .await
         .expect("load extension fixture");
     (manager, plugin_dir)
+}
+
+/// A minimal handcrafted-but-schema-valid `RequestTrace` for writer-focused
+/// tests (bounded shutdown), strict-parsed through the production reader so
+/// it can never drift from the real schema.
+pub fn handcrafted_trace_record(n: usize) -> RequestTrace {
+    serde_json::from_value(serde_json::json!({
+        "schema": "synaps-request-trace/1",
+        "session_id": "session-shutdown-fixture",
+        "turn_id": "turn-shutdown-fixture",
+        "request_id": format!("req-shutdown-{n}"),
+        "attempt": 1,
+        "model": "provider/fixture-model",
+        "transport": serde_json::to_value(TransportKind::AnthropicMessages).unwrap(),
+        "endpoint": {"host": "127.0.0.1", "path": "/fixture"},
+        "anatomy": {
+            "system_segment_count": 0, "message_count": 1,
+            "block_count": 1, "tool_count": 0
+        },
+        "system_segments": [],
+        "messages": [],
+        "tools": [],
+        "cache": {"boundaries": []},
+        "translation_losses": [],
+        "outcome": {"timings": {}, "retries": [], "terminal": {"kind": "completed"}}
+    }))
+    .expect("handcrafted record must strict-parse")
 }

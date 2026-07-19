@@ -191,9 +191,12 @@ async fn s5_trace_secret_exfiltration_probe() {
     ];
 
     // Hostile echoing provider failure (provider-controlled error text).
+    // The surfaced terminal-error / notice strings must exist and carry
+    // NONE of the sentinels the provider echoes back.
     let (url, _, _) = spawn_stub(Script::AlwaysFailEcho(500)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
-    drive_runtime_history_turn(&rt, history).await;
+    let hostile_events = drive_runtime_history_turn(&rt, history).await;
+    assert_surfaced_errors_sentinel_free(&hostile_events);
 
     // Content-armed successful turn: nested-secret capture must be redacted.
     let (url, _, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
@@ -363,5 +366,39 @@ async fn s6_broken_storage_never_fails_turn_and_warns_once() {
     assert_eq!(
         stats.io_warnings, 1,
         "one warning per failure class: {stats:?}"
+    );
+}
+
+/// Direct bounded-shutdown proof IN THIS HARNESS (not delegated to the
+/// in-crate writer test): a slow writer (300 ms per record — controlled
+/// writer delay) with far more queued trace records than its deadline can
+/// drain must return from `shutdown` at the deadline, not after the queue:
+/// elapsed stays near the 200 ms deadline and the outcome honestly reports
+/// the timeout while the detached worker keeps draining in the background.
+#[test]
+fn s6_trace_writer_shutdown_deadline_is_bounded_under_slow_storage() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: None,
+        trace_path: Some(tmp.path().join("trace.jsonl")),
+        capacity: 32,
+        max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+        write_delay: Some(Duration::from_millis(300)),
+    });
+    let sink = WriterTraceSink::new(writer.clone());
+    for n in 0..10 {
+        synaps_cli::runtime::trace::TraceSink::emit(&sink, handcrafted_trace_record(n));
+    }
+    let started = Instant::now();
+    let outcome = writer.shutdown(Duration::from_millis(200));
+    let elapsed = started.elapsed();
+    assert!(
+        !outcome.is_flushed(),
+        "10 × 300 ms of queued work cannot flush inside 200 ms — a flushed \
+         outcome would mean the deadline was not exercised: {outcome:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "shutdown must return at its deadline, not drain the queue: {elapsed:?}"
     );
 }
