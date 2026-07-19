@@ -118,13 +118,19 @@ impl DisclosurePolicy {
 pub struct RenderedCompactionInput {
     /// Full request text (conversation transcript + instruction template).
     pub prompt_text: String,
-    /// Approximate bytes of conversation-derived content that would be
-    /// disclosed to the summarizer.
+    /// Approximate bytes of CONVERSATION-DERIVED content that would be
+    /// disclosed to the summarizer (instruction templates excluded — the
+    /// disclosure line labels the figure accordingly).
     pub transcript_bytes: usize,
-    /// Content classes present in the request under this policy.
+    /// Content classes ACTUALLY PRESENT in the rendered request under this
+    /// policy — absent classes are never claimed as disclosed.
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     /// Content classes withheld by the policy.
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
+    /// The instruction template this rendering selected (the UPDATE
+    /// template when folding into a previous summary) — hashed into the
+    /// outcome's prompt-stack digest.
+    pub base_prompt: &'static str,
 }
 
 /// Render the summarization request under a disclosure policy. Pure — no
@@ -140,6 +146,8 @@ pub fn render_compaction_input(
     let mut parts: Vec<String> = Vec::new();
     let mut file_ops = FileOps::new();
     let track_paths = !policy.excludes(ContentClass::FilePaths);
+    // M5: record which classes ACTUALLY contribute rendered content.
+    let mut present: std::collections::HashSet<ContentClass> = std::collections::HashSet::new();
 
     for msg in api_messages {
         match msg["role"].as_str() {
@@ -149,13 +157,16 @@ pub fn render_compaction_input(
                     // `<event …>` envelope — that is the EventData class.
                     if content.trim_start().starts_with("<event") {
                         if !policy.excludes(ContentClass::EventData) {
+                            present.insert(ContentClass::EventData);
                             parts.push(format!("[Event]: {}", content));
                         }
                     } else if policy.excludes(ContentClass::UserText) {
                         // withheld
                     } else if content.contains("<context-summary>") {
+                        present.insert(ContentClass::UserText);
                         parts.push(format!("[Previous Summary]: {}", content));
                     } else {
+                        present.insert(ContentClass::UserText);
                         parts.push(format!("[User]: {}", content));
                     }
                 } else if let Some(content) = msg["content"].as_array() {
@@ -177,6 +188,7 @@ pub fn render_compaction_input(
                                 .unwrap_or("");
                             let truncated: String = text.chars().take(2000).collect();
                             if !truncated.is_empty() {
+                                present.insert(ContentClass::ToolResults);
                                 parts.push(format!("[Tool result #{}]: {}", id, truncated));
                             }
                         }
@@ -192,6 +204,7 @@ pub fn render_compaction_input(
                                     continue;
                                 }
                                 if let Some(text) = block["thinking"].as_str() {
+                                    present.insert(ContentClass::Thinking);
                                     let preview: String = text.chars().take(500).collect();
                                     parts.push(format!("[Assistant thinking]: {}", preview));
                                 }
@@ -201,6 +214,7 @@ pub fn render_compaction_input(
                                     continue;
                                 }
                                 if let Some(text) = block["text"].as_str() {
+                                    present.insert(ContentClass::AssistantText);
                                     parts.push(format!("[Assistant]: {}", text));
                                 }
                             }
@@ -232,6 +246,7 @@ pub fn render_compaction_input(
                                 } else {
                                     redact_path_arguments(input)
                                 };
+                                present.insert(ContentClass::ToolCalls);
                                 let args_str =
                                     serde_json::to_string(&rendered_input).unwrap_or_default();
                                 let truncated: String = args_str.chars().take(500).collect();
@@ -242,6 +257,7 @@ pub fn render_compaction_input(
                     }
                 } else if let Some(content) = msg["content"].as_str() {
                     if !policy.excludes(ContentClass::AssistantText) {
+                        present.insert(ContentClass::AssistantText);
                         parts.push(format!("[Assistant]: {}", content));
                     }
                 }
@@ -304,12 +320,18 @@ pub fn render_compaction_input(
         ));
     }
 
+    if !file_section.is_empty() {
+        present.insert(ContentClass::FilePaths);
+    }
+
     let excluded_classes: Vec<agent_core::compaction::ContentClass> = policy.exclude.clone();
+    // M5: only classes ACTUALLY present in the rendering are claimed as
+    // included; policy-allowed-but-absent classes are not.
     let included_classes: Vec<agent_core::compaction::ContentClass> =
         agent_core::compaction::ContentClass::ALL
             .iter()
             .copied()
-            .filter(|c| !excluded_classes.contains(c))
+            .filter(|c| present.contains(c) && !excluded_classes.contains(c))
             .collect();
 
     RenderedCompactionInput {
@@ -317,6 +339,7 @@ pub fn render_compaction_input(
         transcript_bytes,
         included_classes,
         excluded_classes,
+        base_prompt,
     }
 }
 
@@ -358,8 +381,10 @@ pub struct CompactionDisclosure {
     /// "local" in local-only mode — nothing leaves the machine.
     pub provider: String,
     pub model: String,
-    /// Approximate bytes of conversation content the request would carry.
-    pub approx_bytes: usize,
+    /// Approximate bytes of CONVERSATION-DERIVED content the request would
+    /// carry (instruction templates not included; the rendered line labels
+    /// the figure as conversation-scoped).
+    pub approx_conversation_bytes: usize,
     pub message_count: usize,
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
@@ -385,8 +410,8 @@ impl CompactionDisclosure {
                         .join(",")
                 };
                 format!(
-                    "compaction: sending ~{} KB ({} messages) to {}/{} — excluded classes: {}",
-                    self.approx_bytes.div_ceil(1024),
+                    "compaction: sending ~{} KB of conversation ({} messages) to {}/{} — excluded classes: {}",
+                    self.approx_conversation_bytes.div_ceil(1024),
                     self.message_count,
                     self.provider,
                     self.model,
@@ -418,7 +443,7 @@ pub fn preview_compaction_disclosure(
         mode: policy.mode,
         provider,
         model,
-        approx_bytes: rendered.transcript_bytes,
+        approx_conversation_bytes: rendered.transcript_bytes,
         message_count: api_messages.len(),
         included_classes: rendered.included_classes,
         excluded_classes: rendered.excluded_classes,
@@ -435,12 +460,15 @@ const LOCAL_SUMMARY_MAX_BYTES: usize = 12_000;
 /// derived without model assistance and WITHOUT any network construction.
 fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolicy) -> String {
     use agent_core::compaction::ContentClass;
-    let excerpt = |text: &str, cap: usize| -> String {
-        let mut s: String = text.chars().take(cap).collect();
-        if s.len() < text.len() {
-            s.push_str(" …");
+    // Byte-budgeted, UTF-8-boundary-safe excerpts with an explicit marker
+    // whenever anything was cut (M7: honest truncation).
+    let excerpt = |text: &str, cap_bytes: usize| -> String {
+        let bounded = agent_core::BoundedText::new(text, cap_bytes);
+        if bounded.truncated {
+            format!("{} …", bounded.text)
+        } else {
+            bounded.text
         }
-        s
     };
 
     let mut goal = String::new();
@@ -493,8 +521,15 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
         if done.is_empty() { "- (none captured)".to_string() } else { done.join("\n") },
         if tail.is_empty() { "- (none)".to_string() } else { tail.join("\n") },
     );
+    // Whole-summary bound, marked explicitly when it truncates (M7).
+    const TRUNCATION_MARKER: &str = "\n[local summary truncated]";
     if out.len() > LOCAL_SUMMARY_MAX_BYTES {
-        out = agent_core::BoundedText::new(&out, LOCAL_SUMMARY_MAX_BYTES).text;
+        let bounded = agent_core::BoundedText::new(
+            &out,
+            LOCAL_SUMMARY_MAX_BYTES.saturating_sub(TRUNCATION_MARKER.len()),
+        );
+        out = bounded.text;
+        out.push_str(TRUNCATION_MARKER);
     }
     out
 }
@@ -528,9 +563,10 @@ pub async fn compact_conversation(
             let user_msg =
                 std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
             let summary_text = runtime.compact_call(vec![user_msg]).await?;
-            let mut outcome = CompactionOutcome::new_with_instructions(
+            let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
                 runtime.compaction_model(),
+                rendered.base_prompt,
                 custom_instructions,
             );
             outcome.included_classes = rendered.included_classes;
@@ -601,15 +637,16 @@ impl CompactionOutcome {
         }
     }
 
-    /// [`Self::new`] over the exact prompt stack `compact_conversation`
-    /// uses: the compaction system prompt, the instruction template, and
-    /// the optional custom focus.
-    fn new_with_instructions(
+    /// [`Self::new`] over the compaction prompt stack that ACTUALLY ran:
+    /// the compaction system prompt, the instruction template selected by
+    /// the rendering (initial or UPDATE), and the optional custom focus.
+    pub fn for_prompt_stack(
         summary_text: String,
         summary_model: &str,
+        base_prompt: &'static str,
         custom_instructions: Option<&str>,
     ) -> Self {
-        let mut parts = vec![COMPACTION_SYSTEM_PROMPT, SUMMARIZATION_PROMPT];
+        let mut parts = vec![COMPACTION_SYSTEM_PROMPT, base_prompt];
         if let Some(instructions) = custom_instructions {
             parts.push(instructions);
         }
@@ -1478,7 +1515,7 @@ mod disclosure_tests {
         assert_eq!(disclosure.provider, "anthropic");
         assert_eq!(disclosure.model, runtime.compaction_model());
         assert_eq!(disclosure.message_count, messages.len());
-        assert!(disclosure.approx_bytes > 0);
+        assert!(disclosure.approx_conversation_bytes > 0);
         assert!(disclosure
             .excluded_classes
             .contains(&ContentClass::Thinking));
@@ -1496,6 +1533,127 @@ mod disclosure_tests {
         let local = preview_compaction_disclosure(&runtime, &messages);
         assert_eq!(local.mode, CompactionMode::LocalOnly);
         assert_eq!(local.provider, "local");
+    }
+
+    /// M1 (CP-12 review): iterative compaction must hash the prompt stack
+    /// that actually ran — the UPDATE template when updating a previous
+    /// summary, the initial template otherwise.
+    #[test]
+    fn iterative_compaction_digest_hashes_the_prompt_actually_used() {
+        let initial = render_compaction_input(&sentinel_messages(), None, &policy(&[]));
+        assert_eq!(initial.base_prompt, SUMMARIZATION_PROMPT);
+
+        let mut msgs = sentinel_messages();
+        msgs.insert(
+            0,
+            Arc::new(json!({"role": "user", "content":
+                "<context-summary>\nprior summary\n</context-summary>"})),
+        );
+        let update = render_compaction_input(&msgs, None, &policy(&[]));
+        assert_eq!(update.base_prompt, UPDATE_SUMMARIZATION_PROMPT);
+
+        let outcome = CompactionOutcome::for_prompt_stack(
+            "summary".to_string(),
+            "claude-sonnet-4-6",
+            update.base_prompt,
+            Some("focus"),
+        );
+        assert_eq!(
+            outcome.prompt_stack_digest,
+            agent_core::compaction::prompt_stack_digest(&[
+                COMPACTION_SYSTEM_PROMPT,
+                UPDATE_SUMMARIZATION_PROMPT,
+                "focus",
+            ]),
+        );
+        let initial_outcome = CompactionOutcome::for_prompt_stack(
+            "summary".to_string(),
+            "claude-sonnet-4-6",
+            initial.base_prompt,
+            Some("focus"),
+        );
+        assert_ne!(
+            outcome.prompt_stack_digest, initial_outcome.prompt_stack_digest,
+            "update and initial prompt stacks must produce distinct digests"
+        );
+    }
+
+    /// M5 (CP-12 review): included_classes records the classes ACTUALLY
+    /// present in the rendered request, not merely the policy-allowed set.
+    #[test]
+    fn included_classes_record_actual_present_classes() {
+        let sparse: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": "just text"})),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "text", "text": "plain reply"}
+            ]})),
+        ];
+        let rendered = render_compaction_input(&sparse, None, &policy(&[]));
+        assert_eq!(
+            rendered.included_classes,
+            vec![ContentClass::UserText, ContentClass::AssistantText],
+            "absent classes must not be claimed as disclosed"
+        );
+
+        // The full sentinel corpus really does contain every class.
+        let full = render_compaction_input(&sentinel_messages(), None, &policy(&[]));
+        assert_eq!(full.included_classes, ContentClass::ALL.to_vec());
+
+        // Excluded-but-present classes stay out of included.
+        let excluded = render_compaction_input(
+            &sentinel_messages(),
+            None,
+            &policy(&[ContentClass::Thinking]),
+        );
+        assert!(!excluded.included_classes.contains(&ContentClass::Thinking));
+    }
+
+    /// M6 (CP-12 review): the disclosure byte figure is labeled for what it
+    /// measures — conversation-derived content only.
+    #[test]
+    fn disclosure_bytes_are_conversation_scoped_and_labeled() {
+        let runtime = crate::Runtime::new_headless();
+        let messages = sentinel_messages();
+        let disclosure = preview_compaction_disclosure(&runtime, &messages);
+        let rendered = render_compaction_input(&messages, None, &runtime.compaction_policy());
+        assert_eq!(
+            disclosure.approx_conversation_bytes,
+            rendered.transcript_bytes
+        );
+        let line = disclosure.render_line();
+        assert!(
+            line.contains("of conversation"),
+            "the rendered line must scope the byte figure: {line}"
+        );
+    }
+
+    /// M7 (CP-12 review): local summaries are byte-bounded at UTF-8 char
+    /// boundaries and say so when they truncate.
+    #[tokio::test]
+    #[serial]
+    async fn local_summary_truncation_is_bounded_and_marked() {
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_compaction_mode(agent_core::compaction::CompactionMode::LocalOnly);
+
+        // Multibyte-heavy giant history to stress char-boundary safety.
+        let giant = "予算計算を集中させます。".repeat(4_000);
+        let messages: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": giant})),
+            Arc::new(json!({"role": "assistant", "content": "ok"})),
+        ];
+        let outcome = compact_conversation(&messages, &runtime, None)
+            .await
+            .expect("local-only compaction");
+        assert!(
+            outcome.summary_text.len() <= LOCAL_SUMMARY_MAX_BYTES,
+            "local summary must respect its byte bound ({} > {})",
+            outcome.summary_text.len(),
+            LOCAL_SUMMARY_MAX_BYTES
+        );
+        assert!(
+            outcome.summary_text.contains('…'),
+            "an excerpt that was cut must carry a truncation marker"
+        );
     }
 
     /// RAII guard for SYNAPS_ANTHROPIC_BASE_URL.
