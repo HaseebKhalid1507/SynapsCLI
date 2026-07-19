@@ -420,7 +420,34 @@ impl Tool for DeferredMcpTool {
                 params,
             )
             .await
-            .map_err(|err| crate::RuntimeError::Tool(err.to_string()))
+            .map_err(|err| {
+                // Grant invalidation (spec 7.4): config removal, fingerprint
+                // drift, and live name/schema mismatch poison the pinned
+                // descriptor, so the EXACT session grant must fall with the
+                // lease. Transport/capacity/revocation-race failures are
+                // transient and must NOT revoke.
+                use super::lease::McpLeaseError;
+                if matches!(
+                    err,
+                    McpLeaseError::ServerNotConfigured(_)
+                        | McpLeaseError::FingerprintDrift(_)
+                        | McpLeaseError::NameNotListed(_, _)
+                        | McpLeaseError::SchemaMismatch(_, _)
+                ) {
+                    if let Some(activation) = ctx.capabilities.tool_activation.as_ref() {
+                        if activation.revoke_exact_mcp_grant(
+                            leases.session(),
+                            &self.server_name,
+                            &self.server_tool_name,
+                        ) {
+                            tracing::debug!(
+                                "revoked exact MCP activation after descriptor invalidation"
+                            );
+                        }
+                    }
+                }
+                crate::RuntimeError::Tool(err.to_string())
+            })
     }
 }
 

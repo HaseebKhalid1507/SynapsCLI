@@ -66,6 +66,15 @@ impl ActivatedTool {
     }
 }
 
+/// Typed failure for [`SessionToolSet::revoke_exact`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ExactRevocationError {
+    #[error("cannot revoke a configured core tool: {0}")]
+    CoreTool(ToolId),
+    #[error("tool is not activated in this session: {0}")]
+    NotActivated(ToolId),
+}
+
 /// Typed failure for constructing a [`SessionToolSet`].
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SessionToolSetError {
@@ -198,6 +207,22 @@ impl SessionToolSet {
             .collect::<Vec<_>>();
         Self::new(session, core, catalog)
             .expect("progressive core ids are filtered through the catalog")
+    }
+
+    /// Typed EXACT revocation (Task 19 grant invalidation): remove one
+    /// non-core exact activation from this session's set. The session
+    /// schema generation advances by exactly one IFF an activation was
+    /// removed; core tools and unknown/never-activated ids fail typed with
+    /// zero mutation. Never touches the catalog or sibling activations.
+    pub fn revoke_exact(&mut self, id: &ToolId) -> Result<(), ExactRevocationError> {
+        if self.core.contains_key(id) {
+            return Err(ExactRevocationError::CoreTool(id.clone()));
+        }
+        if self.activated.remove(id).is_none() {
+            return Err(ExactRevocationError::NotActivated(id.clone()));
+        }
+        self.schema_generation += 1;
+        Ok(())
     }
 
     /// The catalog generation this set snapshot was built against.

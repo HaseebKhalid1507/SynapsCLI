@@ -75,6 +75,28 @@ impl ActivationCapability {
     pub fn authority(&self) -> ActivationAuthority {
         self.authority
     }
+
+    /// Narrow MCP grant invalidation (Task 19): revoke EXACTLY one MCP
+    /// `ToolId` from the RETAINED session set, and only when the caller's
+    /// session identity matches the retained set's session. Core tools and
+    /// sibling activations are untouched; the catalog is never mutated.
+    /// Returns true iff an activation was actually removed.
+    pub fn revoke_exact_mcp_grant(
+        &self,
+        session: &crate::tools::activation::SessionId,
+        server: &str,
+        server_tool_name: &str,
+    ) -> bool {
+        let mut set = self
+            .session_set
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.session() != session {
+            return false;
+        }
+        set.revoke_exact(&ToolId::mcp(server, server_tool_name))
+            .is_ok()
+    }
 }
 
 impl std::fmt::Debug for ActivationCapability {

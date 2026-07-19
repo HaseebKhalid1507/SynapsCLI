@@ -56,12 +56,13 @@ pub fn config_source_from_disk() -> ConfigSource {
 
 /// Default idle bound for opportunistic reaping.
 pub const DEFAULT_IDLE_MAX: Duration = Duration::from_secs(300);
-/// Constant cap on map keys examined per reap pass — reaping work is bounded
-/// regardless of map size; repeated passes make progress as entries drop.
-pub const REAP_SCAN_MAX: usize = 32;
 /// Hard cap on simultaneously live leases per manager, so termination
 /// fanout (and cleanup-task count) is always bounded.
 pub const MAX_LIVE_LEASES: usize = 64;
+/// Reap passes scan up to the FULL capped map (equal to the live-lease
+/// cap), so idle entries can never starve behind an active HashMap
+/// iteration prefix.
+pub const REAP_SCAN_MAX: usize = MAX_LIVE_LEASES;
 /// Outer total bound on one lease cleanup task (lock wait + shutdown).
 const CLEANUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -575,6 +576,11 @@ pub struct McpLeaseCapability {
 impl McpLeaseCapability {
     pub fn new(session: SessionId, manager: Arc<McpRuntimeManager>) -> Self {
         Self { session, manager }
+    }
+
+    /// The exact session identity this capability is scoped to.
+    pub fn session(&self) -> &SessionId {
+        &self.session
     }
 
     pub async fn call_exact(

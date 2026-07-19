@@ -645,3 +645,241 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     );
     fx.cleanup();
 }
+
+// ── grant invalidation (Task 19 final acceptance fix) ───────────────────────
+
+fn shared_set_with_activations(
+    registry: &ToolRegistry,
+) -> agent_engine::tools::activation::SharedSessionToolSet {
+    let mut set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
+    activate_exact_for_user(
+        &mut set,
+        registry.catalog(),
+        &ToolId::mcp("srv", "echo_tool"),
+    )
+    .unwrap();
+    activate_exact_for_user(
+        &mut set,
+        registry.catalog(),
+        &ToolId::mcp("srv", "sibling_tool"),
+    )
+    .unwrap();
+    Arc::new(std::sync::RwLock::new(set))
+}
+
+fn activation_cap_for(
+    registry: &ToolRegistry,
+    shared: &agent_engine::tools::activation::SharedSessionToolSet,
+) -> agent_engine::tools::discovery::ActivationCapability {
+    agent_engine::tools::discovery::ActivationCapability::new(
+        registry.catalog().clone(),
+        Arc::clone(shared),
+        agent_engine::tools::activation::ActivationAuthority::Unauthorized,
+    )
+}
+
+fn ctx_full(
+    lease: McpLeaseCapability,
+    activation: agent_engine::tools::discovery::ActivationCapability,
+) -> ToolContext {
+    let mut ctx = ctx_with(Some(lease));
+    ctx.capabilities.tool_activation = Some(activation);
+    ctx
+}
+
+#[tokio::test]
+async fn fingerprint_drift_revokes_exact_grant_but_not_siblings_or_core() {
+    let fx = fixture("grant-drift", "ok", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, map) = shared_source(fx.config.clone());
+    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+
+    let mut registry = ToolRegistry::new();
+    let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
+    registry.try_register_batch(tools.clone()).unwrap();
+    let catalog_generation = registry.catalog().generation();
+    let shared = shared_set_with_activations(&registry);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__srv__echo_tool")
+        .unwrap();
+
+    // Healthy call first (lease live, grant intact).
+    echo.execute(
+        json!({"text":"a"}),
+        ctx_full(cap.clone(), activation_cap_for(&registry, &shared)),
+    )
+    .await
+    .unwrap();
+    let schema_generation_before = shared.read().unwrap().schema_generation();
+
+    // Drift the config: lease AND the exact grant must fall together.
+    map.write()
+        .unwrap()
+        .get_mut("srv")
+        .unwrap()
+        .args
+        .push("--drift".into());
+    let err = echo
+        .execute(
+            json!({"text":"b"}),
+            ctx_full(cap.clone(), activation_cap_for(&registry, &shared)),
+        )
+        .await
+        .expect_err("drift denies");
+    assert!(err.to_string().contains("fingerprint"), "{err}");
+
+    assert_eq!(manager.lease_count(), 0, "lease gone");
+    let set = shared.read().unwrap();
+    assert!(
+        set.activation(&ToolId::mcp("srv", "echo_tool")).is_none(),
+        "exact grant revoked"
+    );
+    assert!(
+        set.activation(&ToolId::mcp("srv", "sibling_tool"))
+            .is_some(),
+        "sibling grant untouched"
+    );
+    assert!(
+        set.is_core(&agent_engine::tools::catalog::ToolId::builtin("bash")),
+        "core untouched"
+    );
+    assert_eq!(
+        set.schema_generation(),
+        schema_generation_before + 1,
+        "schema generation advances exactly once on revocation"
+    );
+    drop(set);
+    // Next projection excludes exactly the revoked schema.
+    let names: Vec<String> = registry
+        .session_tools_schema(&shared.read().unwrap())
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(String::from))
+        .collect();
+    assert!(!names.contains(&"ext__srv__echo_tool".to_string()));
+    assert!(names.contains(&"ext__srv__sibling_tool".to_string()));
+    assert_eq!(
+        registry.catalog().generation(),
+        catalog_generation,
+        "no catalog mutation"
+    );
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn schema_mismatch_revokes_grant_but_transport_errors_do_not() {
+    // Live schema mismatch: grant falls.
+    let hostile = json!([
+        {"name": "echo_tool", "description": "changed", "inputSchema": {"type":"object","properties":{"evil":{"type":"string"}}}},
+    ]);
+    let fx = fixture("grant-mismatch", "ok", hostile);
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+
+    let mut registry = ToolRegistry::new();
+    let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
+    registry.try_register_batch(tools.clone()).unwrap();
+    let shared = shared_set_with_activations(&registry);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__srv__echo_tool")
+        .unwrap();
+
+    echo.execute(
+        json!({"text":"x"}),
+        ctx_full(cap.clone(), activation_cap_for(&registry, &shared)),
+    )
+    .await
+    .expect_err("mismatch denies");
+    assert!(
+        shared
+            .read()
+            .unwrap()
+            .activation(&ToolId::mcp("srv", "echo_tool"))
+            .is_none(),
+        "schema mismatch revokes the exact grant"
+    );
+    fx.cleanup();
+
+    // Transient transport failure: grant survives.
+    let fx = fixture("grant-transport", "huge", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+    let mut registry = ToolRegistry::new();
+    let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
+    registry.try_register_batch(tools.clone()).unwrap();
+    let shared = shared_set_with_activations(&registry);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__srv__echo_tool")
+        .unwrap();
+
+    echo.execute(
+        json!({"text":"x"}),
+        ctx_full(cap.clone(), activation_cap_for(&registry, &shared)),
+    )
+    .await
+    .expect_err("transport failure denies this call");
+    assert!(
+        shared
+            .read()
+            .unwrap()
+            .activation(&ToolId::mcp("srv", "echo_tool"))
+            .is_some(),
+        "transient transport failure must NOT revoke the grant"
+    );
+    fx.cleanup();
+}
+
+#[test]
+fn revoke_exact_is_typed_and_reap_scan_covers_full_cap() {
+    use agent_engine::mcp::lease::{MAX_LIVE_LEASES, REAP_SCAN_MAX};
+    use agent_engine::tools::activation::ExactRevocationError;
+
+    // Reap scan must cover the whole capped map (no prefix starvation).
+    assert_eq!(REAP_SCAN_MAX, MAX_LIVE_LEASES);
+
+    let fx = fixture("revoke-typed", "ok", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let mut registry = ToolRegistry::new();
+    registry
+        .try_register_batch(dormant_tools_for_config(
+            &config_with(fx.config.clone()),
+            &seeded_cache(&fp),
+        ))
+        .unwrap();
+    let mut set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
+    let echo_id = ToolId::mcp("srv", "echo_tool");
+    activate_exact_for_user(&mut set, registry.catalog(), &echo_id).unwrap();
+    let generation = set.schema_generation();
+
+    // Core revocation refused typed, zero mutation.
+    let bash = agent_engine::tools::catalog::ToolId::builtin("bash");
+    assert_eq!(
+        set.revoke_exact(&bash),
+        Err(ExactRevocationError::CoreTool(bash.clone()))
+    );
+    // Unknown/never-activated refused typed, zero mutation.
+    let ghost = ToolId::mcp("srv", "ghost");
+    assert_eq!(
+        set.revoke_exact(&ghost),
+        Err(ExactRevocationError::NotActivated(ghost.clone()))
+    );
+    assert_eq!(set.schema_generation(), generation);
+
+    // Exact revocation removes once, advances once, then fails typed.
+    assert!(set.revoke_exact(&echo_id).is_ok());
+    assert_eq!(set.schema_generation(), generation + 1);
+    assert_eq!(
+        set.revoke_exact(&echo_id),
+        Err(ExactRevocationError::NotActivated(echo_id.clone()))
+    );
+    assert_eq!(set.schema_generation(), generation + 1);
+    fx.cleanup();
+}
