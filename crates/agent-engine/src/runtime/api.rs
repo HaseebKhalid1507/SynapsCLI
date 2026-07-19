@@ -231,6 +231,7 @@ impl ParseState {
 /// not in `ParseState`: read/write separation is the point.
 struct EventCtx<'t> {
     tx: &'t mpsc::UnboundedSender<StreamEvent>,
+    suppress_stream_deltas: bool,
     telemetry_level: TelemetryLevel,
     request_start: std::time::Instant,
     /// Requested cache TTL — used by the silent-downgrade detector.
@@ -316,26 +317,32 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
         AnthropicEvent::ContentBlockDelta { delta } => match delta {
             Delta::TextDelta { text } => {
                 state.current_text.push_str(&text);
-                let _ = ctx
-                    .tx
-                    .send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx
+                        .tx
+                        .send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
+                }
             }
             Delta::ThinkingDelta { thinking } => {
                 // Anthropic sends thinking text in delta.thinking
                 state.current_thinking.push_str(&thinking);
-                let _ = ctx
-                    .tx
-                    .send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx
+                        .tx
+                        .send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+                }
             }
             Delta::SignatureDelta { signature } => {
                 state.current_thinking_signature = signature.into_owned();
             }
             Delta::InputJsonDelta { partial_json } => {
                 state.current_tool_input_json.push_str(&partial_json);
-                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
-                    tool_id: state.current_tool_id.clone(),
-                    delta: partial_json.into_owned(),
-                }));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                        tool_id: state.current_tool_id.clone(),
+                        delta: partial_json.into_owned(),
+                    }));
+                }
             }
             // Unknown delta subtype: no state change, mirrors the old `_ => {}`.
             Delta::Unknown => {}
@@ -1458,6 +1465,7 @@ impl ApiMethods {
             let mut state = ParseState::new();
             let ctx = EventCtx {
                 tx: &tx,
+                suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
                 request_start,
                 cache_ttl: options.cache_ttl,
@@ -1790,6 +1798,7 @@ mod tests {
     fn make_ctx(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
@@ -1800,11 +1809,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn suppressed_sync_context_accumulates_text_without_emitting_deltas() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ParseState::new();
+        let mut ctx = make_ctx(&tx);
+        ctx.suppress_stream_deltas = true;
+        process_data_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"large-final-text"}}"#,
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.current_text, "large-final-text");
+        assert!(rx.try_recv().is_err());
+    }
+
     /// Telemetry-OFF ctx — the DEFAULT runtime config. Used to prove parse-time
     /// behavior doesn't silently depend on telemetry being enabled.
     fn make_ctx_telemetry_off(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Off,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
@@ -1825,6 +1850,7 @@ mod tests {
     ) -> EventCtx<'a> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: ttl,
@@ -3176,6 +3202,7 @@ mod tests {
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = EventCtx {
             tx: &tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::Hybrid,
