@@ -414,6 +414,159 @@ async fn real_path_and_directory_symlink_alias_serialize_under_reordering_pressu
     );
 }
 
+/// Mutating fixture deriving its lane from the PRODUCTION write-tool key of
+/// `path`, reporting OVERLAP/SERIAL via a shared gauge (same detector as
+/// `OverlapFixture`).
+struct KeyedOverlapWrite {
+    name: String,
+    path: String,
+    gauge: Arc<ConcurrencyGauge>,
+}
+
+#[async_trait]
+impl Tool for KeyedOverlapWrite {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    fn description(&self) -> &str {
+        "keyed overlap write"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::IdempotentWrite
+    }
+    fn concurrency_key(&self, _input: &Value) -> Option<ConcurrencyKey> {
+        let production = synaps_cli::tools::WriteTool;
+        production.concurrency_key(&serde_json::json!({"path": self.path, "content": ""}))
+    }
+    async fn execute(&self, _p: Value, _c: ToolContext) -> Result<String> {
+        let now = self.gauge.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.gauge.peak.fetch_max(now, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+        while self.gauge.peak.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let overlapped = self.gauge.peak.load(Ordering::SeqCst) >= 2;
+        self.gauge.current.fetch_sub(1, Ordering::SeqCst);
+        Ok(if overlapped { "OVERLAP" } else { "SERIAL" }.to_string())
+    }
+}
+
+/// KERNEL resolution order (CP-11 fix-2 C): with `a/link -> b`, the path
+/// `a/link/../shared.txt` actually targets `<tmp>/shared.txt` (the symlink
+/// resolves BEFORE `..`). Writes to both spellings of that ONE actual
+/// target must serialize in model order under reordering pressure.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn symlink_parent_traversal_same_actual_target_serializes() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = HomeGuard::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    symlink(&b, a.join("link")).unwrap();
+    let through_link = a.join("link/../shared.txt");
+    let direct = tmp.path().join("shared.txt");
+
+    let body: &'static str = Box::leak(
+        sse_two_calls(
+            "traverse_write_a",
+            "toolu_t1",
+            "traverse_write_b",
+            "toolu_t2",
+        )
+        .into_boxed_str(),
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
+    let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_with(vec![
+        Arc::new(ObservedWrite {
+            name: "traverse_write_a".into(),
+            tag: "A".into(),
+            path: through_link.to_string_lossy().into_owned(),
+            log: Arc::clone(&log),
+            delay_ms: 300,
+        }),
+        Arc::new(ObservedWrite {
+            name: "traverse_write_b".into(),
+            tag: "B".into(),
+            path: direct.to_string_lossy().into_owned(),
+            log: Arc::clone(&log),
+            delay_ms: 0,
+        }),
+    ])
+    .await;
+    let _events = drive_runtime_turn(&rt, "write through traversal", false).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["start:A", "end:A", "start:B", "end:B"],
+        "one actual kernel target reached via symlink/../ must share a lane"
+    );
+    assert_eq!(std::fs::read_to_string(&direct).unwrap(), "B");
+}
+
+/// The lexical misread of `a/link/../x.txt` is `a/x.txt` — a DIFFERENT
+/// actual target. The two must NOT share a lane: both writes observe each
+/// other concurrently in-flight.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn symlink_parent_traversal_distinct_actual_targets_do_not_share_a_lane() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = HomeGuard::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    symlink(&b, a.join("link")).unwrap();
+
+    let body: &'static str = Box::leak(
+        sse_two_calls("traverse_ov_a", "toolu_v1", "traverse_ov_b", "toolu_v2").into_boxed_str(),
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
+    let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let gauge = Arc::new(ConcurrencyGauge::default());
+    let rt = runtime_with(vec![
+        Arc::new(KeyedOverlapWrite {
+            name: "traverse_ov_a".into(),
+            // Actual kernel target: <tmp>/x.txt (link resolves before ..).
+            path: a.join("link/../x.txt").to_string_lossy().into_owned(),
+            gauge: Arc::clone(&gauge),
+        }),
+        Arc::new(KeyedOverlapWrite {
+            name: "traverse_ov_b".into(),
+            // The lexical misread target — a genuinely different file.
+            path: a.join("x.txt").to_string_lossy().into_owned(),
+            gauge: Arc::clone(&gauge),
+        }),
+    ])
+    .await;
+    let events = drive_runtime_turn(&rt, "distinct traversal targets", false).await;
+    let results = ordered_tool_results(&final_history(&events));
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].1, "OVERLAP",
+        "distinct actual targets must not be serialized into one lexical lane"
+    );
+    assert_eq!(results[1].1, "OVERLAP");
+}
+
 /// Independent read-only tools OVERLAP: both sides reach the shared
 /// barrier while the other is still executing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
