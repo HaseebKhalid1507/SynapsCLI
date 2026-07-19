@@ -1728,6 +1728,16 @@ mod disclosure_tests {
             "local summary should carry goal context"
         );
 
+        // M3: transport-construction seam — local-only mode must never
+        // reach the single remote-summarization entry point, so no HTTP
+        // request/provider transport is ever constructed (the socket spy
+        // below then confirms nothing slipped past the seam either).
+        assert_eq!(
+            runtime.remote_summarization_attempts(),
+            0,
+            "local-only compaction reached the remote transport seam"
+        );
+
         match listener.accept() {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Ok((_, peer)) => panic!("local-only compaction opened a socket from {peer}"),
@@ -1762,6 +1772,15 @@ mod disclosure_tests {
         // spy only cares that the connection attempt happened.
         let result = compact_conversation(&sentinel_messages(), &runtime, None).await;
         assert!(result.is_err(), "mock endpoint cannot produce a summary");
+
+        // M3 seam liveness: the remote path increments the counter BEFORE
+        // constructing the request — proving the zero above is a real
+        // observation from a live seam.
+        assert_eq!(
+            runtime.remote_summarization_attempts(),
+            1,
+            "remote compaction must pass through the transport seam exactly once"
+        );
 
         observed_rx
             .recv_timeout(std::time::Duration::from_secs(10))

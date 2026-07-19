@@ -248,6 +248,11 @@ pub struct Runtime {
     compaction_mode: agent_core::compaction::CompactionMode,
     /// Content classes excluded from remote compaction disclosure.
     compaction_exclusions: Vec<agent_core::compaction::ContentClass>,
+    /// Transport-construction seam (spec §9.4 / CP-12 M3): incremented at
+    /// the SINGLE remote-summarization entry point before any preflight,
+    /// auth, or HTTP request construction. Shared across clones so the
+    /// local-only zero-network proof observes every path.
+    remote_summarization_attempts: Arc<std::sync::atomic::AtomicU64>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     /// Session-scoped orchestration enforcement installed during boot.
@@ -463,6 +468,7 @@ impl Runtime {
             compaction_model: None,
             compaction_mode: agent_core::compaction::CompactionMode::default(),
             compaction_exclusions: Vec::new(),
+            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -547,6 +553,7 @@ impl Runtime {
             compaction_model: None,
             compaction_mode: agent_core::compaction::CompactionMode::default(),
             compaction_exclusions: Vec::new(),
+            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -1284,6 +1291,13 @@ impl Runtime {
         self.compaction_exclusions = exclude;
     }
 
+    /// Number of times the remote-summarization transport seam was entered
+    /// (CP-12 M3). Local-only compaction must leave this at zero.
+    pub fn remote_summarization_attempts(&self) -> u64 {
+        self.remote_summarization_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The session's compaction disclosure policy (spec §9.4) — consumed by
     /// `runtime::compaction` for both the preview and the dispatch path.
     pub fn compaction_policy(&self) -> crate::runtime::compaction::DisclosurePolicy {
@@ -1797,6 +1811,10 @@ impl Runtime {
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
     pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
+        // Transport-construction seam: counted BEFORE preflight, auth
+        // refresh, or any request assembly (CP-12 M3).
+        self.remote_summarization_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let model = self.compaction_model();
         self.validate_request_preflight_for(
             model,
@@ -2386,6 +2404,7 @@ impl Clone for Runtime {
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),
+            remote_summarization_attempts: Arc::clone(&self.remote_summarization_attempts),
             subagent_registry: self.subagent_registry.clone(),
             orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),
