@@ -263,25 +263,31 @@ impl StreamMethods {
             };
             let _ = did_inject;
 
-            let mut options = options.clone();
-            if progressive_tool_disclosure {
-                let session_set = session_tool_set
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let projection =
+            // Flag-off: borrow the turn's options untouched — no per-round
+            // clone, exactly the pre-Task-18 request path. Flag-on: build one
+            // per-round options value carrying the session projection.
+            let projected_options;
+            let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
+                let projection = {
+                    let session_set = session_tool_set
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     tools_snapshot
                         .session_tools_schema(&session_set)
                         .map_err(|err| {
                             RuntimeError::Tool(format!(
                                 "failed to project the authorized session tool set: {err}"
                             ))
-                        })?;
-                options.request_tools_schema = Some(std::sync::Arc::new(projection));
+                        })?
+                };
+                projected_options = super::api::ApiOptions {
+                    request_tools_schema: Some(std::sync::Arc::new(projection)),
+                    ..options.clone()
+                };
+                &projected_options
             } else {
-                // Preserve the legacy path exactly: the API layer clones the
-                // registry's existing cached Arc, with no projection work.
-                options.request_tools_schema = None;
-            }
+                &options
+            };
 
             let response = match ApiMethods::call_api_stream_inner(
                 &auth,
@@ -296,7 +302,7 @@ impl StreamMethods {
                 &cancel,
                 api_retries,
                 refusal_retries,
-                &options,
+                round_options,
                 telemetry_level,
             )
             .await

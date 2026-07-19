@@ -73,6 +73,15 @@ fn sid() -> SessionId {
     SessionId::parse("task18-progressive").unwrap()
 }
 
+/// One documented first-request budget (docs/request-lifecycle-progressive-
+/// disclosure.md) enforced against BOTH byte metrics: the compact serialized
+/// request-schema array and the Task 12 canonical tools-prefix bytes.
+/// 8 KiB, sized against the MEASURED production core (4,402 serialized
+/// bytes / 2,453 tools-prefix bytes at fix time) with honest headroom —
+/// the prior 4 KiB figure was only ever proven on synthetic markers and is
+/// exceeded by the real schemas.
+const DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES: usize = 8 * 1024;
+
 fn registry_with_dormant(count: usize) -> ToolRegistry {
     let mut tools: Vec<Arc<dyn Tool>> = [
         "bash",
@@ -141,29 +150,97 @@ fn progressive_core_is_exact_and_excludes_specialized_sources() {
     }
 }
 
+/// Production-core proof: the REAL `ToolRegistry::new()` catalog (actual
+/// bash/read/write/edit/grep/find/ls schemas plus the discovery and
+/// activation gateways; skill gateways register separately via
+/// `skills::register`) must fit the documented budget on both metrics.
+/// The synthetic-marker fixtures below prove scale invariance only —
+/// absolute budget honesty is proven here, against production schemas.
+#[test]
+fn production_core_first_request_fits_documented_budget() {
+    let registry = ToolRegistry::new();
+    let set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
+    let projected = registry.session_tools_schema(&set).unwrap();
+    let names: Vec<_> = projected
+        .iter()
+        .filter_map(|schema| schema["name"].as_str())
+        .collect();
+    for required in [
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "grep",
+        "find",
+        "ls",
+        "search_tools",
+        "activate_tools",
+    ] {
+        assert!(names.contains(&required), "core member missing: {required}");
+    }
+    for deferred in ["subagent_start", "subagent", "shell_start", "shell_send"] {
+        assert!(
+            !names.contains(&deferred),
+            "specialized schema leaked into production core: {deferred}"
+        );
+    }
+
+    let encoded = bytes(&projected);
+    let prefix = agent_engine::runtime::trace::diagnostics::tools_prefix_bytes(&projected);
+    eprintln!(
+        "production_core tools={} serialized_request_schema_bytes={} tools_prefix_bytes={}",
+        names.len(),
+        encoded.len(),
+        prefix.len()
+    );
+    assert!(!prefix.is_empty(), "Task 12 tools-prefix bytes must exist");
+    assert!(
+        encoded.len() <= DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES,
+        "production core serialized to {} bytes > documented {} byte budget",
+        encoded.len(),
+        DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES
+    );
+    assert!(
+        prefix.len() <= DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES,
+        "production core tools-prefix is {} bytes > documented {} byte budget",
+        prefix.len(),
+        DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES
+    );
+}
+
 #[test]
 fn progressive_first_request_bytes_are_invariant_at_catalog_scale() {
-    const BUDGET: usize = 4 * 1024;
     let mut baseline = None;
+    let mut prefix_baseline = None;
     for dormant in [10, 100, 500, 1_000, 2_000] {
         let registry = registry_with_dormant(dormant);
         let set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
         let projected = registry.session_tools_schema(&set).unwrap();
         let encoded = bytes(&projected);
+        let prefix = agent_engine::runtime::trace::diagnostics::tools_prefix_bytes(&projected);
         eprintln!(
-            "dormant={dormant} first_request_tool_schema_bytes={}",
-            encoded.len()
+            "dormant={dormant} first_request_tool_schema_bytes={} tools_prefix_bytes={}",
+            encoded.len(),
+            prefix.len()
         );
         assert!(
-            encoded.len() <= BUDGET,
-            "{dormant} dormant tools produced {} bytes > {BUDGET}",
-            encoded.len()
+            encoded.len() <= DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES,
+            "{dormant} dormant tools produced {} bytes > {}",
+            encoded.len(),
+            DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES
         );
         match &baseline {
             None => baseline = Some(encoded),
             Some(expected) => assert_eq!(
                 &encoded, expected,
                 "first-request schema changed at {dormant} dormant tools"
+            ),
+        }
+        match &prefix_baseline {
+            None => prefix_baseline = Some(prefix),
+            Some(expected) => assert_eq!(
+                &prefix, expected,
+                "tools-prefix bytes changed at {dormant} dormant tools"
             ),
         }
     }

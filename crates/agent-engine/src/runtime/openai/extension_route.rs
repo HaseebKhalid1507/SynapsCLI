@@ -156,6 +156,15 @@ pub(crate) async fn route_extension_provider(
         // wire shape crossing the extension boundary is unchanged.
         messages: messages.to_vec(),
         system_prompt: system_prompt.clone(),
+        // Generation-pinned for the WHOLE interior tool loop (Task 18): the
+        // caller's schema (full set, or the flag-on session projection) is
+        // snapshotted here and never re-projected between interior rounds.
+        // Sound because the interior loop's ToolContext carries
+        // `tool_activation: None` (below), so `activate_tools` cannot mutate
+        // the retained session set mid-loop — activations only surface on
+        // the next OUTER stream round, which re-projects. If activation
+        // capability is ever wired into this route, `tools` must be
+        // recomputed per interior round from the session set instead.
         tools: tools_schema.as_ref().clone(),
         temperature,
         max_tokens,
