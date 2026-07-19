@@ -6,6 +6,14 @@ pub struct EditTool;
 
 #[async_trait::async_trait]
 impl Tool for EditTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::IdempotentWrite
+    }
+
+    fn concurrency_key(&self, validated_input: &serde_json::Value) -> Option<String> {
+        super::util::canonical_path_key(validated_input["path"].as_str()?)
+    }
+
     fn origin(&self) -> crate::tools::ToolOrigin {
         crate::tools::ToolOrigin::Builtin
     }

@@ -95,3 +95,33 @@ mod tests {
         assert_eq!(result, PathBuf::from("relative/path"));
     }
 }
+
+/// Task 24: deterministic canonical concurrency key for a path-target
+/// mutating tool. Lexical (no filesystem access, works for files that do
+/// not exist yet): expands `~`, absolutizes against the cwd, and
+/// normalizes `.`/`..` components, so two spellings of the same target
+/// collide on one key and distinct targets never do.
+pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let expanded = expand_path(raw);
+    let path = std::path::Path::new(&expanded);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized.to_string_lossy().to_string())
+}

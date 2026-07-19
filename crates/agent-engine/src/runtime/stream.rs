@@ -684,7 +684,26 @@ impl StreamMethods {
                             >,
                         ),
                     }
-                    let prepared_calls: Vec<(String, String, PreparedCall)> = {
+                    // ═══ EFFECT-AWARE SCHEDULER LANES (Task 24, §8.2) ═══
+                    // Computed under the SAME guard as authorization, from
+                    // the authorized implementation's declared effect and
+                    // validated-input concurrency key:
+                    //  - ReadOnly            => own lane (fully concurrent);
+                    //  - IdempotentWrite+key => per-key lane (model order
+                    //    within one key; distinct keys are proven
+                    //    non-conflicting and run concurrently);
+                    //  - everything else     => ONE shared serial lane in
+                    //    model order (NonIdempotent / keyless writes /
+                    //    unclassified dynamic tools).
+                    // Instant outcomes (parse errors, gate denials) join a
+                    // concurrent lane — they execute nothing.
+                    #[derive(Clone, PartialEq, Eq, Hash)]
+                    enum LaneKind {
+                        Concurrent,
+                        Keyed(String),
+                        Serial,
+                    }
+                    let prepared_calls: Vec<(String, String, PreparedCall, LaneKind)> = {
                         let registry = tools.read().await;
                         let session_set = session_tool_set
                             .read()
@@ -699,12 +718,12 @@ impl StreamMethods {
                                     return None;
                                 }
                                 let input = tool_use["input"].clone();
-                                let prepared = if let Some(err) =
+                                let (prepared, lane) = if let Some(err) =
                                     input.get("__parse_error").and_then(|v| v.as_str())
                                 {
-                                    PreparedCall::ParseError(err.to_string())
+                                    (PreparedCall::ParseError(err.to_string()), LaneKind::Concurrent)
                                 } else {
-                                    PreparedCall::Gate(
+                                    let gate =
                                         crate::tools::activation::ExecutionGate::authorize_wire_call(
                                             &registry,
                                             &session_set,
@@ -714,30 +733,61 @@ impl StreamMethods {
                                             let input = registry
                                                 .translate_input_for_api_tool(&tool_name, input);
                                             (authorized, input)
-                                        }),
-                                    )
+                                        });
+                                    let lane = match &gate {
+                                        Ok((authorized, input)) => {
+                                            let implementation = authorized.implementation();
+                                            match implementation.effect() {
+                                                crate::tools::catalog::ToolEffect::ReadOnly => {
+                                                    LaneKind::Concurrent
+                                                }
+                                                crate::tools::catalog::ToolEffect::IdempotentWrite => {
+                                                    match implementation.concurrency_key(input) {
+                                                        Some(key) => LaneKind::Keyed(key),
+                                                        None => LaneKind::Serial,
+                                                    }
+                                                }
+                                                crate::tools::catalog::ToolEffect::NonIdempotent => {
+                                                    LaneKind::Serial
+                                                }
+                                            }
+                                        }
+                                        // Denials execute nothing.
+                                        Err(_) => LaneKind::Concurrent,
+                                    };
+                                    (PreparedCall::Gate(gate), lane)
                                 };
-                                Some((tool_id, tool_name, prepared))
+                                Some((tool_id, tool_name, prepared, lane))
                             })
                             .collect()
                     };
 
-                    for (tool_id, tool_name, prepared) in prepared_calls {
-                        let gate_outcome = match prepared {
-                            PreparedCall::ParseError(err) => {
-                                let tid = tool_id;
-                                let tx_c = tx.clone();
-                                join_set.spawn(async move {
-                                    let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult {
-                                        tool_id: tid.clone(),
-                                        result: err.clone(),
-                                    }));
-                                    (tid, false, err)
-                                });
-                                continue;
+                    // Group into lanes, preserving model order inside each.
+                    let mut lanes: Vec<Vec<(String, String, PreparedCall)>> = Vec::new();
+                    let mut keyed_lane: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    let mut serial_lane: Option<usize> = None;
+                    for (tool_id, tool_name, prepared, lane) in prepared_calls {
+                        let index = match lane {
+                            LaneKind::Concurrent => {
+                                lanes.push(Vec::new());
+                                lanes.len() - 1
                             }
-                            PreparedCall::Gate(gate_outcome) => gate_outcome,
+                            LaneKind::Keyed(key) => *keyed_lane.entry(key).or_insert_with(|| {
+                                lanes.push(Vec::new());
+                                lanes.len() - 1
+                            }),
+                            LaneKind::Serial => *serial_lane.get_or_insert_with(|| {
+                                lanes.push(Vec::new());
+                                lanes.len() - 1
+                            }),
                         };
+                        lanes[index].push((tool_id, tool_name, prepared));
+                    }
+
+                    // One task per lane; calls inside a lane run
+                    // SEQUENTIALLY in model order, lanes run concurrently.
+                    for lane in lanes {
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
@@ -746,7 +796,6 @@ impl StreamMethods {
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
-                        let tool_name_for_hook = tool_name.clone();
                         let prompt_inner = secret_prompt.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
@@ -759,6 +808,20 @@ impl StreamMethods {
                         );
 
                         join_set.spawn(async move {
+                            let mut lane_results: Vec<(String, bool, String)> = Vec::new();
+                            for (tool_id, tool_name, prepared) in lane {
+                            let gate_outcome = match prepared {
+                                PreparedCall::ParseError(err) => {
+                                    let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                        tool_id: tool_id.clone(),
+                                        result: err.clone(),
+                                    }));
+                                    lane_results.push((tool_id, false, err));
+                                    continue;
+                                }
+                                PreparedCall::Gate(gate_outcome) => gate_outcome,
+                            };
+                            let tool_name_for_hook = tool_name.clone();
                             let result = match gate_outcome {
                                 Ok((authorized, input)) => {
                                     let t = authorized.implementation();
@@ -828,7 +891,16 @@ impl StreamMethods {
                                 result: result.1.clone(),
                             }));
 
-                            (tool_id, result.0, result.1)
+                            let was_canceled = result.0;
+                            lane_results.push((tool_id, was_canceled, result.1));
+                            if was_canceled {
+                                // Cancellation stops the lane; the ordered
+                                // assembly below synthesizes cancel results
+                                // for any calls this lane never reached.
+                                break;
+                            }
+                            }
+                            lane_results
                         });
                     }
 
@@ -836,11 +908,13 @@ impl StreamMethods {
                     let mut results_map = std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
                         match res {
-                            Ok((tool_id, was_canceled, result)) => {
-                                if was_canceled {
-                                    canceled = true;
+                            Ok(lane_results) => {
+                                for (tool_id, was_canceled, result) in lane_results {
+                                    if was_canceled {
+                                        canceled = true;
+                                    }
+                                    results_map.insert(tool_id, result);
                                 }
-                                results_map.insert(tool_id, result);
                             }
                             Err(e) => {
                                 tracing::error!("Parallel tool task panicked: {}", e);

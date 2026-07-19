@@ -185,6 +185,21 @@ pub trait Tool: Send + Sync {
             None => ToolOrigin::Unknown,
         }
     }
+
+    /// Conservative effect class (Task 24, spec §8.2). The default keeps
+    /// unknown/dynamic tools `NonIdempotent` — serialized execution;
+    /// implementations opt IN to weaker classes explicitly.
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::NonIdempotent
+    }
+
+    /// Optional concurrency key derived from the VALIDATED input (Task 24):
+    /// mutating calls with the same key run serially in model order;
+    /// keyed calls with distinct keys are proven non-conflicting. `None`
+    /// (default) joins the global serialized mutation lane.
+    fn concurrency_key(&self, _validated_input: &Value) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

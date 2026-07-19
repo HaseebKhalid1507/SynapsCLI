@@ -7,6 +7,10 @@ pub struct LsTool;
 
 #[async_trait::async_trait]
 impl Tool for LsTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
     fn origin(&self) -> crate::tools::ToolOrigin {
         crate::tools::ToolOrigin::Builtin
     }

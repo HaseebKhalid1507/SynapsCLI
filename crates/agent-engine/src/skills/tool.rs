@@ -57,6 +57,10 @@ fn sanitize_header_field(raw: &str, max_bytes: usize) -> String {
 
 #[async_trait::async_trait]
 impl crate::Tool for LoadSkillTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
     fn name(&self) -> &str {
         "load_skill"
     }
@@ -199,6 +203,10 @@ impl SearchSkillsTool {
 
 #[async_trait::async_trait]
 impl crate::Tool for SearchSkillsTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
     fn name(&self) -> &str {
         "search_skills"
     }

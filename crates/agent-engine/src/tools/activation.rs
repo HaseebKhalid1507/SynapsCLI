@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use super::catalog::{
     CapabilityRecord, CapabilitySource, CatalogGeneration, SchemaDigest, SessionActivationGrant,
-    SideEffectClass, ToolCatalog, ToolId, TrustProvenance,
+    ToolCatalog, ToolEffect, ToolId, TrustProvenance,
 };
 use super::{Tool, ToolRegistry};
 
@@ -639,12 +639,13 @@ impl ExecutionGate {
         // is not consulted here yet (Task 20).
         check_source_trust(record)?;
 
-        // Side-effect/confirmation interim policy (until Task 24): the only
-        // classification today is `Unclassified`, which is permitted solely
-        // because the capability already passed the verified-provenance
-        // check above — Unknown/Unverified capabilities were denied there.
-        match record.side_effect() {
-            SideEffectClass::Unclassified => {}
+        // Effect classes (Task 24) are execution-SCHEDULING policy, not
+        // authorization policy: every class may execute once authorized —
+        // the stream scheduler decides concurrency/ordering from the
+        // recorded class. The exhaustive match keeps this decision loud if
+        // a future class needs gate-level treatment.
+        match record.effect() {
+            ToolEffect::ReadOnly | ToolEffect::IdempotentWrite | ToolEffect::NonIdempotent => {}
         }
 
         // Acquisition happens strictly after authorization succeeds.

@@ -192,6 +192,10 @@ pub struct SearchToolsTool;
 
 #[async_trait::async_trait]
 impl Tool for SearchToolsTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
     fn name(&self) -> &str {
         "search_tools"
     }

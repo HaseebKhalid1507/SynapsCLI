@@ -111,12 +111,20 @@ pub enum TrustProvenance {
     Unverified,
 }
 
-/// Side-effect classification placeholder until Phase 4 (spec §8) introduces
-/// real effect classes. Unknown capabilities stay explicitly unclassified so
-/// later policy can treat them conservatively.
+/// Conservative tool effect classes (Task 24, spec §8.2). Declared by the
+/// implementation, recorded in the catalog at registration, and consumed
+/// by the stream scheduler: only `ReadOnly` (or proven non-conflicting
+/// keyed writes) run concurrently; everything else serializes. Unknown/
+/// dynamic tools default to `NonIdempotent` — the safest class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SideEffectClass {
-    Unclassified,
+pub enum ToolEffect {
+    /// No observable side effects; safe to run concurrently.
+    ReadOnly,
+    /// Repeatable write with a stable target; conflicts are detected via
+    /// the concurrency key (same key => model-order serial execution).
+    IdempotentWrite,
+    /// Arbitrary side effects; serialized by default.
+    NonIdempotent,
 }
 
 /// Where the full JSON schema for a capability lives. The catalog may hold
@@ -148,7 +156,7 @@ pub struct CapabilityRecord {
     schema_digest: SchemaDigest,
     factory: ToolFactory,
     provenance: TrustProvenance,
-    side_effect: SideEffectClass,
+    effect: ToolEffect,
 }
 
 impl CapabilityRecord {
@@ -184,7 +192,7 @@ impl CapabilityRecord {
             schema_digest,
             factory,
             provenance,
-            side_effect: SideEffectClass::Unclassified,
+            effect: ToolEffect::NonIdempotent,
         }
     }
 
@@ -201,7 +209,7 @@ impl CapabilityRecord {
         let (id, source, provenance) = identity_for_tool(tool.as_ref());
         let implementation = Arc::clone(tool);
         let factory: ToolFactory = Arc::new(move || Arc::clone(&implementation));
-        Self::new(
+        let mut record = Self::new(
             id,
             source,
             tool.description(),
@@ -209,7 +217,11 @@ impl CapabilityRecord {
             SchemaLocator::Inline(tool.parameters()),
             factory,
             provenance,
-        )
+        );
+        // Task 24: record the implementation-declared effect class; the
+        // trait default keeps unknown/dynamic tools NonIdempotent.
+        record.effect = tool.effect();
+        record
     }
 
     pub fn id(&self) -> &ToolId {
@@ -240,8 +252,9 @@ impl CapabilityRecord {
         &self.provenance
     }
 
-    pub fn side_effect(&self) -> SideEffectClass {
-        self.side_effect
+    /// The recorded conservative effect class (Task 24, spec §8.2).
+    pub fn effect(&self) -> ToolEffect {
+        self.effect
     }
 
     /// Construct the implementation. This is the ONLY place the stored
@@ -260,7 +273,7 @@ impl std::fmt::Debug for CapabilityRecord {
             .field("tags", &self.tags)
             .field("schema_digest", &self.schema_digest)
             .field("provenance", &self.provenance)
-            .field("side_effect", &self.side_effect)
+            .field("effect", &self.effect)
             .finish_non_exhaustive()
     }
 }

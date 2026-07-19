@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agent_engine::tools::catalog::{
-    CapabilityRecord, CapabilitySource, CatalogError, SchemaDigest, SchemaLocator, SideEffectClass,
-    ToolCatalog, ToolId, TrustProvenance,
+    CapabilityRecord, CapabilitySource, CatalogError, SchemaDigest, SchemaLocator, ToolCatalog,
+    ToolId, TrustProvenance,
 };
 use agent_engine::tools::{Tool, ToolContext, ToolRegistry};
 use agent_engine::{Result, Value};
@@ -110,7 +110,9 @@ fn from_registry_catalogs_every_builtin_without_changing_registry_exposure() {
             .unwrap_or_else(|| panic!("missing catalog record for {}", tool.name()));
         assert_eq!(record.source(), &CapabilitySource::Builtin);
         assert_eq!(record.provenance(), &TrustProvenance::BuiltinRuntime);
-        assert_eq!(record.side_effect(), SideEffectClass::Unclassified);
+        // Task 24: the catalog records each builtin's declared effect class
+        // verbatim (the trait default keeps unclassified tools NonIdempotent).
+        assert_eq!(record.effect(), tool.effect());
         assert!(!record.summary().is_empty(), "compact summary retained");
     }
 

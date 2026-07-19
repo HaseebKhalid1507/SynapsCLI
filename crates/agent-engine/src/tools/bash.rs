@@ -78,6 +78,12 @@ impl Tool for BashTool {
         crate::tools::ToolOrigin::Builtin
     }
 
+    /// Explicitly NonIdempotent (Task 24): arbitrary shell side effects —
+    /// serialized execution, no concurrency key.
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::NonIdempotent
+    }
+
     fn name(&self) -> &str {
         "bash"
     }
