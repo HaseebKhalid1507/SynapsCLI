@@ -3,21 +3,27 @@
 //!
 //! The index is fully DERIVED state over the append-only JSONL store:
 //!
-//! - immutable ts-desc-sorted segment files of content-free doc summaries
-//!   (`{"id","ts","tags","terms"}`), staged in batches of
-//!   [`SEGMENT_MAX_DOCS`];
+//! - immutable ts-desc-sorted segment files of doc summaries
+//!   (`{"id","ts","tags","terms"}`). Lexical terms are CONTENT-DERIVED —
+//!   they reveal the vocabulary of record bodies, so index files and
+//!   directories are private-moded (0600/0700) like the store itself, and
+//!   `secret`-sensitivity bodies contribute NO terms at all (metadata-only
+//!   indexing: id, timestamp, tags);
 //! - an atomically renamed `manifest.json` recording the consumed store
 //!   offset, segment metadata (with min/max timestamps for range skipping),
 //!   and the tombstone set;
 //! - queries stream segment lines through a k-way ts-desc merge with a
 //!   result-bounded collector — resident memory is proportional to the
-//!   requested limit (one buffered doc per open segment + the hits), never
-//!   to the total match count, and streaming early-terminates once a page
-//!   is full;
-//! - crash safety: torn store tails are healed by the store's append path
-//!   and skipped by the lenient reader; orphaned `*.tmp` files are ignored;
-//!   an unparseable or offset-mismatched manifest triggers a full rebuild
-//!   from the store (the index can always be deleted safely).
+//!   requested limit plus at most [`MAX_SEGMENTS`] buffered docs (staging
+//!   compacts segments whenever they exceed that bound), never to the
+//!   total match count, and streaming early-terminates once a page is
+//!   full;
+//! - crash safety + integrity: torn store tails are healed by the store's
+//!   append path and skipped by the lenient reader; orphaned `*.tmp` files
+//!   are ignored; the manifest records byte length AND sha256 per segment,
+//!   and any unparseable manifest, offset mismatch, or missing/truncated/
+//!   corrupted segment triggers a VERIFIED full rebuild from the store
+//!   (the index can always be deleted safely).
 //!
 //! No network: this module performs filesystem I/O only. Embeddings are
 //! DISABLED — no embedding hook exists here, so no implicit remote call is
@@ -36,10 +42,14 @@ use super::store::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 
 /// Docs per immutable segment file.
 pub const SEGMENT_MAX_DOCS: usize = 1024;
+/// Hard bound on staged segments (and therefore on open readers per
+/// query). Staging compacts everything above this into fresh globally
+/// ts-ordered segments.
+pub const MAX_SEGMENTS: usize = 32;
 /// Lexical terms retained per document (deduped, sorted).
 pub const MAX_TERMS_PER_DOC: usize = 512;
 
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 
 /// Per-project index directory: `<base>/memory/index/<namespace>/`.
 pub fn index_dir_in(base: &Path, scope: &ProjectScope) -> PathBuf {
@@ -54,6 +64,10 @@ struct SegmentMeta {
     docs: usize,
     min_ts: u64,
     max_ts: u64,
+    /// Exact byte length of the segment file (truncation detection).
+    bytes: u64,
+    /// SHA-256 of the segment file (corruption detection).
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +138,8 @@ pub struct IndexSearchStats {
     pub docs_scanned: usize,
     /// Peak retained hits — bounded by the requested limit by construction.
     pub max_resident_hits: usize,
+    /// Segment readers opened for this query — bounded by [`MAX_SEGMENTS`].
+    pub segments_open: usize,
 }
 
 /// One bounded result page.
@@ -176,6 +192,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
         .map_err(MemoryError::from)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Verify every manifest-referenced segment: present, exact byte length,
+/// exact sha256 (CP-13 fix1 I8). Any deviation invalidates the manifest.
+fn segments_verified(dir: &Path, manifest: &Manifest) -> bool {
+    for seg in &manifest.segments {
+        let path = dir.join(&seg.file);
+        let Ok(bytes) = fs::read(&path) else {
+            return false; // missing/unreadable
+        };
+        if bytes.len() as u64 != seg.bytes {
+            return false; // truncated/grown
+        }
+        if sha256_hex(&bytes) != seg.sha256 {
+            return false; // corrupted
+        }
+    }
+    true
+}
+
 /// Wipe every index artifact (derived state — always safe) for a rebuild.
 fn reset_index_dir(dir: &Path) -> Result<(), MemoryError> {
     if dir.exists() {
@@ -194,9 +239,10 @@ pub fn ensure_index_in(base: &Path, scope: &ProjectScope) -> Result<IndexStatus,
     let store_len = fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
 
     let mut manifest = match load_manifest(&dir) {
-        Some(m) if m.indexed_bytes <= store_len => m,
+        Some(m) if m.indexed_bytes <= store_len && segments_verified(&dir, &m) => m,
         Some(_) | None => {
-            // Corrupt manifest or rewritten store: full derived rebuild.
+            // Corrupt/mismatched manifest, rewritten store, or a
+            // missing/truncated/corrupted segment: verified full rebuild.
             reset_index_dir(&dir)?;
             Manifest::empty()
         }
@@ -255,11 +301,18 @@ pub fn ensure_index_in(base: &Path, scope: &ProjectScope) -> Result<IndexStatus,
             if tombstones.contains(&id) {
                 continue;
             }
+            // CP-13 fix1 I7: secret bodies contribute NO terms — the
+            // persisted index carries only metadata for them.
+            let terms = if record.sensitivity == Some(super::store::MemorySensitivity::Secret) {
+                Vec::new()
+            } else {
+                terms_of(&record.content)
+            };
             pending.push(SegmentDoc {
                 id,
                 ts: record.timestamp_ms,
                 tags: record.tags,
-                terms: terms_of(&record.content),
+                terms,
             });
         }
 
@@ -278,35 +331,89 @@ pub fn ensure_index_in(base: &Path, scope: &ProjectScope) -> Result<IndexStatus,
         for chunk in pending.chunks(SEGMENT_MAX_DOCS) {
             let mut docs = chunk.to_vec();
             docs.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
-            let mut body = String::new();
-            for doc in &docs {
-                body.push_str(&serde_json::to_string(doc)?);
-                body.push('\n');
-            }
-            let file = format!("seg-{next_seg:06}.jsonl");
-            write_atomic(&dir.join(&file), body.as_bytes())?;
-            manifest.segments.push(SegmentMeta {
-                file,
-                docs: docs.len(),
-                min_ts: docs.iter().map(|d| d.ts).min().unwrap_or(0),
-                max_ts: docs.iter().map(|d| d.ts).max().unwrap_or(0),
-            });
+            manifest
+                .segments
+                .push(write_segment(&dir, next_seg, &docs)?);
             next_seg += 1;
         }
 
         manifest.indexed_bytes = consumed;
         manifest.tombstones = tombstones.into_iter().collect();
         manifest.tombstones.sort();
-        write_atomic(
-            &manifest_path(&dir),
-            serde_json::to_string_pretty(&manifest)?.as_bytes(),
-        )?;
+
+        // CP-13 fix1 M1: bound the staged segment count. Above
+        // MAX_SEGMENTS, merge every live doc into fresh globally
+        // ts-ordered segments (tombstones applied and cleared). This is
+        // maintenance-time memory (proportional to indexed docs), traded
+        // for a hard bound on QUERY-time open readers and buffered docs.
+        if manifest.segments.len() > MAX_SEGMENTS {
+            let tombstoned: HashSet<String> = manifest.tombstones.iter().cloned().collect();
+            let mut all_docs: Vec<SegmentDoc> = Vec::new();
+            for seg in &manifest.segments {
+                let mut stream = SegmentStream::open(&dir.join(&seg.file))?;
+                while let Some(doc) = stream.current.take() {
+                    if !tombstoned.contains(&doc.id) {
+                        all_docs.push(doc);
+                    }
+                    stream.advance()?;
+                }
+            }
+            all_docs.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+
+            let old_files: Vec<String> = manifest.segments.iter().map(|s| s.file.clone()).collect();
+            let target_docs = all_docs
+                .len()
+                .div_ceil(MAX_SEGMENTS / 2)
+                .max(SEGMENT_MAX_DOCS);
+            let mut compacted: Vec<SegmentMeta> = Vec::new();
+            for chunk in all_docs.chunks(target_docs) {
+                compacted.push(write_segment(&dir, next_seg, chunk)?);
+                next_seg += 1;
+            }
+            manifest.segments = compacted;
+            manifest.tombstones.clear();
+            // New manifest FIRST (atomic), then the orphaned old segment
+            // files can be removed; a crash in between leaves ignorable
+            // orphans, never a broken index.
+            write_atomic(
+                &manifest_path(&dir),
+                serde_json::to_string_pretty(&manifest)?.as_bytes(),
+            )?;
+            for file in old_files {
+                let _ = fs::remove_file(dir.join(file));
+            }
+        } else {
+            write_atomic(
+                &manifest_path(&dir),
+                serde_json::to_string_pretty(&manifest)?.as_bytes(),
+            )?;
+        }
     }
 
     Ok(IndexStatus {
         segments: manifest.segments.len(),
         indexed_docs: manifest.segments.iter().map(|s| s.docs).sum(),
         tombstones: manifest.tombstones.len(),
+    })
+}
+
+/// Serialize one ts-desc-sorted doc chunk into an immutable segment file
+/// and return its verified metadata (length + sha256).
+fn write_segment(dir: &Path, seq: u64, docs: &[SegmentDoc]) -> Result<SegmentMeta, MemoryError> {
+    let mut body = String::new();
+    for doc in docs {
+        body.push_str(&serde_json::to_string(doc)?);
+        body.push('\n');
+    }
+    let file = format!("seg-{seq:06}.jsonl");
+    write_atomic(&dir.join(&file), body.as_bytes())?;
+    Ok(SegmentMeta {
+        file,
+        docs: docs.len(),
+        min_ts: docs.iter().map(|d| d.ts).min().unwrap_or(0),
+        max_ts: docs.iter().map(|d| d.ts).max().unwrap_or(0),
+        bytes: body.len() as u64,
+        sha256: sha256_hex(body.as_bytes()),
     })
 }
 
@@ -417,7 +524,10 @@ pub fn search_index_in(
     }
 
     let mut hits: Vec<IndexHit> = Vec::new();
-    let mut stats = IndexSearchStats::default();
+    let mut stats = IndexSearchStats {
+        segments_open: streams.len(),
+        ..Default::default()
+    };
     let mut next: Option<PageCursor> = None;
 
     while let Some(key) = heap.pop() {
