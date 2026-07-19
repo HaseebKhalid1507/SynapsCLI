@@ -443,7 +443,7 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
     let victim = h.roots.config_dir.join("victim.json");
     std::fs::write(&victim, "precious").unwrap();
 
-    for id in ["../victim", "..", "a/b", "a\\b", "/etc/passwd", ""] {
+    for id in ["../victim", "..", "a\\b", "/etc/passwd", ""] {
         for domain in [
             RetentionDomain::Sessions,
             RetentionDomain::Traces,
@@ -456,7 +456,24 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
                 "{domain:?} id {id:?} must be rejected as invalid, got: {err}"
             );
         }
-        // Memory ids embed a namespace part that must be sanitized too.
+    }
+    // Single-component domains additionally reject nested ids; Traces
+    // accepts VALIDATED nested relative ids (CP-13 fix2) — a nonexistent
+    // one errors without touching anything outside the cache root.
+    for domain in [
+        RetentionDomain::Sessions,
+        RetentionDomain::Logs,
+        RetentionDomain::MemoryIndex,
+    ] {
+        let err = forget(&h.roots, domain, "a/b").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid"),
+            "{domain:?} nested id must be rejected: {err}"
+        );
+    }
+    assert!(forget(&h.roots, RetentionDomain::Traces, "a/b").is_err());
+    // Memory ids embed a namespace part that must be sanitized too.
+    for id in ["../victim", "..", "a/b", "a\\b", "/etc/passwd", ""] {
         let err = forget(&h.roots, RetentionDomain::Memory, &format!("{id}:mem-x")).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -733,5 +750,127 @@ fn cache_retention_is_recursive_and_confined() {
         std::fs::read_to_string(&outside).unwrap(),
         "keep me\n",
         "symlinked-out content is never followed or deleted"
+    );
+}
+
+// ─── CP-13 fix2: destination ancestor confinement (dir-handle relative) ──────
+
+/// CP-13 fix2: a pre-planted SYMLINK as a destination ANCESTOR directory
+/// (dest/sessions itself, or a nested traces subdirectory) must fail
+/// closed — nothing may be created through it.
+#[cfg(unix)]
+#[test]
+fn export_rejects_ancestor_symlinks_in_the_destination() {
+    let h = harness();
+    write_session(&h.roots, "s1", 50 * DAY_MS, None);
+
+    // Case A: dest/sessions is a symlink to a victim directory.
+    let victim_dir = h.roots.base_dir.join("victim-dir");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    let dest = h.roots.base_dir.join("export-anc");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, dest.join("sessions")).unwrap();
+
+    let result = export(&h.roots, &dest);
+    assert!(
+        result.is_err(),
+        "ancestor symlink must fail the export closed"
+    );
+    assert_eq!(
+        std::fs::read_dir(&victim_dir).unwrap().count(),
+        0,
+        "nothing may be created through a symlinked ancestor"
+    );
+
+    // Case B: nested trace ancestor — dest/traces exists real, but
+    // dest/traces/sub is a symlink.
+    std::fs::create_dir_all(h.roots.cache_dir.join("sub")).unwrap();
+    std::fs::write(h.roots.cache_dir.join("sub/t.jsonl"), "t\n").unwrap();
+    let dest2 = h.roots.base_dir.join("export-anc2");
+    std::fs::create_dir_all(dest2.join("traces")).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, dest2.join("traces/sub")).unwrap();
+
+    let result = export(&h.roots, &dest2);
+    assert!(result.is_err(), "nested ancestor symlink must fail closed");
+    assert_eq!(
+        std::fs::read_dir(&victim_dir).unwrap().count(),
+        0,
+        "nested symlinked ancestor must never be written through"
+    );
+}
+
+/// CP-13 fix2: the confinement primitive itself is race-free — swapping a
+/// component to a symlink AFTER the parent handle exists (the classic
+/// check/use window) is refused at open time, because the check IS the
+/// O_NOFOLLOW handle-relative open. No path is re-resolved after a check.
+#[cfg(unix)]
+#[test]
+fn confined_creation_survives_concurrent_component_swaps() {
+    use agent_core::private_fs::ConfinedDir;
+    let h = harness();
+    let victim_dir = h.roots.base_dir.join("victim-dir2");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    let dest = h.roots.base_dir.join("export-race");
+
+    let root = ConfinedDir::create_root(&dest).unwrap();
+    // Legitimate child created through the handle…
+    let sub = root.child_dir("traces").unwrap();
+    drop(sub);
+    // …then the attacker swaps it for a symlink (simulated race: the swap
+    // happens between two handle-relative operations).
+    std::fs::remove_dir(dest.join("traces")).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, dest.join("traces")).unwrap();
+
+    let err = root.child_dir("traces").unwrap_err();
+    let _ = err; // refused — ELOOP/ENOTDIR, typed io error
+    assert_eq!(
+        std::fs::read_dir(&victim_dir).unwrap().count(),
+        0,
+        "swapped-in symlink must never be traversed"
+    );
+
+    // Same for the file component: swap a regular name for a symlink.
+    let victim_file = h.roots.base_dir.join("victim-file2");
+    std::fs::write(&victim_file, "untouched").unwrap();
+    std::os::unix::fs::symlink(&victim_file, dest.join("swap.json")).unwrap();
+    let err = root.create_file("swap.json").unwrap_err();
+    let _ = err;
+    assert_eq!(std::fs::read_to_string(&victim_file).unwrap(), "untouched");
+
+    // The root itself refuses to be a symlink.
+    let linked_root = h.roots.base_dir.join("root-as-link");
+    std::os::unix::fs::symlink(&victim_dir, &linked_root).unwrap();
+    assert!(ConfinedDir::create_root(&linked_root).is_err());
+}
+
+/// CP-13 fix2 Moderate: trace forget addresses nested traces with
+/// validated relative components through the same dir-handle confinement.
+#[cfg(unix)]
+#[test]
+fn trace_forget_handles_nested_relative_ids_confined() {
+    let h = harness();
+    std::fs::create_dir_all(h.roots.cache_dir.join("sub/deep")).unwrap();
+    std::fs::write(h.roots.cache_dir.join("sub/deep/t.jsonl"), "t\n").unwrap();
+
+    forget(&h.roots, RetentionDomain::Traces, "sub/deep/t.jsonl").unwrap();
+    assert!(!h.roots.cache_dir.join("sub/deep/t.jsonl").exists());
+
+    // Traversal-shaped relative ids stay rejected.
+    for id in ["sub/../t", "../x", "/abs/x", "sub//t", "sub/./t", ""] {
+        let err = forget(&h.roots, RetentionDomain::Traces, id).unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{id:?}: {err}");
+    }
+
+    // A symlinked ancestor inside the cache is refused, victim intact.
+    let victim_dir = h.roots.base_dir.join("victim-dir3");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::write(victim_dir.join("v.jsonl"), "keep\n").unwrap();
+    std::os::unix::fs::symlink(&victim_dir, h.roots.cache_dir.join("link")).unwrap();
+    let err = forget(&h.roots, RetentionDomain::Traces, "link/v.jsonl").unwrap_err();
+    let _ = err;
+    assert_eq!(
+        std::fs::read_to_string(victim_dir.join("v.jsonl")).unwrap(),
+        "keep\n",
+        "symlinked cache ancestors must never be traversed for deletion"
     );
 }

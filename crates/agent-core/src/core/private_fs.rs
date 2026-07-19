@@ -270,3 +270,253 @@ mod tests {
         assert_eq!(mode_of(&dir), 0o700);
     }
 }
+
+// ─── CP-13 fix2: directory-handle-relative confined creation ─────────────────
+
+/// A held `O_DIRECTORY` handle beneath a trusted root. Every operation is
+/// RELATIVE to this handle (`openat`/`mkdirat`/`unlinkat`), each component
+/// is opened `O_NOFOLLOW`, and no path is ever re-resolved after a check —
+/// the check IS the open, so ancestor-symlink plants and concurrent
+/// component swaps fail closed (`ELOOP`/`ENOTDIR`) instead of escaping.
+///
+/// On Linux, multi-component descents additionally try `openat2` with
+/// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` for kernel-side atomic
+/// resolution, falling back to the component-by-component walk when the
+/// syscall is unavailable (`ENOSYS`). Unix-only by design: confined export
+/// fails closed on other platforms.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ConfinedDir {
+    handle: File,
+}
+
+#[cfg(unix)]
+impl ConfinedDir {
+    /// Open the TRUSTED export root itself, creating it 0700 if missing.
+    /// The final component must not be a symlink (`O_NOFOLLOW`); the
+    /// root's own ancestors are the caller's trusted input.
+    pub fn create_root(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        Self::open_dir_nofollow_at_path(path)
+    }
+
+    /// Open an EXISTING trusted root without creating it.
+    pub fn open_root(path: &Path) -> std::io::Result<Self> {
+        Self::open_dir_nofollow_at_path(path)
+    }
+
+    fn open_dir_nofollow_at_path(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| confinement_error(path.to_string_lossy().as_ref(), &e))?;
+        Ok(Self { handle })
+    }
+
+    fn fd(&self) -> libc::c_int {
+        use std::os::unix::io::AsRawFd;
+        self.handle.as_raw_fd()
+    }
+
+    /// Open-or-create one DIRECT child directory (validated single
+    /// component), 0700, refusing symlinks even when swapped in between
+    /// operations.
+    pub fn child_dir(&self, name: &str) -> std::io::Result<Self> {
+        let c_name = validated_component_cstring(name)?;
+        // mkdirat: EEXIST is fine — the subsequent O_NOFOLLOW open decides
+        // whether the existing entry is an acceptable real directory.
+        let rc = unsafe { libc::mkdirat(self.fd(), c_name.as_ptr(), 0o700) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(err);
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(Self {
+            handle: unsafe { File::from_raw_fd(fd) },
+        })
+    }
+
+    /// Descend through validated relative directory components, creating
+    /// each as needed (0700). Component-by-component `O_NOFOLLOW` opens.
+    pub fn create_dirs(&self, components: &[String]) -> std::io::Result<Self> {
+        let mut dir = self.try_clone()?;
+        for component in components {
+            dir = dir.child_dir(component)?;
+        }
+        Ok(dir)
+    }
+
+    /// Descend through EXISTING validated relative directory components
+    /// without creating anything. Tries Linux `openat2` with
+    /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` for the whole descent;
+    /// falls back to the component walk when unavailable.
+    pub fn open_dirs(&self, components: &[String]) -> std::io::Result<Self> {
+        if components.is_empty() {
+            return self.try_clone();
+        }
+        for component in components {
+            let _ = validated_component_cstring(component)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let joined = components.join("/");
+            match self.openat2_beneath(&joined, libc::O_RDONLY | libc::O_DIRECTORY) {
+                Ok(handle) => return Ok(Self { handle }),
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {} // fall back
+                Err(e) => return Err(confinement_error(&joined, &e)),
+            }
+        }
+        let mut dir = self.try_clone()?;
+        for component in components {
+            let c_name = validated_component_cstring(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    dir.fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(confinement_error(component, &err));
+            }
+            use std::os::unix::io::FromRawFd;
+            dir = Self {
+                handle: unsafe { File::from_raw_fd(fd) },
+            };
+        }
+        Ok(dir)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn openat2_beneath(&self, rel: &str, flags: libc::c_int) -> std::io::Result<File> {
+        let c_rel = std::ffi::CString::new(rel)
+            .map_err(|_| std::io::Error::other("NUL in confined path"))?;
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (flags | libc::O_CLOEXEC) as u64;
+        how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS;
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.fd(),
+                c_rel.as_ptr(),
+                &mut how as *mut libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+    }
+
+    /// Create a file (validated single component) `O_CREAT|O_EXCL|
+    /// O_NOFOLLOW` 0600 relative to this handle. An existing entry —
+    /// including any symlink, even one swapped in concurrently — fails.
+    pub fn create_file(&self, name: &str) -> std::io::Result<File> {
+        let c_name = validated_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Unlink a file (validated single component) relative to this handle.
+    pub fn remove_file(&self, name: &str) -> std::io::Result<()> {
+        let c_name = validated_component_cstring(name)?;
+        let rc = unsafe { libc::unlinkat(self.fd(), c_name.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            handle: self.handle.try_clone()?,
+        })
+    }
+}
+
+/// Validate one path component: non-empty, no separators, not `.`/`..`,
+/// no NUL. Returns it as a `CString` for the *at syscalls.
+#[cfg(unix)]
+fn validated_component_cstring(name: &str) -> std::io::Result<std::ffi::CString> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(std::io::Error::other(format!(
+            "invalid confined path component: {name:?}"
+        )));
+    }
+    std::ffi::CString::new(name).map_err(|_| std::io::Error::other("NUL in path component"))
+}
+
+/// Split and validate a RELATIVE multi-component path (`a/b/c.jsonl`).
+/// Rejects absolute paths, `.`/`..`, empty components, and backslashes.
+#[cfg(unix)]
+pub fn validated_relative_components(rel: &str) -> std::io::Result<Vec<String>> {
+    if rel.is_empty() || rel.starts_with('/') {
+        return Err(std::io::Error::other(format!(
+            "invalid confined relative path: {rel:?}"
+        )));
+    }
+    let mut out = Vec::new();
+    for component in rel.split('/') {
+        validated_component_cstring(component).map_err(|_| {
+            std::io::Error::other(format!("invalid confined relative path: {rel:?}"))
+        })?;
+        out.push(component.to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn confinement_error(component: &str, err: &std::io::Error) -> std::io::Error {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EEXIST) | Some(libc::EXDEV)
+    ) {
+        std::io::Error::other(format!(
+            "confinement violation at {component:?}: refusing symlink or \
+             non-directory in a confined destination ({err})"
+        ))
+    } else {
+        std::io::Error::new(err.kind(), format!("{component:?}: {err}"))
+    }
+}

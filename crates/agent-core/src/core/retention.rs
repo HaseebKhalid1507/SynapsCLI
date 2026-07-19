@@ -562,17 +562,22 @@ fn cache_files(cache_dir: &Path) -> Vec<PathBuf> {
     walk_regular_files(cache_dir)
 }
 
-/// Copy one artifact with no symlink surface on either side (CP-13 fix1
-/// I6): the SOURCE is opened `O_NOFOLLOW` and must be a regular file by
-/// opened-handle metadata; the DESTINATION is created `O_EXCL` with 0600
-/// under 0700 directories, so a pre-planted symlink (or any existing file)
-/// fails instead of being written through.
-fn copy_confined(src: &Path, dest: &Path) -> io::Result<u64> {
+/// Copy one artifact with no symlink surface on either side and no
+/// check/use window (CP-13 fix2): the SOURCE is opened `O_NOFOLLOW` and
+/// must be a regular file by opened-handle metadata; the DESTINATION file
+/// is created `O_CREAT|O_EXCL|O_NOFOLLOW` 0600 RELATIVE to a held
+/// [`ConfinedDir`] handle, so neither ancestor symlinks nor concurrently
+/// swapped components can redirect the write.
+#[cfg(unix)]
+fn copy_into_confined(
+    src: &Path,
+    dest_dir: &crate::private_fs::ConfinedDir,
+    name: &str,
+) -> io::Result<u64> {
     use std::io::Read;
 
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc_nofollow());
@@ -586,22 +591,7 @@ fn copy_confined(src: &Path, dest: &Path) -> io::Result<u64> {
         )));
     }
 
-    if let Some(parent) = dest.parent() {
-        crate::core::private_fs::ensure_private_dir(parent).map_err(io::Error::from)?;
-    }
-    let mut dest_options = fs::OpenOptions::new();
-    dest_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        dest_options.mode(0o600);
-    }
-    let mut out = dest_options.open(dest).map_err(|e| {
-        io::Error::other(format!(
-            "refusing to write export target {} (exists or is a symlink): {e}",
-            dest.display()
-        ))
-    })?;
+    let mut out = dest_dir.create_file(name)?;
     let mut buf = [0u8; 64 * 1024];
     let mut written: u64 = 0;
     loop {
@@ -715,43 +705,60 @@ fn compact_memory_file(
 }
 
 /// Headless export: copy sessions, memory, traces (recursive), and logs
-/// to `dest` with no symlink surface and private modes throughout.
+/// to `dest` with no symlink surface, no check/use races, and private
+/// modes throughout (CP-13 fix2): every destination directory and file is
+/// created RELATIVE to held directory handles beneath the trusted export
+/// root — a planted or concurrently swapped ancestor symlink fails the
+/// export closed instead of being written through. Unix-only; other
+/// platforms fail closed.
+#[cfg(unix)]
 pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> {
+    use crate::private_fs::ConfinedDir;
     let mut summary = ExportSummary { files: 0, bytes: 0 };
+    let root = ConfinedDir::create_root(dest)?;
 
     let flat = [
-        (roots.sessions_dir(), dest.join("sessions")),
-        (roots.memory_dir(), dest.join("memory")),
+        (roots.sessions_dir(), "sessions"),
+        (roots.memory_dir(), "memory"),
     ];
-    for (src, out) in flat {
+    for (src, sub) in flat {
+        let out = root.child_dir(sub)?;
         for file in list_files(&src) {
-            // list_files() returns entries without following symlinks, but
-            // a planted symlink is still an entry — copy_confined refuses
-            // to OPEN it (O_NOFOLLOW). Skip symlinks explicitly.
             if file
                 .symlink_metadata()
                 .map(|m| m.is_symlink())
                 .unwrap_or(true)
             {
-                continue;
+                continue; // source symlinks are never followed
             }
-            let target = out.join(file.file_name().unwrap_or_default());
-            summary.bytes += copy_confined(&file, &target)?;
+            let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            summary.bytes += copy_into_confined(&file, &out, name)?;
             summary.files += 1;
         }
     }
 
     // Traces: recursive under the confined cache root, preserving relative
-    // subpaths.
+    // subpaths through validated components and handle-relative descents.
+    let traces_root = root.child_dir("traces")?;
     for file in walk_regular_files(&roots.cache_dir) {
         let rel = file
             .strip_prefix(&roots.cache_dir)
             .map_err(|_| io::Error::other("cache walk escaped its root"))?;
-        let target = dest.join("traces").join(rel);
-        summary.bytes += copy_confined(&file, &target)?;
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| io::Error::other("non-UTF8 cache path"))?;
+        let mut components = crate::private_fs::validated_relative_components(rel_str)?;
+        let name = components
+            .pop()
+            .ok_or_else(|| io::Error::other("empty cache relative path"))?;
+        let dir = traces_root.create_dirs(&components)?;
+        summary.bytes += copy_into_confined(&file, &dir, &name)?;
         summary.files += 1;
     }
 
+    let logs_out = root.child_dir("logs")?;
     for file in log_files(&roots.config_dir) {
         if file
             .symlink_metadata()
@@ -760,11 +767,21 @@ pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> 
         {
             continue;
         }
-        let target = dest.join("logs").join(file.file_name().unwrap_or_default());
-        summary.bytes += copy_confined(&file, &target)?;
+        let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        summary.bytes += copy_into_confined(&file, &logs_out, name)?;
         summary.files += 1;
     }
     Ok(summary)
+}
+
+/// Non-unix: confined export is unavailable — fail closed.
+#[cfg(not(unix))]
+pub fn export(_roots: &RetentionRoots, _dest: &Path) -> io::Result<ExportSummary> {
+    Err(io::Error::other(
+        "confined export requires a unix platform (directory-handle-relative creation)",
+    ))
 }
 
 /// Headless forget: delete one artifact by domain and id. Session chain
@@ -787,7 +804,26 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                 .join(format!("{}.json", file.display()));
             fs::remove_file(path)
         }
-        RetentionDomain::Traces => fs::remove_file(roots.cache_dir.join(sanitize_file_id(id)?)),
+        RetentionDomain::Traces => {
+            // Nested relative addressing with validated components and
+            // dir-handle confinement (CP-13 fix2 moderate): symlinked
+            // ancestors inside the cache are refused at open time.
+            #[cfg(unix)]
+            {
+                let mut components = crate::private_fs::validated_relative_components(id)
+                    .map_err(|_| io::Error::other(format!("invalid artifact id: {id:?}")))?;
+                let name = components
+                    .pop()
+                    .ok_or_else(|| io::Error::other(format!("invalid artifact id: {id:?}")))?;
+                let root = crate::private_fs::ConfinedDir::open_root(&roots.cache_dir)?;
+                let dir = root.open_dirs(&components)?;
+                dir.remove_file(&name)
+            }
+            #[cfg(not(unix))]
+            {
+                fs::remove_file(roots.cache_dir.join(sanitize_file_id(id)?))
+            }
+        }
         RetentionDomain::Logs => {
             let file = sanitize_file_id(id)?;
             if !id.starts_with("synaps.log") {
