@@ -436,7 +436,8 @@ mod tests {
         let tool = BashTool;
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
 
         let responder = tokio::spawn(async move {
             let req = prompt_rx
@@ -462,7 +463,7 @@ mod tests {
         let result = tool.execute(params, ctx).await.unwrap();
         responder.await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 
@@ -486,7 +487,8 @@ mod tests {
         let tool = BashTool;
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
 
         let responder = tokio::spawn(async move {
             let req = prompt_rx
@@ -514,7 +516,7 @@ mod tests {
         let _ = tool.execute(params, ctx).await;
         responder.await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 
@@ -527,7 +529,8 @@ mod tests {
     #[tokio::test]
     async fn test_bash_control_char_output_is_sanitized_and_bounded_in_deltas() {
         let tool = BashTool;
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
         let mut ctx = create_tool_context();
         ctx.channels.tx_delta = Some(delta_tx);
         ctx.limits.max_tool_buffer = 256;
@@ -539,7 +542,7 @@ mod tests {
 
         let result = tool.execute(params, ctx).await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 

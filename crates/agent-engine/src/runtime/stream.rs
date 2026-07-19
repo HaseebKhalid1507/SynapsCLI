@@ -583,20 +583,29 @@ impl StreamMethods {
                         let result = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
-                                let (tx_d, mut rx_d) =
-                                    tokio::sync::mpsc::unbounded_channel::<String>();
+                                // ═══ BOUNDED DELTA LANE (Task 26, §8.4) ═══
+                                // Bounded channel + coalesce/drop policy at
+                                // production; the forwarder enforces the UI
+                                // preview budget and terminates on cancel,
+                                // closing the channel and releasing the
+                                // producer.
+                                let delta_channel = crate::tools::output::delta_channel();
                                 let tx_k = tx.clone();
                                 let t_id = tool_id.clone();
-                                tokio::spawn(async move {
-                                    while let Some(msg) = rx_d.recv().await {
+                                let _forwarder = crate::tools::output::spawn_ui_forwarder(
+                                    delta_channel.receiver,
+                                    crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
+                                    cancel.clone(),
+                                    move |delta| {
                                         let _ = tx_k.send(StreamEvent::Llm(
                                             LlmEvent::ToolResultDelta {
                                                 tool_id: t_id.clone(),
-                                                delta: msg,
+                                                delta,
                                             },
                                         ));
-                                    }
-                                });
+                                    },
+                                );
+                                let tx_d = delta_channel.sender;
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = authorized.runtime_name().to_string();
@@ -867,17 +876,22 @@ impl StreamMethods {
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
-                                    let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                    // Bounded delta lane (Task 26, §8.4) — see the single-tool site.
+                                    let delta_channel = crate::tools::output::delta_channel();
                                     let tx_k = tx_stream.clone();
                                     let t_id = tool_id.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(msg) = rx_d.recv().await {
+                                    let _forwarder = crate::tools::output::spawn_ui_forwarder(
+                                        delta_channel.receiver,
+                                        crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
+                                        cancel_token.clone(),
+                                        move |delta| {
                                             let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
                                                 tool_id: t_id.clone(),
-                                                delta: msg,
+                                                delta,
                                             }));
-                                        }
-                                    });
+                                        },
+                                    );
+                                    let tx_d = delta_channel.sender;
 
                                     tokio::select! {
                                         res = t.execute(input, crate::ToolContext {

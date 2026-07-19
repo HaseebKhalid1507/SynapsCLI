@@ -194,7 +194,7 @@ async fn wait_for_output(
     pty: &mut PtyHandle,
     detector: &ReadinessDetector,
     timeout_override: Option<u64>,
-    tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    tx_delta: Option<&crate::tools::output::DeltaSender>,
     max_output: usize,
 ) -> (String, String) {
     // If a timeout override is provided, build a temporary detector with that
@@ -296,7 +296,7 @@ impl SessionManager {
     pub async fn create_session(
         &self,
         opts: SessionOpts,
-        tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        tx_delta: Option<&crate::tools::output::DeltaSender>,
         max_output: usize,
     ) -> Result<(String, String, String)> {
         // --- Check session limit ---
@@ -397,7 +397,7 @@ impl SessionManager {
         id: &str,
         input: &str,
         timeout_ms: Option<u64>,
-        tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        tx_delta: Option<&crate::tools::output::DeltaSender>,
         max_output: usize,
     ) -> Result<SendResult> {
         // --- Remove session from map (release lock before I/O) ---

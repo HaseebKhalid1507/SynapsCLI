@@ -25,6 +25,7 @@ mod agent;
 pub mod catalog;
 pub mod discovery;
 pub mod ledger;
+pub mod output;
 mod registry;
 pub mod respond;
 pub mod send_channel;
@@ -71,8 +72,13 @@ pub use subagent::finalize::{build_completion_event, finalize_subagent};
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 
 /// Streaming channels — carry partial tool output and stream events.
+///
+/// `tx_delta` is the Task 26 bounded delta lane (spec §8.4): a non-blocking
+/// coalesce-then-drop producer handle whose consumer enforces the UI-preview
+/// byte budget. It replaced the previous unbounded `mpsc` sender so a fast
+/// producer with a slow consumer can no longer grow memory without bound.
 pub struct ToolChannels {
-    pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub tx_delta: Option<crate::tools::output::DeltaSender>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
 }
 
