@@ -221,7 +221,6 @@ fn age_sweep_never_leaves_named_chains_dangling() {
 #[test]
 fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     let h = harness();
-    let now = 100 * DAY_MS;
 
     // Compaction parent (old, forward-linked) ages out; recent successor stays.
     write_session(&h.roots, "old-parent", 10 * DAY_MS, Some("fresh-successor"));
