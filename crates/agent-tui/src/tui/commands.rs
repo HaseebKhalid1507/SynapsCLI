@@ -1401,6 +1401,10 @@ mod tests {
         let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(bus);
         let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
             theme_tokens: Default::default(),
+            // Legacy EAGER lifecycle by declaration (Task 20): this fixture
+            // loads a live process at `load` time, so `deferred: None` is
+            // the semantically correct pre-Task-20-compatible value.
+            deferred: None,
             protocol_version: 1,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
