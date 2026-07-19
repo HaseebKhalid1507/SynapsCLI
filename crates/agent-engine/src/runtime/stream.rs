@@ -57,6 +57,10 @@ pub(super) struct StreamSession {
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
+    /// Runtime-scoped tool-session identity the execution gate scopes the
+    /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
+    /// turns/clones of one Runtime; never a persisted session id.
+    pub(super) tool_session_id: crate::tools::activation::SessionId,
 }
 
 pub(super) struct StreamMethods;
@@ -110,6 +114,7 @@ impl StreamMethods {
             telemetry_level,
             orchestration,
             turn_correlation_id,
+            tool_session_id,
         } = session;
         let mut messages = initial_messages;
 
@@ -351,12 +356,36 @@ impl StreamMethods {
                             result: err.to_string(),
                         }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
-                        let result = match tools.read().await.get(&tool_name).cloned() {
-                            Some(tool) => {
-                                let input = tools
-                                    .read()
-                                    .await
-                                    .translate_input_for_api_tool(&tool_name, input);
+                        // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
+                        // Resolve wire name → exact ToolId, verify session
+                        // snapshot generation + pinned schema digest, require
+                        // core/exact-grant status, re-check source trust, and
+                        // only then acquire the implementation — all under ONE
+                        // registry read guard (one consistent snapshot, no
+                        // TOCTOU). Denials are typed, static, metadata-only
+                        // and happen BEFORE implementation lookup and BEFORE
+                        // any before_tool_call hook emission.
+                        let gate_outcome = {
+                            let registry = tools.read().await;
+                            let session_set =
+                                crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                                    tool_session_id.clone(),
+                                    registry.catalog(),
+                                );
+                            crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                &registry,
+                                &session_set,
+                                &tool_name,
+                            )
+                            .map(|authorized| {
+                                let input =
+                                    registry.translate_input_for_api_tool(&tool_name, input);
+                                (authorized, input)
+                            })
+                        };
+                        let result = match gate_outcome {
+                            Ok((authorized, input)) => {
+                                let tool = authorized.implementation();
                                 let (tx_d, mut rx_d) =
                                     tokio::sync::mpsc::unbounded_channel::<String>();
                                 let tx_k = tx.clone();
@@ -373,11 +402,7 @@ impl StreamMethods {
                                 });
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
-                                let runtime_name = tools
-                                    .read()
-                                    .await
-                                    .runtime_name_for_api(&tool_name)
-                                    .to_string();
+                                let runtime_name = authorized.runtime_name().to_string();
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
                                     emit_before_tool_call(
@@ -426,7 +451,9 @@ impl StreamMethods {
                                     }
                                 }
                             }
-                            None => format!("Unknown tool: {}", tool_name),
+                            // Typed, bounded, metadata-only gate denial — no
+                            // implementation was looked up, no hook emitted.
+                            Err(denial) => denial.to_string(),
                         };
 
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -469,11 +496,29 @@ impl StreamMethods {
                             continue;
                         }
 
+                        // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
+                        // Same gate as the single-tool path: resolve /
+                        // verify / authorize / acquire under ONE registry
+                        // read guard before the task is spawned, so a denial
+                        // never reaches implementation lookup or hook
+                        // emission inside the task.
                         let tools_snapshot = tools.read().await;
-                        let runtime_name =
-                            tools_snapshot.runtime_name_for_api(&tool_name).to_string();
-                        let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
-                        let tool = tools_snapshot.get(&tool_name).cloned();
+                        let session_set =
+                            crate::tools::activation::SessionToolSet::default_core_for_catalog(
+                                tool_session_id.clone(),
+                                tools_snapshot.catalog(),
+                            );
+                        let gate_outcome =
+                            crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                &tools_snapshot,
+                                &session_set,
+                                &tool_name,
+                            )
+                            .map(|authorized| {
+                                let input =
+                                    tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                                (authorized, input)
+                            });
                         drop(tools_snapshot);
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
@@ -484,14 +529,16 @@ impl StreamMethods {
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let tool_name_for_hook = tool_name.clone();
-                        let runtime_name_for_hook = runtime_name.clone();
                         let prompt_inner = secret_prompt.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
 
                         join_set.spawn(async move {
-                            let result = match tool {
-                                Some(t) => {
+                            let result = match gate_outcome {
+                                Ok((authorized, input)) => {
+                                    let t = authorized.implementation();
+                                    let runtime_name_for_hook =
+                                        authorized.runtime_name().to_string();
                                     let decision = resolve_before_tool_call_decision(
                                         input.clone(),
                                         emit_before_tool_call(
@@ -546,7 +593,9 @@ impl StreamMethods {
                                     }
                                     } // close else from Block check
                                 }
-                                None => (false, format!("Unknown tool: {}", tool_name)),
+                                // Typed, bounded, metadata-only gate denial —
+                                // no implementation lookup, no hook emission.
+                                Err(denial) => (false, denial.to_string()),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {

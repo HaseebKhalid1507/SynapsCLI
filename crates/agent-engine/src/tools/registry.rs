@@ -419,6 +419,32 @@ impl ToolRegistry {
             .unwrap_or(name)
     }
 
+    /// Atomic wire-name resolution for the execution gate (Task 16): map
+    /// the incoming API/wire name through the deterministic sanitized-name
+    /// reverse mapping to the exact live runtime tool, then derive its
+    /// catalog [`crate::tools::catalog::ToolId`] from the resolved tool
+    /// instance itself — never from the alias string. Because this runs on
+    /// one `&self` borrow (i.e. under the caller's registry read lock), the
+    /// resolution, the catalog reachable via [`Self::catalog`], and any
+    /// subsequent implementation acquisition observe one consistent
+    /// registry snapshot.
+    pub fn resolve_wire_call(
+        &self,
+        wire_name: &str,
+    ) -> Option<crate::tools::activation::ResolvedToolCall> {
+        let runtime_name = self
+            .api_to_runtime_names
+            .get(wire_name)
+            .map(String::as_str)
+            .unwrap_or(wire_name);
+        let tool = self.tools.get(runtime_name)?;
+        Some(crate::tools::activation::ResolvedToolCall::new(
+            wire_name,
+            runtime_name,
+            tool_id_for(tool.as_ref()),
+        ))
+    }
+
     pub fn translate_input_for_api_tool(&self, tool_name: &str, input: Value) -> Value {
         if let Some(map) = self.input_name_maps.get(tool_name) {
             Self::translate_input_names(input, map)

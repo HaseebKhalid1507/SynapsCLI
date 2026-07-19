@@ -319,6 +319,26 @@ pub struct Runtime {
     /// These seed the session policy and are replayed when a manifestless
     /// foreground model change replaces that policy snapshot.
     trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+    /// Private runtime-scoped tool-session identity (Task 16). Scopes the
+    /// per-stream `SessionToolSet` the execution gate authorizes against.
+    /// Minted fresh per constructed `Runtime` — two independently
+    /// constructed runtimes can never share session grants — and shared by
+    /// `Clone` because clones share the same live tool registry (the
+    /// existing shared-session behavior). Never persisted; unrelated to
+    /// saved session IDs.
+    host_tool_session: crate::tools::activation::SessionId,
+}
+
+/// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
+/// keeps it unique across runtimes and restarts; the parse cannot fail on
+/// this generated shape.
+fn fresh_host_tool_session() -> crate::tools::activation::SessionId {
+    crate::tools::activation::SessionId::parse(&format!(
+        "runtime-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated runtime session id is always valid")
 }
 
 /// Idle timeout for the runtime HTTP client: how long a request may go
@@ -437,6 +457,7 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            host_tool_session: fresh_host_tool_session(),
         })
     }
 
@@ -509,6 +530,7 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            host_tool_session: fresh_host_tool_session(),
         }
     }
 
@@ -777,6 +799,13 @@ impl Runtime {
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus
+    }
+
+    /// Runtime-scoped tool-session identity used by the stream execution
+    /// gate (Task 16). Shared by clones (which share the tool registry);
+    /// fresh per independently constructed `Runtime`.
+    pub fn host_tool_session_id(&self) -> &crate::tools::activation::SessionId {
+        &self.host_tool_session
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -2095,6 +2124,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
+            tool_session_id: self.host_tool_session.clone(),
         };
 
         tokio::spawn(async move {
@@ -2169,6 +2199,11 @@ impl Clone for Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
+            // Clones share the live tool registry, so they share the SAME
+            // host tool session (matching existing shared-session behavior);
+            // independently constructed runtimes mint fresh identities and
+            // can never share session grants.
+            host_tool_session: self.host_tool_session.clone(),
         }
     }
 }
@@ -2176,6 +2211,28 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 16 session identity semantics: clones of one Runtime share the
+    /// live tool registry, so they share the same host tool session;
+    /// independently constructed runtimes mint fresh identities and can
+    /// never share session grants.
+    #[test]
+    fn host_tool_session_shared_by_clones_fresh_per_runtime() {
+        let rt = Runtime::new_headless();
+        let clone = rt.clone();
+        assert_eq!(
+            rt.host_tool_session_id(),
+            clone.host_tool_session_id(),
+            "clones share the live registry and therefore the host session"
+        );
+
+        let other = Runtime::new_headless();
+        assert_ne!(
+            rt.host_tool_session_id(),
+            other.host_tool_session_id(),
+            "independently constructed runtimes must never share a session"
+        );
+    }
 
     /// Task 11 config rule (documented until Task 12 adds explicit trace
     /// config): telemetry `basic`/`full` enables the shared session writer
