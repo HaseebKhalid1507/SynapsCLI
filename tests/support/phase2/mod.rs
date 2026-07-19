@@ -157,6 +157,12 @@ pub enum Script {
     AlwaysFailEcho(u16),
     /// One data frame, then an endless slow keep-alive stream (for cancel).
     Endless(&'static str),
+    /// `preamble` once, then `frame` repeated FOREVER at full speed — a
+    /// hostile unbounded-volume delta flood (CP-11 fix-2 A/B fixtures).
+    FloodSse {
+        preamble: &'static str,
+        frame: &'static str,
+    },
     /// SSE bodies answered per arrival order; the last body repeats for any
     /// further hits (tool-loop fixtures: tool-use turn, then continuation).
     SeqSse(&'static [&'static str]),
@@ -220,6 +226,31 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     Some((Ok(Bytes::from(": keep-alive\n\n")), i + 1))
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        Script::FloodSse { preamble, frame } => {
+            let preamble = (*preamble).to_string();
+            let frame = Bytes::from((*frame).to_string());
+            let stream = futures::stream::unfold(0u64, move |i| {
+                let preamble = preamble.clone();
+                let frame = frame.clone();
+                async move {
+                    if i == 0 && !preamble.is_empty() {
+                        return Some((
+                            Ok::<_, std::convert::Infallible>(Bytes::from(preamble)),
+                            1,
+                        ));
+                    }
+                    // Yield each frame so the stub stays cancellable; TCP
+                    // backpressure paces production to the reader.
+                    tokio::task::yield_now().await;
+                    Some((Ok(frame), i + 1))
                 }
             });
             Response::builder()
@@ -318,6 +349,12 @@ pub enum BrokerScript {
     },
     /// `/proxy` streams one frame then stalls forever (for cancel tests).
     ProxyEndless(&'static str),
+    /// `/proxy` streams `preamble` once then `frame` FOREVER (hostile
+    /// unbounded-volume delta flood through the broker wire).
+    ProxyFlood {
+        preamble: &'static str,
+        frame: &'static str,
+    },
     /// `/cloud/invoke` streams these newline-delimited CloudEvent lines.
     CloudLines(&'static str),
     /// `/cloud/invoke` answers HTTP 500.
@@ -377,6 +414,9 @@ pub async fn spawn_broker(script: BrokerScript) -> (String, Arc<AtomicUsize>, Bo
                 }
                 BrokerScript::ProxyEndless(first) => {
                     scripted_response(&Script::Endless(first), hit, &[])
+                }
+                BrokerScript::ProxyFlood { preamble, frame } => {
+                    scripted_response(&Script::FloodSse { preamble, frame }, hit, &[])
                 }
                 _ => (StatusCode::NOT_FOUND, "no proxy scripted").into_response(),
             }

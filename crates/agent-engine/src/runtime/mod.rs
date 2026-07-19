@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 mod api;
@@ -23,6 +22,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 pub mod openai;
+pub mod relay;
 mod request;
 mod sse;
 mod sse_types;
@@ -2149,7 +2149,14 @@ impl Runtime {
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // CP-11 fix-2 (A): the caller-facing boundary is BOUNDED. The
+        // internal producer keeps an unbounded sender for API stability;
+        // the relay drains it eagerly, enforces the fixed preview-delta
+        // retention budget, and cancels the turn when the caller stream
+        // is dropped (releasing provider tasks).
+        let (tx, internal_rx) = mpsc::unbounded_channel();
+        let bounded_rx =
+            crate::runtime::relay::spawn_bounded_stream_relay(internal_rx, cancel.clone());
 
         // One correlation ID per turn: carried by the typed terminal outcome
         // (spec §5.2) so every frontend can tie the failure to trace lines.
@@ -2160,7 +2167,7 @@ impl Runtime {
                 helpers::turn_error_for(&error, &turn_correlation_id),
             )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-            return Box::pin(UnboundedReceiverStream::new(rx));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
 
         let anthropic_execution_plan = match self.authorized_anthropic_plan().await {
@@ -2170,7 +2177,7 @@ impl Runtime {
                     helpers::turn_error_for(&error, &turn_correlation_id),
                 )));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-                return Box::pin(UnboundedReceiverStream::new(rx));
+                return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
             }
         };
 
@@ -2180,7 +2187,7 @@ impl Runtime {
                 helpers::turn_error_for(&e, &turn_correlation_id),
             )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-            return Box::pin(UnboundedReceiverStream::new(rx));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
 
         // Clone the Arc, not the whole Runtime — the spawned task shares the
@@ -2292,7 +2299,7 @@ impl Runtime {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
-        Box::pin(UnboundedReceiverStream::new(rx))
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx))
     }
 }
 
