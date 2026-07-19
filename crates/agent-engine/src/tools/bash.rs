@@ -421,14 +421,38 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("output truncated"));
-        let after = bash_intermediary_snapshot();
-        let produced = after.produced_bytes - before.produced_bytes;
-        let consumed = after.consumed_bytes - before.consumed_bytes;
-        let accepted = after.accepted_bytes - before.accepted_bytes;
-        let dropped = after.dropped_bytes - before.dropped_bytes;
-        assert_eq!(produced, consumed + dropped);
+
+        // The counters are PROCESS-GLOBAL: sibling tests running bash
+        // concurrently (--test-threads > 1) contribute mid-flight bytes to
+        // any instantaneous snapshot. Conservation is therefore asserted at
+        // quiescence: every completed relay balances produced == consumed +
+        // dropped and returns retained to baseline, so the delta window
+        // rebalances once in-flight relays finish. A REAL leak never
+        // rebalances — the bounded poll keeps the oracle strict while
+        // removing scheduling sensitivity (observed flake under the full
+        // workspace run at 8 threads).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut produced, mut consumed, mut accepted, mut dropped);
+        loop {
+            let after = bash_intermediary_snapshot();
+            produced = after.produced_bytes - before.produced_bytes;
+            consumed = after.consumed_bytes - before.consumed_bytes;
+            accepted = after.accepted_bytes - before.accepted_bytes;
+            dropped = after.dropped_bytes - before.dropped_bytes;
+            let balanced =
+                produced == consumed + dropped && after.retained_bytes == before.retained_bytes;
+            if balanced || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    produced,
+                    consumed + dropped,
+                    "handoff bytes must be conserved at quiescence"
+                );
+                assert_eq!(after.retained_bytes, before.retained_bytes);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(accepted >= consumed);
-        assert_eq!(after.retained_bytes, before.retained_bytes);
         assert!(produced >= 64 * 1024);
     }
 
