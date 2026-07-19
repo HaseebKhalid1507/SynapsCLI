@@ -373,6 +373,11 @@ impl Runtime {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
+        // Operational retention (Task 12): physically remove expired
+        // content-capture bundles at session startup — bounded, fail-soft,
+        // confined to the private capture dir.
+        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
+
         let session_manager = {
             let config = crate::tools::shell::ShellConfig::default();
             crate::tools::shell::SessionManager::new(config)
@@ -1464,6 +1469,10 @@ impl Runtime {
         &self,
         timeout: std::time::Duration,
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        // Operational retention (Task 12): the exit epilogue also removes
+        // expired content-capture bundles — bounded, fail-soft, so a stale
+        // bundle never has to wait for the next trace interaction.
+        let _ = trace::sweep_expired_captures(&trace::default_capture_dir());
         // Drain a retained one-shot ephemeral writer first (Task 12 fix:
         // an armed `/trace next` record written with telemetry Off must
         // survive session exit). Its outcome is returned only when no
@@ -1497,6 +1506,12 @@ impl Runtime {
         &self,
         timeout: std::time::Duration,
     ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        // Same operational retention sweep as the sync epilogue, off the
+        // executor (bounded filesystem work, fail-soft on a failed spawn).
+        let _ = tokio::task::spawn_blocking(|| {
+            trace::sweep_expired_captures(&trace::default_capture_dir())
+        })
+        .await;
         // Same one-shot ephemeral drain as the sync variant.
         let ephemeral = self
             .one_shot_trace_writer
@@ -2296,6 +2311,77 @@ mod tests {
         assert!(outcome.is_flushed());
         // Consumed: a second epilogue call finds nothing.
         assert!(rt.shutdown_observability_async(budget).await.is_none());
+    }
+
+    /// Task 12 operational expiry: stale content-capture bundles are
+    /// physically removed at Runtime startup and by BOTH shutdown
+    /// epilogues (sync and async), not only on trace interactions.
+    /// Combined into one serialized test: all three paths resolve the
+    /// capture dir through `SYNAPS_BASE_DIR`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn startup_and_shutdown_paths_sweep_expired_captures() {
+        struct BaseDirGuard(Option<String>);
+        impl Drop for BaseDirGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(old) => std::env::set_var("SYNAPS_BASE_DIR", old),
+                    None => std::env::remove_var("SYNAPS_BASE_DIR"),
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = BaseDirGuard(std::env::var("SYNAPS_BASE_DIR").ok());
+        std::env::set_var("SYNAPS_BASE_DIR", tmp.path());
+
+        let cap_dir = trace::default_capture_dir();
+        assert!(
+            cap_dir.starts_with(tmp.path()),
+            "capture dir must be private to the test"
+        );
+        let stale_id = trace::TraceId::new("req-stale").unwrap();
+        let plant_stale = || {
+            agent_core::core::private_fs::ensure_private_dir(&cap_dir).unwrap();
+            let stale = trace::controls::ContentCaptureBundle {
+                schema: trace::CONTENT_CAPTURE_SCHEMA.to_string(),
+                request_id: stale_id.clone(),
+                created_unix_ms: 1_000,
+                expires_unix_ms: 2_000, // long past
+                redacted: true,
+                over_budget: false,
+                body: Some(serde_json::json!({"old": true})),
+            };
+            let path = trace::controls::capture_path(&cap_dir, &stale_id);
+            std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            path
+        };
+
+        // 1) Runtime startup sweeps.
+        let stale_path = plant_stale();
+        let rt = Runtime::new().await.expect("runtime constructs");
+        assert!(
+            !stale_path.exists(),
+            "Runtime startup must physically remove expired capture bundles"
+        );
+
+        // 2) Sync shutdown epilogue sweeps (telemetry off → None outcome).
+        let stale_path = plant_stale();
+        let _ = rt.shutdown_observability(std::time::Duration::ZERO);
+        assert!(
+            !stale_path.exists(),
+            "sync shutdown epilogue must remove expired capture bundles"
+        );
+
+        // 3) Async shutdown epilogue sweeps.
+        let stale_path = plant_stale();
+        let _ = rt
+            .shutdown_observability_async(std::time::Duration::from_millis(100))
+            .await;
+        assert!(
+            !stale_path.exists(),
+            "async shutdown epilogue must remove expired capture bundles"
+        );
+        drop(guard);
     }
 
     #[test]

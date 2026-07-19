@@ -59,6 +59,11 @@ pub enum ExportError {
     CaptureInvalid(PathBuf, String),
     /// The capture recorded an over-budget body: nothing to export.
     CaptureOverBudget,
+    /// A streaming read bound was exceeded (per-line or total bytes).
+    BoundExceeded {
+        what: &'static str,
+        limit: u64,
+    },
     Io(std::io::Error),
 }
 
@@ -102,6 +107,9 @@ impl std::fmt::Display for ExportError {
                 f,
                 "the captured request exceeded the capture byte budget; no content was retained"
             ),
+            ExportError::BoundExceeded { what, limit } => {
+                write!(f, "trace export {what} exceeds the {limit}-byte bound")
+            }
             ExportError::Io(e) => write!(f, "export io error: {e}"),
         }
     }
@@ -122,6 +130,97 @@ pub struct MetadataExportStats {
     pub scanned: usize,
     /// Records matching the ID and written to the output.
     pub exported: usize,
+}
+
+/// Conservative cap on bytes read from a single capture bundle. A valid
+/// bundle body is bounded by `CAPTURE_MAX_BYTES` before pretty-printing;
+/// anything beyond this cap is planted garbage, removable without reading.
+pub(crate) const CAPTURE_BUNDLE_READ_CAP: u64 = 8 * 1024 * 1024;
+
+/// Upper bound on directory entries examined by one capture sweep: bounded
+/// work even against a maliciously stuffed directory.
+const MAX_SWEEP_ENTRIES: usize = 4096;
+
+/// Classified failure of the bounded regular-file read primitive.
+#[derive(Debug)]
+enum BoundedReadError {
+    /// No entry at the path.
+    NotFound,
+    /// Symlink, FIFO, directory, device, or other non-regular entry —
+    /// refused before any read (static reason string, never file content).
+    NotRegular(&'static str),
+    /// The (regular) file exceeds the byte cap.
+    Oversized,
+    /// Other I/O failure.
+    Io(std::io::Error),
+}
+
+/// Safe bounded read of a regular file, closing the check/open TOCTOU:
+/// open read-only with `O_NOFOLLOW|O_NONBLOCK` (Unix), `fstat` the opened
+/// handle, require a regular file, enforce `cap` before allocating, and
+/// read at most `cap + 1` bytes to detect concurrent growth. Symlinks,
+/// FIFOs (no blocking open), directories, and devices are refused without
+/// reading a single byte.
+fn read_bounded_regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // O_NOFOLLOW: a planted symlink fails the open (ELOOP), never
+        // followed. O_NONBLOCK: opening a writer-less FIFO returns
+        // immediately instead of blocking forever; harmless on regular
+        // files, which is the only type accepted below.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(BoundedReadError::NotRegular("symlink"));
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BoundedReadError::NotFound)
+        }
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(BoundedReadError::NotRegular("symlink"));
+        }
+        Err(e) => return Err(BoundedReadError::Io(e)),
+    };
+    // fstat the opened handle — the type/size decision and the read use
+    // the same file description, so a swap after open cannot bypass it.
+    let meta = file.metadata().map_err(BoundedReadError::Io)?;
+    if !meta.file_type().is_file() {
+        return Err(BoundedReadError::NotRegular("not a regular file"));
+    }
+    if meta.len() > cap {
+        return Err(BoundedReadError::Oversized);
+    }
+    let mut buf = Vec::with_capacity(meta.len().min(cap) as usize);
+    file.take(cap + 1)
+        .read_to_end(&mut buf)
+        .map_err(BoundedReadError::Io)?;
+    if buf.len() as u64 > cap {
+        return Err(BoundedReadError::Oversized);
+    }
+    Ok(buf)
+}
+
+/// Static classification of a serde_json error: category and position
+/// only — NEVER serde's own message, which can echo hostile input bytes.
+fn classify_json_error(e: &serde_json::Error) -> String {
+    let class = match e.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "schema",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!("{class} error at line {} column {}", e.line(), e.column())
 }
 
 /// Create the output file privately: parent `0700`, file `0600`,
@@ -161,34 +260,86 @@ fn create_private_new(path: &Path) -> Result<std::fs::File, ExportError> {
 
 /// Export all records whose `turn_id` or `request_id` equals `id` from the
 /// trace JSONL at `trace_log` into a fresh private file at `output`.
+///
+/// F5 hardening: the log is streamed line by line under explicit per-line
+/// (1 MiB) and total (64 MiB) byte bounds — no unbounded whole-file read —
+/// and parse failures are reported by static category and position only,
+/// never by echoing persisted bytes.
 pub fn export_metadata(
     trace_log: &Path,
     id: &str,
     output: &Path,
 ) -> Result<MetadataExportStats, ExportError> {
+    export_metadata_bounded(trace_log, id, output, 1024 * 1024, 64 * 1024 * 1024)
+}
+
+/// [`export_metadata`] with explicit per-line and total byte bounds.
+fn export_metadata_bounded(
+    trace_log: &Path,
+    id: &str,
+    output: &Path,
+    line_cap: usize,
+    total_cap: u64,
+) -> Result<MetadataExportStats, ExportError> {
+    use std::io::{BufRead as _, Read as _};
     let id = TraceId::new(id).map_err(ExportError::InvalidId)?;
-    let raw = std::fs::read_to_string(trace_log)
+    let file = std::fs::File::open(trace_log)
         .map_err(|e| ExportError::TraceLogUnreadable(trace_log.to_path_buf(), e))?;
+    let mut reader = std::io::BufReader::new(file);
 
     let mut scanned = 0usize;
     let mut selected: Vec<String> = Vec::new();
-    for (idx, line) in raw.lines().enumerate() {
+    let mut total_read: u64 = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+    loop {
+        line_no += 1;
+        buf.clear();
+        // Bounded line read: never buffer more than the cap (+1 to detect
+        // the overflow) regardless of the log's contents.
+        let read = (&mut reader)
+            .take(line_cap as u64 + 1)
+            .read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        if buf.len() > line_cap {
+            return Err(ExportError::BoundExceeded {
+                what: "log line",
+                limit: line_cap as u64,
+            });
+        }
+        total_read = total_read.saturating_add(read as u64);
+        if total_read > total_cap {
+            return Err(ExportError::BoundExceeded {
+                what: "trace log",
+                limit: total_cap,
+            });
+        }
+        let line = std::str::from_utf8(&buf)
+            .map_err(|_| ExportError::InvalidRecord {
+                line: line_no,
+                reason: "not valid UTF-8".to_string(),
+            })?
+            .trim_end_matches(['\n', '\r']);
         if line.trim().is_empty() {
             continue;
         }
-        // Every line must validate as a RequestTrace (fail closed).
+        // Every line must validate as a RequestTrace (fail closed). Parse
+        // failures are classified statically — hostile bytes never travel
+        // through the error value.
         let record: RequestTrace =
             serde_json::from_str(line).map_err(|e| ExportError::InvalidRecord {
-                line: idx + 1,
-                reason: e.to_string(),
+                line: line_no,
+                reason: classify_json_error(&e),
             })?;
         scanned += 1;
         if record.turn_id == id || record.request_id == id {
             // Re-serialize the validated record (canonical field order) —
             // never copy the raw line into the export.
             let line = serde_json::to_string(&record).map_err(|e| ExportError::InvalidRecord {
-                line: idx + 1,
-                reason: e.to_string(),
+                line: line_no,
+                reason: classify_json_error(&e),
             })?;
             selected.push(line);
         }
@@ -309,36 +460,64 @@ fn contains_private_key_block(s: &str) -> bool {
     s.contains("-----BEGIN") && s.contains("PRIVATE KEY")
 }
 
-/// Redact secret-bearing query parameters inside a URL-shaped string:
-/// `?api_key=…&token=…` → values replaced, keys and safe params preserved.
-/// Applies to any string containing a `?key=value` query, not only strict
-/// URLs — conservative by design.
-fn scrub_url_query(s: &str) -> Option<String> {
-    let query_start = s.find('?')?;
-    let (base, query_and_fragment) = s.split_at(query_start + 1);
-    let (query, fragment) = match query_and_fragment.find('#') {
-        Some(idx) => (&query_and_fragment[..idx], Some(&query_and_fragment[idx..])),
-        None => (query_and_fragment, None),
-    };
-    if !query.contains('=') {
-        return None;
-    }
-    let mut changed = false;
-    let scrubbed: Vec<String> = query
+/// A standalone value shaped like an obvious credential (JWT or known
+/// secret prefix) — used for query/fragment parameter values whose key is
+/// not secret-named.
+fn value_is_secret_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && (looks_like_jwt(value) || SECRET_VALUE_PREFIXES.iter().any(|p| value.starts_with(p)))
+}
+
+/// Scrub one `k=v&k2=v2` parameter list: values under secret-named keys and
+/// credential-shaped values under benign keys are redacted; benign pairs
+/// and non-pair segments are preserved verbatim.
+fn scrub_param_pairs(params: &str, changed: &mut bool) -> String {
+    params
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((key, value)) if key_is_secret(key) && !value.is_empty() => {
-                changed = true;
+            Some((key, value))
+                if !value.is_empty() && (key_is_secret(key) || value_is_secret_shaped(value)) =>
+            {
+                *changed = true;
                 format!("{key}={REDACTED}")
             }
             _ => pair.to_string(),
         })
-        .collect();
+        .collect::<Vec<String>>()
+        .join("&")
+}
+
+/// Redact secret-bearing query parameters AND fragment parameters inside a
+/// URL-shaped string: `?api_key=…&token=…` and `#access_token=…&state=…`
+/// (OAuth implicit-flow style) → secret values replaced, keys and safe
+/// params preserved. Applies to any string containing a `?key=value` query
+/// or `#key=value` fragment, not only strict URLs — conservative by design.
+fn scrub_url_query(s: &str) -> Option<String> {
+    let (head, fragment) = match s.find('#') {
+        Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
+        None => (s, None),
+    };
+    let (base, query) = match head.find('?') {
+        Some(idx) => (&head[..idx + 1], Some(&head[idx + 1..])),
+        None => (head, None),
+    };
+    let mut changed = false;
+    let scrubbed_query = match query {
+        Some(query) if query.contains('=') => Some(scrub_param_pairs(query, &mut changed)),
+        other => other.map(str::to_string),
+    };
+    let scrubbed_fragment = match fragment {
+        Some(fragment) if fragment.contains('=') => Some(scrub_param_pairs(fragment, &mut changed)),
+        other => other.map(str::to_string),
+    };
     changed.then(|| {
         let mut out = String::from(base);
-        out.push_str(&scrubbed.join("&"));
-        if let Some(fragment) = fragment {
-            out.push_str(fragment);
+        if let Some(query) = scrubbed_query {
+            out.push_str(&query);
+        }
+        if let Some(fragment) = scrubbed_fragment {
+            out.push('#');
+            out.push_str(&fragment);
         }
         out
     })
@@ -462,17 +641,24 @@ pub fn export_content(
     // excluded here so its own expiry is reported precisely below
     // (`CaptureExpired`, and deleted there) instead of a generic miss.
     let _ = sweep_expired_captures_except(capture_dir, Some(&path));
-    let meta =
-        std::fs::symlink_metadata(&path).map_err(|_| ExportError::CaptureMissing(path.clone()))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(ExportError::CaptureInvalid(
-            path,
-            "not a regular file".to_string(),
-        ));
-    }
-    let raw = std::fs::read_to_string(&path)?;
-    let bundle: ContentCaptureBundle = serde_json::from_str(&raw)
-        .map_err(|e| ExportError::CaptureInvalid(path.clone(), e.to_string()))?;
+    // Bounded, symlink-refusing, type-checked read of the opened handle —
+    // no check/open TOCTOU, no blocking on planted FIFOs.
+    let raw = match read_bounded_regular_file(&path, CAPTURE_BUNDLE_READ_CAP) {
+        Ok(raw) => raw,
+        Err(BoundedReadError::NotFound) => return Err(ExportError::CaptureMissing(path)),
+        Err(BoundedReadError::NotRegular(why)) => {
+            return Err(ExportError::CaptureInvalid(path, why.to_string()));
+        }
+        Err(BoundedReadError::Oversized) => {
+            return Err(ExportError::CaptureInvalid(
+                path,
+                format!("exceeds the {CAPTURE_BUNDLE_READ_CAP}-byte bundle read cap"),
+            ));
+        }
+        Err(BoundedReadError::Io(e)) => return Err(ExportError::Io(e)),
+    };
+    let bundle: ContentCaptureBundle = serde_json::from_slice(&raw)
+        .map_err(|e| ExportError::CaptureInvalid(path.clone(), classify_json_error(&e)))?;
     if bundle.schema != CONTENT_CAPTURE_SCHEMA {
         return Err(ExportError::CaptureInvalid(
             path,
@@ -543,10 +729,17 @@ pub fn export_content(
 /// Delete any expired capture bundles in `dir` (bounded retention sweep).
 ///
 /// Expiry is *logical* (an expired bundle can never be exported — see
-/// [`export_content`]); this sweep is the *opportunistic* physical deletion
-/// invoked on every trace interaction: new captures, exports, and CLI
-/// startup of trace subcommands. No background process exists after the
-/// CLI exits, so stale bundles are removed on the next interaction.
+/// [`export_content`]); this sweep is the physical deletion invoked on
+/// every trace interaction (new captures, exports, `/trace status`, CLI
+/// trace subcommands) AND operationally at Runtime/session startup and in
+/// both the sync and async shutdown epilogues — stale bundles do not wait
+/// for the next explicit trace interaction.
+///
+/// Hardening: each entry is examined through the bounded regular-file
+/// primitive — symlinks are never followed, FIFOs never block, directories
+/// and devices are never read, and oversized or malformed files are
+/// removed without unbounded reads. Work is bounded ([`MAX_SWEEP_ENTRIES`])
+/// and confined to direct entries of `dir`; every failure is soft.
 pub fn sweep_expired_captures(dir: &Path) -> u64 {
     sweep_expired_captures_except(dir, None)
 }
@@ -559,17 +752,26 @@ fn sweep_expired_captures_except(dir: &Path, keep: Option<&Path>) -> u64 {
     };
     let now = unix_ms_now();
     let mut removed = 0;
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(MAX_SWEEP_ENTRIES) {
         let path = entry.path();
         if keep.is_some_and(|k| k == path) {
             continue;
         }
-        let expired = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<ContentCaptureBundle>(&raw).ok())
-            .map(|b| now >= b.expires_unix_ms)
-            // Unparseable bundles are removed too: nothing else may live here.
-            .unwrap_or(true);
+        let expired = match read_bounded_regular_file(&path, CAPTURE_BUNDLE_READ_CAP) {
+            Ok(raw) => serde_json::from_slice::<ContentCaptureBundle>(&raw)
+                .map(|b| now >= b.expires_unix_ms)
+                // Unparseable bundles are removed too: nothing else may
+                // live here.
+                .unwrap_or(true),
+            // Vanished concurrently: nothing to remove.
+            Err(BoundedReadError::NotFound) => continue,
+            // Symlinks (removed as links, target untouched), FIFOs,
+            // directories, devices, oversized or unreadable files: all
+            // removable garbage — never read, never blocked on.
+            Err(_) => true,
+        };
+        // `remove_file` never follows symlinks and fails softly on
+        // directories — the sweep stays confined to `dir`'s own entries.
         if expired && std::fs::remove_file(&path).is_ok() {
             removed += 1;
         }
@@ -883,5 +1085,232 @@ mod tests {
         let removed = sweep_expired_captures(dir.path());
         assert_eq!(removed, 1);
         assert!(capture_path(dir.path(), &id).exists());
+    }
+
+    fn live_bundle(id: &TraceId) -> ContentCaptureBundle {
+        ContentCaptureBundle {
+            schema: CONTENT_CAPTURE_SCHEMA.to_string(),
+            request_id: id.clone(),
+            created_unix_ms: unix_ms_now(),
+            expires_unix_ms: unix_ms_now() + 60_000,
+            redacted: true,
+            over_budget: false,
+            body: Some(serde_json::json!({})),
+        }
+    }
+
+    /// Security regression (sweep hardening): the sweep must never follow a
+    /// planted symlink — the link itself is removable garbage; the target
+    /// outside the capture dir is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_symlink_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap_dir = dir.path().join("cap");
+        std::fs::create_dir_all(&cap_dir).unwrap();
+        // A live-looking bundle OUTSIDE the capture dir, targeted by a
+        // symlink inside it. Reading through the link would see a live
+        // bundle and keep the link forever.
+        let id = TraceId::new("req-linked").unwrap();
+        let target = dir.path().join("outside.json");
+        std::fs::write(&target, serde_json::to_vec(&live_bundle(&id)).unwrap()).unwrap();
+        let link = cap_dir.join("capture-req-linked.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let removed = sweep_expired_captures(&cap_dir);
+        assert_eq!(removed, 1, "planted symlink must be swept");
+        assert!(!link.exists(), "symlink must be removed");
+        assert!(target.exists(), "symlink target must never be touched");
+    }
+
+    /// Security regression (sweep hardening): a planted FIFO must not block
+    /// the sweep (the historical `read_to_string` open blocked forever
+    /// waiting for a writer) and is removed without reading.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_does_not_block_on_planted_fifo_and_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap_dir = dir.path().join("cap");
+        std::fs::create_dir_all(&cap_dir).unwrap();
+        let fifo = cap_dir.join("capture-fifo.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // Keep a live bundle alongside to prove selectivity.
+        let id = TraceId::new("req-live").unwrap();
+        std::fs::write(
+            capture_path(&cap_dir, &id),
+            serde_json::to_vec(&live_bundle(&id)).unwrap(),
+        )
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sweep_dir = cap_dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(sweep_expired_captures(&sweep_dir));
+        });
+        let removed = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(removed) => removed,
+            Err(_) => {
+                // Unblock the stuck reader thread before failing loudly.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("sweep blocked on a planted FIFO");
+            }
+        };
+        assert_eq!(removed, 1, "FIFO must be swept without blocking");
+        assert!(!fifo.exists());
+        assert!(capture_path(&cap_dir, &id).exists(), "live bundle survives");
+    }
+
+    /// Security regression (sweep hardening): oversized planted files are
+    /// removed without an unbounded read/allocation; non-regular entries
+    /// (a directory) never make the sweep read or panic.
+    #[test]
+    fn sweep_removes_oversized_file_without_unbounded_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap_dir = dir.path().join("cap");
+        std::fs::create_dir_all(&cap_dir).unwrap();
+        // Sparse file far beyond the bundle read cap.
+        let big = cap_dir.join("capture-big.json");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(CAPTURE_BUNDLE_READ_CAP + 1024 * 1024).unwrap();
+        drop(f);
+        // A directory entry: not removable via remove_file, but must be
+        // skipped without reading or panicking.
+        std::fs::create_dir(cap_dir.join("capture-subdir")).unwrap();
+        let id = TraceId::new("req-live2").unwrap();
+        std::fs::write(
+            capture_path(&cap_dir, &id),
+            serde_json::to_vec(&live_bundle(&id)).unwrap(),
+        )
+        .unwrap();
+
+        let removed = sweep_expired_captures(&cap_dir);
+        assert_eq!(removed, 1, "oversized file must be swept");
+        assert!(!big.exists());
+        assert!(capture_path(&cap_dir, &id).exists(), "live bundle survives");
+    }
+
+    /// Security regression (export hardening): a symlink planted at the
+    /// capture path is refused via the O_NOFOLLOW open — never followed —
+    /// and the out-of-dir target survives untouched.
+    #[cfg(unix)]
+    #[test]
+    fn export_content_refuses_symlinked_capture_without_following() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_core::core::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let id = TraceId::new("req-sym").unwrap();
+        let target = dir.path().join("target-outside");
+        std::fs::write(&target, serde_json::to_vec(&live_bundle(&id)).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, capture_path(dir.path(), &id)).unwrap();
+        let out = dir.path().join("out.json");
+        assert!(matches!(
+            export_content(dir.path(), "req-sym", &out, true),
+            Err(ExportError::CaptureInvalid(..))
+        ));
+        assert!(!out.exists());
+        assert!(target.exists(), "symlink target must never be consumed");
+    }
+
+    /// Redaction regression: URL fragments carry OAuth implicit-flow
+    /// credentials (`#access_token=…`, `#id_token=…`) and must be scrubbed
+    /// recursively, while benign fragment values survive.
+    #[test]
+    fn redaction_covers_url_fragments_recursively() {
+        let mut value = serde_json::json!({
+            "messages": [
+                {"content": [{"text":
+                    "see https://x.test/cb#access_token=SENTINEL-FRAG-1&state=keepme ok"}]},
+                {"nested": {"deep": ["https://x.test/p?q=1#id_token=SENTINEL-FRAG-2"]}},
+            ],
+            "doc": "https://x.test/doc#section-2",
+            "app": "https://x.test/app#page=intro&lang=en",
+            "jwt_frag":
+                "https://x.test/app#sess=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "cred_frag": "https://x.test/app#v=AKIASENTINELFRAG34567",
+        });
+        let count = redact_value(&mut value);
+        assert!(count >= 4, "expected >=4 fragment redactions, got {count}");
+        let flat = value.to_string();
+        for sentinel in [
+            "SENTINEL-FRAG-1",
+            "SENTINEL-FRAG-2",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "AKIASENTINELFRAG34567",
+        ] {
+            assert!(!flat.contains(sentinel), "sentinel survived: {sentinel}");
+        }
+        assert!(flat.contains("state=keepme"), "benign fragment param kept");
+        assert!(flat.contains("#section-2"), "benign fragment kept");
+        assert!(flat.contains("page=intro"), "benign fragment param kept");
+        assert!(flat.contains("lang=en"), "benign fragment param kept");
+        assert!(
+            flat.contains("https://x.test/cb#access_token="),
+            "url shape kept"
+        );
+    }
+
+    /// F5 regression: metadata export must never echo hostile persisted
+    /// bytes back through its error values (Display or Debug).
+    #[test]
+    fn metadata_export_errors_never_echo_hostile_log_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("trace.jsonl");
+        // Valid JSON, invalid record: serde's own message would echo the
+        // string value verbatim.
+        std::fs::write(&log, b"\"HOSTILE-SENTINEL-999\"\n").unwrap();
+        let err = export_metadata(&log, "turn-a", &dir.path().join("o.jsonl"))
+            .expect_err("invalid record must fail");
+        let shown = format!("{err} / {err:?}");
+        assert!(
+            !shown.contains("HOSTILE-SENTINEL-999"),
+            "hostile log content echoed in error: {shown}"
+        );
+        assert!(matches!(err, ExportError::InvalidRecord { line: 1, .. }));
+    }
+
+    /// F5 regression: metadata export streams with explicit per-line and
+    /// total byte bounds instead of an unbounded whole-file read.
+    #[test]
+    fn metadata_export_enforces_line_and_total_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample_record("turn-a", "req-a");
+        let line = serde_json::to_string(&record).unwrap();
+
+        // Per-line bound: one line beyond the cap is refused.
+        let log = dir.path().join("wide.jsonl");
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+        let err = export_metadata_bounded(
+            &log,
+            "turn-a",
+            &dir.path().join("o1.jsonl"),
+            line.len() - 1,
+            1024 * 1024,
+        )
+        .expect_err("over-cap line must fail");
+        assert!(matches!(err, ExportError::BoundExceeded { .. }), "{err:?}");
+
+        // Total bound: a log beyond the cap is refused.
+        let log2 = dir.path().join("long.jsonl");
+        std::fs::write(&log2, format!("{line}\n{line}\n")).unwrap();
+        let err = export_metadata_bounded(
+            &log2,
+            "turn-a",
+            &dir.path().join("o2.jsonl"),
+            1024 * 1024,
+            line.len() as u64 + 1,
+        )
+        .expect_err("over-cap log must fail");
+        assert!(matches!(err, ExportError::BoundExceeded { .. }), "{err:?}");
+
+        // Within bounds: exports normally.
+        let stats = export_metadata_bounded(
+            &log,
+            "turn-a",
+            &dir.path().join("o3.jsonl"),
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .expect("in-bounds export");
+        assert_eq!(stats.exported, 1);
     }
 }

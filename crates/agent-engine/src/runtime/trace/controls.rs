@@ -40,13 +40,14 @@
 //!   **Expiry semantics (documented guarantee):** expiry is *logical* —
 //!   an expired bundle can never be exported (the export path checks the
 //!   embedded `expires_unix_ms` and deletes stale bundles). Physical
-//!   deletion is *opportunistic*: no background process exists after the
-//!   CLI exits, so stale bundles are swept on the next trace interaction
-//!   (every new capture, every `synaps trace export` invocation). A bundle
-//!   may therefore sit encrypted-at-rest-equivalent (private `0600` file,
-//!   already redacted) on disk past its TTL until the next interaction —
-//!   but it is unreadable through any supported export path from the
-//!   moment it expires;
+//!   deletion is a bounded, fail-soft sweep run at Runtime/session
+//!   startup, in both the sync and async shutdown epilogues, and on every
+//!   trace interaction (every new capture, `/trace status`, every
+//!   `synaps trace export` invocation). A bundle left behind by a killed
+//!   process may therefore sit (private `0600` file, already redacted) on
+//!   disk past its TTL until the next session startup/shutdown or trace
+//!   interaction — but it is unreadable through any supported export path
+//!   from the moment it expires;
 //! - only the request **body** is captured — headers, cookies, and
 //!   credentials never enter the capture path by construction (they are
 //!   attached by the HTTP client after the body is built).
