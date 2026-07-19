@@ -137,3 +137,19 @@ after a simulated kill); a fast non-ignored proportionality test asserts the
 journal append for one new message stays orders of magnitude below history
 size. Results are recorded in the T35 benchmark commit message and the
 invocation is documented in the consolidated benchmark script (T36).
+
+## Fix iteration 1 addenda (final Judge I1 + M1)
+
+- **Confined reads (I1):** every session read path — journal state on the
+  save side, snapshot load, journal replay, and the listing meta tail —
+  resolves relative to an `O_NOFOLLOW`-opened sessions-dir handle
+  (`ConfinedDir`), verifies the opened handle is a regular file, and reads
+  at most `MAX_PERSISTED_READ_BYTES` from that handle. A symlinked root,
+  ancestor, or artifact — including one swapped in concurrently — fails
+  closed with zero victim bytes read or echoed.
+- **Version enforcement (M1):** `v == JOURNAL_SCHEMA_VERSION` is enforced
+  on every record. An unsupported `open` version invalidates the whole
+  journal (nothing replays; the next save resnapshots); an unknown-version
+  record later in the file ends the valid prefix (replay stops before it;
+  the next save resnapshots rather than appending behind records it cannot
+  interpret).

@@ -37,6 +37,73 @@ pub const JOURNAL_SNAPSHOT_RATIO: u64 = 4;
 /// Bounded tail window scanned for the freshest `meta` record.
 const META_TAIL_WINDOW: u64 = 64 * 1024;
 
+/// Hard cap on any single persisted-session artifact read (snapshot or
+/// journal). Reads are bounded on the OPENED handle; an artifact past the
+/// cap is refused rather than slurped.
+pub const MAX_PERSISTED_READ_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+// ─── confined reads (fix1 I1) ────────────────────────────────────────────────
+//
+// Every read path resolves `<name>` RELATIVE to an O_NOFOLLOW-opened
+// sessions-dir handle (`ConfinedDir`), verifies the opened handle is a
+// regular file, and reads a bounded number of bytes from that handle. A
+// symlink at the root, an ancestor, or the final component — including one
+// swapped in concurrently — fails closed with no victim bytes read.
+
+/// Open `<name>` inside `dir` confined + nofollow. `Ok(None)` when the
+/// directory or file does not exist; confinement violations are errors.
+#[cfg(unix)]
+fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    let root = match crate::core::private_fs::ConfinedDir::open_root(dir) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match root.open_file(&[name.to_string()]) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Non-unix best-effort fallback (matching the rest of `private_fs`):
+/// refuse a symlink at the final component, then open normally.
+#[cfg(not(unix))]
+fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    let path = dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::other(format!(
+                "refusing symlinked session artifact {name:?}"
+            )))
+        }
+        _ => {}
+    }
+    match std::fs::File::open(&path) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Bounded read of the whole artifact from the confined handle.
+fn confined_read_bytes(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let Some(file) = confined_open(dir, name)? else {
+        return Ok(None);
+    };
+    let mut buf = Vec::new();
+    file.take(MAX_PERSISTED_READ_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_PERSISTED_READ_BYTES {
+        return Err(std::io::Error::other(format!(
+            "session artifact {name:?} exceeds the {MAX_PERSISTED_READ_BYTES}-byte read bound"
+        )));
+    }
+    Ok(Some(buf))
+}
+
 /// Which on-disk persistence strategy `Session::save` uses.
 ///
 /// `Json` (the default) is the unchanged legacy behavior. `Journal` is the
@@ -200,11 +267,9 @@ struct JournalState {
     clean: bool,
 }
 
-fn read_journal_state(path: &Path) -> std::io::Result<Option<JournalState>> {
-    let raw = match std::fs::read(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+fn read_journal_state(dir: &Path, id: &str) -> std::io::Result<Option<JournalState>> {
+    let Some(raw) = confined_read_bytes(dir, &format!("{id}.journal"))? else {
+        return Ok(None);
     };
     let bytes = raw.len() as u64;
     let text = String::from_utf8_lossy(&raw);
@@ -219,10 +284,14 @@ fn read_journal_state(path: &Path) -> std::io::Result<Option<JournalState>> {
         }));
     };
     let base = match serde_json::from_str::<JournalRecord>(first) {
-        Ok(JournalRecord::Open { base, .. }) => base,
+        // fix1 M1: only the CURRENT schema version is interpretable. An
+        // unsupported open version invalidates the whole journal — its
+        // record semantics are unknown, so nothing may replay or be
+        // appended behind it.
+        Ok(JournalRecord::Open { v, base }) if v == JOURNAL_SCHEMA_VERSION => base,
         _ => {
-            // No/invalid open record: the journal is unusable as an append
-            // target — resnapshot.
+            // No/invalid/unsupported open record: the journal is unusable
+            // as an append target — resnapshot.
             return Ok(Some(JournalState {
                 durable_len: 0,
                 last_msg: None,
@@ -237,6 +306,14 @@ fn read_journal_state(path: &Path) -> std::io::Result<Option<JournalState>> {
     let mut clean = true;
     for line in lines {
         match serde_json::from_str::<JournalRecord>(line) {
+            // fix1 M1: a record from an unknown schema version ends the
+            // valid prefix — the next save must resnapshot.
+            Ok(JournalRecord::Msg { v, .. }) | Ok(JournalRecord::Meta { v, .. })
+                if v != JOURNAL_SCHEMA_VERSION =>
+            {
+                clean = false;
+                break;
+            }
             Ok(JournalRecord::Msg { i, m, .. }) => {
                 if i == durable_len {
                     durable_len += 1;
@@ -300,7 +377,7 @@ fn save_journal_mode(dir: &Path, session: &Session) -> std::io::Result<SaveRecei
     let snap_path = dir.join(format!("{}.json", session.id));
     let jpath = journal_path(dir, &session.id);
 
-    let state = match read_journal_state(&jpath)? {
+    let state = match read_journal_state(dir, &session.id)? {
         Some(state) if snap_path.exists() => state,
         // First journal-mode save of a new or legacy session (or the
         // snapshot vanished out-of-band): full snapshot + fresh journal.
@@ -389,26 +466,37 @@ fn full_snapshot_reset(dir: &Path, session: &Session) -> std::io::Result<SaveRec
 
 /// Load `<id>.json` and, when a journal exists, replay it idempotently.
 /// Old-format sessions (no journal) load exactly as before; a session with
-/// a torn or stale journal recovers to its last consistent state.
+/// a torn or stale journal recovers to its last consistent state. Both
+/// reads are confined nofollow bounded handle reads (fix1 I1).
 pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
-    let content = std::fs::read_to_string(dir.join(format!("{id}.json")))?;
-    let mut session: Session = serde_json::from_str(&content).map_err(std::io::Error::other)?;
+    let snapshot = confined_read_bytes(dir, &format!("{id}.json"))?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no session snapshot for '{id}'"),
+        )
+    })?;
+    let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
 
-    let raw = match std::fs::read(journal_path(dir, id)) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(session),
-        Err(e) => return Err(e),
+    let Some(raw) = confined_read_bytes(dir, &format!("{id}.journal"))? else {
+        return Ok(session);
     };
     let text = String::from_utf8_lossy(&raw);
     let mut lines = text.lines();
-    // The first line must be an open record; otherwise the whole journal is
-    // untrusted and the snapshot alone is the consistent state.
+    // The first line must be an open record OF THE SUPPORTED VERSION;
+    // otherwise the whole journal is untrusted and the snapshot alone is
+    // the consistent state (fix1 M1).
     match lines.next().map(serde_json::from_str::<JournalRecord>) {
-        Some(Ok(JournalRecord::Open { .. })) => {}
+        Some(Ok(JournalRecord::Open { v, .. })) if v == JOURNAL_SCHEMA_VERSION => {}
         _ => return Ok(session),
     }
     for line in lines {
         match serde_json::from_str::<JournalRecord>(line) {
+            // fix1 M1: an unknown-version record ends the valid prefix.
+            Ok(JournalRecord::Msg { v, .. }) | Ok(JournalRecord::Meta { v, .. })
+                if v != JOURNAL_SCHEMA_VERSION =>
+            {
+                break;
+            }
             Ok(JournalRecord::Msg { i, m, .. }) => {
                 if i == session.api_messages.len() {
                     session.api_messages.push(std::sync::Arc::new(m));
@@ -429,11 +517,12 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
 }
 
 /// Freshest `meta` record from a bounded journal tail window, for listing
-/// freshness without a full journal read. `None` when no journal or no
-/// complete meta record exists in the window.
+/// freshness without a full journal read. `None` when no journal, no
+/// complete supported-version meta record, or a refused (non-confined)
+/// artifact — a symlinked journal discloses nothing.
 pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(journal_path(dir, id)).ok()?;
+    let mut file = confined_open(dir, &format!("{id}.journal")).ok()??;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(META_TAIL_WINDOW);
     file.seek(SeekFrom::Start(start)).ok()?;
@@ -442,11 +531,13 @@ pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
 
     let mut freshest = None;
     for line in tail.lines() {
-        if let Ok(JournalRecord::Meta { meta, .. }) = serde_json::from_str::<JournalRecord>(line) {
-            freshest = Some(JournalMetaTail {
-                updated_at: meta.updated_at,
-                session_cost: meta.session_cost,
-            });
+        if let Ok(JournalRecord::Meta { v, meta }) = serde_json::from_str::<JournalRecord>(line) {
+            if v == JOURNAL_SCHEMA_VERSION {
+                freshest = Some(JournalMetaTail {
+                    updated_at: meta.updated_at,
+                    session_cost: meta.session_cost,
+                });
+            }
         }
     }
     freshest

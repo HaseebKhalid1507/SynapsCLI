@@ -646,3 +646,252 @@ fn bench_save_10mib_history() {
 fn bench_save_100mib_history() {
     bench_save(100);
 }
+
+// ─── 7. fix1: schema-version enforcement (M1) ────────────────────────────────
+
+#[test]
+fn unsupported_open_version_invalidates_the_whole_journal() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = session_with_messages(2);
+    save(&tmp, &s, SessionPersistence::Json);
+    // A future-format journal (open v=2) must not replay AT ALL — its
+    // record semantics are unknown.
+    let future = format!(
+        "{}\n{}\n",
+        json!({"v":2,"k":"open","base":2}),
+        json!({"v":2,"k":"msg","i":2,"m":{"role":"user","content":"FUTURE-RECORD"}}),
+    );
+    std::fs::write(journal_path(tmp.path(), &s.id), future).unwrap();
+
+    let loaded = load(&tmp, &s.id);
+    assert_eq!(
+        loaded.api_messages.len(),
+        2,
+        "an unsupported open version must invalidate the journal"
+    );
+    // And the next journal-mode save must RESNAPSHOT (never append behind
+    // records it cannot interpret).
+    push_msg(&mut s, "post-future save");
+    s.updated_at = chrono::Utc::now();
+    let mode = save(&tmp, &s, SessionPersistence::Journal);
+    assert_eq!(mode, SaveMode::FullSnapshot);
+    assert_equivalent(&s, &load(&tmp, &s.id));
+}
+
+#[test]
+fn unknown_record_version_stops_the_valid_prefix_and_next_save_resnapshots() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = session_with_messages(2);
+    save(&tmp, &s, SessionPersistence::Json);
+    // v=1 open, one valid v=1 append, then a v=2 record: replay must stop
+    // BEFORE the unknown-version record.
+    let mixed = format!(
+        "{}\n{}\n{}\n",
+        json!({"v":1,"k":"open","base":2}),
+        json!({"v":1,"k":"msg","i":2,"m":{"role":"user","content":"valid v1 tail"}}),
+        json!({"v":2,"k":"msg","i":3,"m":{"role":"user","content":"FUTURE-RECORD"}}),
+    );
+    std::fs::write(journal_path(tmp.path(), &s.id), mixed).unwrap();
+
+    let loaded = load(&tmp, &s.id);
+    assert_eq!(loaded.api_messages.len(), 3, "valid v1 prefix replays");
+    assert!(
+        !serde_json::to_string(&loaded.api_messages)
+            .unwrap()
+            .contains("FUTURE-RECORD"),
+        "unknown-version records must never apply"
+    );
+
+    // Next save resnapshots rather than appending after the foreign record.
+    s.api_messages = loaded.api_messages.clone();
+    push_msg(&mut s, "post-mixed save");
+    s.updated_at = chrono::Utc::now();
+    let mode = save(&tmp, &s, SessionPersistence::Journal);
+    assert_eq!(mode, SaveMode::FullSnapshot);
+    assert_equivalent(&s, &load(&tmp, &s.id));
+}
+
+#[test]
+fn unsupported_meta_version_does_not_apply() {
+    let tmp = TempDir::new().unwrap();
+    let s = session_with_messages(2);
+    save(&tmp, &s, SessionPersistence::Json);
+    let hostile_meta = format!(
+        "{}\n{}\n",
+        json!({"v":1,"k":"open","base":2}),
+        json!({"v":9,"k":"meta","meta":{
+            "id": s.id, "title": "FUTURE TITLE", "model": s.model,
+            "thinking_level": s.thinking_level, "system_prompt": null,
+            "created_at": s.created_at.to_rfc3339(),
+            "updated_at": "2099-01-01T00:00:00Z",
+            "total_input_tokens": 0, "total_output_tokens": 0,
+            "session_cost": 999.0
+        }}),
+    );
+    std::fs::write(journal_path(tmp.path(), &s.id), hostile_meta).unwrap();
+    let loaded = load(&tmp, &s.id);
+    assert_eq!(loaded.title, s.title);
+    assert_eq!(loaded.session_cost, s.session_cost);
+}
+
+// ─── 8. fix1: confined, nofollow, bounded read paths (I1) ────────────────────
+
+#[cfg(unix)]
+mod confined_reads {
+    use super::*;
+
+    const VICTIM_SENTINEL: &str = "VICTIM-CONTENT-4f6a1b-DO-NOT-DISCLOSE";
+
+    /// A victim file OUTSIDE the sessions dir whose content must never be
+    /// readable through any session read path.
+    fn plant_victim(tmp: &TempDir) -> std::path::PathBuf {
+        let victim = tmp.path().join("victim-secret");
+        std::fs::write(&victim, VICTIM_SENTINEL).unwrap();
+        victim
+    }
+
+    #[test]
+    fn symlinked_journal_is_refused_and_never_discloses_the_victim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let victim = plant_victim(&tmp);
+        let s = session_with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+        std::os::unix::fs::symlink(&victim, journal_path(&dir, &s.id)).unwrap();
+
+        let res = load_session_in_dir(&dir, &s.id);
+        match res {
+            Err(e) => assert!(
+                !e.to_string().contains(VICTIM_SENTINEL),
+                "refusal must not echo victim content"
+            ),
+            Ok(loaded) => panic!(
+                "symlinked journal must be refused, got a session with {} messages",
+                loaded.api_messages.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn symlinked_snapshot_is_refused_and_never_discloses_the_victim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = plant_victim(&tmp);
+        std::os::unix::fs::symlink(&victim, dir.join("sess-sym.json")).unwrap();
+
+        let res = load_session_in_dir(&dir, "sess-sym");
+        assert!(res.is_err(), "symlinked snapshot must be refused");
+        assert!(
+            !res.unwrap_err().to_string().contains(VICTIM_SENTINEL),
+            "refusal must not echo victim content"
+        );
+    }
+
+    #[test]
+    fn symlinked_sessions_root_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-sessions");
+        let s = session_with_messages(1);
+        save_session_in_dir(&real, &s, SessionPersistence::Json).unwrap();
+        let link = tmp.path().join("linked-sessions");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            load_session_in_dir(&link, &s.id).is_err(),
+            "a symlinked sessions root (ancestor) must be refused"
+        );
+    }
+
+    #[test]
+    fn hostile_session_id_components_are_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let victim = plant_victim(&tmp);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Even with a traversal id, no read may escape the sessions dir.
+        let rel = format!("../{}", victim.file_name().unwrap().to_str().unwrap());
+        let res = load_session_in_dir(&dir, &rel);
+        assert!(res.is_err(), "traversal ids must be rejected");
+        assert!(!res.unwrap_err().to_string().contains(VICTIM_SENTINEL));
+    }
+
+    #[test]
+    fn meta_tail_through_symlink_discloses_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = plant_victim(&tmp);
+        std::os::unix::fs::symlink(&victim, journal_path(&dir, "sess-1")).unwrap();
+        assert!(
+            journal_meta_tail(&dir, "sess-1").is_none(),
+            "a symlinked journal must yield no meta tail"
+        );
+    }
+
+    #[test]
+    fn save_side_journal_state_read_refuses_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let victim = plant_victim(&tmp);
+        let mut s = session_with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        std::fs::remove_file(journal_path(&dir, &s.id)).unwrap();
+        std::os::unix::fs::symlink(&victim, journal_path(&dir, &s.id)).unwrap();
+        push_msg(&mut s, "append attempt");
+        let res = save_session_in_dir(&dir, &s, SessionPersistence::Journal);
+        assert!(res.is_err(), "save must refuse a symlinked journal");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            VICTIM_SENTINEL,
+            "victim must be untouched"
+        );
+    }
+
+    /// Concurrent swap: a writer flips the journal between a real file and
+    /// a symlink to the victim while readers load in a loop. No loaded
+    /// state may ever contain the victim sentinel (confidentiality), and
+    /// nothing may panic.
+    #[test]
+    fn concurrent_symlink_swap_never_discloses_the_victim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let victim = plant_victim(&tmp);
+        let mut s = session_with_messages(2);
+        push_msg(&mut s, "real journal tail");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let jpath = journal_path(&dir, &s.id);
+        let real_journal = std::fs::read(&jpath).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = stop.clone();
+            let jpath = jpath.clone();
+            let victim = victim.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&jpath);
+                    let _ = std::os::unix::fs::symlink(&victim, &jpath);
+                    let _ = std::fs::remove_file(&jpath);
+                    let _ = std::fs::write(&jpath, &real_journal);
+                }
+            })
+        };
+
+        for _ in 0..300 {
+            match load_session_in_dir(&dir, &s.id) {
+                Ok(loaded) => {
+                    let dump = serde_json::to_string(&loaded.api_messages).unwrap();
+                    assert!(
+                        !dump.contains(VICTIM_SENTINEL),
+                        "a concurrent swap disclosed victim content"
+                    );
+                }
+                Err(e) => {
+                    assert!(!e.to_string().contains(VICTIM_SENTINEL));
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().unwrap();
+    }
+}
