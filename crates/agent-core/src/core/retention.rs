@@ -245,8 +245,9 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
         .into_iter()
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
         .collect();
-    let traces = list_files(&roots.cache_dir);
+    let traces = cache_files(&roots.cache_dir);
     let logs = log_files(&roots.config_dir);
+    let index_files = walk_regular_files(&roots.index_dir());
 
     let sum = |files: &[PathBuf]| -> u64 {
         files
@@ -269,7 +270,7 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
         },
         DomainReport {
             domain: RetentionDomain::MemoryIndex,
-            files: 0,
+            files: index_files.len(),
             bytes: index_bytes,
         },
         DomainReport {
@@ -327,8 +328,9 @@ pub fn sweep_at(
             }
         }
 
-        // ── Traces + logs: mtime-aged whole files ──
-        for path in list_files(&roots.cache_dir)
+        // ── Traces + logs: mtime-aged whole files (traces recursive,
+        // symlink-confined) ──
+        for path in cache_files(&roots.cache_dir)
             .into_iter()
             .chain(log_files(&roots.config_dir))
         {
@@ -524,9 +526,108 @@ fn evict_oldest_memory_records(
     Ok(dropped)
 }
 
-/// Cache files under the confined cache root (no symlink following).
+/// Recursively list REGULAR files under a confined root. Symlinks (files
+/// or directories) are never followed — `DirEntry::file_type` does not
+/// follow, so symlinked escapes are simply skipped. Bounded depth.
+fn walk_regular_files(root: &Path) -> Vec<PathBuf> {
+    fn recurse(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 32 {
+            return;
+        }
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue; // confined: never follow
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    recurse(&path, depth + 1, out);
+                } else if file_type.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    recurse(root, 0, &mut out);
+    out.sort();
+    out
+}
+
+/// Cache files under the confined cache root (recursive, symlink-free).
 fn cache_files(cache_dir: &Path) -> Vec<PathBuf> {
-    list_files(cache_dir)
+    walk_regular_files(cache_dir)
+}
+
+/// Copy one artifact with no symlink surface on either side (CP-13 fix1
+/// I6): the SOURCE is opened `O_NOFOLLOW` and must be a regular file by
+/// opened-handle metadata; the DESTINATION is created `O_EXCL` with 0600
+/// under 0700 directories, so a pre-planted symlink (or any existing file)
+/// fails instead of being written through.
+fn copy_confined(src: &Path, dest: &Path) -> io::Result<u64> {
+    use std::io::Read;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc_nofollow());
+    }
+    let mut source = options.open(src)?;
+    let meta = source.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other(format!(
+            "refusing to export non-regular file {}",
+            src.display()
+        )));
+    }
+
+    if let Some(parent) = dest.parent() {
+        crate::core::private_fs::ensure_private_dir(parent).map_err(io::Error::from)?;
+    }
+    let mut dest_options = fs::OpenOptions::new();
+    dest_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        dest_options.mode(0o600);
+    }
+    let mut out = dest_options.open(dest).map_err(|e| {
+        io::Error::other(format!(
+            "refusing to write export target {} (exists or is a symlink): {e}",
+            dest.display()
+        ))
+    })?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = source.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        use std::io::Write;
+        out.write_all(&buf[..n])?;
+        written += n as u64;
+    }
+    Ok(written)
+}
+
+#[cfg(unix)]
+fn libc_nofollow() -> i32 {
+    // O_NOFOLLOW without a libc dependency: the constant is stable ABI on
+    // the supported unix targets.
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0x0100
+    }
 }
 
 /// Production sweep at the current clock.
@@ -613,31 +714,55 @@ fn compact_memory_file(
     Ok(dropped)
 }
 
-/// Headless export: copy sessions, memory, traces, and logs to `dest`.
+/// Headless export: copy sessions, memory, traces (recursive), and logs
+/// to `dest` with no symlink surface and private modes throughout.
 pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> {
     let mut summary = ExportSummary { files: 0, bytes: 0 };
-    let plans = [
+
+    let flat = [
         (roots.sessions_dir(), dest.join("sessions")),
         (roots.memory_dir(), dest.join("memory")),
-        (roots.cache_dir.clone(), dest.join("traces")),
     ];
-    for (src, out) in plans {
+    for (src, out) in flat {
         for file in list_files(&src) {
-            fs::create_dir_all(&out)?;
-            let name = file.file_name().unwrap_or_default();
-            let target = out.join(name);
-            fs::copy(&file, &target)?;
+            // list_files() returns entries without following symlinks, but
+            // a planted symlink is still an entry — copy_confined refuses
+            // to OPEN it (O_NOFOLLOW). Skip symlinks explicitly.
+            if file
+                .symlink_metadata()
+                .map(|m| m.is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let target = out.join(file.file_name().unwrap_or_default());
+            summary.bytes += copy_confined(&file, &target)?;
             summary.files += 1;
-            summary.bytes += fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         }
     }
-    for file in log_files(&roots.config_dir) {
-        let out = dest.join("logs");
-        fs::create_dir_all(&out)?;
-        let target = out.join(file.file_name().unwrap_or_default());
-        fs::copy(&file, &target)?;
+
+    // Traces: recursive under the confined cache root, preserving relative
+    // subpaths.
+    for file in walk_regular_files(&roots.cache_dir) {
+        let rel = file
+            .strip_prefix(&roots.cache_dir)
+            .map_err(|_| io::Error::other("cache walk escaped its root"))?;
+        let target = dest.join("traces").join(rel);
+        summary.bytes += copy_confined(&file, &target)?;
         summary.files += 1;
-        summary.bytes += fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+    }
+
+    for file in log_files(&roots.config_dir) {
+        if file
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let target = dest.join("logs").join(file.file_name().unwrap_or_default());
+        summary.bytes += copy_confined(&file, &target)?;
+        summary.files += 1;
     }
     Ok(summary)
 }

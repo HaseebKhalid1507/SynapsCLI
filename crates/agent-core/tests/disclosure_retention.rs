@@ -620,3 +620,118 @@ fn malformed_chain_files_fail_closed_without_destructive_sweep() {
     );
     assert!(session_exists(&h.roots, "old-session"));
 }
+
+// ─── CP-13 fix1: export confinement + recursive cache retention ──────────────
+
+#[cfg(unix)]
+#[test]
+fn export_never_follows_source_or_destination_symlinks_and_uses_private_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness();
+    write_session(&h.roots, "s1", 50 * DAY_MS, None);
+
+    // Hostile SOURCE: a symlink planted in the sessions dir pointing at a
+    // secret outside the retention roots.
+    let secret = h.roots.base_dir.join("outside-secret.txt");
+    std::fs::write(&secret, "OUTSIDE-SECRET-CONTENT").unwrap();
+    std::os::unix::fs::symlink(&secret, h.roots.config_dir.join("sessions/planted.json")).unwrap();
+
+    // Hostile DESTINATION: dest file pre-created as a symlink to a victim.
+    let victim = h.roots.base_dir.join("victim.txt");
+    std::fs::write(&victim, "untouched").unwrap();
+    let dest = h.roots.base_dir.join("export-out");
+    std::fs::create_dir_all(dest.join("sessions")).unwrap();
+    std::os::unix::fs::symlink(&victim, dest.join("sessions/s1.json")).unwrap();
+
+    let result = export(&h.roots, &dest);
+
+    // The planted source symlink was never followed.
+    let exported_planted = dest.join("sessions/planted.json");
+    if exported_planted.exists() {
+        assert!(
+            !std::fs::read_to_string(&exported_planted)
+                .unwrap_or_default()
+                .contains("OUTSIDE-SECRET-CONTENT"),
+            "source symlink content must never be exported"
+        );
+    }
+    // The destination symlink was never written through.
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "untouched",
+        "export must never write through a destination symlink"
+    );
+    assert!(
+        result.is_err(),
+        "a pre-planted destination symlink must surface as an error"
+    );
+
+    // Clean run: private modes on everything it creates.
+    let clean_dest = h.roots.base_dir.join("export-clean");
+    std::fs::remove_file(h.roots.config_dir.join("sessions/planted.json")).unwrap();
+    export(&h.roots, &clean_dest).unwrap();
+    let dir_mode = std::fs::metadata(clean_dest.join("sessions"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = std::fs::metadata(clean_dest.join("sessions/s1.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700, "export dirs must be private");
+    assert_eq!(file_mode, 0o600, "export files must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_retention_is_recursive_and_confined() {
+    let h = harness();
+    // Nested trace artifacts.
+    std::fs::create_dir_all(h.roots.cache_dir.join("sub/deep")).unwrap();
+    std::fs::write(h.roots.cache_dir.join("sub/deep/trace.jsonl"), "t\n").unwrap();
+    std::fs::write(h.roots.cache_dir.join("top.jsonl"), "t\n").unwrap();
+    // A symlink inside the cache pointing OUTSIDE — never followed, and
+    // sweeping must not delete its target.
+    let outside = h.roots.base_dir.join("outside-data.jsonl");
+    std::fs::write(&outside, "keep me\n").unwrap();
+    std::os::unix::fs::symlink(&outside, h.roots.cache_dir.join("sub/escape.jsonl")).unwrap();
+    // Index files for the honest MemoryIndex count (M5).
+    let index_dir = h.roots.base_dir.join("memory/index/project-x");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(index_dir.join("manifest.json"), "{}").unwrap();
+    std::fs::write(index_dir.join("seg-000000.jsonl"), "d\n").unwrap();
+
+    // Inspect sees nested cache files and real index file counts.
+    let report = inspect(&h.roots).unwrap();
+    let domain = |d: RetentionDomain| report.domains.iter().find(|x| x.domain == d).unwrap();
+    assert_eq!(
+        domain(RetentionDomain::Traces).files,
+        2,
+        "recursive cache count (symlinks excluded)"
+    );
+    assert_eq!(
+        domain(RetentionDomain::MemoryIndex).files,
+        2,
+        "actual index file count, not zero"
+    );
+
+    // Sweep ages out nested files but never the symlink target.
+    sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+        },
+        agent_core::epoch_millis() + 40 * DAY_MS,
+    )
+    .unwrap();
+    assert!(!h.roots.cache_dir.join("sub/deep/trace.jsonl").exists());
+    assert!(!h.roots.cache_dir.join("top.jsonl").exists());
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "keep me\n",
+        "symlinked-out content is never followed or deleted"
+    );
+}
