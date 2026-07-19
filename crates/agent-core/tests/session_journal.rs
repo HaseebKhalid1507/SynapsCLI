@@ -606,6 +606,7 @@ fn bench_save(hist_mib: usize) {
     let t = std::time::Instant::now();
     let append = save_session_in_dir(tmp2.path(), &s, SessionPersistence::Journal).unwrap();
     let append_ms = t.elapsed().as_millis();
+    let append_us = t.elapsed().as_micros();
     assert_eq!(append.mode, SaveMode::Append { messages: 1 });
     assert!(
         append.bytes_written < 64 * 1024,
@@ -623,8 +624,8 @@ fn bench_save(hist_mib: usize) {
 
     println!(
         "BENCH session_save hist_mib={hist_mib} legacy_save_ms={legacy_ms} \
-         legacy_bytes={} journal_append_ms={append_ms} journal_append_bytes={} \
-         recover_load_ms={recover_ms}",
+         legacy_bytes={} journal_append_ms={append_ms} journal_append_us={append_us} \
+         journal_append_bytes={} recover_load_ms={recover_ms}",
         legacy.bytes_written, append.bytes_written
     );
 }

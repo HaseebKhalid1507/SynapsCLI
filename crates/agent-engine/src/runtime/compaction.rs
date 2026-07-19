@@ -709,8 +709,27 @@ pub struct CompactionTransition {
     pub hook_source: String,
 }
 
+/// Monotonic count of SUCCESSFUL compaction transitions applied through
+/// [`apply_compaction`] in this process — the runtime-observable proof that
+/// the one typed engine entry ran (fix1 T36 strengthening).
+static TRANSITIONS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the process-wide applied-transition count (see
+/// [`TRANSITIONS_APPLIED`]). Test/diagnostic seam: harnesses assert the
+/// counter moves exactly once per transition and not at all for
+/// summarization without a transition.
+pub fn transitions_applied() -> u64 {
+    TRANSITIONS_APPLIED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// What the engine applied. Pure data — the frontend adopts these fields;
 /// all persistence already happened (successor-first save ordering).
+///
+/// TYPED ENTRY (fix1 T36 strengthening): the private `_transition_proof`
+/// field makes this struct impossible to construct outside the engine —
+/// the ONLY way any frontend can hold an `AppliedCompaction` is to have
+/// called [`apply_compaction`], so "every frontend compacts through the
+/// one engine transition" is compiler-enforced, not convention.
 #[derive(Debug, Clone)]
 pub struct AppliedCompaction {
     /// Session to adopt (successor, or the in-place-updated session).
@@ -723,6 +742,8 @@ pub struct AppliedCompaction {
     pub chains_advanced: Vec<String>,
     /// The policy that was applied.
     pub policy: CompactionPolicy,
+    /// Private construction proof — see the struct docs.
+    _transition_proof: (),
 }
 
 /// Task 30 (spec §9.2): the ONE engine operation applying a successful
@@ -878,12 +899,16 @@ pub async fn apply_compaction(
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
     let api_messages = session.api_messages.clone();
+    // The transition is fully persisted — count the successful pass through
+    // the ONE typed entry (runtime-observable architectural proof).
+    TRANSITIONS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(AppliedCompaction {
         session,
         api_messages,
         previous_session_id: current.id.clone(),
         chains_advanced,
         policy: transition.policy,
+        _transition_proof: (),
     })
 }
 

@@ -3,7 +3,7 @@
 //!
 //! | §9 bullet | test(s) |
 //! | --- | --- |
-//! | one engine transition, equivalent logical history | `s9_1_every_frontend_compacts_through_one_engine_transition`, `s9_1_linked_and_inplace_policies_produce_equivalent_logical_history` |
+//! | one engine transition, equivalent logical history | `s9_1_transition_entry_is_typed_counted_and_sole_producer` (runtime + compile-enforced typed entry), `s9_1_linked_and_inplace_policies_produce_equivalent_logical_history`, `s9_1_no_frontend_splices_summaries_locally` (source defense-in-depth) |
 //! | trigger before exhaustion, documented reserve, 7 fixture classes | `s9_2_estimator_is_conservative_for_every_fixture_class`, `s9_2_compaction_triggers_before_exhaustion_across_fixture_classes` |
 //! | local-only compaction: zero network | `s9_3_local_only_compaction_performs_zero_network_operations` |
 //! | injected wrappers cannot escape / override policy | `s9_4_summary_wrapper_injection_cannot_escape_or_override_prompt_policy`, `s9_4_memory_content_enters_as_bounded_data_never_policy` |
@@ -111,8 +111,81 @@ fn record(content: &str, sensitivity: MemorySensitivity) -> NewMemoryRecord {
 
 // ─── §9.1 one engine transition, equivalent logical history ──────────────────
 
+/// PRIMARY architectural proof (fix1 T36 strengthening) — runtime + typed,
+/// not source text:
+///
+/// 1. `AppliedCompaction` carries a PRIVATE construction proof, so outside
+///    the engine crate it is impossible to fabricate an applied transition
+///    — the only way any frontend can hold one is to have called
+///    `apply_compaction`. (Compiler-enforced: constructing the struct in
+///    this test file would not compile.)
+/// 2. The `transitions_applied()` runtime counter moves exactly once per
+///    successful transition — for BOTH policies — and not at all for
+///    summarization without a transition, so "the one engine entry ran"
+///    is observable at runtime, not inferred from source text.
+#[tokio::test]
+#[serial(base_dir)]
+async fn s9_1_transition_entry_is_typed_counted_and_sole_producer() {
+    use synaps_cli::runtime::compaction::transitions_applied;
+    let _base = BaseDirGuard::new();
+    let mut runtime = Runtime::new().await.expect("runtime");
+    runtime.set_compaction_mode(agent_core::compaction::CompactionMode::LocalOnly);
+
+    // Summarization WITHOUT a transition must not count as one.
+    let before_summarize = transitions_applied();
+    let outcome = compact_conversation(&history(), &runtime, None)
+        .await
+        .expect("local-only summarization");
+    assert_eq!(
+        transitions_applied(),
+        before_summarize,
+        "summarization alone is not a transition"
+    );
+
+    for policy in [CompactionPolicy::LinkedSuccessor, CompactionPolicy::InPlace] {
+        let mut parent = Session::new("claude-sonnet-4-6", "medium", Some("policy prompt"));
+        parent.api_messages = history();
+        parent.save().await.unwrap();
+        let before = transitions_applied();
+        let applied = apply_compaction(&runtime, &parent, &history(), &outcome, transition(policy))
+            .await
+            .expect("transition");
+        assert_eq!(
+            transitions_applied(),
+            before + 1,
+            "{policy:?}: exactly one transition through the typed entry"
+        );
+        // The typed proof travels with the value the frontend adopts.
+        assert!(applied.session.compaction.is_some());
+    }
+
+    // A FAILED transition must not count: poison the sessions dir.
+    let sessions = _base.path().join("sessions");
+    std::fs::remove_dir_all(&sessions).unwrap();
+    std::fs::write(&sessions, b"not a directory").unwrap();
+    let mut parent = Session::new("claude-sonnet-4-6", "medium", None);
+    parent.api_messages = history();
+    let before = transitions_applied();
+    let res = apply_compaction(
+        &runtime,
+        &parent,
+        &history(),
+        &outcome,
+        transition(CompactionPolicy::LinkedSuccessor),
+    )
+    .await;
+    assert!(res.is_err(), "poisoned save must fail the transition");
+    assert_eq!(
+        transitions_applied(),
+        before,
+        "failed transitions must not count as applied"
+    );
+}
+
+/// Secondary defense-in-depth: no frontend re-grows local summary
+/// splicing. (The primary guarantee is the typed entry above.)
 #[test]
-fn s9_1_every_frontend_compacts_through_one_engine_transition() {
+fn s9_1_no_frontend_splices_summaries_locally() {
     let root = env!("CARGO_MANIFEST_DIR");
     for rel in [
         "src/cmd/chat.rs",
@@ -801,15 +874,27 @@ fn s9_9_bench_program_level_save_and_recovery() {
     let t = std::time::Instant::now();
     let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
     let append_ms = t.elapsed().as_millis();
+    let append_us = t.elapsed().as_micros();
 
     let t = std::time::Instant::now();
     let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
     let load_ms = t.elapsed().as_millis();
     assert_eq!(loaded.api_messages.len(), s.api_messages.len());
 
+    // Documented recovery timing: tear the journal tail (simulated kill
+    // during append) and measure the recovering load.
+    let jpath = journal_path(tmp.path(), &s.id);
+    let bytes = std::fs::read(&jpath).unwrap();
+    std::fs::write(&jpath, &bytes[..bytes.len().saturating_sub(9)]).unwrap();
+    let t = std::time::Instant::now();
+    let recovered = load_session_in_dir(tmp.path(), &s.id).unwrap();
+    let recover_load_ms = t.elapsed().as_millis();
+    assert!(!recovered.api_messages.is_empty());
+
     println!(
         "BENCH phase5_save hist_mib=10 snapshot_ms={snapshot_ms} \
-         append_ms={append_ms} append_bytes={} load_ms={load_ms}",
+         append_ms={append_ms} append_us={append_us} append_bytes={} \
+         load_ms={load_ms} recover_load_ms={recover_load_ms}",
         receipt.bytes_written
     );
 }
