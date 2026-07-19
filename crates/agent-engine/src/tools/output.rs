@@ -694,6 +694,13 @@ pub fn spawn_ui_forwarder(
                 },
             }
         }
+        // Cancellation may win while bytes remain in the bounded queue.
+        // Receiver drop releases the producer; account every such byte as a
+        // cancellation drop before the task exits.
+        let retained = counters.snapshot().retained_bytes();
+        if retained > 0 {
+            counters.note_dropped(retained as usize, 1);
+        }
         // Receiver drops here: the channel closes and producers are
         // released — a post-cancel send is a counted drop, never a block.
     })
@@ -849,6 +856,11 @@ mod tests {
         );
         let counters = channel.sender.counters();
         let before = counters.snapshot();
+        assert_eq!(
+            before.retained_bytes(),
+            0,
+            "cancellation must account every queued/coalesced byte as dropped"
+        );
         channel.sender.send("after cancel".to_string());
         let after = counters.snapshot();
         assert_eq!(
