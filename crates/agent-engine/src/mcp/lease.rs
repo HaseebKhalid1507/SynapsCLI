@@ -25,9 +25,10 @@
 //!   callers make that inevitable) with an immediate best-effort
 //!   `start_kill` accelerator — the manager retains nothing;
 //! - idle leases are reaped opportunistically with a CONSTANT per-pass
-//!   scan cap; session end is enforced by the RAII [`McpSessionEndGuard`]
-//!   on every stream exit path. No PID signalling, no background task, no
-//!   unbounded channel.
+//!   scan cap; session end is the drop of the LAST owner of the shared
+//!   durable [`McpSessionEndGuard`] scope (runtime clones + in-flight
+//!   streams hold it; no per-turn guard exists). No PID signalling, no
+//!   long-lived task, no unbounded channel.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -603,8 +604,11 @@ impl std::fmt::Debug for McpLeaseCapability {
     }
 }
 
-/// RAII session-end guard: dropping it terminates every lease of the
-/// session on every stream exit path (success, error, cancellation).
+/// Durable last-owner session scope. The Runtime mints ONE of these per
+/// tool session (wrapped in an `Arc` shared by every runtime clone and
+/// in-flight stream); streams HOLD it, never construct or drop their own.
+/// Leases therefore survive across provider turns, and only the drop of
+/// the LAST owner — true session end — terminates the session's leases.
 pub struct McpSessionEndGuard {
     session: SessionId,
     manager: Arc<McpRuntimeManager>,

@@ -34,9 +34,15 @@ impl McpConnection {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn MCP server '{}': {}", config.command, e))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            // Static process metadata only: command/env values may be
+            // sensitive local operator data.
+            format!(
+                "Failed to spawn MCP server process (io kind {:?}, os code {:?})",
+                e.kind(),
+                e.raw_os_error()
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -51,7 +57,6 @@ impl McpConnection {
         // content: only byte-count metadata is recorded. The task ends at
         // child EOF (no unbounded work).
         if let Some(mut stderr) = child.stderr.take() {
-            let cmd_name = config.command.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 8192];
@@ -60,11 +65,14 @@ impl McpConnection {
                     if n == 0 {
                         break;
                     }
-                    total += n as u64;
+                    total = total.saturating_add(n as u64);
                 }
                 if total > 0 {
-                    tracing::debug!(server = %cmd_name, bytes = total,
-                        "MCP server stderr drained (content withheld)");
+                    // Static metadata only: no command name, no content.
+                    tracing::debug!(
+                        bytes = total,
+                        "MCP server stderr drained (content withheld)"
+                    );
                 }
             });
         }
@@ -306,7 +314,10 @@ impl McpConnection {
                 .map(|b| b.len())
                 .unwrap_or(usize::MAX);
             if !input_schema.is_object() || schema_len > TOOL_SCHEMA_MAX_BYTES {
-                tracing::warn!(tool = %name, "Skipping MCP listed tool with invalid or oversized schema");
+                // Listed name is provider-controlled — withheld from logs.
+                tracing::warn!(
+                    "Skipping MCP listed tool with invalid or oversized schema (name withheld)"
+                );
                 continue;
             }
             defs.push(McpToolDef {

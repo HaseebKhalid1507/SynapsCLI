@@ -55,18 +55,100 @@ pub fn load_mcp_config() -> Option<McpConfig> {
         Ok(content) => content,
         Err(descriptors::DescriptorCacheError::NotFound) => return None,
         Err(err) => {
-            tracing::warn!(file = "mcp.json", error = %err, "Refusing unsafe MCP config read");
+            // Static category only: Io Display strings can embed paths.
+            let category = match err {
+                descriptors::DescriptorCacheError::NotFound => "not_found",
+                descriptors::DescriptorCacheError::NotRegularFile => "not_regular_file",
+                descriptors::DescriptorCacheError::Oversize { .. } => "oversize",
+                descriptors::DescriptorCacheError::Io(_) => "io",
+                descriptors::DescriptorCacheError::Parse(_) => "parse",
+                descriptors::DescriptorCacheError::Version(_) => "version",
+            };
+            tracing::warn!(
+                file = "mcp.json",
+                category,
+                "Refusing unsafe MCP config read"
+            );
             return None;
         }
     };
-    match serde_json::from_str::<McpConfig>(&content) {
-        Ok(config) => Some(config),
+    let config = match serde_json::from_str::<McpConfig>(&content) {
+        Ok(config) => config,
         Err(e) => {
-            // Parse position metadata only — no raw content, no full path.
-            tracing::warn!(file = "mcp.json", error = %e, "Failed to parse MCP config");
-            None
+            // Numeric/class parse metadata ONLY: serde Display can embed
+            // hostile key/value excerpts.
+            tracing::warn!(
+                file = "mcp.json",
+                class = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                "Failed to parse MCP config"
+            );
+            return None;
+        }
+    };
+    if let Err(reason) = validate_mcp_config(&config) {
+        // The WHOLE config fails closed on any structural violation.
+        tracing::warn!(
+            file = "mcp.json",
+            reason,
+            "Refusing structurally unsafe MCP config"
+        );
+        return None;
+    }
+    Some(config)
+}
+
+/// Structural bounds on `mcp.json` (Task 19 review): the 1 MiB byte cap
+/// alone leaves server/env counts and string shapes unbounded. Violations
+/// fail the WHOLE config closed with a static reason.
+pub const MCP_CONFIG_MAX_SERVERS: usize = 32;
+pub const MCP_CONFIG_MAX_ARGS: usize = 64;
+pub const MCP_CONFIG_MAX_ENV_ENTRIES: usize = 64;
+pub const MCP_CONFIG_MAX_SERVER_NAME_BYTES: usize = 64;
+pub const MCP_CONFIG_MAX_COMMAND_BYTES: usize = 512;
+pub const MCP_CONFIG_MAX_ARG_BYTES: usize = 4096;
+pub const MCP_CONFIG_MAX_ENV_KEY_BYTES: usize = 128;
+pub const MCP_CONFIG_MAX_ENV_VALUE_BYTES: usize = 4096;
+
+fn safe_str(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+/// Validate config structure before ANY use. Static reasons only — no
+/// config content is ever echoed.
+pub fn validate_mcp_config(config: &McpConfig) -> Result<(), &'static str> {
+    if config.mcp_servers.len() > MCP_CONFIG_MAX_SERVERS {
+        return Err("too_many_servers");
+    }
+    for (name, server) in &config.mcp_servers {
+        if !safe_str(name, MCP_CONFIG_MAX_SERVER_NAME_BYTES) {
+            return Err("invalid_server_name");
+        }
+        if !safe_str(&server.command, MCP_CONFIG_MAX_COMMAND_BYTES) {
+            return Err("invalid_command");
+        }
+        if server.args.len() > MCP_CONFIG_MAX_ARGS {
+            return Err("too_many_args");
+        }
+        for arg in &server.args {
+            if arg.len() > MCP_CONFIG_MAX_ARG_BYTES || arg.chars().any(char::is_control) {
+                return Err("invalid_arg");
+            }
+        }
+        if server.env.len() > MCP_CONFIG_MAX_ENV_ENTRIES {
+            return Err("too_many_env_entries");
+        }
+        for (key, value) in &server.env {
+            if !safe_str(key, MCP_CONFIG_MAX_ENV_KEY_BYTES) {
+                return Err("invalid_env_key");
+            }
+            if value.len() > MCP_CONFIG_MAX_ENV_VALUE_BYTES || value.chars().any(char::is_control) {
+                return Err("invalid_env_value");
+            }
         }
     }
+    Ok(())
 }
 
 /// Connect to all configured MCP servers and register their tools.
@@ -275,6 +357,106 @@ mod tests {
         let server = &config.mcp_servers["test"];
         assert_eq!(server.command, "echo");
         assert_eq!(server.args, vec!["hi"]);
+    }
+
+    fn base_server() -> McpServerConfig {
+        McpServerConfig {
+            command: "/bin/true".to_string(),
+            args: vec!["--flag".to_string()],
+            env: HashMap::from([("KEY".to_string(), "value".to_string())]),
+        }
+    }
+
+    fn config_of(servers: Vec<(&str, McpServerConfig)>) -> McpConfig {
+        McpConfig {
+            mcp_servers: servers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_config_accepts_sane_configs() {
+        assert!(validate_mcp_config(&config_of(vec![("srv", base_server())])).is_ok());
+        assert!(validate_mcp_config(&config_of(vec![])).is_ok());
+    }
+
+    #[test]
+    fn validate_mcp_config_fails_whole_config_closed_on_structural_violations() {
+        // Too many servers.
+        let many: Vec<(String, McpServerConfig)> = (0..=MCP_CONFIG_MAX_SERVERS)
+            .map(|i| (format!("s{i}"), base_server()))
+            .collect();
+        let config = McpConfig {
+            mcp_servers: many.into_iter().collect(),
+        };
+        assert_eq!(validate_mcp_config(&config), Err("too_many_servers"));
+
+        // Hostile server name (control chars) and oversized name.
+        let mut c = base_server();
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("evil\u{7}", c.clone())])),
+            Err("invalid_server_name")
+        );
+        let long_name = "n".repeat(MCP_CONFIG_MAX_SERVER_NAME_BYTES + 1);
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![(long_name.as_str(), c.clone())])),
+            Err("invalid_server_name")
+        );
+
+        // Command: empty, oversized, control-bearing.
+        c.command = String::new();
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_command")
+        );
+        c.command = "x".repeat(MCP_CONFIG_MAX_COMMAND_BYTES + 1);
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_command")
+        );
+        c.command = "bad\u{0}cmd".to_string();
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_command")
+        );
+
+        // Args: count and shape.
+        let mut c = base_server();
+        c.args = vec!["a".to_string(); MCP_CONFIG_MAX_ARGS + 1];
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("too_many_args")
+        );
+        c.args = vec!["ok".to_string(), "bad\u{1b}arg".to_string()];
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_arg")
+        );
+
+        // Env: entry count, key shape, value shape.
+        let mut c = base_server();
+        c.env = (0..=MCP_CONFIG_MAX_ENV_ENTRIES)
+            .map(|i| (format!("K{i}"), "v".to_string()))
+            .collect();
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("too_many_env_entries")
+        );
+        c.env = HashMap::from([(String::new(), "v".to_string())]);
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_env_key")
+        );
+        c.env = HashMap::from([(
+            "K".to_string(),
+            "v".repeat(MCP_CONFIG_MAX_ENV_VALUE_BYTES + 1),
+        )]);
+        assert_eq!(
+            validate_mcp_config(&config_of(vec![("srv", c.clone())])),
+            Err("invalid_env_value")
+        );
     }
 
     #[test]
