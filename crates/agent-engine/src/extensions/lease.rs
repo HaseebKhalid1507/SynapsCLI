@@ -975,7 +975,7 @@ impl ExtensionHandler for LazyExtensionHandler {
         command: &str,
         args: Vec<String>,
         request_id: &str,
-        sink: tokio::sync::mpsc::UnboundedSender<super::runtime::InvokeCommandEvent>,
+        sink: crate::extensions::invoke_output::InvokeEventSink,
     ) -> Result<Value, String> {
         let inner = self.live().await?;
         let result = inner

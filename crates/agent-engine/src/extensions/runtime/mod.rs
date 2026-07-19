@@ -121,19 +121,24 @@ pub trait ExtensionHandler: Send + Sync {
     /// forward `command.output` notifications matching `request_id` and any
     /// `task.*` notifications to `sink`. Returns the final response value.
     ///
-    /// CP-11 fix-2 (B) audit note: this sink intentionally stays UNBOUNDED.
-    /// It is a user-initiated control lane (one in-flight command per user
-    /// action, 120 s invoke timeout, ≤ 4 MiB per reader frame), and its TUI
-    /// consumer drains only after the call resolves — an awaited bounded
-    /// send here would deadlock that post-hoc drain against the reader.
-    /// The bounded notification queue in front of it still paces hostile
-    /// frame production. Model/tool byte paths never flow through this sink.
+    /// CP-11 fix-3: the sink is BOUNDED and metered
+    /// ([`crate::extensions::invoke_output::InvokeEventSink`]). It must be
+    /// paired with an EAGERLY CONCURRENT consumer — normally the collector
+    /// half of [`crate::extensions::invoke_output::invoke_event_channel`],
+    /// joined with this call by
+    /// `ExtensionManager::invoke_command_collected` — which enforces
+    /// invocation-local byte/event budgets at production time. A hostile
+    /// `command.output` flood is therefore paced by awaited sends and
+    /// bounded retention instead of parking aggregate bytes in an
+    /// unbounded post-hoc queue (the pre-fix behavior). Handlers must
+    /// treat a closed sink like the old closed-unbounded-sink case: stop
+    /// forwarding, still complete the call.
     async fn invoke_command(
         &self,
         _command: &str,
         _args: Vec<String>,
         _request_id: &str,
-        _sink: tokio::sync::mpsc::UnboundedSender<InvokeCommandEvent>,
+        _sink: crate::extensions::invoke_output::InvokeEventSink,
     ) -> Result<Value, String> {
         Err("extension runtime does not support command.invoke".to_string())
     }

@@ -1036,18 +1036,61 @@ impl ExtensionManager {
     /// Invoke an interactive plugin command on extension `id`. Streams
     /// `command.output` (matching `request_id`) and `task.*` notifications
     /// to `sink`. Returns the final JSON-RPC response value.
+    ///
+    /// CP-11 fix-3: `sink` is the bounded, metered producer half of
+    /// [`crate::extensions::invoke_output::invoke_event_channel`]; the
+    /// caller MUST drive the matching collector concurrently with this
+    /// call (an awaited bounded send with no consumer would stall the
+    /// invocation loop until the 120 s timeout). Prefer
+    /// [`Self::invoke_command_collected`], which wires that correctly.
     pub async fn invoke_command(
         &self,
         id: &str,
         command: &str,
         args: Vec<String>,
         request_id: &str,
-        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+        sink: crate::extensions::invoke_output::InvokeEventSink,
     ) -> Result<serde_json::Value, String> {
         let handler = self.user_action_handler(id)?;
         handler
             .invoke_command(command, args, request_id, sink)
             .await
+    }
+
+    /// Invoke an interactive plugin command and collect its budgeted
+    /// output. This is THE production entry point for user-facing
+    /// surfaces: it joins the invocation with an eagerly concurrent
+    /// collector so hostile `command.output` floods are paced and capped
+    /// at production time (never parked unbounded), then returns the
+    /// final response alongside the retained events and exact
+    /// produced/consumed/retained/truncated/dropped accounting.
+    ///
+    /// Dropping the returned future cancels the invocation, drops the
+    /// sink, and releases the collector plus any blocked producers — no
+    /// detached tasks are spawned.
+    pub async fn invoke_command_collected(
+        &self,
+        id: &str,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+    ) -> (
+        Result<serde_json::Value, String>,
+        crate::extensions::invoke_output::InvokeOutputReport,
+    ) {
+        let (sink, collector) = crate::extensions::invoke_output::invoke_event_channel(
+            crate::extensions::invoke_output::InvokeOutputBudget::default(),
+        );
+        let handler = match self.user_action_handler(id) {
+            Ok(handler) => handler,
+            Err(error) => {
+                drop(sink);
+                return (Err(error), collector.collect().await);
+            }
+        };
+        let invoke = handler.invoke_command(command, args, request_id, sink);
+        let (result, report) = tokio::join!(invoke, collector.collect());
+        (result, report)
     }
 
     pub async fn settings_editor_open(
@@ -1521,6 +1564,102 @@ impl ExtensionManager {
         }
 
         (loaded, failed)
+    }
+}
+
+#[cfg(test)]
+mod invoke_command_collected_tests {
+    //! CP-11 fix-3: prove the manager's collected entry point pairs the
+    //! bounded sink with an eagerly concurrent collector — an in-process
+    //! handler that floods far past the channel capacity AND the retained
+    //! budget must neither deadlock nor grow retention, and accounting
+    //! must be exact.
+    use super::*;
+    use crate::extensions::commands::CommandOutputEvent;
+    use crate::extensions::invoke_output::INVOKE_RETAINED_BYTE_BUDGET;
+    use crate::extensions::runtime::InvokeCommandEvent;
+
+    struct FloodingHandler;
+
+    #[async_trait::async_trait]
+    impl super::ExtensionHandler for FloodingHandler {
+        fn id(&self) -> &str {
+            "flooding-fake"
+        }
+        async fn handle(
+            &self,
+            _event: &crate::extensions::hooks::events::HookEvent,
+        ) -> crate::extensions::hooks::events::HookResult {
+            Default::default()
+        }
+        async fn shutdown(&self) {}
+
+        async fn invoke_command(
+            &self,
+            _command: &str,
+            _args: Vec<String>,
+            _request_id: &str,
+            sink: crate::extensions::invoke_output::InvokeEventSink,
+        ) -> Result<Value, String> {
+            // 2048 x 4 KiB = 8 MiB >> 256 KiB budget, and 2048 events
+            // >> channel capacity 8: every awaited send past capacity
+            // requires the concurrent collector to make progress.
+            for _ in 0..2048 {
+                let event = InvokeCommandEvent::Output(CommandOutputEvent::Text {
+                    content: "f".repeat(4096),
+                });
+                if sink.send(event).await.is_err() {
+                    return Err("collector vanished".to_string());
+                }
+            }
+            let _ = sink
+                .send(InvokeCommandEvent::Output(CommandOutputEvent::Done))
+                .await;
+            Ok(serde_json::json!({"status": "flooded"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn collected_invoke_bounds_in_process_flood_without_deadlock() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus);
+        mgr.extensions
+            .insert("flooding-fake".to_string(), Arc::new(FloodingHandler));
+
+        let (result, report) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mgr.invoke_command_collected("flooding-fake", "any", vec![], "req-1"),
+        )
+        .await
+        .expect("bounded sink + concurrent collector must not deadlock");
+
+        assert_eq!(result.expect("invoke ok")["status"], "flooded");
+        let c = &report.counters;
+        assert_eq!(c.produced_events, 2049);
+        assert_eq!(c.produced_payload_bytes, 2048 * 4096);
+        assert_eq!(c.consumed_events, c.produced_events);
+        assert_eq!(c.consumed_payload_bytes, c.produced_payload_bytes);
+        assert_eq!(c.retained_payload_bytes, INVOKE_RETAINED_BYTE_BUDGET as u64);
+        assert!(c.saw_done);
+        assert_eq!(
+            c.consumed_payload_bytes,
+            c.retained_payload_bytes + c.truncated_payload_bytes + c.dropped_payload_bytes,
+        );
+        assert_eq!(c.consumed_events, c.retained_events + c.dropped_events);
+    }
+
+    #[tokio::test]
+    async fn collected_invoke_reports_unknown_extension_with_empty_report() {
+        let bus = Arc::new(HookBus::new());
+        let mgr = ExtensionManager::new(bus);
+        let (result, report) = mgr
+            .invoke_command_collected("nope", "any", vec![], "req-1")
+            .await;
+        assert!(result
+            .expect_err("unknown id")
+            .contains("unknown extension"));
+        assert!(report.events.is_empty());
+        assert_eq!(report.counters.produced_events, 0);
     }
 }
 

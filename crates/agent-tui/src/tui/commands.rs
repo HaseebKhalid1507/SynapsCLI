@@ -191,12 +191,17 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
     app: &mut App,
 ) {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InvokeCommandEvent>();
-    let result = manager
-        .invoke_command(plugin_extension_id, command_name, args, &request_id, tx)
+    // CP-11 fix-3: the collected entry point pairs the bounded event sink
+    // with an eagerly concurrent collector, so a hostile command-output
+    // flood is paced and capped at production time. The report holds the
+    // budget-bounded retained events plus exact accounting; consuming it
+    // here (post-hoc, as before) can no longer affect host retention.
+    let (result, report) = manager
+        .invoke_command_collected(plugin_extension_id, command_name, args, &request_id)
         .await;
 
-    while let Ok(event) = rx.try_recv() {
+    let notice = report.limit_notice();
+    for event in report.events {
         match event {
             InvokeCommandEvent::Output(output) => {
                 if let Some(msg) = command_output_event_to_chat_message(output) {
@@ -206,6 +211,15 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
             InvokeCommandEvent::Task(task) => {
                 std::sync::Arc::make_mut(&mut app.active_tasks).apply(task)
             }
+        }
+    }
+    if let Some(notice) = notice {
+        // Preserve error visibility: dropped Error events surface the
+        // notice on the error channel.
+        if notice.severity_error {
+            app.push_msg(ChatMessage::Error(notice.message));
+        } else {
+            app.push_msg(ChatMessage::System(notice.message));
         }
     }
 
