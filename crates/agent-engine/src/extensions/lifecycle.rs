@@ -199,8 +199,10 @@ pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static
         {
             return Err("invalid_declared_provider_display_name");
         }
-        if provider.description.len() > DECLARED_DESCRIPTION_MAX_BYTES {
-            return Err("oversized_declared_provider_description");
+        if provider.description.is_empty()
+            || provider.description.len() > DECLARED_DESCRIPTION_MAX_BYTES
+        {
+            return Err("invalid_declared_provider_description");
         }
         if provider.models.is_empty() || provider.models.len() > DECLARED_MAX_PROVIDER_MODELS {
             return Err("invalid_declared_provider_model_count");
@@ -293,8 +295,11 @@ fn validate_tool_shape(
     if !valid_name(name) || name.contains(':') {
         return Err("invalid_declared_tool_name");
     }
-    if description.len() > DECLARED_DESCRIPTION_MAX_BYTES {
-        return Err("oversized_declared_tool_description");
+    // Non-empty required: the runtime's initialize validation refuses
+    // empty descriptions, so an empty declaration could never match a
+    // live registration — fail closed at manifest time instead.
+    if description.trim().is_empty() || description.len() > DECLARED_DESCRIPTION_MAX_BYTES {
+        return Err("invalid_declared_tool_description");
     }
     if !input_schema.is_object() {
         return Err("declared_tool_schema_not_object");
@@ -411,6 +416,35 @@ pub fn validate_runtime_provider_declarations(
         }
     }
     Ok(())
+}
+
+impl DeclaredExtensionProvider {
+    /// Convert a VALIDATED passive declaration into the runtime's
+    /// `RegisteredProviderSpec` shape for metadata-only registration
+    /// (Task 20 Commit C). Field-for-field: routing later re-validates the
+    /// live runtime's registrations against these same declarations.
+    pub fn to_registered_spec(
+        &self,
+    ) -> crate::extensions::runtime::process::RegisteredProviderSpec {
+        crate::extensions::runtime::process::RegisteredProviderSpec {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            models: self
+                .models
+                .iter()
+                .map(
+                    |model| crate::extensions::runtime::process::RegisteredProviderModelSpec {
+                        id: model.id.clone(),
+                        display_name: model.display_name.clone(),
+                        capabilities: model.capabilities.clone(),
+                        context_window: model.context_window,
+                    },
+                )
+                .collect(),
+            config_schema: self.config_schema.clone(),
+        }
+    }
 }
 
 /// A dormant, manifest-declared extension tool. Registered like any live

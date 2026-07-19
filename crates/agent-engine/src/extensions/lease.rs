@@ -191,6 +191,13 @@ pub struct ExtensionRuntimeManager {
     records: SharedDeferredRecords,
     idle_max: Duration,
     next_token: std::sync::atomic::AtomicU64,
+    /// Host-scope session identity for HANDLER-based acquisition (hook
+    /// events, provider routing, user sidecar/command APIs). Bound at
+    /// engine boot to the Runtime's durable tool session, so a MIXED
+    /// extension's tool leases and handler leases share ONE key — one
+    /// shared child process per plugin. Unbound (tests/manual) falls back
+    /// to a fixed private scope.
+    host_scope: std::sync::OnceLock<SessionId>,
 }
 
 impl ExtensionRuntimeManager {
@@ -200,7 +207,25 @@ impl ExtensionRuntimeManager {
             records,
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
+            host_scope: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bind the host-scope session identity used by handler-based
+    /// acquisition (first binder wins; the engine binds the Runtime's
+    /// durable tool session at boot so Mixed extensions share one child).
+    pub fn bind_host_scope(&self, session: SessionId) {
+        let _ = self.host_scope.set(session);
+    }
+
+    /// The host-scope session identity (bound, or the private fallback).
+    pub fn host_scope(&self) -> SessionId {
+        self.host_scope
+            .get_or_init(|| {
+                SessionId::parse("extension-host-scope")
+                    .expect("static host scope identity is valid")
+            })
+            .clone()
     }
 
     fn current_record(&self, plugin: &str) -> Option<DeferredExtensionRecord> {
@@ -359,50 +384,20 @@ impl ExtensionRuntimeManager {
         }
     }
 
-    /// Execute one EXACT already-gate-authorized extension tool call. See
-    /// module docs for the lease/single-flight/validation contract.
-    pub async fn call_exact(
+    /// Single-flight acquisition of the validated Ready lease for one
+    /// (session, plugin) key. Shared by exact tool calls and handler-based
+    /// (hook/provider/user) acquisition — one child per key. The map lock
+    /// is never held across I/O; a live lease whose pinned launch
+    /// fingerprint no longer matches the CURRENT record is launch drift
+    /// and fails closed after terminating the stale child.
+    async fn acquire_ready(
         &self,
         session: &SessionId,
         plugin: &str,
-        tool_name: &str,
-        expected_digest: &SchemaDigest,
-        params: Value,
-    ) -> Result<Value, ExtensionLeaseError> {
-        // 1. Re-read the retained internal launch record (pure local).
-        let Some(record) = self.current_record(plugin) else {
-            self.revoke_plugin_lease(session, plugin);
-            return Err(ExtensionLeaseError::NotDeferred(plugin.to_string()));
-        };
-        // 2. RE-VALIDATE the manifest — permissions included — before any
-        // spawn decision (defense in depth: records are trusted internal
-        // state, but a permission that no longer validates must fail
-        // closed here, not after a child exists).
-        let Ok(validated) = record.manifest.validate(plugin) else {
-            self.revoke_plugin_lease(session, plugin);
-            return Err(ExtensionLeaseError::ManifestInvalid(plugin.to_string()));
-        };
-        // 3. Catalog-drift check: the CURRENT record must still declare
-        // this exact tool with the digest pinned in the catalog entry.
-        let declared_tools = record
-            .manifest
-            .deferred
-            .as_ref()
-            .map(|d| d.tools.as_slice())
-            .unwrap_or(&[]);
-        let still_declared = declared_tools.iter().any(|t| {
-            t.name == tool_name && &SchemaDigest::of_schema(&t.input_schema) == expected_digest
-        });
-        if !still_declared {
-            self.revoke_plugin_lease(session, plugin);
-            return Err(ExtensionLeaseError::DeclarationDrift(
-                plugin.to_string(),
-                tool_name.to_string(),
-            ));
-        }
-        let expected_fingerprint = record_fingerprint(&record);
-        self.reap_idle();
-
+        record: &DeferredExtensionRecord,
+        validated: &super::manifest::ValidatedExtensionManifest,
+    ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
+        let expected_fingerprint = record_fingerprint(record);
         let key = (session.as_str().to_string(), plugin.to_string());
         let inner: Arc<LeaseInner> = loop {
             // 4. Single-flight acquisition: the guard-scoped decision
@@ -494,7 +489,7 @@ impl ExtensionRuntimeManager {
                 }
                 Acquire::Start { token, done_tx } => {
                     let started = self
-                        .start_lease(plugin, &record, &validated, expected_fingerprint.clone())
+                        .start_lease(plugin, record, validated, expected_fingerprint.clone())
                         .await;
                     let ours = {
                         let mut map = self
@@ -538,6 +533,101 @@ impl ExtensionRuntimeManager {
             }
         };
 
+        Ok(inner)
+    }
+
+    /// Acquire the shared validated per-plugin lease under the HOST scope
+    /// for handler-based capabilities (hook events, provider routing, user
+    /// sidecar/command/settings APIs). Same record re-validation, exact
+    /// runtime declaration matching, single-flight, and teardown rules as
+    /// exact tool calls — and, when the host scope is bound to the
+    /// Runtime's tool session (engine boot), the SAME lease key: a Mixed
+    /// extension runs ONE shared child.
+    async fn acquire_handler_scope(
+        &self,
+        plugin: &str,
+    ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
+        let session = self.host_scope();
+        let (record, validated) = self.record_and_validate(&session, plugin)?;
+        self.reap_idle();
+        self.acquire_ready(&session, plugin, &record, &validated)
+            .await
+    }
+
+    /// Whether a Ready (non-cancelled) lease exists for one key.
+    fn has_ready_lease(&self, session: &SessionId, plugin: &str) -> bool {
+        let map = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(
+            map.get(&(session.as_str().to_string(), plugin.to_string())),
+            Some(LeaseState::Ready(inner)) if !inner.cancelled()
+        )
+    }
+
+    /// Steps shared by every acquisition path: re-read the retained
+    /// internal launch record and RE-VALIDATE the manifest (permissions
+    /// included) before any spawn decision. Failure revokes the session's
+    /// plugin lease and fails closed.
+    fn record_and_validate(
+        &self,
+        session: &SessionId,
+        plugin: &str,
+    ) -> Result<
+        (
+            DeferredExtensionRecord,
+            super::manifest::ValidatedExtensionManifest,
+        ),
+        ExtensionLeaseError,
+    > {
+        let Some(record) = self.current_record(plugin) else {
+            self.revoke_plugin_lease(session, plugin);
+            return Err(ExtensionLeaseError::NotDeferred(plugin.to_string()));
+        };
+        let Ok(validated) = record.manifest.validate(plugin) else {
+            self.revoke_plugin_lease(session, plugin);
+            return Err(ExtensionLeaseError::ManifestInvalid(plugin.to_string()));
+        };
+        Ok((record, validated))
+    }
+
+    /// Execute one EXACT already-gate-authorized extension tool call. See
+    /// module docs for the lease/single-flight/validation contract.
+    pub async fn call_exact(
+        &self,
+        session: &SessionId,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+    ) -> Result<Value, ExtensionLeaseError> {
+        // 1.-2. Record re-read + manifest re-validation (pure local).
+        let (record, validated) = self.record_and_validate(session, plugin)?;
+        // 3. Catalog-drift check: the CURRENT record must still declare
+        // this exact tool with the digest pinned in the catalog entry.
+        let declared_tools = record
+            .manifest
+            .deferred
+            .as_ref()
+            .map(|d| d.tools.as_slice())
+            .unwrap_or(&[]);
+        let still_declared = declared_tools.iter().any(|t| {
+            t.name == tool_name && &SchemaDigest::of_schema(&t.input_schema) == expected_digest
+        });
+        if !still_declared {
+            self.revoke_plugin_lease(session, plugin);
+            return Err(ExtensionLeaseError::DeclarationDrift(
+                plugin.to_string(),
+                tool_name.to_string(),
+            ));
+        }
+        self.reap_idle();
+
+        // 4. Single-flight acquisition of the validated per-plugin lease.
+        let inner = self
+            .acquire_ready(session, plugin, &record, &validated)
+            .await?;
         // 5. Exact validation against the pinned validated listing BEFORE
         // any call.
         match inner.listing.get(tool_name) {
@@ -773,6 +863,201 @@ impl Drop for ExtensionSessionEndGuard {
 impl std::fmt::Debug for ExtensionSessionEndGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionSessionEndGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Lazy [`ExtensionHandler`] for deferred hook/provider/user capabilities
+/// (Task 20 Commit C). Registered/subscribed at load WITHOUT a process;
+/// the first AUTHORIZED use (a matching hook event delivered by the
+/// permission-checked `HookBus` subscription, a selected provider
+/// complete/stream, or an explicit user sidecar/command/settings action)
+/// single-flights through the SAME per-plugin lease manager — starting
+/// and exact-validating the child once. Discovery, load, search, and
+/// diagnostics never acquire.
+pub struct LazyExtensionHandler {
+    plugin: String,
+    manager: Arc<ExtensionRuntimeManager>,
+}
+
+impl LazyExtensionHandler {
+    pub fn new(plugin: &str, manager: Arc<ExtensionRuntimeManager>) -> Self {
+        Self {
+            plugin: plugin.to_string(),
+            manager,
+        }
+    }
+
+    /// Acquire the shared validated lease (host scope) and hand back the
+    /// live inner. Static-only failure text.
+    async fn live(&self) -> Result<Arc<LeaseInner>, String> {
+        self.manager
+            .acquire_handler_scope(&self.plugin)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn touch(inner: &LeaseInner) {
+        *inner
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+    }
+}
+
+#[async_trait::async_trait]
+impl ExtensionHandler for LazyExtensionHandler {
+    fn id(&self) -> &str {
+        &self.plugin
+    }
+
+    async fn handle(
+        &self,
+        event: &crate::extensions::hooks::events::HookEvent,
+    ) -> crate::extensions::hooks::events::HookResult {
+        // First AUTHORIZED matching event (the HookBus checked the
+        // permission at subscribe time and matched the filter) starts the
+        // child. Acquisition failure follows the documented eager hook
+        // transport policy: warn + Continue (never a silent block).
+        match self.live().await {
+            Ok(inner) => {
+                let result = inner.handler.handle(event).await;
+                Self::touch(&inner);
+                result
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extension = %self.plugin,
+                    error = %error,
+                    "Deferred extension could not start for hook event — continuing",
+                );
+                crate::extensions::hooks::events::HookResult::Continue
+            }
+        }
+    }
+
+    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
+        // FAIL CLOSED: deferred extension tool execution flows ONLY
+        // through the gate-authorized exact lease path
+        // (`ExtensionRuntimeManager::call_exact`, which pins and checks
+        // the declared name + canonical schema digest). A generic handler
+        // call with an arbitrary tool name would bypass those checks.
+        Err(format!(
+            "extension '{}' is deferred: tool calls are only served through the \
+             gate-authorized exact activation path",
+            self.plugin
+        ))
+    }
+
+    async fn provider_complete(
+        &self,
+        params: super::runtime::process::ProviderCompleteParams,
+    ) -> Result<super::runtime::process::ProviderCompleteResult, String> {
+        let inner = self.live().await?;
+        let result = inner.handler.provider_complete(params).await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn provider_stream(
+        &self,
+        params: super::runtime::process::ProviderCompleteParams,
+        sink: tokio::sync::mpsc::UnboundedSender<super::runtime::process::ProviderStreamEvent>,
+    ) -> Result<super::runtime::process::ProviderCompleteResult, String> {
+        let inner = self.live().await?;
+        let result = inner.handler.provider_stream(params, sink).await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn invoke_command(
+        &self,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<super::runtime::InvokeCommandEvent>,
+    ) -> Result<Value, String> {
+        let inner = self.live().await?;
+        let result = inner
+            .handler
+            .invoke_command(command, args, request_id, sink)
+            .await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
+        // Diagnostics must never spawn a deferred extension.
+        Err("deferred extension info is unavailable without activation".to_string())
+    }
+
+    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        // Explicit user sidecar action: a legitimate acquisition trigger.
+        let inner = self.live().await?;
+        let result = inner.handler.sidecar_spawn_args().await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {
+        let inner = self.live().await?;
+        let result = inner.handler.settings_editor_open(category, field).await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn settings_editor_key(
+        &self,
+        category: &str,
+        field: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        let inner = self.live().await?;
+        let result = inner
+            .handler
+            .settings_editor_key(category, field, key)
+            .await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn settings_editor_commit(
+        &self,
+        category: &str,
+        field: &str,
+        value: Value,
+    ) -> Result<Value, String> {
+        let inner = self.live().await?;
+        let result = inner
+            .handler
+            .settings_editor_commit(category, field, value)
+            .await;
+        Self::touch(&inner);
+        result
+    }
+
+    async fn shutdown(&self) {
+        // Terminates every session's lease for this plugin; never spawns.
+        self.manager.revoke_plugin_all_sessions(&self.plugin);
+    }
+
+    async fn health(&self) -> super::runtime::ExtensionHealth {
+        // Dormant reporting only — health checks never spawn.
+        if self
+            .manager
+            .has_ready_lease(&self.manager.host_scope(), &self.plugin)
+        {
+            super::runtime::ExtensionHealth::Running
+        } else {
+            super::runtime::ExtensionHealth::Loaded
+        }
+    }
+}
+
+impl std::fmt::Debug for LazyExtensionHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyExtensionHandler")
+            .field("plugin", &self.plugin)
             .finish_non_exhaustive()
     }
 }

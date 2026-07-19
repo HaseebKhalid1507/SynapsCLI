@@ -243,14 +243,21 @@ impl ExtensionManager {
         self.progressive_deferral = enabled;
     }
 
-    /// Whether one plugin id is currently deferred (tool-only, zero spawn).
-    /// Boolean-only diagnostic: the underlying launch record (which holds
-    /// resolved — potentially secret — config) is never exposed.
-    pub fn is_deferred_tool_only(&self, id: &str) -> bool {
+    /// Whether one plugin id is currently deferred (any Task 20 class:
+    /// tool-only, provider, hook/lifecycle, UI/sidecar, mixed — zero
+    /// spawn). Boolean-only diagnostic: the underlying launch record
+    /// (which holds resolved — potentially secret — config) is never
+    /// exposed.
+    pub fn is_deferred(&self, id: &str) -> bool {
         self.deferred_records()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(id)
+    }
+
+    /// Compatibility alias for [`Self::is_deferred`] (Commit B name).
+    pub fn is_deferred_tool_only(&self, id: &str) -> bool {
+        self.is_deferred(id)
     }
 
     /// Number of retained deferred tool-only launch records (count-only
@@ -362,30 +369,49 @@ impl ExtensionManager {
         let permissions = validated.permissions;
         let subscriptions = validated.subscriptions;
 
-        // Task 20: under progressive disclosure, a TOOL-ONLY manifest with
-        // validated passive declarations defers its spawn entirely — its
-        // dormant descriptor tools are cataloged (zero process, zero
-        // network) and the launch record is retained for exact-activation
-        // lease acquisition. Every other class (legacy eager, provider,
-        // hook, sidecar, mixed) continues on the existing eager path in
-        // this commit.
+        // Task 20: under progressive disclosure, EVERY manifest with a
+        // validated `deferred` block defers its spawn entirely (spec §7.5):
+        //  - tool-only: dormant descriptor tools cataloged; exact
+        //    activation acquires the lease;
+        //  - provider: declared provider METADATA registered with a lazy
+        //    handler; first selected complete/stream acquires;
+        //  - hook/lifecycle: permission-validated subscriptions registered
+        //    with a lazy handler; the first AUTHORIZED matching event
+        //    acquires;
+        //  - UI/sidecar: record retained only; explicit user APIs acquire;
+        //  - mixed: all of the above against ONE shared per-plugin lease
+        //    (earliest legitimate capability starts it; tool SEARCH alone
+        //    never does).
+        // Legacy manifests (no `deferred` block) and flag-off stay on the
+        // documented eager path byte-for-byte.
+        let class = crate::extensions::lifecycle::classify(manifest);
         if self.progressive_deferral
-            && crate::extensions::lifecycle::classify(manifest)
-                == crate::extensions::lifecycle::ExtensionClass::ToolOnly
+            && class != crate::extensions::lifecycle::ExtensionClass::LegacyEager
         {
+            let declared_tool_names: Vec<String> = manifest
+                .deferred
+                .as_ref()
+                .map(|d| d.tools.iter().map(|t| format!("{id}:{}", t.name)).collect())
+                .unwrap_or_default();
             let dormant = crate::extensions::lifecycle::dormant_extension_tools(id, manifest);
-            let Some(tools) = &self.tools else {
-                return Err(format!(
-                    "Extension '{}' declares deferred tools but no tool registry is available",
-                    id
-                ));
-            };
-            let count = dormant.len();
-            tools
-                .write()
-                .await
-                .try_register_batch(dormant)
-                .map_err(|e| format!("Extension '{}' deferred tool catalog rejected: {}", id, e))?;
+            let tool_count = dormant.len();
+            if !dormant.is_empty() {
+                let Some(tools) = &self.tools else {
+                    return Err(format!(
+                        "Extension '{}' declares deferred tools but no tool registry is available",
+                        id
+                    ));
+                };
+                tools
+                    .write()
+                    .await
+                    .try_register_batch(dormant)
+                    .map_err(|e| {
+                        format!("Extension '{}' deferred tool catalog rejected: {}", id, e)
+                    })?;
+            }
+            // Retain the launch record BEFORE registering lazy capability
+            // surfaces so a capability firing immediately can acquire.
             self.deferred_tool_only
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -394,13 +420,109 @@ impl ExtensionManager {
                     DeferredExtensionRecord {
                         manifest: manifest.clone(),
                         cwd,
-                        config,
+                        config: config.clone(),
                     },
                 );
+            // Bounded unwind shared by the failure paths below: remove the
+            // record, the dormant batch, and any provider metadata.
+            macro_rules! unwind_deferred {
+                () => {{
+                    self.deferred_tool_only
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(id);
+                    self.providers.unregister_plugin(id);
+                    if let Some(tools) = &self.tools {
+                        let _ = tools.write().await.try_disable(&declared_tool_names);
+                    }
+                    self.hook_bus.unsubscribe_all(id).await;
+                }};
+            }
+            let lazy: Option<Arc<dyn ExtensionHandler>> = {
+                // Created only when a lazy capability surface exists, so a
+                // tool-only load never pre-initializes the runtime manager
+                // (its idle policy stays first-caller-configurable).
+                let needs_lazy = manifest
+                    .deferred
+                    .as_ref()
+                    .map(|d| !d.providers.is_empty())
+                    .unwrap_or(false)
+                    || !manifest.hooks.is_empty();
+                needs_lazy.then(|| {
+                    Arc::new(crate::extensions::lease::LazyExtensionHandler::new(
+                        id,
+                        self.extension_runtime(),
+                    )) as Arc<dyn ExtensionHandler>
+                })
+            };
+            // Declared provider METADATA (validated shape) registered with
+            // the lazy handler; routing re-validates the live runtime's
+            // declarations against the manifest before any call.
+            let declared_providers: Vec<_> = manifest
+                .deferred
+                .as_ref()
+                .map(|d| d.providers.clone())
+                .unwrap_or_default();
+            let mut registered_provider_ids = Vec::new();
+            for declared in &declared_providers {
+                let spec = declared.to_registered_spec();
+                if let Err(error) = Self::validate_provider_config_requirements(id, &spec, &config)
+                {
+                    unwind_deferred!();
+                    return Err(error);
+                }
+                let handler = lazy.clone().expect("providers imply a lazy handler");
+                match self
+                    .providers
+                    .register_with_handler(id, spec, Some(handler))
+                {
+                    Ok(runtime_id) => registered_provider_ids.push(runtime_id),
+                    Err(error) => {
+                        unwind_deferred!();
+                        return Err(error);
+                    }
+                }
+            }
+            // Tool-use audit parity with the eager path.
+            for runtime_id in &registered_provider_ids {
+                if let Some(provider) = self.providers.get(runtime_id) {
+                    let tool_use = provider.spec.models.iter().any(|m| {
+                        m.capabilities
+                            .get("tool_use")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    });
+                    if tool_use {
+                        tracing::warn!(
+                            "Provider '{}' is tool-use capable: it can request Synaps tools through provider mediation. Use `/extensions trust disable {}` to block routing.",
+                            runtime_id,
+                            runtime_id,
+                        );
+                    }
+                }
+            }
+            // Permission-validated hook subscriptions with the lazy
+            // handler: the first AUTHORIZED matching event acquires.
+            for (kind, tool_filter, matcher) in subscriptions {
+                let handler = lazy.clone().expect("subscriptions imply a lazy handler");
+                if let Err(error) = self
+                    .hook_bus
+                    .subscribe(kind, handler, tool_filter, matcher, permissions.clone())
+                    .await
+                {
+                    unwind_deferred!();
+                    return Err(error);
+                }
+            }
             self.manifest_configs
                 .insert(id.to_string(), manifest.config.clone());
-            tracing::info!(extension = %id, tools = count,
-                "Tool-only extension deferred: dormant descriptors cataloged, no process started");
+            if !manifest.theme_tokens.is_empty() {
+                self.manifest_theme_tokens
+                    .insert(id.to_string(), manifest.theme_tokens.clone());
+            }
+            tracing::info!(extension = %id, class = ?class, tools = tool_count,
+                providers = registered_provider_ids.len(), hooks = manifest.hooks.len(),
+                "Extension deferred: passive surfaces registered, no process started");
             return Ok(());
         }
 
@@ -709,6 +831,8 @@ impl ExtensionManager {
                         "Terminated live runtime leases of unloaded deferred extension");
                 }
             }
+            self.hook_bus.unsubscribe_all(id).await;
+            self.providers.unregister_plugin(id);
             if let Some(tools) = &self.tools {
                 let names: Vec<String> = record
                     .manifest
@@ -880,15 +1004,32 @@ impl ExtensionManager {
     /// plugins that don't host a sidecar (or pre-Phase-7 plugins that
     /// haven't implemented the RPC yet) return `Err`. Callers are
     /// expected to treat that as "no overrides; use manifest defaults".
+    /// Handler for explicit USER-triggered plugin APIs (sidecar spawn,
+    /// interactive commands, settings editors). Live extensions use their
+    /// running handler; a DEFERRED extension (Task 20) gets a lazy handler
+    /// whose first use acquires the shared per-plugin runtime lease — a
+    /// user action is a legitimate activation trigger. Discovery/search/
+    /// diagnostics never call this.
+    fn user_action_handler(
+        &self,
+        id: &str,
+    ) -> Result<Arc<dyn super::runtime::ExtensionHandler>, String> {
+        if let Some(handler) = self.extensions.get(id) {
+            return Ok(handler.clone());
+        }
+        if self.is_deferred(id) {
+            return Ok(Arc::new(
+                crate::extensions::lease::LazyExtensionHandler::new(id, self.extension_runtime()),
+            ));
+        }
+        Err(format!("unknown extension '{}'", id))
+    }
+
     pub async fn sidecar_spawn_args(
         &self,
         id: &str,
     ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.sidecar_spawn_args().await
     }
 
@@ -903,11 +1044,7 @@ impl ExtensionManager {
         request_id: &str,
         sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler
             .invoke_command(command, args, request_id, sink)
             .await
@@ -919,11 +1056,7 @@ impl ExtensionManager {
         category: &str,
         field: &str,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_open(category, field).await
     }
 
@@ -934,11 +1067,7 @@ impl ExtensionManager {
         field: &str,
         key: &str,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_key(category, field, key).await
     }
 
@@ -949,11 +1078,7 @@ impl ExtensionManager {
         field: &str,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_commit(category, field, value).await
     }
 

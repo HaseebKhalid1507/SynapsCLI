@@ -750,3 +750,317 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     );
     fx.cleanup();
 }
+
+// ── Commit C: provider / hook / sidecar / mixed / legacy classes ────────────
+
+/// Flexible fixture: custom manifest JSON with fixture argv wired in.
+fn fixture_with(
+    tag: &str,
+    mode: &str,
+    tools: Value,
+    providers: Option<Value>,
+    mut manifest_json: Value,
+) -> Fixture {
+    let dir = tmp_dir(tag);
+    let spy = dir.join("spy.log");
+    let tools_json = dir.join("tools.json");
+    std::fs::write(&tools_json, serde_json::to_vec(&tools).unwrap()).unwrap();
+    let mut args = vec![
+        fixture_script().display().to_string(),
+        spy.display().to_string(),
+        tools_json.display().to_string(),
+        mode.to_string(),
+    ];
+    if let Some(providers) = providers {
+        let providers_json = dir.join("providers.json");
+        std::fs::write(&providers_json, serde_json::to_vec(&providers).unwrap()).unwrap();
+        args.push(providers_json.display().to_string());
+    }
+    manifest_json["runtime"] = json!("process");
+    manifest_json["command"] = json!("python3");
+    manifest_json["args"] = json!(args);
+    let manifest: ExtensionManifest = serde_json::from_value(manifest_json).unwrap();
+    Fixture { dir, spy, manifest }
+}
+
+fn declared_provider_json() -> Value {
+    json!({
+        "id": "prov",
+        "display_name": "Provider",
+        "description": "declared provider",
+        "models": [{
+            "id": "model-1",
+            "capabilities": {"tool_use": false},
+            "context_window": 8192
+        }]
+    })
+}
+
+/// Runtime provider registration matching the declaration exactly.
+fn registered_provider_json() -> Value {
+    declared_provider_json()
+}
+
+fn provider_params() -> agent_engine::extensions::runtime::process::ProviderCompleteParams {
+    agent_engine::extensions::runtime::process::ProviderCompleteParams {
+        provider_id: "prov".to_string(),
+        model_id: "model-1".to_string(),
+        model: format!("{PLUGIN}:prov:model-1"),
+        messages: vec![],
+        system_prompt: None,
+        tools: vec![],
+        temperature: None,
+        max_tokens: None,
+        thinking_budget: 0,
+    }
+}
+
+#[tokio::test]
+async fn provider_class_registers_metadata_and_first_selection_starts_once() {
+    let fx = fixture_with(
+        "provider-class",
+        "ok",
+        json!([]),
+        Some(json!([registered_provider_json()])),
+        json!({
+            "permissions": ["providers.register"],
+            "deferred": {"providers": [declared_provider_json()]}
+        }),
+    );
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+
+    // Metadata registered at load with ZERO spawn.
+    assert!(fx.events().is_empty(), "provider metadata must not spawn");
+    assert!(mgr.is_deferred(PLUGIN));
+    let provider = mgr
+        .provider(&format!("{PLUGIN}:prov"))
+        .expect("declared provider metadata registered");
+    assert_eq!(provider.spec.display_name, "Provider");
+    let handler = provider.handler.clone().expect("lazy handler attached");
+
+    // First SELECTED provider completion starts once and validates.
+    let result = handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(result.content[0]["text"], json!("provider-reply"));
+    assert_eq!(fx.count("spawn"), 1);
+    assert_eq!(fx.count("request:initialize"), 1);
+    assert_eq!(fx.count("provider:model-1"), 1);
+
+    // Second completion reuses the same child.
+    handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(fx.count("spawn"), 1, "second selection reuses the lease");
+    assert_eq!(fx.count("provider:model-1"), 2);
+    assert_eq!(runtime.lease_count(), 1);
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn provider_runtime_mismatch_fails_before_route_and_terminates() {
+    // Runtime registers a DIFFERENT display_name than declared: strict
+    // declaration matching terminates the child before any provider call.
+    let mut drifted = registered_provider_json();
+    drifted["display_name"] = json!("Evil Provider");
+    let fx = fixture_with(
+        "provider-mismatch",
+        "ok",
+        json!([]),
+        Some(json!([drifted])),
+        json!({
+            "permissions": ["providers.register"],
+            "deferred": {"providers": [declared_provider_json()]}
+        }),
+    );
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    let handler = mgr
+        .provider(&format!("{PLUGIN}:prov"))
+        .unwrap()
+        .handler
+        .clone()
+        .unwrap();
+
+    let err = handler
+        .provider_complete(provider_params())
+        .await
+        .expect_err("declaration mismatch must deny the route");
+    assert!(err.contains("declarations"), "{err}");
+    assert_eq!(fx.count("provider:model-1"), 0, "no provider call routed");
+    assert_eq!(runtime.lease_count(), 0, "poisoned lease terminated");
+    assert!(
+        wait_until(|| fx.count("shutdown") == 1).await,
+        "mismatching child shut down"
+    );
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn hook_class_first_authorized_matching_event_starts_once() {
+    use agent_engine::extensions::hooks::events::{HookEvent, HookResult};
+
+    let fx = fixture_with(
+        "hook-class",
+        "ok",
+        json!([]),
+        None,
+        json!({
+            "permissions": ["tools.intercept"],
+            "hooks": [{"hook": "before_tool_call"}],
+            "deferred": {}
+        }),
+    );
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    assert!(
+        fx.events().is_empty(),
+        "lazy hook subscription must not spawn"
+    );
+
+    // A NON-matching event kind reaches no subscription: still no spawn.
+    let unmatched = HookEvent::after_tool_call("bash", json!({}), "out".to_string());
+    let _ = mgr.hook_bus().emit(&unmatched).await;
+    assert!(fx.events().is_empty(), "unmatched event must not spawn");
+
+    // First AUTHORIZED matching event starts the child once.
+    let event = HookEvent::before_tool_call("bash", json!({"cmd": "ls"}));
+    let result = mgr.hook_bus().emit(&event).await;
+    assert!(matches!(result, HookResult::Continue));
+    assert_eq!(fx.count("spawn"), 1);
+    assert_eq!(fx.count("request:initialize"), 1);
+    let hook_events = |fx: &Fixture| {
+        fx.events()
+            .iter()
+            .filter(|e| e.starts_with("hook:"))
+            .count()
+    };
+    assert_eq!(hook_events(&fx), 1);
+
+    // Second matching event reuses the same child.
+    let _ = mgr.hook_bus().emit(&event).await;
+    assert_eq!(fx.count("spawn"), 1, "second event reuses the lease");
+    assert_eq!(hook_events(&fx), 2);
+    assert_eq!(runtime.lease_count(), 1);
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn sidecar_class_stays_user_triggered() {
+    let fx = fixture_with(
+        "sidecar-class",
+        "ok",
+        json!([]),
+        None,
+        json!({
+            "permissions": ["config.write"],
+            "deferred": {"lifecycle": "user"}
+        }),
+    );
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+
+    // Discovery/load leave the sidecar fully dormant.
+    assert!(fx.events().is_empty(), "user-lifecycle load must not spawn");
+    assert!(mgr.is_deferred(PLUGIN));
+
+    // The explicit USER sidecar API is the legitimate trigger.
+    let args = mgr.sidecar_spawn_args(PLUGIN).await.unwrap();
+    assert_eq!(args.args, vec!["--fixture-sidecar".to_string()]);
+    assert_eq!(fx.count("spawn"), 1);
+    assert_eq!(fx.count("sidecar"), 1);
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn mixed_class_shares_one_process_and_tool_search_never_triggers() {
+    let fx = fixture_with(
+        "mixed-class",
+        "ok",
+        advertised_tools(),
+        Some(json!([registered_provider_json()])),
+        json!({
+            "permissions": ["tools.register", "providers.register"],
+            "deferred": {
+                "tools": [
+                    {"name": "search", "description": "deferred search", "input_schema": search_schema()},
+                    {"name": "sibling", "description": "sibling stays dormant", "input_schema": sibling_schema()},
+                ],
+                "providers": [declared_provider_json()]
+            }
+        }),
+    );
+    let (mgr, registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    // Bind the handler host scope to the test session BEFORE first use so
+    // tool leases and handler leases share ONE key (as the engine does).
+    runtime.bind_host_scope(sid());
+
+    // Tool SEARCH alone never triggers a start.
+    let reg = registry.read().await;
+    let index = DiscoveryIndex::build(reg.catalog()).unwrap();
+    let hits = index.search(
+        &DiscoveryQuery::parse("deferred search").unwrap(),
+        &SearchLimits::new(16, 8 * 1024).unwrap(),
+    );
+    assert!(!hits.hits().is_empty());
+    drop(reg);
+    assert!(fx.events().is_empty(), "search must never spawn");
+
+    // Earliest legitimate capability (provider selection) starts the ONE
+    // shared child…
+    let handler = mgr
+        .provider(&format!("{PLUGIN}:prov"))
+        .unwrap()
+        .handler
+        .clone()
+        .unwrap();
+    handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(fx.count("spawn"), 1);
+
+    // …and the exact tool call REUSES the same process.
+    let cap = ExtensionLeaseCapability::new(sid(), Arc::clone(&runtime));
+    let tools = dormant_extension_tools(PLUGIN, &fx.manifest);
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "fixture-plugin:search")
+        .unwrap();
+    let out = search
+        .execute(json!({"q":"x"}), ctx_with(Some(cap)))
+        .await
+        .unwrap();
+    assert_eq!(out, "called:search");
+    assert_eq!(fx.count("spawn"), 1, "mixed class shares ONE child");
+    assert_eq!(fx.count("request:initialize"), 1, "initialize once");
+    assert_eq!(fx.count("call:search"), 1);
+    assert_eq!(runtime.lease_count(), 1, "one shared lease");
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn legacy_manifest_without_deferred_stays_eager_under_progressive_flag() {
+    let fx = fixture_with(
+        "legacy-eager",
+        "ok",
+        json!([]),
+        None,
+        json!({
+            "permissions": ["tools.intercept"],
+            "hooks": [{"hook": "before_tool_call"}]
+        }),
+    );
+    let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::new()));
+    let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), Arc::clone(&registry));
+    mgr.set_progressive_deferral(true);
+
+    // No `deferred` block => documented legacy EAGER lifecycle even with
+    // the progressive flag ON.
+    mgr.load(PLUGIN, &fx.manifest).await.unwrap();
+    assert_eq!(fx.count("spawn"), 1, "legacy manifest spawns at load");
+    assert_eq!(fx.count("request:initialize"), 1);
+    assert_eq!(mgr.count(), 1, "live handler registered");
+    assert!(!mgr.is_deferred(PLUGIN));
+    mgr.shutdown_all().await;
+    fx.cleanup();
+}

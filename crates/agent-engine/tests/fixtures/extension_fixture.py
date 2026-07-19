@@ -6,13 +6,16 @@ over stdio, proper JSON parsing (json.loads/json.dumps) — no field-order
 assumptions, no sockets, no network. The extension host clears the child
 environment, so ALL behavior is driven by argv:
 
-  argv[1]  spy log path (append-only event log:
-           spawn / request:<method> / call:<tool> / shutdown / eof)
+  argv[1]  spy log path (append-only event log: spawn / request:<method>
+           / call:<tool> / hook:<kind> / provider:<model> / sidecar /
+           shutdown / eof)
   argv[2]  path to a JSON array of tools to register at initialize
            (objects with name/description/input_schema)
   argv[3]  mode: ok (default) | hostile-error (tool.call returns a
            JSON-RPC error carrying marker content that must be withheld) |
            huge-stderr (floods stderr before serving normally)
+  argv[4]  optional path to a JSON array of providers to register at
+           initialize (RegisteredProviderSpec-shaped objects)
 """
 import json
 import sys
@@ -20,6 +23,7 @@ import sys
 SPY = sys.argv[1]
 TOOLS_PATH = sys.argv[2] if len(sys.argv) > 2 else None
 MODE = sys.argv[3] if len(sys.argv) > 3 else "ok"
+PROVIDERS_PATH = sys.argv[4] if len(sys.argv) > 4 else None
 
 
 def log(event):
@@ -67,6 +71,10 @@ tools = []
 if TOOLS_PATH:
     with open(TOOLS_PATH, encoding="utf-8") as f:
         tools = json.load(f)
+providers = []
+if PROVIDERS_PATH:
+    with open(PROVIDERS_PATH, encoding="utf-8") as f:
+        providers = json.load(f)
 
 if MODE == "huge-stderr":
     # One enormous newline-free blob: proves the host's bounded stderr
@@ -82,13 +90,28 @@ while True:
     method = request.get("method", "")
     if method == "tool.call":
         log("call:" + str(request.get("params", {}).get("name")))
+    elif method == "hook.handle":
+        log("hook:" + str(request.get("params", {}).get("kind")))
+    elif method == "provider.complete":
+        log("provider:" + str(request.get("params", {}).get("model_id")))
     else:
         log("request:" + method)
     if method == "initialize":
         respond(request, {
             "protocol_version": 1,
-            "capabilities": {"tools": tools, "providers": [], "capabilities": []},
+            "capabilities": {"tools": tools, "providers": providers,
+                             "capabilities": []},
         })
+    elif method == "hook.handle":
+        respond(request, {"action": "continue"})
+    elif method == "provider.complete":
+        respond(request, {
+            "content": [{"type": "text", "text": "provider-reply"}],
+            "stop_reason": "end_turn",
+        })
+    elif method == "sidecar.spawn_args":
+        log("sidecar")
+        respond(request, {"args": ["--fixture-sidecar"]})
     elif method == "tool.call":
         if MODE == "hostile-error":
             respond_error(request, -32000,

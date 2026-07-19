@@ -720,6 +720,10 @@ impl Runtime {
         &mut self,
         manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
     ) {
+        // Bind the handler host scope to THIS runtime's durable tool
+        // session: a Mixed extension's tool leases and hook/provider/user
+        // handler leases share one key — ONE shared child per plugin.
+        manager.bind_host_scope(self.host_tool_session.clone());
         self.extension_session_scope = Some(std::sync::Arc::new(
             crate::extensions::lease::ExtensionSessionEndGuard::new(
                 self.host_tool_session.clone(),
