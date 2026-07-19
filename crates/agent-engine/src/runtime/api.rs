@@ -247,6 +247,9 @@ struct EventCtx<'t> {
     /// tools): no 1h marker exists anywhere in the payload, so a 1h bucket of
     /// zero proves nothing — the detector must stay disarmed.
     request_has_1h_marker: bool,
+    /// Optional Task 23 turn-budget usage counters, recorded at the single
+    /// authoritative Usage emission (and its residual twin) only.
+    usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -521,6 +524,9 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         cache_read_tokens: Some(cache_read),
                         cache_write_tokens: Some(cache_create),
                     });
+                    if let Some(counters) = &ctx.usage_counters {
+                        counters.record(input_t, output_t, cache_read, cache_create);
+                    }
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -655,6 +661,9 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
         cache_read_tokens: Some(cache_read),
         cache_write_tokens: Some(cache_create),
     });
+    if let Some(counters) = &ctx.usage_counters {
+        counters.record(input_t, output_t, cache_read, cache_create);
+    }
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
         output_tokens: output_t,
@@ -795,6 +804,11 @@ pub struct ApiOptions {
     /// flag-off request bytes exactly. Stream rounds set `Some` only when the
     /// progressive-disclosure flag is enabled.
     pub request_tools_schema: Option<std::sync::Arc<Vec<Value>>>,
+    /// Optional shared turn-budget usage counters (Task 23). Updated at the
+    /// single authoritative Usage emission per request; the stream loop
+    /// reads them for the optional token/cost budget dimensions. `None`
+    /// (default, non-stream callers) records nothing.
+    pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1439,6 +1453,7 @@ impl ApiMethods {
                 ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
+                usage_counters: options.usage_counters.clone(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -1770,6 +1785,7 @@ mod tests {
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
+            usage_counters: None,
         }
     }
 
@@ -1784,6 +1800,7 @@ mod tests {
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
+            usage_counters: None,
         }
     }
 
@@ -1805,6 +1822,7 @@ mod tests {
             // Default armed: most detector tests model a request that DID
             // carry a 1h marker. The no-marker test overrides this.
             request_has_1h_marker: true,
+            usage_counters: None,
         }
     }
 
@@ -3153,6 +3171,7 @@ mod tests {
             ttl_downgrade_notified: notified.clone(),
             saw_1h_honored: honored.clone(),
             request_has_1h_marker: false,
+            usage_counters: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(

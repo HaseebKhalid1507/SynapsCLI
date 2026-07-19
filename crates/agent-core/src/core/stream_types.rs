@@ -79,6 +79,27 @@ pub enum BudgetDimension {
     OutputTokens,
     ToolCalls,
     WallClock,
+    /// Provider rounds within one stream turn (spec §8.1).
+    ProviderRounds,
+    /// Accumulated tool-result bytes within one stream turn (spec §8.1).
+    ToolResultBytes,
+    /// Accumulated estimated USD cost within one stream turn (spec §8.1).
+    CostUsd,
+}
+
+impl BudgetDimension {
+    /// Stable wire/diagnostic label (matches the serde snake_case form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::ToolCalls => "tool_calls",
+            Self::WallClock => "wall_clock",
+            Self::ProviderRounds => "provider_rounds",
+            Self::ToolResultBytes => "tool_result_bytes",
+            Self::CostUsd => "cost_usd",
+        }
+    }
 }
 
 /// Typed terminal outcome of a model turn (spec §5.2). Produced ONCE by the
@@ -131,6 +152,15 @@ pub struct TurnError {
 }
 
 impl TurnError {
+    /// Typed budget exhaustion (spec §8.1): static message naming the
+    /// dimension only — no counts, no content.
+    pub fn budget(dimension: BudgetDimension) -> Self {
+        Self {
+            message: format!("turn budget exhausted ({})", dimension.as_str()),
+            outcome: TurnOutcome::BudgetExceeded { dimension },
+        }
+    }
+
     /// Provider-category failure with an explicit correlation ID.
     pub fn provider(
         message: impl Into<String>,

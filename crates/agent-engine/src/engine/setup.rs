@@ -253,6 +253,13 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         )));
     }
 
+    // Task 23: the engine's interactive session runs under the FOREGROUND
+    // turn budget with typed per-role config overrides applied.
+    runtime.set_turn_budget(crate::runtime::budget::TurnBudget::from_config(
+        crate::runtime::budget::TurnRole::Foreground,
+        &config.turn_budgets,
+    ));
+
     // Extension manager
     let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
         Arc::clone(runtime.hook_bus()),

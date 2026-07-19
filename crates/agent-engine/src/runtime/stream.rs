@@ -76,6 +76,8 @@ pub(super) struct StreamSession {
     /// rule as `mcp_session_scope`).
     pub(super) extension_session_scope:
         Option<Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
+    /// Per-turn budget (Task 23, spec §8.1).
+    pub(super) turn_budget: crate::runtime::budget::TurnBudget,
 }
 
 pub(super) struct StreamMethods;
@@ -135,6 +137,7 @@ impl StreamMethods {
             mcp_session_scope,
             extension_runtime,
             extension_session_scope,
+            turn_budget,
         } = session;
         let mut messages = initial_messages;
 
@@ -196,11 +199,35 @@ impl StreamMethods {
             crate::tools::activation::ActivationAuthority::Unauthorized
         };
 
+        // ═══ TURN BUDGET (Task 23, spec §8.1) ═══
+        // One meter for the whole turn; the shared usage counters are
+        // filled by the transport's single authoritative Usage emission.
+        let mut budget_meter = crate::runtime::budget::TurnBudgetMeter::new(turn_budget);
+        let usage_counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+        // Finalize a budget-exhausted turn: history is already valid at
+        // every call site; surface the typed outcome and stop cleanly.
+        macro_rules! finish_budget_exceeded {
+            ($dimension:expr) => {{
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                    agent_core::TurnError::budget($dimension),
+                )));
+                return Ok(());
+            }};
+        }
+
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
                 let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 return Ok(());
+            }
+
+            // Budget pre-flight: wall clock, then the exact round cap —
+            // BEFORE any provider call is spent. History is valid here
+            // (round boundaries always end on paired tool_results).
+            if let Err(dimension) = budget_meter.begin_round() {
+                finish_budget_exceeded!(dimension);
             }
 
             // Refresh token before each API call in the tool loop — fixes stale
@@ -303,6 +330,7 @@ impl StreamMethods {
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
             let projected_options;
+            let metered_options;
             let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
                 let projection = {
                     let session_set = session_tool_set
@@ -318,11 +346,16 @@ impl StreamMethods {
                 };
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
+                    usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     ..options.clone()
                 };
                 &projected_options
             } else {
-                &options
+                metered_options = super::api::ApiOptions {
+                    usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
+                    ..options.clone()
+                };
+                &metered_options
             };
 
             let response = match ApiMethods::call_api_stream_inner(
@@ -350,6 +383,12 @@ impl StreamMethods {
                     return Err(e);
                 }
             };
+
+            // Optional usage dimensions (context tokens / cost), fed by
+            // the transport's authoritative Usage emission this round.
+            if let Err(dimension) = budget_meter.check_usage(&usage_counters, &model) {
+                finish_budget_exceeded!(dimension);
+            }
 
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
@@ -456,6 +495,21 @@ impl StreamMethods {
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
                 let mut canceled = false;
+
+                // ═══ TURN BUDGET: exact tool-call allowance (Task 23) ═══
+                // Calls beyond the remaining allowance are NEVER executed;
+                // they receive synthetic valid tool_results (appended below
+                // in model order) and the turn finalizes as ToolCalls-
+                // exhausted after this round's results are recorded.
+                let mut tool_uses = tool_uses;
+                let remaining_calls = budget_meter.remaining_tool_calls() as usize;
+                let over_budget_tool_uses: Vec<Value> = if tool_uses.len() > remaining_calls {
+                    tool_uses.split_off(remaining_calls)
+                } else {
+                    Vec::new()
+                };
+                let tool_call_budget_hit = !over_budget_tool_uses.is_empty();
+                budget_meter.charge_tool_calls(tool_uses.len() as u32);
 
                 if cancel.is_cancelled() {
                     // Already canceled before tool execution — fill all with cancel results
@@ -809,6 +863,24 @@ impl StreamMethods {
                     }
                 }
 
+                // Synthetic valid results for over-budget calls (model
+                // order preserved: executed prefix first, suffix here).
+                for tool_use in &over_budget_tool_uses {
+                    if let Some(tool_id) = tool_use["id"].as_str() {
+                        let content = "Tool call not executed: turn tool-call budget exhausted";
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                            tool_id: tool_id.to_string(),
+                            result: content.to_string(),
+                        }));
+                        tool_results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": content,
+                            "is_error": true
+                        }));
+                    }
+                }
+
                 // Drain dynamic tool registrations (e.g. from MCP connect)
                 drop(tool_reg_tx); // close sender so recv returns None
                 while let Ok(new_tools) = tool_reg_rx.try_recv() {
@@ -836,6 +908,20 @@ impl StreamMethods {
                     // Send final history on cancellation so session can be saved
                     let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Ok(());
+                }
+
+                // ═══ TURN BUDGET: post-round exhaustion (Task 23) ═══
+                // History is valid here (all results recorded). The exact
+                // tool-call cap outranks the byte cap when both trip.
+                if tool_call_budget_hit {
+                    finish_budget_exceeded!(agent_core::BudgetDimension::ToolCalls);
+                }
+                let round_result_bytes: usize = tool_results
+                    .iter()
+                    .map(|r| r["content"].as_str().map(str::len).unwrap_or(0))
+                    .sum();
+                if let Err(dimension) = budget_meter.charge_tool_result_bytes(round_result_bytes) {
+                    finish_budget_exceeded!(dimension);
                 }
 
                 // Check for steering messages between tool rounds.

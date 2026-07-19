@@ -6,13 +6,13 @@
 //! Usage: synaps-agent --config <path/to/config.toml>
 
 use fs4::fs_std::FileExt;
-use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
 use futures::StreamExt;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
 use synaps_cli::{
     watcher_types::{AgentStats, DailyStats},
     AgentConfig, HandoffState, LlmEvent, Runtime, SessionEvent, StreamEvent,
@@ -241,6 +241,12 @@ pub async fn run(config_path: String, trigger_context: String) {
         );
         std::process::exit(1);
     });
+    // Task 23: headless autonomous workers run under the AUTONOMOUS turn
+    // budget (typed config overrides applied) — the tightest role.
+    runtime.set_turn_budget(synaps_cli::runtime::budget::TurnBudget::from_config(
+        synaps_cli::runtime::budget::TurnRole::Autonomous,
+        &synaps_cli::config::load_config().turn_budgets,
+    ));
     runtime.set_model(config.agent.model.clone());
     let foreground = agent_engine::orchestration::canonical_foreground_identity(runtime.model())
         .unwrap_or_else(|e| {
@@ -425,7 +431,13 @@ pub async fn run(config_path: String, trigger_context: String) {
                 None,  // no steer channel
             );
             for d in &drained {
-                log(agent_name, &format!("event [{}]: {}", d.event.content.content_type, d.event.content.text));
+                log(
+                    agent_name,
+                    &format!(
+                        "event [{}]: {}",
+                        d.event.content.content_type, d.event.content.text
+                    ),
+                );
             }
         }
 
@@ -586,7 +598,9 @@ pub async fn run(config_path: String, trigger_context: String) {
         // In a non-always mode this would trigger sleep, but for now just check if
         // the last message was from the assistant with no tool use
         if let Some(last) = messages.last() {
-            if last["role"].as_str() == Some("assistant") && last["stop_reason"].as_str() == Some("end_turn") {
+            if last["role"].as_str() == Some("assistant")
+                && last["stop_reason"].as_str() == Some("end_turn")
+            {
                 // Agent stopped on its own without calling watcher_exit.
                 // Determine whether to wait on reactive events or nag immediately.
                 let (children_running, queue_len) = {
@@ -604,14 +618,18 @@ pub async fn run(config_path: String, trigger_context: String) {
                 if idle_should_wait(children_running, queue_len) {
                     // Park on the queue notifier (bounded 30s) then loop back to
                     // drain at the top.  Exactly one waiter exists in agent mode.
-                    log(agent_name, &format!(
-                        "idle — waiting for events (children={}, queue={})",
-                        children_running as u8, queue_len
-                    ));
+                    log(
+                        agent_name,
+                        &format!(
+                            "idle — waiting for events (children={}, queue={})",
+                            children_running as u8, queue_len
+                        ),
+                    );
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from_secs(30),
                         runtime.event_queue().notified(),
-                    ).await;
+                    )
+                    .await;
                     // Loop back — drain fires at the top.
                     continue;
                 }

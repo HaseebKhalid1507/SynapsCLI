@@ -16,6 +16,7 @@ mod api_sync;
 mod auth;
 #[cfg(test)]
 mod body_golden;
+pub mod budget;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod google_gemini;
@@ -340,6 +341,9 @@ pub struct Runtime {
     /// LAST owner (runtime clone or in-flight stream) drops.
     extension_session_scope:
         Option<std::sync::Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
+    /// Per-turn budget (Task 23, spec §8.1). Resolved from role + typed
+    /// config at boot; every stream turn is metered against it.
+    turn_budget: crate::runtime::budget::TurnBudget,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -483,6 +487,9 @@ impl Runtime {
             mcp_session_scope: None,
             extension_runtime: None,
             extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
             host_tool_session: fresh_host_tool_session(),
         })
     }
@@ -561,6 +568,9 @@ impl Runtime {
             mcp_session_scope: None,
             extension_runtime: None,
             extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
             host_tool_session: fresh_host_tool_session(),
         }
     }
@@ -710,6 +720,18 @@ impl Runtime {
             std::sync::Arc::clone(&manager),
         )));
         self.mcp_runtime = Some(manager);
+    }
+
+    /// Set this runtime's per-turn budget (Task 23). The engine resolves
+    /// role + typed config at boot; subagent/watcher constructions pass
+    /// their role's budget explicitly.
+    pub fn set_turn_budget(&mut self, budget: crate::runtime::budget::TurnBudget) {
+        self.turn_budget = budget;
+    }
+
+    /// The currently configured per-turn budget.
+    pub fn turn_budget(&self) -> &crate::runtime::budget::TurnBudget {
+        &self.turn_budget
     }
 
     /// Install the shared exact EXTENSION lease manager (Task 20, engine
@@ -1775,6 +1797,7 @@ impl Runtime {
                     // policy (fresh default-core, zero activations).
                     session_tool_set: None,
                     request_tools_schema: None,
+                    usage_counters: None,
                 },
             )
             .await?;
@@ -2183,6 +2206,7 @@ impl Runtime {
             // the first provider round.
             session_tool_set: None,
             request_tools_schema: None,
+            usage_counters: None,
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -2221,6 +2245,7 @@ impl Runtime {
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
             extension_session_scope: self.extension_session_scope.clone(),
+            turn_budget: self.turn_budget.clone(),
         };
 
         tokio::spawn(async move {
@@ -2303,6 +2328,7 @@ impl Clone for Runtime {
             extension_runtime: self.extension_runtime.clone(),
             // Same durable shared-scope rule for extension leases.
             extension_session_scope: self.extension_session_scope.clone(),
+            turn_budget: self.turn_budget.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and
