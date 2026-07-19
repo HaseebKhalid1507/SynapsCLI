@@ -213,6 +213,79 @@ async fn load_skill_alias_ambiguity_and_unknown_ids_fail_typed() {
     assert!(unknown.to_string().contains("unknown"), "{unknown}");
 }
 
+// ── Stable-namespace vs legacy plugin-qualified collisions ──────────────────
+
+#[tokio::test]
+async fn load_skill_stable_id_colliding_with_legacy_plugin_qualified_fails_closed() {
+    // A loose skill `foo` (stable id `skill:foo`) AND a legacy plugin
+    // literally named `skill` providing `foo` (legacy qualified `skill:foo`):
+    // the input denotes both, so it must fail closed as ambiguous — never
+    // silently resolve either interpretation.
+    let reg = Arc::new(CommandRegistry::new(
+        BUILTIN_COMMANDS,
+        vec![
+            skill("foo", None, "loose foo description"),
+            skill("foo", Some("skill"), "plugin-qualified foo description"),
+        ],
+    ));
+    let tool = LoadSkillTool::new(reg);
+    let err = tool
+        .execute(json!({"skill": "skill:foo"}), ctx())
+        .await
+        .expect_err("colliding spelling must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("ambiguous"), "{msg}");
+    // The denial points at the unambiguous stable id of the plugin skill.
+    assert!(msg.contains("skill.skill:foo"), "{msg}");
+    assert!(!msg.contains("loose foo description"), "{msg}");
+}
+
+#[tokio::test]
+async fn load_skill_plugin_named_skill_keeps_qualified_access_without_collision() {
+    // Only the legacy plugin-qualified skill exists: exact backward-compatible
+    // behavior — `skill:foo` resolves to the plugin skill.
+    let reg = Arc::new(CommandRegistry::new(
+        BUILTIN_COMMANDS,
+        vec![skill(
+            "foo",
+            Some("skill"),
+            "plugin-qualified foo description",
+        )],
+    ));
+    let tool = LoadSkillTool::new(Arc::clone(&reg));
+    let out = tool
+        .execute(json!({"skill": "skill:foo"}), ctx())
+        .await
+        .expect("plugin-only qualified access keeps resolving");
+    assert!(out.contains("plugin-qualified foo description"), "{out}");
+
+    // The unambiguous stable id of the same plugin skill also resolves.
+    let plugin_id = stable_skill_id(&skill("foo", Some("skill"), "d"));
+    let via_stable = tool
+        .execute(json!({"skill": plugin_id}), ctx())
+        .await
+        .expect("stable plugin-skill id resolves");
+    assert!(
+        via_stable.contains("plugin-qualified foo description"),
+        "{via_stable}"
+    );
+}
+
+#[tokio::test]
+async fn load_skill_stable_loose_id_keeps_resolving_without_collision() {
+    // Only the loose skill exists: `skill:foo` resolves it by stable id.
+    let reg = Arc::new(CommandRegistry::new(
+        BUILTIN_COMMANDS,
+        vec![skill("foo", None, "loose foo description")],
+    ));
+    let tool = LoadSkillTool::new(reg);
+    let out = tool
+        .execute(json!({"skill": "skill:foo"}), ctx())
+        .await
+        .expect("stable loose id resolves");
+    assert!(out.contains("loose foo description"), "{out}");
+}
+
 #[test]
 fn load_skill_schema_stays_compact_without_bodies() {
     let tool = LoadSkillTool::new(registry());

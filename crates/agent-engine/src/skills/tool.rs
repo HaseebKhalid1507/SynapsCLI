@@ -86,8 +86,10 @@ impl crate::Tool for LoadSkillTool {
         // `skill:`/`skill.<plugin>:` namespace resolve by EXACT deterministic
         // id. Exactly one match loads that skill and nothing else; zero
         // matches fail typed; duplicate ids fail closed as ambiguous rather
-        // than guessing. Legacy exact qualified (`plugin:skill`) and
-        // unambiguous bare names keep resolving through the registry below.
+        // than guessing. A legacy plugin literally named `skill`
+        // (`skill:foo` qualified) keeps resolving when it is the ONLY
+        // interpretation; when the same spelling also denotes a stable
+        // loose id, neither interpretation wins — fail closed as ambiguous.
         if looks_like_stable_skill_id(name) {
             let matches: Vec<Arc<LoadedSkill>> = self
                 .registry
@@ -95,6 +97,26 @@ impl crate::Tool for LoadSkillTool {
                 .into_iter()
                 .filter(|s| stable_skill_id(s) == name)
                 .collect();
+            // Legacy plugin-qualified reading of the SAME raw spelling
+            // (a plugin whose name begins the reserved namespace). This is
+            // always a different skill than any stable match: stable loose
+            // ids have no plugin, and stable plugin ids never share their
+            // plugin's raw spelling with the `skill`/`skill.*` prefix.
+            let legacy: Option<Arc<LoadedSkill>> = match self.registry.resolve(name) {
+                Resolution::Skill(s) => Some(s),
+                _ => None,
+            };
+            if let Some(legacy) = &legacy {
+                if !matches.is_empty() {
+                    return Err(crate::RuntimeError::Tool(format!(
+                        "ambiguous skill id '{}': it names both a stable skill id and a \
+                         plugin-qualified skill; use '{}' for the plugin skill",
+                        crate::BoundedText::new(name, 160).text,
+                        stable_skill_id(legacy)
+                    )));
+                }
+                return Ok(Self::format_body(legacy));
+            }
             return match matches.as_slice() {
                 [] => Err(crate::RuntimeError::Tool(format!(
                     "unknown skill id '{}'",

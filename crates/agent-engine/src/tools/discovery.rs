@@ -17,8 +17,12 @@
 //! credentials. `activate_tools` performs deterministic atomic bulk
 //! activation of EXACT known ids through host grant issuance; source-wide,
 //! provider-wide, wildcard, unknown, and malformed identities fail typed
-//! with zero mutation. Without host confirmation authority the request is
-//! denied before any grant, set, or schema-generation mutation.
+//! with zero mutation. Confirmation authority is host-only: explicit host
+//! auto-approve authorizes directly; otherwise the interactive host prompt
+//! (when present) must approve the bounded exact id list with y/yes. Absent
+//! prompt or any other answer, the request is denied before any grant, set,
+//! or schema-generation mutation — model-authored JSON never confers
+//! authority.
 
 use serde_json::{json, Value};
 
@@ -85,6 +89,46 @@ fn require_capability(ctx: &ToolContext) -> Result<ActivationCapability> {
     ctx.capabilities.tool_activation.clone().ok_or_else(|| {
         RuntimeError::Tool("tool discovery/activation is not available in this context".to_string())
     })
+}
+
+/// Interactive host confirmation for model-initiated activation (M1).
+///
+/// Returns `ModelConfirmed` ONLY when the host's interactive prompt exists
+/// and the host answers an explicit `y`/`yes` (case-insensitive, trimmed)
+/// to the bounded exact id list. Every other outcome — no prompt handle, a
+/// closed prompt channel, cancellation (`None`), or any other answer —
+/// stays `Unauthorized` (fail-closed). The id list shown to the host is
+/// exactly the parsed batch: each id passed `ToolId::parse` (bounded,
+/// canonical) and the batch is capped at [`ACTIVATE_TOOLS_MAX_BATCH`].
+async fn confirm_activation_with_host(
+    prompt: Option<&crate::tools::SecretPromptHandle>,
+    tool_ids: &[ToolId],
+) -> ActivationAuthority {
+    let Some(prompt) = prompt else {
+        return ActivationAuthority::Unauthorized;
+    };
+    let mut ids: Vec<&str> = tool_ids.iter().map(ToolId::as_str).collect();
+    ids.sort_unstable();
+    let question = format!(
+        "The model requests session-scoped activation of {} exact tool id(s):\n{}\n\
+         Type y/yes to allow exactly these tools; anything else denies.",
+        ids.len(),
+        ids.join("\n")
+    );
+    match prompt
+        .prompt("Confirm tool activation".to_string(), question)
+        .await
+    {
+        Some(answer) => {
+            let normalized = answer.trim().to_ascii_lowercase();
+            if normalized == "y" || normalized == "yes" {
+                ActivationAuthority::ModelConfirmed
+            } else {
+                ActivationAuthority::Unauthorized
+            }
+        }
+        None => ActivationAuthority::Unauthorized,
+    }
 }
 
 fn require_query(params: &Value) -> Result<DiscoveryQuery> {
@@ -222,31 +266,41 @@ impl Tool for ActivateToolsTool {
             })?;
             tool_ids.push(id);
         }
+        // Host confirmation policy (M1): authority is host-only and exact.
+        // Explicit host auto-approve authorizes directly; otherwise, when an
+        // interactive host prompt exists, the HOST is asked to approve this
+        // bounded exact id list and only an explicit y/yes authorizes.
+        // Absent prompt, denial, or cancellation stays fail-closed. The
+        // model-authored JSON arguments are never consulted for authority.
+        // The prompt await happens strictly BEFORE the session-set lock is
+        // taken; no lock is held across an await.
+        let authority = match capability.authority() {
+            ActivationAuthority::ModelConfirmed => ActivationAuthority::ModelConfirmed,
+            ActivationAuthority::Unauthorized => {
+                confirm_activation_with_host(ctx.capabilities.secret_prompt.as_ref(), &tool_ids)
+                    .await
+            }
+        };
         // Authority check + host grant issuance + atomic bulk activation.
-        // The write guard is short-lived and never held across an await.
-        let activated = {
+        // The write guard is short-lived and never held across an await; the
+        // resulting schema generation is captured inside the SAME critical
+        // section (M3) so the reported value is exactly the completed
+        // batch's generation, never a later concurrent one.
+        let (activated, schema_generation) = {
             let mut set = capability
                 .session_set()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            activate_model_initiated(
-                capability.authority(),
-                &mut set,
-                capability.catalog(),
-                &tool_ids,
-            )
-            .map_err(|err| RuntimeError::Tool(format!("tool activation denied: {err}")))?
+            let applied =
+                activate_model_initiated(authority, &mut set, capability.catalog(), &tool_ids)
+                    .map_err(|err| RuntimeError::Tool(format!("tool activation denied: {err}")))?;
+            (applied, set.schema_generation())
         };
         let ids: Vec<&str> = {
             let mut sorted: Vec<&ToolId> = tool_ids.iter().collect();
             sorted.sort();
             sorted.into_iter().map(ToolId::as_str).collect()
         };
-        let schema_generation = capability
-            .session_set()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .schema_generation();
         let body = json!({
             "activated": ids,
             "count": activated,

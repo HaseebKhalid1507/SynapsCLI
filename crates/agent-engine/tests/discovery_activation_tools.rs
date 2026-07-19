@@ -111,6 +111,13 @@ fn shared(set: SessionToolSet) -> SharedSessionToolSet {
 }
 
 fn ctx(cap: Option<ActivationCapability>) -> ToolContext {
+    ctx_with_prompt(cap, None)
+}
+
+fn ctx_with_prompt(
+    cap: Option<ActivationCapability>,
+    secret_prompt: Option<agent_engine::tools::SecretPromptHandle>,
+) -> ToolContext {
     ToolContext {
         channels: ToolChannels {
             tx_delta: None,
@@ -122,7 +129,7 @@ fn ctx(cap: Option<ActivationCapability>) -> ToolContext {
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
-            secret_prompt: None,
+            secret_prompt,
             orchestration: None,
             tool_activation: cap,
         },
@@ -379,6 +386,175 @@ async fn activate_tools_rejects_source_wide_unknown_and_malformed_ids() {
         .await
         .expect_err("empty batch fails typed");
     assert!(empty.to_string().contains("no tool"), "{empty}");
+}
+
+// ── activate_tools (interactive host confirmation) ──────────────────────────
+
+/// Fake interactive host: answers every secret-prompt request with `answer`
+/// and records the prompt text it was shown.
+fn fake_prompt(
+    answer: Option<&'static str>,
+) -> (
+    agent_engine::tools::SecretPromptHandle,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<agent_engine::tools::SecretPromptRequest>();
+    let handle = agent_engine::tools::SecretPromptHandle::new(tx);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_writer = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            seen_writer
+                .lock()
+                .unwrap()
+                .push(format!("{}\n{}", req.title, req.prompt));
+            let _ = req.response_tx.send(answer.map(str::to_string));
+        }
+    });
+    (handle, seen)
+}
+
+#[tokio::test]
+async fn activate_tools_host_prompt_yes_activates_exact_tool_only() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let (prompt, seen) = fake_prompt(Some("yes"));
+
+    let out = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability(
+                    &registry,
+                    &set,
+                    ActivationAuthority::Unauthorized,
+                )),
+                Some(prompt),
+            ),
+        )
+        .await
+        .expect("host-confirmed activation succeeds");
+
+    // The host was shown the bounded EXACT id list before authorization.
+    let prompts = seen.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1, "exactly one confirmation prompt");
+    assert!(prompts[0].contains("builtin:beta_tool"), "{}", prompts[0]);
+
+    // Exact tool activated; sibling stays denied.
+    let guard = set.read().unwrap();
+    assert_eq!(guard.schema_generation(), 1);
+    ExecutionGate::authorize_wire_call(&registry, &guard, "beta_tool")
+        .expect("activated tool authorizes");
+    let denial = ExecutionGate::authorize_wire_call(&registry, &guard, "gamma_tool")
+        .expect_err("sibling stays denied");
+    assert!(matches!(denial, ToolAuthorizationError::NotActivated(_)));
+
+    // The reported schema_generation is the completed batch's generation.
+    let body: serde_json::Value = serde_json::from_str(&out).expect("json result");
+    assert_eq!(body["schema_generation"], json!(guard.schema_generation()));
+}
+
+#[tokio::test]
+async fn activate_tools_host_prompt_no_or_absent_denies_without_mutation() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let before = set_fingerprint(&set.read().unwrap());
+
+    // Host answers "no": denied, zero mutation.
+    let (deny_prompt, _) = fake_prompt(Some("no"));
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability(
+                    &registry,
+                    &set,
+                    ActivationAuthority::Unauthorized,
+                )),
+                Some(deny_prompt),
+            ),
+        )
+        .await
+        .expect_err("host denial fails closed");
+    assert!(err.to_string().contains("confirmation"), "{err}");
+    assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+
+    // Host cancels (None response): denied, zero mutation.
+    let (cancel_prompt, _) = fake_prompt(None);
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability(
+                    &registry,
+                    &set,
+                    ActivationAuthority::Unauthorized,
+                )),
+                Some(cancel_prompt),
+            ),
+        )
+        .await
+        .expect_err("host cancel fails closed");
+    assert!(err.to_string().contains("confirmation"), "{err}");
+    assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+
+    // Model-authored `confirmed` flag with NO host prompt available: the
+    // model JSON can never substitute for host authority.
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"], "confirmed": true}),
+            ctx_with_prompt(
+                Some(capability(
+                    &registry,
+                    &set,
+                    ActivationAuthority::Unauthorized,
+                )),
+                None,
+            ),
+        )
+        .await
+        .expect_err("model-authored flag cannot bypass absent prompt");
+    assert!(err.to_string().contains("confirmation"), "{err}");
+    assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+}
+
+#[tokio::test]
+async fn activate_tools_reports_generation_of_the_completed_batch() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+
+    // First batch (nonconcurrent): reported generation == set generation.
+    let first = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx(Some(capability(
+                &registry,
+                &set,
+                ActivationAuthority::ModelConfirmed,
+            ))),
+        )
+        .await
+        .expect("first batch succeeds");
+    let first: serde_json::Value = serde_json::from_str(&first).expect("json");
+    assert_eq!(first["schema_generation"], json!(1));
+    assert_eq!(set.read().unwrap().schema_generation(), 1);
+
+    // Second batch advances by exactly one and reports its own generation.
+    let second = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:gamma_tool"]}),
+            ctx(Some(capability(
+                &registry,
+                &set,
+                ActivationAuthority::ModelConfirmed,
+            ))),
+        )
+        .await
+        .expect("second batch succeeds");
+    let second: serde_json::Value = serde_json::from_str(&second).expect("json");
+    assert_eq!(second["schema_generation"], json!(2));
+    assert_eq!(set.read().unwrap().schema_generation(), 2);
 }
 
 // ── Host APIs ───────────────────────────────────────────────────────────────
