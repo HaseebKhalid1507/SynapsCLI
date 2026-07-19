@@ -367,6 +367,11 @@ pub struct SynapsConfig {
     /// stream starts with the small essential local core plus discovery and
     /// authorization gateways; exact activations are added per session.
     pub progressive_tool_disclosure: bool,
+    /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
+    /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
+    /// an append-only delta journal with periodic atomic snapshots. See
+    /// docs/decisions/T35-session-journal-opt-in.md.
+    pub session_persistence: crate::core::session_journal::SessionPersistence,
     /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
     /// from the registry at boot so they're never offered to the model.
     pub disabled_tools: Vec<String>,
@@ -412,6 +417,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
+            session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
@@ -451,6 +457,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_skills",
     "disabled_tools",
     "progressive_tool_disclosure",
+    "session_persistence",
 ];
 
 /// Simple Levenshtein distance for did-you-mean suggestions.
@@ -861,6 +868,15 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             }
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
+            }
+            "session_persistence" => {
+                match crate::core::session_journal::SessionPersistence::parse(val) {
+                    Some(mode) => config.session_persistence = mode,
+                    None => config.warnings.push(format!(
+                        "session_persistence = {val} — expected json or journal; \
+                         keeping the default (json)"
+                    )),
+                }
             }
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);

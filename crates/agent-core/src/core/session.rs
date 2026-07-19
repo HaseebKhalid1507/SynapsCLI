@@ -141,19 +141,22 @@ impl Session {
         }
     }
 
+    /// Persist this session under the configured persistence mode
+    /// (`session_persistence` config key; default is the unchanged legacy
+    /// JSON path — see Task 35 / `crate::core::session_journal`).
     pub async fn save(&self) -> std::io::Result<()> {
         let dir = crate::config::resolve_write_path("sessions");
-        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        let id = self.id.clone();
-        tokio::task::spawn_blocking(move || save_json_in_dir(&dir, &id, json.as_bytes()))
-            .await
-            .map_err(std::io::Error::other)?
+        let mode = crate::config::load_config().session_persistence;
+        let session = self.clone(); // messages are Arc-shared — cheap clone
+        tokio::task::spawn_blocking(move || {
+            crate::core::session_journal::save_session_in_dir(&dir, &session, mode).map(|_| ())
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {
-        let path = sessions_dir().join(format!("{}.json", id));
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(std::io::Error::other)
+        crate::core::session_journal::load_session_in_dir(&sessions_dir(), id)
     }
 
     pub fn info(&self) -> SessionInfo {
