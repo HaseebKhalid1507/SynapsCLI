@@ -4,12 +4,35 @@ use agent_core::orchestration::{
 };
 use agent_core::prompt::QualifiedModelId;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
+
+pub struct DelegationTreeBudget {
+    pub max_depth: u16,
+    pub max_children_per_worker: usize,
+    pub max_total_descendants: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DelegationTreeDenied {
+    DepthLimit,
+    ChildLimit,
+    DescendantLimit,
+    UnknownParent,
+}
+
+#[derive(Debug, Default)]
+struct DelegationTreeState {
+    depth_by_worker: BTreeMap<String, u16>,
+    child_count: BTreeMap<String, usize>,
+    descendants: usize,
+}
 
 /// Session-scoped runtime enforcement shared by every subagent tool path.
 pub struct OrchestrationRuntime {
     inner: Mutex<Inner>,
+    tree_budget: DelegationTreeBudget,
+    tree: Mutex<DelegationTreeState>,
 }
 struct Inner {
     registry: WorkerRegistry,
@@ -209,12 +232,81 @@ impl OrchestrationRuntime {
     }
 
     pub fn new(policy: DelegationPolicy) -> Self {
+        let max_total_descendants = policy.max_total_workers;
         Self {
             inner: Mutex::new(Inner {
                 registry: WorkerRegistry::new(policy),
                 handles: HashMap::new(),
             }),
+            tree_budget: DelegationTreeBudget {
+                max_depth: 4,
+                max_children_per_worker: 8,
+                max_total_descendants,
+            },
+            tree: Mutex::new(DelegationTreeState::default()),
         }
+    }
+
+    pub fn with_tree_budget(mut self, budget: DelegationTreeBudget) -> Result<Self, &'static str> {
+        if budget.max_depth == 0
+            || budget.max_children_per_worker == 0
+            || budget.max_total_descendants == 0
+        {
+            return Err("invalid delegation tree budget");
+        }
+        self.tree_budget = budget;
+        Ok(self)
+    }
+
+    /// Reserve one tree edge before allocating channels/threads/provider
+    /// runtimes. `parent=None` is a foreground-root child. Every denial is
+    /// fail-closed and leaves the counters unchanged.
+    pub fn reserve_delegation(
+        &self,
+        worker_id: &str,
+        parent: Option<&str>,
+    ) -> Result<u16, DelegationTreeDenied> {
+        let mut tree = self.tree.lock().unwrap();
+        if tree.descendants >= self.tree_budget.max_total_descendants {
+            return Err(DelegationTreeDenied::DescendantLimit);
+        }
+        let depth = match parent {
+            None => 1,
+            Some(parent_id) => tree
+                .depth_by_worker
+                .get(parent_id)
+                .copied()
+                .ok_or(DelegationTreeDenied::UnknownParent)?
+                .saturating_add(1),
+        };
+        if depth > self.tree_budget.max_depth {
+            return Err(DelegationTreeDenied::DepthLimit);
+        }
+        let parent_key = parent.unwrap_or("<root>");
+        if tree.child_count.get(parent_key).copied().unwrap_or(0)
+            >= self.tree_budget.max_children_per_worker
+        {
+            return Err(DelegationTreeDenied::ChildLimit);
+        }
+        tree.depth_by_worker.insert(worker_id.to_string(), depth);
+        *tree.child_count.entry(parent_key.to_string()).or_default() += 1;
+        tree.descendants += 1;
+        Ok(depth)
+    }
+
+    pub fn release_delegation(&self, worker_id: &str, parent: Option<&str>) {
+        let mut tree = self.tree.lock().unwrap();
+        if tree.depth_by_worker.remove(worker_id).is_some() {
+            tree.descendants = tree.descendants.saturating_sub(1);
+            let parent_key = parent.unwrap_or("<root>");
+            if let Some(count) = tree.child_count.get_mut(parent_key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn delegation_descendants(&self) -> usize {
+        self.tree.lock().unwrap().descendants
     }
     pub fn preflight(&self, model: &str) -> Result<(), String> {
         let model = QualifiedModelId::parse(model)
@@ -766,6 +858,38 @@ mod tests {
 
     /// Completion remediation must cite tool-facing `sa_*` handles, never the
     /// internal policy IDs (`worker-N`) that `WorkerRegistry` allocates.
+    #[test]
+    fn delegation_tree_depth_children_and_total_are_independently_bounded() {
+        let foreground = model("anthropic/foreground");
+        let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
+            foreground.clone(),
+            [foreground],
+            8,
+            16,
+        ))
+        .with_tree_budget(DelegationTreeBudget {
+            max_depth: 2,
+            max_children_per_worker: 2,
+            max_total_descendants: 3,
+        })
+        .unwrap();
+
+        assert_eq!(rt.reserve_delegation("a", None), Ok(1));
+        assert_eq!(rt.reserve_delegation("b", Some("a")), Ok(2));
+        assert_eq!(
+            rt.reserve_delegation("too-deep", Some("b")),
+            Err(DelegationTreeDenied::DepthLimit)
+        );
+        assert_eq!(rt.reserve_delegation("c", Some("a")), Ok(2));
+        assert_eq!(
+            rt.reserve_delegation("too-many", Some("a")),
+            Err(DelegationTreeDenied::DescendantLimit)
+        );
+        assert_eq!(rt.delegation_descendants(), 3);
+        rt.release_delegation("c", Some("a"));
+        assert_eq!(rt.delegation_descendants(), 2);
+    }
+
     #[test]
     fn completion_gate_reports_runtime_handles_not_policy_ids() {
         let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(

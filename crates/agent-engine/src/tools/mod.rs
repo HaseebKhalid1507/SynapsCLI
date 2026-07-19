@@ -89,6 +89,9 @@ pub struct ToolCapabilities {
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
+    /// Current worker handle when this context belongs to a delegated
+    /// runtime. `None` denotes the foreground root.
+    pub delegation_parent: Option<String>,
     pub secret_prompt: Option<SecretPromptHandle>,
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.

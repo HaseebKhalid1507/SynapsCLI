@@ -98,6 +98,7 @@ fn manual_ctx() -> ToolContext {
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
+            delegation_parent: None,
             secret_prompt: None,
             orchestration: None,
             tool_activation: None,

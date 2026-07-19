@@ -10,9 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
+use super::super::{resolve_agent_prompt, Tool, ToolContext, NEXT_SUBAGENT_ID};
+use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
+use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
 
 pub struct SubagentStartTool;
 
@@ -22,7 +22,9 @@ impl Tool for SubagentStartTool {
         crate::tools::ToolOrigin::Builtin
     }
 
-    fn name(&self) -> &str { "subagent_start" }
+    fn name(&self) -> &str {
+        "subagent_start"
+    }
 
     fn description(&self) -> &str {
         "Dispatch a reactive subagent and return immediately with a handle_id. \
@@ -79,7 +81,8 @@ impl Tool for SubagentStartTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         // ── Parse params ───────────────────────────────────────────────────────
-        let task = params["task"].as_str()
+        let task = params["task"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
@@ -115,13 +118,23 @@ impl Tool for SubagentStartTool {
         };
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
-        let decision = ctx
+        let orchestration = ctx
             .capabilities
             .orchestration
             .as_ref()
-            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?;
+        orchestration
+            .reserve_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref())
+            .map_err(|reason| {
+                RuntimeError::Tool(format!("delegation tree budget denied: {reason:?}"))
+            })?;
+        let decision = orchestration
             .resolve_and_authorize(&handle_id, requested_model)
-            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+            .map_err(|error| {
+                orchestration
+                    .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
+                RuntimeError::Tool(error.to_string())
+            })?;
         let model = decision.model.as_str().to_owned();
         let timeout_secs = params["timeout"]
             .as_u64()
@@ -131,7 +144,12 @@ impl Tool for SubagentStartTool {
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
 
-        tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
+        tracing::info!(
+            "subagent_start: dispatching '{}' (id={}) model={}",
+            label,
+            handle_id,
+            model
+        );
 
         // ── Shared state ───────────────────────────────────────────────────────
         let state = Arc::new(RwLock::new(SubagentState::new()));
@@ -151,14 +169,15 @@ impl Tool for SubagentStartTool {
         }
 
         // ── Clone state for the spawned thread ─────────────────────────────────
-        let state_t          = Arc::clone(&state);
-        let task_full_a      = task_full.clone();
-        let label_inner      = label.clone();
-        let model_inner      = model.clone();
-        let tx_events_inner  = ctx.channels.tx_events.clone();
-        let start_time       = std::time::Instant::now();
-        let parent_queue     = ctx.capabilities.event_queue.clone();
-        let handle_id_inner  = handle_id.clone();
+        let state_t = Arc::clone(&state);
+        let task_full_a = task_full.clone();
+        let label_inner = label.clone();
+        let model_inner = model.clone();
+        let tx_events_inner = ctx.channels.tx_events.clone();
+        let start_time = std::time::Instant::now();
+        let parent_queue = ctx.capabilities.event_queue.clone();
+        let handle_id_inner = handle_id.clone();
+        let child_parent_id = handle_id.clone();
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can
@@ -185,8 +204,12 @@ impl Tool for SubagentStartTool {
         }
 
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        let orchestration_for_worker = Arc::clone(orchestration);
+        let parent_for_worker = ctx.capabilities.delegation_parent.clone();
         if let Err(error) = orchestration.mark_starting(&handle_id) {
             orchestration.rollback(&handle_id);
+            orchestration
+                .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
 
@@ -195,6 +218,7 @@ impl Tool for SubagentStartTool {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
             let state_for_finalizer = Arc::clone(&state_t);
             let label_for_finalizer = label_inner.clone();
+            let orchestration_for_runtime = Arc::clone(&orchestration_for_worker);
 
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -210,10 +234,10 @@ impl Tool for SubagentStartTool {
                 };
 
                 // Clones for the async block — the outer closure still needs the originals.
-                let state_a        = Arc::clone(&state_t);
-                let label_a        = label_inner.clone();
-                let model_a        = model_inner.clone();
-                let tx_events_a    = tx_events_inner.clone();
+                let state_a = Arc::clone(&state_t);
+                let label_a = label_inner.clone();
+                let model_a = model_inner.clone();
+                let tx_events_a = tx_events_inner.clone();
                 let task_for_timeout = task_full_a.clone();
                 let task_for_complete = task_full_a;
 
@@ -233,6 +257,8 @@ impl Tool for SubagentStartTool {
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
                     runtime.set_tools(super::subagent_tools().await);
+                    runtime.install_orchestration(Arc::clone(&orchestration_for_runtime));
+                    runtime.set_delegation_parent(Some(child_parent_id.clone()));
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -438,7 +464,8 @@ impl Tool for SubagentStartTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Subagent thread panicked: {}", msg);
-                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status =
+                    SubagentStatus::Failed(format!("panic: {}", msg));
             }
 
             // ── Terminal finalizer — exactly once, outside catch_unwind ────────
@@ -450,8 +477,10 @@ impl Tool for SubagentStartTool {
                 subagent_id,
                 &label_for_finalizer,
                 start_time,
-                None,  // start.rs: not a resume
+                None, // start.rs: not a resume
             );
+            orchestration_for_worker
+                .release_delegation(&handle_id_inner, parent_for_worker.as_deref());
         });
 
         // ── Attach the already-persisted handle to the started thread ──────────
@@ -479,6 +508,8 @@ impl Tool for SubagentStartTool {
                 let _ = handle.collect().await;
             }
             orchestration.rollback(&handle_id);
+            orchestration
+                .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
 
@@ -486,7 +517,8 @@ impl Tool for SubagentStartTool {
             "handle_id":  handle_id,
             "agent_name": label,
             "status":     "running"
-        }).to_string())
+        })
+        .to_string())
     }
 }
 
@@ -510,7 +542,10 @@ mod tests {
         });
 
         let result = tool.execute(params, ctx).await;
-        assert!(result.is_err(), "missing registry must return Err before spawn");
+        assert!(
+            result.is_err(),
+            "missing registry must return Err before spawn"
+        );
         let msg = format!("{:?}", result.unwrap_err());
         assert!(
             msg.contains("subagent_registry"),
@@ -533,9 +568,15 @@ mod tests {
         });
 
         let result = tool.execute(params, ctx).await;
-        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+        assert!(
+            result.is_ok(),
+            "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}"
+        );
         let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(body["agent_name"], "inline");
-        assert!(body["handle_id"].as_str().unwrap_or_default().starts_with("sa_"));
+        assert!(body["handle_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sa_"));
     }
 }

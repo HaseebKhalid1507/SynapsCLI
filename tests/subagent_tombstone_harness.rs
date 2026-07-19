@@ -75,6 +75,7 @@ fn tool_context(
             session_manager: None,
             subagent_registry: Some(registry),
             event_queue: None,
+            delegation_parent: None,
             secret_prompt: None,
             orchestration: Some(orchestration),
             tool_activation: None,

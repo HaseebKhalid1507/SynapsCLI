@@ -129,6 +129,7 @@ fn ctx_with_prompt(
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
+            delegation_parent: None,
             secret_prompt,
             orchestration: None,
             tool_activation: cap,

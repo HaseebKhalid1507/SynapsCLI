@@ -116,6 +116,7 @@ fn ctx_full(
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
+            delegation_parent: None,
             secret_prompt: prompt,
             orchestration: None,
             tool_activation: activation,

@@ -324,6 +324,9 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// Current worker handle for bounded delegation-tree accounting. `None`
+    /// for foreground roots.
+    delegation_parent: Option<String>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -483,6 +486,7 @@ impl Runtime {
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: false,
+            delegation_parent: None,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -564,6 +568,7 @@ impl Runtime {
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: false,
+            delegation_parent: None,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -769,6 +774,10 @@ impl Runtime {
             }
         }
         self.orchestration = Some(runtime);
+    }
+
+    pub fn set_delegation_parent(&mut self, parent: Option<String>) {
+        self.delegation_parent = parent;
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -1878,6 +1887,7 @@ impl Runtime {
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
+                                        delegation_parent: None,
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
@@ -2014,6 +2024,7 @@ impl Runtime {
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
+                                                    delegation_parent: None,
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
@@ -2240,6 +2251,7 @@ impl Runtime {
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
+            delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             tool_session_id: self.host_tool_session.clone(),
@@ -2323,6 +2335,7 @@ impl Clone for Runtime {
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            delegation_parent: self.delegation_parent.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
