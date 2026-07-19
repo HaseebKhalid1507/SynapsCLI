@@ -568,3 +568,81 @@ fn retention_sweeps_orphan_journals() {
         "orphan journals are swept"
     );
 }
+
+// ─── 6. benchmarks (resource-capped, --ignored) ──────────────────────────────
+//
+// cargo test -p synaps-core --test session_journal -- --ignored --test-threads=1
+//
+// Machine-readable output: one `BENCH session_save …` line per scale.
+
+fn session_of_bytes(target_bytes: usize) -> Session {
+    let mut s = Session::new("claude-sonnet-4-6", "medium", None);
+    let body = "z".repeat(8 * 1024);
+    let mut approx = serde_json::to_string(&s).unwrap().len();
+    while approx < target_bytes {
+        let i = s.api_messages.len();
+        let msg = json!({"role": if i % 2 == 0 {"user"} else {"assistant"},
+                         "content": format!("{i} {body}")});
+        approx += msg.to_string().len() + 1; // + separator
+        s.api_messages.push(Arc::new(msg));
+    }
+    s
+}
+
+fn bench_save(hist_mib: usize) {
+    let tmp = TempDir::new().unwrap();
+    let mut s = session_of_bytes(hist_mib * 1024 * 1024);
+
+    // Legacy: every save rewrites the full history.
+    let t = std::time::Instant::now();
+    let legacy = save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+    let legacy_ms = t.elapsed().as_millis();
+
+    // Journal steady state: first save snapshots, then appends are deltas.
+    let tmp2 = TempDir::new().unwrap();
+    save_session_in_dir(tmp2.path(), &s, SessionPersistence::Journal).unwrap();
+    push_msg(&mut s, "steady-state delta message");
+    s.updated_at = chrono::Utc::now();
+    let t = std::time::Instant::now();
+    let append = save_session_in_dir(tmp2.path(), &s, SessionPersistence::Journal).unwrap();
+    let append_ms = t.elapsed().as_millis();
+    assert_eq!(append.mode, SaveMode::Append { messages: 1 });
+    assert!(
+        append.bytes_written < 64 * 1024,
+        "journal append must stay delta-bounded at {hist_mib} MiB"
+    );
+
+    // Documented recovery: kill during append, then load.
+    let jpath = journal_path(tmp2.path(), &s.id);
+    let bytes = std::fs::read(&jpath).unwrap();
+    std::fs::write(&jpath, &bytes[..bytes.len().saturating_sub(9)]).unwrap();
+    let t = std::time::Instant::now();
+    let recovered = load_session_in_dir(tmp2.path(), &s.id).unwrap();
+    let recover_ms = t.elapsed().as_millis();
+    assert!(!recovered.api_messages.is_empty());
+
+    println!(
+        "BENCH session_save hist_mib={hist_mib} legacy_save_ms={legacy_ms} \
+         legacy_bytes={} journal_append_ms={append_ms} journal_append_bytes={} \
+         recover_load_ms={recover_ms}",
+        legacy.bytes_written, append.bytes_written
+    );
+}
+
+#[test]
+#[ignore = "benchmark — run explicitly, resource-capped"]
+fn bench_save_1mib_history() {
+    bench_save(1);
+}
+
+#[test]
+#[ignore = "benchmark — run explicitly, resource-capped"]
+fn bench_save_10mib_history() {
+    bench_save(10);
+}
+
+#[test]
+#[ignore = "benchmark — run explicitly, resource-capped"]
+fn bench_save_100mib_history() {
+    bench_save(100);
+}
