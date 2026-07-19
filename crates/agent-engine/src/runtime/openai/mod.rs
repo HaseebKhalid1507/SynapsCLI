@@ -258,59 +258,80 @@ pub async fn try_route(
             )
             .await,
         ),
-        WireProtocol::OpenAiResponses => Some(
-            stream::call_xai_responses_stream_inner(
-                &cfg,
-                &broker,
-                tools_schema,
-                system_prompt,
-                messages,
-                tx,
-                max_tokens,
-                reasoning_level,
-                cancel,
-                trace,
-                exact_wire_bytes,
+        WireProtocol::OpenAiResponses => {
+            if suppress_stream_deltas {
+                return Some(Err(
+                    "internal sync routing is unavailable for this streaming provider".into(),
+                ));
+            }
+            Some(
+                stream::call_xai_responses_stream_inner(
+                    &cfg,
+                    &broker,
+                    tools_schema,
+                    system_prompt,
+                    messages,
+                    tx,
+                    max_tokens,
+                    reasoning_level,
+                    cancel,
+                    trace,
+                    exact_wire_bytes,
+                )
+                .await,
             )
-            .await,
-        ),
-        WireProtocol::CodexResponses => Some(
-            stream::call_codex_stream_inner(
-                &cfg,
-                client,
-                &broker,
-                tools_schema,
-                system_prompt,
-                messages,
-                tx,
-                temperature,
-                max_tokens,
-                reasoning_level,
-                codex_request_role,
-                cancel,
-                // Codex transport rides out chatgpt.com edge bursts with the
-                // same persistent posture as Anthropic OAuth overloads (10
-                // retries), not the generic three-attempt budget.
-                stream::codex_retry_budget(max_retries),
-                trace,
+        }
+        WireProtocol::CodexResponses => {
+            if suppress_stream_deltas {
+                return Some(Err(
+                    "internal sync routing is unavailable for this streaming provider".into(),
+                ));
+            }
+            Some(
+                stream::call_codex_stream_inner(
+                    &cfg,
+                    client,
+                    &broker,
+                    tools_schema,
+                    system_prompt,
+                    messages,
+                    tx,
+                    temperature,
+                    max_tokens,
+                    reasoning_level,
+                    codex_request_role,
+                    cancel,
+                    // Codex transport rides out chatgpt.com edge bursts with the
+                    // same persistent posture as Anthropic OAuth overloads (10
+                    // retries), not the generic three-attempt budget.
+                    stream::codex_retry_budget(max_retries),
+                    trace,
+                )
+                .await,
             )
-            .await,
-        ),
+        }
         WireProtocol::AnthropicMessages => None,
-        WireProtocol::GoogleGeminiCodeAssist => Some(
-            crate::runtime::google_gemini::runtime::call_google_gemini_stream_inner(
-                &cfg,
-                &broker,
-                tools_schema,
-                system_prompt,
-                messages,
-                tx,
-                cancel,
-                trace,
-                exact_wire_bytes,
+        WireProtocol::GoogleGeminiCodeAssist => {
+            if suppress_stream_deltas {
+                return Some(Err(
+                    "internal sync routing is unavailable for this streaming provider".into(),
+                ));
+            }
+            Some(
+                crate::runtime::google_gemini::runtime::call_google_gemini_stream_inner(
+                    &cfg,
+                    &broker,
+                    tools_schema,
+                    system_prompt,
+                    messages,
+                    tx,
+                    cancel,
+                    trace,
+                    exact_wire_bytes,
+                )
+                .await,
             )
-            .await,
-        ),
+        }
     }
 }
 
