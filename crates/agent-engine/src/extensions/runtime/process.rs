@@ -698,13 +698,39 @@ impl ProcessExtension {
         if let Some(stderr) = child.stderr.take() {
             let extension_id = id.to_string();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
+                // Bounded stderr forwarding (Task 20): extension-controlled
+                // bytes. Each line is capped, total forwarded bytes are
+                // budgeted; past the budget only byte counts are tracked so
+                // a hostile child can never grow memory or flood the log.
+                const MAX_STDERR_LINE: usize = 8 * 1024;
+                const MAX_STDERR_FORWARD_TOTAL: u64 = 128 * 1024;
+                let mut reader = BufReader::new(stderr);
+                let mut forwarded: u64 = 0;
+                let mut suppressed: u64 = 0;
                 loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            tracing::debug!(extension = %extension_id, stderr = %line);
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut limited =
+                        tokio::io::AsyncReadExt::take(&mut reader, MAX_STDERR_LINE as u64 + 1);
+                    match tokio::io::AsyncBufReadExt::read_until(&mut limited, b'\n', &mut buf)
+                        .await
+                    {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if forwarded < MAX_STDERR_FORWARD_TOTAL {
+                                forwarded = forwarded.saturating_add(n as u64);
+                                let truncated = n > MAX_STDERR_LINE;
+                                let end = buf.len().min(MAX_STDERR_LINE);
+                                let line = String::from_utf8_lossy(&buf[..end]);
+                                let line = line.trim_end_matches(['\r', '\n']);
+                                tracing::debug!(
+                                    extension = %extension_id,
+                                    truncated,
+                                    stderr = %line,
+                                );
+                            } else {
+                                suppressed = suppressed.saturating_add(n as u64);
+                            }
                         }
-                        Ok(None) => break,
                         Err(error) => {
                             tracing::debug!(
                                 extension = %extension_id,
@@ -714,6 +740,13 @@ impl ProcessExtension {
                             break;
                         }
                     }
+                }
+                if suppressed > 0 {
+                    tracing::debug!(
+                        extension = %extension_id,
+                        suppressed_bytes = suppressed,
+                        "Extension stderr exceeded the forwarding budget; further bytes counted only",
+                    );
                 }
             });
         }
@@ -786,10 +819,15 @@ impl ProcessExtension {
         let mut saw_any_header = false;
         loop {
             let mut header_line = String::new();
-            let n = reader
-                .read_line(&mut header_line)
-                .await
-                .map_err(|e| format!("Read header error: {}", e))?;
+            // Bounded header read: a hostile child streaming bytes without
+            // a newline must fail the 1 KiB header policy, not grow memory.
+            let n = {
+                let mut limited = tokio::io::AsyncReadExt::take(&mut *reader, 1025);
+                limited
+                    .read_line(&mut header_line)
+                    .await
+                    .map_err(|e| format!("Read header error: {}", e))?
+            };
             if n == 0 {
                 if saw_any_header {
                     return Err("Unexpected EOF while reading response headers".into());
@@ -1535,6 +1573,43 @@ impl ProcessExtension {
             id,
         )
         .await
+    }
+
+    /// Task 20 lease path: one `tool.call` that NEVER (re)spawns. A missing
+    /// process state fails typed instead of resurrecting a terminated
+    /// child, and the restart machinery is bypassed entirely — a lease
+    /// child that dies is a transport error, never a silent new process
+    /// whose declarations were not re-validated.
+    pub(crate) async fn call_tool_once_no_spawn(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let fut = async {
+            let _call_guard = self.call_lock.lock().await;
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let mut state_guard = self.state.lock().await;
+            let Some(state) = state_guard.as_mut() else {
+                return Err(format!(
+                    "Extension '{}' process is not running; leased call refused (no respawn)",
+                    self.id
+                ));
+            };
+            self.call_once_locked(
+                state,
+                "tool.call",
+                serde_json::json!({"name": name, "input": input}),
+                id,
+            )
+            .await
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Extension '{}' leased tool.call timed out after 120s",
+                self.id
+            )),
+        }
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {

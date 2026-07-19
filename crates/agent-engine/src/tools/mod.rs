@@ -96,6 +96,11 @@ pub struct ToolCapabilities {
     /// identity + shared runtime manager. `None` (default for non-stream
     /// contexts) means deferred MCP tools fail typed and start nothing.
     pub mcp_leases: Option<crate::mcp::McpLeaseCapability>,
+    /// Session-scoped exact EXTENSION lease capability (Task 20): exact
+    /// session identity + shared extension runtime manager. `None`
+    /// (default for non-stream contexts) means deferred extension tools
+    /// fail typed and start nothing.
+    pub extension_leases: Option<crate::extensions::lease::ExtensionLeaseCapability>,
 }
 
 /// Configuration limits and timeouts.

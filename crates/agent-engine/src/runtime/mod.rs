@@ -331,6 +331,15 @@ pub struct Runtime {
     /// runtime session's MCP leases only when the LAST owner (runtime clone
     /// or in-flight stream) drops — never per provider turn.
     mcp_session_scope: Option<std::sync::Arc<crate::mcp::McpSessionEndGuard>>,
+    /// Shared exact EXTENSION lease manager (Task 20). Installed at engine
+    /// boot under progressive disclosure; streams mint per-session
+    /// capabilities and hold the durable scope below.
+    extension_runtime: Option<std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
+    /// Durable shared session-scope guard for extension leases (Task 20):
+    /// terminates this runtime session's extension leases only when the
+    /// LAST owner (runtime clone or in-flight stream) drops.
+    extension_session_scope:
+        Option<std::sync::Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -472,6 +481,8 @@ impl Runtime {
             progressive_tool_disclosure: false,
             mcp_runtime: None,
             mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
             host_tool_session: fresh_host_tool_session(),
         })
     }
@@ -548,6 +559,8 @@ impl Runtime {
             progressive_tool_disclosure: false,
             mcp_runtime: None,
             mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
             host_tool_session: fresh_host_tool_session(),
         }
     }
@@ -697,6 +710,23 @@ impl Runtime {
             std::sync::Arc::clone(&manager),
         )));
         self.mcp_runtime = Some(manager);
+    }
+
+    /// Install the shared exact EXTENSION lease manager (Task 20, engine
+    /// boot). Also mints ONE durable session-scope guard for the runtime's
+    /// tool session, shared by every clone and stream; only the LAST
+    /// owner's drop terminates leases.
+    pub fn install_extension_runtime(
+        &mut self,
+        manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    ) {
+        self.extension_session_scope = Some(std::sync::Arc::new(
+            crate::extensions::lease::ExtensionSessionEndGuard::new(
+                self.host_tool_session.clone(),
+                std::sync::Arc::clone(&manager),
+            ),
+        ));
+        self.extension_runtime = Some(manager);
     }
 
     pub fn install_orchestration(
@@ -1825,6 +1855,7 @@ impl Runtime {
                                         orchestration: self.orchestration.clone(),
                                         tool_activation: None,
                                         mcp_leases: None,
+                                        extension_leases: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -1960,6 +1991,7 @@ impl Runtime {
                                                     orchestration: orchestration_inner,
                                                     tool_activation: None,
                                                     mcp_leases: None,
+                                                    extension_leases: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -2183,6 +2215,8 @@ impl Runtime {
             tool_session_id: self.host_tool_session.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
+            extension_runtime: self.extension_runtime.clone(),
+            extension_session_scope: self.extension_session_scope.clone(),
         };
 
         tokio::spawn(async move {
@@ -2262,6 +2296,9 @@ impl Clone for Runtime {
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
             mcp_session_scope: self.mcp_session_scope.clone(),
+            extension_runtime: self.extension_runtime.clone(),
+            // Same durable shared-scope rule for extension leases.
+            extension_session_scope: self.extension_session_scope.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and

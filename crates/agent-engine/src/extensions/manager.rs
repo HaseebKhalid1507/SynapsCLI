@@ -150,10 +150,21 @@ pub struct ExtensionManager {
     /// is retained for exact-activation lease acquisition.
     progressive_deferral: bool,
     /// Launch records for deferred tool-only extensions (manifest + cwd +
-    /// resolved config), keyed by plugin id. Consumed by the extension
-    /// runtime lease lifecycle.
-    deferred_tool_only: HashMap<String, DeferredExtensionRecord>,
+    /// resolved config), keyed by plugin id, behind a SHARED handle: the
+    /// [`crate::extensions::lease::ExtensionRuntimeManager`] reads the
+    /// CURRENT record at every lease acquisition (sync lock, map ops only,
+    /// never held across I/O). Consumed by the lease lifecycle only.
+    deferred_tool_only: SharedDeferredRecords,
+    /// Lazily-created shared extension runtime lease manager (Task 20
+    /// Commit B). One instance shared by this manager (unload revocation)
+    /// and the `Runtime` (per-session capabilities + session-end scope).
+    extension_runtime: std::sync::OnceLock<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
 }
+
+/// Shared handle to the retained deferred launch records. Crate-private:
+/// records hold RESOLVED (potentially secret) config.
+pub(crate) type SharedDeferredRecords =
+    Arc<std::sync::Mutex<HashMap<String, DeferredExtensionRecord>>>;
 
 /// Retained launch expectation for a spawn-deferred tool-only extension.
 ///
@@ -164,9 +175,6 @@ pub struct ExtensionManager {
 /// counts (see [`ExtensionManager::is_deferred_tool_only`]); runtime
 /// acquisition stays inside the manager/lease lifecycle API.
 #[derive(Clone)]
-// Transitional allow: consumed by the extension runtime lease lifecycle in
-// Task 20 Commit B (immediate next commit); until then only tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DeferredExtensionRecord {
     pub(crate) manifest: ExtensionManifest,
     pub(crate) cwd: Option<std::path::PathBuf>,
@@ -186,7 +194,8 @@ impl ExtensionManager {
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
-            deferred_tool_only: HashMap::new(),
+            deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            extension_runtime: std::sync::OnceLock::new(),
         }
     }
 
@@ -205,7 +214,8 @@ impl ExtensionManager {
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
-            deferred_tool_only: HashMap::new(),
+            deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            extension_runtime: std::sync::OnceLock::new(),
         }
     }
 
@@ -237,24 +247,100 @@ impl ExtensionManager {
     /// Boolean-only diagnostic: the underlying launch record (which holds
     /// resolved — potentially secret — config) is never exposed.
     pub fn is_deferred_tool_only(&self, id: &str) -> bool {
-        self.deferred_tool_only.contains_key(id)
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
     }
 
     /// Number of retained deferred tool-only launch records (count-only
     /// diagnostic; never the records).
     pub fn deferred_tool_only_count(&self) -> usize {
-        self.deferred_tool_only.len()
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
-    /// Crate-internal: clone one retained launch record for the extension
-    /// runtime lease lifecycle (Commit B). Never exposed publicly.
-    ///
-    /// TODO(Task20 Commit B — immediate next commit): `unload`/`reload`
-    /// of a deferred extension must remove this record, deregister its
-    /// dormant catalog batch, and revoke/terminate any live session lease.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Commit B lease acquisition
+    fn deferred_records(&self) -> &SharedDeferredRecords {
+        &self.deferred_tool_only
+    }
+
+    /// The SHARED extension runtime lease manager (Task 20 Commit B),
+    /// created on first use against this manager's retained launch
+    /// records. The engine installs the same instance on the `Runtime`
+    /// (session capabilities + durable session-end scope); this manager
+    /// uses it for unload/reload lease revocation. Runtime acquisition —
+    /// spawn, re-validation, exact declaration matching — happens ONLY
+    /// inside that manager's lease lifecycle.
+    pub fn extension_runtime(&self) -> Arc<crate::extensions::lease::ExtensionRuntimeManager> {
+        self.extension_runtime_with_idle(crate::extensions::lease::DEFAULT_IDLE_MAX)
+    }
+
+    /// As [`Self::extension_runtime`], but the FIRST caller fixes the idle
+    /// reap bound (tests use short bounds; production uses the default).
+    pub fn extension_runtime_with_idle(
+        &self,
+        idle_max: std::time::Duration,
+    ) -> Arc<crate::extensions::lease::ExtensionRuntimeManager> {
+        Arc::clone(self.extension_runtime.get_or_init(|| {
+            Arc::new(crate::extensions::lease::ExtensionRuntimeManager::new(
+                Arc::clone(&self.deferred_tool_only),
+                idle_max,
+            ))
+        }))
+    }
+
+    /// Test-only internal introspection: clone one retained launch record
+    /// (the lease manager reads the shared records handle directly).
+    #[cfg(test)]
     pub(crate) fn deferred_launch_record(&self, id: &str) -> Option<DeferredExtensionRecord> {
-        self.deferred_tool_only.get(id).cloned()
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    /// Test seam: tamper the retained manifest permissions of one deferred
+    /// record IN PLACE (simulates internal-state drift the public API can
+    /// never produce, to prove acquisition re-validation fails closed).
+    /// Reveals nothing.
+    #[doc(hidden)]
+    pub fn tamper_deferred_manifest_permissions_for_tests(
+        &self,
+        id: &str,
+        permissions: Vec<String>,
+    ) -> bool {
+        let mut map = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get_mut(id) {
+            Some(record) => {
+                record.manifest.permissions = permissions;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test seam: tamper the retained RESOLVED config of one deferred
+    /// record in place (simulates launch-record/config drift under a live
+    /// lease). Reveals nothing.
+    #[doc(hidden)]
+    pub fn tamper_deferred_config_for_tests(&self, id: &str, config: Value) -> bool {
+        let mut map = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get_mut(id) {
+            Some(record) => {
+                record.config = config;
+                true
+            }
+            None => false,
+        }
     }
 
     async fn load_with_cwd_and_config(
@@ -264,8 +350,8 @@ impl ExtensionManager {
         cwd: Option<std::path::PathBuf>,
         config: Value,
     ) -> Result<(), String> {
-        // Don't load duplicates
-        if self.extensions.contains_key(id) {
+        // Don't load duplicates (live OR deferred).
+        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
             return Err(format!("Extension '{}' is already loaded", id));
         }
 
@@ -300,14 +386,17 @@ impl ExtensionManager {
                 .await
                 .try_register_batch(dormant)
                 .map_err(|e| format!("Extension '{}' deferred tool catalog rejected: {}", id, e))?;
-            self.deferred_tool_only.insert(
-                id.to_string(),
-                DeferredExtensionRecord {
-                    manifest: manifest.clone(),
-                    cwd,
-                    config,
-                },
-            );
+            self.deferred_tool_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    id.to_string(),
+                    DeferredExtensionRecord {
+                        manifest: manifest.clone(),
+                        cwd,
+                        config,
+                    },
+                );
             self.manifest_configs
                 .insert(id.to_string(), manifest.config.clone());
             tracing::info!(extension = %id, tools = count,
@@ -598,7 +687,55 @@ impl ExtensionManager {
     }
 
     /// Unload an extension — unsubscribe hooks and shut down the process.
+    ///
+    /// A DEFERRED tool-only extension (Task 20) has no live handler:
+    /// unloading it removes the retained launch record, deregisters its
+    /// dormant catalog batch (advancing the catalog generation so stale
+    /// grants cannot survive), and terminates every session's runtime
+    /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        let deferred = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        if let Some(record) = deferred {
+            // Record removed FIRST: any concurrent lease acquisition now
+            // fails closed (NotDeferred) regardless of the steps below.
+            if let Some(runtime) = self.extension_runtime.get() {
+                let revoked = runtime.revoke_plugin_all_sessions(id);
+                if revoked > 0 {
+                    tracing::info!(extension = %id, leases = revoked,
+                        "Terminated live runtime leases of unloaded deferred extension");
+                }
+            }
+            if let Some(tools) = &self.tools {
+                let names: Vec<String> = record
+                    .manifest
+                    .deferred
+                    .as_ref()
+                    .map(|d| {
+                        d.tools
+                            .iter()
+                            .map(|t| format!("{}:{}", id, t.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Err(error) = tools.write().await.try_disable(&names) {
+                    // Fail-closed either way: with the record gone, dormant
+                    // descriptors can never execute; surface the partial
+                    // cleanup instead of hiding it.
+                    return Err(format!(
+                        "Extension '{}' unloaded (record removed, leases revoked) but its dormant catalog batch could not be deregistered: {}",
+                        id, error
+                    ));
+                }
+            }
+            self.manifest_configs.remove(id);
+            self.manifest_theme_tokens.remove(id);
+            tracing::info!(extension = %id, "Deferred extension unloaded");
+            return Ok(());
+        }
         let handler = self
             .extensions
             .remove(id)
@@ -625,7 +762,7 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        if self.extensions.contains_key(id) {
+        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
             self.unload(id).await?;
         }
         self.load_with_cwd(id, manifest, cwd).await
@@ -636,6 +773,21 @@ impl ExtensionManager {
         let ids: Vec<String> = self.extensions.keys().cloned().collect();
         for id in ids {
             let _ = self.unload(&id).await;
+        }
+        // Deferred extensions (Task 20): unload each retained record so
+        // dormant catalog batches and any live runtime leases go with it.
+        let deferred_ids: Vec<String> = {
+            let map = self
+                .deferred_tool_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.keys().cloned().collect()
+        };
+        for id in deferred_ids {
+            let _ = self.unload(&id).await;
+        }
+        if let Some(runtime) = self.extension_runtime.get() {
+            runtime.terminate_all();
         }
     }
 

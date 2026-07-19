@@ -154,6 +154,7 @@ fn empty_tool_context() -> ToolContext {
             orchestration: None,
             tool_activation: None,
             mcp_leases: None,
+            extension_leases: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

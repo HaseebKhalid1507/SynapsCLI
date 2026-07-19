@@ -133,6 +133,7 @@ fn ctx_with_prompt(
             orchestration: None,
             tool_activation: cap,
             mcp_leases: None,
+            extension_leases: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

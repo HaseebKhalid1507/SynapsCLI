@@ -97,6 +97,28 @@ impl ActivationCapability {
         set.revoke_exact(&ToolId::mcp(server, server_tool_name))
             .is_ok()
     }
+
+    /// Narrow extension grant invalidation (Task 20): revoke EXACTLY one
+    /// extension `ToolId` from the RETAINED session set, and only when the
+    /// caller's session identity matches the retained set's session. Core
+    /// tools and sibling activations are untouched; the catalog is never
+    /// mutated. Returns true iff an activation was actually removed.
+    pub fn revoke_exact_extension_grant(
+        &self,
+        session: &crate::tools::activation::SessionId,
+        plugin_id: &str,
+        tool_name: &str,
+    ) -> bool {
+        let mut set = self
+            .session_set
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.session() != session {
+            return false;
+        }
+        set.revoke_exact(&ToolId::extension(plugin_id, tool_name))
+            .is_ok()
+    }
 }
 
 impl std::fmt::Debug for ActivationCapability {

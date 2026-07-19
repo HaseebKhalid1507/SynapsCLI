@@ -2,8 +2,6 @@
 //! bounded passive deferred declarations, and dormant zero-spawn
 //! descriptor tools for tool-only extensions.
 
-use std::sync::Arc;
-
 use agent_engine::extensions::lifecycle::{
     classify, dormant_extension_tools, earliest_trigger, validate_runtime_tool_declarations,
     ActivationTrigger, DeclaredExtensionProvider, DeclaredExtensionProviderModel,
@@ -68,6 +66,7 @@ fn ctx() -> ToolContext {
             orchestration: None,
             tool_activation: None,
             mcp_leases: None,
+            extension_leases: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

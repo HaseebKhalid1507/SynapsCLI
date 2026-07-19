@@ -261,6 +261,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // Task 20: progressive disclosure defers tool-only extension spawns
     // (dormant descriptors only); flag-off keeps the legacy eager loads.
     ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
+    if config.progressive_tool_disclosure {
+        // ONE shared extension runtime lease manager: the manager uses it
+        // for unload revocation; the runtime mints per-session capabilities
+        // and the durable session-end scope from the SAME instance.
+        runtime.install_extension_runtime(ext_mgr.extension_runtime());
+    }
     let ext_manager = Arc::new(RwLock::new(ext_mgr));
     crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 

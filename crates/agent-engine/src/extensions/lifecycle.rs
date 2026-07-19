@@ -352,6 +352,67 @@ pub fn validate_runtime_tool_declarations(
     Ok(())
 }
 
+/// Strict initialize-time PROVIDER declaration check (Task 20 Commit B):
+/// the runtime's registered provider specs must match the manifest's
+/// passive declarations EXACTLY — same id set, display names,
+/// descriptions, model id sets, per-model display/context-window/
+/// capability values, and config schemas as declared. A manifest that
+/// declares NO providers must see NO registered providers (a tool-only
+/// runtime sneaking provider metadata in is an undeclared capability).
+/// Static reasons only; callers shut the child down and fail closed.
+pub fn validate_runtime_provider_declarations(
+    declared: &[DeclaredExtensionProvider],
+    registered: &[crate::extensions::runtime::process::RegisteredProviderSpec],
+) -> Result<(), &'static str> {
+    if declared.len() != registered.len() {
+        return Err("declared_and_registered_provider_counts_differ");
+    }
+    let mut live_ids: HashSet<&str> = HashSet::new();
+    for spec in registered {
+        if !live_ids.insert(spec.id.as_str()) {
+            return Err("registered_provider_ids_duplicate");
+        }
+    }
+    for decl in declared {
+        let Some(live) = registered.iter().find(|spec| spec.id == decl.id) else {
+            return Err("declared_provider_not_registered");
+        };
+        if live.display_name != decl.display_name {
+            return Err("registered_provider_display_name_mismatch");
+        }
+        if live.description != decl.description {
+            return Err("registered_provider_description_mismatch");
+        }
+        if live.config_schema != decl.config_schema {
+            return Err("registered_provider_config_schema_mismatch");
+        }
+        if live.models.len() != decl.models.len() {
+            return Err("registered_provider_model_counts_differ");
+        }
+        let mut live_model_ids: HashSet<&str> = HashSet::new();
+        for model in &live.models {
+            if !live_model_ids.insert(model.id.as_str()) {
+                return Err("registered_provider_model_ids_duplicate");
+            }
+        }
+        for declared_model in &decl.models {
+            let Some(live_model) = live.models.iter().find(|m| m.id == declared_model.id) else {
+                return Err("declared_provider_model_not_registered");
+            };
+            if live_model.display_name != declared_model.display_name {
+                return Err("registered_provider_model_display_name_mismatch");
+            }
+            if live_model.context_window != declared_model.context_window {
+                return Err("registered_provider_model_context_window_mismatch");
+            }
+            if live_model.capabilities != declared_model.capabilities {
+                return Err("registered_provider_model_capabilities_mismatch");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A dormant, manifest-declared extension tool. Registered like any live
 /// tool (stable `ext:<plugin>:<name>` identity, schema, digest — so wire
 /// resolution, discovery, exact grants, and the execution gate all work
@@ -418,14 +479,64 @@ impl Tool for DeferredExtensionTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, _params: Value, _ctx: ToolContext) -> crate::Result<String> {
-        // Lease-manager execution arrives with the lease lifecycle commit;
-        // until wired, a deferred extension tool NEVER starts a process.
-        Err(crate::RuntimeError::Tool(format!(
-            "extension tool '{}' (plugin '{}') is activation-deferred and no extension \
-             runtime lease capability is available in this context; no process was started",
-            self.runtime_name, self.plugin_id
-        )))
+    async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
+        // Runs strictly AFTER the ExecutionGate authorized this exact call.
+        // Without the typed session lease capability, a deferred extension
+        // tool NEVER starts a process.
+        let Some(leases) = ctx.capabilities.extension_leases.clone() else {
+            return Err(crate::RuntimeError::Tool(format!(
+                "extension tool '{}' (plugin '{}') is activation-deferred and no extension \
+                 runtime lease capability is available in this context; no process was started",
+                self.runtime_name, self.plugin_id
+            )));
+        };
+        match leases
+            .call_exact(
+                &self.plugin_id,
+                &self.tool_name,
+                &self.expected_digest,
+                params,
+            )
+            .await
+        {
+            Ok(value) => Ok(render_tool_result(&value)),
+            Err(err) => {
+                // Grant invalidation (spec §7.5): record removal, manifest/
+                // permission re-validation failure, launch-record (config)
+                // drift, catalog drift, and runtime declaration mismatches
+                // poison the pinned declaration, so the EXACT session grant
+                // must fall with the lease. Transport/capacity/revocation-
+                // race and extension-reported tool errors are transient and
+                // must NOT revoke.
+                if err.revokes_exact_grant() {
+                    if let Some(activation) = ctx.capabilities.tool_activation.as_ref() {
+                        if activation.revoke_exact_extension_grant(
+                            leases.session(),
+                            &self.plugin_id,
+                            &self.tool_name,
+                        ) {
+                            tracing::debug!(
+                                "revoked exact extension activation after declaration invalidation"
+                            );
+                        }
+                    }
+                }
+                Err(crate::RuntimeError::Tool(err.to_string()))
+            }
+        }
+    }
+}
+
+/// Render an extension tool-call result value exactly like the eager
+/// `ExtensionTool` path: plain string, `content` string field, or the
+/// serialized value.
+fn render_tool_result(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        text.to_string()
+    } else if let Some(text) = value.get("content").and_then(Value::as_str) {
+        text.to_string()
+    } else {
+        value.to_string()
     }
 }
 

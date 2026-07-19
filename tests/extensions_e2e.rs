@@ -5,29 +5,37 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use serde_json::{json, Value};
 use synaps_cli::config;
 use synaps_cli::extensions::hooks::events::{HookEvent, HookKind, HookResult};
 use synaps_cli::extensions::hooks::HookBus;
 use synaps_cli::extensions::manager::ExtensionManager;
+use synaps_cli::extensions::manifest::ExtensionConfigEntry;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::ExtensionHandler;
-use synaps_cli::extensions::manifest::ExtensionConfigEntry;
-use synaps_cli::{Tool, ToolContext};
 use synaps_cli::tools::ToolOrigin;
-use async_trait::async_trait;
-use serde_json::{json, Value};
+use synaps_cli::{Tool, ToolContext};
 
 struct EchoTestTool;
 
 #[async_trait]
 impl Tool for EchoTestTool {
-    fn name(&self) -> &str { "echo_test" }
-    fn description(&self) -> &str { "echo test" }
-    fn parameters(&self) -> Value { json!({"type": "object"}) }
+    fn name(&self) -> &str {
+        "echo_test"
+    }
+    fn description(&self) -> &str {
+        "echo test"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
     /// Verified-core fixture: the Task 16 execution gate admits only
     /// verified-provenance tools into the default core set.
-    fn origin(&self) -> ToolOrigin { ToolOrigin::Builtin }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
     async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
         Ok(params["message"].as_str().unwrap_or_default().to_string())
     }
@@ -43,8 +51,8 @@ fn installed_fixture_script() -> String {
 
 #[tokio::test]
 async fn time_extension_injects_timestamp() {
-    let ext_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/extensions/time-ext.py");
+    let ext_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/time-ext.py");
 
     if !ext_path.exists() {
         eprintln!("Skipping: time-ext.py not found at {:?}", ext_path);
@@ -108,8 +116,8 @@ async fn time_extension_injects_timestamp() {
 
 #[tokio::test]
 async fn time_extension_continues_for_non_message_hooks() {
-    let ext_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/extensions/time-ext.py");
+    let ext_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/time-ext.py");
 
     if !ext_path.exists() {
         return;
@@ -125,7 +133,10 @@ async fn time_extension_continues_for_non_message_hooks() {
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "ls"}));
     let result = handler.handle(&event).await;
-    assert!(matches!(result, HookResult::Continue), "Expected Continue for tool hook");
+    assert!(
+        matches!(result, HookResult::Continue),
+        "Expected Continue for tool hook"
+    );
 
     handler.shutdown().await;
 }
@@ -173,16 +184,20 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         "bash",
         None,
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
-    ).await;
+    )
+    .await;
     let decision = synaps_cli::runtime::resolve_before_tool_call_decision(
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
         before,
         None,
         false,
-    ).await;
+    )
+    .await;
     let input = match decision {
         synaps_cli::runtime::BeforeToolCallDecision::Continue { input } => input,
-        synaps_cli::runtime::BeforeToolCallDecision::Block { reason } => panic!("unexpected block: {reason}"),
+        synaps_cli::runtime::BeforeToolCallDecision::Block { reason } => {
+            panic!("unexpected block: {reason}")
+        }
     };
     assert_eq!(input, serde_json::json!({"command": "printf modified"}));
 
@@ -190,7 +205,10 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         .execute(
             input.clone(),
             synaps_cli::ToolContext {
-                channels: synaps_cli::tools::ToolChannels { tx_delta: None, tx_events: None },
+                channels: synaps_cli::tools::ToolChannels {
+                    tx_delta: None,
+                    tx_events: None,
+                },
                 capabilities: synaps_cli::tools::ToolCapabilities {
                     watcher_exit_path: None,
                     tool_register_tx: None,
@@ -198,9 +216,10 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     subagent_registry: None,
                     event_queue: None,
                     secret_prompt: None,
-            orchestration: None,
-            tool_activation: None,
+                    orchestration: None,
+                    tool_activation: None,
                     mcp_leases: None,
+                    extension_leases: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -222,7 +241,8 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         input,
         output,
         256 * 1024,
-    ).await;
+    )
+    .await;
     // No after_tool_call transform handler registered → output unchanged.
     assert_eq!(after, "modified");
 
@@ -254,7 +274,10 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
-        permissions: vec!["tools.intercept".to_string(), "tools.transform_output".to_string()],
+        permissions: vec![
+            "tools.intercept".to_string(),
+            "tools.transform_output".to_string(),
+        ],
         hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
             hook: "after_tool_call".to_string(),
             tool: Some("bash".to_string()),
@@ -316,7 +339,9 @@ async fn extension_tools_are_registered_in_tool_registry() {
         .to_string_lossy()
         .to_string();
     let hook_bus = Arc::new(HookBus::new());
-    let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
+    let tools = Arc::new(tokio::sync::RwLock::new(
+        synaps_cli::ToolRegistry::without_subagent(),
+    ));
     let mut manager = ExtensionManager::new_with_tools(hook_bus, tools.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
         theme_tokens: Default::default(),
@@ -342,7 +367,10 @@ async fn extension_tools_are_registered_in_tool_registry() {
         .execute(
             serde_json::json!({"text": "hello"}),
             synaps_cli::ToolContext {
-                channels: synaps_cli::tools::ToolChannels { tx_delta: None, tx_events: None },
+                channels: synaps_cli::tools::ToolChannels {
+                    tx_delta: None,
+                    tx_events: None,
+                },
                 capabilities: synaps_cli::tools::ToolCapabilities {
                     watcher_exit_path: None,
                     tool_register_tx: None,
@@ -350,9 +378,10 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     subagent_registry: None,
                     event_queue: None,
                     secret_prompt: None,
-            orchestration: None,
-            tool_activation: None,
+                    orchestration: None,
+                    tool_activation: None,
                     mcp_leases: None,
+                    extension_leases: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -367,8 +396,13 @@ async fn extension_tools_are_registered_in_tool_registry() {
         .unwrap();
     assert_eq!(output, "echo: hello");
     let schema = registry.tools_schema();
-    let registered = schema.iter().find(|tool| tool["name"] == "register-tool-test_echo");
-    assert!(registered.is_some(), "extension tool should appear in API schema: {schema:?}");
+    let registered = schema
+        .iter()
+        .find(|tool| tool["name"] == "register-tool-test_echo");
+    assert!(
+        registered.is_some(),
+        "extension tool should appear in API schema: {schema:?}"
+    );
     drop(registry);
 
     manager.shutdown_all().await;
@@ -406,18 +440,28 @@ async fn extension_registering_tools_requires_tools_register_permission() {
         config: vec![],
     };
 
-    let error = manager.load("register-tool-test", &manifest).await.unwrap_err();
+    let error = manager
+        .load("register-tool-test", &manifest)
+        .await
+        .unwrap_err();
     assert!(error.contains("tools.register"), "{error}");
     manager.shutdown_all().await;
 
-    let pid: i32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let still_running = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
-    assert!(!still_running, "extension process {pid} leaked after load failure");
+    assert!(
+        !still_running,
+        "extension process {pid} leaked after load failure"
+    );
 }
 
 #[tokio::test]
@@ -435,7 +479,9 @@ async fn extension_tool_specs_are_validated() {
         ("non_object_schema", "input_schema must be a JSON object"),
     ] {
         let hook_bus = Arc::new(HookBus::new());
-        let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
+        let tools = Arc::new(tokio::sync::RwLock::new(
+            synaps_cli::ToolRegistry::without_subagent(),
+        ));
         let mut manager = ExtensionManager::new_with_tools(hook_bus, tools);
         let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
             theme_tokens: Default::default(),
@@ -455,7 +501,10 @@ async fn extension_tool_specs_are_validated() {
             config: vec![],
         };
 
-        let error = manager.load("invalid-tool-spec", &manifest).await.unwrap_err();
+        let error = manager
+            .load("invalid-tool-spec", &manifest)
+            .await
+            .unwrap_err();
         assert!(error.contains(expected), "mode={mode}; error={error}");
         manager.shutdown_all().await;
     }
@@ -536,7 +585,10 @@ async fn provider_capability_specs_are_validated() {
             config: vec![],
         };
 
-        let error = manager.load("invalid-provider-spec", &manifest).await.unwrap_err();
+        let error = manager
+            .load("invalid-provider-spec", &manifest)
+            .await
+            .unwrap_err();
         assert!(error.contains(expected), "mode={mode}; error={error}");
         manager.shutdown_all().await;
     }
@@ -553,7 +605,11 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         "http://localhost:1234",
     )
     .unwrap();
-    fs::write(home.path().join("config"), "extension.config-test.endpoint = http://localhost:1234\n").unwrap();
+    fs::write(
+        home.path().join("config"),
+        "extension.config-test.endpoint = http://localhost:1234\n",
+    )
+    .unwrap();
     std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
 
     let fixture = std::env::current_dir()
@@ -607,11 +663,21 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         ],
     };
 
-    manager.load_with_cwd("config-test", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+    manager
+        .load_with_cwd(
+            "config-test",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     manager.shutdown_all().await;
     std::env::remove_var("CONFIG_TEST_TOKEN");
 
-    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(plugin_dir.path().join("config-seen.json")).unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(plugin_dir.path().join("config-seen.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(seen["endpoint"], "http://localhost:1234");
     assert_eq!(seen["mode"], "safe");
     assert_eq!(seen["token"], "secret-token");
@@ -649,18 +715,34 @@ async fn extension_missing_required_config_fails_before_spawn() {
         }],
     };
 
-    let error = manager.load_with_cwd("missing-config", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap_err();
-    assert!(error.contains("missing required config 'endpoint'"), "{error}");
-    assert!(!error.contains("spawn"), "config validation should happen before spawn: {error}");
+    let error = manager
+        .load_with_cwd(
+            "missing-config",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("missing required config 'endpoint'"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("spawn"),
+        "config validation should happen before spawn: {error}"
+    );
 }
-
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_provider_complete_routes_to_process() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
-    fs::write(home.path().join("config"), "extension.provider-test.prefix = echo\n").unwrap();
+    fs::write(
+        home.path().join("config"),
+        "extension.provider-test.prefix = echo\n",
+    )
+    .unwrap();
 
     let fixture = std::env::current_dir()
         .unwrap()
@@ -691,7 +773,16 @@ async fn extension_provider_complete_routes_to_process() {
             secret_env: None,
         }],
     };
-    manager.write().await.load_with_cwd("provider-test", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+    manager
+        .write()
+        .await
+        .load_with_cwd(
+            "provider-test",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let tools = std::sync::Arc::new(Vec::new());
@@ -700,7 +791,9 @@ async fn extension_provider_complete_routes_to_process() {
         &reqwest::Client::new(),
         &tools,
         &None,
-        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}))],
+        &[std::sync::Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+        )],
         &tx,
         None,
         None,
@@ -714,11 +807,16 @@ async fn extension_provider_complete_routes_to_process() {
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
-    ).await.expect("extension route").unwrap();
+    )
+    .await
+    .expect("extension route")
+    .unwrap();
 
     assert_eq!(result["content"][0]["text"], "echo:hello");
     match rx.recv().await.unwrap() {
-        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => assert_eq!(text, "echo:hello"),
+        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => {
+            assert_eq!(text, "echo:hello")
+        }
         other => panic!("unexpected event: {other:?}"),
     }
     manager.write().await.shutdown_all().await;
@@ -730,7 +828,11 @@ async fn provider_disabled_in_trust_state_blocks_route() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
-    fs::write(home.path().join("config"), "extension.provider-trust-test.prefix = echo\n").unwrap();
+    fs::write(
+        home.path().join("config"),
+        "extension.provider-trust-test.prefix = echo\n",
+    )
+    .unwrap();
 
     // Use a fixture that records every invocation, so we can prove it was NOT called.
     let fixture = std::env::current_dir()
@@ -766,7 +868,11 @@ async fn provider_disabled_in_trust_state_blocks_route() {
     manager
         .write()
         .await
-        .load_with_cwd("provider-trust-test", &manifest, Some(plugin_dir.path().to_path_buf()))
+        .load_with_cwd(
+            "provider-trust-test",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
         .await
         .unwrap();
 
@@ -786,7 +892,9 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         &reqwest::Client::new(),
         &tools,
         &None,
-        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}))],
+        &[std::sync::Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+        )],
         &tx,
         None,
         None,
@@ -806,7 +914,10 @@ async fn provider_disabled_in_trust_state_blocks_route() {
 
     let err = result.expect_err("disabled provider should error out instead of completing");
     let msg = err.to_string();
-    assert!(msg.contains("disabled"), "error should mention disabled: {msg}");
+    assert!(
+        msg.contains("disabled"),
+        "error should mention disabled: {msg}"
+    );
     assert!(
         msg.contains("provider-trust-test:echo"),
         "error should reference the runtime_id: {msg}"
@@ -836,7 +947,10 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
     let hook_bus = Arc::new(HookBus::new());
     let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::empty()));
     tools.write().await.register(Arc::new(EchoTestTool));
-    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new_with_tools(hook_bus, tools.clone())));
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new_with_tools(
+        hook_bus,
+        tools.clone(),
+    )));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
         theme_tokens: Default::default(),
@@ -851,7 +965,16 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         hooks: vec![],
         config: vec![],
     };
-    manager.write().await.load_with_cwd("provider-tool", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+    manager
+        .write()
+        .await
+        .load_with_cwd(
+            "provider-tool",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let tools_schema = tools.read().await.tools_schema();
@@ -860,7 +983,9 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         &reqwest::Client::new(),
         &tools_schema,
         &None,
-        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"use tool"}]}))],
+        &[std::sync::Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"use tool"}]}),
+        )],
         &tx,
         None,
         None,
@@ -874,11 +999,16 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         None,
         None,
         &synaps_cli::runtime::trace::TraceContext::disabled(),
-    ).await.expect("extension route").unwrap();
+    )
+    .await
+    .expect("extension route")
+    .unwrap();
 
     assert_eq!(result["content"][0]["text"], "final:from-provider");
     match rx.recv().await.unwrap() {
-        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => assert_eq!(text, "final:from-provider"),
+        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => {
+            assert_eq!(text, "final:from-provider")
+        }
         other => panic!("unexpected event: {other:?}"),
     }
     manager.write().await.shutdown_all().await;
@@ -894,7 +1024,11 @@ async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
     let plugin_dir = home.path().join("plugins/installed-test");
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
-    fs::copy(installed_fixture_script(), plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::copy(
+        installed_fixture_script(),
+        plugin_dir.join("extensions/installed_extension.py"),
+    )
+    .unwrap();
 
     fs::write(
         plugin_dir.join(".synaps-plugin/plugin.json"),
@@ -919,7 +1053,10 @@ async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
     let (loaded, failed) = manager.discover_and_load().await;
 
     assert_eq!(loaded, vec!["installed-test".to_string()]);
-    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    assert!(
+        failed.is_empty(),
+        "unexpected discovery failures: {failed:?}"
+    );
     assert_eq!(manager.count(), 1);
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo e2e"}));
@@ -948,7 +1085,9 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir().unwrap().join("tests/fixtures/compaction_extension.py"),
+        std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/compaction_extension.py"),
         plugin_dir.join("extensions/compaction_extension.py"),
     )
     .unwrap();
@@ -978,7 +1117,10 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
     let (loaded, failed) = manager.discover_and_load().await;
 
     assert_eq!(loaded, vec!["compaction-test".to_string()]);
-    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    assert!(
+        failed.is_empty(),
+        "unexpected discovery failures: {failed:?}"
+    );
 
     let event = HookEvent::on_compaction(
         "old-session",
@@ -988,7 +1130,10 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
         serde_json::json!({"source": "manual"}),
     );
     let result = hook_bus.emit(&event).await;
-    assert!(matches!(result, HookResult::Continue), "on_compaction should ignore non-continue actions, got {result:?}");
+    assert!(
+        matches!(result, HookResult::Continue),
+        "on_compaction should ignore non-continue actions, got {result:?}"
+    );
 
     let seen = fs::read_to_string(&log_path).unwrap();
     assert!(seen.contains("on_compaction"));
@@ -1019,13 +1164,22 @@ async fn on_message_complete_is_observe_only() {
     let handler: Arc<dyn ExtensionHandler> = Arc::new(handler);
     let mut perms = PermissionSet::new();
     perms.grant(Permission::LlmContent);
-    bus.subscribe(HookKind::OnMessageComplete, handler.clone(), None, None, perms)
-        .await
-        .expect("subscribe on_message_complete");
+    bus.subscribe(
+        HookKind::OnMessageComplete,
+        handler.clone(),
+        None,
+        None,
+        perms,
+    )
+    .await
+    .expect("subscribe on_message_complete");
 
     let event = HookEvent::on_message_complete("Block me", serde_json::json!({}));
     let result = bus.emit(&event).await;
-    assert!(matches!(result, HookResult::Continue), "on_message_complete should ignore non-continue actions, got {result:?}");
+    assert!(
+        matches!(result, HookResult::Continue),
+        "on_message_complete should ignore non-continue actions, got {result:?}"
+    );
 
     handler.shutdown().await;
 }
@@ -1041,7 +1195,9 @@ async fn installed_extension_receives_on_message_complete() {
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir().unwrap().join("tests/fixtures/message_complete_extension.py"),
+        std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/message_complete_extension.py"),
         plugin_dir.join("extensions/message_complete_extension.py"),
     )
     .unwrap();
@@ -1073,7 +1229,10 @@ async fn installed_extension_receives_on_message_complete() {
     let (loaded, failed) = manager.discover_and_load().await;
 
     assert_eq!(loaded, vec!["message-complete-test".to_string()]);
-    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    assert!(
+        failed.is_empty(),
+        "unexpected discovery failures: {failed:?}"
+    );
 
     let event = HookEvent::on_message_complete(
         "Assistant answer",
@@ -1109,8 +1268,14 @@ async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
     assert_eq!(failed.len(), 1);
     let failure = &failed[0];
     assert_eq!(failure.plugin, "bad-json");
-    assert_eq!(failure.manifest_path.as_deref(), Some(manifest_path.as_path()));
-    assert!(failure.reason.contains("Invalid plugin manifest JSON"), "{failure:?}");
+    assert_eq!(
+        failure.manifest_path.as_deref(),
+        Some(manifest_path.as_path())
+    );
+    assert!(
+        failure.reason.contains("Invalid plugin manifest JSON"),
+        "{failure:?}"
+    );
     assert!(failure.hint.contains("plugin validate"), "{failure:?}");
 }
 
@@ -1127,7 +1292,11 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
     let user_plugin_dir = home.path().join("plugins/layered-test");
     fs::create_dir_all(user_plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(user_plugin_dir.join("extensions")).unwrap();
-    fs::copy(&fixture, user_plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::copy(
+        &fixture,
+        user_plugin_dir.join("extensions/installed_extension.py"),
+    )
+    .unwrap();
     fs::write(
         user_plugin_dir.join(".synaps-plugin/plugin.json"),
         r#"{
@@ -1149,7 +1318,11 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
     let project_plugin_dir = project.path().join(".synaps/plugins/layered-test");
     fs::create_dir_all(project_plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(project_plugin_dir.join("extensions")).unwrap();
-    fs::copy(&fixture, project_plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::copy(
+        &fixture,
+        project_plugin_dir.join("extensions/installed_extension.py"),
+    )
+    .unwrap();
     fs::write(
         project_plugin_dir.join(".synaps-plugin/plugin.json"),
         r#"{
@@ -1172,11 +1345,17 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
     let mut manager = ExtensionManager::new(hook_bus.clone());
     let (loaded, failed) = manager.discover_and_load().await;
 
-    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    assert!(
+        failed.is_empty(),
+        "unexpected discovery failures: {failed:?}"
+    );
     assert_eq!(loaded, vec!["layered-test".to_string()]);
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo local"}));
-    assert!(matches!(hook_bus.emit(&event).await, HookResult::Block { .. }));
+    assert!(matches!(
+        hook_bus.emit(&event).await,
+        HookResult::Block { .. }
+    ));
     assert!(project_plugin_dir.join("hook-seen.json").exists());
     assert!(!user_plugin_dir.join("hook-seen.json").exists());
 
@@ -1252,7 +1431,9 @@ async fn audit_log_records_disabled_route() {
         &reqwest::Client::new(),
         &tools,
         &None,
-        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}))],
+        &[std::sync::Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+        )],
         &tx,
         None,
         None,
@@ -1272,9 +1453,12 @@ async fn audit_log_records_disabled_route() {
 
     assert!(result.is_err(), "disabled provider should return Err");
 
-    let entries = synaps_cli::extensions::audit::read_audit_entries()
-        .expect("read audit entries");
-    assert_eq!(entries.len(), 1, "expected exactly one audit entry, got {entries:?}");
+    let entries = synaps_cli::extensions::audit::read_audit_entries().expect("read audit entries");
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one audit entry, got {entries:?}"
+    );
     let entry = &entries[0];
     assert_eq!(entry.outcome, "blocked");
     assert_eq!(entry.error_class.as_deref(), Some("trust_disabled"));
