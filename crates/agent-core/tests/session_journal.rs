@@ -15,6 +15,7 @@
 //! 5. Retention treats `<id>.json` + `<id>.journal` as ONE artifact and
 //!    chain heads protect both; orphan journals are swept.
 
+use agent_core::core::retention::{sweep_at, RetentionPolicy, RetentionRoots};
 use agent_core::core::session::Session;
 use agent_core::core::session_journal::{
     delete_session_files_in_dir, journal_meta_tail, journal_path, load_session_in_dir,
@@ -447,4 +448,123 @@ fn delete_removes_snapshot_and_journal_together() {
     assert!(!journal_path(tmp.path(), &s.id).exists());
     // Idempotent (compaction rollback calls this on already-clean state).
     delete_session_files_in_dir(tmp.path(), &s.id).unwrap();
+}
+
+struct RetentionHarness {
+    _tmp: TempDir,
+    roots: RetentionRoots,
+}
+
+fn retention_harness() -> RetentionHarness {
+    let tmp = TempDir::new().unwrap();
+    let roots = RetentionRoots {
+        config_dir: tmp.path().join("config"),
+        base_dir: tmp.path().join("base"),
+        cache_dir: tmp.path().join("cache"),
+    };
+    std::fs::create_dir_all(roots.config_dir.join("sessions")).unwrap();
+    std::fs::create_dir_all(roots.config_dir.join("chains")).unwrap();
+    std::fs::create_dir_all(roots.base_dir.join("memory")).unwrap();
+    std::fs::create_dir_all(&roots.cache_dir).unwrap();
+    RetentionHarness { _tmp: tmp, roots }
+}
+
+fn aged_session(dir: &std::path::Path, id: &str, updated_at: &str, with_journal: bool) {
+    let mut s = session_with_messages(2);
+    s.id = id.to_string();
+    s.updated_at = chrono::DateTime::parse_from_rfc3339(updated_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mode = if with_journal {
+        SessionPersistence::Journal
+    } else {
+        SessionPersistence::Json
+    };
+    save_session_in_dir(dir, &s, mode).unwrap();
+}
+
+#[test]
+fn retention_age_sweep_deletes_session_and_journal_as_one_artifact() {
+    let h = retention_harness();
+    let sessions = h.roots.config_dir.join("sessions");
+    aged_session(
+        &sessions,
+        "20200101-000000-dead",
+        "2020-01-01T00:00:00Z",
+        true,
+    );
+    aged_session(
+        &sessions,
+        "20990101-000000-live",
+        "2099-01-01T00:00:00Z",
+        true,
+    );
+
+    let now_ms = 1_800_000_000_000; // 2027 — the 2020 session is long past 30d
+    let policy = RetentionPolicy {
+        max_age_days: Some(30),
+        max_disk_bytes: None,
+    };
+    sweep_at(&h.roots, &policy, now_ms).unwrap();
+
+    assert!(!sessions.join("20200101-000000-dead.json").exists());
+    assert!(
+        !journal_path(&sessions, "20200101-000000-dead").exists(),
+        "the journal must be swept with its session, never orphaned"
+    );
+    assert!(sessions.join("20990101-000000-live.json").exists());
+    assert!(journal_path(&sessions, "20990101-000000-live").exists());
+}
+
+#[test]
+fn retention_chain_head_protects_journal_too() {
+    let h = retention_harness();
+    let sessions = h.roots.config_dir.join("sessions");
+    aged_session(
+        &sessions,
+        "20200101-000000-head",
+        "2020-01-01T00:00:00Z",
+        true,
+    );
+    std::fs::write(
+        h.roots.config_dir.join("chains").join("main.json"),
+        json!({"head": "20200101-000000-head"}).to_string(),
+    )
+    .unwrap();
+
+    let policy = RetentionPolicy {
+        max_age_days: Some(30),
+        max_disk_bytes: None,
+    };
+    sweep_at(&h.roots, &policy, 1_800_000_000_000).unwrap();
+
+    assert!(sessions.join("20200101-000000-head.json").exists());
+    assert!(
+        journal_path(&sessions, "20200101-000000-head").exists(),
+        "a protected chain head keeps its journal"
+    );
+}
+
+#[test]
+fn retention_sweeps_orphan_journals() {
+    let h = retention_harness();
+    let sessions = h.roots.config_dir.join("sessions");
+    aged_session(
+        &sessions,
+        "20200101-000000-orfn",
+        "2020-01-01T00:00:00Z",
+        true,
+    );
+    // The snapshot vanished out-of-band; the journal alone is unusable.
+    std::fs::remove_file(sessions.join("20200101-000000-orfn.json")).unwrap();
+
+    let policy = RetentionPolicy {
+        max_age_days: Some(30),
+        max_disk_bytes: None,
+    };
+    sweep_at(&h.roots, &policy, 1_800_000_000_000).unwrap();
+    assert!(
+        !journal_path(&sessions, "20200101-000000-orfn").exists(),
+        "orphan journals are swept"
+    );
 }

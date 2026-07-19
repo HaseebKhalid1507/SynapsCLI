@@ -307,10 +307,36 @@ pub fn sweep_at(
         .max_age_days
         .map(|days| now_ms.saturating_sub(days as u64 * DAY_MS));
 
+    // ── Orphan journals (Task 35): a `<id>.journal` whose snapshot is gone
+    // is unusable regardless of age — swept on every pass, unless a chain
+    // head claims the id (fail-safe keep). ──
+    for path in list_files(&roots.sessions_dir()) {
+        if path.extension().and_then(|e| e.to_str()) != Some("journal")
+            || path.with_extension("json").exists()
+        {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if protected.contains(&id) {
+            outcome.protected_chain_heads += 1;
+            continue;
+        }
+        delete_file(&path, &mut outcome)?;
+    }
+
     // ── Age pass: sessions (embedded timestamps; compaction parents are
     // ordinary sessions here) ──
     if let Some(cutoff) = age_cutoff {
         for path in list_files(&roots.sessions_dir()) {
+            // Paired journals age WITH their snapshot (Task 35) — never as
+            // independent candidates.
+            if is_paired_journal(&path) {
+                continue;
+            }
             let id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -324,7 +350,7 @@ pub fn sweep_at(
                 continue; // unknown age: fail safe, keep
             };
             if age_ref < cutoff {
-                delete_file(&path, &mut outcome)?;
+                delete_session_artifact(&path, &mut outcome)?;
             }
         }
 
@@ -394,6 +420,10 @@ pub fn sweep_at(
         if total_now(roots) > budget {
             let mut candidates: Vec<(u64, PathBuf, bool)> = Vec::new();
             for path in list_files(&roots.sessions_dir()) {
+                // Paired journals evict WITH their snapshot (Task 35).
+                if is_paired_journal(&path) {
+                    continue;
+                }
                 let id = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -575,6 +605,28 @@ fn delete_file(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
     fs::remove_file(path)?;
     outcome.deleted_files += 1;
     outcome.freed_bytes += len;
+    Ok(())
+}
+
+/// True when `path` is a Task 35 session journal whose snapshot sibling
+/// still exists — such a journal is handled WITH its `.json` artifact,
+/// never as an independent retention candidate.
+fn is_paired_journal(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("journal")
+        && path.with_extension("json").exists()
+}
+
+/// Delete a session artifact: the file plus, for `.json` snapshots, any
+/// sibling journal (Task 35 — a session and its journal die together, so a
+/// sweep can never orphan journal state).
+fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
+    delete_file(path, outcome)?;
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        let journal = path.with_extension("journal");
+        if journal.exists() {
+            delete_file(&journal, outcome)?;
+        }
+    }
     Ok(())
 }
 
@@ -804,7 +856,16 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
             let path = roots
                 .sessions_dir()
                 .join(format!("{}.json", file.display()));
-            fs::remove_file(path)
+            fs::remove_file(path)?;
+            // Pair-delete the opt-in journal (Task 35) — forgetting a
+            // session must not leave replayable journal state behind.
+            let journal = roots
+                .sessions_dir()
+                .join(format!("{}.journal", file.display()));
+            match fs::remove_file(journal) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
         }
         RetentionDomain::Traces => {
             // Nested relative addressing with validated components and

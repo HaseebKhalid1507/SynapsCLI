@@ -280,11 +280,23 @@ pub fn latest_session() -> std::io::Result<Session> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
-                    newest = Some((mtime, path));
+        // A journal append IS a save of its session (Task 35): attribute the
+        // journal's mtime to the sibling snapshot so "latest" stays exact
+        // when snapshots lag behind appends.
+        let json_path = match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => path.clone(),
+            Some("journal") => {
+                let sibling = path.with_extension("json");
+                if !sibling.exists() {
+                    continue; // orphan journal — not loadable
                 }
+                sibling
+            }
+            _ => continue,
+        };
+        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+            if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                newest = Some((mtime, json_path));
             }
         }
     }
@@ -332,16 +344,34 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    let mut by_snapshot: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+        std::collections::HashMap::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                files.push((mtime, path));
+        // Journal mtimes attribute to their session snapshot (Task 35).
+        let json_path = match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => path.clone(),
+            Some("journal") => {
+                let sibling = path.with_extension("json");
+                if !sibling.exists() {
+                    continue;
+                }
+                sibling
+            }
+            _ => continue,
+        };
+        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+            let slot = by_snapshot
+                .entry(json_path)
+                .or_insert(std::time::SystemTime::UNIX_EPOCH);
+            if mtime > *slot {
+                *slot = mtime;
             }
         }
     }
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> =
+        by_snapshot.into_iter().map(|(p, t)| (t, p)).collect();
     files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     files.truncate(limit);
     let mut sessions: Vec<SessionInfo> = Vec::new();
@@ -372,7 +402,7 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
     }
     let header = read_session_header(path)?;
     let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
-    Some(SessionInfo {
+    let mut info = SessionInfo {
         id: meta.id,
         title: meta.title,
         name: meta.name,
@@ -381,7 +411,19 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
         updated_at: meta.updated_at,
         session_cost: meta.session_cost,
         message_count: 0,
-    })
+    };
+    // Journal freshness overlay (Task 35): when an opt-in journal exists,
+    // its bounded meta tail is newer than the (possibly lagging) snapshot
+    // header. Legacy sessions have no journal — zero extra I/O.
+    if let Some(dir) = path.parent() {
+        if let Some(tail) = crate::core::session_journal::journal_meta_tail(dir, &info.id) {
+            if tail.updated_at > info.updated_at {
+                info.updated_at = tail.updated_at;
+                info.session_cost = tail.session_cost;
+            }
+        }
+    }
+    Some(info)
 }
 
 /// Read just the metadata header of a session file — everything BEFORE the
@@ -428,14 +470,11 @@ fn sessions_dir() -> PathBuf {
     crate::config::get_active_config_dir().join("sessions")
 }
 
-/// Remove a persisted session file (compaction-transition rollback).
-/// A missing file is not an error — rollback must be idempotent.
+/// Remove a persisted session file (compaction-transition rollback) AND its
+/// journal, when one exists (Task 35) — a session and its journal live and
+/// die together. A missing file is not an error — rollback must be idempotent.
 pub fn delete_session_file(id: &str) -> std::io::Result<()> {
-    let path = sessions_dir().join(format!("{}.json", id));
-    match std::fs::remove_file(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    crate::core::session_journal::delete_session_files_in_dir(&sessions_dir(), id)
 }
 
 /// Validate a session or chain name: [a-z0-9-]{1,40}.
