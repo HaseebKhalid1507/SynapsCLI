@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod chain;
+pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod logging;

@@ -17,6 +17,7 @@ pub use core::stream_types::{
 // `crate::models`, `crate::session`, etc. resolve INSIDE agent-core.
 pub use core::auth;
 pub use core::chain;
+pub use core::compaction;
 pub use core::config;
 pub use core::error;
 pub use core::logging;

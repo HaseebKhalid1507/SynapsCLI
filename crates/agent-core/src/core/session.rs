@@ -29,6 +29,10 @@ pub struct Session {
     pub compacted_into: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_provenance: Option<crate::prompt::PromptProvenance>,
+    /// Typed compaction summary provenance (spec §9.3). Present on sessions
+    /// produced by (or updated in place by) a compaction transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::CompactionRecord>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -70,11 +74,20 @@ impl Session {
             parent_session: None,
             compacted_into: None,
             prompt_provenance: None,
+            compaction: None,
         }
     }
 
-    /// Create a new session from a compaction summary, linked to the parent.
-    pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
+    /// Create a successor session from a compaction transition (spec §9.3).
+    /// The summary enters context through the canonical sanitized rendering
+    /// ([`crate::compaction::compaction_context_messages`]); the parent's
+    /// system prompt stays TYPED metadata — the successor's `system_prompt`
+    /// field and the provenance record — never plain user text.
+    pub fn from_compaction_record(
+        parent: &Session,
+        summary_text: &str,
+        record: crate::compaction::CompactionRecord,
+    ) -> Self {
         let now = Utc::now();
         let id = format!(
             "{}-{}",
@@ -84,6 +97,46 @@ impl Session {
         // Transfer session name from parent — the compacted session is the
         // continuation, so the name should follow. Parent's name will be
         // cleared when the caller saves it with compacted_into set.
+        let name = parent.name.clone();
+        Session {
+            id,
+            title: format!(
+                "↳ {}",
+                if parent.title.is_empty() {
+                    &parent.id
+                } else {
+                    &parent.title
+                }
+            ),
+            name,
+            model: parent.model.clone(),
+            thinking_level: parent.thinking_level.clone(),
+            system_prompt: parent.system_prompt.clone(),
+            created_at: now,
+            updated_at: now,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            session_cost: 0.0,
+            api_messages: crate::compaction::compaction_context_messages(summary_text),
+            abort_context: None,
+            parent_session: Some(parent.id.clone()),
+            compacted_into: None,
+            prompt_provenance: None,
+            compaction: Some(record),
+        }
+    }
+
+    /// Legacy successor constructor kept ONLY until every frontend routes
+    /// through the unified engine compaction transition (T30). Embeds the
+    /// parent system prompt in user text — superseded by
+    /// [`Session::from_compaction_record`]; do not add callers.
+    pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
+        let now = Utc::now();
+        let id = format!(
+            "{}-{}",
+            now.format("%Y%m%d-%H%M%S"),
+            &uuid::Uuid::new_v4().to_string()[..4]
+        );
         let name = parent.name.clone();
         let mut summary_parts = String::new();
         if let Some(ref sp) = parent.system_prompt {
@@ -122,6 +175,7 @@ impl Session {
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
             prompt_provenance: None,
+            compaction: None,
         }
     }
 
@@ -501,6 +555,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Minimal typed provenance for constructor tests.
+    fn test_record(parent: &Session) -> crate::compaction::CompactionRecord {
+        crate::compaction::CompactionRecord {
+            schema_version: crate::compaction::COMPACTION_SUMMARY_SCHEMA_VERSION,
+            source_session: parent.id.clone(),
+            source_message_count: parent.api_messages.len(),
+            source_range_digest: crate::compaction::message_range_digest(&parent.api_messages),
+            summary_provider: "anthropic".into(),
+            summary_model: "claude-sonnet-4-6".into(),
+            created_at: Utc::now(),
+            prompt_stack_digest: crate::compaction::prompt_stack_digest(&["test"]),
+            included_classes: crate::compaction::ContentClass::ALL.to_vec(),
+            excluded_classes: Vec::new(),
+            redaction_policy: crate::compaction::RedactionPolicy::TruncationOnly,
+            prior_system_prompt: parent.system_prompt.clone(),
+        }
+    }
+
     #[test]
     fn test_session_new() {
         let session = Session::new("gpt-4", "brief", Some("test prompt"));
@@ -686,7 +758,8 @@ mod tests {
         assert_eq!(restored.model, "openai-codex/gpt-5.6-sol");
         assert_eq!(restored.thinking_level, "ultra");
 
-        let compacted = Session::new_from_compaction(&restored, "summary".to_string());
+        let compacted =
+            Session::from_compaction_record(&restored, "summary", test_record(&restored));
         assert_eq!(compacted.model, restored.model);
         assert_eq!(compacted.thinking_level, "ultra");
         assert_eq!(
@@ -895,7 +968,8 @@ mod tests {
         for other in ["ultra", "max", "xhigh"] {
             assert_ne!(restored.thinking_level, other);
         }
-        let compacted = Session::new_from_compaction(&restored, "summary".into());
+        let compacted =
+            Session::from_compaction_record(&restored, "summary", test_record(&restored));
         let resumed: Session =
             serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
         assert_eq!(resumed.thinking_level, "ultracode");
