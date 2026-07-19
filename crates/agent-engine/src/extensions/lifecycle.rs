@@ -252,6 +252,36 @@ pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static
     Ok(())
 }
 
+/// Manifest-level coupling checks for a `deferred` block (review fix A1/
+/// A2). Passive declarations are CAPABILITY claims: cataloging a dormant
+/// tool descriptor (or provider metadata) grants the extension future
+/// runtime reach, so it MUST be backed by the exact permission the live
+/// registration would require — otherwise a manifest could obtain
+/// discoverable/activatable surface it was never authorized to register.
+/// Likewise `lifecycle = "hook"` without a real manifest hook subscription
+/// has NO authorized trigger and can never legitimately start: it fails
+/// closed here instead of lingering as unreachable-but-cataloged state.
+///
+/// Runs inside `ExtensionManifest::validate` — i.e. strictly BEFORE any
+/// spawn or catalog registration on every load path.
+pub fn validate_manifest_deferred(manifest: &ExtensionManifest) -> Result<(), &'static str> {
+    let Some(deferred) = &manifest.deferred else {
+        return Ok(());
+    };
+    validate_deferred(deferred)?;
+    let has_permission = |wire: &str| manifest.permissions.iter().any(|p| p == wire);
+    if !deferred.tools.is_empty() && !has_permission("tools.register") {
+        return Err("deferred_tools_require_tools_register_permission");
+    }
+    if !deferred.providers.is_empty() && !has_permission("providers.register") {
+        return Err("deferred_providers_require_providers_register_permission");
+    }
+    if deferred.lifecycle == Some(DeferredLifecycle::Hook) && manifest.hooks.is_empty() {
+        return Err("hook_lifecycle_requires_hook_subscriptions");
+    }
+    Ok(())
+}
+
 /// Shared bounded shape check for a tool identity (declared OR runtime
 /// registered). Declared tool names additionally must not contain ':'
 /// so the `<plugin>:<tool>` runtime name stays reverse-parseable.
@@ -422,7 +452,10 @@ pub fn dormant_extension_tools(
     let Some(deferred) = &manifest.deferred else {
         return Vec::new();
     };
-    if validate_deferred(deferred).is_err() {
+    // Full manifest-level policy (bounds + permission/hook coupling), not
+    // just block bounds: dormant descriptors minted for a manifest that
+    // lacks `tools.register` would be an unauthorized catalog grant.
+    if validate_manifest_deferred(manifest).is_err() {
         return Vec::new();
     }
     deferred

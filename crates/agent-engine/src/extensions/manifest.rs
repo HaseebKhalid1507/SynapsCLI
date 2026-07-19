@@ -126,11 +126,14 @@ pub struct ValidatedExtensionManifest {
 impl ExtensionManifest {
     /// Validate manifest fields and derive typed permissions/subscriptions.
     pub fn validate(&self, id: &str) -> Result<ValidatedExtensionManifest, String> {
-        if let Some(deferred) = &self.deferred {
-            super::lifecycle::validate_deferred(deferred).map_err(|reason| {
-                format!("Extension '{id}' deferred declarations invalid: {reason}")
-            })?;
-        }
+        // Review fix A1/A2: full deferred policy — block bounds PLUS
+        // permission coupling (deferred tools => 'tools.register',
+        // deferred providers => 'providers.register') and hook-lifecycle
+        // coupling (lifecycle 'hook' => at least one hook subscription).
+        // Runs before any spawn or catalog registration.
+        super::lifecycle::validate_manifest_deferred(self).map_err(|reason| {
+            format!("Extension '{id}' deferred declarations invalid: {reason}")
+        })?;
         if self.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
             return Err(format!(
                 "Extension '{}' uses unsupported protocol_version {} (supported: {})",

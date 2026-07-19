@@ -344,6 +344,9 @@ fn earliest_trigger_matrix_never_uses_tool_search_alone() {
 fn provider_declarations_are_deeply_bounded_and_typed() {
     let ok = |p: DeclaredExtensionProvider| {
         let mut m = base_manifest();
+        // Review fix A1: passive provider declarations now REQUIRE the
+        // exact `providers.register` permission during validation.
+        m.permissions.push("providers.register".to_string());
         m.deferred = Some(DeferredDeclarations {
             tools: vec![],
             providers: vec![p],
@@ -354,6 +357,7 @@ fn provider_declarations_are_deeply_bounded_and_typed() {
     ok(declared_provider("prov")).unwrap();
 
     let mut m = base_manifest();
+    m.permissions.push("providers.register".to_string());
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![declared_provider("dup"), declared_provider("dup")],
@@ -430,6 +434,119 @@ fn _assert_runtime_enum(m: &ExtensionManifest) -> &ExtensionRuntime {
     &m.runtime
 }
 
+// ── review fix A1/A2: permission + hook coupling fail closed pre-spawn ──────
+
+/// A1: deferred tools are a future `tools.register` surface, so a manifest
+/// without that permission must fail validation (and the manager load)
+/// BEFORE any spawn or catalog registration.
+#[tokio::test]
+async fn deferred_tools_without_tools_register_permission_fail_before_spawn() {
+    use agent_engine::extensions::hooks::HookBus;
+    use agent_engine::extensions::manager::ExtensionManager;
+
+    let dir = std::env::temp_dir().join(format!("synaps-ext-a1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("spawn.marker");
+
+    // `memory.read` satisfies the legacy hook-or-capability gate, so the
+    // failure below is specifically the new deferred permission coupling.
+    let mut m: ExtensionManifest = serde_json::from_value(json!({
+        "runtime": "process",
+        "command": "/bin/sh",
+        "permissions": ["memory.read"]
+    }))
+    .unwrap();
+    m.args = vec!["-c".to_string(), format!("echo x >> {}", marker.display())];
+    m.deferred = Some(DeferredDeclarations {
+        tools: vec![declared("search")],
+        providers: vec![],
+        lifecycle: None,
+    });
+
+    let err = m.validate("plug").expect_err("must fail closed");
+    assert!(err.contains("tools_register"), "{err}");
+
+    // No dormant descriptors are ever minted for the unauthorized manifest.
+    assert!(dormant_extension_tools("plug", &m).is_empty());
+
+    // Manager load fails BEFORE spawn and BEFORE catalog registration,
+    // with and without progressive deferral.
+    for progressive in [true, false] {
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(ToolRegistry::new()));
+        let mut mgr = ExtensionManager::new_with_tools(
+            std::sync::Arc::new(HookBus::new()),
+            std::sync::Arc::clone(&registry),
+        );
+        mgr.set_progressive_deferral(progressive);
+        assert!(mgr.load("plug", &m).await.is_err());
+        assert!(!marker.exists(), "validation must reject before any spawn");
+        assert!(!mgr.is_deferred_tool_only("plug"));
+        assert!(registry
+            .read()
+            .await
+            .catalog()
+            .get(&ToolId::extension("plug", "search"))
+            .is_none());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A1 (providers): deferred provider metadata requires `providers.register`.
+#[test]
+fn deferred_providers_without_providers_register_permission_fail_closed() {
+    let mut m = base_manifest(); // permissions: ["tools.register"] only
+    m.deferred = Some(DeferredDeclarations {
+        tools: vec![],
+        providers: vec![declared_provider("prov")],
+        lifecycle: None,
+    });
+    let err = m.validate("plug").expect_err("must fail closed");
+    assert!(err.contains("providers_register"), "{err}");
+    // Granting the exact permission fixes exactly this failure.
+    m.permissions.push("providers.register".to_string());
+    m.validate("plug").unwrap();
+}
+
+/// A2: `lifecycle = "hook"` with no manifest hook subscription has no
+/// authorized trigger — it must fail closed, not linger untriggerable.
+#[test]
+fn hook_lifecycle_without_hook_subscriptions_fails_closed() {
+    let mut m: ExtensionManifest = serde_json::from_value(json!({
+        "runtime": "process",
+        "command": "/bin/false",
+        "permissions": ["memory.read"]
+    }))
+    .unwrap();
+    m.deferred = Some(DeferredDeclarations {
+        tools: vec![],
+        providers: vec![],
+        lifecycle: Some(DeferredLifecycle::Hook),
+    });
+    let err = m.validate("plug").expect_err("must fail closed");
+    assert!(err.contains("hook"), "{err}");
+
+    // A REAL authorized subscription makes the same lifecycle valid.
+    let mut hooked: ExtensionManifest = serde_json::from_value(json!({
+        "runtime": "process",
+        "command": "/bin/false",
+        "permissions": ["tools.intercept"],
+        "hooks": [{"hook": "before_tool_call"}]
+    }))
+    .unwrap();
+    hooked.deferred = Some(DeferredDeclarations {
+        tools: vec![],
+        providers: vec![],
+        lifecycle: Some(DeferredLifecycle::Hook),
+    });
+    hooked.validate("plug").unwrap();
+    assert_eq!(classify(&hooked), ExtensionClass::HookLifecycle);
+    assert_eq!(
+        earliest_trigger(&hooked),
+        ActivationTrigger::FirstAuthorizedHookEvent
+    );
+}
+
 // ── manager boot gating: zero spawn under progressive deferral ──────────────
 
 #[tokio::test]
@@ -460,7 +577,8 @@ async fn manager_defers_tool_only_extension_without_spawn_and_eager_flag_off_spa
         "progressive tool-only load must not spawn"
     );
     assert_eq!(mgr.count(), 0, "no live handler for a deferred extension");
-    assert!(mgr.deferred_tool_only("fixture-plugin").is_some());
+    assert!(mgr.is_deferred_tool_only("fixture-plugin"));
+    assert_eq!(mgr.deferred_tool_only_count(), 1);
     assert!(registry
         .read()
         .await

@@ -156,11 +156,21 @@ pub struct ExtensionManager {
 }
 
 /// Retained launch expectation for a spawn-deferred tool-only extension.
+///
+/// INTERNAL AND OPAQUE (review fix A3): `config` holds RESOLVED values —
+/// including `secret_env` material — so this record is crate-private,
+/// exposes no public accessor, and deliberately implements neither
+/// `Debug` nor `Serialize`. Public diagnostics may reveal only booleans/
+/// counts (see [`ExtensionManager::is_deferred_tool_only`]); runtime
+/// acquisition stays inside the manager/lease lifecycle API.
 #[derive(Clone)]
-pub struct DeferredExtensionRecord {
-    pub manifest: ExtensionManifest,
-    pub cwd: Option<std::path::PathBuf>,
-    pub config: Value,
+// Transitional allow: consumed by the extension runtime lease lifecycle in
+// Task 20 Commit B (immediate next commit); until then only tests read it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct DeferredExtensionRecord {
+    pub(crate) manifest: ExtensionManifest,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) config: Value,
 }
 
 impl ExtensionManager {
@@ -223,9 +233,28 @@ impl ExtensionManager {
         self.progressive_deferral = enabled;
     }
 
-    /// Retained launch records of spawn-deferred tool-only extensions.
-    pub fn deferred_tool_only(&self, id: &str) -> Option<&DeferredExtensionRecord> {
-        self.deferred_tool_only.get(id)
+    /// Whether one plugin id is currently deferred (tool-only, zero spawn).
+    /// Boolean-only diagnostic: the underlying launch record (which holds
+    /// resolved — potentially secret — config) is never exposed.
+    pub fn is_deferred_tool_only(&self, id: &str) -> bool {
+        self.deferred_tool_only.contains_key(id)
+    }
+
+    /// Number of retained deferred tool-only launch records (count-only
+    /// diagnostic; never the records).
+    pub fn deferred_tool_only_count(&self) -> usize {
+        self.deferred_tool_only.len()
+    }
+
+    /// Crate-internal: clone one retained launch record for the extension
+    /// runtime lease lifecycle (Commit B). Never exposed publicly.
+    ///
+    /// TODO(Task20 Commit B — immediate next commit): `unload`/`reload`
+    /// of a deferred extension must remove this record, deregister its
+    /// dormant catalog batch, and revoke/terminate any live session lease.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Commit B lease acquisition
+    pub(crate) fn deferred_launch_record(&self, id: &str) -> Option<DeferredExtensionRecord> {
+        self.deferred_tool_only.get(id).cloned()
     }
 
     async fn load_with_cwd_and_config(
@@ -1227,6 +1256,66 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mgr = ExtensionManager::new(bus);
         assert!(mgr.capability_snapshots().await.is_empty());
+    }
+
+    /// Review fix A3: the retained deferred launch record resolves
+    /// `secret_env` config values, so NOTHING public/debug/diagnostic may
+    /// ever reveal them — only booleans/counts. The record type itself is
+    /// crate-private, field-private, and implements neither `Debug` nor
+    /// `Serialize` (compiler-enforced); this test additionally proves the
+    /// live diagnostic surfaces never carry the resolved secret.
+    #[tokio::test]
+    async fn deferred_launch_record_never_leaks_secret_config_through_diagnostics() {
+        const SECRET: &str = "task20-A3-sentinel-5f2c9d";
+        const VAR: &str = "SYNAPS_TEST_T20_A3_SECRET";
+        std::env::set_var(VAR, SECRET);
+
+        let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["tools.register"],
+            "config": [{
+                "key": "api_key",
+                "type": "string",
+                "required": true,
+                "secret_env": VAR
+            }],
+            "deferred": {
+                "tools": [{
+                    "name": "search",
+                    "description": "deferred search",
+                    "input_schema": {"type": "object"}
+                }]
+            }
+        }))
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(crate::ToolRegistry::new()));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry);
+        mgr.set_progressive_deferral(true);
+        mgr.load("secretive", &manifest).await.unwrap();
+
+        // Boolean/count-only public surface for the deferral state.
+        assert!(mgr.is_deferred_tool_only("secretive"));
+        assert_eq!(mgr.deferred_tool_only_count(), 1);
+        // The internal record DID resolve the secret (lease path needs it).
+        let record = mgr.deferred_launch_record("secretive").expect("retained");
+        assert_eq!(record.config["api_key"], serde_json::json!(SECRET));
+
+        // Every public/debug/diagnostic surface stays free of the value.
+        let mut rendered = String::new();
+        rendered.push_str(&format!("{:?}", mgr.statuses().await));
+        rendered.push_str(&format!("{:?}", mgr.config_diagnostics("secretive")));
+        rendered.push_str(&format!("{:?}", mgr.all_config_diagnostics()));
+        rendered.push_str(&format!("{:?}", mgr.capability_snapshots().await));
+        rendered.push_str(&format!("{:?}", mgr.plugin_infos()));
+        rendered.push_str(&format!("{:?}", mgr.list()));
+        assert!(
+            !rendered.contains(SECRET),
+            "resolved secret config leaked through a public diagnostic surface"
+        );
+
+        std::env::remove_var(VAR);
     }
 
     #[tokio::test]
