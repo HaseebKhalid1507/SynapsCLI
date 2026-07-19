@@ -338,14 +338,14 @@ pub struct SynapsConfig {
     pub compaction_mode: crate::core::compaction::CompactionMode,
     /// Content classes excluded from remote compaction disclosure.
     pub compaction_exclude: Vec<crate::core::compaction::ContentClass>,
-    pub max_tool_output: usize,      // default 30000
-    pub bash_timeout: u64,           // default 30
-    pub bash_max_timeout: u64,       // default 300
-    pub subagent_timeout: u64,       // default 300
-    pub api_retries: u32,            // default 3
-    pub refusal_retries: u32,        // default 2 — retries on stop_reason=refusal
-    pub telemetry: String,           // off | basic | full (default off)
-    pub cache_diagnostics: bool,     // opt into cache-diagnosis beta (default false)
+    pub max_tool_output: usize,  // default 30000
+    pub bash_timeout: u64,       // default 30
+    pub bash_max_timeout: u64,   // default 300
+    pub subagent_timeout: u64,   // default 300
+    pub api_retries: u32,        // default 3
+    pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
+    pub telemetry: String,       // off | basic | full (default off)
+    pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
@@ -1418,7 +1418,10 @@ bridge.heartbeat_timeout_ms = 750\n\
             bad_mode.compaction_mode,
             crate::core::compaction::CompactionMode::Remote
         );
-        assert!(bad_mode.warnings.iter().any(|w| w.contains("compaction_mode")));
+        assert!(bad_mode
+            .warnings
+            .iter()
+            .any(|w| w.contains("compaction_mode")));
     }
 
     #[test]
