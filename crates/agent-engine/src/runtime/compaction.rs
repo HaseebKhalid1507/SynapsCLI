@@ -241,14 +241,17 @@ pub fn render_compaction_input(
                                 if policy.excludes(ContentClass::ToolCalls) {
                                     continue;
                                 }
-                                let rendered_input = if track_paths {
-                                    input.clone()
-                                } else {
-                                    redact_path_arguments(input)
-                                };
                                 present.insert(ContentClass::ToolCalls);
-                                let args_str =
-                                    serde_json::to_string(&rendered_input).unwrap_or_default();
+                                // M2 boundary: excluding FilePaths withholds
+                                // the argument payload WHOLESALE — paths
+                                // inside nested/positional/unrecognized
+                                // argument shapes cannot be identified
+                                // reliably, so no per-key guessing.
+                                let args_str = if track_paths {
+                                    serde_json::to_string(input).unwrap_or_default()
+                                } else {
+                                    "[arguments withheld: file_paths excluded]".to_string()
+                                };
                                 let truncated: String = args_str.chars().take(500).collect();
                                 parts.push(format!("[Tool call #{}: {}({})]", id, name, truncated));
                             }
@@ -340,36 +343,6 @@ pub fn render_compaction_input(
         included_classes,
         excluded_classes,
         base_prompt,
-    }
-}
-
-/// Replace path-bearing argument values with a redaction marker (FilePaths
-/// exclusion keeps tool-call structure while withholding filesystem detail).
-fn redact_path_arguments(input: &serde_json::Value) -> serde_json::Value {
-    const PATH_KEYS: [&str; 6] = [
-        "path",
-        "file_path",
-        "directory",
-        "working_directory",
-        "cwd",
-        "old_path",
-    ];
-    match input {
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (key, value) in map {
-                if PATH_KEYS.contains(&key.as_str()) {
-                    out.insert(key.clone(), json!("[path redacted]"));
-                } else {
-                    out.insert(key.clone(), redact_path_arguments(value));
-                }
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(redact_path_arguments).collect())
-        }
-        other => other.clone(),
     }
 }
 
@@ -1492,16 +1465,70 @@ mod disclosure_tests {
             );
         }
 
-        // FilePaths exclusion redacts paths but keeps the rest of the call.
+        // FilePaths exclusion keeps the CALL visible (tool id + name) while
+        // withholding the argument payload wholesale.
         let rendered = render_compaction_input(
             &sentinel_messages(),
             None,
             &policy(&[ContentClass::FilePaths]),
         );
         assert!(
-            rendered.prompt_text.contains(TOOL_CALL_SENTINEL),
-            "FilePaths exclusion must not drop whole tool calls"
+            rendered
+                .prompt_text
+                .contains("[Tool call #t1: read([arguments withheld: file_paths excluded])]"),
+            "FilePaths exclusion must keep the call line without arguments: {}",
+            rendered.prompt_text
         );
+    }
+
+    /// M2 (CP-12 review): the FilePaths boundary is STRUCTURAL — nested,
+    /// positional, and unrecognized-key path-bearing argument values are all
+    /// withheld, because per-key guessing cannot identify paths reliably.
+    /// Paths inside free text belong to their text class (user/assistant/
+    /// tool-result/event) and are governed by THOSE exclusions.
+    #[test]
+    fn file_paths_exclusion_is_structural_over_arbitrary_argument_shapes() {
+        let messages: Vec<crate::SharedMessage> = vec![Arc::new(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "p1", "name": "bash",
+                 "input": {"argv": ["/secret/positional/AAA", "-r"]}},
+                {"type": "tool_use", "id": "p2", "name": "custom",
+                 "input": {"weird_key": "/secret/unrecognized/BBB"}},
+                {"type": "tool_use", "id": "p3", "name": "custom",
+                 "input": {"cfg": {"inner": {"target": "/secret/nested/CCC"}}}},
+            ]
+        }))];
+
+        let open = render_compaction_input(&messages, None, &policy(&[]));
+        for sentinel in [
+            "/secret/positional/AAA",
+            "/secret/unrecognized/BBB",
+            "/secret/nested/CCC",
+        ] {
+            assert!(
+                open.prompt_text.contains(sentinel),
+                "baseline includes {sentinel}"
+            );
+        }
+
+        let closed = render_compaction_input(&messages, None, &policy(&[ContentClass::FilePaths]));
+        for sentinel in [
+            "/secret/positional/AAA",
+            "/secret/unrecognized/BBB",
+            "/secret/nested/CCC",
+        ] {
+            assert!(
+                !closed.prompt_text.contains(sentinel),
+                "FilePaths exclusion must withhold {sentinel} regardless of shape"
+            );
+        }
+        for name in ["bash", "custom"] {
+            assert!(
+                closed.prompt_text.contains(name),
+                "the call name '{name}' stays visible"
+            );
+        }
     }
 
     #[test]

@@ -34,6 +34,13 @@ pub enum ContentClass {
     Thinking,
     ToolCalls,
     ToolResults,
+    /// STRUCTURED path-bearing surfaces only: the file-operations record
+    /// derived from tool calls, and — conservatively — entire tool-call
+    /// argument payloads (withheld wholesale on exclusion, because paths
+    /// inside nested/positional/unrecognized argument shapes cannot be
+    /// reliably identified). Paths mentioned inside free text belong to
+    /// their text class (`UserText`, `AssistantText`, `ToolResults`,
+    /// `EventData`); excluding those classes withholds such mentions.
     FilePaths,
     EventData,
 }
