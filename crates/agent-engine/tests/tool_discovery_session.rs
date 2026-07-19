@@ -17,6 +17,7 @@ use agent_engine::tools::catalog::{
     CapabilityRecord, CapabilitySource, DiscoveryIndex, DiscoveryQuery, DiscoveryQueryError,
     SchemaLocator, SearchLimits, SearchLimitsError, SessionActivationGrant, ToolCatalog, ToolId,
     TrustProvenance, QUERY_MAX_BYTES, SEARCH_MAX_RESULTS_CAP, SEARCH_MAX_RESULT_BYTES_CAP,
+    SEARCH_MIN_RESULT_BYTES,
 };
 use agent_engine::tools::{Tool, ToolContext};
 use agent_engine::{Result, Value};
@@ -182,9 +183,87 @@ fn search_single_entry_larger_than_budget_returns_bounded_empty_result() {
     let catalog = adversarial_catalog(Arc::clone(&spy));
     let index = DiscoveryIndex::build(&catalog).expect("build index");
 
-    let results = index.search(&query("searchword"), &limits(SEARCH_MAX_RESULTS_CAP, 1));
-    assert!(results.hits().is_empty(), "no entry fits one byte");
+    // The minimum budget only covers the empty serialized array (`[]`).
+    let results = index.search(
+        &query("searchword"),
+        &limits(SEARCH_MAX_RESULTS_CAP, SEARCH_MIN_RESULT_BYTES),
+    );
+    assert!(
+        results.hits().is_empty(),
+        "no entry fits alongside the array container"
+    );
+    assert_eq!(
+        results.serialized_bytes(),
+        serde_json::to_vec(results.hits())
+            .expect("empty array serializes")
+            .len(),
+        "empty result must still account the `[]` container exactly"
+    );
+    assert_eq!(results.serialized_bytes(), SEARCH_MIN_RESULT_BYTES);
     assert!(results.truncated(), "dropped matches must be reported");
+}
+
+#[test]
+fn search_byte_accounting_is_exact_at_boundary_budgets() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = adversarial_catalog(Arc::clone(&spy));
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+    let q = query("searchword");
+
+    // Discover the exact serialized array size for one and two hits, then
+    // probe budgets exactly at and one byte below those boundaries.
+    let generous = index.search(&q, &limits(2, SEARCH_MAX_RESULT_BYTES_CAP));
+    assert_eq!(generous.hits().len(), 2, "fixture yields at least two hits");
+    let two_hit_bytes = serde_json::to_vec(generous.hits())
+        .expect("two-hit array serializes")
+        .len();
+    assert_eq!(generous.serialized_bytes(), two_hit_bytes);
+    let one_hit_bytes = serde_json::to_vec(&generous.hits()[..1])
+        .expect("one-hit array serializes")
+        .len();
+
+    for budget in [
+        SEARCH_MIN_RESULT_BYTES,
+        one_hit_bytes - 1,
+        one_hit_bytes,
+        two_hit_bytes - 1,
+        two_hit_bytes,
+    ] {
+        let results = index.search(&q, &limits(SEARCH_MAX_RESULTS_CAP, budget));
+        let actual = serde_json::to_vec(results.hits())
+            .expect("hit array serializes")
+            .len();
+        assert_eq!(
+            results.serialized_bytes(),
+            actual,
+            "budget {budget}: reported bytes must match serialized array"
+        );
+        assert!(
+            actual <= budget,
+            "budget {budget}: serialized array ({actual} bytes) must never exceed it"
+        );
+    }
+    // Exact-boundary budgets admit exactly the hits they cover.
+    assert_eq!(
+        index
+            .search(&q, &limits(SEARCH_MAX_RESULTS_CAP, one_hit_bytes))
+            .hits()
+            .len(),
+        1
+    );
+    assert_eq!(
+        index
+            .search(&q, &limits(SEARCH_MAX_RESULTS_CAP, one_hit_bytes - 1))
+            .hits()
+            .len(),
+        0
+    );
+    assert_eq!(index.search(&q, &limits(2, two_hit_bytes)).hits().len(), 2);
+    assert_eq!(
+        index.search(&q, &limits(2, two_hit_bytes - 1)).hits().len(),
+        1
+    );
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
 }
 
 // ── DiscoveryIndex: never exposes schemas or implementations ────────────────
@@ -306,6 +385,13 @@ fn search_limits_reject_zero_and_over_cap_values_typed() {
     assert_eq!(
         SearchLimits::new(4, 0).unwrap_err(),
         SearchLimitsError::ZeroBytes
+    );
+    assert_eq!(
+        SearchLimits::new(4, SEARCH_MIN_RESULT_BYTES - 1).unwrap_err(),
+        SearchLimitsError::BytesBelowMinimum {
+            actual: SEARCH_MIN_RESULT_BYTES - 1,
+            min: SEARCH_MIN_RESULT_BYTES
+        }
     );
     assert_eq!(
         SearchLimits::new(SEARCH_MAX_RESULTS_CAP + 1, 1024).unwrap_err(),
@@ -534,4 +620,233 @@ fn activation_rejects_duplicate_exact_activation_typed() {
         1,
         "duplicate rejection must leave the set unchanged"
     );
+}
+
+// ── SessionToolSet: stale snapshots, core pinning, changed schemas ──────────
+
+#[test]
+fn fresh_grant_cannot_rescue_stale_set_snapshot() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = adversarial_catalog(Arc::clone(&spy));
+    let sid = session("session-stale-set");
+    let mut set = SessionToolSet::new(sid.clone(), vec![], &catalog).expect("build set");
+    let built_at = set.catalog_generation();
+
+    // The catalog mutates AFTER the set snapshot was built.
+    catalog
+        .insert(spy_record(
+            "mcp.server-1:post-snapshot",
+            "post snapshot",
+            vec![],
+            Arc::clone(&spy),
+        ))
+        .expect("insert");
+    assert!(set.is_stale(&catalog));
+
+    // Mint a FRESH grant against the CURRENT catalog generation and digest:
+    // the grant itself is exact, so this cannot be StaleGeneration — only
+    // the stale set snapshot can reject it.
+    let tool = ToolId::parse("mcp.server-1:adversarial-08").expect("id");
+    let fresh = grant_for(&sid, &catalog, &tool);
+    assert_eq!(fresh.catalog_generation(), catalog.generation());
+    let err = set
+        .activate(fresh, &catalog)
+        .expect_err("fresh grant must not rescue a stale set snapshot");
+    assert_eq!(
+        err,
+        ActivationError::StaleSnapshot {
+            set: built_at,
+            catalog: catalog.generation(),
+        },
+        "stale snapshot rejection must carry both generations"
+    );
+    assert_eq!(
+        set.activated().count(),
+        0,
+        "rejected activation must leave the set unchanged"
+    );
+
+    // A stale grant against the same stale set still reports StaleGeneration
+    // (grant drift is detected before snapshot drift).
+    let stale_grant = SessionActivationGrant::new(
+        sid.as_str(),
+        tool.clone(),
+        built_at,
+        catalog.get(&tool).expect("record").schema_digest().clone(),
+    )
+    .expect("grant");
+    assert!(matches!(
+        set.activate(stale_grant, &catalog).unwrap_err(),
+        ActivationError::StaleGeneration { .. }
+    ));
+    assert_eq!(set.activated().count(), 0);
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn activation_rejects_core_tool_typed_without_mutation() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = adversarial_catalog(Arc::clone(&spy));
+    let core_tool = ToolId::parse("mcp.server-1:adversarial-00").expect("id");
+    let sid = session("session-core");
+    let mut set =
+        SessionToolSet::new(sid.clone(), vec![core_tool.clone()], &catalog).expect("build set");
+    assert!(set.is_core(&core_tool));
+
+    let grant = grant_for(&sid, &catalog, &core_tool);
+    let err = set
+        .activate(grant, &catalog)
+        .expect_err("core tools must not be re-activated as deferred tools");
+    assert_eq!(err, ActivationError::AlreadyCore(core_tool.clone()));
+    assert!(
+        set.activation(&core_tool).is_none(),
+        "core rejection must not record an activation"
+    );
+    assert_eq!(set.activated().count(), 0);
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn session_tool_set_pins_core_schema_digests_from_catalog() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = adversarial_catalog(Arc::clone(&spy));
+    let core = vec![
+        ToolId::parse("mcp.server-1:adversarial-02").expect("id"),
+        ToolId::parse("mcp.server-1:adversarial-01").expect("id"),
+    ];
+    let set =
+        SessionToolSet::new(session("session-digests"), core.clone(), &catalog).expect("build set");
+    for id in &core {
+        let expected = catalog.get(id).expect("record").schema_digest();
+        assert_eq!(
+            set.core_schema_digest(id),
+            Some(expected),
+            "core digest must be pinned from the catalog record"
+        );
+    }
+    assert_eq!(
+        set.core_schema_digest(&ToolId::parse("mcp.server-1:adversarial-09").expect("id")),
+        None,
+        "non-core tools have no pinned core digest"
+    );
+    // `core_ids` stays the deterministic ToolId-ordered projection.
+    let ids: Vec<&str> = set.core_ids().map(ToolId::as_str).collect();
+    assert_eq!(
+        ids,
+        vec!["mcp.server-1:adversarial-01", "mcp.server-1:adversarial-02"]
+    );
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn replaced_schema_for_same_tool_id_invalidates_old_grants() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = adversarial_catalog(Arc::clone(&spy));
+    let sid = session("session-schema-swap");
+    let tool = ToolId::parse("mcp.server-1:adversarial-03").expect("id");
+    let set = SessionToolSet::new(sid.clone(), vec![], &catalog).expect("build set");
+
+    let old_grant = grant_for(&sid, &catalog, &tool);
+    let old_digest = old_grant.schema_digest().clone();
+
+    // Replace the SAME ToolId with a record whose schema differs.
+    let replacement = CapabilityRecord::new(
+        tool.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-1".to_string(),
+            server_tool_name: "adversarial-03".to_string(),
+        },
+        "replaced schema",
+        vec![],
+        SchemaLocator::Inline(serde_json::json!({
+            "type": "object",
+            "properties": {"changed": {"type": "string"}}
+        })),
+        {
+            let spy = Arc::clone(&spy);
+            Arc::new(move || -> Arc<dyn Tool> {
+                spy.fetch_add(1, Ordering::SeqCst);
+                Arc::new(FixtureTool)
+            })
+        },
+        TrustProvenance::McpConfig {
+            server_id: "server-1".to_string(),
+        },
+    );
+    let new_digest = replacement.schema_digest().clone();
+    assert_ne!(old_digest, new_digest, "fixture schemas must differ");
+    catalog.upsert(Some(&tool), replacement).expect("upsert");
+
+    // Set must be rebuilt against the mutated catalog for this probe.
+    let mut set2 = SessionToolSet::new(sid.clone(), vec![], &catalog).expect("rebuild set");
+
+    // The old grant is rejected. Generation drift is detected first
+    // (StaleGeneration) — documented ordering — so the changed schema can
+    // never be reached through a stale generation.
+    assert!(matches!(
+        set2.activate(old_grant, &catalog).unwrap_err(),
+        ActivationError::StaleGeneration { .. }
+    ));
+    assert_eq!(set2.activated().count(), 0);
+
+    // A forged grant at the CURRENT generation but carrying the OLD digest
+    // is caught by the digest check.
+    let forged =
+        SessionActivationGrant::new(sid.as_str(), tool.clone(), catalog.generation(), old_digest)
+            .expect("grant");
+    assert!(matches!(
+        set2.activate(forged, &catalog).unwrap_err(),
+        ActivationError::DigestMismatch(id) if id == tool
+    ));
+    assert_eq!(set2.activated().count(), 0);
+
+    // The exact new-digest grant still works.
+    set2.activate(grant_for(&sid, &catalog, &tool), &catalog)
+        .expect("current-digest grant activates");
+    assert_eq!(set2.activated().count(), 1);
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+    let _ = set.session();
+}
+
+// ── Control-character rejection (log/query injection hardening) ─────────────
+
+#[test]
+fn session_id_rejects_control_characters_typed() {
+    for raw in [
+        "sess\nion",
+        "sess\rion",
+        "\x1b[31mred-session",
+        "sess\x00ion",
+        "s\u{0085}id",
+    ] {
+        assert_eq!(
+            SessionId::parse(raw).unwrap_err(),
+            SessionIdError::ControlCharacters,
+            "control characters must be rejected: {raw:?}"
+        );
+    }
+    // Ordinary host session ids are preserved.
+    for raw in [
+        "session-a",
+        "9f8e7d6c-5b4a-3f2e-1d0c-b9a897867564",
+        "host/session:42",
+    ] {
+        assert!(SessionId::parse(raw).is_ok(), "ordinary id rejected: {raw}");
+    }
+}
+
+#[test]
+fn discovery_query_rejects_control_characters_typed() {
+    for raw in ["search\nword", "\x1b[2Jsearch", "sea\x00rch"] {
+        assert_eq!(
+            DiscoveryQuery::parse(raw).unwrap_err(),
+            DiscoveryQueryError::ControlCharacters,
+            "control characters must be rejected: {raw:?}"
+        );
+    }
+    // A newline-bearing query must never be able to straddle the id/summary
+    // field separator inside the search haystack.
+    assert!(DiscoveryQuery::parse("adversarial-00\nsearchword").is_err());
+    // Ordinary queries (with trimmable outer whitespace) still parse.
+    assert!(DiscoveryQuery::parse("  searchword  ").is_ok());
 }

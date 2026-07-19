@@ -327,6 +327,8 @@ pub enum SessionIdError {
     Empty,
     #[error("session id is oversized: {actual} bytes exceeds limit {limit}")]
     Oversized { actual: usize, limit: usize },
+    #[error("session id contains control characters")]
+    ControlCharacters,
 }
 
 /// Typed, validated session identity (Task 15). Freely accepted unbounded
@@ -347,6 +349,13 @@ impl SessionId {
                 actual: raw.len(),
                 limit: SESSION_ID_MAX_BYTES,
             });
+        }
+        // Reject C0/C1/DEL control values (newline, carriage return, NUL,
+        // ESC/ANSI, NEL, …): session ids reach `Display`/log output and
+        // grant comparisons, so raw control bytes must fail closed at the
+        // boundary instead of being smuggled through.
+        if raw.chars().any(char::is_control) {
+            return Err(SessionIdError::ControlCharacters);
         }
         Ok(Self(raw.to_string()))
     }
@@ -369,6 +378,8 @@ pub enum ActivationGrantError {
     EmptySessionId,
     #[error("activation grant session id is oversized: {actual} bytes exceeds limit {limit}")]
     OversizedSessionId { actual: usize, limit: usize },
+    #[error("activation grant session id contains control characters")]
+    ControlCharacterSessionId,
 }
 
 /// An exact, session-scoped activation of one catalog capability, pinned to
@@ -399,6 +410,7 @@ impl SessionActivationGrant {
             SessionIdError::Oversized { actual, limit } => {
                 ActivationGrantError::OversizedSessionId { actual, limit }
             }
+            SessionIdError::ControlCharacters => ActivationGrantError::ControlCharacterSessionId,
         })?;
         Ok(Self {
             session_id: session_id.0,

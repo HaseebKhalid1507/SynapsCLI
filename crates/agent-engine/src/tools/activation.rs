@@ -16,7 +16,7 @@
 //!   mutation);
 //! - catalog drift is represented (`is_stale`), never silently absorbed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 
@@ -90,6 +90,8 @@ pub enum ActivationError {
     DigestMismatch(ToolId),
     #[error("tool is already activated for this session: {0}")]
     AlreadyActivated(ToolId),
+    #[error("tool is already in this session's configured core set: {0}")]
+    AlreadyCore(ToolId),
     #[error(
         "session tool set snapshot at generation {} is stale against catalog generation {}; rebuild it",
         set.value(),
@@ -102,30 +104,33 @@ pub enum ActivationError {
 }
 
 /// The small configured core set plus exact activated deferred tools for one
-/// session, pinned to the catalog generation it was built against.
+/// session, pinned to the catalog generation it was built against. Core
+/// tools are pinned with the schema digest of their catalog record at build
+/// time, so later drift is detectable per tool, not just per generation.
 #[derive(Clone, Debug)]
 pub struct SessionToolSet {
     session: SessionId,
     catalog_generation: CatalogGeneration,
-    core: BTreeSet<ToolId>,
+    core: BTreeMap<ToolId, SchemaDigest>,
     activated: BTreeMap<ToolId, ActivatedTool>,
 }
 
 impl SessionToolSet {
     /// Build a fresh set for one session. Every configured core id must
-    /// exist in the catalog (typed failure otherwise), and the set starts
-    /// with zero activations — nothing is inherited from any other session.
+    /// exist in the catalog (typed failure otherwise) and its schema digest
+    /// is pinned from the catalog record; the set starts with zero
+    /// activations — nothing is inherited from any other session.
     pub fn new(
         session: SessionId,
         core: impl IntoIterator<Item = ToolId>,
         catalog: &ToolCatalog,
     ) -> Result<Self, SessionToolSetError> {
-        let mut validated = BTreeSet::new();
+        let mut validated = BTreeMap::new();
         for id in core {
-            if catalog.get(&id).is_none() {
+            let Some(record) = catalog.get(&id) else {
                 return Err(SessionToolSetError::UnknownCoreTool(id));
-            }
-            validated.insert(id);
+            };
+            validated.insert(id, record.schema_digest().clone());
         }
         Ok(Self {
             session,
@@ -152,11 +157,17 @@ impl SessionToolSet {
 
     /// Deterministic projection of configured core ids (ToolId order).
     pub fn core_ids(&self) -> impl Iterator<Item = &ToolId> {
-        self.core.iter()
+        self.core.keys()
     }
 
     pub fn is_core(&self, id: &ToolId) -> bool {
-        self.core.contains(id)
+        self.core.contains_key(id)
+    }
+
+    /// The schema digest pinned for a configured core tool at build time,
+    /// or `None` when the id is not in this session's core set.
+    pub fn core_schema_digest(&self, id: &ToolId) -> Option<&SchemaDigest> {
+        self.core.get(id)
     }
 
     /// Deterministic projection of exact activations (ToolId order).
@@ -173,9 +184,9 @@ impl SessionToolSet {
     /// match this session, a cataloged tool, the CURRENT catalog generation,
     /// and the CURRENT schema digest exactly. Any drift — foreign session,
     /// unknown tool, stale generation, changed digest, stale set snapshot,
-    /// duplicate activation — fails typed before any mutation, so a failed
-    /// call leaves the set byte-for-byte unchanged. No implementation is
-    /// constructed, no process started, no schema exposed.
+    /// duplicate activation, core-set membership — fails typed before any
+    /// mutation, so a failed call leaves the set byte-for-byte unchanged. No
+    /// implementation is constructed, no process started, no schema exposed.
     pub fn activate(
         &mut self,
         grant: SessionActivationGrant,
@@ -215,6 +226,12 @@ impl SessionToolSet {
         ));
         if self.activated.contains_key(&tool_id) {
             return Err(ActivationError::AlreadyActivated(tool_id));
+        }
+        // Core tools are always available to the session; re-recording one
+        // as a deferred activation would create two conflicting bookkeeping
+        // entries for the same capability.
+        if self.core.contains_key(&tool_id) {
+            return Err(ActivationError::AlreadyCore(tool_id));
         }
         self.activated.insert(
             tool_id,

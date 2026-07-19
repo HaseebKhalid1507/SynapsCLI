@@ -475,6 +475,9 @@ pub const QUERY_MAX_BYTES: usize = 256;
 pub const SEARCH_MAX_RESULTS_CAP: usize = 64;
 /// Hard cap on the per-search serialized byte budget (64 KiB).
 pub const SEARCH_MAX_RESULT_BYTES_CAP: usize = 64 * 1024;
+/// Minimum per-search serialized byte budget: the empty serialized result
+/// collection (`[]`) is 2 bytes, so no smaller budget can be honest.
+pub const SEARCH_MIN_RESULT_BYTES: usize = 2;
 
 /// Typed failure for boundary parsing of a [`DiscoveryQuery`].
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -483,11 +486,13 @@ pub enum DiscoveryQueryError {
     Empty,
     #[error("discovery query is oversized: {actual} bytes exceeds limit {limit}")]
     Oversized { actual: usize, limit: usize },
+    #[error("discovery query contains control characters")]
+    ControlCharacters,
 }
 
 /// A validated, bounded, case-folded discovery query. Parse-at-boundary:
-/// empty (or whitespace-only) and oversized input fails typed before any
-/// search runs.
+/// empty (or whitespace-only), oversized, and control-character-bearing
+/// input fails typed before any search runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryQuery {
     needle: String,
@@ -505,6 +510,13 @@ impl DiscoveryQuery {
         if trimmed.is_empty() {
             return Err(DiscoveryQueryError::Empty);
         }
+        // Reject C0/C1/DEL control values (newline, ESC/ANSI, NUL, …) in the
+        // retained needle: the search haystack joins id/summary/tag fields
+        // with `\n`, so an embedded newline could match across field
+        // boundaries, and control bytes must never survive into logs.
+        if trimmed.chars().any(char::is_control) {
+            return Err(DiscoveryQueryError::ControlCharacters);
+        }
         Ok(Self {
             needle: trimmed.to_lowercase(),
         })
@@ -517,22 +529,29 @@ impl DiscoveryQuery {
 }
 
 /// Typed failure for constructing [`SearchLimits`]. Zero budgets would make
-/// every search vacuous; over-cap budgets would defeat the bound.
+/// every search vacuous; sub-minimum byte budgets could not even hold the
+/// empty serialized result collection; over-cap budgets would defeat the
+/// bound.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SearchLimitsError {
     #[error("search result count budget must be positive")]
     ZeroResults,
     #[error("search byte budget must be positive")]
     ZeroBytes,
+    #[error(
+        "search byte budget {actual} is below the serialized empty result collection size {min}"
+    )]
+    BytesBelowMinimum { actual: usize, min: usize },
     #[error("search result count budget {actual} exceeds cap {cap}")]
     ResultsOverCap { actual: usize, cap: usize },
     #[error("search byte budget {actual} exceeds cap {cap}")]
     BytesOverCap { actual: usize, cap: usize },
 }
 
-/// Validated positive, capped search budgets. The byte budget covers full
-/// serialized entries (JSON structure and metadata included), not merely
-/// descriptor text.
+/// Validated positive, capped search budgets. The byte budget bounds the
+/// exact compact-JSON serialization of the returned hit collection as an
+/// array (entries plus `[`/`]` and comma overhead), so a caller can rely on
+/// `serde_json::to_vec(results.hits())` never exceeding it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchLimits {
     max_results: usize,
@@ -546,6 +565,12 @@ impl SearchLimits {
         }
         if max_result_bytes == 0 {
             return Err(SearchLimitsError::ZeroBytes);
+        }
+        if max_result_bytes < SEARCH_MIN_RESULT_BYTES {
+            return Err(SearchLimitsError::BytesBelowMinimum {
+                actual: max_result_bytes,
+                min: SEARCH_MIN_RESULT_BYTES,
+            });
         }
         if max_results > SEARCH_MAX_RESULTS_CAP {
             return Err(SearchLimitsError::ResultsOverCap {
@@ -672,7 +697,10 @@ impl<'a> SearchResults<'a> {
         &self.hits
     }
 
-    /// Total serialized bytes of the returned entries (≤ the byte budget).
+    /// Exact compact-JSON byte size of the returned hit collection serialized
+    /// as an array — equal to `serde_json::to_vec(self.hits()).len()`,
+    /// including the `[`/`]` container (2 bytes when empty) and separating
+    /// commas. Always ≤ the byte budget the search ran with.
     pub fn serialized_bytes(&self) -> usize {
         self.serialized_bytes
     }
@@ -750,23 +778,37 @@ impl DiscoveryIndex {
     /// Deterministic, bounded, pure substring search over compact
     /// descriptors. Entries are visited in ToolId order; a matching entry is
     /// returned only if it fits both the remaining count budget and the
-    /// remaining serialized byte budget. The first match that does not fit
-    /// stops the scan (documented bounded behavior; `truncated` reports it).
+    /// remaining serialized byte budget. The byte budget accounts the exact
+    /// compact-JSON array serialization of the returned hits — container
+    /// brackets (2 bytes even when empty) plus one comma per additional
+    /// entry — so `serde_json::to_vec` of the hit collection can never
+    /// exceed it. The first match that does not fit stops the scan
+    /// (documented bounded behavior; `truncated` reports it).
     pub fn search(&self, query: &DiscoveryQuery, limits: &SearchLimits) -> SearchResults<'_> {
         let mut hits = Vec::new();
-        let mut used_bytes = 0usize;
+        // Serialized cost so far of `hits` as a compact JSON array: `[]` is
+        // 2 bytes; each entry adds its own bytes plus a comma when it is not
+        // the first.
+        let mut used_bytes = SEARCH_MIN_RESULT_BYTES;
         let mut truncated = false;
         for row in &self.rows {
             if !row.haystack.contains(query.needle()) {
                 continue;
             }
-            if hits.len() == limits.max_results()
-                || used_bytes + row.serialized_bytes > limits.max_result_bytes()
-            {
+            let separator = usize::from(!hits.is_empty());
+            let next_bytes = used_bytes
+                .checked_add(separator)
+                .and_then(|bytes| bytes.checked_add(row.serialized_bytes));
+            let fits = match next_bytes {
+                Some(bytes) => bytes <= limits.max_result_bytes(),
+                // Overflow can only mean "far beyond any budget".
+                None => false,
+            };
+            if hits.len() == limits.max_results() || !fits {
                 truncated = true;
                 break;
             }
-            used_bytes += row.serialized_bytes;
+            used_bytes = next_bytes.expect("fits implies no overflow");
             hits.push(&row.entry);
         }
         SearchResults {
