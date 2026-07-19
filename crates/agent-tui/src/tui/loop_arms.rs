@@ -216,6 +216,15 @@ async fn handle_extension_loader_event(
 
             // Spawn a background notification watcher for each loaded extension.
             // The watcher forwards widget.* notifications to the TUI via widget_tx.
+            //
+            // CP-11 fix-3 sibling audit: widget_tx is BOUNDED and this
+            // watcher must NEVER await capacity — an awaited send would
+            // backpressure the extension's lossless notification fan-out
+            // (stalling command.invoke / provider.stream subscribers on
+            // the same queue). On overflow the event is DROPPED with a
+            // warn instead: widget upserts are idempotent last-writer-wins
+            // UI state, so the first event after the TUI loop resumes
+            // consuming restores the display.
             let handlers = ext_mgr.read().await.handlers();
             for (ext_id, handler) in handlers {
                 let widget_tx = app.widget_tx.clone();
@@ -230,12 +239,19 @@ async fn handle_extension_loader_event(
                                         &frame.params,
                                     )
                                 {
-                                    let _ = widget_tx.send(
-                                        synaps_cli::extensions::widgets::ExtensionWidgetEvent {
-                                            extension_id: ext_id.clone(),
-                                            event,
-                                        },
-                                    );
+                                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                                        widget_tx.try_send(
+                                            synaps_cli::extensions::widgets::ExtensionWidgetEvent {
+                                                extension_id: ext_id.clone(),
+                                                event,
+                                            },
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            extension = %ext_id,
+                                            "widget event queue full; dropping widget event",
+                                        );
+                                    }
                                 }
                             }
                         }

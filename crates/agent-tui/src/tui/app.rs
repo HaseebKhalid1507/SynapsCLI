@@ -12,6 +12,11 @@ pub(crate) use super::transcript::TimestampedMsg;
 #[allow(unused_imports)]
 pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
 
+/// CP-11 fix-3 sibling audit: bounded capacity for the extension widget
+/// event lane. Producers are extension-controlled notification watchers;
+/// see the `App::widget_rx` field docs for the drop-on-overflow policy.
+pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
+
 /// Central TUI state.
 ///
 /// T199.2 boundary: `App` is **loop state**, not render input. The render
@@ -175,10 +180,19 @@ pub(crate) struct App {
         tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
     pub(crate) extension_loader_running: bool,
     /// Channel for receiving widget events from background extension notification watchers.
+    ///
+    /// CP-11 fix-3 sibling audit: BOUNDED ([`WIDGET_EVENT_QUEUE_CAPACITY`]).
+    /// Producers are extension-controlled (`widget.*` notification
+    /// frames), and this loop's consumer arm stalls during inline awaits
+    /// — e.g. the up-to-120 s `command.invoke` window — so an unbounded
+    /// channel here let a hostile extension park aggregate widget bytes
+    /// in host memory. Watchers `try_send` and DROP-newest on overflow
+    /// with a warn: widget upserts are idempotent last-writer-wins UI
+    /// state, so the next event after the consumer resumes restores it.
     pub(crate) widget_rx:
-        tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
+        tokio::sync::mpsc::Receiver<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     pub(crate) widget_tx:
-        tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
+        tokio::sync::mpsc::Sender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds:
         Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
@@ -216,7 +230,8 @@ impl App {
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) =
             tokio::sync::mpsc::unbounded_channel();
-        let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (widget_tx_init, widget_rx_init) =
+            tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             input: String::new(),
