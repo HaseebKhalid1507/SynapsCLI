@@ -304,7 +304,14 @@ pub async fn begin_cloud_invoke_tracer(
     structure.wire = None;
     // Prompt-cache markers are not sent on the cloud-invoke route.
     structure.cache = Default::default();
-    RequestTracer::begin(trace, model, TransportKind::CloudProxy, endpoint, structure)
+    RequestTracer::begin(
+        trace,
+        None,
+        model,
+        TransportKind::CloudProxy,
+        endpoint,
+        structure,
+    )
 }
 
 /// Provider-reported usage from a broker `CloudEvent::Usage`. The broker

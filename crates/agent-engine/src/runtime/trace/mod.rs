@@ -32,6 +32,7 @@ pub mod anthropic;
 pub mod controls;
 pub mod diagnostics;
 pub mod emit;
+pub mod execution;
 pub mod export;
 pub mod extension;
 pub mod google;
@@ -45,9 +46,10 @@ pub use controls::{
 };
 pub use diagnostics::{CacheActivity, CacheSnapshotStore, ContextReport, ReportValue};
 pub use emit::{
-    wire_meta_from_sent_bytes, AttemptClock, CollectingTraceSink, NoopTraceSink, RequestStructure,
-    RequestTracer, TraceContext, TraceSink,
+    wire_meta_from_sent_bytes, AttemptClock, CollectingTraceSink, NoopTraceSink,
+    RequestCorrelation, RequestStructure, RequestTracer, TraceContext, TraceSink,
 };
+pub use execution::ExecutionCorrelation;
 pub use export::{
     export_content, export_metadata, redact_value, sweep_expired_captures, ContentExport,
     ExportError, MetadataExportStats, CONTENT_EXPORT_SCHEMA,
@@ -57,10 +59,11 @@ pub use key::{
     ComponentDigest, DigestDomain, TraceDigestKey, TraceKeyError,
 };
 pub use types::{
-    BlockKind, BlockMeta, CacheBoundaryLocation, CacheBoundaryMeta, CacheMeta, CacheSegmentDelta,
-    CacheTtlClass, EndpointMeta, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy,
-    RequestTrace, RetryClass, RetryMeta, SegmentChange, StopReason, SystemSegmentKind,
-    SystemSegmentMeta, TimingStages, ToolMeta, TraceId, TraceSchemaVersion, TranslationAction,
+    ActivationGrantRef, BlockKind, BlockMeta, CacheBoundaryLocation, CacheBoundaryMeta, CacheMeta,
+    CacheSegmentDelta, CacheTtlClass, EndpointMeta, ExecutionCommitStatus, ExecutionEffect,
+    ExecutionPhase, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy, RequestTrace, RetryClass,
+    RetryMeta, SegmentChange, StopReason, SystemSegmentKind, SystemSegmentMeta, TimingStages,
+    ToolExecutionEvent, ToolMeta, TraceId, TraceSchemaVersion, TranslationAction,
     TranslationElement, TranslationLoss, TransportKind, TransportOutcome, UsageMeta,
     UsageProvenance, WireMeta, WireName, TRACE_ID_MAX_BYTES, TRACE_SCHEMA, WIRE_NAME_MAX_BYTES,
 };

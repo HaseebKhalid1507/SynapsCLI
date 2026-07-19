@@ -779,6 +779,10 @@ pub struct ApiOptions {
     /// sink, zero request-path work); tests install a collecting sink and
     /// production installs the Task 11 writer-backed sink via the Runtime.
     pub trace: crate::runtime::trace::TraceContext,
+    /// The correlated IDs reserved for this provider request. Set before the
+    /// transport starts and consumed by both RequestTracer and the stream's
+    /// tool lifecycle recorder.
+    pub request_correlation: Option<crate::runtime::trace::RequestCorrelation>,
     /// Bounded background writer for legacy telemetry records (Task 11).
     /// `None` (default) drops records; production sets the Runtime's shared
     /// session writer whenever the telemetry level is Basic/Full. Enqueue
@@ -874,6 +878,7 @@ pub(super) async fn begin_anthropic_tracer(
     );
     let tracer = tr::RequestTracer::begin(
         &options.trace,
+        options.request_correlation.clone(),
         model,
         tr::TransportKind::AnthropicMessages,
         endpoint,

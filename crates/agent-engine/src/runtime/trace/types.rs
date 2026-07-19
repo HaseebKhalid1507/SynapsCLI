@@ -695,6 +695,69 @@ impl TransportOutcome {
     }
 }
 
+// --- Correlated execution events (Task 27, spec §8.5) ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    Planned,
+    Authorized,
+    Started,
+    Committed,
+    ResultRecorded,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEffect {
+    ReadOnly,
+    IdempotentWrite,
+    NonIdempotent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCommitStatus {
+    NotStarted,
+    Started,
+    Committed,
+    ResultRecorded,
+    UnknownAfterSideEffect,
+    CanceledBeforeCommit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActivationGrantRef {
+    Core,
+    Exact { catalog_generation: u64 },
+}
+
+/// One bounded, content-free lifecycle event. IDs and wire names use the
+/// validated trace types; result content is represented only by byte count,
+/// truncation metadata, and an optional bounded preview byte count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionEvent {
+    pub session_id: TraceId,
+    pub turn_id: TraceId,
+    pub request_id: TraceId,
+    pub tool_call_id: TraceId,
+    pub stable_tool_id: TraceId,
+    pub wire_name: WireName,
+    pub phase: ExecutionPhase,
+    pub elapsed_ms: u64,
+    pub result_bytes: u64,
+    pub truncated: bool,
+    pub preview_bytes: u64,
+    pub activation: ActivationGrantRef,
+    pub effect: ExecutionEffect,
+    pub commit_status: ExecutionCommitStatus,
+    /// Original model-request position; event assembly and returned
+    /// `tool_result` blocks both preserve this ordering.
+    pub model_order: u32,
+}
+
 // --- The envelope ---
 
 /// One `synaps-request-trace/1` record: metadata for a single request
@@ -706,6 +769,10 @@ pub struct RequestTrace {
     pub session_id: TraceId,
     pub turn_id: TraceId,
     pub request_id: TraceId,
+    /// Correlated tool-execution lifecycle metadata observed while this
+    /// logical request's tool results were produced. Bounded metadata only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_events: Vec<ToolExecutionEvent>,
     /// 1-based try ordinal for this record: the number of tries the
     /// transport made, i.e. `outcome.retries.len() + 1`.
     pub attempt: u32,

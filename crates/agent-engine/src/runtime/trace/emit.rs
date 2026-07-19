@@ -49,6 +49,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// non-blocking: they run inline on the request path.
 pub trait TraceSink: Send + Sync + std::fmt::Debug {
     fn emit(&self, record: RequestTrace);
+    /// Optional latest record snapshot used to append execution-enriched
+    /// copies after the provider request has completed.
+    fn snapshot_for_request(&self, _request_id: &TraceId) -> Option<RequestTrace> {
+        None
+    }
     /// When `false`, transports skip record construction entirely.
     fn enabled(&self) -> bool {
         true
@@ -93,6 +98,16 @@ impl TraceSink for CollectingTraceSink {
             .expect("trace sink poisoned")
             .push(record);
     }
+
+    fn snapshot_for_request(&self, request_id: &TraceId) -> Option<RequestTrace> {
+        self.records
+            .lock()
+            .expect("trace sink poisoned")
+            .iter()
+            .rev()
+            .find(|record| &record.request_id == request_id)
+            .cloned()
+    }
 }
 
 // --- Context handle ---
@@ -127,6 +142,12 @@ pub struct TraceContext {
     /// (tool-loop continuation sharing the `ApiOptions`) is disabled.
     /// `None` (Basic/Full session contexts) never gates anything.
     one_shot_gate: Option<Arc<AtomicBool>>,
+    /// Request-correlated execution events keyed by the request ID. The
+    /// transport may emit before tool execution; the collecting/writer sinks
+    /// receive an updated envelope snapshot when the stream records events.
+    execution_events: Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<super::types::ToolExecutionEvent>>>,
+    >,
 }
 
 impl std::fmt::Debug for TraceContext {
@@ -145,6 +166,69 @@ impl Default for TraceContext {
 }
 
 impl TraceContext {
+    /// Replace the first matching request record with an execution-enriched
+    /// snapshot. Sinks that persist append-only records may retain both; the
+    /// latest snapshot is authoritative for the request ID.
+    pub fn emit_execution_enriched(&self, request_id: &TraceId) {
+        let Some(mut record) = self.sink.snapshot_for_request(request_id) else {
+            return;
+        };
+        record.execution_events = self.execution_events(request_id);
+        self.sink.emit(record);
+    }
+
+    /// Session identity shared by all request/tool events in this context.
+    pub fn session_id(&self) -> &TraceId {
+        &self.session_id
+    }
+
+    /// Append bounded execution metadata for a request. This never fails the
+    /// turn; malformed/unrepresentable fields are rejected before this seam.
+    pub fn record_execution_event(&self, event: super::types::ToolExecutionEvent) {
+        self.execution_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(event.request_id.as_str().to_string())
+            .or_default()
+            .push(event);
+    }
+
+    pub fn execution_events(&self, request_id: &TraceId) -> Vec<super::types::ToolExecutionEvent> {
+        self.execution_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request_id.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Test/stream seam: correlated IDs for the most recently begun request.
+    pub fn latest_request_correlation(&self) -> Option<(TraceId, TraceId, TraceId)> {
+        let seq = self.request_seq.load(Ordering::Relaxed);
+        if seq == 0 {
+            return None;
+        }
+        let pid = std::process::id();
+        Some((
+            self.session_id.clone(),
+            TraceId::new(format!("turn-{pid}-{seq}")).ok()?,
+            TraceId::new(format!("req-{pid}-{seq}")).ok()?,
+        ))
+    }
+
+    pub fn reserve_request_correlation(&self) -> Option<RequestCorrelation> {
+        if !self.enabled() {
+            return None;
+        }
+        let seq = self.next_request_seq();
+        let pid = std::process::id();
+        Some(RequestCorrelation {
+            session_id: self.session_id.clone(),
+            turn_id: TraceId::new(format!("turn-{pid}-{seq}")).ok()?,
+            request_id: TraceId::new(format!("req-{pid}-{seq}")).ok()?,
+        })
+    }
+
     /// Disabled context: no-op sink, no key I/O, zero request-path work.
     pub fn disabled() -> Self {
         Self::with_sink(Arc::new(NoopTraceSink))
@@ -165,6 +249,7 @@ impl TraceContext {
             cache_snapshots: Arc::new(super::diagnostics::CacheSnapshotStore::new()),
             content_capture: None,
             one_shot_gate: None,
+            execution_events: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
@@ -186,6 +271,7 @@ impl TraceContext {
             cache_snapshots: Arc::clone(&self.cache_snapshots),
             content_capture: None,
             one_shot_gate: None,
+            execution_events: Arc::clone(&self.execution_events),
         }
     }
 
@@ -451,6 +537,13 @@ pub fn wire_meta_from_sent_bytes(key: &TraceDigestKey, sent_bytes: &[u8]) -> Wir
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestCorrelation {
+    pub session_id: TraceId,
+    pub turn_id: TraceId,
+    pub request_id: TraceId,
+}
+
 // --- Per-request tracer ---
 
 /// Builds and emits one record per actual transport attempt (see module
@@ -474,6 +567,7 @@ impl RequestTracer {
     /// degraded record — never an error).
     pub fn begin(
         ctx: &TraceContext,
+        correlation: Option<RequestCorrelation>,
         model: QualifiedModelId,
         transport: TransportKind,
         endpoint: EndpointMeta,
@@ -482,18 +576,16 @@ impl RequestTracer {
         if !ctx.enabled() {
             return None;
         }
-        let seq = ctx.next_request_seq();
-        let pid = std::process::id();
-        let request_id = match TraceId::new(format!("req-{pid}-{seq}")) {
-            Ok(id) => id,
-            Err(_) => {
+        let correlation = match correlation.or_else(|| ctx.reserve_request_correlation()) {
+            Some(correlation) => correlation,
+            None => {
                 ctx.note_degraded();
                 return None;
             }
         };
-        // The transport layer has no turn knowledge yet; the turn ID shares
-        // the request sequence until runtime-level correlation lands.
-        let turn_id = TraceId::new(format!("turn-{pid}-{seq}")).ok()?;
+        let request_id = correlation.request_id;
+        let turn_id = correlation.turn_id;
+        let session_id = correlation.session_id;
         // One-shot gate LAST (Task 12 `/trace next`): consumed only when a
         // tracer can actually start — an identity-validation failure above
         // returns without spending the arm, so the arm still covers the
@@ -505,7 +597,7 @@ impl RequestTracer {
         }
         Some(Self {
             ctx: ctx.clone(),
-            session_id: ctx.session_id.clone(),
+            session_id,
             turn_id,
             request_id,
             model,
@@ -520,6 +612,10 @@ impl RequestTracer {
     /// The shared request ID for correlating this request's records.
     pub fn request_id(&self) -> &TraceId {
         &self.request_id
+    }
+
+    pub fn correlation_ids(&self) -> (&TraceId, &TraceId, &TraceId) {
+        (&self.session_id, &self.turn_id, &self.request_id)
     }
 
     /// Record a failed attempt that WILL be retried: emits this attempt's
@@ -594,6 +690,14 @@ impl RequestTracer {
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
             request_id: self.request_id.clone(),
+            execution_events: self
+                .ctx
+                .execution_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(self.request_id.as_str())
+                .cloned()
+                .unwrap_or_default(),
             attempt: self.attempt,
             model: self.model.clone(),
             transport: self.transport,

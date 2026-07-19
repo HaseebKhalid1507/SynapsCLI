@@ -148,7 +148,7 @@ pub async fn begin_openai_tracer(
         tools_schema,
         translation,
     );
-    RequestTracer::begin(trace, model, transport, endpoint, structure)
+    RequestTracer::begin(trace, None, model, transport, endpoint, structure)
 }
 
 /// Structural, metadata-only description of one OpenAI-compatible request.

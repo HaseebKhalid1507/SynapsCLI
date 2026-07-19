@@ -408,6 +408,7 @@ fn report_flows_into_trace_translation_losses() {
     };
     let tracer = tr::RequestTracer::begin(
         &ctx,
+        None,
         agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6").unwrap(),
         tr::TransportKind::AnthropicMessages,
         tr::EndpointMeta::new("api.anthropic.com", "/v1/messages").unwrap(),

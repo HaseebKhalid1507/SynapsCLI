@@ -794,6 +794,7 @@ mod tests {
             session_id: TraceId::new("session-1").unwrap(),
             turn_id: TraceId::new(turn).unwrap(),
             request_id: TraceId::new(request).unwrap(),
+            execution_events: Vec::new(),
             attempt: 1,
             model: agent_core::prompt::QualifiedModelId::parse("anthropic/claude-test").unwrap(),
             transport: TransportKind::AnthropicMessages,

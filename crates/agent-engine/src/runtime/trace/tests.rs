@@ -34,6 +34,7 @@ fn sample_trace(key: &TraceDigestKey) -> RequestTrace {
         session_id: id("sess-01"),
         turn_id: id("turn-01"),
         request_id: id("req-01"),
+        execution_events: Vec::new(),
         attempt: 2,
         model: agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6").unwrap(),
         transport: TransportKind::AnthropicMessages,
@@ -618,6 +619,7 @@ fn one_shot_gate_admits_one_tracer_with_all_its_attempts() {
 
     let mut first = RequestTracer::begin(
         &ctx,
+        None,
         model.clone(),
         TransportKind::AnthropicMessages,
         endpoint.clone(),
@@ -645,6 +647,7 @@ fn one_shot_gate_admits_one_tracer_with_all_its_attempts() {
     assert!(
         RequestTracer::begin(
             &ctx,
+            None,
             model,
             TransportKind::AnthropicMessages,
             endpoint,

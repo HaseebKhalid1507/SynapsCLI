@@ -329,6 +329,7 @@ impl StreamMethods {
             // Flag-off: borrow the turn's options untouched — no per-round
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
+            let request_correlation = options.trace.reserve_request_correlation();
             let projected_options;
             let metered_options;
             let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
@@ -347,12 +348,14 @@ impl StreamMethods {
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
+                    request_correlation: request_correlation.clone(),
                     ..options.clone()
                 };
                 &projected_options
             } else {
                 metered_options = super::api::ApiOptions {
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
+                    request_correlation: request_correlation.clone(),
                     ..options.clone()
                 };
                 &metered_options
@@ -580,11 +583,25 @@ impl StreamMethods {
                                 (authorized, input)
                             })
                         };
+                        let tool_call_started = std::time::Instant::now();
+                        let execution_correlation = request_correlation.as_ref().map(|request| {
+                            crate::runtime::trace::ExecutionCorrelation::from_request(
+                                &round_options.trace,
+                                request,
+                            )
+                        });
                         let mut production_output: Option<crate::tools::output::OutputHandle> =
                             None;
+                        let mut execution_identity = None;
                         let result = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
+                                execution_identity = Some((
+                                    authorized.tool_id().clone(),
+                                    authorized.wire_name().to_string(),
+                                    authorized.activation_basis(),
+                                    tool.effect(),
+                                ));
                                 // ═══ BOUNDED DELTA LANE (Task 26, §8.4) ═══
                                 // Bounded channel + coalesce/drop policy at
                                 // production; the forwarder enforces the UI
@@ -691,6 +708,29 @@ impl StreamMethods {
                             .as_ref()
                             .map(crate::tools::output::OutputHandle::model_history)
                             .filter(|bounded| bounded.original_bytes > 0);
+                        if let (
+                            Some(correlation),
+                            Some((stable_id, wire_name, activation, effect)),
+                        ) = (&execution_correlation, execution_identity)
+                        {
+                            let retained = history_result
+                                .as_ref()
+                                .map(|bounded| bounded.retained_bytes)
+                                .unwrap_or_else(|| result.len().min(max_tool_output));
+                            correlation.record(
+                                &tool_id,
+                                &stable_id,
+                                &wire_name,
+                                crate::runtime::trace::ExecutionPhase::ResultRecorded,
+                                tool_call_started,
+                                result.len(),
+                                retained,
+                                activation,
+                                effect,
+                                crate::runtime::trace::ExecutionCommitStatus::ResultRecorded,
+                                0,
+                            );
+                        }
                         let ui_result = crate::tools::output::bounded_preview(
                             &result,
                             crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
@@ -709,6 +749,7 @@ impl StreamMethods {
                 } else {
                     // Multiple tools — run in parallel with JoinSet
                     // Delta streaming is per-tool so each gets its own channel
+                    let request_correlation = request_correlation.clone();
                     let mut join_set = tokio::task::JoinSet::new();
 
                     // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
@@ -753,14 +794,15 @@ impl StreamMethods {
                         Keyed(String),
                         Serial,
                     }
-                    let prepared_calls: Vec<(String, String, PreparedCall, LaneKind)> = {
+                    let prepared_calls: Vec<(usize, String, String, PreparedCall, LaneKind)> = {
                         let registry = tools.read().await;
                         let session_set = session_tool_set
                             .read()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         tool_uses
                             .iter()
-                            .filter_map(|tool_use| {
+                            .enumerate()
+                            .filter_map(|(model_order, tool_use)| {
                                 let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
                                 let tool_name =
                                     tool_use["name"].as_str().unwrap_or("").to_string();
@@ -807,17 +849,17 @@ impl StreamMethods {
                                     };
                                     (PreparedCall::Gate(gate), lane)
                                 };
-                                Some((tool_id, tool_name, prepared, lane))
+                                Some((model_order, tool_id, tool_name, prepared, lane))
                             })
                             .collect()
                     };
 
                     // Group into lanes, preserving model order inside each.
-                    let mut lanes: Vec<Vec<(String, String, PreparedCall)>> = Vec::new();
+                    let mut lanes: Vec<Vec<(usize, String, String, PreparedCall)>> = Vec::new();
                     let mut keyed_lane: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
                     let mut serial_lane: Option<usize> = None;
-                    for (tool_id, tool_name, prepared, lane) in prepared_calls {
+                    for (model_order, tool_id, tool_name, prepared, lane) in prepared_calls {
                         let index = match lane {
                             LaneKind::Concurrent => {
                                 lanes.push(Vec::new());
@@ -832,13 +874,15 @@ impl StreamMethods {
                                 lanes.len() - 1
                             }),
                         };
-                        lanes[index].push((tool_id, tool_name, prepared));
+                        lanes[index].push((model_order, tool_id, tool_name, prepared));
                     }
 
                     // One task per lane; calls inside a lane run
                     // SEQUENTIALLY in model order, lanes run concurrently.
                     for lane in lanes {
                         let tx_stream = tx.clone();
+                        let request_correlation_inner = request_correlation.clone();
+                        let trace_inner = round_options.trace.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
@@ -859,7 +903,7 @@ impl StreamMethods {
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, String)> = Vec::new();
-                            for (tool_id, tool_name, prepared) in lane {
+                            for (model_order, tool_id, tool_name, prepared) in lane {
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
                                     let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -876,6 +920,9 @@ impl StreamMethods {
                                 Ok((authorized, input)) => {
                                     let t = authorized.implementation();
                                     let call_effect = t.effect();
+                                    let stable_tool_id = authorized.tool_id().clone();
+                                    let activation_basis = authorized.activation_basis();
+                                    let tool_call_started = std::time::Instant::now();
                                     let runtime_name_for_hook =
                                         authorized.runtime_name().to_string();
                                     let decision = resolve_before_tool_call_decision(
@@ -890,7 +937,7 @@ impl StreamMethods {
                                         auto_approve_inner,
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
-                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None)
+                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
@@ -936,17 +983,17 @@ impl StreamMethods {
                                                 output,
                                                 max_tool_output,
                                             ).await;
-                                            (false, Some(call_effect), output, Some(output_handle))
+                                            (false, Some(call_effect), output, Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)))
                                         }
                                         _ = cancel_token.cancelled() => {
-                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle))
+                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)))
                                         }
                                     }
                                     } // close else from Block check
                                 }
                                 // Typed, bounded, metadata-only gate denial —
                                 // no implementation lookup, no hook emission.
-                                Err(denial) => (false, None, denial.to_string(), None),
+                                Err(denial) => (false, None, denial.to_string(), None, None),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -974,11 +1021,49 @@ impl StreamMethods {
                                 }
                                 _ => None,
                             };
-                            let history = result.3.as_ref()
+                            let history_bounded = result.3.as_ref()
                                 .map(crate::tools::output::OutputHandle::model_history)
-                                .filter(|bounded| bounded.original_bytes > 0)
-                                .map(|bounded| bounded.text)
+                                .filter(|bounded| bounded.original_bytes > 0);
+                            let history = history_bounded.as_ref()
+                                .map(|bounded| bounded.text.clone())
                                 .unwrap_or_else(|| HelperMethods::truncate_tool_result(&result.2, max_tool_output));
+                            if let (Some(request), Some((stable_tool_id, activation_basis, tool_call_started)), Some(call_effect)) = (request_correlation_inner.as_ref(), result.4, result.1) {
+                                let correlation =
+                                    crate::runtime::trace::ExecutionCorrelation::from_request(
+                                        &trace_inner,
+                                        request,
+                                    );
+                                let retained = history_bounded
+                                    .as_ref()
+                                    .map(|bounded| bounded.retained_bytes)
+                                    .unwrap_or_else(|| result.2.len().min(max_tool_output));
+                                let commit_status = if was_canceled {
+                                    match call_effect {
+                                        crate::tools::catalog::ToolEffect::NonIdempotent =>
+                                            crate::runtime::trace::ExecutionCommitStatus::UnknownAfterSideEffect,
+                                        _ => crate::runtime::trace::ExecutionCommitStatus::CanceledBeforeCommit,
+                                    }
+                                } else {
+                                    crate::runtime::trace::ExecutionCommitStatus::ResultRecorded
+                                };
+                                correlation.record(
+                                    &tool_id,
+                                    &stable_tool_id,
+                                    &tool_name_for_hook,
+                                    if was_canceled {
+                                        crate::runtime::trace::ExecutionPhase::Canceled
+                                    } else {
+                                        crate::runtime::trace::ExecutionPhase::ResultRecorded
+                                    },
+                                    tool_call_started,
+                                    result.2.len(),
+                                    retained,
+                                    activation_basis,
+                                    call_effect,
+                                    commit_status,
+                                    model_order,
+                                );
+                            }
                             lane_results.push((tool_id, was_canceled, interrupted, history));
                             if was_canceled {
                                 // Cancellation stops the lane; the ordered

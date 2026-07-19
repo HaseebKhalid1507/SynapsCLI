@@ -197,7 +197,14 @@ pub async fn begin_extension_tracer(
         "extension provider: the sidecar owns request serialization; \
          no exact request body exists in this process",
     );
-    RequestTracer::begin(trace, model, TransportKind::Extension, endpoint, structure)
+    RequestTracer::begin(
+        trace,
+        None,
+        model,
+        TransportKind::Extension,
+        endpoint,
+        structure,
+    )
 }
 
 /// Sentinel meaning "no first model event observed yet".

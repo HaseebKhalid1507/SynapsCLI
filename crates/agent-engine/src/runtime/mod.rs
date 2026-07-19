@@ -1784,6 +1784,7 @@ impl Runtime {
                     // loop too (the one-shot gate inside the armed context
                     // limits it to exactly one logical request).
                     trace: self.effective_trace_context(),
+                    request_correlation: None,
                     telemetry: self.telemetry_writer.clone(),
                     // Non-stream path note (Task 16 review): threading the
                     // host session here gates extension-provider interior
@@ -2197,6 +2198,7 @@ impl Runtime {
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
+            request_correlation: None,
             telemetry: self.telemetry_writer.clone(),
             // Threads the runtime-scoped gate identity into extension-
             // provider interior tool loops (Task 16).

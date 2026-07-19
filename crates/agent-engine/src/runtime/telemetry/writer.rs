@@ -219,6 +219,7 @@ struct Shared {
     /// `None` after shutdown — dropping the sender disconnects the channel,
     /// which is the worker's drain-and-exit signal.
     tx: StdMutex<Option<SyncSender<Job>>>,
+    latest_traces: StdMutex<std::collections::BTreeMap<String, RequestTrace>>,
     /// Joined only on a fully-drained shutdown; otherwise the worker stays
     /// detached (it exits on its own once the queue drains).
     worker: StdMutex<Option<std::thread::JoinHandle<()>>>,
@@ -243,6 +244,7 @@ impl TelemetryWriter {
         let (tx, rx) = sync_channel::<Job>(options.capacity.max(1));
         let shared = Arc::new(Shared {
             tx: StdMutex::new(Some(tx)),
+            latest_traces: StdMutex::new(std::collections::BTreeMap::new()),
             worker: StdMutex::new(None),
             done: StdMutex::new(false),
             done_cv: Condvar::new(),
@@ -270,7 +272,18 @@ impl TelemetryWriter {
 
     /// Enqueue a metadata-only request trace. Non-blocking; overflow drops.
     pub fn enqueue_trace(&self, record: RequestTrace) {
+        lock_recover(&self.shared.latest_traces)
+            .insert(record.request_id.as_str().to_string(), record.clone());
         self.enqueue(Job::Trace(Box::new(record)));
+    }
+
+    pub fn trace_snapshot(
+        &self,
+        request_id: &crate::runtime::trace::TraceId,
+    ) -> Option<RequestTrace> {
+        lock_recover(&self.shared.latest_traces)
+            .get(request_id.as_str())
+            .cloned()
     }
 
     fn enqueue(&self, job: Job) {
@@ -499,6 +512,13 @@ impl TraceSink for WriterTraceSink {
         self.writer.enqueue_trace(record);
     }
 
+    fn snapshot_for_request(
+        &self,
+        request_id: &crate::runtime::trace::TraceId,
+    ) -> Option<RequestTrace> {
+        self.writer.trace_snapshot(request_id)
+    }
+
     fn enabled(&self) -> bool {
         true
     }
@@ -552,6 +572,7 @@ mod tests {
             session_id: TraceId::new("sess-w1").unwrap(),
             turn_id: TraceId::new("turn-w1").unwrap(),
             request_id: TraceId::new("req-w1").unwrap(),
+            execution_events: Vec::new(),
             attempt: 1,
             model: agent_core::prompt::QualifiedModelId::parse("anthropic/claude-sonnet-4-6")
                 .unwrap(),

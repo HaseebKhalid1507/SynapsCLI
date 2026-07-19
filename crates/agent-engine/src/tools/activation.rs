@@ -460,6 +460,14 @@ impl ResolvedToolCall {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationBasis {
+    Core,
+    Exact {
+        catalog_generation: CatalogGeneration,
+    },
+}
+
 /// A fully authorized tool call: exact resolved identity plus the acquired
 /// implementation. The implementation field is private and the ONLY
 /// constructor is [`ExecutionGate::authorize`], which acquires it strictly
@@ -468,6 +476,7 @@ impl ResolvedToolCall {
 pub struct AuthorizedToolCall {
     resolved: ResolvedToolCall,
     implementation: Arc<dyn Tool>,
+    activation_basis: ActivationBasis,
 }
 
 impl AuthorizedToolCall {
@@ -485,6 +494,10 @@ impl AuthorizedToolCall {
 
     pub fn tool_id(&self) -> &ToolId {
         self.resolved.tool_id()
+    }
+
+    pub fn activation_basis(&self) -> ActivationBasis {
+        self.activation_basis
     }
 
     /// The authorized implementation handle.
@@ -611,10 +624,12 @@ impl ExecutionGate {
 
         // Core status or exact activation grant, with pinned-digest
         // verification either way.
+        let activation_basis;
         if let Some(pinned) = session.core_schema_digest(&tool_id) {
             if pinned != record.schema_digest() {
                 return Err(ToolAuthorizationError::SchemaDigestMismatch(tool_id));
             }
+            activation_basis = ActivationBasis::Core;
         } else if let Some(activated) = session.activation(&tool_id) {
             if activated.schema_digest() != record.schema_digest() {
                 return Err(ToolAuthorizationError::SchemaDigestMismatch(tool_id));
@@ -629,6 +644,9 @@ impl ExecutionGate {
             ) {
                 return Err(ToolAuthorizationError::NotActivated(tool_id));
             }
+            activation_basis = ActivationBasis::Exact {
+                catalog_generation: activated.catalog_generation(),
+            };
         } else {
             return Err(ToolAuthorizationError::NotActivated(tool_id));
         }
@@ -653,6 +671,7 @@ impl ExecutionGate {
         Ok(AuthorizedToolCall {
             resolved,
             implementation,
+            activation_basis,
         })
     }
 
