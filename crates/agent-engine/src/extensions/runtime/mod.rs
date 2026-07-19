@@ -112,7 +112,7 @@ pub trait ExtensionHandler: Send + Sync {
     async fn provider_stream(
         &self,
         _params: ProviderCompleteParams,
-        _sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+        _sink: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         Err("provider.stream is not supported by this extension".to_string())
     }
@@ -120,6 +120,14 @@ pub trait ExtensionHandler: Send + Sync {
     /// Invoke a plugin-registered interactive slash command. The handler must
     /// forward `command.output` notifications matching `request_id` and any
     /// `task.*` notifications to `sink`. Returns the final response value.
+    ///
+    /// CP-11 fix-2 (B) audit note: this sink intentionally stays UNBOUNDED.
+    /// It is a user-initiated control lane (one in-flight command per user
+    /// action, 120 s invoke timeout, ≤ 4 MiB per reader frame), and its TUI
+    /// consumer drains only after the call resolves — an awaited bounded
+    /// send here would deadlock that post-hoc drain against the reader.
+    /// The bounded notification queue in front of it still paces hostile
+    /// frame production. Model/tool byte paths never flow through this sink.
     async fn invoke_command(
         &self,
         _command: &str,
@@ -180,11 +188,8 @@ pub trait ExtensionHandler: Send + Sync {
     /// a no-op for handler impls that don't support notifications.
     async fn subscribe_notifications(
         &self,
-    ) -> (
-        usize,
-        tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>,
-    ) {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> (usize, tokio::sync::mpsc::Receiver<NotificationFrame>) {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         (0, rx)
     }
 

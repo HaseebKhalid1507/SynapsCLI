@@ -189,9 +189,15 @@ pub(crate) async fn route_extension_provider(
             .await,
         );
         let first_event = attempt.first_event_mark();
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::extensions::runtime::process::ProviderStreamEvent,
-        >();
+        // CP-11 fix-2 (B): BOUNDED provider-event handoff. A slow forwarder
+        // backpressures the provider_stream loop (and transitively the
+        // sidecar) instead of retaining hostile TextDelta floods; the
+        // forwarder itself feeds the outer boundary, whose retention is
+        // policy-bounded by the stream relay.
+        let (sink_tx, mut sink_rx) =
+            tokio::sync::mpsc::channel::<crate::extensions::runtime::process::ProviderStreamEvent>(
+                crate::extensions::runtime::process::PROVIDER_EVENT_QUEUE_CAPACITY,
+            );
         let tx_clone = tx.clone();
         let forwarder = tokio::spawn(async move {
             use crate::extensions::runtime::process::ProviderStreamEvent;

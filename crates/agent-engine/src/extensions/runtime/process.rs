@@ -524,6 +524,16 @@ pub struct NotificationFrame {
     pub params: Value,
 }
 
+/// CP-11 fix-2 (B): bounded notification handoff. Combined with the 4 MiB
+/// per-frame reader cap, queue capacity fixes the worst-case bytes parked
+/// between the sidecar reader and a subscriber; beyond it the reader
+/// AWAITS (backpressure onto the child's stdout pipe) instead of retaining
+/// hostile flood frames in host memory.
+pub const NOTIFICATION_QUEUE_CAPACITY: usize = 8;
+/// CP-11 fix-2 (B): bounded provider stream-event handoff between the
+/// `provider_stream` notification loop and the route forwarder.
+pub const PROVIDER_EVENT_QUEUE_CAPACITY: usize = 8;
+
 /// Shared mailbox for the background reader task. Holds in-flight request
 /// senders (keyed by JSON-RPC id) and an optional notification subscriber.
 ///
@@ -537,7 +547,9 @@ struct Inbox {
     /// subscribers (e.g. background watchers that overlap with
     /// `command.invoke` / `provider.stream`). Dead senders (receiver dropped)
     /// are pruned lazily on dispatch and on `unsubscribe_notifications`.
-    notification_sinks: Mutex<Vec<(usize, mpsc::UnboundedSender<NotificationFrame>)>>,
+    /// BOUNDED ([`NOTIFICATION_QUEUE_CAPACITY`]): a subscriber that stops
+    /// draining backpressures the reader instead of growing host memory.
+    notification_sinks: Mutex<Vec<(usize, mpsc::Sender<NotificationFrame>)>>,
     /// Monotonic id allocator for `notification_sinks`. Wraparound is not a
     /// concern in practice — `usize` is enormous relative to subscription
     /// lifetimes — but uniqueness is only required among live subscribers.
@@ -1002,18 +1014,34 @@ impl ProcessExtension {
                 method: method.to_string(),
                 params,
             };
-            let mut sinks = inbox.notification_sinks.lock().await;
-            if sinks.is_empty() {
+            // Snapshot the live subscribers WITHOUT holding the lock across
+            // the awaited sends below — a subscriber unsubscribing while we
+            // backpressure must not deadlock against this dispatch.
+            let targets: Vec<(usize, mpsc::Sender<NotificationFrame>)> = {
+                let sinks = inbox.notification_sinks.lock().await;
+                sinks.to_vec()
+            };
+            if targets.is_empty() {
                 tracing::trace!(
                     extension = %extension_id,
                     method = %method,
                     "Notification with no active subscribers; dropping",
                 );
             } else {
-                // Fan out to every live subscriber; prune any whose receiver
-                // has been dropped. `mpsc::UnboundedSender::send` only errors
-                // when the receiver is gone, so failure == dead subscriber.
-                sinks.retain(|(_, tx)| tx.send(frame.clone()).is_ok());
+                // Bounded fan-out: an un-draining subscriber BACKPRESSURES
+                // this reader (and, through the stdout pipe, the child)
+                // instead of growing host memory. `send` only errors when
+                // the receiver is gone, so failure == dead subscriber.
+                let mut dead = Vec::new();
+                for (id, tx) in &targets {
+                    if tx.send(frame.clone()).await.is_err() {
+                        dead.push(*id);
+                    }
+                }
+                if !dead.is_empty() {
+                    let mut sinks = inbox.notification_sinks.lock().await;
+                    sinks.retain(|(id, _)| !dead.contains(id));
+                }
             }
         } else {
             tracing::trace!(
@@ -1703,10 +1731,8 @@ impl ProcessExtension {
     /// Internal API: exposed publicly with `#[doc(hidden)]` only so
     /// integration tests can exercise the bidirectional transport.
     #[doc(hidden)]
-    pub async fn subscribe_notifications(
-        &self,
-    ) -> (usize, mpsc::UnboundedReceiver<NotificationFrame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub async fn subscribe_notifications(&self) -> (usize, mpsc::Receiver<NotificationFrame>) {
+        let (tx, rx) = mpsc::channel(NOTIFICATION_QUEUE_CAPACITY);
         let id = self
             .inbox
             .next_sink_id
@@ -1811,11 +1837,14 @@ impl ProcessExtension {
     ///
     /// - Frames whose method is not `provider.stream.event` are ignored (logged at trace).
     /// - Malformed event params are logged at warn and skipped (do not abort the call).
+    /// - The sink is BOUNDED ([`PROVIDER_EVENT_QUEUE_CAPACITY`]): a slow
+    ///   downstream backpressures this loop (and transitively the sidecar)
+    ///   instead of retaining hostile flood events in host memory.
     /// - If the caller's sink has been closed, sets `sink_open = false` and stops forwarding,
     ///   but the in-flight request is still allowed to complete.
-    fn forward_provider_stream_frame(
+    async fn forward_provider_stream_frame(
         extension_id: &str,
-        sink: &mpsc::UnboundedSender<ProviderStreamEvent>,
+        sink: &mpsc::Sender<ProviderStreamEvent>,
         sink_open: &mut bool,
         frame: NotificationFrame,
     ) {
@@ -1829,7 +1858,7 @@ impl ProcessExtension {
         }
         match parse_provider_stream_event(&frame.params) {
             Ok(event) => {
-                if *sink_open && sink.send(event).is_err() {
+                if *sink_open && sink.send(event).await.is_err() {
                     *sink_open = false;
                 }
             }
@@ -1893,7 +1922,7 @@ impl ExtensionHandler for ProcessExtension {
     async fn provider_stream(
         &self,
         params: ProviderCompleteParams,
-        sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+        sink: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         // Subscribe BEFORE issuing the request so we don't miss early
         // notifications that may arrive before `call(...)` even starts polling.
@@ -1910,7 +1939,7 @@ impl ExtensionHandler for ProcessExtension {
                     Some(frame) = rx.recv() => {
                         Self::forward_provider_stream_frame(
                             &extension_id, &sink, &mut sink_open, frame,
-                        );
+                        ).await;
                     }
                 }
             };
@@ -1920,7 +1949,8 @@ impl ExtensionHandler for ProcessExtension {
             // subscribers (if any) are untouched.
             self.unsubscribe_notifications(sub_id).await;
             while let Some(frame) = rx.recv().await {
-                Self::forward_provider_stream_frame(&extension_id, &sink, &mut sink_open, frame);
+                Self::forward_provider_stream_frame(&extension_id, &sink, &mut sink_open, frame)
+                    .await;
             }
             response
         };
@@ -2164,10 +2194,7 @@ impl ExtensionHandler for ProcessExtension {
 
     async fn subscribe_notifications(
         &self,
-    ) -> (
-        usize,
-        tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>,
-    ) {
+    ) -> (usize, tokio::sync::mpsc::Receiver<NotificationFrame>) {
         ProcessExtension::subscribe_notifications(self).await
     }
 

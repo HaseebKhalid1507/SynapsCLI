@@ -86,14 +86,14 @@ impl ExtensionHandler for FakeProvider {
     async fn provider_stream(
         &self,
         _params: ProviderCompleteParams,
-        sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+        sink: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         if self.hang_stream {
             std::future::pending::<()>().await;
         }
         for event in &self.stream_events {
-            let _ = sink.send(event.clone());
+            let _ = sink.send(event.clone()).await;
         }
         self.stream_result
             .lock()

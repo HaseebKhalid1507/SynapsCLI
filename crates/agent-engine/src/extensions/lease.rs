@@ -962,7 +962,7 @@ impl ExtensionHandler for LazyExtensionHandler {
     async fn provider_stream(
         &self,
         params: super::runtime::process::ProviderCompleteParams,
-        sink: tokio::sync::mpsc::UnboundedSender<super::runtime::process::ProviderStreamEvent>,
+        sink: tokio::sync::mpsc::Sender<super::runtime::process::ProviderStreamEvent>,
     ) -> Result<super::runtime::process::ProviderCompleteResult, String> {
         let inner = self.live().await?;
         let result = inner.handler.provider_stream(params, sink).await;
