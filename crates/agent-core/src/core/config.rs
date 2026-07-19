@@ -333,6 +333,11 @@ pub struct SynapsConfig {
     pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>, // override auto-detected context window (tokens)
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
+    /// Where compaction summarization runs (spec §9.4): remote provider or
+    /// local-only (zero network construction).
+    pub compaction_mode: crate::core::compaction::CompactionMode,
+    /// Content classes excluded from remote compaction disclosure.
+    pub compaction_exclude: Vec<crate::core::compaction::ContentClass>,
     pub max_tool_output: usize,      // default 30000
     pub bash_timeout: u64,           // default 30
     pub bash_max_timeout: u64,       // default 300
@@ -387,6 +392,8 @@ impl Default for SynapsConfig {
             thinking_level: None,
             context_window: None,
             compaction_model: None,
+            compaction_mode: crate::core::compaction::CompactionMode::default(),
+            compaction_exclude: Vec::new(),
             max_tool_output: 30000,
             bash_timeout: 30,
             bash_max_timeout: 300,
@@ -728,6 +735,37 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 }
             }
             "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "compaction_mode" => match val {
+                "remote" => {
+                    config.compaction_mode = crate::core::compaction::CompactionMode::Remote
+                }
+                "local" | "local_only" | "local-only" => {
+                    config.compaction_mode = crate::core::compaction::CompactionMode::LocalOnly
+                }
+                _ => {
+                    config.warnings.push(format!(
+                        "compaction_mode = {val} — expected remote or local; ignored"
+                    ));
+                }
+            },
+            "compaction_exclude" => {
+                let mut classes = Vec::new();
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    match crate::core::compaction::ContentClass::parse(part) {
+                        Some(class) => {
+                            if !classes.contains(&class) {
+                                classes.push(class);
+                            }
+                        }
+                        None => config.warnings.push(format!(
+                            "compaction_exclude — unknown content class '{part}'; \
+                             expected one of: user_text, assistant_text, thinking, \
+                             tool_calls, tool_results, file_paths, event_data"
+                        )),
+                    }
+                }
+                config.compaction_exclude = classes;
+            }
             "context_window" => {
                 let parsed = match val {
                     "200k" | "200K" => Some(200_000),
@@ -1344,6 +1382,43 @@ bridge.heartbeat_timeout_ms = 750\n\
         });
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn compaction_disclosure_keys_parse_with_typed_warnings() {
+        let config = load_config_from_str(
+            "compaction_mode = local\ncompaction_exclude = thinking, tool_results, bogus\n",
+        );
+        assert_eq!(
+            config.compaction_mode,
+            crate::core::compaction::CompactionMode::LocalOnly
+        );
+        assert_eq!(
+            config.compaction_exclude,
+            vec![
+                crate::core::compaction::ContentClass::Thinking,
+                crate::core::compaction::ContentClass::ToolResults,
+            ]
+        );
+        assert!(
+            config.warnings.iter().any(|w| w.contains("bogus")),
+            "unknown class must warn: {:?}",
+            config.warnings
+        );
+
+        let defaults = load_config_from_str("");
+        assert_eq!(
+            defaults.compaction_mode,
+            crate::core::compaction::CompactionMode::Remote
+        );
+        assert!(defaults.compaction_exclude.is_empty());
+
+        let bad_mode = load_config_from_str("compaction_mode = cloud\n");
+        assert_eq!(
+            bad_mode.compaction_mode,
+            crate::core::compaction::CompactionMode::Remote
+        );
+        assert!(bad_mode.warnings.iter().any(|w| w.contains("compaction_mode")));
     }
 
     #[test]

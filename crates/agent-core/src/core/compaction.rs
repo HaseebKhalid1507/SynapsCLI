@@ -49,6 +49,36 @@ impl ContentClass {
         ContentClass::FilePaths,
         ContentClass::EventData,
     ];
+
+    /// Canonical snake_case name (matches the serde representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContentClass::UserText => "user_text",
+            ContentClass::AssistantText => "assistant_text",
+            ContentClass::Thinking => "thinking",
+            ContentClass::ToolCalls => "tool_calls",
+            ContentClass::ToolResults => "tool_results",
+            ContentClass::FilePaths => "file_paths",
+            ContentClass::EventData => "event_data",
+        }
+    }
+
+    /// Parse a canonical snake_case name. Unknown names return `None` so
+    /// config surfaces can warn instead of silently dropping policy.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+}
+
+/// Where compaction summarization runs (spec §9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// Summarize through the configured remote provider (default).
+    #[default]
+    Remote,
+    /// Summarize locally — no HTTP request may be constructed.
+    LocalOnly,
 }
 
 /// Redaction posture applied while serializing the source range for

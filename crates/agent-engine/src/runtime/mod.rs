@@ -244,6 +244,10 @@ pub struct Runtime {
     context_window_override: Option<u64>,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
+    /// Where compaction summarization runs (spec §9.4).
+    compaction_mode: agent_core::compaction::CompactionMode,
+    /// Content classes excluded from remote compaction disclosure.
+    compaction_exclusions: Vec<agent_core::compaction::ContentClass>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     /// Session-scoped orchestration enforcement installed during boot.
@@ -457,6 +461,8 @@ impl Runtime {
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
+            compaction_mode: agent_core::compaction::CompactionMode::default(),
+            compaction_exclusions: Vec::new(),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -539,6 +545,8 @@ impl Runtime {
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
+            compaction_mode: agent_core::compaction::CompactionMode::default(),
+            compaction_exclusions: Vec::new(),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -1263,6 +1271,28 @@ impl Runtime {
         self.compaction_model = model;
     }
 
+    /// Set where compaction summarization runs (spec §9.4).
+    pub fn set_compaction_mode(&mut self, mode: agent_core::compaction::CompactionMode) {
+        self.compaction_mode = mode;
+    }
+
+    /// Set the content classes withheld from remote compaction disclosure.
+    pub fn set_compaction_exclusions(
+        &mut self,
+        exclude: Vec<agent_core::compaction::ContentClass>,
+    ) {
+        self.compaction_exclusions = exclude;
+    }
+
+    /// The session's compaction disclosure policy (spec §9.4) — consumed by
+    /// `runtime::compaction` for both the preview and the dispatch path.
+    pub fn compaction_policy(&self) -> crate::runtime::compaction::DisclosurePolicy {
+        crate::runtime::compaction::DisclosurePolicy {
+            mode: self.compaction_mode,
+            exclude: self.compaction_exclusions.clone(),
+        }
+    }
+
     pub fn set_context_window(&mut self, window: Option<u64>) {
         self.context_window_override = window;
     }
@@ -1325,6 +1355,8 @@ impl Runtime {
         }
         self.context_window_override = config.context_window;
         self.compaction_model = config.compaction_model.clone();
+        self.compaction_mode = config.compaction_mode;
+        self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -2352,6 +2384,8 @@ impl Clone for Runtime {
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
+            compaction_mode: self.compaction_mode,
+            compaction_exclusions: self.compaction_exclusions.clone(),
             subagent_registry: self.subagent_registry.clone(),
             orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),

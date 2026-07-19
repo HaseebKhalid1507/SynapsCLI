@@ -432,6 +432,14 @@ pub(crate) async fn handle_input_action(
                             "compaction already in progress".to_string(),
                         ));
                     } else {
+                        // Spec §9.4: surface provider/model and approximate
+                        // disclosure BEFORE the summarization dispatch.
+                        let disclosure =
+                            synaps_cli::runtime::compaction::preview_compaction_disclosure(
+                                runtime,
+                                &app.api_messages,
+                            );
+                        app.push_msg(ChatMessage::System(disclosure.render_line()));
                         app.push_msg(ChatMessage::System(
                             "compacting conversation...".to_string(),
                         ));

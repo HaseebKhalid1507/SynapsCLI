@@ -1287,6 +1287,14 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 let _ = broadcast.send(ServerMessage::System {
                     message: "compacting conversation...".to_string(),
                 });
+                // Spec §9.4: surface provider/model and approximate
+                // disclosure BEFORE the summarization dispatch.
+                let _ = broadcast.send(ServerMessage::System {
+                    message: synaps_cli::runtime::compaction::preview_compaction_disclosure(
+                        &rt, &msgs,
+                    )
+                    .render_line(),
+                });
                 let applied = match synaps_cli::runtime::compaction::compact_conversation(
                     &msgs,
                     &rt,

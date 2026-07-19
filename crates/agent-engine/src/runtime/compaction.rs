@@ -97,29 +97,72 @@ impl FileOps {
     }
 }
 
-/// Serialize the in-memory API message history into a readable transcript,
-/// ask the summarizer model for a structured summary, and return the typed
-/// [`CompactionOutcome`] (summary text + provenance metadata). Called by
-/// `/compact` and every auto-compaction path.
-pub async fn compact_conversation(
+/// Disclosure policy for one compaction (spec §9.4): where summarization
+/// runs and which content classes are withheld from the request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisclosurePolicy {
+    pub mode: agent_core::compaction::CompactionMode,
+    pub exclude: Vec<agent_core::compaction::ContentClass>,
+}
+
+impl DisclosurePolicy {
+    fn excludes(&self, class: agent_core::compaction::ContentClass) -> bool {
+        self.exclude.contains(&class)
+    }
+}
+
+/// The policy-filtered summarization input, computable WITHOUT any network
+/// operation — this is what disclosure previews and the dispatch path share,
+/// so what the user inspects is exactly what would be sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedCompactionInput {
+    /// Full request text (conversation transcript + instruction template).
+    pub prompt_text: String,
+    /// Approximate bytes of conversation-derived content that would be
+    /// disclosed to the summarizer.
+    pub transcript_bytes: usize,
+    /// Content classes present in the request under this policy.
+    pub included_classes: Vec<agent_core::compaction::ContentClass>,
+    /// Content classes withheld by the policy.
+    pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
+}
+
+/// Render the summarization request under a disclosure policy. Pure — no
+/// network, no provider dependence. Sentinel-tested per class: excluded
+/// classes must not appear in `prompt_text`.
+pub fn render_compaction_input(
     api_messages: &[crate::SharedMessage],
-    runtime: &Runtime,
     custom_instructions: Option<&str>,
-) -> Result<CompactionOutcome> {
+    policy: &DisclosurePolicy,
+) -> RenderedCompactionInput {
+    use agent_core::compaction::ContentClass;
+
     let mut parts: Vec<String> = Vec::new();
     let mut file_ops = FileOps::new();
+    let track_paths = !policy.excludes(ContentClass::FilePaths);
 
     for msg in api_messages {
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
-                    if content.contains("<context-summary>") {
+                    // Reactor-injected events carry the canonical
+                    // `<event …>` envelope — that is the EventData class.
+                    if content.trim_start().starts_with("<event") {
+                        if !policy.excludes(ContentClass::EventData) {
+                            parts.push(format!("[Event]: {}", content));
+                        }
+                    } else if policy.excludes(ContentClass::UserText) {
+                        // withheld
+                    } else if content.contains("<context-summary>") {
                         parts.push(format!("[Previous Summary]: {}", content));
                     } else {
                         parts.push(format!("[User]: {}", content));
                     }
                 } else if let Some(content) = msg["content"].as_array() {
                     // Tool results are shaped as user messages with tool_result blocks.
+                    if policy.excludes(ContentClass::ToolResults) {
+                        continue;
+                    }
                     for block in content {
                         if block["type"].as_str() == Some("tool_result") {
                             let id = block["tool_use_id"].as_str().unwrap_or("?");
@@ -145,12 +188,18 @@ pub async fn compact_conversation(
                     for block in content {
                         match block["type"].as_str() {
                             Some("thinking") => {
+                                if policy.excludes(ContentClass::Thinking) {
+                                    continue;
+                                }
                                 if let Some(text) = block["thinking"].as_str() {
                                     let preview: String = text.chars().take(500).collect();
                                     parts.push(format!("[Assistant thinking]: {}", preview));
                                 }
                             }
                             Some("text") => {
+                                if policy.excludes(ContentClass::AssistantText) {
+                                    continue;
+                                }
                                 if let Some(text) = block["text"].as_str() {
                                     parts.push(format!("[Assistant]: {}", text));
                                 }
@@ -159,21 +208,32 @@ pub async fn compact_conversation(
                                 let id = block["id"].as_str().unwrap_or("?");
                                 let name = block["name"].as_str().unwrap_or("");
                                 let input = &block["input"];
-                                if let Some(path) = input["path"].as_str() {
-                                    match name {
-                                        "read" => {
-                                            file_ops.read.insert(path.to_string());
+                                if track_paths {
+                                    if let Some(path) = input["path"].as_str() {
+                                        match name {
+                                            "read" => {
+                                                file_ops.read.insert(path.to_string());
+                                            }
+                                            "write" => {
+                                                file_ops.written.insert(path.to_string());
+                                            }
+                                            "edit" => {
+                                                file_ops.edited.insert(path.to_string());
+                                            }
+                                            _ => {}
                                         }
-                                        "write" => {
-                                            file_ops.written.insert(path.to_string());
-                                        }
-                                        "edit" => {
-                                            file_ops.edited.insert(path.to_string());
-                                        }
-                                        _ => {}
                                     }
                                 }
-                                let args_str = serde_json::to_string(input).unwrap_or_default();
+                                if policy.excludes(ContentClass::ToolCalls) {
+                                    continue;
+                                }
+                                let rendered_input = if track_paths {
+                                    input.clone()
+                                } else {
+                                    redact_path_arguments(input)
+                                };
+                                let args_str =
+                                    serde_json::to_string(&rendered_input).unwrap_or_default();
                                 let truncated: String = args_str.chars().take(500).collect();
                                 parts.push(format!("[Tool call #{}: {}({})]", id, name, truncated));
                             }
@@ -181,7 +241,9 @@ pub async fn compact_conversation(
                         }
                     }
                 } else if let Some(content) = msg["content"].as_str() {
-                    parts.push(format!("[Assistant]: {}", content));
+                    if !policy.excludes(ContentClass::AssistantText) {
+                        parts.push(format!("[Assistant]: {}", content));
+                    }
                 }
             }
             _ => {}
@@ -191,23 +253,24 @@ pub async fn compact_conversation(
     let conversation_text = parts.join("\n\n");
 
     // Build file-operations summary (read-only = read but not modified).
-    let modified: std::collections::HashSet<String> =
-        file_ops.written.union(&file_ops.edited).cloned().collect();
-    let read_only: Vec<String> = file_ops.read.difference(&modified).cloned().collect();
-    let modified_list: Vec<String> = modified.into_iter().collect();
-
     let mut file_section = String::new();
-    if !read_only.is_empty() {
-        file_section.push_str(&format!(
-            "\n\n<read-files>\n{}\n</read-files>",
-            read_only.join("\n")
-        ));
-    }
-    if !modified_list.is_empty() {
-        file_section.push_str(&format!(
-            "\n\n<modified-files>\n{}\n</modified-files>",
-            modified_list.join("\n")
-        ));
+    if track_paths {
+        let modified: std::collections::HashSet<String> =
+            file_ops.written.union(&file_ops.edited).cloned().collect();
+        let read_only: Vec<String> = file_ops.read.difference(&modified).cloned().collect();
+        let modified_list: Vec<String> = modified.into_iter().collect();
+        if !read_only.is_empty() {
+            file_section.push_str(&format!(
+                "\n\n<read-files>\n{}\n</read-files>",
+                read_only.join("\n")
+            ));
+        }
+        if !modified_list.is_empty() {
+            file_section.push_str(&format!(
+                "\n\n<modified-files>\n{}\n</modified-files>",
+                modified_list.join("\n")
+            ));
+        }
     }
 
     // Iterative compaction — if the first user message already contains a
@@ -223,6 +286,8 @@ pub async fn compact_conversation(
         SUMMARIZATION_PROMPT
     };
 
+    let transcript_bytes = conversation_text.len() + file_section.len();
+
     let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
     if let Some(instructions) = custom_instructions {
         prompt_text.push_str(&format!(
@@ -232,18 +297,258 @@ pub async fn compact_conversation(
     } else {
         prompt_text.push_str(base_prompt);
     }
-    prompt_text.push_str(&format!(
-        "\n\nAlso append these file operation records to the end of your summary:{}",
-        file_section
-    ));
+    if !file_section.is_empty() {
+        prompt_text.push_str(&format!(
+            "\n\nAlso append these file operation records to the end of your summary:{}",
+            file_section
+        ));
+    }
 
-    let user_msg = std::sync::Arc::new(json!({"role": "user", "content": prompt_text}));
-    let summary_text = runtime.compact_call(vec![user_msg]).await?;
-    Ok(CompactionOutcome::new_with_instructions(
-        summary_text,
-        runtime.compaction_model(),
-        custom_instructions,
-    ))
+    let excluded_classes: Vec<agent_core::compaction::ContentClass> = policy.exclude.clone();
+    let included_classes: Vec<agent_core::compaction::ContentClass> =
+        agent_core::compaction::ContentClass::ALL
+            .iter()
+            .copied()
+            .filter(|c| !excluded_classes.contains(c))
+            .collect();
+
+    RenderedCompactionInput {
+        prompt_text,
+        transcript_bytes,
+        included_classes,
+        excluded_classes,
+    }
+}
+
+/// Replace path-bearing argument values with a redaction marker (FilePaths
+/// exclusion keeps tool-call structure while withholding filesystem detail).
+fn redact_path_arguments(input: &serde_json::Value) -> serde_json::Value {
+    const PATH_KEYS: [&str; 6] = [
+        "path",
+        "file_path",
+        "directory",
+        "working_directory",
+        "cwd",
+        "old_path",
+    ];
+    match input {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if PATH_KEYS.contains(&key.as_str()) {
+                    out.insert(key.clone(), json!("[path redacted]"));
+                } else {
+                    out.insert(key.clone(), redact_path_arguments(value));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_path_arguments).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The pre-dispatch disclosure summary (spec §9.4): provider, model, and
+/// approximate disclosure every frontend surfaces BEFORE remote compaction.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompactionDisclosure {
+    pub mode: agent_core::compaction::CompactionMode,
+    /// "local" in local-only mode — nothing leaves the machine.
+    pub provider: String,
+    pub model: String,
+    /// Approximate bytes of conversation content the request would carry.
+    pub approx_bytes: usize,
+    pub message_count: usize,
+    pub included_classes: Vec<agent_core::compaction::ContentClass>,
+    pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
+}
+
+impl CompactionDisclosure {
+    /// One-line rendering shared by the frontends.
+    pub fn render_line(&self) -> String {
+        use agent_core::compaction::CompactionMode;
+        match self.mode {
+            CompactionMode::LocalOnly => format!(
+                "compaction: local-only ({} messages, no network, nothing disclosed)",
+                self.message_count
+            ),
+            CompactionMode::Remote => {
+                let excluded = if self.excluded_classes.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.excluded_classes
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                format!(
+                    "compaction: sending ~{} KB ({} messages) to {}/{} — excluded classes: {}",
+                    self.approx_bytes.div_ceil(1024),
+                    self.message_count,
+                    self.provider,
+                    self.model,
+                    excluded
+                )
+            }
+        }
+    }
+}
+
+/// Compute the disclosure summary for the next compaction WITHOUT any
+/// network operation. Uses the same rendering as the dispatch path, so the
+/// preview is exact for content classes and approximate only in bytes.
+pub fn preview_compaction_disclosure(
+    runtime: &Runtime,
+    api_messages: &[crate::SharedMessage],
+) -> CompactionDisclosure {
+    use agent_core::compaction::CompactionMode;
+    let policy = runtime.compaction_policy();
+    let rendered = render_compaction_input(api_messages, None, &policy);
+    let (provider, model) = match policy.mode {
+        CompactionMode::LocalOnly => ("local".to_string(), LOCAL_SUMMARY_MODEL.to_string()),
+        CompactionMode::Remote => (
+            provider_label_for_model(runtime.compaction_model()),
+            runtime.compaction_model().to_string(),
+        ),
+    };
+    CompactionDisclosure {
+        mode: policy.mode,
+        provider,
+        model,
+        approx_bytes: rendered.transcript_bytes,
+        message_count: api_messages.len(),
+        included_classes: rendered.included_classes,
+        excluded_classes: rendered.excluded_classes,
+    }
+}
+
+/// Model label for the local extractive summarizer.
+pub const LOCAL_SUMMARY_MODEL: &str = "local-extractive-v1";
+
+/// Byte bound for locally produced summaries.
+const LOCAL_SUMMARY_MAX_BYTES: usize = 12_000;
+
+/// Deterministic local summary — structured like the remote template but
+/// derived without model assistance and WITHOUT any network construction.
+fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolicy) -> String {
+    use agent_core::compaction::ContentClass;
+    let excerpt = |text: &str, cap: usize| -> String {
+        let mut s: String = text.chars().take(cap).collect();
+        if s.len() < text.len() {
+            s.push_str(" …");
+        }
+        s
+    };
+
+    let mut goal = String::new();
+    let mut done: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+
+    for msg in api_messages {
+        match (msg["role"].as_str(), msg["content"].as_str()) {
+            (Some("user"), Some(text)) => {
+                if text.trim_start().starts_with("<event") {
+                    continue;
+                }
+                if goal.is_empty() && !policy.excludes(ContentClass::UserText) {
+                    goal = excerpt(text, 600);
+                }
+                if !policy.excludes(ContentClass::UserText) {
+                    tail.push(format!("[User]: {}", excerpt(text, 300)));
+                }
+            }
+            (Some("assistant"), _) => {
+                if policy.excludes(ContentClass::AssistantText) {
+                    continue;
+                }
+                let text = msg["content"].as_str().map(|s| s.to_string()).or_else(|| {
+                    msg["content"].as_array().and_then(|blocks| {
+                        blocks
+                            .iter()
+                            .find(|b| b["type"].as_str() == Some("text"))
+                            .and_then(|b| b["text"].as_str())
+                            .map(|s| s.to_string())
+                    })
+                });
+                if let Some(text) = text {
+                    if done.len() < 10 {
+                        done.push(format!("- [x] {}", excerpt(&text, 200)));
+                    }
+                    tail.push(format!("[Assistant]: {}", excerpt(&text, 300)));
+                }
+            }
+            _ => {}
+        }
+    }
+    if tail.len() > 4 {
+        tail.drain(..tail.len() - 4);
+    }
+
+    let mut out = format!(
+        "## Goal\n{}\n\n## Constraints & Preferences\n- (local-only compaction:          summary derived without model assistance)\n\n## Progress\n### Done\n{}\n\n         ## Next Steps\n1. Review this local checkpoint and continue the work.\n\n         ## Critical Context\n{}\n",
+        if goal.is_empty() { "(unavailable under the current disclosure policy)" } else { &goal },
+        if done.is_empty() { "- (none captured)".to_string() } else { done.join("\n") },
+        if tail.is_empty() { "- (none)".to_string() } else { tail.join("\n") },
+    );
+    if out.len() > LOCAL_SUMMARY_MAX_BYTES {
+        out = agent_core::BoundedText::new(&out, LOCAL_SUMMARY_MAX_BYTES).text;
+    }
+    out
+}
+
+/// Serialize the in-memory API message history into a policy-filtered
+/// transcript and produce the typed [`CompactionOutcome`]. Remote mode asks
+/// the configured summarizer model; local-only mode (spec §9.4) derives the
+/// summary in-process and constructs NO network request. Called by
+/// `/compact` and every auto-compaction path.
+pub async fn compact_conversation(
+    api_messages: &[crate::SharedMessage],
+    runtime: &Runtime,
+    custom_instructions: Option<&str>,
+) -> Result<CompactionOutcome> {
+    use agent_core::compaction::CompactionMode;
+    let policy = runtime.compaction_policy();
+    let rendered = render_compaction_input(api_messages, custom_instructions, &policy);
+
+    match policy.mode {
+        CompactionMode::LocalOnly => {
+            let summary_text = local_summary(api_messages, &policy);
+            let mut outcome =
+                CompactionOutcome::new(summary_text, LOCAL_SUMMARY_MODEL, &[LOCAL_SUMMARY_MODEL]);
+            outcome.summary_provider = "local".to_string();
+            outcome.included_classes = rendered.included_classes;
+            outcome.excluded_classes = rendered.excluded_classes.clone();
+            outcome.redaction_policy = redaction_for(&rendered.excluded_classes);
+            Ok(outcome)
+        }
+        CompactionMode::Remote => {
+            let user_msg =
+                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
+            let summary_text = runtime.compact_call(vec![user_msg]).await?;
+            let mut outcome = CompactionOutcome::new_with_instructions(
+                summary_text,
+                runtime.compaction_model(),
+                custom_instructions,
+            );
+            outcome.included_classes = rendered.included_classes;
+            outcome.excluded_classes = rendered.excluded_classes.clone();
+            outcome.redaction_policy = redaction_for(&rendered.excluded_classes);
+            Ok(outcome)
+        }
+    }
+}
+
+fn redaction_for(
+    excluded: &[agent_core::compaction::ContentClass],
+) -> agent_core::compaction::RedactionPolicy {
+    if excluded.is_empty() {
+        agent_core::compaction::RedactionPolicy::TruncationOnly
+    } else {
+        agent_core::compaction::RedactionPolicy::PolicyExclusions
+    }
 }
 
 /// Typed result of a summarization call (spec §9.3): the summary text plus
@@ -800,5 +1105,228 @@ mod transition_tests {
             1,
             "on_compaction must fire once"
         );
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+    use agent_core::compaction::{CompactionMode, ContentClass};
+    use serde_json::json;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    const USER_SENTINEL: &str = "USER-SENTINEL-72aa";
+    const ASSISTANT_SENTINEL: &str = "ASSISTANT-SENTINEL-91bc";
+    const THINKING_SENTINEL: &str = "THINKING-SENTINEL-3fd0";
+    const TOOL_CALL_SENTINEL: &str = "TOOLCALL-SENTINEL-55ee";
+    const TOOL_RESULT_SENTINEL: &str = "TOOLRESULT-SENTINEL-8c1d";
+    const PATH_SENTINEL: &str = "/secret/projects/PATH-SENTINEL-27af/config.yaml";
+    const EVENT_SENTINEL: &str = "EVENT-SENTINEL-c4e9";
+
+    fn sentinel_messages() -> Vec<crate::SharedMessage> {
+        vec![
+            Arc::new(json!({"role": "user", "content": format!("please fix {USER_SENTINEL}")})),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("secretly considering {THINKING_SENTINEL}")},
+                {"type": "text", "text": format!("working on it {ASSISTANT_SENTINEL}")},
+                {"type": "tool_use", "id": "t1", "name": "read",
+                 "input": {"path": PATH_SENTINEL, "note": TOOL_CALL_SENTINEL}},
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": format!("file body {TOOL_RESULT_SENTINEL}")},
+            ]})),
+            Arc::new(json!({"role": "user", "content":
+                format!("<event id=\"e1\" type=\"message\" severity=\"high\" source=\"kuma\">{EVENT_SENTINEL}</event>")})),
+        ]
+    }
+
+    fn policy(exclude: &[ContentClass]) -> DisclosurePolicy {
+        DisclosurePolicy {
+            mode: CompactionMode::Remote,
+            exclude: exclude.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unrestricted_rendering_discloses_every_class() {
+        let rendered = render_compaction_input(&sentinel_messages(), None, &policy(&[]));
+        for sentinel in [
+            USER_SENTINEL,
+            ASSISTANT_SENTINEL,
+            THINKING_SENTINEL,
+            TOOL_CALL_SENTINEL,
+            TOOL_RESULT_SENTINEL,
+            PATH_SENTINEL,
+            EVENT_SENTINEL,
+        ] {
+            assert!(
+                rendered.prompt_text.contains(sentinel),
+                "unrestricted policy must include {sentinel}"
+            );
+        }
+        assert!(rendered.excluded_classes.is_empty());
+        assert!(rendered.transcript_bytes > 0);
+    }
+
+    /// Spec §9.4 sentinel test per category: an excluded category's content
+    /// must not reach the summarization request; everything else stays.
+    #[test]
+    fn each_excluded_class_is_withheld_from_the_request() {
+        let cases: [(ContentClass, &[&str]); 5] = [
+            (ContentClass::Thinking, &[THINKING_SENTINEL]),
+            (ContentClass::ToolResults, &[TOOL_RESULT_SENTINEL]),
+            // ToolCalls hides call arguments; the file-operations record is
+            // FilePaths-classed content and has its own exclusion below.
+            (ContentClass::ToolCalls, &[TOOL_CALL_SENTINEL]),
+            (ContentClass::FilePaths, &[PATH_SENTINEL]),
+            (ContentClass::EventData, &[EVENT_SENTINEL]),
+        ];
+        for (class, hidden) in cases {
+            let rendered = render_compaction_input(&sentinel_messages(), None, &policy(&[class]));
+            for sentinel in hidden {
+                assert!(
+                    !rendered.prompt_text.contains(sentinel),
+                    "{class:?}: excluded sentinel {sentinel} leaked into the request"
+                );
+            }
+            assert!(
+                rendered.excluded_classes.contains(&class),
+                "{class:?} must be recorded as excluded"
+            );
+            // Unrelated classes survive.
+            assert!(
+                rendered.prompt_text.contains(USER_SENTINEL),
+                "{class:?}: user text must survive unrelated exclusions"
+            );
+        }
+
+        // FilePaths exclusion redacts paths but keeps the rest of the call.
+        let rendered = render_compaction_input(
+            &sentinel_messages(),
+            None,
+            &policy(&[ContentClass::FilePaths]),
+        );
+        assert!(
+            rendered.prompt_text.contains(TOOL_CALL_SENTINEL),
+            "FilePaths exclusion must not drop whole tool calls"
+        );
+    }
+
+    #[test]
+    fn disclosure_preview_reports_provider_model_bytes_and_classes() {
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_compaction_exclusions(vec![ContentClass::Thinking]);
+        let messages = sentinel_messages();
+
+        let disclosure = preview_compaction_disclosure(&runtime, &messages);
+        assert_eq!(disclosure.mode, CompactionMode::Remote);
+        assert_eq!(disclosure.provider, "anthropic");
+        assert_eq!(disclosure.model, runtime.compaction_model());
+        assert_eq!(disclosure.message_count, messages.len());
+        assert!(disclosure.approx_bytes > 0);
+        assert!(disclosure
+            .excluded_classes
+            .contains(&ContentClass::Thinking));
+        assert!(!disclosure
+            .included_classes
+            .contains(&ContentClass::Thinking));
+
+        // The rendered line every frontend surfaces before dispatch.
+        let line = disclosure.render_line();
+        assert!(line.contains("anthropic"), "line: {line}");
+        assert!(line.contains(runtime.compaction_model()), "line: {line}");
+
+        // Local-only preview is honest about performing no disclosure.
+        runtime.set_compaction_mode(CompactionMode::LocalOnly);
+        let local = preview_compaction_disclosure(&runtime, &messages);
+        assert_eq!(local.mode, CompactionMode::LocalOnly);
+        assert_eq!(local.provider, "local");
+    }
+
+    /// RAII guard for SYNAPS_ANTHROPIC_BASE_URL.
+    struct BaseUrlGuard {
+        old: Option<String>,
+    }
+    impl BaseUrlGuard {
+        fn set(url: &str) -> Self {
+            let old = std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok();
+            std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
+            Self { old }
+        }
+    }
+    impl Drop for BaseUrlGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", v),
+                None => std::env::remove_var("SYNAPS_ANTHROPIC_BASE_URL"),
+            }
+        }
+    }
+
+    /// Spec §9.4: local-only compaction performs ZERO network operations.
+    /// Socket spy: every Anthropic request in this process would land on the
+    /// local listener; local-only compaction must never touch it.
+    #[tokio::test]
+    #[serial]
+    async fn local_only_compaction_touches_no_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _guard = BaseUrlGuard::set(&format!("http://{addr}"));
+
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_compaction_mode(CompactionMode::LocalOnly);
+
+        let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+            .await
+            .expect("local-only compaction must succeed offline");
+
+        assert_eq!(outcome.summary_provider, "local");
+        assert!(!outcome.summary_text.is_empty());
+        assert!(
+            outcome.summary_text.contains(USER_SENTINEL),
+            "local summary should carry goal context"
+        );
+
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => panic!("local-only compaction opened a socket from {peer}"),
+            Err(e) => panic!("socket spy failed: {e}"),
+        }
+    }
+
+    /// Spy liveness: the SAME harness observes the connection when remote
+    /// compaction dispatches — proving the zero-socket assertion above is a
+    /// real observation, not a blind spy.
+    #[tokio::test]
+    #[serial]
+    async fn remote_compaction_is_observed_by_the_socket_spy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _guard = BaseUrlGuard::set(&format!("http://{addr}"));
+
+        // Accept exactly one connection and slam it shut so the client
+        // errors immediately instead of waiting out a read timeout.
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+                let _ = observed_tx.send(());
+            }
+        });
+
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_api_retries(0);
+
+        // The mock listener never answers HTTP, so the call errors — the
+        // spy only cares that the connection attempt happened.
+        let result = compact_conversation(&sentinel_messages(), &runtime, None).await;
+        assert!(result.is_err(), "mock endpoint cannot produce a summary");
+
+        observed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("remote compaction must hit the spy listener");
     }
 }

@@ -23,7 +23,8 @@ use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::runtime::compaction::{
-    apply_compaction, compact_conversation, CompactionPolicy, CompactionTransition,
+    apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
+    CompactionTransition,
 };
 use synaps_cli::{flush_stdout, CancellationToken};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
@@ -226,6 +227,13 @@ pub async fn run(
                                 custom_instructions,
                             } => {
                                 eprintln!("compacting...");
+                                // Spec §9.4: surface provider/model and the
+                                // approximate disclosure BEFORE dispatch.
+                                eprintln!(
+                                    "{}",
+                                    preview_compaction_disclosure(&runtime, &conv.api_messages)
+                                        .render_line()
+                                );
                                 match compact_conversation(
                                     &conv.api_messages,
                                     &runtime,
@@ -483,6 +491,11 @@ pub async fn run(
                 eprintln!(
                     "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
                     assessment.used_tokens()
+                );
+                // Spec §9.4: pre-dispatch disclosure (provider/model/bytes).
+                eprintln!(
+                    "\x1b[2m[{}]\x1b[0m",
+                    preview_compaction_disclosure(&runtime, &conv.api_messages).render_line()
                 );
                 match compact_conversation(&conv.api_messages, &runtime, None).await {
                     Ok(outcome) => match apply_compaction(

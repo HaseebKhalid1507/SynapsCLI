@@ -580,6 +580,12 @@ async fn handle_compact(
         )
     };
 
+    // Spec §9.4: the disclosure summary is computed and logged BEFORE any
+    // summarization dispatch; it also rides the response for clients.
+    let disclosure =
+        synaps_cli::runtime::compaction::preview_compaction_disclosure(&runtime, &msgs);
+    tracing::info!(disclosure = %disclosure.render_line(), "compaction disclosure");
+
     // 2. Long-running LLM call + engine transition — no lock held.
     let applied =
         match synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None).await {
@@ -612,7 +618,7 @@ async fn handle_compact(
                 .send(RpcEvent::Response {
                     id,
                     command: "compact".to_string(),
-                    body: serde_json::json!({ "summary": summary }),
+                    body: serde_json::json!({ "summary": summary, "disclosure": disclosure }),
                 })
                 .await;
         }
