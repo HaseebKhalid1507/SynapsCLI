@@ -342,7 +342,7 @@ fn tools_to_gemini_drops_internal_only_tools() {
         json!({"name": "respond"}),
         json!({"name": "search", "description": "d", "input_schema": {"type":"object"}}),
     ];
-    let out = tools_to_gemini(&tools);
+    let out = translate_tool_schemas(&tools);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].name, "search");
     assert_eq!(out[0].description.as_deref(), Some("d"));

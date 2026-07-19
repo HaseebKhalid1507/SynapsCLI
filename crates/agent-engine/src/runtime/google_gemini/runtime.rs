@@ -26,7 +26,13 @@ use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 
 /// Translate tool schemas (Anthropic-shaped: `{name, description, input_schema}`)
 /// into Gemini `ToolSpec`s. Internal-only tool names are dropped.
-fn tools_to_gemini(schema: &[Value]) -> Vec<ToolSpec> {
+///
+/// PUBLIC provider-adapter API (Task 22): this is the single seam that
+/// converts a session's projected tool schemas into Gemini request
+/// specs — production streaming uses it, and the Phase 3 acceptance
+/// harness drives it directly to prove cross-provider logical tool-set
+/// equivalence without duplicating the conversion.
+pub fn translate_tool_schemas(schema: &[Value]) -> Vec<ToolSpec> {
     schema
         .iter()
         .filter_map(|t| {
@@ -222,7 +228,7 @@ pub(crate) async fn call_google_gemini_stream_inner(
     use crate::runtime::trace::openai as tro;
 
     let turns = messages_to_gemini_turns(messages);
-    let tools = tools_to_gemini(tools_schema);
+    let tools = translate_tool_schemas(tools_schema);
 
     // Resolve the Code Assist project id through the broker before streaming.
     // Code Assist rejects `streamGenerateContent` without a project on the

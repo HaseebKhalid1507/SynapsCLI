@@ -13,6 +13,7 @@ pub use setup::{
     ONBOARDING_POLL_INTERVAL,
 };
 
+pub use runtime::translate_tool_schemas;
 pub use stream::{stream_gemini, StreamError};
 
 pub use translate::{
