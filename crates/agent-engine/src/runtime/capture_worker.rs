@@ -48,7 +48,7 @@ pub struct CaptureFailure {
 
 enum CapturePayload {
     Turn(Box<ChatTurnCapture>),
-    Summary(ConversationSummaryCapture),
+    Summary(Box<ConversationSummaryCapture>),
 }
 
 impl CapturePayload {
@@ -62,7 +62,7 @@ impl CapturePayload {
     fn dispatch(&self, provider: &dyn CaptureProvider) -> Result<(), CaptureFailure> {
         match self {
             Self::Turn(capture) => provider.capture(capture.as_ref().clone()),
-            Self::Summary(capture) => provider.capture_summary(capture.clone()),
+            Self::Summary(capture) => provider.capture_summary(capture.as_ref().clone()),
         }
     }
 
@@ -253,7 +253,7 @@ impl CaptureWorker {
         let job = CaptureJob {
             provider_id: lease.provider_id.clone(),
             provider,
-            payload: CapturePayload::Summary(capture),
+            payload: CapturePayload::Summary(Box::new(capture)),
             committed: None,
         };
         match self.sender.try_send(job) {
