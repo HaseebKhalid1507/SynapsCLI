@@ -645,6 +645,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
                 required: true,
                 default: None,
                 secret_env: None,
+                host_context: None,
             },
             ExtensionConfigEntry {
                 key: "mode".to_string(),
@@ -653,6 +654,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
                 required: false,
                 default: Some(serde_json::json!("safe")),
                 secret_env: None,
+                host_context: None,
             },
             ExtensionConfigEntry {
                 key: "token".to_string(),
@@ -661,6 +663,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
                 required: true,
                 default: None,
                 secret_env: Some("CONFIG_TEST_TOKEN".to_string()),
+                host_context: None,
             },
         ],
     };
@@ -714,6 +717,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
             required: true,
             default: None,
             secret_env: None,
+            host_context: None,
         }],
     };
 
@@ -773,6 +777,7 @@ async fn extension_provider_complete_routes_to_process() {
             required: true,
             default: None,
             secret_env: None,
+            host_context: None,
         }],
     };
     manager
@@ -866,6 +871,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
             required: true,
             default: None,
             secret_env: None,
+            host_context: None,
         }],
     };
     manager
@@ -1407,6 +1413,7 @@ async fn audit_log_records_disabled_route() {
             required: true,
             default: None,
             secret_env: None,
+            host_context: None,
         }],
     };
     manager

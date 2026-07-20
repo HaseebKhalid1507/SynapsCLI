@@ -168,6 +168,7 @@ mod tests {
                 required: true,
                 default: None,
                 secret_env: Some("API_KEY".to_string()),
+                host_context: None,
             }],
         })));
 

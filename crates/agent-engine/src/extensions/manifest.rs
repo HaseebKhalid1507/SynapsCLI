@@ -14,7 +14,15 @@ fn default_protocol_version() -> u32 {
 }
 
 /// Extension declaration inside a plugin manifest.
+///
+/// Deserialization goes through [`RawExtensionManifest`] so legacy
+/// manifest aliases (`extension.tools` + `activation: "deferred"`, the
+/// pre-native shape shipped by early deferred plugins such as
+/// axel-memory-manager 0.1) are folded into the native `deferred` block
+/// BEFORE any classification or validation can observe them. Unknown
+/// `activation` values fail closed instead of silently loading eager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawExtensionManifest")]
 pub struct ExtensionManifest {
     /// Extension protocol version. Defaults to v1 for pre-versioned manifests.
     #[serde(default = "default_protocol_version")]
@@ -72,6 +80,94 @@ pub struct ExtensionManifest {
     pub deferred: Option<super::lifecycle::DeferredDeclarations>,
 }
 
+/// Wire-shape shadow of [`ExtensionManifest`] carrying the LEGACY manifest
+/// aliases (`tools` + `activation`) used by pre-native deferred plugins.
+/// [`TryFrom`] folds them into the native `deferred` block with a
+/// fail-closed policy:
+///   * `activation` values other than `"deferred"` are rejected (a typo or
+///     unknown mode must never silently fall back to the eager lifecycle);
+///   * declaring BOTH native `deferred` and a legacy alias is ambiguous
+///     and rejected;
+///   * `activation: "deferred"` without legacy `tools` declarations has no
+///     deferrable surface and is rejected.
+#[derive(Deserialize)]
+struct RawExtensionManifest {
+    #[serde(default = "default_protocol_version")]
+    protocol_version: u32,
+    runtime: ExtensionRuntime,
+    command: String,
+    #[serde(default)]
+    setup: Option<String>,
+    #[serde(default)]
+    prebuilt: std::collections::HashMap<String, PrebuiltAsset>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    hooks: Vec<HookSubscription>,
+    #[serde(default)]
+    config: Vec<ExtensionConfigEntry>,
+    #[serde(default)]
+    theme_tokens: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    deferred: Option<super::lifecycle::DeferredDeclarations>,
+    /// LEGACY ALIAS: passive tool declarations at the extension top level.
+    #[serde(default)]
+    tools: Vec<super::lifecycle::DeclaredExtensionTool>,
+    /// LEGACY ALIAS: `"deferred"` marks the legacy `tools` block deferred.
+    #[serde(default)]
+    activation: Option<String>,
+}
+
+impl TryFrom<RawExtensionManifest> for ExtensionManifest {
+    type Error = String;
+
+    fn try_from(raw: RawExtensionManifest) -> Result<Self, Self::Error> {
+        if let Some(activation) = raw.activation.as_deref() {
+            if activation != "deferred" {
+                return Err(format!(
+                    "unsupported extension activation '{}' (supported: \"deferred\"); refusing to fall back to the eager lifecycle",
+                    activation,
+                ));
+            }
+        }
+        let legacy_alias_used = raw.activation.is_some() || !raw.tools.is_empty();
+        if raw.deferred.is_some() && legacy_alias_used {
+            return Err(
+                "extension declares both a native 'deferred' block and legacy 'tools'/'activation' aliases; use only the native 'deferred' block".to_string(),
+            );
+        }
+        let deferred = if legacy_alias_used {
+            if raw.tools.is_empty() {
+                return Err(
+                    "extension declares activation \"deferred\" without legacy 'tools' declarations; declare tools or use the native 'deferred' block".to_string(),
+                );
+            }
+            Some(super::lifecycle::DeferredDeclarations {
+                tools: raw.tools,
+                providers: Vec::new(),
+                lifecycle: None,
+            })
+        } else {
+            raw.deferred
+        };
+        Ok(Self {
+            protocol_version: raw.protocol_version,
+            runtime: raw.runtime,
+            command: raw.command,
+            setup: raw.setup,
+            prebuilt: raw.prebuilt,
+            args: raw.args,
+            permissions: raw.permissions,
+            hooks: raw.hooks,
+            config: raw.config,
+            theme_tokens: raw.theme_tokens,
+            deferred,
+        })
+    }
+}
+
 /// Per-host-triple prebuilt distribution asset for an extension. Lives
 /// inside [`ExtensionManifest::prebuilt`]. When a matching entry exists
 /// for the current host, the installer fetches `url`, verifies its
@@ -114,6 +210,23 @@ pub struct ExtensionConfigEntry {
     pub default: Option<Value>,
     #[serde(default)]
     pub secret_env: Option<String>,
+    /// RESERVED host-context source: when present the value is resolved
+    /// EXCLUSIVELY from trusted host state recorded by the
+    /// `ExtensionManager` (never from env overrides, user config, or model
+    /// input) and injected into the resolved config sent at initialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_context: Option<HostContextKey>,
+}
+
+/// Typed host-context sources for [`ExtensionConfigEntry::host_context`].
+/// Each variant is a host-owned trusted value; no secrets, no environment
+/// forwarding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostContextKey {
+    /// Canonical trusted project root, discovered once by the host from
+    /// its own working directory (see `ExtensionManager::host_project_root`).
+    ProjectRoot,
 }
 
 /// A validated extension manifest prepared for loading.

@@ -97,6 +97,14 @@ while True:
     else:
         log("request:" + method)
     if method == "initialize":
+        # Persist the initialize params next to the spy log so tests can
+        # assert on the host-resolved config (e.g. host_context values)
+        # without changing the spy event stream existing tests assert on.
+        try:
+            with open(SPY + ".init.json", "w", encoding="utf-8") as f:
+                json.dump(request.get("params", {}), f)
+        except OSError:
+            pass
         respond(request, {
             "protocol_version": 1,
             "capabilities": {"tools": tools, "providers": providers,

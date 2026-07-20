@@ -79,10 +79,15 @@
     "manifest_key": "extension.config",
     "storage_key_prefix": "extension.<plugin-id>.",
     "secret_env_field": "secret_env",
+    "host_context_field": "host_context",
+    "host_context_keys": {
+      "project_root": "RESERVED host-owned value: the canonical trusted project root the host discovers ONCE from its own working directory (nearest .git/.synaps-project marker, canonicalized). Entries declaring host_context are resolved EXCLUSIVELY from host state — env overrides, secret_env, plugin config, and legacy config keys are all skipped — and the value is injected into the resolved config sent at initialize (retained in deferred launch records). Never forwarded as an environment variable; user or model input can never supply or widen it."
+    },
     "validation": [
       "key must be non-empty and must not contain dots, slashes, or spaces",
       "required must be boolean when present",
-      "secret_env must be an environment variable name when present"
+      "secret_env must be an environment variable name when present",
+      "host_context, when present, must be a known host-context key and must not be combined with secret_env"
     ]
   },
   "theme_tokens": {
@@ -149,6 +154,15 @@
       "classification: no declarations => legacy_eager; tools => tool_only; providers => provider; hooks/lifecycle=hook => hook_lifecycle; lifecycle=user => ui_sidecar; multiple => mixed",
       "mixed manifests share ONE child process across their capabilities and start on the EARLIEST legitimately required trigger (hook event, then provider selection, then exact tool activation); tool SEARCH alone never starts a process"
     ],
-    "flag_off": "when progressive tool disclosure is off, every manifest — with or without deferred — loads on the legacy eager path unchanged"
+    "flag_off": "when progressive tool disclosure is off, every manifest — with or without deferred — loads on the legacy eager path unchanged",
+    "legacy_aliases": {
+      "shape": "extension-level `tools: [{name, description, input_schema}]` plus optional `activation: \"deferred\"` (pre-native manifests such as axel-memory-manager 0.1)",
+      "semantics": [
+        "folded into the native `deferred.tools` block at deserialization, BEFORE any classification or validation — a legacy tool-declaring manifest can never silently load eager",
+        "`activation` values other than \"deferred\" fail the manifest closed (no unknown-activation fallback)",
+        "declaring both a native `deferred` block and a legacy alias is ambiguous and fails closed",
+        "`activation: \"deferred\"` without legacy tools declarations fails closed"
+      ]
+    }
   }
 }

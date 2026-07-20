@@ -159,6 +159,13 @@ pub struct ExtensionManager {
     /// Commit B). One instance shared by this manager (unload revocation)
     /// and the `Runtime` (per-session capabilities + session-end scope).
     extension_runtime: std::sync::OnceLock<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
+    /// HOST-OWNED trusted project root, recorded ONCE per manager on first
+    /// use (canonical `ProjectScope::discover` walk from the host's own
+    /// working directory). Injected into resolved config for manifest
+    /// entries declaring `host_context: "project_root"`; never sourced
+    /// from env overrides, user config, or model input, and never
+    /// forwarded as an environment variable.
+    host_project_root: std::sync::OnceLock<Option<String>>,
 }
 
 /// Shared handle to the retained deferred launch records. Crate-private:
@@ -196,6 +203,7 @@ impl ExtensionManager {
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
             extension_runtime: std::sync::OnceLock::new(),
+            host_project_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -216,6 +224,7 @@ impl ExtensionManager {
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
             extension_runtime: std::sync::OnceLock::new(),
+            host_project_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -231,7 +240,7 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        let config = Self::resolve_config(id, &manifest.config)?;
+        let config = Self::resolve_config(id, &manifest.config, self.host_project_root())?;
         self.load_with_cwd_and_config(id, manifest, cwd, config)
             .await
     }
@@ -241,6 +250,23 @@ impl ExtensionManager {
     /// eager path byte-for-byte).
     pub fn set_progressive_deferral(&mut self, enabled: bool) {
         self.progressive_deferral = enabled;
+    }
+
+    /// The HOST-OWNED trusted project root, discovered ONCE per manager
+    /// from the host's own working directory via the canonical
+    /// `agent_core` project-scope walk (nearest `.git`/`.synaps-project`
+    /// marker, canonicalized). Recorded here so every extension load in
+    /// this manager's lifetime sees one stable value. `None` when the
+    /// working directory is unavailable or cannot be canonicalized.
+    pub fn host_project_root(&self) -> Option<&str> {
+        self.host_project_root
+            .get_or_init(|| {
+                let cwd = std::env::current_dir().ok()?;
+                agent_core::memory::store::ProjectScope::discover(&cwd)
+                    .ok()
+                    .map(|scope| scope.root().display().to_string())
+            })
+            .as_deref()
     }
 
     /// Whether one plugin id is currently deferred (any Task 20 class:
@@ -738,7 +764,11 @@ impl ExtensionManager {
         Ok(())
     }
 
-    fn resolve_config(id: &str, entries: &[ExtensionConfigEntry]) -> Result<Value, String> {
+    fn resolve_config(
+        id: &str,
+        entries: &[ExtensionConfigEntry],
+        host_project_root: Option<&str>,
+    ) -> Result<Value, String> {
         let mut out = Map::new();
         for entry in entries {
             let key = entry.key.trim();
@@ -750,6 +780,34 @@ impl ExtensionManager {
                     "Extension '{}' config key '{}' must not contain dots, slashes, or spaces",
                     id, key,
                 ));
+            }
+            // RESERVED host-context entries: the value comes EXCLUSIVELY
+            // from trusted host state recorded once by this manager. Env
+            // overrides, secret_env, plugin config, and legacy config keys
+            // are all deliberately skipped — user or model input can never
+            // supply or widen a host-context value.
+            if let Some(host_key) = entry.host_context {
+                if entry.secret_env.is_some() {
+                    return Err(format!(
+                        "Extension '{}' config key '{}' declares both host_context and secret_env; host-context values never carry secrets",
+                        id, key,
+                    ));
+                }
+                match host_key {
+                    crate::extensions::manifest::HostContextKey::ProjectRoot => {
+                        if let Some(root) = host_project_root {
+                            out.insert(key.to_string(), Value::String(root.to_string()));
+                        } else if let Some(default) = &entry.default {
+                            out.insert(key.to_string(), default.clone());
+                        } else if entry.required {
+                            return Err(format!(
+                                "Extension '{}' requires host context 'project_root' but the host could not resolve a trusted project root",
+                                id,
+                            ));
+                        }
+                    }
+                }
+                continue;
             }
             let config_key = format!("extension.{}.{}", id, key);
             if let Ok(value) = std::env::var(format!(
@@ -1522,7 +1580,11 @@ impl ExtensionManager {
 
             let resolved = ExtensionManifest {
                 theme_tokens: Default::default(),
-                deferred: None,
+                // Deferred declarations flow through from the installed
+                // manifest (legacy `tools`/`activation` aliases are folded
+                // into `deferred` at deserialization) so installed plugins
+                // keep their zero-spawn deferred lifecycle instead of
+                // silently loading eager.
                 command,
                 args,
                 ..ext_manifest
@@ -1988,7 +2050,9 @@ mod tests {
                     required: true,
                     default: None,
                     secret_env: None,
+                    host_context: None,
                 }],
+                None,
             )
             .unwrap();
 
@@ -2015,7 +2079,9 @@ mod tests {
                     required: true,
                     default: None,
                     secret_env: None,
+                    host_context: None,
                 }],
+                None,
             )
             .unwrap();
 
@@ -2064,6 +2130,7 @@ mod tests {
                 required: false,
                 default: Some(serde_json::Value::String("us-east-1".to_string())),
                 secret_env: None,
+                host_context: None,
             }],
         };
 
