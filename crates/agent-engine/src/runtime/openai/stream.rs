@@ -929,6 +929,20 @@ fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     }
 }
 
+/// Map a Codex terminal failure to a user-facing message. Only reacts to the
+/// already-sanitized enum identifiers (`error.type` / `error.code`) — never to
+/// provider free-text — so no request content can leak. Known, user-actionable
+/// conditions get a specific remedy; everything else keeps the neutral,
+/// details-withheld default.
+fn user_message_for_terminal_failure(error_kind: &str, error_code: &str) -> &'static str {
+    // Context-window overflow is deterministic and user-fixable: the turn
+    // cannot succeed until the conversation is smaller.
+    if error_code == "context_length_exceeded" || error_kind == "context_length_exceeded" {
+        return "Codex rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.";
+    }
+    "Codex response failed in stream. Provider error details withheld because they can echo request content."
+}
+
 impl CodexSseDecoder {
     fn push_line(
         &mut self,
@@ -1070,7 +1084,7 @@ impl CodexSseDecoder {
                 );
                 self.terminal_failure = Some(ResponsesStreamFailure {
                     code: "responses_failed",
-                    message: "Codex response failed in stream. Provider error details withheld because they can echo request content.",
+                    message: user_message_for_terminal_failure(error_kind, error_code),
                 });
                 self.finish();
             }
@@ -1827,6 +1841,27 @@ mod codex_decoder_tests {
         assert_eq!(sanitize_error_identifier(Some("")), "unsafe_or_freeform");
         let long = "a".repeat(65);
         assert_eq!(sanitize_error_identifier(Some(&long)), "unsafe_or_freeform");
+    }
+
+    /// Context-window overflow maps to a specific, actionable message; every
+    /// other terminal failure keeps the neutral details-withheld default. The
+    /// mapping only ever reads sanitized enum identifiers, never free-text.
+    #[test]
+    fn terminal_failure_user_message_is_specific_only_for_known_codes() {
+        assert!(user_message_for_terminal_failure(
+            "invalid_request_error",
+            "context_length_exceeded"
+        )
+        .contains("/compact"));
+        // Code carried on `type` rather than `code` still maps.
+        assert!(
+            user_message_for_terminal_failure("context_length_exceeded", "absent")
+                .contains("context window")
+        );
+        // Unknown/other codes keep the neutral default (no remedy claim).
+        let default = user_message_for_terminal_failure("server_error", "unlisted_identifier");
+        assert!(default.starts_with("Codex response failed in stream."));
+        assert!(!default.contains("/compact"));
     }
 
     #[test]
