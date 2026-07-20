@@ -3367,6 +3367,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "synaps-core",
+ "synaps-engine",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

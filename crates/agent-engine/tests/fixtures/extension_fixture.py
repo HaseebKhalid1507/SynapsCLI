@@ -13,17 +13,38 @@ environment, so ALL behavior is driven by argv:
            (objects with name/description/input_schema)
   argv[3]  mode: ok (default) | hostile-error (tool.call returns a
            JSON-RPC error carrying marker content that must be withheld) |
-           huge-stderr (floods stderr before serving normally)
+           huge-stderr (floods stderr before serving normally) |
+           recall-timeout (recall calls sleep past the host's 150ms
+           spec-16.2 hard budget before answering) |
+           recall-malformed (recall calls return a structurally invalid
+           contribution shape) |
+           recall-cross-project (recall calls return a valid-shaped
+           contribution claiming a DIFFERENT project id, so the host's
+           validate_contribution must reject it)
   argv[4]  optional path to a JSON array of providers to register at
            initialize (RegisteredProviderSpec-shaped objects)
+  argv[5]  optional path to a JSON array of context providers
+           (DeclaredExtensionContextProvider-shaped objects) declared in
+           the initialize response as `context_providers` (task B6)
+
+Recall calls (continuous-memory task B6) arrive on the REAL engine path as
+`tool.call` frames naming the manifest-declared `memory_recall` tool; a
+direct `context_provider.recall` RPC method is served identically. Every
+recall call received logs a `recall:<count>` spy event so tests can assert
+exact call counts.
 """
 import json
 import sys
+import time
 
 SPY = sys.argv[1]
 TOOLS_PATH = sys.argv[2] if len(sys.argv) > 2 else None
 MODE = sys.argv[3] if len(sys.argv) > 3 else "ok"
 PROVIDERS_PATH = sys.argv[4] if len(sys.argv) > 4 else None
+CONTEXT_PROVIDERS_PATH = sys.argv[5] if len(sys.argv) > 5 else None
+
+RECALL_TOOL_NAME = "memory_recall"
+recall_calls = 0
 
 
 def log(event):
@@ -66,6 +87,83 @@ def respond_error(request, code, message):
     )
 
 
+def recall_response(params):
+    """One MemoryContextContributionWire-shaped recall result (task B6).
+
+    MODE "ok" echoes the host-authored project_id back with 2-3 synthetic
+    model_visible records carrying plausible rank reasons; the recall-*
+    failure modes produce exactly one typed failure shape each.
+    """
+    request_wire = params.get("input", params) or {}
+    project_id = str(request_wire.get("project_id", "project-unknown"))
+    if MODE == "recall-timeout":
+        # Sleep well past the host's 150ms spec-16.2 hard budget, then
+        # answer normally: the host must already have failed open.
+        time.sleep(1.0)
+    if MODE == "recall-malformed":
+        # Structurally invalid contribution: `records` is not an array and
+        # `rendered` is not a string — the host wire parser must reject it.
+        return {
+            "schema": "contribution/1",
+            "provider_id": "project-memory",
+            "project_id": project_id,
+            "records": "not-an-array",
+            "rendered": 42,
+        }
+    if MODE == "recall-cross-project":
+        # Valid SHAPE, wrong project: parses fine, then the host's
+        # validate_contribution must reject the project mismatch.
+        project_id = "project-cwd-0000000000000000"
+    records = [
+        {
+            "memory_id": "mem-b6-0001",
+            "source": "chat_history",
+            "timestamp": 1752000000,
+            "rank_reason": ["exact_topic"],
+            "sensitivity": "model_visible",
+            "retention": "standard",
+            "content": "Decision: extension authority flows through "
+                       "host-minted leases (B6-REC-ALPHA).",
+            "truncated": False,
+        },
+        {
+            "memory_id": "mem-b6-0002",
+            "source": "user_stated",
+            "timestamp": 1752000100,
+            "rank_reason": ["recency"],
+            "sensitivity": "model_visible",
+            "retention": "standard",
+            "content": "Preference: keep extension spawns exact and "
+                       "lease-scoped (B6-REC-BETA).",
+            "truncated": False,
+        },
+        {
+            "memory_id": "mem-b6-0003",
+            "source": "chat_history",
+            "timestamp": 1752000200,
+            "rank_reason": ["exact_topic", "recency"],
+            "sensitivity": "model_visible",
+            "retention": "standard",
+            "content": "Unresolved: extend the recall harness to turn "
+                       "capture (B6-REC-GAMMA).",
+            "truncated": False,
+        },
+    ]
+    rendered = "\n".join(
+        "%d. %s — %s" % (i + 1, r["memory_id"], r["content"])
+        for i, r in enumerate(records)
+    )
+    return {
+        "schema": "contribution/1",
+        "provider_id": "project-memory",
+        "project_id": project_id,
+        "records": records,
+        "rendered": rendered,
+        "accounting": {"candidates_considered": 7, "withheld": 1,
+                       "truncated": 0},
+    }
+
+
 log("spawn")
 tools = []
 if TOOLS_PATH:
@@ -75,6 +173,10 @@ providers = []
 if PROVIDERS_PATH:
     with open(PROVIDERS_PATH, encoding="utf-8") as f:
         providers = json.load(f)
+context_providers = []
+if CONTEXT_PROVIDERS_PATH:
+    with open(CONTEXT_PROVIDERS_PATH, encoding="utf-8") as f:
+        context_providers = json.load(f)
 
 if MODE == "huge-stderr":
     # One enormous newline-free blob: proves the host's bounded stderr
@@ -89,7 +191,15 @@ while True:
         sys.exit(0)
     method = request.get("method", "")
     if method == "tool.call":
-        log("call:" + str(request.get("params", {}).get("name")))
+        called = str(request.get("params", {}).get("name"))
+        if called == RECALL_TOOL_NAME:
+            recall_calls += 1
+            log("recall:%d" % recall_calls)
+        else:
+            log("call:" + called)
+    elif method == "context_provider.recall":
+        recall_calls += 1
+        log("recall:%d" % recall_calls)
     elif method == "hook.handle":
         log("hook:" + str(request.get("params", {}).get("kind")))
     elif method == "provider.complete":
@@ -105,10 +215,13 @@ while True:
                 json.dump(request.get("params", {}), f)
         except OSError:
             pass
+        capabilities = {"tools": tools, "providers": providers,
+                        "capabilities": []}
+        if context_providers:
+            capabilities["context_providers"] = context_providers
         respond(request, {
             "protocol_version": 1,
-            "capabilities": {"tools": tools, "providers": providers,
-                             "capabilities": []},
+            "capabilities": capabilities,
         })
     elif method == "hook.handle":
         respond(request, {"action": "continue"})
@@ -120,12 +233,16 @@ while True:
     elif method == "sidecar.spawn_args":
         log("sidecar")
         respond(request, {"args": ["--fixture-sidecar"]})
+    elif method == "context_provider.recall":
+        respond(request, recall_response(request.get("params", {})))
     elif method == "tool.call":
-        if MODE == "hostile-error":
+        name = request.get("params", {}).get("name")
+        if name == RECALL_TOOL_NAME:
+            respond(request, recall_response(request.get("params", {})))
+        elif MODE == "hostile-error":
             respond_error(request, -32000,
                           "HOSTILE_EXTENSION_MARKER " + ("s3cr3t" * 64))
         else:
-            name = request.get("params", {}).get("name")
             respond(request, {"content": "called:" + str(name)})
     elif method == "shutdown":
         log("shutdown")

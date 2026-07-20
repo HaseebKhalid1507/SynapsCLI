@@ -92,3 +92,7 @@ testing = []
 serial_test = "3.4.0"
 tempfile    = "3"
 tokio       = { version = "1.0", features = ["full", "test-util"] }
+# Self dev-dependency (same pattern as synaps-tui): turns the `testing`
+# feature on for every test target via feature unification, so integration
+# tests in tests/ see the harness seams without extra cargo flags.
+synaps-engine = { path = ".", features = ["testing"] }

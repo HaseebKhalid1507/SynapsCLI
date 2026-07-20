@@ -1625,6 +1625,23 @@ impl Runtime {
         }
     }
 
+    /// Task B6 harness seam: the EXACT per-prompt recall entry point the
+    /// stream path runs ([`Self::apply_turn_memory_recall`], the single
+    /// hook `run_stream_with_messages` calls before any per-provider wire
+    /// translation), exposed so the headless Phase B end-to-end harness
+    /// (`tests/memory_context_e2e.rs`) can drive the REAL engine recall
+    /// flow — real [`crate::extensions::lease::ExtensionLeaseCapability`],
+    /// real child process, real §16.2 timeout — without provider
+    /// credentials for the outer HTTP call. Compiled only for tests and
+    /// `testing` builds, mirroring [`Runtime::new_headless`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn apply_turn_memory_recall_for_harness(
+        &self,
+        messages: &mut Vec<crate::SharedMessage>,
+    ) {
+        self.apply_turn_memory_recall(messages).await;
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
         if let Some(ref model) = config.model {
