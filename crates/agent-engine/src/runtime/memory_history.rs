@@ -319,6 +319,40 @@ struct ImportCheckpoint {
     committed_source_digests: Vec<String>,
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub fn authorize_import_for_tests(
+    preview: HistoryImportPreview,
+) -> (
+    ImportPlan,
+    crate::runtime::memory_context::MemoryContextLease,
+) {
+    use crate::runtime::memory_context::{
+        mint_explicit_command_proof, CapturePolicy, ContextProviderId, MemoryContextLease,
+        MemoryContextMode, MemoryLeaseId, ProjectId, RecallPolicy, SessionId,
+    };
+
+    let intent = mint_explicit_command_proof();
+    let plan = ImportPlan {
+        preview: preview.clone(),
+        confirmation_id: "history-import-test-confirmation".into(),
+        user_intent: intent.clone(),
+    };
+    let lease = MemoryContextLease::grant(
+        MemoryLeaseId::parse("history-import-test-lease").expect("static lease id"),
+        SessionId::parse("history-import-test-session").expect("static session id"),
+        ProjectId::parse(&preview.project_id).expect("test project id must be valid"),
+        ContextProviderId::parse("extension:test:memory").expect("static provider id"),
+        MemoryContextMode::CaptureOnly,
+        CapturePolicy::default(),
+        RecallPolicy::default(),
+        intent,
+        std::time::SystemTime::now(),
+        None,
+    )
+    .expect("test lease must be valid");
+    (plan, lease)
+}
+
 /// D2 host-only import path. Session scope comes from the host session index;
 /// a foreign ID is rejected before its session artifact is opened. Session
 /// bodies then load exclusively through [`agent_core::session::Session`]'s
