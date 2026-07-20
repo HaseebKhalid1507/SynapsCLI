@@ -2477,7 +2477,8 @@ impl Runtime {
     /// streaming.
     pub(crate) fn memory_history_confirm(
         &self,
-    ) -> std::result::Result<memory_history::ImportPlan, memory_history::HistoryImportError> {
+    ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
+    {
         let preview = self
             .pending_history_import_preview
             .lock()
@@ -2499,7 +2500,24 @@ impl Runtime {
                     .history_import_plan
                     .lock()
                     .expect("history plan mutex poisoned") = Some(plan.clone());
-                Ok(plan)
+                let lease = self
+                    .memory_context_lock()
+                    .capture_lease_at(std::time::SystemTime::now())
+                    .ok_or(memory_history::HistoryImportError::CaptureLeaseUnavailable)?;
+                // This resolves only a manifest-declared extension sidecar. No
+                // HTTP client or network transport is built by history import.
+                let provider = self
+                    .extension_capture_provider(&lease)
+                    .ok_or(memory_history::HistoryImportError::CaptureProviderUnavailable)?;
+                let sessions_dir = agent_core::config::get_active_config_dir().join("sessions");
+                memory_history::import_history_from_dir(
+                    &plan,
+                    &lease,
+                    &sessions_dir,
+                    memory_history::IMPORT_BATCH_MAX_RECORDS,
+                    memory_capture_worker(),
+                    provider,
+                )
             }
             memory_history::HistoryImportOutcome::Declined => {
                 Err(memory_history::HistoryImportError::ConsentRequired)

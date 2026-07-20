@@ -341,10 +341,9 @@ pub fn memory_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
             Err(error) => CommandResult::Error(error.to_string()),
         },
         "index-history confirm" => match runtime.memory_history_confirm() {
-            Ok(plan) => CommandResult::Output(format!(
-                "History import confirmed for {} session(s), approximately {} bytes. \
-                 Typed import plan {} is ready for D2; no import has started.",
-                plan.preview.session_count, plan.preview.approx_bytes, plan.confirmation_id,
+            Ok(report) => CommandResult::Output(format!(
+                "History import complete: {} session(s) loaded, {} bounded capture record(s) submitted in {} batch(es).",
+                report.sessions_loaded, report.captures_built, report.batches_submitted,
             )),
             Err(error) => CommandResult::Error(error.to_string()),
         },

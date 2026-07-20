@@ -164,6 +164,34 @@ impl CaptureWorker {
         }
     }
 
+    /// Submit a capture already built by the C1 builder. Historical import
+    /// uses this narrow seam so it shares the same bounded C3 queue and exact
+    /// leased provider dispatch as live terminal capture.
+    pub(crate) fn submit_built(
+        &self,
+        lease: &MemoryContextLease,
+        capture: ChatTurnCapture,
+        provider: Arc<dyn CaptureProvider>,
+    ) -> bool {
+        if lease.mode.turn_capture() != TurnCapture::Enabled
+            || lease.project_id != capture.project_id
+        {
+            return false;
+        }
+        let job = CaptureJob {
+            provider_id: lease.provider_id.clone(),
+            provider,
+            payload: CapturePayload::Turn(capture),
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
     /// Apply the same exact lease gate as turn capture, build a bounded
     /// first-class compaction memory, and attempt a nonblocking enqueue.
     pub fn submit_summary(

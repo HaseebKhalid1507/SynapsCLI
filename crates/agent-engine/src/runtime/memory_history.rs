@@ -179,6 +179,240 @@ pub enum HistoryImportError {
     MetadataScanFailed,
     #[error("history import host scope is unavailable")]
     HostStateUnavailable,
+    #[error("history import batch size is outside the host bound")]
+    InvalidBatchSize,
+    #[error("history import session index could not be read")]
+    SessionIndexReadFailed,
+    #[error("history import session could not be loaded")]
+    SessionLoadFailed,
+    #[error("history import identity is invalid")]
+    InvalidIdentity,
+    #[error("history import capture could not be built")]
+    CaptureBuildFailed,
+    #[error("history import requires a live capture lease")]
+    CaptureLeaseUnavailable,
+    #[error("history import requires the leased local provider")]
+    CaptureProviderUnavailable,
+    #[error("history import capture queue is full")]
+    CaptureQueueFull,
+}
+
+/// Hard ceiling on records accumulated before dispatch. The C3 worker queue is
+/// independently fixed-capacity and nonblocking; imports can therefore bound
+/// both their producer batch and consumer queue.
+pub const IMPORT_BATCH_MAX_RECORDS: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryImportReport {
+    pub sessions_loaded: usize,
+    pub captures_built: usize,
+    pub batches_submitted: usize,
+}
+
+/// D2 host-only import path. Session scope comes from the host session index;
+/// a foreign ID is rejected before its session artifact is opened. Session
+/// bodies then load exclusively through [`agent_core::session::Session`]'s
+/// canonical legacy+journal API and become C1-shaped, bounded captures sent
+/// through the existing C3 worker/provider seam.
+pub(crate) fn import_history_from_dir(
+    plan: &ImportPlan,
+    lease: &crate::runtime::memory_context::MemoryContextLease,
+    sessions_dir: &std::path::Path,
+    batch_size: usize,
+    worker: &crate::runtime::capture_worker::CaptureWorker,
+    provider: std::sync::Arc<dyn crate::runtime::capture_worker::CaptureProvider>,
+) -> Result<HistoryImportReport, HistoryImportError> {
+    use crate::runtime::chat_capture::{
+        build_chat_turn_capture, CanonicalCaptureItem, CaptureContentClass, Sensitivity,
+        TerminalTurnHistory,
+    };
+    use crate::runtime::memory_context::{ProjectId, RetentionClass, SessionId, TurnId};
+    use agent_core::core::disclosure::{
+        gate_for_model, may_persist, DisclosureClass, ModelVisibility,
+    };
+    use agent_core::core::session_index::{SessionIndexEventKind, SessionIndexRecord};
+    use std::collections::HashSet;
+    use std::io::BufRead;
+    use std::time::{Duration, SystemTime};
+
+    if batch_size == 0 || batch_size > IMPORT_BATCH_MAX_RECORDS {
+        return Err(HistoryImportError::InvalidBatchSize);
+    }
+    if lease.project_id.as_str() != plan.preview.project_id {
+        return Err(HistoryImportError::InvalidIdentity);
+    }
+
+    // Scope first, content second: the index contains metadata only and lets
+    // us exclude foreign project sessions without probing their body files.
+    let index = match std::fs::File::open(sessions_dir.join("index.jsonl")) {
+        Ok(index) => index,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryImportReport::default())
+        }
+        Err(_) => return Err(HistoryImportError::SessionIndexReadFailed),
+    };
+    let mut scoped = HashSet::new();
+    for line in std::io::BufReader::new(index).lines() {
+        let line = line.map_err(|_| HistoryImportError::SessionIndexReadFailed)?;
+        let Ok(record) = serde_json::from_str::<SessionIndexRecord>(&line) else {
+            continue;
+        };
+        if record.event == SessionIndexEventKind::Start
+            && record.cwd.as_deref() == Some(plan.preview.project_root.as_path())
+        {
+            scoped.insert(record.session_id);
+        }
+    }
+
+    let project_id = ProjectId::parse(&plan.preview.project_id)
+        .map_err(|_| HistoryImportError::InvalidIdentity)?;
+    let redactor = |text: &str| redact_import_text(text);
+    let mut captures = Vec::with_capacity(batch_size);
+    let mut report = HistoryImportReport::default();
+
+    // Only enumerate names; full bodies are opened after the scope check and
+    // only by Session::load_from_dir (the canonical compatibility boundary).
+    let mut ids: Vec<String> = agent_core::session_journal::session_dir_entries(sessions_dir)
+        .map_err(|_| HistoryImportError::SessionIndexReadFailed)?
+        .into_iter()
+        .filter_map(|entry| entry.name.strip_suffix(".json").map(str::to_owned))
+        .filter(|id| scoped.contains(id))
+        .collect();
+    ids.sort();
+
+    for id in ids {
+        let session = agent_core::session::Session::load_from_dir(sessions_dir, &id)
+            .map_err(|_| HistoryImportError::SessionLoadFailed)?;
+        report.sessions_loaded += 1;
+        let session_id =
+            SessionId::parse(&session.id).map_err(|_| HistoryImportError::InvalidIdentity)?;
+        let started_at: SystemTime = session.created_at.into();
+        let completed_at: SystemTime = session.updated_at.into();
+
+        let mut pending_user: Option<String> = None;
+        let mut ordinal = 0_u64;
+        for message in &session.api_messages {
+            let role = message.get("role").and_then(serde_json::Value::as_str);
+            let Some(text) = import_message_text(message) else {
+                continue;
+            };
+            match role {
+                Some("user") => pending_user = Some(text),
+                Some("assistant") => {
+                    let Some(user) = pending_user.take() else {
+                        continue;
+                    };
+                    ordinal = ordinal.saturating_add(1);
+                    let disclosure = DisclosureClass::ModelVisibleAfterRedaction;
+                    if !may_persist(disclosure) {
+                        continue;
+                    }
+                    let user = match gate_for_model(disclosure, &user, false, Some(&redactor)) {
+                        ModelVisibility::Visible(text) => text,
+                        ModelVisibility::Withheld(_) => continue,
+                    };
+                    let assistant = match gate_for_model(disclosure, &text, false, Some(&redactor))
+                    {
+                        ModelVisibility::Visible(text) => text,
+                        ModelVisibility::Withheld(_) => continue,
+                    };
+                    let history = TerminalTurnHistory {
+                        project_id: project_id.clone(),
+                        session_id: session_id.clone(),
+                        turn_id: TurnId::parse(&format!("import-{ordinal}"))
+                            .map_err(|_| HistoryImportError::InvalidIdentity)?,
+                        turn_ordinal: ordinal,
+                        started_at,
+                        completed_at: completed_at.max(started_at + Duration::from_nanos(1)),
+                        outcome: agent_core::TurnOutcome::Completed,
+                        items: vec![
+                            CanonicalCaptureItem {
+                                project_id: project_id.clone(),
+                                class: CaptureContentClass::UserMessage,
+                                disclosure,
+                                sensitivity: Sensitivity::Normal,
+                                text: user,
+                                tool_name: None,
+                            },
+                            CanonicalCaptureItem {
+                                project_id: project_id.clone(),
+                                class: CaptureContentClass::AssistantFinal,
+                                disclosure,
+                                sensitivity: Sensitivity::Normal,
+                                text: assistant,
+                                tool_name: None,
+                            },
+                        ],
+                        compaction: None,
+                    };
+                    captures.push(
+                        build_chat_turn_capture(&project_id, history, RetentionClass::Standard)
+                            .map_err(|_| HistoryImportError::CaptureBuildFailed)?,
+                    );
+                    report.captures_built += 1;
+                    if captures.len() == batch_size {
+                        submit_import_batch(worker, lease, provider.clone(), &mut captures)?;
+                        report.batches_submitted += 1;
+                    }
+                }
+                _ => {} // system/developer/tool/raw content is excluded.
+            }
+        }
+    }
+    if !captures.is_empty() {
+        submit_import_batch(worker, lease, provider, &mut captures)?;
+        report.batches_submitted += 1;
+    }
+    Ok(report)
+}
+
+fn submit_import_batch(
+    worker: &crate::runtime::capture_worker::CaptureWorker,
+    lease: &crate::runtime::memory_context::MemoryContextLease,
+    provider: std::sync::Arc<dyn crate::runtime::capture_worker::CaptureProvider>,
+    captures: &mut Vec<crate::runtime::chat_capture::ChatTurnCapture>,
+) -> Result<(), HistoryImportError> {
+    for capture in captures.drain(..) {
+        if !worker.submit_built(lease, capture, provider.clone()) {
+            return Err(HistoryImportError::CaptureQueueFull);
+        }
+    }
+    Ok(())
+}
+
+fn import_message_text(message: &serde_json::Value) -> Option<String> {
+    match message.get("content")? {
+        serde_json::Value::String(text) => (!text.trim().is_empty()).then(|| text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                })
+                .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn redact_import_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            if ["password=", "token=", "secret=", "api_key="]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+            {
+                "[REDACTED]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl HistoryImportHostState {
@@ -502,5 +736,296 @@ mod tests {
         assert_eq!(io.metadata_scans, 1);
         assert_eq!(io.content_reads, 0);
         assert_eq!(io.axel_writes, 0);
+    }
+
+    mod streaming_import {
+        use super::*;
+        use crate::runtime::capture_worker::{CaptureFailure, CaptureProvider, CaptureWorker};
+        use crate::runtime::chat_capture::ChatTurnCapture;
+        use crate::runtime::memory_context::{
+            mint_explicit_command_proof, CapturePolicy, ContextProviderId, MemoryContextLease,
+            MemoryContextMode, MemoryLeaseId, ProjectId, RecallPolicy, SessionId,
+        };
+        use agent_core::session::Session;
+        use agent_core::session_journal::{save_session_in_dir, SessionPersistence};
+        use chrono::{TimeZone, Utc};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime};
+
+        struct RecordingProvider {
+            captures: Mutex<Vec<ChatTurnCapture>>,
+            network_constructions: std::sync::atomic::AtomicUsize,
+            block: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+
+        impl Default for RecordingProvider {
+            fn default() -> Self {
+                Self {
+                    captures: Mutex::new(Vec::new()),
+                    network_constructions: std::sync::atomic::AtomicUsize::new(0),
+                    block: Mutex::new(None),
+                }
+            }
+        }
+
+        impl CaptureProvider for RecordingProvider {
+            fn capture(&self, capture: ChatTurnCapture) -> Result<(), CaptureFailure> {
+                self.captures.lock().expect("captures lock").push(capture);
+                if let Some(receiver) = self.block.lock().expect("block lock").take() {
+                    let _ = receiver.recv();
+                }
+                Ok(())
+            }
+        }
+
+        fn fixture_session(id: &str, user: &str, assistant: &str) -> Session {
+            let timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+            Session {
+                id: id.into(),
+                title: id.into(),
+                name: None,
+                model: "fixture-model".into(),
+                thinking_level: "brief".into(),
+                system_prompt: Some("must never import".into()),
+                created_at: timestamp,
+                updated_at: timestamp,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                session_cost: 0.0,
+                api_messages: vec![
+                    Arc::new(json!({"role": "user", "content": user})),
+                    Arc::new(json!({"role": "assistant", "content": assistant})),
+                ],
+                abort_context: None,
+                parent_session: None,
+                compacted_into: None,
+                prompt_provenance: None,
+                compaction: None,
+            }
+        }
+
+        fn append_index(dir: &std::path::Path, id: &str, root: &std::path::Path) {
+            use std::io::Write;
+            std::fs::create_dir_all(dir).unwrap();
+            let mut index = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("index.jsonl"))
+                .unwrap();
+            writeln!(
+                index,
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "session_id": id,
+                    "event": "start",
+                    "timestamp": "2023-11-14T22:13:20Z",
+                    "cwd": root,
+                })
+            )
+            .unwrap();
+        }
+
+        fn plan(root: &std::path::Path, session_count: usize) -> ImportPlan {
+            ImportPlan {
+                preview: HistoryImportPreview {
+                    project_id: "project-import".into(),
+                    project_root: root.to_path_buf(),
+                    session_count,
+                    approx_bytes: 1,
+                    included_date_range: None,
+                    included_content_classes: vec!["user_messages", "assistant_final_messages"],
+                    excluded_content_classes: vec!["foreign_project_content"],
+                    retention_policy: "standard".into(),
+                    redaction_policy: "host".into(),
+                    destination_r8_path: root.join("axel.r8"),
+                    explicit_confirmation_required: true,
+                },
+                confirmation_id: "confirmed-import".into(),
+                user_intent: mint_explicit_command_proof(),
+            }
+        }
+
+        fn lease() -> MemoryContextLease {
+            let now = SystemTime::now();
+            MemoryContextLease::grant(
+                MemoryLeaseId::parse("lease-import").unwrap(),
+                SessionId::parse("active-session").unwrap(),
+                ProjectId::parse("project-import").unwrap(),
+                ContextProviderId::parse("extension:axel:memory").unwrap(),
+                MemoryContextMode::CaptureOnly,
+                CapturePolicy::default(),
+                RecallPolicy::default(),
+                mint_explicit_command_proof(),
+                now,
+                Some(now + Duration::from_secs(60)),
+            )
+            .unwrap()
+        }
+
+        fn wait_for(provider: &RecordingProvider, count: usize) {
+            for _ in 0..100 {
+                if provider.captures.lock().unwrap().len() >= count {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("capture worker did not drain");
+        }
+
+        #[test]
+        fn legacy_json_and_journal_sessions_stream_through_one_host_api() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project");
+            let sessions = temp.path().join("sessions");
+            std::fs::create_dir_all(&root).unwrap();
+
+            let legacy = fixture_session("legacy", "old user token=secret-sentinel", "old answer");
+            save_session_in_dir(&sessions, &legacy, SessionPersistence::Json).unwrap();
+            append_index(&sessions, "legacy", &root);
+
+            let mut journal = fixture_session("journal", "journal user", "journal answer");
+            save_session_in_dir(&sessions, &journal, SessionPersistence::Journal).unwrap();
+            journal.api_messages.push(Arc::new(json!({
+                "role": "user", "content": "appended user"
+            })));
+            journal.api_messages.push(Arc::new(json!({
+                "role": "assistant", "content": "appended answer"
+            })));
+            save_session_in_dir(&sessions, &journal, SessionPersistence::Journal).unwrap();
+            append_index(&sessions, "journal", &root);
+
+            let provider = Arc::new(RecordingProvider::default());
+            let worker = CaptureWorker::new(4);
+            let report = import_history_from_dir(
+                &plan(&root, 2),
+                &lease(),
+                &sessions,
+                2,
+                &worker,
+                provider.clone(),
+            )
+            .unwrap();
+
+            assert_eq!(report.sessions_loaded, 2);
+            assert_eq!(report.captures_built, 3);
+            wait_for(&provider, 3);
+            let captures = provider.captures.lock().unwrap();
+            let users: Vec<&str> = captures
+                .iter()
+                .map(|c| c.user.content.text.as_str())
+                .collect();
+            assert!(users.contains(&"old user [REDACTED]"));
+            assert!(users.contains(&"journal user"));
+            assert!(users.contains(&"appended user"));
+            assert!(captures.iter().all(|capture| !capture
+                .user
+                .content
+                .text
+                .contains("secret-sentinel")));
+            assert_eq!(
+                provider
+                    .network_constructions
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+
+        #[test]
+        fn foreign_project_session_is_not_opened_or_disclosed() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project-a");
+            let foreign_root = temp.path().join("project-b");
+            let sessions = temp.path().join("sessions");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&foreign_root).unwrap();
+
+            let own = fixture_session("own", "own user", "own answer");
+            save_session_in_dir(&sessions, &own, SessionPersistence::Json).unwrap();
+            append_index(&sessions, "own", &root);
+            append_index(&sessions, "foreign-sentinel", &foreign_root);
+            std::fs::write(
+                sessions.join("foreign-sentinel.json"),
+                b"SENTINEL: opening this foreign session must fail parsing",
+            )
+            .unwrap();
+
+            let provider = Arc::new(RecordingProvider::default());
+            let worker = CaptureWorker::new(2);
+            let report = import_history_from_dir(
+                &plan(&root, 1),
+                &lease(),
+                &sessions,
+                1,
+                &worker,
+                provider.clone(),
+            )
+            .unwrap();
+
+            assert_eq!(report.sessions_loaded, 1);
+            wait_for(&provider, 1);
+            let captures = provider.captures.lock().unwrap();
+            assert_eq!(captures.len(), 1);
+            assert_eq!(captures[0].session_id.as_str(), "own");
+        }
+
+        #[test]
+        fn import_batches_are_hard_bounded() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project");
+            let sessions = temp.path().join("sessions");
+            std::fs::create_dir_all(&root).unwrap();
+            let provider = Arc::new(RecordingProvider::default());
+            let worker = CaptureWorker::new(1);
+
+            let error = import_history_from_dir(
+                &plan(&root, 0),
+                &lease(),
+                &sessions,
+                IMPORT_BATCH_MAX_RECORDS + 1,
+                &worker,
+                provider,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, HistoryImportError::InvalidBatchSize);
+        }
+
+        #[test]
+        fn import_queue_overflow_is_bounded_and_reported() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project");
+            let sessions = temp.path().join("sessions");
+            std::fs::create_dir_all(&root).unwrap();
+            let session = fixture_session("many", "u1", "a1");
+            save_session_in_dir(&sessions, &session, SessionPersistence::Json).unwrap();
+            append_index(&sessions, "many", &root);
+            // Expand the legacy fixture to three completed turns.
+            let mut session = session;
+            for (user, assistant) in [("u2", "a2"), ("u3", "a3")] {
+                session
+                    .api_messages
+                    .push(Arc::new(json!({"role": "user", "content": user})));
+                session
+                    .api_messages
+                    .push(Arc::new(json!({"role": "assistant", "content": assistant})));
+            }
+            save_session_in_dir(&sessions, &session, SessionPersistence::Json).unwrap();
+
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let provider = Arc::new(RecordingProvider {
+                block: Mutex::new(Some(release_rx)),
+                ..RecordingProvider::default()
+            });
+            let worker = CaptureWorker::new(1);
+            let error =
+                import_history_from_dir(&plan(&root, 1), &lease(), &sessions, 3, &worker, provider)
+                    .unwrap_err();
+            release_tx.send(()).unwrap();
+
+            assert_eq!(error, HistoryImportError::CaptureQueueFull);
+            assert!(worker.overflow_drops() >= 1);
+        }
     }
 }

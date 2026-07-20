@@ -156,7 +156,14 @@ impl Session {
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {
-        crate::core::session_journal::load_session_in_dir(&sessions_dir(), id)
+        Self::load_from_dir(&sessions_dir(), id)
+    }
+
+    /// Canonical backward-compatible host load for a caller-selected sessions
+    /// directory. Both legacy snapshots and journal-backed sessions resolve
+    /// through the same journal overlay implementation.
+    pub fn load_from_dir(dir: &std::path::Path, id: &str) -> std::io::Result<Self> {
+        crate::core::session_journal::load_session_in_dir(dir, id)
     }
 
     pub fn info(&self) -> SessionInfo {
