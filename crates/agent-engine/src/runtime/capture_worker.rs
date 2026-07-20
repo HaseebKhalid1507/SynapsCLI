@@ -83,6 +83,9 @@ struct CaptureJob {
     provider_id: ContextProviderId,
     provider: Arc<dyn CaptureProvider>,
     payload: CapturePayload,
+    /// Present for imports that may advance a durable host checkpoint only
+    /// after the provider has acknowledged (or reconciled) the capture.
+    committed: Option<mpsc::Sender<Result<(), CaptureFailure>>>,
 }
 
 /// Fixed-capacity worker. Enqueue is always `try_send`; persistence never runs
@@ -106,23 +109,28 @@ impl CaptureWorker {
                 let mut submitted = HashSet::new();
                 while let Ok(job) = receiver.recv() {
                     let id = (job.provider_id.clone(), job.payload.id_bytes());
-                    if submitted.contains(&id) {
-                        continue;
-                    }
-                    if job.payload.dispatch(job.provider.as_ref()).is_err() {
+                    let result = if submitted.contains(&id) {
+                        Ok(())
+                    } else if let Err(error) = job.payload.dispatch(job.provider.as_ref()) {
                         // The call may have committed before its acknowledgement
                         // was lost. Reconcile by idempotency key before accepting
                         // an explicit retry; never blindly dispatch it again.
                         match job.payload.query_committed(job.provider.as_ref()) {
                             Ok(CaptureCommitState::Committed) => {
                                 submitted.insert(id);
+                                Ok(())
                             }
                             Ok(CaptureCommitState::Absent) | Err(_) => {
                                 worker_failures.fetch_add(1, Ordering::Relaxed);
+                                Err(error)
                             }
                         }
                     } else {
                         submitted.insert(id);
+                        Ok(())
+                    };
+                    if let Some(committed) = job.committed {
+                        let _ = committed.send(result);
                     }
                 }
             })
@@ -154,6 +162,7 @@ impl CaptureWorker {
             provider_id: lease.provider_id.clone(),
             provider,
             payload: CapturePayload::Turn(capture),
+            committed: None,
         };
         match self.sender.try_send(job) {
             Ok(()) => Ok(true),
@@ -173,6 +182,28 @@ impl CaptureWorker {
         capture: ChatTurnCapture,
         provider: Arc<dyn CaptureProvider>,
     ) -> bool {
+        self.submit_built_job(lease, capture, provider, None)
+    }
+
+    /// Submit one historical capture with a completion receipt. Waiting for the
+    /// receipt happens only on the explicit import path, never turn completion.
+    pub(crate) fn submit_built_with_receipt(
+        &self,
+        lease: &MemoryContextLease,
+        capture: ChatTurnCapture,
+        provider: Arc<dyn CaptureProvider>,
+        committed: mpsc::Sender<Result<(), CaptureFailure>>,
+    ) -> bool {
+        self.submit_built_job(lease, capture, provider, Some(committed))
+    }
+
+    fn submit_built_job(
+        &self,
+        lease: &MemoryContextLease,
+        capture: ChatTurnCapture,
+        provider: Arc<dyn CaptureProvider>,
+        committed: Option<mpsc::Sender<Result<(), CaptureFailure>>>,
+    ) -> bool {
         if lease.mode.turn_capture() != TurnCapture::Enabled
             || lease.project_id != capture.project_id
         {
@@ -182,6 +213,7 @@ impl CaptureWorker {
             provider_id: lease.provider_id.clone(),
             provider,
             payload: CapturePayload::Turn(capture),
+            committed,
         };
         match self.sender.try_send(job) {
             Ok(()) => true,
@@ -221,6 +253,7 @@ impl CaptureWorker {
             provider_id: lease.provider_id.clone(),
             provider,
             payload: CapturePayload::Summary(capture),
+            committed: None,
         };
         match self.sender.try_send(job) {
             Ok(()) => Ok(true),

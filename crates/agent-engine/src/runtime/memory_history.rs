@@ -195,6 +195,14 @@ pub enum HistoryImportError {
     CaptureProviderUnavailable,
     #[error("history import capture queue is full")]
     CaptureQueueFull,
+    #[error("history import was cancelled")]
+    Cancelled,
+    #[error("history import checkpoint could not be read")]
+    CheckpointReadFailed,
+    #[error("history import checkpoint could not be committed")]
+    CheckpointWriteFailed,
+    #[error("history import provider capture failed")]
+    ProviderCaptureFailed,
 }
 
 /// Hard ceiling on records accumulated before dispatch. The C3 worker queue is
@@ -207,6 +215,108 @@ pub struct HistoryImportReport {
     pub sessions_loaded: usize,
     pub captures_built: usize,
     pub batches_submitted: usize,
+    pub ranges_skipped: usize,
+}
+
+/// Maximum durable host state for one project import. One digest is 64 bytes;
+/// this supports thousands of committed source ranges without unbounded growth.
+pub const CHECKPOINT_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, Default)]
+pub struct HistoryImportCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl HistoryImportCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Content-free event envelope for frontends and diagnostics. The payload type
+/// intentionally has no content, session id, project id, or filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HistoryImportEvent {
+    pub name: &'static str,
+    pub status: &'static str,
+    pub ranges_committed: usize,
+    pub ranges_total: usize,
+    pub bytes_processed: u64,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
+}
+
+impl HistoryImportEvent {
+    pub fn progress(
+        ranges_committed: usize,
+        ranges_total: usize,
+        bytes_processed: u64,
+        duration: std::time::Duration,
+    ) -> Self {
+        Self {
+            name: "memory_import.progress",
+            status: "running",
+            ranges_committed,
+            ranges_total,
+            bytes_processed,
+            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            error_code: None,
+        }
+    }
+
+    pub fn error(
+        ranges_committed: usize,
+        bytes_processed: u64,
+        duration: std::time::Duration,
+        error: HistoryImportError,
+    ) -> Self {
+        Self {
+            name: "memory_import.progress",
+            status: "error",
+            ranges_committed,
+            ranges_total: 0,
+            bytes_processed,
+            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            error_code: Some(error.code()),
+        }
+    }
+}
+
+impl HistoryImportError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ModelCannotConfirm => "model_cannot_confirm",
+            Self::ConsentRequired => "consent_required",
+            Self::MetadataScanFailed => "metadata_scan_failed",
+            Self::HostStateUnavailable => "host_state_unavailable",
+            Self::InvalidBatchSize => "invalid_batch_size",
+            Self::SessionIndexReadFailed => "session_index_read_failed",
+            Self::SessionLoadFailed => "session_load_failed",
+            Self::InvalidIdentity => "invalid_identity",
+            Self::CaptureBuildFailed => "capture_build_failed",
+            Self::CaptureLeaseUnavailable => "capture_lease_unavailable",
+            Self::CaptureProviderUnavailable => "capture_provider_unavailable",
+            Self::CaptureQueueFull => "capture_queue_full",
+            Self::Cancelled => "cancelled",
+            Self::CheckpointReadFailed => "checkpoint_read_failed",
+            Self::CheckpointWriteFailed => "checkpoint_write_failed",
+            Self::ProviderCaptureFailed => "provider_capture_failed",
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ImportCheckpoint {
+    version: u8,
+    key: String,
+    committed_source_digests: Vec<String>,
 }
 
 /// D2 host-only import path. Session scope comes from the host session index;
@@ -364,6 +474,339 @@ pub(crate) fn import_history_from_dir(
         report.batches_submitted += 1;
     }
     Ok(report)
+}
+
+/// Incremental D3 import. A source range is checkpointed only after the C3
+/// worker receives a provider acknowledgement (or idempotency reconciliation).
+/// Therefore a process killed between provider commit and checkpoint rename may
+/// replay at most one stable capture id, which the provider store deduplicates.
+pub fn import_history_resumable_from_dir(
+    plan: &ImportPlan,
+    lease: &crate::runtime::memory_context::MemoryContextLease,
+    sessions_dir: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+    batch_size: usize,
+    worker: &crate::runtime::capture_worker::CaptureWorker,
+    provider: std::sync::Arc<dyn crate::runtime::capture_worker::CaptureProvider>,
+    cancellation: &HistoryImportCancellation,
+    emit: &mut impl FnMut(HistoryImportEvent),
+) -> Result<HistoryImportReport, HistoryImportError> {
+    use crate::runtime::chat_capture::{
+        build_chat_turn_capture, CanonicalCaptureItem, CaptureContentClass, Sensitivity,
+        TerminalTurnHistory,
+    };
+    use crate::runtime::memory_context::{ProjectId, RetentionClass, SessionId, TurnId};
+    use agent_core::core::disclosure::{
+        gate_for_model, may_persist, DisclosureClass, ModelVisibility,
+    };
+    use agent_core::core::session_index::{SessionIndexEventKind, SessionIndexRecord};
+    use std::collections::HashSet;
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, SystemTime};
+
+    let started = Instant::now();
+    let mut report = HistoryImportReport::default();
+    let mut bytes_processed = 0_u64;
+    let key = import_checkpoint_key(&plan.preview.project_id);
+    let mut committed = load_import_checkpoint(checkpoint_path, &key)?;
+
+    let run = (|| {
+        if batch_size == 0 || batch_size > IMPORT_BATCH_MAX_RECORDS {
+            return Err(HistoryImportError::InvalidBatchSize);
+        }
+        if lease.project_id.as_str() != plan.preview.project_id {
+            return Err(HistoryImportError::InvalidIdentity);
+        }
+        if cancellation.is_cancelled() {
+            return Err(HistoryImportError::Cancelled);
+        }
+
+        let index = match std::fs::File::open(sessions_dir.join("index.jsonl")) {
+            Ok(index) => index,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+            Err(_) => return Err(HistoryImportError::SessionIndexReadFailed),
+        };
+        let mut scoped = HashSet::new();
+        for line in std::io::BufReader::new(index).lines() {
+            let line = line.map_err(|_| HistoryImportError::SessionIndexReadFailed)?;
+            let Ok(record) = serde_json::from_str::<SessionIndexRecord>(&line) else {
+                continue;
+            };
+            if record.event == SessionIndexEventKind::Start
+                && record.cwd.as_deref() == Some(plan.preview.project_root.as_path())
+            {
+                scoped.insert(record.session_id);
+            }
+        }
+
+        let project_id = ProjectId::parse(&plan.preview.project_id)
+            .map_err(|_| HistoryImportError::InvalidIdentity)?;
+        let redactor = |text: &str| redact_import_text(text);
+        let mut ids: Vec<String> = agent_core::session_journal::session_dir_entries(sessions_dir)
+            .map_err(|_| HistoryImportError::SessionIndexReadFailed)?
+            .into_iter()
+            .filter_map(|entry| entry.name.strip_suffix(".json").map(str::to_owned))
+            .filter(|id| scoped.contains(id))
+            .collect();
+        ids.sort();
+
+        let mut submitted_in_batch = 0_usize;
+        for id in ids {
+            if cancellation.is_cancelled() {
+                return Err(HistoryImportError::Cancelled);
+            }
+            let session = agent_core::session::Session::load_from_dir(sessions_dir, &id)
+                .map_err(|_| HistoryImportError::SessionLoadFailed)?;
+            report.sessions_loaded += 1;
+            let session_id =
+                SessionId::parse(&session.id).map_err(|_| HistoryImportError::InvalidIdentity)?;
+            let started_at: SystemTime = session.created_at.into();
+            let completed_at: SystemTime = session.updated_at.into();
+            let mut pending_user: Option<String> = None;
+            let mut ordinal = 0_u64;
+
+            for message in &session.api_messages {
+                if cancellation.is_cancelled() {
+                    return Err(HistoryImportError::Cancelled);
+                }
+                let role = message.get("role").and_then(serde_json::Value::as_str);
+                let Some(text) = import_message_text(message) else {
+                    continue;
+                };
+                match role {
+                    Some("user") => pending_user = Some(text),
+                    Some("assistant") => {
+                        let Some(user) = pending_user.take() else {
+                            continue;
+                        };
+                        ordinal = ordinal.saturating_add(1);
+                        let disclosure = DisclosureClass::ModelVisibleAfterRedaction;
+                        if !may_persist(disclosure) {
+                            continue;
+                        }
+                        let user = match gate_for_model(disclosure, &user, false, Some(&redactor)) {
+                            ModelVisibility::Visible(text) => text,
+                            ModelVisibility::Withheld(_) => continue,
+                        };
+                        let assistant =
+                            match gate_for_model(disclosure, &text, false, Some(&redactor)) {
+                                ModelVisibility::Visible(text) => text,
+                                ModelVisibility::Withheld(_) => continue,
+                            };
+                        let history = TerminalTurnHistory {
+                            project_id: project_id.clone(),
+                            session_id: session_id.clone(),
+                            turn_id: TurnId::parse(&format!("import-{ordinal}"))
+                                .map_err(|_| HistoryImportError::InvalidIdentity)?,
+                            turn_ordinal: ordinal,
+                            started_at,
+                            completed_at: completed_at.max(started_at + Duration::from_nanos(1)),
+                            outcome: agent_core::TurnOutcome::Completed,
+                            items: vec![
+                                CanonicalCaptureItem {
+                                    project_id: project_id.clone(),
+                                    class: CaptureContentClass::UserMessage,
+                                    disclosure,
+                                    sensitivity: Sensitivity::Normal,
+                                    text: user,
+                                    tool_name: None,
+                                },
+                                CanonicalCaptureItem {
+                                    project_id: project_id.clone(),
+                                    class: CaptureContentClass::AssistantFinal,
+                                    disclosure,
+                                    sensitivity: Sensitivity::Normal,
+                                    text: assistant,
+                                    tool_name: None,
+                                },
+                            ],
+                            compaction: None,
+                        };
+                        let capture =
+                            build_chat_turn_capture(&project_id, history, RetentionClass::Standard)
+                                .map_err(|_| HistoryImportError::CaptureBuildFailed)?;
+                        report.captures_built += 1;
+                        let digest = capture.source_digest.to_hex();
+                        if committed.contains(&digest) {
+                            report.ranges_skipped += 1;
+                            continue;
+                        }
+                        let capture_bytes = capture
+                            .user
+                            .content
+                            .text
+                            .len()
+                            .saturating_add(capture.assistant.content.text.len())
+                            as u64;
+                        let (receipt_tx, receipt_rx) = mpsc::channel();
+                        if !worker.submit_built_with_receipt(
+                            lease,
+                            capture,
+                            provider.clone(),
+                            receipt_tx,
+                        ) {
+                            return Err(HistoryImportError::CaptureQueueFull);
+                        }
+                        loop {
+                            match receipt_rx.try_recv() {
+                                Ok(Ok(())) => break,
+                                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                                    return Err(HistoryImportError::ProviderCaptureFailed)
+                                }
+                                Err(mpsc::TryRecvError::Empty) if cancellation.is_cancelled() => {
+                                    return Err(HistoryImportError::Cancelled)
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                            }
+                        }
+                        // Cancellation can race with a provider acknowledgement.
+                        // Do not advance the host checkpoint after cancellation;
+                        // the stable C1 idempotency key makes this ambiguous range
+                        // safe for the existing C3/plugin store to see on resume.
+                        if cancellation.is_cancelled() {
+                            return Err(HistoryImportError::Cancelled);
+                        }
+
+                        committed.insert(digest);
+                        persist_import_checkpoint(checkpoint_path, &key, &committed)?;
+                        bytes_processed = bytes_processed.saturating_add(capture_bytes);
+                        submitted_in_batch += 1;
+                        if submitted_in_batch == batch_size {
+                            report.batches_submitted += 1;
+                            submitted_in_batch = 0;
+                        }
+                        emit(HistoryImportEvent::progress(
+                            committed.len(),
+                            plan.preview.session_count,
+                            bytes_processed,
+                            started.elapsed(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if submitted_in_batch != 0 {
+            report.batches_submitted += 1;
+        }
+        Ok(report)
+    })();
+
+    if let Err(error) = &run {
+        emit(HistoryImportEvent::error(
+            committed.len(),
+            bytes_processed,
+            started.elapsed(),
+            error.clone(),
+        ));
+    }
+    run
+}
+
+fn import_checkpoint_key(project_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"synaps-memory-history-checkpoint-v1\0");
+    digest.update(project_id.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn load_import_checkpoint(
+    path: &std::path::Path,
+    key: &str,
+) -> Result<std::collections::HashSet<String>, HistoryImportError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(_) => return Err(HistoryImportError::CheckpointReadFailed),
+    };
+    if bytes.len() as u64 > CHECKPOINT_FILE_MAX_BYTES {
+        return Err(HistoryImportError::CheckpointReadFailed);
+    }
+    let checkpoint: ImportCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|_| HistoryImportError::CheckpointReadFailed)?;
+    if checkpoint.version != 1 {
+        return Err(HistoryImportError::CheckpointReadFailed);
+    }
+    if checkpoint.key != key {
+        return Ok(Default::default());
+    }
+    if checkpoint
+        .committed_source_digests
+        .iter()
+        .any(|digest| digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(HistoryImportError::CheckpointReadFailed);
+    }
+    Ok(checkpoint.committed_source_digests.into_iter().collect())
+}
+
+fn persist_import_checkpoint(
+    path: &std::path::Path,
+    key: &str,
+    committed: &std::collections::HashSet<String>,
+) -> Result<(), HistoryImportError> {
+    use std::io::Write;
+    let mut digests: Vec<_> = committed.iter().cloned().collect();
+    digests.sort();
+    let bytes = serde_json::to_vec(&ImportCheckpoint {
+        version: 1,
+        key: key.to_owned(),
+        committed_source_digests: digests,
+    })
+    .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    if bytes.len() as u64 > CHECKPOINT_FILE_MAX_BYTES {
+        return Err(HistoryImportError::CheckpointWriteFailed);
+    }
+    let parent = path
+        .parent()
+        .ok_or(HistoryImportError::CheckpointWriteFailed)?;
+    std::fs::create_dir_all(parent).map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.as_file_mut().sync_all())
+        .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    temporary
+        .persist(path)
+        .map_err(|_| HistoryImportError::CheckpointWriteFailed)?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn load_import_checkpoint_for_test(
+    path: &std::path::Path,
+) -> Result<std::collections::HashSet<String>, HistoryImportError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(_) => return Err(HistoryImportError::CheckpointReadFailed),
+    };
+    let checkpoint: ImportCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|_| HistoryImportError::CheckpointReadFailed)?;
+    Ok(checkpoint.committed_source_digests.into_iter().collect())
 }
 
 fn submit_import_batch(
@@ -750,8 +1193,10 @@ mod tests {
         use agent_core::session_journal::{save_session_in_dir, SessionPersistence};
         use chrono::{TimeZone, Utc};
         use serde_json::json;
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, SystemTime};
+        use std::time::{Duration, Instant, SystemTime};
 
         struct RecordingProvider {
             captures: Mutex<Vec<ChatTurnCapture>>,
@@ -1026,6 +1471,189 @@ mod tests {
 
             assert_eq!(error, HistoryImportError::CaptureQueueFull);
             assert!(worker.overflow_drops() >= 1);
+        }
+
+        struct DurableDigestProvider {
+            digests: Mutex<HashSet<String>>,
+            committed: AtomicUsize,
+            cancel_after: Option<usize>,
+            cancel: Option<HistoryImportCancellation>,
+        }
+
+        impl CaptureProvider for DurableDigestProvider {
+            fn capture(&self, capture: ChatTurnCapture) -> Result<(), CaptureFailure> {
+                let inserted = self
+                    .digests
+                    .lock()
+                    .unwrap()
+                    .insert(capture.source_digest.to_hex());
+                if inserted {
+                    let committed = self.committed.fetch_add(1, Ordering::SeqCst) + 1;
+                    if self.cancel_after == Some(committed) {
+                        self.cancel.as_ref().unwrap().cancel();
+                    }
+                }
+                Ok(())
+            }
+
+            fn contains_capture(
+                &self,
+                _capture_id: &[u8; 32],
+            ) -> Result<crate::runtime::capture_worker::CaptureCommitState, CaptureFailure>
+            {
+                Ok(crate::runtime::capture_worker::CaptureCommitState::Absent)
+            }
+        }
+
+        fn many_turn_session(id: &str, turns: usize, sentinel: &str) -> Session {
+            let mut session = fixture_session(id, &format!("{sentinel}-u1"), "a1");
+            for turn in 2..=turns {
+                session.api_messages.push(Arc::new(json!({
+                    "role": "user", "content": format!("{sentinel}-u{turn}")
+                })));
+                session.api_messages.push(Arc::new(json!({
+                    "role": "assistant", "content": format!("a{turn}")
+                })));
+            }
+            session
+        }
+
+        fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) {
+            let deadline = Instant::now() + timeout;
+            while !predicate() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(predicate());
+        }
+
+        #[test]
+        fn forced_stop_resumes_last_checkpoint_without_duplicate_source_digests() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project");
+            let sessions = temp.path().join("sessions");
+            let checkpoints = temp.path().join("private/import-checkpoints.json");
+            std::fs::create_dir_all(&root).unwrap();
+            let session = many_turn_session("resume", 6, "CONTENT_SENTINEL");
+            save_session_in_dir(&sessions, &session, SessionPersistence::Json).unwrap();
+            append_index(&sessions, "resume", &root);
+
+            let cancel = HistoryImportCancellation::new();
+            let first_provider = Arc::new(DurableDigestProvider {
+                digests: Mutex::new(HashSet::new()),
+                committed: AtomicUsize::new(0),
+                cancel_after: Some(2),
+                cancel: Some(cancel.clone()),
+            });
+            let worker = CaptureWorker::new(8);
+            let mut first_events = Vec::new();
+            let first = import_history_resumable_from_dir(
+                &plan(&root, 1),
+                &lease(),
+                &sessions,
+                &checkpoints,
+                1,
+                &worker,
+                first_provider.clone(),
+                &cancel,
+                &mut |event| first_events.push(event),
+            );
+            assert_eq!(first, Err(HistoryImportError::Cancelled));
+            wait_until(Duration::from_secs(1), || {
+                first_provider.committed.load(Ordering::SeqCst) == 2
+            });
+
+            let first_digests = first_provider.digests.lock().unwrap().clone();
+            let resume_provider = Arc::new(DurableDigestProvider {
+                digests: Mutex::new(first_digests.clone()),
+                committed: AtomicUsize::new(0),
+                cancel_after: None,
+                cancel: None,
+            });
+            let resume_worker = CaptureWorker::new(8);
+            let mut resume_events = Vec::new();
+            let report = import_history_resumable_from_dir(
+                &plan(&root, 1),
+                &lease(),
+                &sessions,
+                &checkpoints,
+                1,
+                &resume_worker,
+                resume_provider.clone(),
+                &HistoryImportCancellation::new(),
+                &mut |event| resume_events.push(event),
+            )
+            .unwrap();
+            wait_until(Duration::from_secs(1), || {
+                resume_provider.digests.lock().unwrap().len() == 6
+            });
+
+            let final_digests = resume_provider.digests.lock().unwrap();
+            assert_eq!(final_digests.len(), 6, "source ranges must be unique");
+            assert_eq!(report.ranges_skipped, 1, "resume starts at last checkpoint");
+            assert!(std::fs::metadata(&checkpoints).unwrap().len() <= CHECKPOINT_FILE_MAX_BYTES);
+            #[cfg(unix)]
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(
+                    &std::fs::metadata(&checkpoints).unwrap().permissions()
+                ) & 0o777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn cancellation_keeps_checkpoint_consistent_and_does_not_block_producer() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().join("project");
+            let sessions = temp.path().join("sessions");
+            let checkpoints = temp.path().join("private/import-checkpoints.json");
+            std::fs::create_dir_all(&root).unwrap();
+            let session = many_turn_session("cancel", 20, "CANCEL_SENTINEL");
+            save_session_in_dir(&sessions, &session, SessionPersistence::Json).unwrap();
+            append_index(&sessions, "cancel", &root);
+
+            let cancel = HistoryImportCancellation::new();
+            cancel.cancel();
+            let provider = Arc::new(RecordingProvider::default());
+            let worker = CaptureWorker::new(1);
+            let started = Instant::now();
+            let result = import_history_resumable_from_dir(
+                &plan(&root, 1),
+                &lease(),
+                &sessions,
+                &checkpoints,
+                1,
+                &worker,
+                provider,
+                &cancel,
+                &mut |_| {},
+            );
+
+            assert_eq!(result, Err(HistoryImportError::Cancelled));
+            assert!(started.elapsed() < Duration::from_millis(100));
+            assert!(load_import_checkpoint_for_test(&checkpoints)
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn progress_and_error_events_are_metadata_only() {
+            let event = HistoryImportEvent::progress(3, 7, 1024, Duration::from_millis(9));
+            let error = HistoryImportEvent::error(
+                3,
+                1024,
+                Duration::from_millis(10),
+                HistoryImportError::SessionLoadFailed,
+            );
+            for serialized in [
+                serde_json::to_string(&event).unwrap(),
+                serde_json::to_string(&error).unwrap(),
+            ] {
+                assert!(!serialized.contains("CONTENT_SENTINEL"));
+                assert!(!serialized.contains("project"));
+                assert!(!serialized.contains("path"));
+                assert!(!serialized.contains("content"));
+            }
+            assert_eq!(event.name, "memory_import.progress");
         }
     }
 }
