@@ -298,6 +298,16 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// The validated recall contribution held for the CURRENT turn, if any
+    /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
+    /// never raw text — admitted only through the
+    /// [`memory_context::validate_contribution`] gate. Phase A scope: it
+    /// feeds ONLY the T29 context-budget `memory_contents` lane in
+    /// [`Runtime::assess_context`]; per-provider wire injection is task B4.
+    /// Shared across `Clone`s (same session, one truth) but NEVER inherited
+    /// by subagents — every constructor initializes the slot empty, same
+    /// invariant as `memory_context_state` above.
+    pending_memory_segment: std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
     /// Writer handle backing the most recent armed one-shot ephemeral
     /// trace context (telemetry Off + `/trace next`). Retained here — not
     /// only inside the request's cloned context — so the session exit
@@ -560,6 +570,9 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            // Empty per construction — a held recall segment is turn-scoped
+            // session state and is never copied into a fresh runtime.
+            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir,
             cache_diagnostics: false,
@@ -649,6 +662,9 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            // Empty per construction — a held recall segment is turn-scoped
+            // session state and is never copied into a fresh runtime.
+            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: trace::default_capture_dir(),
             cache_diagnostics: false,
@@ -1411,16 +1427,29 @@ impl Runtime {
     /// configured reserves (thinking budget, tool-result cap, model output
     /// reserve, provider window with the documented safety margin).
     ///
-    /// Skill and memory bodies that reach the request do so through the
-    /// system prompt or history today, so they are already accounted there;
-    /// the separate breakdown lanes are fed once loaders hand the engine
-    /// distinct segments.
+    /// Skill bodies that reach the request do so through the system prompt
+    /// or history today, so they are already accounted there; the skill lane
+    /// is fed once loaders hand the engine distinct segments. The memory
+    /// lane is live as of task A7: a validated recall segment held for the
+    /// current turn is charged to `ContextBreakdown::memory_tokens` (spec
+    /// §10.3 — memory competes for budget headroom only, never reserves).
     pub async fn assess_context(
         &self,
         messages: &[crate::SharedMessage],
     ) -> context::ContextAssessment {
         let system = self.effective_system_prompt().await;
         let schema = self.tools.read().await.tools_schema();
+        // Task A7 (spec §10.1/§10.3): the T29 memory lane is fed by the
+        // validated recall segment held for this turn, if any. No held
+        // segment ⇒ the lane stays empty — byte-identical to the pre-A7
+        // assessment. Cloned out so no lock is held across the estimate.
+        let memory_rendered: Option<String> = self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|segment| segment.rendered_text().to_string());
+        let memory_contents: Vec<&str> = memory_rendered.as_deref().into_iter().collect();
         context::assess(&context::ContextBudgetInputs {
             model: &self.model,
             provider_window: self.context_window(),
@@ -1428,11 +1457,54 @@ impl Runtime {
             tools_schema: &schema,
             messages,
             skill_contents: &[],
-            memory_contents: &[],
+            memory_contents: &memory_contents,
             thinking_budget_tokens: self.thinking_budget as u64,
             next_tool_result_bytes: self.max_tool_output as u64,
             output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
         })
+    }
+
+    /// Task A7: hold a validated recall contribution for the current turn as
+    /// a typed [`memory_context::ContextSegment`] (spec §10.1 — typed
+    /// segment, never raw text). Fail-closed acceptance gate:
+    ///
+    /// - the §10.3 budget must clear its minimum floor for the session's
+    ///   provider window ([`memory_context::memory_budget_tokens`]) —
+    ///   otherwise recall is skipped and nothing is held;
+    /// - [`memory_context::validate_contribution`] must pass — project
+    ///   identity (spec §5.2), schema, and bounds — otherwise nothing is
+    ///   held.
+    ///
+    /// Phase A scope: a held segment feeds ONLY the T29 budget lane in
+    /// [`Self::assess_context`]; per-provider wire injection is task B4.
+    /// Hold-time uses the provider window as the capacity input — the
+    /// conservative upper bound available before a request exists; B4's
+    /// injection path re-checks against the request-aware effective budget.
+    #[allow(dead_code)] // exercised by tests until task B4 routes real recall
+    pub(crate) fn hold_memory_contribution(
+        &self,
+        contribution: memory_context::MemoryContextContribution,
+    ) -> std::result::Result<(), memory_context::MemoryContextError> {
+        let budget = memory_context::memory_budget_tokens(self.context_window())
+            .ok_or(memory_context::MemoryContextError::RecallBudgetBelowMinimum)?;
+        memory_context::validate_contribution(&contribution, &memory_project_id(), budget)?;
+        *self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(memory_context::ContextSegment::Memory(contribution));
+        Ok(())
+    }
+
+    /// Task A7: drop any recall segment held for the current turn. Idempotent.
+    /// Task B4 calls this on turn completion; the disable/revocation path may
+    /// also use it defensively.
+    #[allow(dead_code)] // exercised by tests until task B4 routes real recall
+    pub(crate) fn clear_memory_contribution(&self) {
+        *self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
@@ -2750,6 +2822,9 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            // Clones are the same session: they observe the same held
+            // recall segment (one truth), like memory_context_state above.
+            pending_memory_segment: std::sync::Arc::clone(&self.pending_memory_segment),
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,

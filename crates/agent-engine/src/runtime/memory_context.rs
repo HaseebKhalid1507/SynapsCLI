@@ -863,6 +863,21 @@ pub enum MemoryContextError {
     /// Fail closed — the host never picks one arbitrarily, and nothing
     /// was granted.
     ProviderAmbiguous,
+    /// A recall contribution's project identity does not match the host's
+    /// expected project (spec §5.2 isolation) — rejected fail-closed, the
+    /// contribution never influences budgeting or request assembly.
+    ContributionProjectMismatch,
+    /// A recall contribution exceeded a spec §10.3 bound (record count,
+    /// per-record size, or engine-provided rendered budget). Content-free:
+    /// only the static field name is carried.
+    ContributionOutOfBounds {
+        /// Static name of the offending field.
+        field: &'static str,
+    },
+    /// The computed §10.3 recall budget is below the minimum useful floor —
+    /// recall is skipped rather than reducing core reserves; nothing was
+    /// held.
+    RecallBudgetBelowMinimum,
 }
 
 impl std::fmt::Display for MemoryContextError {
@@ -911,6 +926,17 @@ impl std::fmt::Display for MemoryContextError {
                 f,
                 "multiple installed extensions declare overlapping memory context providers; \
                  an exact provider id is required (nothing was granted)"
+            ),
+            MemoryContextError::ContributionProjectMismatch => write!(
+                f,
+                "memory contribution targets a different project (rejected, nothing admitted)"
+            ),
+            MemoryContextError::ContributionOutOfBounds { field } => {
+                write!(f, "memory contribution exceeds its bound: {field}")
+            }
+            MemoryContextError::RecallBudgetBelowMinimum => write!(
+                f,
+                "memory recall budget is below the minimum useful floor; recall skipped"
             ),
         }
     }
@@ -1060,6 +1086,224 @@ impl std::fmt::Debug for MemoryContextCapability {
         f.debug_struct("MemoryContextCapability")
             .finish_non_exhaustive()
     }
+}
+
+// ---------------------------------------------------------------------------
+// §6.5 / §10.1 Recall contribution — typed segment, never raw text
+// ---------------------------------------------------------------------------
+
+bounded_identifier!(
+    /// Version of the contribution schema a provider produced (spec §6.5).
+    /// Parse-at-the-boundary: empty/oversized/control input fails closed, so
+    /// a constructed value is never empty.
+    ContributionSchemaVersion,
+    "contribution_schema"
+);
+bounded_identifier!(
+    /// Identity of one stored memory record (spec §6.5).
+    MemoryId,
+    "memory_id"
+);
+
+/// Source class of a recalled record (spec §6.5). Minimal closed set for the
+/// Phase A typed boundary; the retrieval pipeline (task B1) extends it to the
+/// full spec §9 vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemorySource {
+    /// Consolidated from captured chat history (spec §8).
+    #[default]
+    ChatHistory,
+    /// Explicitly stated by the user.
+    UserStated,
+}
+
+/// Why the provider ranked a record into the contribution (spec §6.5, §10.4
+/// explainability). Minimal closed set until task B1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankReason {
+    /// Exact topical match against the recall query.
+    ExactTopic,
+    /// Recency-weighted selection.
+    Recency,
+}
+
+/// Sensitivity class of a recalled record (spec §6.5). Mirrors the workspace
+/// memory-store vocabulary; disclosure enforcement lands in task B1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sensitivity {
+    /// Ordinary project data.
+    #[default]
+    Normal,
+    /// Secret-class content — bodies are never disclosed in rendered output.
+    Secret,
+}
+
+/// Retention class of a recalled record (spec §6.5). Placeholder single
+/// variant until the consolidation/retention flow lands (spec §11, Phase B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetentionClass {
+    /// Standard project retention.
+    #[default]
+    Standard,
+}
+
+/// Provider-reported recall accounting (spec §6.5, §10.4): bounded counters
+/// only — never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContributionAccounting {
+    /// Candidate records the provider considered before selection.
+    pub candidates_considered: u32,
+    /// Records withheld by disclosure policy (counted, never named).
+    pub withheld: u32,
+    /// Records truncated to fit their per-record bound.
+    pub truncated: u32,
+}
+
+/// One record inside a recall contribution (spec §6.5, verbatim shape).
+/// Content fields are [`BoundedText`] — byte-bounded at construction, exact
+/// truncation accounting preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryContributionRecord {
+    /// Identity of the stored memory this record was recalled from.
+    pub memory_id: MemoryId,
+    /// Source class of the record.
+    pub source: MemorySource,
+    /// When the underlying memory was recorded.
+    pub timestamp: SystemTime,
+    /// Why the provider ranked this record in (explainability, spec §10.4).
+    pub rank_reason: Vec<RankReason>,
+    /// Sensitivity class of the record.
+    pub sensitivity: Sensitivity,
+    /// Retention class of the record.
+    pub retention: RetentionClass,
+    /// Bounded record body.
+    pub content: BoundedText,
+    /// Whether the provider truncated the body to fit its bound.
+    pub truncated: bool,
+    /// The memory this record supersedes, if any.
+    pub supersedes: Option<MemoryId>,
+}
+
+/// A provider's recall contribution for one turn (spec §6.5, verbatim
+/// shape). The host accepts one only through [`validate_contribution`] —
+/// project identity, schema, and bounds are checked before it may influence
+/// budgeting or (in task B4) request assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryContextContribution {
+    /// Contribution schema version the provider produced.
+    pub schema: ContributionSchemaVersion,
+    /// The provider that produced this contribution.
+    pub provider_id: ContextProviderId,
+    /// Project isolation boundary the records belong to (spec §5.2).
+    pub project_id: ProjectId,
+    /// The selected records (≤ [`MEMORY_MAX_SELECTED_RECORDS`]).
+    pub records: Vec<MemoryContributionRecord>,
+    /// The bounded rendered text the engine budgets (and, in task B4,
+    /// injects as a typed segment — never a system message, spec §5.3).
+    pub rendered: BoundedText,
+    /// Bounded recall accounting counters.
+    pub accounting: ContributionAccounting,
+}
+
+/// Typed context segment admitted to provider request assembly (spec §10.1):
+/// accepted memory enters as `ContextSegment::Memory(...)`, never as raw
+/// text, never appended to the user message, and never as system policy.
+/// Deliberately a single-variant enum today — it exists to make the "typed
+/// segment, not raw text" boundary explicit and extensible. Per-provider
+/// wire translation of the segment is task B4; in Phase A the segment only
+/// feeds the T29 context-budget lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextSegment {
+    /// An accepted, validated memory recall contribution.
+    Memory(MemoryContextContribution),
+}
+
+impl ContextSegment {
+    /// The bounded rendered text this segment contributes to context
+    /// budgeting (T29 `memory_contents` lane).
+    pub fn rendered_text(&self) -> &str {
+        match self {
+            ContextSegment::Memory(contribution) => &contribution.rendered.text,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §10.3 Budget policy
+// ---------------------------------------------------------------------------
+
+/// Spec §10.3 hard ceiling on the memory recall budget, in estimated tokens.
+pub const MEMORY_BUDGET_MAX_TOKENS: u64 = 4096;
+
+/// Spec §10.3: memory may use at most this percentage of the effective
+/// provider input capacity.
+pub const MEMORY_BUDGET_CAPACITY_PERCENT: u64 = 10;
+
+/// Spec §10.3 minimum useful recall budget in estimated tokens. Below this,
+/// recall is skipped entirely — core safety/output/tool-result reserves are
+/// NEVER reduced to make room for memory.
+pub const MEMORY_BUDGET_MIN_TOKENS: u64 = 512;
+
+/// Spec §10.3: maximum selected records per contribution.
+pub const MEMORY_MAX_SELECTED_RECORDS: usize = 8;
+
+/// Spec §10.3: maximum rendered bytes for one individual record (2 KiB).
+pub const MEMORY_MAX_RENDERED_RECORD_BYTES: usize = 2048;
+
+/// The memory recall budget for a request, per spec §10.3 exactly:
+/// `min(4096, 10% of effective_provider_input_capacity)` estimated tokens,
+/// or `None` (skip recall) when the computed value falls below the
+/// [`MEMORY_BUDGET_MIN_TOKENS`] floor. Pure — no engine state is read.
+pub fn memory_budget_tokens(effective_provider_input_capacity: u64) -> Option<u64> {
+    let capacity_share = effective_provider_input_capacity
+        .saturating_mul(MEMORY_BUDGET_CAPACITY_PERCENT)
+        / 100;
+    let budget = MEMORY_BUDGET_MAX_TOKENS.min(capacity_share);
+    (budget >= MEMORY_BUDGET_MIN_TOKENS).then_some(budget)
+}
+
+/// Host-side contribution acceptance gate (spec §6.5: "The host validates
+/// project ID, record count, record sizes, total size, disclosure classes,
+/// and schema version"). Phase A scope — minimal but real:
+///
+/// - project identity mismatch fails closed (spec §5.2 isolation is a
+///   Phase A invariant, never deferred);
+/// - schema version must be non-empty (already guaranteed by the
+///   [`ContributionSchemaVersion`] parse gate; re-checked here so the
+///   validator stays the single acceptance authority when task B1 adds
+///   boundary deserialization);
+/// - record count, per-record size, and total rendered size are bounded
+///   (`max_rendered_tokens` is the ENGINE-provided budget from
+///   [`memory_budget_tokens`] — never plugin-chosen).
+///
+/// Disclosure-class and duplicate-ID checks belong to task B1.
+pub fn validate_contribution(
+    contribution: &MemoryContextContribution,
+    expected_project: &ProjectId,
+    max_rendered_tokens: u64,
+) -> Result<(), MemoryContextError> {
+    if contribution.project_id != *expected_project {
+        return Err(MemoryContextError::ContributionProjectMismatch);
+    }
+    if contribution.schema.as_str().trim().is_empty() {
+        return Err(MemoryContextError::ContributionOutOfBounds { field: "schema" });
+    }
+    if contribution.records.len() > MEMORY_MAX_SELECTED_RECORDS {
+        return Err(MemoryContextError::ContributionOutOfBounds { field: "records" });
+    }
+    for record in &contribution.records {
+        if record.content.retained_bytes > MEMORY_MAX_RENDERED_RECORD_BYTES {
+            return Err(MemoryContextError::ContributionOutOfBounds {
+                field: "record_content",
+            });
+        }
+    }
+    let rendered_tokens =
+        crate::runtime::context::conservative_token_estimate(&contribution.rendered.text);
+    if rendered_tokens > max_rendered_tokens {
+        return Err(MemoryContextError::ContributionOutOfBounds { field: "rendered" });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1518,5 +1762,137 @@ mod tests {
         .expect("disable succeeds");
         assert_eq!(status.durable, DurableStatus::Off);
         assert_eq!(status.one_shot, OneShotStatus::Idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task A7 — §10.3 budget policy and §6.5 contribution validation
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic, in-bounds contribution for validator tests.
+    pub(crate) fn synthetic_contribution(
+        project: &ProjectId,
+        rendered: &str,
+    ) -> MemoryContextContribution {
+        MemoryContextContribution {
+            schema: ContributionSchemaVersion::parse("contribution/1").expect("valid schema"),
+            provider_id: ContextProviderId::parse("axel-memory").expect("valid provider"),
+            project_id: project.clone(),
+            records: vec![MemoryContributionRecord {
+                memory_id: MemoryId::parse("mem-0001").expect("valid memory id"),
+                source: MemorySource::ChatHistory,
+                timestamp: SystemTime::UNIX_EPOCH,
+                rank_reason: vec![RankReason::ExactTopic, RankReason::Recency],
+                sensitivity: Sensitivity::Normal,
+                retention: RetentionClass::Standard,
+                content: BoundedText::new("session-scoped authorization decision", 2048),
+                truncated: false,
+                supersedes: None,
+            }],
+            rendered: BoundedText::new(rendered, MEMORY_MAX_RENDERED_RECORD_BYTES * 8),
+            accounting: ContributionAccounting {
+                candidates_considered: 1,
+                withheld: 0,
+                truncated: 0,
+            },
+        }
+    }
+
+    fn pid(raw: &str) -> ProjectId {
+        ProjectId::parse(raw).expect("valid project id")
+    }
+
+    /// Spec §10.3 exactly: `min(4096, 10% of capacity)` at several window
+    /// sizes, including the exact ceiling and floor crossover points.
+    #[test]
+    fn memory_budget_matches_the_min_4096_ten_percent_formula() {
+        // 10% dominates the 4096 ceiling.
+        assert_eq!(memory_budget_tokens(200_000), Some(4_096));
+        assert_eq!(memory_budget_tokens(1_000_000), Some(4_096));
+        // Exact crossover: 10% of 40_960 is exactly 4_096.
+        assert_eq!(memory_budget_tokens(40_960), Some(4_096));
+        // Below the crossover the 10% share governs.
+        assert_eq!(memory_budget_tokens(32_768), Some(3_276));
+        assert_eq!(memory_budget_tokens(8_192), Some(819));
+        // Exact floor: 10% of 5_120 is exactly the 512 minimum.
+        assert_eq!(memory_budget_tokens(5_120), Some(512));
+        // Saturating arithmetic never wraps at absurd capacities.
+        assert_eq!(memory_budget_tokens(u64::MAX), Some(4_096));
+    }
+
+    /// Spec §10.3: below the 512-token minimum, recall is skipped (`None`) —
+    /// reserves are never shrunk to make room.
+    #[test]
+    fn memory_budget_returns_none_below_the_minimum_floor() {
+        assert_eq!(memory_budget_tokens(5_110), None); // 511 < 512
+        assert_eq!(memory_budget_tokens(4_000), None);
+        assert_eq!(memory_budget_tokens(512), None); // 10% of 512 is 51
+        assert_eq!(memory_budget_tokens(0), None);
+    }
+
+    /// Project isolation (spec §5.2) is a Phase A invariant: a contribution
+    /// for a different project fails closed; a matching one is accepted.
+    #[test]
+    fn validate_contribution_enforces_project_identity() {
+        let project = pid("project-a");
+        let contribution = synthetic_contribution(&project, "rendered memory text");
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096),
+            Ok(())
+        );
+        assert_eq!(
+            validate_contribution(&contribution, &pid("project-b"), 4_096),
+            Err(MemoryContextError::ContributionProjectMismatch)
+        );
+    }
+
+    /// Spec §10.3 bounds fail closed: record count above 8, an oversized
+    /// individual record, and rendered text above the ENGINE-provided budget
+    /// are each rejected with a content-free error.
+    #[test]
+    fn validate_contribution_enforces_spec_10_3_bounds() {
+        let project = pid("project-a");
+
+        let mut too_many = synthetic_contribution(&project, "rendered");
+        let record = too_many.records[0].clone();
+        too_many.records = vec![record; MEMORY_MAX_SELECTED_RECORDS + 1];
+        assert_eq!(
+            validate_contribution(&too_many, &project, 4_096),
+            Err(MemoryContextError::ContributionOutOfBounds { field: "records" })
+        );
+
+        let mut oversized_record = synthetic_contribution(&project, "rendered");
+        oversized_record.records[0].content = BoundedText::new(
+            &"x".repeat(MEMORY_MAX_RENDERED_RECORD_BYTES + 1),
+            MEMORY_MAX_RENDERED_RECORD_BYTES * 2,
+        );
+        assert_eq!(
+            validate_contribution(&oversized_record, &project, 4_096),
+            Err(MemoryContextError::ContributionOutOfBounds {
+                field: "record_content"
+            })
+        );
+
+        // 4_000 ASCII chars ⇒ 1_600 estimated tokens > a 512-token budget.
+        let oversized_rendered = synthetic_contribution(&project, &"y".repeat(4_000));
+        assert_eq!(
+            validate_contribution(&oversized_rendered, &project, 512),
+            Err(MemoryContextError::ContributionOutOfBounds { field: "rendered" })
+        );
+        // The same contribution passes under a budget that covers it.
+        assert_eq!(
+            validate_contribution(&oversized_rendered, &project, 4_096),
+            Ok(())
+        );
+    }
+
+    /// The typed segment (spec §10.1) exposes exactly the bounded rendered
+    /// text for budgeting — the single-variant enum is the explicit
+    /// "typed segment, not raw text" boundary.
+    #[test]
+    fn context_segment_memory_exposes_the_bounded_rendered_text() {
+        let contribution = synthetic_contribution(&pid("project-a"), "rendered memory text");
+        let segment = ContextSegment::Memory(contribution.clone());
+        assert_eq!(segment.rendered_text(), "rendered memory text");
+        assert_eq!(segment.rendered_text(), contribution.rendered.text);
     }
 }

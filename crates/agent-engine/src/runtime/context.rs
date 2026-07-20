@@ -519,4 +519,143 @@ mod tests {
             "actual system segment must be accounted"
         );
     }
+
+    /// Build a synthetic, in-bounds recall contribution for the runtime's
+    /// own project identity (task A7 budget-wiring tests).
+    fn synthetic_memory_contribution(
+        rendered: &str,
+    ) -> crate::runtime::memory_context::MemoryContextContribution {
+        use crate::runtime::memory_context as mc;
+        use agent_core::BoundedText;
+        mc::MemoryContextContribution {
+            schema: mc::ContributionSchemaVersion::parse("contribution/1").expect("valid schema"),
+            provider_id: mc::ContextProviderId::parse("axel-memory").expect("valid provider"),
+            project_id: crate::runtime::memory_project_id(),
+            records: vec![mc::MemoryContributionRecord {
+                memory_id: mc::MemoryId::parse("mem-0001").expect("valid memory id"),
+                source: mc::MemorySource::ChatHistory,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                rank_reason: vec![mc::RankReason::ExactTopic],
+                sensitivity: mc::Sensitivity::Normal,
+                retention: mc::RetentionClass::Standard,
+                content: BoundedText::new("the project uses session-scoped authorization", 2048),
+                truncated: false,
+                supersedes: None,
+            }],
+            rendered: BoundedText::new(rendered, 16 * 1024),
+            accounting: mc::ContributionAccounting::default(),
+        }
+    }
+
+    /// Task A7 (spec §10.3): a held recall contribution is charged EXACTLY
+    /// to the `memory_tokens` breakdown lane — `used_tokens`/`remaining_tokens`
+    /// move by exactly the estimated memory tokens, every other breakdown
+    /// lane is unchanged, and the typed reserves (thinking, tool-result,
+    /// output, safety margin) are bit-for-bit identical with and without the
+    /// contribution: memory competes for budget headroom only, NEVER for
+    /// reserves. Clearing the contribution restores the assessment
+    /// bit-for-bit.
+    #[tokio::test]
+    async fn memory_contribution_charges_only_the_memory_lane_and_never_reserves() {
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_system_prompt("system prompt for the memory budget test".into());
+        runtime.set_context_window(Some(200_000));
+
+        let messages: Vec<SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": "what auth model do we use?"})),
+            Arc::new(json!({"role": "assistant", "content": "let me check"})),
+        ];
+
+        let without = runtime.assess_context(&messages).await;
+        assert_eq!(without.breakdown.memory_tokens, 0);
+
+        let rendered = "[Axel memory — lower-authority project data; verify before relying]\n\
+                        1. mem-0001 — Decision — the project uses session-scoped \
+                        authorization rather than persisted grants.";
+        runtime
+            .hold_memory_contribution(synthetic_memory_contribution(rendered))
+            .expect("in-bounds contribution for the runtime's own project is accepted");
+        let with = runtime.assess_context(&messages).await;
+
+        let expected_memory = conservative_token_estimate(rendered);
+        assert!(expected_memory > 0, "test contribution must be non-empty");
+        assert_eq!(
+            with.breakdown.memory_tokens, expected_memory,
+            "memory lane must carry exactly the estimated rendered tokens"
+        );
+
+        // Reserves: bit-for-bit identical. Memory never touches thinking,
+        // tool-result, output, or safety-margin reserves.
+        assert_eq!(
+            with.reserves, without.reserves,
+            "reserves must be COMPLETELY unaffected by memory content"
+        );
+        assert_eq!(
+            with.budget_tokens(),
+            without.budget_tokens(),
+            "the admissible budget (window minus reserves) must not move"
+        );
+
+        // Every non-memory breakdown lane is unchanged.
+        assert_eq!(with.breakdown.system_tokens, without.breakdown.system_tokens);
+        assert_eq!(
+            with.breakdown.tool_schema_tokens,
+            without.breakdown.tool_schema_tokens
+        );
+        assert_eq!(with.breakdown.history_tokens, without.breakdown.history_tokens);
+        assert_eq!(with.breakdown.framing_tokens, without.breakdown.framing_tokens);
+        assert_eq!(with.breakdown.skill_tokens, without.breakdown.skill_tokens);
+        assert_eq!(with.history_messages, without.history_messages);
+
+        // Usage moves by exactly the memory estimate — in both directions.
+        assert_eq!(with.used_tokens(), without.used_tokens() + expected_memory);
+        assert_eq!(
+            with.remaining_tokens(),
+            without.remaining_tokens() - expected_memory
+        );
+
+        // should_compact still keys off the SAME budget, now with memory
+        // usage included (not asserted to flip here — the contribution is
+        // far smaller than the window; the invariant is the inputs).
+        assert_eq!(
+            with.should_compact(),
+            with.history_messages >= MIN_COMPACTION_MESSAGES
+                && with.used_tokens() >= with.budget_tokens()
+        );
+
+        // Clearing the held segment restores the assessment bit-for-bit —
+        // the no-contribution path is byte-identical to before task A7.
+        runtime.clear_memory_contribution();
+        let cleared = runtime.assess_context(&messages).await;
+        assert_eq!(
+            cleared, without,
+            "no held contribution ⇒ assessment identical to the empty lane"
+        );
+    }
+
+    /// Task A7 fail-closed gate (spec §5.2): a contribution whose project
+    /// identity does not match the host's is refused at hold time and never
+    /// reaches the budget lane.
+    #[tokio::test]
+    async fn foreign_project_contribution_is_refused_and_never_budgeted() {
+        use crate::runtime::memory_context as mc;
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_context_window(Some(200_000));
+
+        let mut contribution = synthetic_memory_contribution("foreign project memory");
+        contribution.project_id =
+            mc::ProjectId::parse("project-not-this-host").expect("valid project id");
+        assert_eq!(
+            runtime.hold_memory_contribution(contribution),
+            Err(mc::MemoryContextError::ContributionProjectMismatch)
+        );
+
+        let messages: Vec<SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"})) as SharedMessage];
+        let assessment = runtime.assess_context(&messages).await;
+        assert_eq!(
+            assessment.breakdown.memory_tokens, 0,
+            "a refused contribution must never be budgeted"
+        );
+    }
 }
