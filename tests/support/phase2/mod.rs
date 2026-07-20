@@ -1,6 +1,11 @@
 //! Shared fixtures for the Phase 2 trace-conformance harness
 //! (`tests/phase2_trace_conformance.rs`). Loopback-only: every server binds
 //! `127.0.0.1:0`; nothing here can reach a non-loopback address.
+//!
+//! Multiple integration-test binaries include this module via `#[path]`;
+//! each binary only uses a subset of the helpers, so per-binary dead-code
+//! lints are expected and suppressed here.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
