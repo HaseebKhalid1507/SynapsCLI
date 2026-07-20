@@ -768,13 +768,16 @@ pub fn resolve_system_prompt_module(content: impl Into<String>) -> PromptModule 
 /// collect each terminal handle with reconciliation before ending the turn.
 const CODEX_SUBAGENT_SUPERVISION: &str =
     include_str!("builtin_prompts/codex_subagent_supervision.md");
+/// Project-memory lookup doctrine for OpenAI Codex models: literal bounded
+/// searches must complete before exact returned record IDs can be fetched.
+const CODEX_PROJECT_MEMORY: &str = include_str!("builtin_prompts/codex_project_memory.md");
 const ANTHROPIC_ULTRACODE_WORKFLOW: &str =
     include_str!("builtin_prompts/anthropic_ultracode_workflow.md");
 
 /// Builtin orchestration prompt adapters, shipped in source. Selection is
-/// typed: each adapter carries exact [`PromptSelectors`] (today a single
-/// `provider = openai-codex` module), so matching is provider-atom equality
-/// — never substring or inferred-family matching.
+/// typed: adapters carry exact [`PromptSelectors`] (including provider-level
+/// `openai-codex` modules), so matching is provider-atom equality — never
+/// substring or inferred-family matching.
 pub fn builtin_orchestration_adapters() -> Vec<PromptModule> {
     vec![
         PromptModule::new(
@@ -786,6 +789,17 @@ pub fn builtin_orchestration_adapters() -> Vec<PromptModule> {
             PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
             ModuleMutability::MutableGuidance,
             CODEX_SUBAGENT_SUPERVISION.trim_end(),
+        )
+        .expect("builtin doctrine is within size limit"),
+        PromptModule::new(
+            PromptModuleId::parse("builtin.codex.project-memory")
+                .expect("builtin module id is valid"),
+            "1.0.0",
+            PromptModuleSource::Builtin,
+            11,
+            PromptSelectors::provider("openai-codex").expect("builtin provider selector is valid"),
+            ModuleMutability::MutableGuidance,
+            CODEX_PROJECT_MEMORY.trim_end(),
         )
         .expect("builtin doctrine is within size limit"),
         PromptModule::new(
