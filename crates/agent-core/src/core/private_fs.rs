@@ -717,6 +717,8 @@ pub struct ConfinedEntry {
     /// `fstatat(AT_SYMLINK_NOFOLLOW)` — of the entry ITSELF, never a
     /// symlink target.
     pub mtime_unix_ms: Option<u64>,
+    /// File length from the same handle-relative stat.
+    pub byte_len: u64,
 }
 
 #[cfg(unix)]
@@ -776,6 +778,7 @@ impl ConfinedDir {
                 is_file: kind == libc::S_IFREG,
                 is_dir: kind == libc::S_IFDIR,
                 mtime_unix_ms,
+                byte_len: u64::try_from(stat.st_size).unwrap_or_default(),
             });
         }
         let close_rc = unsafe { libc::closedir(directory) }; // owns duplicated fd

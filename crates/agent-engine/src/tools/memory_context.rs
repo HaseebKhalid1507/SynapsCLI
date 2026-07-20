@@ -1,13 +1,13 @@
 //! `memory_context` control tool (task A4, spec §7.2).
 //!
-//! Scope (final): only `disable`, `status`, and `recall_once` commit directly
-//! — they are always locally safe/revocable (spec §7.2 rules). `enable` and
-//! `index_history` require deterministic host-owned proof of user intent
-//! (`ExplicitCommand` from the `/memory` frontend command, task A5) that a
-//! model tool call cannot supply through JSON parameters alone, so both fail
-//! with the typed [`MemoryContextError::RequiresHostConfirmation`] refusal and
-//! never install a lease. A model call is a proposal; only the host commits
-//! lease state.
+//! Scope: only `disable`, `status`, and `recall_once` commit directly — they
+//! are always locally safe/revocable (spec §7.2 rules). `enable` requires
+//! deterministic host-owned proof of user intent (`ExplicitCommand` from the
+//! `/memory` frontend command, task A5) that a model tool call cannot supply
+//! through JSON parameters alone, so it fails with the typed
+//! [`MemoryContextError::RequiresHostConfirmation`] refusal. `index_history`
+//! returns the host-computed D1 disclosure preview, but a model call remains
+//! only a proposal and cannot confirm or begin import.
 //!
 //! Boundary discipline: raw JSON arguments are parsed into the typed
 //! [`MemoryContextRequest`] here at the boundary — malformed values, unknown
@@ -18,6 +18,9 @@ use super::{Tool, ToolContext};
 use crate::runtime::memory_context::{
     DurableStatus, MemoryContextCapability, MemoryContextError, MemoryContextMode,
     MemoryContextStatus, OneShotStatus,
+};
+use crate::runtime::memory_history::{
+    propose_history_import, CanonicalHistoryMetadataIo, HistoryImportHostState,
 };
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
@@ -73,8 +76,7 @@ fn parse_request(params: &Value) -> std::result::Result<MemoryContextRequest, St
         .any(|key| !SCHEMA_PROPERTIES.contains(&key.as_str()))
     {
         return Err(
-            "memory_context rejects unknown parameters (additionalProperties is false)"
-                .to_string(),
+            "memory_context rejects unknown parameters (additionalProperties is false)".to_string(),
         );
     }
 
@@ -118,7 +120,9 @@ fn parse_request(params: &Value) -> std::result::Result<MemoryContextRequest, St
     // strictness on top of the schema's flat property list.
     let reject_inapplicable = |action_name: &'static str| -> std::result::Result<(), String> {
         if mode_supplied {
-            return Err(format!("'mode' is not applicable to action '{action_name}'"));
+            return Err(format!(
+                "'mode' is not applicable to action '{action_name}'"
+            ));
         }
         if capture_tools_supplied {
             return Err(format!(
@@ -184,7 +188,9 @@ fn render_summary(action: &'static str, status: Option<&MemoryContextStatus>) ->
         Some(status) => {
             let (mode, expires_at) = match &status.durable {
                 DurableStatus::Off => ("off", Value::Null),
-                DurableStatus::Active { mode, expires_at, .. } => (
+                DurableStatus::Active {
+                    mode, expires_at, ..
+                } => (
                     mode_label(*mode),
                     expires_at
                         .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
@@ -225,7 +231,7 @@ impl Tool for MemoryContextTool {
     }
 
     fn description(&self) -> &str {
-        "Control the continuous-memory context of this session. Supported here: 'status' (metadata only), 'disable' (always allowed), and 'recall_once' (one-shot recall lease). 'enable' and 'index_history' are proposals that require the deterministic /memory command with host-owned confirmation and are always refused when called as a tool."
+        "Control the continuous-memory context of this session. 'status', 'disable', and 'recall_once' commit locally safe actions. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call."
     }
 
     fn parameters(&self) -> Value {
@@ -236,7 +242,7 @@ impl Tool for MemoryContextTool {
             "properties": {
                 "action": {
                     "enum": ["enable", "disable", "status", "recall_once", "index_history"],
-                    "description": "Memory-context action. Only disable/status/recall_once commit here; enable/index_history require /memory."
+                    "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation."
                 },
                 "mode": {
                     "enum": ["recall_each_prompt", "capture_only", "capture_and_recall"],
@@ -259,8 +265,7 @@ impl Tool for MemoryContextTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         let request = parse_request(&params).map_err(RuntimeError::Tool)?;
-        let capability: Option<&MemoryContextCapability> =
-            ctx.capabilities.memory_context.as_ref();
+        let capability: Option<&MemoryContextCapability> = ctx.capabilities.memory_context.as_ref();
 
         match request {
             // `status` is deterministic even with no capability wired: memory
@@ -283,11 +288,21 @@ impl Tool for MemoryContextTool {
                     .map_err(typed_failure)?;
                 Ok(render_summary(request.action_name(), Some(&status)))
             }
-            // Task A4 scope decision: durable enable and history indexing
-            // need deterministic host-owned proof (ExplicitCommand from
-            // /memory, task A5). A tool call cannot carry it — typed refusal,
-            // no lease installed, nothing mutated.
-            MemoryContextRequest::Enable | MemoryContextRequest::IndexHistory => {
+            // A model may request the host-owned preview, but the request is
+            // only a proposal: this branch never receives a confirmation proof
+            // and cannot begin import.
+            MemoryContextRequest::IndexHistory => {
+                let host = HistoryImportHostState::from_current_host()
+                    .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+                let mut io = CanonicalHistoryMetadataIo::new();
+                let preview = propose_history_import(&host, &mut io)
+                    .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+                Ok(preview.render())
+            }
+            // Durable enable needs deterministic host-owned proof
+            // (ExplicitCommand from /memory, task A5). A tool call cannot carry
+            // it — typed refusal, no lease installed, nothing mutated.
+            MemoryContextRequest::Enable => {
                 if capability.is_none() {
                     return Err(typed_failure(MemoryContextError::CapabilityUnavailable));
                 }
@@ -364,16 +379,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forged_index_history_is_denied_and_installs_no_lease() {
+    async fn model_index_history_returns_preview_but_cannot_confirm() {
         let (ctx, capability) = wired_context();
 
-        let error = MemoryContextTool
+        let preview = MemoryContextTool
             .execute(json!({"action": "index_history"}), ctx)
             .await
-            .unwrap_err()
-            .to_string();
+            .expect("model proposal receives metadata-only preview");
 
-        assert!(error.contains("host confirmation"), "{error}");
+        assert!(preview.contains("History import preview"), "{preview}");
+        assert!(
+            preview.contains("explicit confirmation required: true"),
+            "{preview}"
+        );
+        assert!(preview.contains("no import has started"), "{preview}");
         assert_fully_off(&capability);
     }
 
@@ -490,7 +509,10 @@ mod tests {
 
         let output = parsed(&output);
         assert_eq!(output["action"], "recall_once");
-        assert_eq!(output["mode"], "off", "one-shot never occupies the durable slot");
+        assert_eq!(
+            output["mode"], "off",
+            "one-shot never occupies the durable slot"
+        );
         assert_eq!(output["one_shot_recall"], "pending");
         assert!(matches!(
             capability.status().one_shot,
@@ -562,7 +584,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_action_and_missing_action_fail_closed() {
-        for params in [json!({}), json!({"action": 5}), json!({"action": null}), json!([])] {
+        for params in [
+            json!({}),
+            json!({"action": 5}),
+            json!({"action": null}),
+            json!([]),
+        ] {
             let (ctx, capability) = wired_context();
             let error = MemoryContextTool
                 .execute(params, ctx)
@@ -582,10 +609,7 @@ mod tests {
         let (ctx, capability) = wired_context();
 
         let error = MemoryContextTool
-            .execute(
-                json!({"action": "status", "surprise_grant": true}),
-                ctx,
-            )
+            .execute(json!({"action": "status", "surprise_grant": true}), ctx)
             .await
             .unwrap_err()
             .to_string();

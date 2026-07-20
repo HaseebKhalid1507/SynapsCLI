@@ -25,6 +25,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 pub mod memory_context;
+pub mod memory_history;
 pub mod openai;
 pub mod relay;
 mod request;
@@ -307,6 +308,13 @@ pub struct Runtime {
     capture_provider_for_test: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<dyn capture_worker::CaptureProvider>>>,
     >,
+    /// Pending D1 disclosure awaiting an explicit `/memory index-history
+    /// confirm|decline` decision. Same-session clones share one pending preview;
+    /// fresh runtimes and subagents start with none.
+    pending_history_import_preview:
+        std::sync::Arc<std::sync::Mutex<Option<memory_history::HistoryImportPreview>>>,
+    /// The last explicitly confirmed D1 plan, retained for D2 to consume.
+    history_import_plan: std::sync::Arc<std::sync::Mutex<Option<memory_history::ImportPlan>>>,
     /// The validated recall contribution held for the CURRENT turn, if any
     /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
     /// never raw text — admitted only through the
@@ -447,22 +455,22 @@ fn fresh_memory_context_state(
 }
 
 /// Host-derived project isolation identity (spec §5.2) recorded on
-/// command-granted memory leases: a bounded digest of the current working
-/// directory. Exact project-root resolution arrives with provider
-/// activation (task A6); the digest keeps the identity bounded and
-/// control-character free for any path.
-fn memory_project_id() -> memory_context::ProjectId {
-    use sha2::{Digest as _, Sha256};
+/// command-granted memory leases: the stable scope discovered from the current
+/// working directory (or `SYNAPS_PROJECT_ROOT`).
+fn memory_project_scope() -> std::result::Result<agent_core::memory::store::ProjectScope, String> {
     let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unresolved".to_string());
-    let digest = Sha256::digest(cwd.as_bytes());
-    let mut id = String::from("project-cwd-");
-    for byte in &digest[..8] {
-        use std::fmt::Write as _;
-        let _ = write!(id, "{byte:02x}");
+        .map_err(|error| format!("cannot resolve current project directory: {error}"))?;
+    agent_core::memory::store::ProjectScope::discover(&cwd)
+        .map_err(|error| format!("cannot resolve project scope: {error}"))
+}
+
+fn memory_project_id() -> memory_context::ProjectId {
+    match memory_project_scope() {
+        Ok(scope) => memory_context::ProjectId::parse(scope.key())
+            .expect("host project scope key is always a valid identifier"),
+        Err(_) => memory_context::ProjectId::parse("project-unresolved")
+            .expect("static fallback project id is valid"),
     }
-    memory_context::ProjectId::parse(&id).expect("generated project id is always valid")
 }
 
 /// The spec-canonical continuous-memory provider identity (spec §17.3,
@@ -737,6 +745,8 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
             capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // Empty per construction — a held recall segment is turn-scoped
@@ -832,6 +842,8 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
             capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // Empty per construction — a held recall segment is turn-scoped
@@ -2443,6 +2455,67 @@ impl Runtime {
         }))
     }
 
+    /// Return the history-import disclosure preview. This is D1's production
+    /// entry point: metadata is scanned, but session bodies and Axel are never
+    /// opened. All frontends share this runtime implementation.
+    pub fn memory_history_preview(
+        &self,
+    ) -> std::result::Result<memory_history::HistoryImportPreview, memory_history::HistoryImportError>
+    {
+        let host = memory_history::HistoryImportHostState::from_current_host()?;
+        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
+        let preview = memory_history::preview_history_import(&host, &mut io)?;
+        *self
+            .pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned") = Some(preview.clone());
+        Ok(preview)
+    }
+
+    /// Bind the pending, already-presented history preview to an explicit
+    /// frontend command. D1 returns only a typed plan; D2 owns all content
+    /// streaming.
+    pub(crate) fn memory_history_confirm(
+        &self,
+    ) -> std::result::Result<memory_history::ImportPlan, memory_history::HistoryImportError> {
+        let preview = self
+            .pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned")
+            .take()
+            .ok_or(memory_history::HistoryImportError::ConsentRequired)?;
+        let intent = memory_history::ConfirmedUserIntent::from_explicit_command(
+            memory_context::mint_explicit_command_id(),
+        );
+        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
+        match memory_history::authorize_history_import(
+            preview,
+            memory_history::HistoryImportConsent::Confirmed(intent),
+            memory_history::RequestAuthority::UserFrontend,
+            &mut io,
+        )? {
+            memory_history::HistoryImportOutcome::Ready(plan) => {
+                *self
+                    .history_import_plan
+                    .lock()
+                    .expect("history plan mutex poisoned") = Some(plan.clone());
+                Ok(plan)
+            }
+            memory_history::HistoryImportOutcome::Declined => {
+                Err(memory_history::HistoryImportError::ConsentRequired)
+            }
+        }
+    }
+
+    /// Decline and clear a pending preview without any content reads or writes.
+    pub(crate) fn memory_history_decline(&self) -> bool {
+        self.pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned")
+            .take()
+            .is_some()
+    }
+
     /// Test-only: intent proof recorded on the current durable lease.
     #[cfg(test)]
     pub(crate) fn memory_durable_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
@@ -3336,6 +3409,10 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            pending_history_import_preview: std::sync::Arc::clone(
+                &self.pending_history_import_preview,
+            ),
+            history_import_plan: std::sync::Arc::clone(&self.history_import_plan),
             #[cfg(any(test, feature = "testing"))]
             capture_provider_for_test: std::sync::Arc::clone(&self.capture_provider_for_test),
             // Clones are the same session: they observe the same held
@@ -4996,7 +5073,7 @@ mod memory_context_provider_tests {
         for event in &events {
             let json = serde_json::to_string(event).expect("event serializes");
             assert!(
-                json.contains("project-cwd-"),
+                json.contains("\"project_digest\":\"p") || json.contains("project-cwd-"),
                 "digest identity expected; got: {json}"
             );
             assert!(

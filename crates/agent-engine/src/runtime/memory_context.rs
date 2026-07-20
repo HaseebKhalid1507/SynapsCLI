@@ -284,9 +284,15 @@ pub enum UserIntentProof {
 /// generated here and never accepted from model or plugin text.
 pub(crate) fn mint_explicit_command_proof() -> UserIntentProof {
     UserIntentProof::ExplicitCommand {
-        command_id: RequestId::parse(&format!("memcmd-{}", uuid::Uuid::new_v4()))
-            .expect("generated command id is always valid"),
+        command_id: mint_explicit_command_id(),
     }
+}
+
+/// Mint the host-owned request identity used when another memory operation
+/// needs to bind its own typed proof (for example history-import consent).
+pub(crate) fn mint_explicit_command_id() -> RequestId {
+    RequestId::parse(&format!("memcmd-{}", uuid::Uuid::new_v4()))
+        .expect("generated command id is always valid")
 }
 
 // ---------------------------------------------------------------------------

@@ -188,6 +188,9 @@ fn read_artifact_bytes(handle: &SessionsDirHandle, name: &str) -> std::io::Resul
 pub struct SessionDirEntry {
     pub name: String,
     pub mtime: Option<std::time::SystemTime>,
+    /// Stored bytes for metadata-only accounting. Obtained from the directory
+    /// entry stat; reading it never opens session content.
+    pub byte_len: u64,
 }
 
 /// Enumerate the sessions dir through the SAME strict handle resolution as
@@ -210,6 +213,7 @@ pub fn session_dir_entries(dir: &Path) -> std::io::Result<Vec<SessionDirEntry>> 
                 mtime: e.mtime_unix_ms.map(|ms| {
                     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms)
                 }),
+                byte_len: e.byte_len,
             })
             .collect())
     }
@@ -227,9 +231,14 @@ pub fn session_dir_entries(dir: &Path) -> std::io::Result<Vec<SessionDirEntry>> 
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
+            let byte_len = entry
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
             out.push(SessionDirEntry {
                 name,
                 mtime: entry.metadata().and_then(|m| m.modified()).ok(),
+                byte_len,
             });
         }
         Ok(out)

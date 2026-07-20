@@ -336,11 +336,31 @@ pub fn memory_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
         // Disable is applied to session state BEFORE this returns: `render`
         // runs on the post-revocation status snapshot.
         "off" => CommandResult::Output(runtime.memory_context_disable().render()),
-        "index-history" => CommandResult::Error(
-            "index-history requires a separate disclosure/consent flow, \
-             not yet implemented (task D1)"
-                .to_string(),
-        ),
+        "index-history" => match runtime.memory_history_preview() {
+            Ok(preview) => CommandResult::Output(preview.render()),
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+        "index-history confirm" => match runtime.memory_history_confirm() {
+            Ok(plan) => CommandResult::Output(format!(
+                "History import confirmed for {} session(s), approximately {} bytes. \
+                 Typed import plan {} is ready for D2; no import has started.",
+                plan.preview.session_count, plan.preview.approx_bytes, plan.confirmation_id,
+            )),
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+        "index-history decline" => {
+            if runtime.memory_history_decline() {
+                CommandResult::Output(
+                    "History import declined; no session content was read and no Axel data was written."
+                        .to_string(),
+                )
+            } else {
+                CommandResult::Error(
+                    "history import requires a pending disclosure preview before decline"
+                        .to_string(),
+                )
+            }
+        }
         "why" => CommandResult::Output(crate::runtime::memory_context::render_recall_why(
             runtime.memory_recall_why().as_ref(),
         )),
@@ -995,23 +1015,60 @@ mod tests {
         assert_eq!(runtime.memory_context_status().durable, DurableStatus::Off);
     }
 
-    /// `index-history` (task D1) is a typed not-yet-implemented error —
-    /// never a silent no-op — and mutates no session state. (`why` graduated
-    /// to real output in task B5; see
-    /// `memory_why_without_recall_metadata_is_clear_output_not_error`.)
+    /// `index-history` (task D1) returns the host-computed disclosure preview
+    /// and does not begin import.
     #[test]
-    fn memory_index_history_is_a_typed_not_yet_error() {
+    fn memory_index_history_surfaces_disclosure_preview() {
         let runtime = crate::Runtime::new_headless();
         match memory_command("index-history", &runtime) {
-            CommandResult::Error(e) => {
-                assert!(e.contains("disclosure/consent"), "got: {e}");
-                assert!(e.contains("task D1"), "got: {e}");
+            CommandResult::Output(text) => {
+                assert!(text.contains("History import preview"), "got: {text}");
+                assert!(text.contains("project:"), "got: {text}");
+                assert!(text.contains("sessions:"), "got: {text}");
+                assert!(text.contains("approximate bytes:"), "got: {text}");
+                assert!(text.contains("included date range:"), "got: {text}");
+                assert!(text.contains("included classes:"), "got: {text}");
+                assert!(text.contains("excluded classes:"), "got: {text}");
+                assert!(text.contains("retention policy:"), "got: {text}");
+                assert!(text.contains("redaction policy:"), "got: {text}");
+                assert!(text.contains("destination .r8:"), "got: {text}");
+                assert!(
+                    text.contains("explicit confirmation required: true"),
+                    "got: {text}"
+                );
+                assert!(text.contains("no import has started"), "got: {text}");
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Output, got {other:?}"),
         }
         let status = runtime.memory_context_status();
         assert_eq!(status.durable, DurableStatus::Off);
         assert_eq!(status.one_shot, OneShotStatus::Idle);
+    }
+
+    #[test]
+    fn memory_index_history_decline_clears_pending_preview() {
+        let runtime = crate::Runtime::new_headless();
+        assert!(matches!(
+            memory_command("index-history", &runtime),
+            CommandResult::Output(_)
+        ));
+        assert!(matches!(
+            memory_command("index-history decline", &runtime),
+            CommandResult::Output(text) if text.contains("no session content was read")
+        ));
+        assert!(matches!(
+            memory_command("index-history confirm", &runtime),
+            CommandResult::Error(error) if error.contains("explicit user confirmation")
+        ));
+    }
+
+    #[test]
+    fn memory_index_history_confirmation_requires_prior_preview() {
+        let runtime = crate::Runtime::new_headless();
+        assert!(matches!(
+            memory_command("index-history confirm", &runtime),
+            CommandResult::Error(error) if error.contains("explicit user confirmation")
+        ));
     }
 
     /// All frontends route `/memory` through the single
