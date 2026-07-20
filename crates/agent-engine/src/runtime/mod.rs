@@ -301,13 +301,22 @@ pub struct Runtime {
     /// The validated recall contribution held for the CURRENT turn, if any
     /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
     /// never raw text — admitted only through the
-    /// [`memory_context::validate_contribution`] gate. Phase A scope: it
-    /// feeds ONLY the T29 context-budget `memory_contents` lane in
-    /// [`Runtime::assess_context`]; per-provider wire injection is task B4.
-    /// Shared across `Clone`s (same session, one truth) but NEVER inherited
-    /// by subagents — every constructor initializes the slot empty, same
-    /// invariant as `memory_context_state` above.
+    /// [`memory_context::validate_contribution`] gate. It feeds the T29
+    /// context-budget `memory_contents` lane in [`Runtime::assess_context`];
+    /// as of task B4 the per-turn recall flow keeps it in sync with the
+    /// injected wire segment. Shared across `Clone`s (same session, one
+    /// truth) but NEVER inherited by subagents — every constructor
+    /// initializes the slot empty, same invariant as `memory_context_state`
+    /// above.
     pending_memory_segment: std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
+    /// Task B4 (spec §7.4): the accepted recall retained for the CURRENT
+    /// logical request — the contribution reused verbatim by retries of the
+    /// same request (never a second provider call) plus the §10.4
+    /// explainability metadata behind `/memory why` (task B5). Shared
+    /// across `Clone`s; never inherited by subagents (fresh empty slot in
+    /// every constructor, same invariant as `pending_memory_segment`).
+    retained_recall_turn:
+        std::sync::Arc<std::sync::Mutex<Option<memory_context::RetainedRecallTurn>>>,
     /// Writer handle backing the most recent armed one-shot ephemeral
     /// trace context (telemetry Off + `/trace next`). Retained here — not
     /// only inside the request's cloned context — so the session exit
@@ -573,6 +582,7 @@ impl Runtime {
             // Empty per construction — a held recall segment is turn-scoped
             // session state and is never copied into a fresh runtime.
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir,
             cache_diagnostics: false,
@@ -665,6 +675,7 @@ impl Runtime {
             // Empty per construction — a held recall segment is turn-scoped
             // session state and is never copied into a fresh runtime.
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: trace::default_capture_dir(),
             cache_diagnostics: false,
@@ -1505,14 +1516,113 @@ impl Runtime {
     }
 
     /// Task A7: drop any recall segment held for the current turn. Idempotent.
-    /// Task B4 calls this on turn completion; the disable/revocation path may
-    /// also use it defensively.
-    #[allow(dead_code)] // exercised by tests until task B4 routes real recall
+    /// Task B4 calls this on every turn that carries no accepted recall; the
+    /// disable/revocation path may also use it defensively.
     pub(crate) fn clear_memory_contribution(&self) {
         *self
             .pending_memory_segment
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Task B4 (spec §10.4): explainability metadata retained for the
+    /// current turn's accepted recall, if any. Metadata only — selected IDs,
+    /// source classes, rank reasons, byte/token accounting, latency, and
+    /// withheld/skipped counts; never memory content. Full `/memory why`
+    /// rendering is task B5.
+    pub fn memory_recall_why(&self) -> Option<memory_context::RecallTurnMetadata> {
+        self.retained_recall_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|retained| retained.why.clone())
+    }
+
+    /// Task B4 (spec §7.4): the ONE provider-agnostic per-prompt recall
+    /// point, run on the owned turn `messages` BEFORE any per-provider wire
+    /// translation forks. Delegates every decision to
+    /// [`memory_context::resolve_turn_recall`] (eligibility, retry-exact
+    /// reuse, §10.3 budget floor, §16.2 hard timeout, fail-open skips) and
+    /// then syncs the T29 budget lane:
+    ///
+    /// - accepted/reused recall ⇒ the held segment mirrors the injected
+    ///   synthetic message;
+    /// - everything else ⇒ the held segment is cleared, so `messages` and
+    ///   the assessment are byte-identical to the pre-task behavior.
+    ///
+    /// Dispatch routes through the granted provider's
+    /// [`crate::extensions::lease::ExtensionLeaseCapability::call_exact`]
+    /// (task A6 wiring): the lease's composed `extension:<plugin>:<id>`
+    /// address plus the plugin's declared recall tool digest — an unroutable
+    /// provider fails open as `provider_unavailable` without ever spawning.
+    async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
+        let extension_runtime = self.extension_runtime.clone();
+        let session = self.host_tool_session.clone();
+        let outcome = memory_context::resolve_turn_recall(
+            &self.memory_context_state,
+            &self.retained_recall_turn,
+            &memory_project_id(),
+            self.context_window(),
+            messages,
+            memory_context::RECALL_HARD_TIMEOUT,
+            move |lease: memory_context::MemoryContextLease,
+                  request: memory_context::RecallRequest| async move {
+                let Some(manager) = extension_runtime else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                let mut parts = lease.provider_id.as_str().splitn(3, ':');
+                let (Some("extension"), Some(plugin), Some(_local)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                let Some(digest) = manager
+                    .declared_tool_digest(plugin, memory_context::MEMORY_RECALL_TOOL_NAME)
+                else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
+                    .call_exact(
+                        plugin,
+                        memory_context::MEMORY_RECALL_TOOL_NAME,
+                        &digest,
+                        memory_context::recall_request_wire(&request),
+                    )
+                    .await
+                    .map_err(|_| memory_context::RecallCallError::CallFailed)
+            },
+        )
+        .await;
+        match outcome {
+            memory_context::TurnRecallOutcome::Injected
+            | memory_context::TurnRecallOutcome::ReusedRetained => {
+                let contribution = self
+                    .retained_recall_turn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|retained| retained.contribution.clone());
+                if let Some(contribution) = contribution {
+                    *self
+                        .pending_memory_segment
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(memory_context::ContextSegment::Memory(contribution));
+                }
+            }
+            memory_context::TurnRecallOutcome::NotEligible => {
+                self.clear_memory_contribution();
+            }
+            memory_context::TurnRecallOutcome::SkippedOpen(reason) => {
+                self.clear_memory_contribution();
+                // Bounded metadata diagnostic (spec §13.1) — reason key
+                // only, never content. Fail open: the turn proceeds.
+                tracing::debug!(
+                    reason = reason.as_str(),
+                    "memory recall skipped; turn proceeds without memory"
+                );
+            }
+        }
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
@@ -2674,6 +2784,19 @@ impl Runtime {
             return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
 
+        // Task B4 (spec §7.4): resolve this turn's memory recall HERE — the
+        // single provider-agnostic point where the owned turn Vec exists but
+        // has not yet been read, borrowed, or forked into any per-provider
+        // wire translation (`run_stream_internal` and everything below it
+        // only ever borrows from this Vec). When no contribution applies the
+        // Vec is returned byte-identical — no empty or no-op synthetic
+        // message is ever inserted — and the disabled path performs zero
+        // extension calls. Every recall failure fails OPEN: the turn itself
+        // is never blocked or failed by memory.
+        let mut messages = messages;
+        self.apply_turn_memory_recall(&mut messages).await;
+        let messages = messages;
+
         // Clone the Arc, not the whole Runtime — the spawned task shares the
         // same AuthState so mid-loop token refreshes are visible immediately.
         let auth = Arc::clone(&self.auth);
@@ -2833,6 +2956,9 @@ impl Clone for Runtime {
             // Clones are the same session: they observe the same held
             // recall segment (one truth), like memory_context_state above.
             pending_memory_segment: std::sync::Arc::clone(&self.pending_memory_segment),
+            // Same-session truth for retry-exact reuse and `/memory why`
+            // (task B4): clones share ONE retained recall per request.
+            retained_recall_turn: std::sync::Arc::clone(&self.retained_recall_turn),
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,

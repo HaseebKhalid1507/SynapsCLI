@@ -270,6 +270,27 @@ impl ExtensionRuntimeManager {
             .cloned()
     }
 
+    /// Task B4: pinned schema digest of one plugin's CURRENTLY declared
+    /// deferred tool — a pure launch-record read that never spawns. The
+    /// memory recall dispatch uses it to address the provider's declared
+    /// recall tool through the same exact-digest [`Self::call_exact`] gate
+    /// as every other extension call (drift still re-checked there).
+    pub(crate) fn declared_tool_digest(
+        &self,
+        plugin: &str,
+        tool_name: &str,
+    ) -> Option<SchemaDigest> {
+        let record = self.current_record(plugin)?;
+        record
+            .manifest
+            .deferred
+            .as_ref()?
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .map(|tool| SchemaDigest::of_schema(&tool.input_schema))
+    }
+
     /// Mark cancelled and hand the lease to ONE bounded cleanup task
     /// (graceful `shutdown` RPC + kill under an outer timeout). Without a
     /// runtime handle the last `Arc` drop triggers `kill_on_drop` — the
