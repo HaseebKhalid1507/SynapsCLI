@@ -341,10 +341,9 @@ pub fn memory_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
              not yet implemented (task D1)"
                 .to_string(),
         ),
-        "why" => CommandResult::Error(
-            "/memory why requires per-turn recall metadata, not yet implemented (task B5)"
-                .to_string(),
-        ),
+        "why" => CommandResult::Output(crate::runtime::memory_context::render_recall_why(
+            runtime.memory_recall_why().as_ref(),
+        )),
         other => CommandResult::Error(format!(
             "unknown /memory subcommand: `{other}` \
              (try: on, recall, capture, once, status, off, index-history, why)"
@@ -937,6 +936,25 @@ mod tests {
         assert!(text.contains("mode off"), "got: {text}");
     }
 
+    /// Task B5 (spec §10.4): `/memory why` with no accepted recall this
+    /// session is clear OUTPUT (never `CommandResult::Error`) explaining the
+    /// three no-metadata causes — both while memory is off and after enable
+    /// but before any eligible prompt has run.
+    #[test]
+    fn memory_why_without_recall_metadata_is_clear_output_not_error() {
+        let runtime = crate::Runtime::new_headless();
+        let text = output_text(memory_command("why", &runtime));
+        assert!(text.contains("no recall metadata available"), "got: {text}");
+        assert!(text.contains("memory is off"), "got: {text}");
+        assert!(text.contains("no eligible prompt"), "got: {text}");
+        assert!(text.contains("skipped"), "got: {text}");
+
+        // Enabled but no eligible prompt yet: still the clear non-error text.
+        output_text(memory_command("on", &runtime));
+        let text = output_text(memory_command("why", &runtime));
+        assert!(text.contains("no recall metadata available"), "got: {text}");
+    }
+
     /// Spec §6.3 / assumption 5: every enable path grants under host-minted
     /// `ExplicitCommand` proof — never model-supplied text.
     #[test]
@@ -977,23 +995,17 @@ mod tests {
         assert_eq!(runtime.memory_context_status().durable, DurableStatus::Off);
     }
 
-    /// `index-history` (task D1) and `why` (task B5) are typed
-    /// not-yet-implemented errors — never silent no-ops — and mutate no
-    /// session state.
+    /// `index-history` (task D1) is a typed not-yet-implemented error —
+    /// never a silent no-op — and mutates no session state. (`why` graduated
+    /// to real output in task B5; see
+    /// `memory_why_without_recall_metadata_is_clear_output_not_error`.)
     #[test]
-    fn memory_index_history_and_why_are_typed_not_yet_errors() {
+    fn memory_index_history_is_a_typed_not_yet_error() {
         let runtime = crate::Runtime::new_headless();
         match memory_command("index-history", &runtime) {
             CommandResult::Error(e) => {
                 assert!(e.contains("disclosure/consent"), "got: {e}");
                 assert!(e.contains("task D1"), "got: {e}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match memory_command("why", &runtime) {
-            CommandResult::Error(e) => {
-                assert!(e.contains("per-turn recall metadata"), "got: {e}");
-                assert!(e.contains("task B5"), "got: {e}");
             }
             other => panic!("expected Error, got {other:?}"),
         }

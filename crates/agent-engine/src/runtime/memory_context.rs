@@ -1340,6 +1340,30 @@ pub enum RankReason {
     Recency,
 }
 
+impl MemorySource {
+    /// Human-readable source-class word for `/memory why` (task B5, spec
+    /// §10.4). Exhaustive — a future variant fails compilation here rather
+    /// than silently rendering nothing.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemorySource::ChatHistory => "chat history",
+            MemorySource::UserStated => "user stated",
+        }
+    }
+}
+
+impl RankReason {
+    /// Plain-words `/memory why` phrase (task B5, spec §10.4). Exhaustive
+    /// match with NO wildcard arm — adding a wire variant without a phrase
+    /// is a compile error, never a silently unexplained selection.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            RankReason::ExactTopic => "matched the topic of your prompt",
+            RankReason::Recency => "recently recorded",
+        }
+    }
+}
+
 /// Retention class of a recalled record (spec §6.5). Placeholder single
 /// variant until the consolidation/retention flow lands (spec §11, Phase B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1714,8 +1738,8 @@ pub(crate) enum TurnRecallOutcome {
 
 /// Spec §10.4 explainability metadata retained for the current turn's
 /// accepted recall. Counters, identities, and durations only — bounded by
-/// the §10.3 record limits; never memory content. Full `/memory why`
-/// rendering is task B5.
+/// the §10.3 record limits; never memory content. Rendered for `/memory why`
+/// by [`RecallTurnMetadata::render`] (task B5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecallTurnMetadata {
     /// Selected memory identities, in contribution order.
@@ -1739,6 +1763,103 @@ pub struct RecallTurnMetadata {
     pub withheld_count: u32,
     /// Candidates considered but not selected.
     pub skipped_count: u32,
+}
+
+impl RecallTurnMetadata {
+    /// Human-readable `/memory why` text (task B5, spec §10.4). Mirrors
+    /// [`MemoryContextStatus::render`]: bounded metadata only — selected
+    /// IDs, source classes, plain-words rank reasons, byte/token
+    /// accounting, truncation count, latency, and withheld/skipped
+    /// counts — never memory body content.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "memory recall (this turn): {} record(s) selected",
+            self.selected_memory_ids.len()
+        );
+        for (index, memory_id) in self.selected_memory_ids.iter().enumerate() {
+            let source = self
+                .source_classes
+                .get(index)
+                .map_or("unknown source", |source| source.as_str());
+            let _ = writeln!(
+                out,
+                "    {}. {} — source: {}",
+                index + 1,
+                short_memory_id(memory_id),
+                source,
+            );
+        }
+        // Union of rank reasons in plain words: first-seen order, deduped.
+        let mut phrases: Vec<&'static str> = Vec::new();
+        for reason in &self.rank_reasons {
+            let phrase = reason.phrase();
+            if !phrases.contains(&phrase) {
+                phrases.push(phrase);
+            }
+        }
+        if phrases.is_empty() {
+            let _ = writeln!(out, "  why chosen: no rank reasons reported");
+        } else {
+            let _ = writeln!(out, "  why chosen: {}", phrases.join("; "));
+        }
+        let _ = writeln!(
+            out,
+            "  retained: {} bytes (~{} tokens)",
+            self.retained_bytes, self.retained_tokens,
+        );
+        let _ = writeln!(
+            out,
+            "  dropped by bounding: {} bytes ({} record(s) truncated)",
+            self.dropped_bytes, self.truncation_count,
+        );
+        let _ = writeln!(
+            out,
+            "  recall latency: {}ms",
+            self.recall_latency.as_millis()
+        );
+        let _ = writeln!(
+            out,
+            "  withheld by disclosure policy: {}",
+            self.withheld_count
+        );
+        let _ = writeln!(
+            out,
+            "  considered but not selected: {}",
+            self.skipped_count
+        );
+        out.trim_end().to_string()
+    }
+}
+
+/// Ceiling on the memory-ID prefix `/memory why` displays. IDs are already
+/// parse-bounded ([`MEMORY_IDENTIFIER_MAX_BYTES`]); the short form keeps the
+/// listing scannable.
+const WHY_MEMORY_ID_DISPLAY_CHARS: usize = 24;
+
+/// Short display form of one memory identity: the full ID when it is short,
+/// otherwise a truncated prefix marked with an ellipsis (char-boundary safe).
+fn short_memory_id(memory_id: &MemoryId) -> String {
+    let raw = memory_id.as_str();
+    match raw.char_indices().nth(WHY_MEMORY_ID_DISPLAY_CHARS) {
+        None => raw.to_string(),
+        Some((cut, _)) => format!("{}…", &raw[..cut]),
+    }
+}
+
+/// The ONE `/memory why` text entry point (task B5, spec §10.4): renders the
+/// retained metadata when a recall was accepted this turn, and a clear,
+/// NON-error explanation when none is available (memory off, no eligible
+/// prompt yet, or the last recall was skipped).
+pub fn render_recall_why(metadata: Option<&RecallTurnMetadata>) -> String {
+    match metadata {
+        Some(why) => why.render(),
+        None => "no recall metadata available — either memory is off, \
+                 no eligible prompt has run yet, or the last recall was skipped"
+            .to_string(),
+    }
 }
 
 /// Build the §10.4 metadata for one ACCEPTED contribution.
@@ -1793,6 +1914,305 @@ fn recall_turn_metadata(
             .accounting
             .candidates_considered
             .saturating_sub(contribution.records.len() as u32),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §15 Observability — metadata-only events (task B5)
+// ---------------------------------------------------------------------------
+
+/// Spec §15 event: a memory-context lease was installed.
+pub(crate) const EVENT_MEMORY_CONTEXT_ENABLED: &str = "memory_context.enabled";
+/// Spec §15 event: the session's memory context was revoked.
+pub(crate) const EVENT_MEMORY_CONTEXT_DISABLED: &str = "memory_context.disabled";
+/// Spec §15 event: a recall dispatch is about to call the provider.
+pub(crate) const EVENT_MEMORY_RECALL_STARTED: &str = "memory_recall.started";
+/// Spec §15 event: an accepted contribution entered this turn's request.
+pub(crate) const EVENT_MEMORY_RECALL_COMPLETED: &str = "memory_recall.completed";
+/// Spec §15 event: recall was considered but the turn proceeds without
+/// memory (off / budget floor / timeout / failure / rejection).
+pub(crate) const EVENT_MEMORY_RECALL_SKIPPED: &str = "memory_recall.skipped";
+
+/// Spec §15 "duration buckets": recall latency is reported as one coarse
+/// bucket string, never a high-resolution timing.
+pub(crate) fn duration_bucket(duration: Duration) -> &'static str {
+    match duration.as_millis() {
+        0..=49 => "lt_50ms",
+        50..=249 => "50ms_250ms",
+        250..=999 => "250ms_1s",
+        1000..=4999 => "1s_5s",
+        _ => "ge_5s",
+    }
+}
+
+/// One spec §15 metadata-only observability event. Every field is drawn from
+/// the §15 ALLOWED list — session/turn correlation IDs, the host-derived
+/// project digest identity (never a raw project path), provider ID, mode,
+/// record counts, byte/token accounting, duration buckets,
+/// disclosure/withholding counts, and a typed outcome code. The struct has
+/// no field that could carry user messages, memory bodies, raw tool
+/// results, credentials, or provider error text, so the §15 DISALLOWED list
+/// is excluded by construction, not by discipline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryObservabilityEvent {
+    /// Spec §15 event name.
+    pub event: &'static str,
+    /// Typed outcome code (e.g. `enabled`, `injected`, `timeout`).
+    pub outcome: &'static str,
+    /// Session correlation ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Turn correlation ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Host-derived project digest identity — never the raw project path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_digest: Option<String>,
+    /// Context-provider identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Spec §6.1 mode vocabulary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    /// Selected record count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u32>,
+    /// Bytes of rendered contribution retained after bounding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_bytes: Option<u64>,
+    /// Conservative token estimate of the retained rendered text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_tokens: Option<u64>,
+    /// Bytes dropped by bounding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_bytes: Option<u64>,
+    /// Coarse recall-duration bucket ([`duration_bucket`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_bucket: Option<&'static str>,
+    /// Records withheld by disclosure policy (counted, never named).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withheld_count: Option<u32>,
+    /// Candidates considered but not selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_count: Option<u32>,
+}
+
+/// Correlation identities for one recall dispatch, cloned off the lease
+/// BEFORE the `FnOnce` call consumes it. Identity strings only.
+pub(crate) struct RecallCorrelation {
+    session_id: SessionId,
+    turn_id: TurnId,
+    project_id: ProjectId,
+    provider_id: ContextProviderId,
+    mode: MemoryContextMode,
+}
+
+impl RecallCorrelation {
+    fn new(lease: &MemoryContextLease, turn_id: &TurnId) -> Self {
+        Self {
+            session_id: lease.session_id.clone(),
+            turn_id: turn_id.clone(),
+            project_id: lease.project_id.clone(),
+            provider_id: lease.provider_id.clone(),
+            mode: lease.mode,
+        }
+    }
+}
+
+impl MemoryObservabilityEvent {
+    /// Content-free skeleton: name + outcome, every optional field absent.
+    fn base(event: &'static str, outcome: &'static str) -> Self {
+        Self {
+            event,
+            outcome,
+            session_id: None,
+            turn_id: None,
+            project_digest: None,
+            provider_id: None,
+            mode: None,
+            record_count: None,
+            retained_bytes: None,
+            retained_tokens: None,
+            dropped_bytes: None,
+            duration_bucket: None,
+            withheld_count: None,
+            skipped_count: None,
+        }
+    }
+
+    /// `memory_context.enabled` for one freshly granted lease.
+    pub(crate) fn context_enabled(lease: &MemoryContextLease) -> Self {
+        Self {
+            session_id: Some(lease.session_id.as_str().to_string()),
+            project_digest: Some(lease.project_id.as_str().to_string()),
+            provider_id: Some(lease.provider_id.as_str().to_string()),
+            mode: Some(lease.mode.as_str()),
+            ..Self::base(EVENT_MEMORY_CONTEXT_ENABLED, "enabled")
+        }
+    }
+
+    /// `memory_context.disabled` after the session revocation applied.
+    pub(crate) fn context_disabled(session_id: &SessionId, project_id: &ProjectId) -> Self {
+        Self {
+            session_id: Some(session_id.as_str().to_string()),
+            project_digest: Some(project_id.as_str().to_string()),
+            mode: Some(MemoryContextMode::Off.as_str()),
+            ..Self::base(EVENT_MEMORY_CONTEXT_DISABLED, "disabled")
+        }
+    }
+
+    /// `memory_recall.started` — emitted BEFORE the extension call.
+    pub(crate) fn recall_started(correlation: &RecallCorrelation) -> Self {
+        Self {
+            session_id: Some(correlation.session_id.as_str().to_string()),
+            turn_id: Some(correlation.turn_id.as_str().to_string()),
+            project_digest: Some(correlation.project_id.as_str().to_string()),
+            provider_id: Some(correlation.provider_id.as_str().to_string()),
+            mode: Some(correlation.mode.as_str()),
+            ..Self::base(EVENT_MEMORY_RECALL_STARTED, "dispatched")
+        }
+    }
+
+    /// `memory_recall.completed` for a freshly accepted contribution.
+    pub(crate) fn recall_completed(
+        correlation: &RecallCorrelation,
+        why: &RecallTurnMetadata,
+    ) -> Self {
+        Self {
+            session_id: Some(correlation.session_id.as_str().to_string()),
+            turn_id: Some(correlation.turn_id.as_str().to_string()),
+            project_digest: Some(correlation.project_id.as_str().to_string()),
+            provider_id: Some(correlation.provider_id.as_str().to_string()),
+            mode: Some(correlation.mode.as_str()),
+            ..Self::completed_accounting(why, "injected")
+        }
+    }
+
+    /// `memory_recall.completed` for a §7.4 retry-exact reuse of the
+    /// retained contribution — no provider call was made, so there is no
+    /// dispatch correlation beyond the contribution's own identities.
+    pub(crate) fn recall_reused(
+        session_id: &SessionId,
+        contribution: &MemoryContextContribution,
+        why: &RecallTurnMetadata,
+    ) -> Self {
+        Self {
+            session_id: Some(session_id.as_str().to_string()),
+            project_digest: Some(contribution.project_id.as_str().to_string()),
+            provider_id: Some(contribution.provider_id.as_str().to_string()),
+            ..Self::completed_accounting(why, "reused_retained")
+        }
+    }
+
+    /// Shared §10.4 accounting projection for the completed variants.
+    fn completed_accounting(why: &RecallTurnMetadata, outcome: &'static str) -> Self {
+        Self {
+            record_count: Some(why.selected_memory_ids.len() as u32),
+            retained_bytes: Some(why.retained_bytes),
+            retained_tokens: Some(why.retained_tokens),
+            dropped_bytes: Some(why.dropped_bytes),
+            duration_bucket: Some(duration_bucket(why.recall_latency)),
+            withheld_count: Some(why.withheld_count),
+            skipped_count: Some(why.skipped_count),
+            ..Self::base(EVENT_MEMORY_RECALL_COMPLETED, outcome)
+        }
+    }
+
+    /// `memory_recall.skipped` on an eligible prompt while memory is off
+    /// (no lease) — recall was considered and made zero calls.
+    pub(crate) fn recall_skipped_off(session_id: &SessionId, project_id: &ProjectId) -> Self {
+        Self {
+            session_id: Some(session_id.as_str().to_string()),
+            project_digest: Some(project_id.as_str().to_string()),
+            mode: Some(MemoryContextMode::Off.as_str()),
+            ..Self::base(EVENT_MEMORY_RECALL_SKIPPED, "memory_off")
+        }
+    }
+
+    /// `memory_recall.skipped` BEFORE any dispatch correlation exists
+    /// (§10.3 budget floor): lease identities, no turn ID, no duration.
+    pub(crate) fn recall_skipped_before_dispatch(
+        lease: &MemoryContextLease,
+        skip: RecallSkip,
+    ) -> Self {
+        Self {
+            session_id: Some(lease.session_id.as_str().to_string()),
+            project_digest: Some(lease.project_id.as_str().to_string()),
+            provider_id: Some(lease.provider_id.as_str().to_string()),
+            mode: Some(lease.mode.as_str()),
+            ..Self::base(EVENT_MEMORY_RECALL_SKIPPED, skip.as_str())
+        }
+    }
+
+    /// `memory_recall.skipped` after dispatch began: full correlation plus
+    /// the elapsed-duration bucket.
+    pub(crate) fn recall_skipped_after_dispatch(
+        correlation: &RecallCorrelation,
+        skip: RecallSkip,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            session_id: Some(correlation.session_id.as_str().to_string()),
+            turn_id: Some(correlation.turn_id.as_str().to_string()),
+            project_digest: Some(correlation.project_id.as_str().to_string()),
+            provider_id: Some(correlation.provider_id.as_str().to_string()),
+            mode: Some(correlation.mode.as_str()),
+            duration_bucket: Some(duration_bucket(elapsed)),
+            ..Self::base(EVENT_MEMORY_RECALL_SKIPPED, skip.as_str())
+        }
+    }
+}
+
+// Task B5 test seam: §15 events captured for THIS thread, in emission
+// order. Thread-local so parallel tests (each on its own libtest thread)
+// never interfere — unlike a captured `tracing` subscriber, whose global
+// callsite-interest cache is racy under `--test-threads` (a concurrent
+// no-subscriber test can rebuild interest to `never` mid-test).
+#[cfg(test)]
+thread_local! {
+    static CAPTURED_MEMORY_EVENTS: std::cell::RefCell<Vec<MemoryObservabilityEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: drain the events captured on this thread, in emission order.
+#[cfg(test)]
+pub(crate) fn drain_captured_memory_events_for_test() -> Vec<MemoryObservabilityEvent> {
+    CAPTURED_MEMORY_EVENTS.with(|events| events.borrow_mut().drain(..).collect())
+}
+
+/// Test-only: emission-ordered event names captured on this thread so far,
+/// WITHOUT draining (for mid-flow ordering probes).
+#[cfg(test)]
+pub(crate) fn captured_memory_event_names_for_test() -> Vec<&'static str> {
+    CAPTURED_MEMORY_EVENTS.with(|events| events.borrow().iter().map(|e| e.event).collect())
+}
+
+/// Emit one §15 event through the host's structured `tracing` diagnostics —
+/// the SAME bounded mechanism the runtime already uses for other
+/// metadata-only diagnostics (e.g. the `anthropic_mode_plan` events in
+/// `runtime::mod`); no new event bus. The serialized typed payload rides in
+/// one field so downstream collectors get exactly the §15 shape.
+/// Correctness firewall: emission can never fail the recall or command path
+/// (serialization failure degrades to name+outcome only).
+pub(crate) fn emit_memory_observability_event(event: &MemoryObservabilityEvent) {
+    #[cfg(test)]
+    CAPTURED_MEMORY_EVENTS.with(|events| events.borrow_mut().push(event.clone()));
+    match serde_json::to_string(event) {
+        Ok(payload) => {
+            tracing::debug!(
+                event = event.event,
+                outcome = event.outcome,
+                payload = %payload,
+                "memory observability event"
+            );
+        }
+        Err(_) => {
+            tracing::debug!(
+                event = event.event,
+                outcome = event.outcome,
+                "memory observability event (payload serialization degraded)"
+            );
+        }
     }
 }
 
@@ -2123,8 +2543,21 @@ where
         match slot.as_ref() {
             Some(retained_turn) if retained_turn.request_digest == request_digest => {
                 let contribution = retained_turn.contribution.clone();
+                let why = retained_turn.why.clone();
                 drop(slot);
                 insert_memory_message(messages, &contribution);
+                // §15: the retry-exact reuse is an accepted contribution for
+                // this request — observable as completed (reused), no call.
+                let session_id = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .session_id()
+                    .clone();
+                emit_memory_observability_event(&MemoryObservabilityEvent::recall_reused(
+                    &session_id,
+                    &contribution,
+                    &why,
+                ));
                 return TurnRecallOutcome::ReusedRetained;
             }
             // A different digest is a genuinely new turn: previous-turn
@@ -2134,20 +2567,35 @@ where
         }
     }
     // 3. Eligibility — the disabled path makes ZERO provider calls.
-    let lease = {
+    let (lease, session_id) = {
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.take_turn_recall_lease()
+        let session_id = state.session_id().clone();
+        (state.take_turn_recall_lease(), session_id)
     };
     let Some(lease) = lease else {
+        // §15: recall was considered on an eligible prompt while memory is
+        // off — observable as a metadata-only skip, never silence.
+        emit_memory_observability_event(&MemoryObservabilityEvent::recall_skipped_off(
+            &session_id,
+            project_id,
+        ));
         return TurnRecallOutcome::NotEligible;
     };
     // 4. §10.3 budget floor — checked before any dispatch.
     let Some(budget_tokens) = memory_budget_tokens(provider_window_tokens) else {
+        emit_memory_observability_event(&MemoryObservabilityEvent::recall_skipped_before_dispatch(
+            &lease,
+            RecallSkip::BudgetBelowMinimum,
+        ));
         return TurnRecallOutcome::SkippedOpen(RecallSkip::BudgetBelowMinimum);
     };
     let Ok(budget) = RecallBudget::from_engine_tokens(budget_tokens) else {
+        emit_memory_observability_event(&MemoryObservabilityEvent::recall_skipped_before_dispatch(
+            &lease,
+            RecallSkip::BudgetBelowMinimum,
+        ));
         return TurnRecallOutcome::SkippedOpen(RecallSkip::BudgetBelowMinimum);
     };
     let permitted_classes = DisclosureGrantSet::model_visible_only();
@@ -2165,27 +2613,40 @@ where
         permitted_classes: permitted_classes.clone(),
     };
     // 5. Bounded dispatch (spec §16.2 hard timeout) — fail open past it.
+    let correlation = RecallCorrelation::new(&lease, &request.turn_id);
+    let skipped = |skip: RecallSkip, elapsed: Duration| {
+        emit_memory_observability_event(
+            &MemoryObservabilityEvent::recall_skipped_after_dispatch(&correlation, skip, elapsed),
+        );
+        TurnRecallOutcome::SkippedOpen(skip)
+    };
+    // §15: started is emitted BEFORE the extension call dispatches.
+    emit_memory_observability_event(&MemoryObservabilityEvent::recall_started(&correlation));
     let started = std::time::Instant::now();
     let response = match tokio::time::timeout(hard_timeout, call(lease, request)).await {
-        Err(_elapsed) => return TurnRecallOutcome::SkippedOpen(RecallSkip::Timeout),
+        Err(_elapsed) => return skipped(RecallSkip::Timeout, hard_timeout),
         Ok(Err(RecallCallError::ProviderUnavailable)) => {
-            return TurnRecallOutcome::SkippedOpen(RecallSkip::ProviderUnavailable)
+            return skipped(RecallSkip::ProviderUnavailable, started.elapsed())
         }
         Ok(Err(RecallCallError::CallFailed)) => {
-            return TurnRecallOutcome::SkippedOpen(RecallSkip::CallFailed)
+            return skipped(RecallSkip::CallFailed, started.elapsed())
         }
         Ok(Ok(response)) => response,
     };
     let recall_latency = started.elapsed();
     let Ok(contribution) = parse_contribution_wire(&response) else {
-        return TurnRecallOutcome::SkippedOpen(RecallSkip::InvalidResponse);
+        return skipped(RecallSkip::InvalidResponse, recall_latency);
     };
     if validate_contribution(&contribution, project_id, budget_tokens, &permitted_classes).is_err()
     {
-        return TurnRecallOutcome::SkippedOpen(RecallSkip::RejectedByValidator);
+        return skipped(RecallSkip::RejectedByValidator, recall_latency);
     }
     // 6. Accept: inject + retain for retry reuse and §10.4 explainability.
     let why = recall_turn_metadata(&contribution, recall_latency);
+    emit_memory_observability_event(&MemoryObservabilityEvent::recall_completed(
+        &correlation,
+        &why,
+    ));
     insert_memory_message(messages, &contribution);
     *retained
         .lock()
@@ -3613,5 +4074,426 @@ mod tests {
         runtime.apply_turn_memory_recall(&mut messages).await;
         assert_eq!(wire_bytes(&messages), before);
         assert!(runtime.memory_recall_why().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task B5 — §10.4 `/memory why` rendering + §15 observability events
+    // -----------------------------------------------------------------------
+
+    /// Emission-ordered `(event, outcome)` pairs drained from this thread's
+    /// typed capture seam.
+    fn drained_event_outcomes() -> Vec<(&'static str, &'static str)> {
+        drain_captured_memory_events_for_test()
+            .iter()
+            .map(|event| (event.event, event.outcome))
+            .collect()
+    }
+
+    /// A §6.5 wire response whose record bodies and rendered text are laced
+    /// with content-leak sentinels — the adversarial §15 input.
+    fn hostile_wire_contribution(project: &str, secret: &str, path: &str) -> Value {
+        json!({
+            "schema": "contribution/1",
+            "provider_id": "axel-memory",
+            "project_id": project,
+            "records": [{
+                "memory_id": "mem-0001",
+                "source": "chat_history",
+                "timestamp": 1_752_000_000u64,
+                "rank_reason": ["exact_topic", "recency"],
+                "sensitivity": "model_visible",
+                "retention": "standard",
+                "content": format!("credential {secret} stored under {path}"),
+                "truncated": true
+            }],
+            "rendered": format!("1. mem-0001 — {secret} at {path}"),
+            "accounting": {"candidates_considered": 5, "withheld": 2, "truncated": 1}
+        })
+    }
+
+    /// §10.4: the why-render includes every documented metadata field —
+    /// selected IDs with source classes, plain-words rank reasons,
+    /// bytes/tokens retained, bytes dropped, truncation count, latency in
+    /// milliseconds, and withheld/skipped counts — and NEVER body content.
+    #[test]
+    fn why_render_reports_every_documented_field_and_never_memory_bodies() {
+        const BODY_SENTINEL: &str = "SENTINEL-memory-body-xk91";
+        let mut contribution =
+            synthetic_contribution(&pid("proj-1"), &format!("1. mem-0001 — {BODY_SENTINEL}"));
+        contribution.records[0].content = BoundedText::new(BODY_SENTINEL, 2048);
+        contribution.accounting.withheld = 3;
+        contribution.accounting.candidates_considered = 9;
+        contribution.accounting.truncated = 1;
+        let why = recall_turn_metadata(&contribution, Duration::from_millis(137));
+        let text = why.render();
+
+        // Selected identity + source class.
+        assert!(text.contains("1 record(s) selected"), "got: {text}");
+        assert!(text.contains("mem-0001"), "got: {text}");
+        assert!(text.contains("chat history"), "got: {text}");
+        // Union of rank reasons in plain words.
+        assert!(text.contains(RankReason::ExactTopic.phrase()), "got: {text}");
+        assert!(text.contains(RankReason::Recency.phrase()), "got: {text}");
+        // Byte/token accounting.
+        assert!(
+            text.contains(&format!(
+                "retained: {} bytes (~{} tokens)",
+                why.retained_bytes, why.retained_tokens
+            )),
+            "got: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "dropped by bounding: {} bytes ({} record(s) truncated)",
+                why.dropped_bytes, why.truncation_count
+            )),
+            "got: {text}"
+        );
+        // Latency in milliseconds, withheld and skipped counts.
+        assert!(text.contains("recall latency: 137ms"), "got: {text}");
+        assert!(text.contains("withheld by disclosure policy: 3"), "got: {text}");
+        assert!(text.contains("considered but not selected: 8"), "got: {text}");
+        // NEVER memory body content — neither record body nor rendered text.
+        assert!(!text.contains(BODY_SENTINEL), "body leaked: {text}");
+    }
+
+    /// §10.4: without retained metadata `/memory why` is a clear NON-error
+    /// explanation, and the Some path delegates to the full render.
+    #[test]
+    fn why_render_without_metadata_is_a_clear_non_error_message() {
+        let text = render_recall_why(None);
+        assert!(text.contains("no recall metadata available"), "got: {text}");
+        assert!(text.contains("memory is off"), "got: {text}");
+        assert!(text.contains("no eligible prompt"), "got: {text}");
+        assert!(text.contains("skipped"), "got: {text}");
+        for error_word in ["error", "failed", "panic"] {
+            assert!(
+                !text.to_lowercase().contains(error_word),
+                "must read as status, not an error; got: {text}"
+            );
+        }
+
+        let contribution = synthetic_contribution(&pid("proj-1"), "1. mem-0001 — auth");
+        let why = recall_turn_metadata(&contribution, Duration::from_millis(5));
+        assert_eq!(render_recall_why(Some(&why)), why.render());
+    }
+
+    /// §10.4: every [`RankReason`] variant maps to a non-empty, distinct
+    /// plain-words phrase. `phrase()` itself matches exhaustively with NO
+    /// wildcard arm, and the match below repeats that guarantee here: a
+    /// future variant fails compilation instead of silently rendering
+    /// nothing.
+    #[test]
+    fn every_rank_reason_variant_maps_to_a_nonempty_distinct_phrase() {
+        let all = [RankReason::ExactTopic, RankReason::Recency];
+        for reason in all {
+            // Exhaustive, wildcard-free: extend this arm list AND `all`
+            // when a new wire variant lands.
+            match reason {
+                RankReason::ExactTopic | RankReason::Recency => {}
+            }
+            assert!(
+                !reason.phrase().trim().is_empty(),
+                "{reason:?} must map to a non-empty phrase"
+            );
+        }
+        assert_ne!(
+            RankReason::ExactTopic.phrase(),
+            RankReason::Recency.phrase(),
+            "phrases must be distinguishable"
+        );
+    }
+
+    /// §15 firing points, accepted path: `memory_recall.started` is emitted
+    /// BEFORE the extension call runs, `memory_recall.completed` (outcome
+    /// `injected`) on acceptance, and the retry-exact reuse emits a
+    /// completed event with outcome `reused_retained` WITHOUT re-dispatch.
+    #[tokio::test]
+    async fn recall_events_fire_started_before_call_and_completed_on_acceptance() {
+        drain_captured_memory_events_for_test();
+
+        let state = Mutex::new(state_in(MemoryContextMode::RecallEachPrompt));
+        let retained = Mutex::new(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let original = shared_msgs(vec![json!({"role": "user", "content": "what auth?"})]);
+
+        // The scripted call snapshots the events already emitted at the
+        // moment the extension call runs (same thread, inline future).
+        let events_at_call: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut messages = original.clone();
+        let marker_calls = Arc::clone(&calls);
+        let at_call = Arc::clone(&events_at_call);
+        let outcome = resolve_turn_recall(
+            &state,
+            &retained,
+            &pid("proj-1"),
+            200_000,
+            &mut messages,
+            RECALL_HARD_TIMEOUT,
+            move |_lease, _request| async move {
+                marker_calls.fetch_add(1, Ordering::SeqCst);
+                *at_call.lock().expect("snapshot") = captured_memory_event_names_for_test();
+                Ok(wire_contribution("proj-1", "1. mem-0001 — auth decision"))
+            },
+        )
+        .await;
+        assert_eq!(outcome, TurnRecallOutcome::Injected);
+        assert_eq!(
+            *events_at_call.lock().expect("snapshot"),
+            vec![EVENT_MEMORY_RECALL_STARTED],
+            "started must be the one event already emitted BEFORE the extension call"
+        );
+        assert_eq!(
+            drained_event_outcomes(),
+            vec![
+                (EVENT_MEMORY_RECALL_STARTED, "dispatched"),
+                (EVENT_MEMORY_RECALL_COMPLETED, "injected"),
+            ],
+        );
+
+        // Retry of the SAME logical request: no new started (no dispatch),
+        // one completed with the reused outcome.
+        let mut retry = original.clone();
+        let outcome = resolve_turn_recall(
+            &state,
+            &retained,
+            &pid("proj-1"),
+            200_000,
+            &mut retry,
+            RECALL_HARD_TIMEOUT,
+            scripted(Arc::clone(&calls), Ok(wire_contribution("proj-1", "NOT CALLED"))),
+        )
+        .await;
+        assert_eq!(outcome, TurnRecallOutcome::ReusedRetained);
+        assert_eq!(
+            drained_event_outcomes(),
+            vec![(EVENT_MEMORY_RECALL_COMPLETED, "reused_retained")],
+            "reuse makes no dispatch: no started event, one completed event"
+        );
+    }
+
+    /// §15 firing points, skip paths: timeout, call failure, and memory-off
+    /// each emit `memory_recall.skipped` with the typed outcome code —
+    /// memory-off with NO started event (zero dispatch), the others after
+    /// their started event. No completed event fires on any skip.
+    #[tokio::test(start_paused = true)]
+    async fn recall_skipped_events_fire_on_timeout_failure_and_off() {
+        drain_captured_memory_events_for_test();
+
+        // Memory off: skip observable, zero dispatch, no started event.
+        {
+            let state = Mutex::new(state_in(MemoryContextMode::Off));
+            let retained = Mutex::new(None);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut messages = shared_msgs(vec![json!({"role": "user", "content": "q"})]);
+            let outcome = resolve_turn_recall(
+                &state,
+                &retained,
+                &pid("proj-1"),
+                200_000,
+                &mut messages,
+                RECALL_HARD_TIMEOUT,
+                scripted(Arc::clone(&calls), Ok(wire_contribution("proj-1", "x"))),
+            )
+            .await;
+            assert_eq!(outcome, TurnRecallOutcome::NotEligible);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                drained_event_outcomes(),
+                vec![(EVENT_MEMORY_RECALL_SKIPPED, "memory_off")],
+            );
+        }
+
+        // Call failure: started, then skipped(call_failed), no completed.
+        {
+            let state = Mutex::new(state_in(MemoryContextMode::RecallEachPrompt));
+            let retained = Mutex::new(None);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut messages = shared_msgs(vec![json!({"role": "user", "content": "q"})]);
+            let outcome = resolve_turn_recall(
+                &state,
+                &retained,
+                &pid("proj-1"),
+                200_000,
+                &mut messages,
+                RECALL_HARD_TIMEOUT,
+                scripted(Arc::clone(&calls), Err(RecallCallError::CallFailed)),
+            )
+            .await;
+            assert_eq!(outcome, TurnRecallOutcome::SkippedOpen(RecallSkip::CallFailed));
+            assert_eq!(
+                drained_event_outcomes(),
+                vec![
+                    (EVENT_MEMORY_RECALL_STARTED, "dispatched"),
+                    (EVENT_MEMORY_RECALL_SKIPPED, "call_failed"),
+                ],
+            );
+        }
+
+        // §16.2 timeout: started, then skipped(timeout) with a duration
+        // bucket — never a completed event.
+        {
+            let state = Mutex::new(state_in(MemoryContextMode::RecallEachPrompt));
+            let retained = Mutex::new(None);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut messages = shared_msgs(vec![json!({"role": "user", "content": "q"})]);
+            let outcome = resolve_turn_recall(
+                &state,
+                &retained,
+                &pid("proj-1"),
+                200_000,
+                &mut messages,
+                RECALL_HARD_TIMEOUT,
+                never_answers(Arc::clone(&calls)),
+            )
+            .await;
+            assert_eq!(outcome, TurnRecallOutcome::SkippedOpen(RecallSkip::Timeout));
+            let events = drain_captured_memory_events_for_test();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| (event.event, event.outcome))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (EVENT_MEMORY_RECALL_STARTED, "dispatched"),
+                    (EVENT_MEMORY_RECALL_SKIPPED, "timeout"),
+                ],
+            );
+            assert_eq!(
+                events[1].duration_bucket,
+                Some(duration_bucket(RECALL_HARD_TIMEOUT)),
+                "the skip carries a coarse duration bucket"
+            );
+        }
+    }
+
+    /// §15 adversarial content-leak gate: when the recall involves records
+    /// whose bodies, rendered block, and user prompt carry secret/path
+    /// sentinels, neither the serialized event JSON of ANY §15 event built
+    /// from that recall nor the emitted diagnostics stream contains them —
+    /// and the §15 disallowed field names cannot even be expressed.
+    #[tokio::test]
+    async fn observability_event_json_never_contains_content_leak_sentinels() {
+        const FAKE_SECRET: &str = "AKIAFAKESECRETKEY9917-hunter2";
+        const FAKE_PATH: &str = "/home/eve/projects/topsecret-repo";
+        const PROMPT_SENTINEL: &str = "SENTINEL-user-prompt-zz41";
+        let sentinels = [FAKE_SECRET, FAKE_PATH, PROMPT_SENTINEL];
+
+        // Full accepted flow, capturing the typed events actually emitted.
+        drain_captured_memory_events_for_test();
+        let state = Mutex::new(state_in(MemoryContextMode::RecallEachPrompt));
+        let retained = Mutex::new(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut messages = shared_msgs(vec![
+            json!({"role": "user", "content": format!("question about {PROMPT_SENTINEL}")}),
+        ]);
+        let outcome = resolve_turn_recall(
+            &state,
+            &retained,
+            &pid("proj-1"),
+            200_000,
+            &mut messages,
+            RECALL_HARD_TIMEOUT,
+            scripted(
+                Arc::clone(&calls),
+                Ok(hostile_wire_contribution("proj-1", FAKE_SECRET, FAKE_PATH)),
+            ),
+        )
+        .await;
+        assert_eq!(outcome, TurnRecallOutcome::Injected);
+        let emitted = drain_captured_memory_events_for_test();
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>(),
+            vec![EVENT_MEMORY_RECALL_STARTED, EVENT_MEMORY_RECALL_COMPLETED],
+            "the recall must be observable"
+        );
+
+        // Direct serialized-JSON check on the ACTUALLY EMITTED events plus
+        // every event constructor, all built from the SAME contaminated
+        // recall state.
+        let retained_turn = retained
+            .lock()
+            .expect("retained slot")
+            .clone()
+            .expect("accepted recall retained");
+        let why = &retained_turn.why;
+        let contribution = &retained_turn.contribution;
+        let lease = mint("sess-1", MemoryContextMode::RecallEachPrompt, "lease-b5");
+        let turn_id = TurnId::parse("turn-b5").expect("turn id");
+        let correlation = RecallCorrelation::new(&lease, &turn_id);
+        let mut events = vec![
+            MemoryObservabilityEvent::context_enabled(&lease),
+            MemoryObservabilityEvent::context_disabled(&sid("sess-1"), &pid("proj-1")),
+            MemoryObservabilityEvent::recall_started(&correlation),
+            MemoryObservabilityEvent::recall_completed(&correlation, why),
+            MemoryObservabilityEvent::recall_reused(&sid("sess-1"), contribution, why),
+            MemoryObservabilityEvent::recall_skipped_off(&sid("sess-1"), &pid("proj-1")),
+            MemoryObservabilityEvent::recall_skipped_before_dispatch(
+                &lease,
+                RecallSkip::BudgetBelowMinimum,
+            ),
+            MemoryObservabilityEvent::recall_skipped_after_dispatch(
+                &correlation,
+                RecallSkip::RejectedByValidator,
+                Duration::from_millis(90),
+            ),
+        ];
+        events.extend(emitted);
+        for event in &events {
+            let json = serde_json::to_string(event).expect("event serializes");
+            for sentinel in sentinels {
+                assert!(
+                    !json.contains(sentinel),
+                    "event JSON leaked {sentinel:?}: {json}"
+                );
+            }
+            // §15 disallowed classes are structurally inexpressible: no
+            // field of the serialized shape may even be named for them.
+            for banned_key in [
+                "\"message\"",
+                "\"content\"",
+                "\"body\"",
+                "\"tool_result\"",
+                "\"path\"",
+                "\"credential\"",
+                "\"error\"",
+            ] {
+                assert!(
+                    !json.contains(banned_key),
+                    "event JSON exposes banned field {banned_key}: {json}"
+                );
+            }
+        }
+        // And the why-render built from the same recall stays body-free.
+        let text = why.render();
+        for sentinel in sentinels {
+            assert!(!text.contains(sentinel), "why render leaked: {text}");
+        }
+    }
+
+    /// §15 duration buckets are coarse, closed, and total.
+    #[test]
+    fn duration_buckets_are_coarse_and_total() {
+        for (millis, bucket) in [
+            (0u64, "lt_50ms"),
+            (49, "lt_50ms"),
+            (50, "50ms_250ms"),
+            (249, "50ms_250ms"),
+            (250, "250ms_1s"),
+            (999, "250ms_1s"),
+            (1_000, "1s_5s"),
+            (4_999, "1s_5s"),
+            (5_000, "ge_5s"),
+            (3_600_000, "ge_5s"),
+        ] {
+            assert_eq!(
+                duration_bucket(Duration::from_millis(millis)),
+                bucket,
+                "{millis}ms"
+            );
+        }
     }
 }

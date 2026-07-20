@@ -1528,8 +1528,8 @@ impl Runtime {
     /// Task B4 (spec §10.4): explainability metadata retained for the
     /// current turn's accepted recall, if any. Metadata only — selected IDs,
     /// source classes, rank reasons, byte/token accounting, latency, and
-    /// withheld/skipped counts; never memory content. Full `/memory why`
-    /// rendering is task B5.
+    /// withheld/skipped counts; never memory content. Rendered for
+    /// `/memory why` by [`memory_context::render_recall_why`] (task B5).
     pub fn memory_recall_why(&self) -> Option<memory_context::RecallTurnMetadata> {
         self.retained_recall_turn
             .lock()
@@ -1916,13 +1916,15 @@ impl Runtime {
     ///
     /// [`ExtensionRuntimeManager`]: crate::extensions::lease::ExtensionRuntimeManager
     pub fn memory_context_disable(&self) -> memory_context::MemoryContextStatus {
-        let (status, bound) = {
+        let (status, bound, session) = {
             let mut state = self.memory_context_lock();
             let session = state.session_id().clone();
             let bound = state.bound_provider_ids();
             let status = match memory_context::apply_memory_context_action(
                 &mut state,
-                memory_context::AuthorizedMemoryAction::Disable { session },
+                memory_context::AuthorizedMemoryAction::Disable {
+                    session: session.clone(),
+                },
             ) {
                 Ok(status) => status,
                 // Unreachable by construction (the session identity is read
@@ -1930,8 +1932,16 @@ impl Runtime {
                 // panic on the fallback: report current status.
                 Err(_) => state.status(),
             };
-            (status, bound)
+            (status, bound, session)
         };
+        // §15 `memory_context.disabled` (task B5): emitted after the state
+        // transition applied — session + project digest identities only.
+        memory_context::emit_memory_observability_event(
+            &memory_context::MemoryObservabilityEvent::context_disabled(
+                &session,
+                &memory_project_id(),
+            ),
+        );
         // State mutex released before touching the lease manager: the
         // revocation below locks only the lease map (idempotent no-op when
         // nothing was ever spawned).
@@ -2041,10 +2051,18 @@ impl Runtime {
     {
         let mut state = self.memory_context_lock();
         let lease = self.grant_command_memory_lease(&state, mode, proof, requested_provider)?;
-        memory_context::apply_memory_context_action(
+        // §15 `memory_context.enabled` (task B5): metadata-only snapshot of
+        // the lease identities, captured before `apply` consumes the lease
+        // and emitted only on a successful install.
+        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
+        let result = memory_context::apply_memory_context_action(
             &mut state,
             memory_context::AuthorizedMemoryAction::Enable { lease },
-        )
+        );
+        if result.is_ok() {
+            memory_context::emit_memory_observability_event(&enabled_event);
+        }
+        result
     }
 
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
@@ -2063,10 +2081,17 @@ impl Runtime {
             proof,
             None,
         )?;
-        memory_context::apply_memory_context_action(
+        // §15 `memory_context.enabled` (task B5): the one-shot grant is an
+        // enable of `recall_once` — emitted only on a successful install.
+        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
+        let result = memory_context::apply_memory_context_action(
             &mut state,
             memory_context::AuthorizedMemoryAction::RecallOnce { lease },
-        )
+        );
+        if result.is_ok() {
+            memory_context::emit_memory_observability_event(&enabled_event);
+        }
+        result
     }
 
     /// Mint one host-owned lease for a `/memory` command grant: host-minted
@@ -4546,6 +4571,68 @@ mod memory_context_provider_tests {
         let status = runtime.memory_context_disable();
         assert_eq!(status.durable, memory_context::DurableStatus::Off);
         assert_eq!(ext.lease_count(), 0);
+    }
+
+    /// Task B5 (spec §15): enable and disable emit metadata-only
+    /// `memory_context.enabled` / `memory_context.disabled` events — mode +
+    /// identities with the host-derived project DIGEST, never the raw
+    /// project path; a failed enable emits nothing.
+    #[test]
+    fn memory_context_enable_disable_emit_metadata_only_events() {
+        memory_context::drain_captured_memory_events_for_test();
+
+        let runtime = Runtime::new_headless();
+        // A rejected enable (Off is not a session-lease mode) emits nothing.
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::Off,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("Off is not an enable mode");
+        assert!(
+            memory_context::drain_captured_memory_events_for_test().is_empty(),
+            "failed enable must emit no event"
+        );
+
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        runtime.memory_context_disable();
+
+        let events = memory_context::drain_captured_memory_events_for_test();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.event, event.outcome))
+                .collect::<Vec<_>>(),
+            vec![
+                ("memory_context.enabled", "enabled"),
+                ("memory_context.disabled", "disabled"),
+            ],
+        );
+        assert_eq!(events[0].mode, Some("capture_and_recall"));
+        assert_eq!(events[1].mode, Some("off"));
+
+        // §15: the project identity in every event is the digest form,
+        // never the raw working-directory path.
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .into_owned();
+        for event in &events {
+            let json = serde_json::to_string(event).expect("event serializes");
+            assert!(
+                json.contains("project-cwd-"),
+                "digest identity expected; got: {json}"
+            );
+            assert!(
+                !json.contains(&cwd),
+                "raw project path leaked into event JSON: {json}"
+            );
+        }
     }
 
     /// Task A6 session-end plumbing: dropping the LAST runtime owner runs
