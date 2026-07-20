@@ -1613,6 +1613,48 @@ pub(crate) fn capture_request_wire(capture: &super::chat_capture::ChatTurnCaptur
     })
 }
 
+pub(crate) fn summary_capture_request_wire(
+    capture: &super::chat_capture::ConversationSummaryCapture,
+) -> Value {
+    use super::chat_capture::CompactionSummaryOrigin;
+    let (summary_provider, summary_model, local_only) = match &capture.summary_origin {
+        CompactionSummaryOrigin::LocalOnly => (Value::Null, Value::Null, true),
+        CompactionSummaryOrigin::Provider {
+            provider_id,
+            model_id,
+        } => (
+            Value::String(provider_id.clone()),
+            Value::String(model_id.clone()),
+            false,
+        ),
+    };
+    serde_json::json!({
+        "schema": "conversation_summary/1",
+        "capture_id": capture.capture_id.to_hex(),
+        "project_id": capture.project_id.as_str(),
+        "source_session_id": capture.source_session_id.as_str(),
+        "source_message_count": capture.source_message_count,
+        "source_turn_range": {
+            "first": capture.first_turn_ordinal,
+            "last": capture.last_turn_ordinal,
+            "digest": capture.source_turn_range_digest.to_hex(),
+        },
+        "summary": capture.summary.text,
+        "summary_provider": summary_provider,
+        "summary_model": summary_model,
+        "local_only": local_only,
+        "prompt_stack_digest": capture.prompt_stack_digest.to_hex(),
+        "redaction_policy": match capture.redaction_policy {
+            agent_core::compaction::RedactionPolicy::TruncationOnly => "truncation_only",
+            agent_core::compaction::RedactionPolicy::PolicyExclusions => "policy_exclusions",
+        },
+        "content_classes": capture.content_classes.iter().map(agent_core::compaction::ContentClass::as_str).collect::<Vec<_>>(),
+        "summarized_at_unix_ms": capture.summarized_at.duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+    })
+}
+
 /// Recall-request wire schema version the host produces (spec §6.4).
 pub(crate) const RECALL_WIRE_SCHEMA: &str = "recall/1";
 

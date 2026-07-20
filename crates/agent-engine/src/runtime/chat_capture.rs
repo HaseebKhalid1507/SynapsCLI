@@ -13,6 +13,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CAPTURE_SEGMENT_MAX_BYTES: usize = 4096;
+pub const SUMMARY_CAPTURE_MAX_BYTES: usize = 12_000;
 pub const TOOL_SUMMARY_MAX_BYTES: usize = 1024;
 pub const TOOL_NAME_MAX_BYTES: usize = 128;
 pub const MAX_TOOL_SUMMARIES: usize = 16;
@@ -116,6 +117,14 @@ pub struct ToolCaptureSummary {
 pub struct MessageRangeDigest([u8; 32]);
 
 impl MessageRangeDigest {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        decode_hex_32(hex).map(Self)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -133,8 +142,16 @@ impl PromptStackDigest {
         Self(bytes)
     }
 
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        decode_hex_32(hex).map(Self)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        hex_bytes(&self.0)
     }
 }
 
@@ -177,14 +194,94 @@ pub struct CompactionSource {
     pub schema: CompactionSchemaVersion,
     pub project_id: ProjectId,
     pub source_session_id: SessionId,
+    /// Inclusive source range. Compaction of legacy histories uses canonical
+    /// message positions because those messages have no durable turn ordinal;
+    /// the accompanying digest binds the exact ordered content.
     pub first_turn_ordinal: u64,
     pub last_turn_ordinal: u64,
     pub source_digest: MessageRangeDigest,
     pub summary_origin: CompactionSummaryOrigin,
     pub prompt_stack_digest: PromptStackDigest,
     pub redaction: RedactionPolicy,
-    pub content_classes: Vec<CaptureContentClass>,
+    pub content_classes: Vec<agent_core::compaction::ContentClass>,
     pub summarized_at: SystemTime,
+}
+
+/// First-class compaction memory. It links to (and never substitutes for) the
+/// source range whose full provenance remains on the compacted session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSummaryCapture {
+    pub schema: CompactionSchemaVersion,
+    pub capture_id: CaptureId,
+    pub project_id: ProjectId,
+    pub source_session_id: SessionId,
+    pub source_message_count: usize,
+    pub first_turn_ordinal: u64,
+    pub last_turn_ordinal: u64,
+    pub source_turn_range_digest: MessageRangeDigest,
+    pub summary: BoundedText,
+    pub summary_origin: CompactionSummaryOrigin,
+    pub prompt_stack_digest: PromptStackDigest,
+    pub redaction_policy: agent_core::compaction::RedactionPolicy,
+    pub content_classes: Vec<agent_core::compaction::ContentClass>,
+    pub summarized_at: SystemTime,
+    pub retention: RetentionClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryCaptureBuildError {
+    ForeignProject,
+    EmptySourceRange,
+    InvalidTurnRange,
+}
+
+/// Build the bounded first-class memory emitted after a persisted compaction
+/// transition. The source digest and session are copied from the transition's
+/// typed provenance rather than recomputed from the post-compaction history.
+pub fn build_conversation_summary_capture(
+    expected_project: &ProjectId,
+    source: CompactionSource,
+    source_message_count: usize,
+    summary_text: &str,
+    redaction_policy: agent_core::compaction::RedactionPolicy,
+    retention: RetentionClass,
+) -> Result<ConversationSummaryCapture, SummaryCaptureBuildError> {
+    if &source.project_id != expected_project {
+        return Err(SummaryCaptureBuildError::ForeignProject);
+    }
+    if source_message_count == 0 {
+        return Err(SummaryCaptureBuildError::EmptySourceRange);
+    }
+    if source.first_turn_ordinal > source.last_turn_ordinal {
+        return Err(SummaryCaptureBuildError::InvalidTurnRange);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"synaps.conversation-summary-capture-id.v1\0");
+    digest_text(&mut digest, expected_project.as_str());
+    digest_text(&mut digest, source.source_session_id.as_str());
+    digest_u64(&mut digest, source.first_turn_ordinal);
+    digest_u64(&mut digest, source.last_turn_ordinal);
+    digest.update(source.source_digest.as_bytes());
+    let capture_id = CaptureId(digest.finalize().into());
+
+    Ok(ConversationSummaryCapture {
+        schema: source.schema,
+        capture_id,
+        project_id: source.project_id,
+        source_session_id: source.source_session_id,
+        source_message_count,
+        first_turn_ordinal: source.first_turn_ordinal,
+        last_turn_ordinal: source.last_turn_ordinal,
+        source_turn_range_digest: source.source_digest,
+        summary: BoundedText::new(summary_text, SUMMARY_CAPTURE_MAX_BYTES),
+        summary_origin: source.summary_origin,
+        prompt_stack_digest: source.prompt_stack_digest,
+        redaction_policy,
+        content_classes: source.content_classes,
+        summarized_at: source.summarized_at,
+        retention,
+    })
 }
 
 /// Exact disclosure classes present after filtering, in deterministic order.
@@ -451,7 +548,7 @@ fn digest_compaction(digest: &mut Sha256, source: &CompactionSource) {
     }]);
     digest_u64(digest, source.content_classes.len() as u64);
     for class in &source.content_classes {
-        digest.update([class.digest_tag()]);
+        digest_text(digest, class.as_str());
     }
     digest_time(digest, source.summarized_at);
 }
@@ -540,6 +637,19 @@ fn digest_time(digest: &mut Sha256, time: SystemTime) {
             digest.update(error.duration().subsec_nanos().to_be_bytes());
         }
     }
+}
+
+fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        bytes[index] = (high << 4) | low;
+    }
+    Some(bytes)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -715,6 +825,48 @@ mod tests {
     }
 
     #[test]
+    fn conversation_summary_builder_is_bounded_and_digest_linked() {
+        let source_digest = MessageRangeDigest::from_bytes([7; 32]);
+        let source = CompactionSource {
+            schema: CompactionSchemaVersion::V1,
+            project_id: project("project-a"),
+            source_session_id: SessionId::parse("session-previous").unwrap(),
+            first_turn_ordinal: 2,
+            last_turn_ordinal: 5,
+            source_digest,
+            summary_origin: CompactionSummaryOrigin::Provider {
+                provider_id: "anthropic".into(),
+                model_id: "claude-sonnet-4-6".into(),
+            },
+            prompt_stack_digest: PromptStackDigest::from_bytes([8; 32]),
+            redaction: RedactionPolicy::HostRedacted,
+            content_classes: vec![agent_core::compaction::ContentClass::UserText],
+            summarized_at: UNIX_EPOCH + Duration::from_secs(9),
+        };
+
+        let summary = build_conversation_summary_capture(
+            &project("project-a"),
+            source,
+            4,
+            &"s".repeat(SUMMARY_CAPTURE_MAX_BYTES + 1),
+            agent_core::compaction::RedactionPolicy::PolicyExclusions,
+            RetentionClass::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(summary.source_session_id.as_str(), "session-previous");
+        assert_eq!(summary.source_turn_range_digest, source_digest);
+        assert_eq!(summary.first_turn_ordinal, 2);
+        assert_eq!(summary.last_turn_ordinal, 5);
+        assert_eq!(
+            summary.redaction_policy,
+            agent_core::compaction::RedactionPolicy::PolicyExclusions
+        );
+        assert_eq!(summary.summary.retained_bytes, SUMMARY_CAPTURE_MAX_BYTES);
+        assert!(summary.summary.truncated);
+    }
+
+    #[test]
     fn carries_times_ordinal_disclosure_retention_sensitivity_and_compaction() {
         let mut items = required_items();
         items[0].disclosure = DisclosureClass::LocalOnly;
@@ -731,7 +883,7 @@ mod tests {
             summary_origin: CompactionSummaryOrigin::LocalOnly,
             prompt_stack_digest: PromptStackDigest::from_bytes([8; 32]),
             redaction: RedactionPolicy::HostRedacted,
-            content_classes: vec![CaptureContentClass::UserMessage],
+            content_classes: vec![agent_core::compaction::ContentClass::UserText],
             summarized_at: UNIX_EPOCH + Duration::from_secs(9),
         });
 

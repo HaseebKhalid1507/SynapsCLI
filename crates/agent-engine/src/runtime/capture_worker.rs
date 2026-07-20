@@ -1,7 +1,8 @@
 //! Nonblocking, bounded dispatch of completed memory captures.
 
 use super::chat_capture::{
-    build_chat_turn_capture, CaptureBuildError, ChatTurnCapture, TerminalTurnHistory,
+    build_chat_turn_capture, build_conversation_summary_capture, CaptureBuildError,
+    ChatTurnCapture, ConversationSummaryCapture, SummaryCaptureBuildError, TerminalTurnHistory,
 };
 use super::memory_context::{ContextProviderId, MemoryContextLease, RetentionClass, TurnCapture};
 use std::collections::HashSet;
@@ -9,9 +10,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-/// Provider seam. Implementations must treat `capture_id` as an idempotency key.
+/// Provider seam. Implementations must treat every capture id as an
+/// idempotency key. Summary capture is additive so existing turn providers
+/// keep source compatibility while adopting the C4 record class.
 pub trait CaptureProvider: Send + Sync + 'static {
     fn capture(&self, capture: ChatTurnCapture) -> Result<(), CaptureFailure>;
+
+    fn capture_summary(&self, _capture: ConversationSummaryCapture) -> Result<(), CaptureFailure> {
+        Err(CaptureFailure {
+            code: "summary_capture_unsupported",
+        })
+    }
 }
 
 /// Content-free failure metadata suitable for diagnostics.
@@ -20,14 +29,35 @@ pub struct CaptureFailure {
     pub code: &'static str,
 }
 
+enum CapturePayload {
+    Turn(ChatTurnCapture),
+    Summary(ConversationSummaryCapture),
+}
+
+impl CapturePayload {
+    fn id_bytes(&self) -> [u8; 32] {
+        match self {
+            Self::Turn(capture) => *capture.capture_id.as_bytes(),
+            Self::Summary(capture) => *capture.capture_id.as_bytes(),
+        }
+    }
+
+    fn dispatch(self, provider: &dyn CaptureProvider) -> Result<(), CaptureFailure> {
+        match self {
+            Self::Turn(capture) => provider.capture(capture),
+            Self::Summary(capture) => provider.capture_summary(capture),
+        }
+    }
+}
+
 struct CaptureJob {
     provider_id: ContextProviderId,
     provider: Arc<dyn CaptureProvider>,
-    capture: ChatTurnCapture,
+    payload: CapturePayload,
 }
 
 /// Fixed-capacity worker. Enqueue is always `try_send`; persistence never runs
-/// on the turn-completion path.
+/// on the turn-completion or compaction-transition path.
 pub struct CaptureWorker {
     sender: mpsc::SyncSender<CaptureJob>,
     dropped: Arc<AtomicU64>,
@@ -46,11 +76,11 @@ impl CaptureWorker {
             .spawn(move || {
                 let mut submitted = HashSet::new();
                 while let Ok(job) = receiver.recv() {
-                    let id = (job.provider_id.clone(), *job.capture.capture_id.as_bytes());
+                    let id = (job.provider_id.clone(), job.payload.id_bytes());
                     if submitted.contains(&id) {
                         continue;
                     }
-                    if job.provider.capture(job.capture).is_err() {
+                    if job.payload.dispatch(job.provider.as_ref()).is_err() {
                         // No automatic retry: completion stays decoupled. Because a
                         // failed ID is not committed, an explicit retry remains safe.
                         worker_failures.fetch_add(1, Ordering::Relaxed);
@@ -86,7 +116,46 @@ impl CaptureWorker {
         let job = CaptureJob {
             provider_id: lease.provider_id.clone(),
             provider,
-            capture,
+            payload: CapturePayload::Turn(capture),
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => Ok(true),
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Apply the same exact lease gate as turn capture, build a bounded
+    /// first-class compaction memory, and attempt a nonblocking enqueue.
+    pub fn submit_summary(
+        &self,
+        lease: &MemoryContextLease,
+        source: super::chat_capture::CompactionSource,
+        source_message_count: usize,
+        summary_text: &str,
+        redaction_policy: agent_core::compaction::RedactionPolicy,
+        retention: RetentionClass,
+        provider: Arc<dyn CaptureProvider>,
+    ) -> Result<bool, SummaryCaptureBuildError> {
+        if lease.mode.turn_capture() != TurnCapture::Enabled
+            || lease.project_id != source.project_id
+        {
+            return Ok(false);
+        }
+        let capture = build_conversation_summary_capture(
+            &lease.project_id,
+            source,
+            source_message_count,
+            summary_text,
+            redaction_policy,
+            retention,
+        )?;
+        let job = CaptureJob {
+            provider_id: lease.provider_id.clone(),
+            provider,
+            payload: CapturePayload::Summary(capture),
         };
         match self.sender.try_send(job) {
             Ok(()) => Ok(true),

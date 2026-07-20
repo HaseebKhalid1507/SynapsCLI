@@ -527,6 +527,7 @@ pub async fn compact_conversation(
             let mut outcome =
                 CompactionOutcome::new(summary_text, LOCAL_SUMMARY_MODEL, &[LOCAL_SUMMARY_MODEL]);
             outcome.summary_provider = "local".to_string();
+            outcome.local_only = true;
             outcome.included_classes = rendered.included_classes;
             outcome.excluded_classes = rendered.excluded_classes.clone();
             outcome.redaction_policy = redaction_for(&rendered.excluded_classes);
@@ -578,6 +579,9 @@ pub struct CompactionOutcome {
     pub summary_text: String,
     pub summary_provider: String,
     pub summary_model: String,
+    /// True means no provider produced this summary. Kept independently from
+    /// provider/model labels so capture never fabricates remote provenance.
+    pub local_only: bool,
     pub prompt_stack_digest: String,
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
@@ -596,6 +600,7 @@ impl CompactionOutcome {
             summary_text,
             summary_provider: provider_label_for_model(summary_model),
             summary_model: summary_model.to_string(),
+            local_only: false,
             prompt_stack_digest: agent_core::compaction::prompt_stack_digest(prompt_parts),
             included_classes: vec![
                 ContentClass::UserText,
@@ -760,6 +765,12 @@ pub async fn apply_compaction(
     transition: CompactionTransition,
 ) -> Result<AppliedCompaction> {
     use agent_core::session::Session;
+    let summarized_at = std::time::SystemTime::now();
+    // Snapshot the full lease at transition entry. A concurrent `/memory off`
+    // may revoke future work but cannot swap this transition to another
+    // provider after its compaction source has already been accepted.
+    let capture_lease = runtime.compaction_capture_lease_at(summarized_at);
+    let created_at: chrono::DateTime<chrono::Utc> = summarized_at.into();
 
     let record = agent_core::compaction::CompactionRecord {
         schema_version: agent_core::compaction::COMPACTION_SUMMARY_SCHEMA_VERSION,
@@ -768,7 +779,7 @@ pub async fn apply_compaction(
         source_range_digest: agent_core::compaction::message_range_digest(api_messages),
         summary_provider: outcome.summary_provider.clone(),
         summary_model: outcome.summary_model.clone(),
-        created_at: chrono::Utc::now(),
+        created_at,
         prompt_stack_digest: outcome.prompt_stack_digest.clone(),
         included_classes: outcome.included_classes.clone(),
         excluded_classes: outcome.excluded_classes.clone(),
@@ -898,6 +909,17 @@ pub async fn apply_compaction(
     );
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
+    // Capture is emitted only after the transition and its source provenance
+    // are durable. It is additive: the session's CompactionRecord remains the
+    // canonical source link even if the bounded asynchronous dispatch fails.
+    runtime.submit_compaction_summary_capture(
+        capture_lease,
+        current,
+        api_messages,
+        outcome,
+        summarized_at,
+    );
+
     let api_messages = session.api_messages.clone();
     // The transition is fully persisted — count the successful pass through
     // the ONE typed entry (runtime-observable architectural proof).
@@ -978,6 +1000,185 @@ mod transition_tests {
         // Provider label follows the model route, not a hardcoded string.
         let openai = CompactionOutcome::new("s".into(), "openai-codex/gpt-5.2-codex", &["p"]);
         assert_ne!(openai.summary_provider, "anthropic");
+    }
+
+    #[derive(Default)]
+    struct SummaryCaptureRecorder {
+        summaries: std::sync::Mutex<Vec<crate::runtime::chat_capture::ConversationSummaryCapture>>,
+    }
+
+    impl crate::runtime::capture_worker::CaptureProvider for SummaryCaptureRecorder {
+        fn capture(
+            &self,
+            _capture: crate::runtime::chat_capture::ChatTurnCapture,
+        ) -> std::result::Result<(), crate::runtime::capture_worker::CaptureFailure> {
+            Ok(())
+        }
+
+        fn capture_summary(
+            &self,
+            capture: crate::runtime::chat_capture::ConversationSummaryCapture,
+        ) -> std::result::Result<(), crate::runtime::capture_worker::CaptureFailure> {
+            self.summaries
+                .lock()
+                .expect("summary recorder lock")
+                .push(capture);
+            Ok(())
+        }
+    }
+
+    fn wait_for_summary(
+        recorder: &SummaryCaptureRecorder,
+    ) -> crate::runtime::chat_capture::ConversationSummaryCapture {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(summary) = recorder
+                .summaries
+                .lock()
+                .expect("summary recorder lock")
+                .first()
+                .cloned()
+            {
+                return summary;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "summary capture timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn capture_enabled_runtime(recorder: Arc<SummaryCaptureRecorder>) -> crate::Runtime {
+        let runtime = crate::Runtime::new_headless();
+        runtime.set_capture_provider_for_test(recorder);
+        runtime
+            .memory_context_enable(
+                crate::runtime::memory_context::MemoryContextMode::CaptureOnly,
+                crate::runtime::memory_context::mint_explicit_command_proof(),
+            )
+            .expect("capture lease");
+        runtime
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn memory_summary_capture_links_source_range_without_replacing_provenance() {
+        let _base = BaseDirGuard::new();
+        let recorder = Arc::new(SummaryCaptureRecorder::default());
+        let runtime = capture_enabled_runtime(recorder.clone());
+        let parent = parent_session();
+        let messages = history();
+        let outcome = hostile_outcome();
+
+        let applied = apply_compaction(
+            &runtime,
+            &parent,
+            &messages,
+            &outcome,
+            transition(CompactionPolicy::InPlace),
+        )
+        .await
+        .expect("transition");
+
+        let summary = wait_for_summary(&recorder);
+        let source = applied
+            .session
+            .compaction
+            .as_ref()
+            .expect("source provenance retained");
+        assert_eq!(summary.source_session_id.as_str(), parent.id);
+        assert_eq!(summary.source_message_count, messages.len());
+        assert_eq!(summary.first_turn_ordinal, 0);
+        assert_eq!(summary.last_turn_ordinal, (messages.len() - 1) as u64);
+        assert_eq!(
+            summary.source_turn_range_digest.to_hex(),
+            source.source_range_digest
+        );
+        assert_eq!(source.source_session, parent.id);
+        assert_eq!(
+            source.source_range_digest,
+            agent_core::compaction::message_range_digest(&messages)
+        );
+        assert_eq!(summary.summary.text, outcome.summary_text);
+        assert_eq!(
+            summary.prompt_stack_digest.to_hex(),
+            source.prompt_stack_digest
+        );
+        assert_eq!(summary.content_classes, source.included_classes);
+        assert_eq!(summary.redaction_policy, source.redaction_policy);
+        let summary_created_at: chrono::DateTime<chrono::Utc> = summary.summarized_at.into();
+        assert_eq!(summary_created_at, source.created_at);
+        assert_eq!(
+            summary.schema,
+            crate::runtime::chat_capture::CompactionSchemaVersion::V1
+        );
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn memory_local_only_compaction_capture_has_marker_and_no_provider() {
+        let _base = BaseDirGuard::new();
+        let recorder = Arc::new(SummaryCaptureRecorder::default());
+        let mut runtime = capture_enabled_runtime(recorder.clone());
+        runtime.set_compaction_mode(agent_core::compaction::CompactionMode::LocalOnly);
+        let parent = parent_session();
+        let messages = history();
+        let outcome = compact_conversation(&messages, &runtime, None)
+            .await
+            .expect("local summary");
+
+        apply_compaction(
+            &runtime,
+            &parent,
+            &messages,
+            &outcome,
+            transition(CompactionPolicy::InPlace),
+        )
+        .await
+        .expect("transition");
+
+        let summary = wait_for_summary(&recorder);
+        assert!(outcome.local_only);
+        assert_eq!(
+            summary.summary_origin,
+            crate::runtime::chat_capture::CompactionSummaryOrigin::LocalOnly
+        );
+        let wire = crate::runtime::memory_context::summary_capture_request_wire(&summary);
+        assert_eq!(wire["local_only"], true);
+        assert!(wire["summary_provider"].is_null());
+        assert!(wire["summary_model"].is_null());
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn memory_capture_disabled_lease_emits_no_compaction_summary() {
+        let _base = BaseDirGuard::new();
+        let recorder = Arc::new(SummaryCaptureRecorder::default());
+        let runtime = crate::Runtime::new_headless();
+        runtime.set_capture_provider_for_test(recorder.clone());
+        runtime
+            .memory_context_enable(
+                crate::runtime::memory_context::MemoryContextMode::RecallEachPrompt,
+                crate::runtime::memory_context::mint_explicit_command_proof(),
+            )
+            .expect("recall-only lease");
+
+        apply_compaction(
+            &runtime,
+            &parent_session(),
+            &history(),
+            &hostile_outcome(),
+            transition(CompactionPolicy::InPlace),
+        )
+        .await
+        .expect("transition");
+
+        assert!(recorder
+            .summaries
+            .lock()
+            .expect("summary recorder lock")
+            .is_empty());
     }
 
     #[tokio::test]

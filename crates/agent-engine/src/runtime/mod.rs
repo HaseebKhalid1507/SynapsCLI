@@ -300,6 +300,13 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// Production resolves the exact leased extension provider at dispatch.
+    /// Tests may install this in-process provider to observe the same worker
+    /// boundary without spawning an extension process.
+    #[cfg(any(test, feature = "testing"))]
+    capture_provider_for_test: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<dyn capture_worker::CaptureProvider>>>,
+    >,
     /// The validated recall contribution held for the CURRENT turn, if any
     /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
     /// never raw text — admitted only through the
@@ -503,6 +510,30 @@ impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
                 code: "provider_call_failed",
             })
     }
+
+    fn capture_summary(
+        &self,
+        capture: chat_capture::ConversationSummaryCapture,
+    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
+        let params = memory_context::summary_capture_request_wire(&capture);
+        self.handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    params,
+                ),
+            )
+            .map(|_| ())
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_call_failed",
+            })
+    }
 }
 
 fn terminal_capture_history(
@@ -670,6 +701,8 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // Empty per construction — a held recall segment is turn-scoped
             // session state and is never copied into a fresh runtime.
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -763,6 +796,8 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // Empty per construction — a held recall segment is turn-scoped
             // session state and is never copied into a fresh runtime.
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2231,6 +2266,131 @@ impl Runtime {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_capture_provider_for_test(
+        &self,
+        provider: std::sync::Arc<dyn capture_worker::CaptureProvider>,
+    ) {
+        *self
+            .capture_provider_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider);
+    }
+
+    pub(crate) fn compaction_capture_lease_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<memory_context::MemoryContextLease> {
+        self.memory_context_lock().capture_lease_at(now)
+    }
+
+    pub(crate) fn submit_compaction_summary_capture(
+        &self,
+        capture_lease: Option<memory_context::MemoryContextLease>,
+        current: &agent_core::session::Session,
+        api_messages: &[crate::SharedMessage],
+        outcome: &compaction::CompactionOutcome,
+        summarized_at: std::time::SystemTime,
+    ) {
+        let Some(lease) = capture_lease else {
+            return;
+        };
+        let Ok(source_session_id) = memory_context::SessionId::parse(&current.id) else {
+            return;
+        };
+        // A compaction source range is the exact pre-transition message range.
+        // Legacy session messages have no durable turn ordinals, so this
+        // inclusive range uses canonical message positions and the digest
+        // binds the exact ordered content.
+        if api_messages.is_empty() {
+            return;
+        }
+        let first_turn_ordinal = 0;
+        let last_turn_ordinal = (api_messages.len() - 1) as u64;
+        let Some(source_digest) = chat_capture::MessageRangeDigest::from_hex(
+            &agent_core::compaction::message_range_digest(api_messages),
+        ) else {
+            return;
+        };
+        let Some(prompt_stack_digest) =
+            chat_capture::PromptStackDigest::from_hex(&outcome.prompt_stack_digest)
+        else {
+            return;
+        };
+        let summary_origin = if outcome.local_only {
+            chat_capture::CompactionSummaryOrigin::LocalOnly
+        } else {
+            chat_capture::CompactionSummaryOrigin::Provider {
+                provider_id: outcome.summary_provider.clone(),
+                model_id: outcome.summary_model.clone(),
+            }
+        };
+        let content_classes = outcome.included_classes.clone();
+        let source = chat_capture::CompactionSource {
+            schema: chat_capture::CompactionSchemaVersion::V1,
+            project_id: lease.project_id.clone(),
+            source_session_id,
+            first_turn_ordinal,
+            last_turn_ordinal,
+            source_digest,
+            summary_origin,
+            prompt_stack_digest,
+            redaction: match outcome.redaction_policy {
+                agent_core::compaction::RedactionPolicy::TruncationOnly => {
+                    chat_capture::RedactionPolicy::None
+                }
+                agent_core::compaction::RedactionPolicy::PolicyExclusions => {
+                    chat_capture::RedactionPolicy::HostRedacted
+                }
+            },
+            content_classes,
+            summarized_at,
+        };
+
+        #[cfg(any(test, feature = "testing"))]
+        let test_provider = self
+            .capture_provider_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(not(any(test, feature = "testing")))]
+        let test_provider: Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> = None;
+        let provider = test_provider.or_else(|| self.extension_capture_provider(&lease));
+        if let Some(provider) = provider {
+            let _ = memory_capture_worker().submit_summary(
+                &lease,
+                source,
+                api_messages.len(),
+                &outcome.summary_text,
+                outcome.redaction_policy,
+                memory_context::RetentionClass::Standard,
+                provider,
+            );
+        }
+    }
+
+    fn extension_capture_provider(
+        &self,
+        lease: &memory_context::MemoryContextLease,
+    ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
+        let manager = self.extension_runtime.clone()?;
+        let mut parts = lease.provider_id.as_str().splitn(3, ':');
+        let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let digest =
+            manager.declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)?;
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        Some(std::sync::Arc::new(ExtensionCaptureProvider {
+            manager,
+            session: self.host_tool_session.clone(),
+            plugin: plugin.to_owned(),
+            digest,
+            handle,
+        }))
+    }
+
     /// Test-only: intent proof recorded on the current durable lease.
     #[cfg(test)]
     pub(crate) fn memory_durable_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
@@ -3124,6 +3284,8 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::clone(&self.capture_provider_for_test),
             // Clones are the same session: they observe the same held
             // recall segment (one truth), like memory_context_state above.
             pending_memory_segment: std::sync::Arc::clone(&self.pending_memory_segment),
