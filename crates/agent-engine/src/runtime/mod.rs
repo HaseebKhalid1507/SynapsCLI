@@ -22,6 +22,7 @@ pub mod context;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
+pub mod memory_context;
 pub mod openai;
 pub mod relay;
 mod request;
