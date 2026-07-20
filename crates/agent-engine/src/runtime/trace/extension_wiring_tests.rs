@@ -34,9 +34,6 @@ use tokio_util::sync::CancellationToken;
 
 const SENTINEL: &str = "EXTENSION_TRACE_SENTINEL_9e4b_never_persist";
 
-/// Serializes tests that mutate the process-global base dir (trust + audit).
-static BASE_DIR_LOCK: Mutex<()> = Mutex::new(());
-
 // ═══ Fake in-process provider handler ═══════════════════════════════════════
 
 #[derive(Default)]
@@ -120,21 +117,21 @@ fn ok_result(stop_reason: &str) -> ProviderCompleteResult {
 struct Harness {
     sink: Arc<CollectingTraceSink>,
     trace: TraceContext,
-    _tmp: tempfile::TempDir,
+    _base: crate::test_env::BaseDirGuard,
 }
 
-/// Pins the base dir to a fresh tempdir (caller must hold `BASE_DIR_LOCK`)
-/// and builds a collecting trace context keyed inside the same tempdir.
+/// Pins the base dir to a fresh tempdir via the shared panic-safe
+/// `BaseDirGuard` (caller must hold `#[serial(synaps_base_dir)]`) and
+/// builds a collecting trace context keyed inside the same tempdir.
 fn harness() -> Harness {
-    let tmp = tempfile::TempDir::new().unwrap();
-    crate::config::set_base_dir_for_tests(tmp.path().to_path_buf());
-    let key_path = tmp.path().join("trace").join("digest.key");
+    let base = crate::test_env::BaseDirGuard::new();
+    let key_path = base.path().join("trace").join("digest.key");
     let sink = CollectingTraceSink::new();
     let trace = TraceContext::with_sink(sink.clone()).with_key_path(key_path);
     Harness {
         sink,
         trace,
-        _tmp: tmp,
+        _base: base,
     }
 }
 
@@ -244,8 +241,8 @@ fn assert_extension_identity(record: &RequestTrace, path: &str) {
 // ═══ Streaming path ═════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn streaming_success_emits_one_schema_valid_extension_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         stream_events: vec![
@@ -294,8 +291,8 @@ async fn streaming_success_emits_one_schema_valid_extension_record() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn streaming_extension_error_emits_static_code_only() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         stream_result: Mutex::new(Some(Err(format!("{SENTINEL} exploded")))),
@@ -329,8 +326,8 @@ async fn streaming_extension_error_emits_static_code_only() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn streaming_cancel_while_ipc_active_emits_canceled_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         hang_stream: true,
@@ -362,8 +359,8 @@ async fn streaming_cancel_while_ipc_active_emits_canceled_record() {
 // ═══ Non-streaming path ═════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn nonstreaming_success_emits_complete_record_with_merge_loss() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         complete_results: Mutex::new(vec![Ok(ok_result("max_tokens"))]),
@@ -401,8 +398,8 @@ async fn nonstreaming_success_emits_complete_record_with_merge_loss() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn nonstreaming_extension_error_emits_failed_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         complete_results: Mutex::new(vec![Err(format!("{SENTINEL} broke"))]),
@@ -429,8 +426,8 @@ async fn nonstreaming_extension_error_emits_failed_record() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn nonstreaming_cancel_during_ipc_emits_canceled_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let cancel = CancellationToken::new();
     let handler = Arc::new(FakeProvider {
@@ -456,8 +453,8 @@ async fn nonstreaming_cancel_during_ipc_emits_canceled_record() {
 // ═══ Gate ordering: no record before the actual IPC ═════════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn trust_disabled_provider_makes_zero_ipc_and_zero_records() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let mut trust = crate::extensions::trust::ProviderTrustState::default();
     crate::extensions::trust::disable_provider(&mut trust, "plug:prov", None);
@@ -478,8 +475,8 @@ async fn trust_disabled_provider_makes_zero_ipc_and_zero_records() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn unavailable_provider_emits_no_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(
         HookBus::new(),
@@ -494,8 +491,8 @@ async fn unavailable_provider_emits_no_record() {
 }
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn cancelled_before_start_emits_no_record_and_no_ipc() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider::default());
     let manager = manager_with(handler.clone(), true, false, false).await;
@@ -515,8 +512,8 @@ async fn cancelled_before_start_emits_no_record_and_no_ipc() {
 // ═══ Tool loop: one outer turn, one record ══════════════════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn tool_loop_with_multiple_interior_calls_emits_exactly_one_record() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         complete_results: Mutex::new(vec![
@@ -573,8 +570,8 @@ async fn tool_loop_with_multiple_interior_calls_emits_exactly_one_record() {
 // ═══ Capability-driven translation report ═══════════════════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn tools_without_model_tool_use_report_unsupported_with_safe_ids_only() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
     let h = harness();
     let handler = Arc::new(FakeProvider {
         stream_result: Mutex::new(Some(Ok(ok_result("end_turn")))),
@@ -614,10 +611,9 @@ async fn tools_without_model_tool_use_report_unsupported_with_safe_ids_only() {
 // ═══ Disabled tracing never changes provider behavior ═══════════════════════
 
 #[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
 async fn disabled_trace_context_routes_normally_with_zero_records() {
-    let _guard = BASE_DIR_LOCK.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    crate::config::set_base_dir_for_tests(tmp.path().to_path_buf());
+    let _base = crate::test_env::BaseDirGuard::new();
     let handler = Arc::new(FakeProvider {
         stream_result: Mutex::new(Some(Ok(ok_result("end_turn")))),
         stream_events: vec![ProviderStreamEvent::TextDelta {
