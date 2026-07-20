@@ -897,34 +897,30 @@ fn parse_tool_arguments(raw: &str) -> Value {
 }
 
 /// Reduce a provider-supplied error identifier (`error.type`, `error.code`,
-/// `incomplete_details.reason`) to a short enum-like token safe for local
-/// logs. Providers use snake_case identifiers here (`server_error`,
-/// `rate_limit_exceeded`, `max_output_tokens`); anything outside a strict
-/// identifier charset — or longer than 64 bytes — is replaced so free-text
-/// (which can echo request content) can never leak into the log stream.
-fn sanitize_error_identifier(raw: Option<&str>) -> &'static str {
-    const KNOWN: &[&str] = &[
-        "server_error",
-        "rate_limit_exceeded",
-        "usage_limit_reached",
-        "usage_not_included",
-        "invalid_prompt",
-        "invalid_request_error",
-        "max_output_tokens",
-        "content_filter",
-        "quota_exceeded",
-    ];
+/// `incomplete_details.reason`) to a token safe for local logs. Lowercase
+/// snake-case identifiers (`server_error`, `rate_limit_exceeded`,
+/// `context_length_exceeded`, `max_output_tokens`) pass through verbatim —
+/// that shape cannot carry prose or credential material. Anything with
+/// uppercase, whitespace, or symbols outside the identifier charset — or
+/// longer than 64 bytes — is replaced so free-text (which can echo request
+/// content) and secret-shaped tokens can never leak into the log stream.
+fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     match raw {
         None => "absent",
         Some(s) => {
-            if let Some(k) = KNOWN.iter().find(|k| **k == s) {
-                k
-            } else if s.len() <= 64
-                && !s.is_empty()
+            let identifier_shaped = !s.is_empty()
+                && s.len() <= 64
                 && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.');
+            if identifier_shaped
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
             {
-                // Identifier-shaped but not in the allowlist: report shape only.
+                // Lowercase snake_case enum value: safe to record verbatim.
+                s
+            } else if identifier_shaped {
+                // Mixed-case / dashed identifiers can be secret-shaped
+                // (API keys, tokens): report shape only.
                 "unlisted_identifier"
             } else {
                 "unsafe_or_freeform"
@@ -1797,9 +1793,9 @@ mod codex_decoder_tests {
         );
     }
 
-    /// The local-log sanitizer must map known enum identifiers through
-    /// verbatim, collapse unknown-but-identifier-shaped values to a shape
-    /// marker, and never emit free-form provider text.
+    /// The local-log sanitizer must pass lowercase snake-case identifiers
+    /// verbatim, collapse secret-shaped identifiers to a shape marker, and
+    /// never emit free-form provider text.
     #[test]
     fn error_identifier_sanitizer_never_passes_freeform_text() {
         assert_eq!(sanitize_error_identifier(None), "absent");
@@ -1808,11 +1804,20 @@ mod codex_decoder_tests {
             "rate_limit_exceeded"
         );
         assert_eq!(
-            sanitize_error_identifier(Some("max_output_tokens")),
-            "max_output_tokens"
+            sanitize_error_identifier(Some("context_length_exceeded")),
+            "context_length_exceeded"
         );
         assert_eq!(
-            sanitize_error_identifier(Some("some_new_code")),
+            sanitize_error_identifier(Some("some_new_code2")),
+            "some_new_code2"
+        );
+        // Mixed-case / dashed tokens can be secret-shaped (API keys).
+        assert_eq!(
+            sanitize_error_identifier(Some("sk-Abc123XYZ")),
+            "unlisted_identifier"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("Server.Error")),
             "unlisted_identifier"
         );
         assert_eq!(
