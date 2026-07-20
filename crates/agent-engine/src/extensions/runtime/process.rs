@@ -628,6 +628,24 @@ pub struct ProcessExtension {
 }
 
 impl ProcessExtension {
+    /// Abort the child transport immediately. Cancellation uses this rather
+    /// than waiting for the per-call permit; draining pending responders
+    /// releases every blocked call/producer.
+    pub async fn force_shutdown(&self) {
+        let mut state_guard = self.state.lock().await;
+        if let Some(state) = state_guard.take() {
+            state.reader_handle.abort();
+            let mut child = state.child;
+            let _ = child.kill().await;
+        }
+        drop(state_guard);
+        self.inbox.closed.store(true, Ordering::Release);
+        self.inbox.notification_sinks.lock().await.clear();
+        self.inbox
+            .fail_all_pending("transport closed: extension cancelled")
+            .await;
+    }
+
     pub async fn spawn(id: &str, command: &str, args: &[String]) -> Result<Self, String> {
         Self::spawn_with_cwd(id, command, args, None).await
     }
@@ -1616,20 +1634,34 @@ impl ProcessExtension {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let mut state_guard = self.state.lock().await;
-            let Some(state) = state_guard.as_mut() else {
-                return Err(format!(
-                    "Extension '{}' process is not running; leased call refused (no respawn)",
-                    self.id
-                ));
+            // Take the running state out while awaiting the response so a
+            // concurrent cancellation can observe an empty slot and still
+            // fail the shared inbox pending map. The state is restored only
+            // if cancellation did not close the inbox.
+            let mut state = {
+                let mut state_guard = self.state.lock().await;
+                state_guard.take().ok_or_else(|| {
+                    format!(
+                        "Extension '{}' process is not running; leased call refused (no respawn)",
+                        self.id
+                    )
+                })?
             };
-            self.call_once_locked(
-                state,
-                "tool.call",
-                serde_json::json!({"name": name, "input": input}),
-                id,
-            )
-            .await
+            let result = self
+                .call_once_locked(
+                    &mut state,
+                    "tool.call",
+                    serde_json::json!({"name": name, "input": input}),
+                    id,
+                )
+                .await;
+            if !self.inbox.closed.load(std::sync::atomic::Ordering::Acquire) {
+                *self.state.lock().await = Some(state);
+            } else {
+                state.reader_handle.abort();
+                let _ = state.child.kill().await;
+            }
+            result
         };
         match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
             Ok(result) => result,

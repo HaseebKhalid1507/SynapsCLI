@@ -10,11 +10,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
+/// Outcome of an idempotency-key query after an ambiguous capture call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureCommitState {
+    Committed,
+    Absent,
+}
+
 /// Provider seam. Implementations must treat every capture id as an
 /// idempotency key. Summary capture is additive so existing turn providers
 /// keep source compatibility while adopting the C4 record class.
 pub trait CaptureProvider: Send + Sync + 'static {
     fn capture(&self, capture: ChatTurnCapture) -> Result<(), CaptureFailure>;
+
+    /// Query whether this idempotency key is already durable after an
+    /// interrupted/ambiguous call. Providers that cannot query return false;
+    /// no automatic blind retry is performed in either case.
+    fn contains_capture(
+        &self,
+        _capture_id: &[u8; 32],
+    ) -> Result<CaptureCommitState, CaptureFailure> {
+        Ok(CaptureCommitState::Absent)
+    }
 
     fn capture_summary(&self, _capture: ConversationSummaryCapture) -> Result<(), CaptureFailure> {
         Err(CaptureFailure {
@@ -42,10 +59,22 @@ impl CapturePayload {
         }
     }
 
-    fn dispatch(self, provider: &dyn CaptureProvider) -> Result<(), CaptureFailure> {
+    fn dispatch(&self, provider: &dyn CaptureProvider) -> Result<(), CaptureFailure> {
         match self {
-            Self::Turn(capture) => provider.capture(capture),
-            Self::Summary(capture) => provider.capture_summary(capture),
+            Self::Turn(capture) => provider.capture(capture.clone()),
+            Self::Summary(capture) => provider.capture_summary(capture.clone()),
+        }
+    }
+
+    fn query_committed(
+        &self,
+        provider: &dyn CaptureProvider,
+    ) -> Result<CaptureCommitState, CaptureFailure> {
+        match self {
+            Self::Turn(capture) => provider.contains_capture(capture.capture_id.as_bytes()),
+            // Summary retry/query support is additive and not part of the C5
+            // terminal-turn crash gate.
+            Self::Summary(_) => Ok(CaptureCommitState::Absent),
         }
     }
 }
@@ -81,9 +110,17 @@ impl CaptureWorker {
                         continue;
                     }
                     if job.payload.dispatch(job.provider.as_ref()).is_err() {
-                        // No automatic retry: completion stays decoupled. Because a
-                        // failed ID is not committed, an explicit retry remains safe.
-                        worker_failures.fetch_add(1, Ordering::Relaxed);
+                        // The call may have committed before its acknowledgement
+                        // was lost. Reconcile by idempotency key before accepting
+                        // an explicit retry; never blindly dispatch it again.
+                        match job.payload.query_committed(job.provider.as_ref()) {
+                            Ok(CaptureCommitState::Committed) => {
+                                submitted.insert(id);
+                            }
+                            Ok(CaptureCommitState::Absent) | Err(_) => {
+                                worker_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     } else {
                         submitted.insert(id);
                     }
@@ -190,7 +227,9 @@ mod tests {
 
     struct ProviderDouble {
         calls: AtomicU64,
+        queries: AtomicU64,
         fail: AtomicBool,
+        committed: AtomicBool,
         block: Mutex<Option<mpsc::Receiver<()>>>,
     }
 
@@ -205,8 +244,21 @@ mod tests {
                     code: "fixture_failure",
                 })
             } else {
+                self.committed.store(true, Ordering::SeqCst);
                 Ok(())
             }
+        }
+
+        fn contains_capture(
+            &self,
+            _capture_id: &[u8; 32],
+        ) -> Result<CaptureCommitState, CaptureFailure> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.committed.load(Ordering::SeqCst) {
+                CaptureCommitState::Committed
+            } else {
+                CaptureCommitState::Absent
+            })
         }
     }
 
@@ -272,7 +324,9 @@ mod tests {
     fn memory_duplicate_capture_id_idempotent_at_engine_seam() {
         let provider = Arc::new(ProviderDouble {
             calls: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
             fail: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
             block: Mutex::new(None),
         });
         let worker = CaptureWorker::new(4);
@@ -302,7 +356,9 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let provider = Arc::new(ProviderDouble {
             calls: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
             fail: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
             block: Mutex::new(Some(release_rx)),
         });
         let worker = CaptureWorker::new(1);
@@ -340,10 +396,66 @@ mod tests {
     }
 
     #[test]
+    fn memory_possibly_committed_capture_is_queried_before_retry() {
+        struct AckLostAfterCommit {
+            calls: AtomicU64,
+            queries: AtomicU64,
+            committed: AtomicBool,
+        }
+        impl CaptureProvider for AckLostAfterCommit {
+            fn capture(&self, _capture: ChatTurnCapture) -> Result<(), CaptureFailure> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.committed.store(true, Ordering::SeqCst);
+                Err(CaptureFailure { code: "ack_lost" })
+            }
+
+            fn contains_capture(
+                &self,
+                _capture_id: &[u8; 32],
+            ) -> Result<CaptureCommitState, CaptureFailure> {
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                Ok(if self.committed.load(Ordering::SeqCst) {
+                    CaptureCommitState::Committed
+                } else {
+                    CaptureCommitState::Absent
+                })
+            }
+        }
+
+        let provider = Arc::new(AckLostAfterCommit {
+            calls: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
+            committed: AtomicBool::new(false),
+        });
+        let worker = CaptureWorker::new(2);
+        for _ in 0..2 {
+            worker
+                .submit_terminal(
+                    &lease(),
+                    history(99),
+                    RetentionClass::Standard,
+                    provider.clone(),
+                )
+                .unwrap();
+            wait_until(|| provider.queries.load(Ordering::SeqCst) == 1);
+        }
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "must not blindly retry"
+        );
+        assert_eq!(provider.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.provider_failures(), 0, "query proved the commit");
+    }
+
+    #[test]
     fn memory_failed_capture_id_can_be_explicitly_retried() {
         let provider = Arc::new(ProviderDouble {
             calls: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
             fail: AtomicBool::new(true),
+            committed: AtomicBool::new(false),
             block: Mutex::new(None),
         });
         let worker = CaptureWorker::new(2);
@@ -372,7 +484,9 @@ mod tests {
     fn memory_provider_capture_failure_leaves_typed_terminal_turn_completed() {
         let provider = Arc::new(ProviderDouble {
             calls: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
             fail: AtomicBool::new(true),
+            committed: AtomicBool::new(false),
             block: Mutex::new(None),
         });
         let worker = CaptureWorker::new(1);

@@ -175,6 +175,16 @@ impl LeaseInner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
     }
+
+    fn interrupt(&self) {
+        self.set_cancelled();
+        let handler = Arc::clone(&self.handler);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                handler.force_shutdown().await;
+            });
+        }
+    }
 }
 
 enum LeaseState {
@@ -298,7 +308,7 @@ impl ExtensionRuntimeManager {
     fn cancel_state(state: LeaseState) {
         match state {
             LeaseState::Ready(inner) => {
-                inner.set_cancelled();
+                inner.interrupt();
                 Self::spawn_bounded_cleanup(inner);
             }
             // The in-flight starter detects its placeholder is gone and

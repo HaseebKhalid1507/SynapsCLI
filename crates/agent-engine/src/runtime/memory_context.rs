@@ -1595,6 +1595,16 @@ pub(crate) const MEMORY_RECALL_TOOL_NAME: &str = "memory_recall";
 /// Canonical deferred-tool name for idempotent terminal capture dispatch.
 pub(crate) const MEMORY_CAPTURE_TOOL_NAME: &str = "memory_capture";
 
+/// Query whether a possibly committed terminal capture is already durable.
+/// The query carries only the idempotency key and is intentionally routed
+/// through the same exact extension tool/lease as capture.
+pub(crate) fn capture_query_wire(capture_id: &super::chat_capture::CaptureId) -> Value {
+    serde_json::json!({
+        "operation": "query",
+        "capture_id": capture_id.to_hex(),
+    })
+}
+
 /// Bounded wire payload passed to the exact leased extension provider.
 pub(crate) fn capture_request_wire(capture: &super::chat_capture::ChatTurnCapture) -> Value {
     serde_json::json!({

@@ -239,6 +239,11 @@ while True:
         name = request.get("params", {}).get("name")
         if name == RECALL_TOOL_NAME:
             respond(request, recall_response(request.get("params", {})))
+        elif name == "memory_capture" and MODE == "memory-cancel-block":
+            # Keep the call pending until session cancellation closes stdin or
+            # kills this child. A blocked producer must never keep the lease.
+            time.sleep(30.0)
+            respond(request, {"ok": True})
         elif MODE == "hostile-error":
             respond_error(request, -32000,
                           "HOSTILE_EXTENSION_MARKER " + ("s3cr3t" * 64))

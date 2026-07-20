@@ -511,6 +511,42 @@ impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
             })
     }
 
+    fn contains_capture(
+        &self,
+        capture_id: &[u8; 32],
+    ) -> std::result::Result<capture_worker::CaptureCommitState, capture_worker::CaptureFailure>
+    {
+        let capture_id = chat_capture::CaptureId::from_bytes(*capture_id);
+        let response = self
+            .handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    memory_context::capture_query_wire(&capture_id),
+                ),
+            )
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_query_failed",
+            })?;
+        Ok(
+            if response
+                .get("committed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                capture_worker::CaptureCommitState::Committed
+            } else {
+                capture_worker::CaptureCommitState::Absent
+            },
+        )
+    }
+
     fn capture_summary(
         &self,
         capture: chat_capture::ConversationSummaryCapture,
@@ -1766,6 +1802,22 @@ impl Runtime {
         messages: &mut Vec<crate::SharedMessage>,
     ) {
         self.apply_turn_memory_recall(messages).await;
+    }
+
+    /// C5 cancellation seam: closes memory recall/capture authority and the
+    /// backing extension lease synchronously from the caller's perspective.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn cancel_memory_forwarding_for_harness(&self) {
+        self.clear_memory_contribution();
+        self.memory_context_disable();
+    }
+
+    /// C5 lease-release assertion seam (metadata only).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn extension_lease_count_for_harness(&self) -> usize {
+        self.extension_runtime
+            .as_ref()
+            .map_or(0, |manager| manager.lease_count())
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
