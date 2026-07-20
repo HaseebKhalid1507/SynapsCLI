@@ -38,8 +38,15 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
         return RuntimeError::Canceled;
     }
 
-    // Upstream returned an HTTP error status — an API failure, not config.
-    if msg.starts_with("codex request failed:") || msg.starts_with("openai request failed:") {
+    // Upstream returned an HTTP error status or the Responses API reported a
+    // terminal stream failure — API failures, not configuration errors.
+    if msg.starts_with("codex request failed:")
+        || msg.starts_with("openai request failed:")
+        || msg.starts_with("Codex response failed in stream.")
+        || msg.starts_with("Codex response was incomplete.")
+        || msg.starts_with("Codex completed without text or tool output.")
+        || msg.starts_with("Codex response stream ended without a terminal event.")
+    {
         tracing::warn!(error = %msg, "provider API error");
         return RuntimeError::ApiStatus(msg);
     }
@@ -150,6 +157,23 @@ mod tests {
             provider_error_to_runtime(e),
             RuntimeError::ApiStatus(_)
         ));
+    }
+
+    #[test]
+    fn responses_terminal_errors_are_api_status_not_config() {
+        for msg in [
+            "Codex response failed in stream. Provider error details withheld because they can echo request content.",
+            "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
+            "Codex completed without text or tool output. Retry the request.",
+            "Codex response stream ended without a terminal event. Retry the request.",
+        ] {
+            let err = provider_error_to_runtime(msg.into());
+            assert!(
+                matches!(err, RuntimeError::ApiStatus(_)),
+                "Responses terminal must classify as ApiStatus: {err:?}"
+            );
+            assert!(!err.to_string().starts_with("Config error"));
+        }
     }
 
     #[test]

@@ -633,6 +633,10 @@ pub(crate) async fn call_codex_stream_inner(
     if parser.saw_model_event {
         attempt.mark_first_model_event();
     }
+    if let Err(failure) = parser.terminal_result() {
+        attempt.finish_failed(failure.code, http_status, trace_rid);
+        return Err(failure.message.into());
+    }
     attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
 
     let mut content: Vec<Value> = Vec::new();
@@ -842,6 +846,12 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
     out
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResponsesStreamFailure {
+    code: &'static str,
+    message: &'static str,
+}
+
 #[derive(Default)]
 struct CodexSseDecoder {
     buffer: String,
@@ -850,6 +860,12 @@ struct CodexSseDecoder {
     /// Trace (Task 10A): set once the decoder parses any model event —
     /// feeds the first-model-event timing bucket.
     saw_model_event: bool,
+    /// A terminal Responses event was observed. Failure/incomplete events
+    /// take precedence over completion and are surfaced after the stream is
+    /// drained; provider-controlled text is never retained.
+    terminal_success: bool,
+    terminal_failure: Option<ResponsesStreamFailure>,
+    emitted_output: bool,
     /// Trace (Task 10A): provider-reported usage from `response.completed`
     /// (input including cached, output, cached slice). `None` until observed.
     observed_usage: Option<(u64, u64, u64)>,
@@ -899,6 +915,7 @@ impl CodexSseDecoder {
             return;
         };
         if data == "[DONE]" {
+            self.terminal_success = true;
             self.finish();
             return;
         }
@@ -912,6 +929,10 @@ impl CodexSseDecoder {
         text_acc: &mut String,
     ) {
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            tracing::debug!(
+                payload_bytes = payload.len(),
+                "discarding malformed Responses SSE payload"
+            );
             return;
         };
         let event_type = event
@@ -926,12 +947,18 @@ impl CodexSseDecoder {
                 | "response.output_item.done"
                 | "response.completed"
                 | "response.done"
+                | "response.failed"
+                | "response.incomplete"
+                | "error"
         ) {
             self.saw_model_event = true;
         }
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.emitted_output = true;
+                    }
                     text_acc.push_str(delta);
                     let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
                         delta.to_string(),
@@ -979,9 +1006,51 @@ impl CodexSseDecoder {
             }
             "response.completed" | "response.done" => {
                 self.push_usage(&event, tx);
+                self.terminal_success = true;
                 self.finish();
             }
-            _ => {}
+            "response.failed" | "error" => {
+                self.push_usage(&event, tx);
+                self.terminal_failure = Some(ResponsesStreamFailure {
+                    code: "responses_failed",
+                    message: "Codex response failed in stream. Provider error details withheld because they can echo request content.",
+                });
+                self.finish();
+            }
+            "response.incomplete" => {
+                self.push_usage(&event, tx);
+                self.terminal_failure = Some(ResponsesStreamFailure {
+                    code: "responses_incomplete",
+                    message: "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
+                });
+                self.finish();
+            }
+            _ => {
+                if !event_type.is_empty() {
+                    tracing::debug!(event_type, "ignoring unknown Responses SSE event");
+                }
+            }
+        }
+    }
+
+    fn terminal_result(&self) -> Result<(), ResponsesStreamFailure> {
+        if let Some(failure) = self.terminal_failure {
+            return Err(failure);
+        }
+        if self.terminal_success {
+            if self.emitted_output || !self.completed_tools.is_empty() {
+                Ok(())
+            } else {
+                Err(ResponsesStreamFailure {
+                    code: "responses_empty",
+                    message: "Codex completed without text or tool output. Retry the request.",
+                })
+            }
+        } else {
+            Err(ResponsesStreamFailure {
+                code: "responses_missing_terminal",
+                message: "Codex response stream ended without a terminal event. Retry the request.",
+            })
         }
     }
 
@@ -1071,6 +1140,7 @@ impl CodexSseDecoder {
             if self.completed_tools.iter().any(|done| done.id == call.id) {
                 return;
             }
+            self.emitted_output = true;
             // Emit the finalized `ToolUse` event so the chat UI can collapse
             // the streaming `ToolUseStart` (animated) into a stable
             // `ToolUse` block. Without this the bash-trace animation
@@ -1148,6 +1218,7 @@ impl CodexSseDecoder {
                 && !tool.name.is_empty()
                 && !self.completed_tools.iter().any(|done| done.id == tool.id)
             {
+                self.emitted_output = true;
                 self.completed_tools.push(ToolCall {
                     id: tool.id,
                     kind: "function".to_string(),
@@ -1574,14 +1645,87 @@ mod codex_decoder_tests {
     #[test]
     fn response_completed_with_zero_usage_emits_nothing() {
         let lines = [
+            r#"data: {"type":"response.output_text.delta","delta":"ok"}"#,
+            "",
             r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":0,"output_tokens":0}}}"#,
             "",
         ];
-        let (_decoder, _text, events) = drive(&lines);
+        let (decoder, _text, events) = drive(&lines);
         let any_usage = events
             .iter()
             .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
         assert!(!any_usage, "zero-token usage should be suppressed");
+        assert_eq!(decoder.terminal_result(), Ok(()));
+    }
+
+    #[test]
+    fn response_failed_is_a_terminal_failure_without_retaining_provider_text() {
+        let lines = [
+            r#"data: {"type":"response.failed","response":{"error":{"type":"server_error","message":"ECHOED:secret prompt"}}}"#,
+            "",
+        ];
+        let (decoder, text, events) = drive(&lines);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_failed");
+        assert_eq!(
+            failure.message,
+            "Codex response failed in stream. Provider error details withheld because they can echo request content."
+        );
+        assert!(!failure.message.contains("ECHOED"));
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn top_level_error_event_is_a_terminal_failure() {
+        let lines = [
+            r#"data: {"type":"error","error":{"type":"server_error","message":"private"}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_failed"
+        );
+    }
+
+    #[test]
+    fn response_incomplete_is_not_misreported_as_empty_success() {
+        let lines = [
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_incomplete");
+        assert!(failure.message.contains("incomplete"));
+        assert!(!failure.message.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn completed_without_text_or_tools_fails_at_transport_boundary() {
+        let lines = [
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":0}}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_empty"
+        );
+    }
+
+    #[test]
+    fn eof_without_terminal_event_fails_closed() {
+        let lines = [
+            r#"data: {"type":"response.created","response":{"id":"resp_123"}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_missing_terminal"
+        );
     }
 
     #[test]
@@ -2018,6 +2162,10 @@ pub(crate) async fn call_xai_responses_stream_inner(
     // Broker paths never observe the upstream HTTP status; the Responses
     // stream does not yet expose a normalized stop reason — both stay
     // honest `None` rather than guessed values.
+    if let Err(failure) = parser.terminal_result() {
+        attempt.finish_failed(failure.code, None, None);
+        return Err(failure.message.into());
+    }
     attempt.finish_success(None, None, None, parser.trace_usage());
     let mut content = Vec::new();
     if !text.is_empty() {
@@ -2751,6 +2899,23 @@ mod send_retry_tests {
         (format!("http://{addr}"), counter)
     }
 
+    async fn spawn_codex_sse(body: &'static str) -> String {
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post(move || async move {
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
     async fn run_codex(
         base_url: &str,
         max_retries: u32,
@@ -2877,6 +3042,55 @@ mod send_retry_tests {
         );
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn codex_response_failed_surfaces_typed_provider_error_not_empty_response() {
+        const BODY: &str = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"ECHOED:private prompt\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = spawn_codex_sse(BODY).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.starts_with("Codex response failed in stream."), "{msg}");
+        assert!(!msg.contains("empty response"), "{msg}");
+        assert!(!msg.contains("ECHOED"), "provider text leaked: {msg}");
+        assert!(
+            !msg.contains("private prompt"),
+            "provider text leaked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_response_incomplete_surfaces_typed_provider_error_not_empty_response() {
+        const BODY: &str = concat!(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = spawn_codex_sse(BODY).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.starts_with("Codex response was incomplete."), "{msg}");
+        assert!(!msg.contains("empty response"), "{msg}");
+        assert!(
+            !msg.contains("max_output_tokens"),
+            "provider text leaked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_clean_eof_without_terminal_fails_closed() {
+        let base_url = spawn_codex_sse(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+        )
+        .await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response stream ended without a terminal event."),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -583,8 +583,10 @@ async fn responses_tail_only_model_event_marks_first_model_event() {
     // ends `…}\n\r` with no final newline, so the blank line that flushes
     // the buffered payload is only ever seen by the tail `push_line` (after
     // the chunk loop) — and `first_model_event_ms` must still be marked.
-    const TAIL_ONLY_SSE: &str =
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\r";
+    const TAIL_ONLY_SSE: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        "data: [DONE]\n\r",
+    );
     let upstream = spawn_responses_stub_sse(TAIL_ONLY_SSE).await;
     let h = harness();
 
