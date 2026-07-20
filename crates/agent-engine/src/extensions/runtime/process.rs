@@ -614,6 +614,10 @@ pub struct ProcessExtension {
     call_lock: Arc<Mutex<()>>,
     next_id: AtomicU64,
     restart_count: AtomicUsize,
+    /// Last resolved initialize config. Kept in memory only so a restarted
+    /// extension receives the same manifest-resolved values (including secrets).
+    /// Never written to disk or emitted in logs.
+    initialize_config: Mutex<Value>,
     /// Lifetime restart total — never reset. `restart_count` tracks
     /// *consecutive* failures (reset on successful restart, H-8) for the
     /// exhaustion budget; this one feeds health/reporting so a previously
@@ -672,6 +676,7 @@ impl ProcessExtension {
             call_lock: Arc::new(Mutex::new(())),
             next_id: AtomicU64::new(1),
             restart_count: AtomicUsize::new(0),
+            initialize_config: Mutex::new(Value::Object(Default::default())),
             total_restarts: AtomicUsize::new(0),
             restart_policy: RestartPolicy::default(),
             inbox,
@@ -1244,6 +1249,9 @@ impl ProcessExtension {
         plugin_root: Option<PathBuf>,
         config: Value,
     ) -> Result<InitializeCapabilitiesResult, String> {
+        // Retain only in memory: restart handshakes must receive the same
+        // resolved config, while secrets never enter env, logs, or storage.
+        *self.initialize_config.lock().await = config.clone();
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
@@ -1509,6 +1517,7 @@ impl ProcessExtension {
     }
 
     async fn initialize_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        let config = self.initialize_config.lock().await.clone();
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
@@ -1517,7 +1526,7 @@ impl ProcessExtension {
                 .cwd
                 .clone()
                 .map(|path| path.to_string_lossy().to_string()),
-            config: Value::Object(Default::default()),
+            config,
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let value = tokio::time::timeout(

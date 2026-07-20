@@ -742,6 +742,36 @@ async fn extension_missing_required_config_fails_before_spawn() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn declared_secret_env_survives_extension_restart_without_persistence() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    std::env::set_var("PRIA_AGENT_TOOL_TOKEN", "regression-secret-token");
+
+    let fixture = std::env::current_dir().unwrap()
+        .join("tests/fixtures/config_seen_extension.py").to_string_lossy().to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(), protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process, command: "python3".to_string(), setup: None,
+        prebuilt: ::std::collections::HashMap::new(), args: vec![fixture, "--exit-on-hook-once".to_string()],
+        permissions: vec!["tools.intercept".to_string()],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription { hook: "before_tool_call".to_string(), tool: Some("bash".to_string()), matcher: None }],
+        config: vec![ExtensionConfigEntry { key: "pria_agent_tool_token".to_string(), value_type: None, description: None, required: true, default: None, secret_env: Some("PRIA_AGENT_TOOL_TOKEN".to_string()) }],
+    };
+    manager.load_with_cwd("knowledge", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+    assert_eq!(manager.hook_bus().emit(&HookEvent::before_tool_call("bash", json!({}))).await, HookResult::Continue);
+    manager.shutdown_all().await;
+    std::env::remove_var("PRIA_AGENT_TOOL_TOKEN");
+
+    let seen = fs::read_to_string(plugin_dir.path().join("config-seen.json")).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&seen).unwrap()["pria_agent_tool_token"], "regression-secret-token");
+    assert!(!home.path().join("config").exists(), "secret must not be persisted");
+    assert!(!std::fs::read_dir(home.path()).unwrap().filter_map(Result::ok).any(|e| e.path().is_file() && fs::read_to_string(e.path()).unwrap_or_default().contains("regression-secret-token")));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn extension_provider_complete_routes_to_process() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
