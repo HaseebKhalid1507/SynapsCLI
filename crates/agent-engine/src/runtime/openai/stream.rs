@@ -566,92 +566,118 @@ pub(crate) async fn call_codex_stream_inner(
         trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
+    let mut stream_retry = 0u32;
 
-    let resp = send_with_retries(
-        "codex",
-        &url,
-        || {
-            client
-                .post(&url)
-                .bearer_auth(&access)
-                .header("chatgpt-account-id", account_id.as_str())
-                .header("originator", "synaps")
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .body(body_bytes.clone())
-        },
-        cancel,
-        max_retries,
-        &mut attempt,
-    )
-    .await?;
-    // Direct HTTP: upstream status and provider request id are observed.
-    let http_status = Some(resp.status().as_u16());
-    let trace_rid = tr::provider_request_id_from_headers(resp.headers());
+    loop {
+        let resp = send_with_retries(
+            "codex",
+            &url,
+            || {
+                client
+                    .post(&url)
+                    .bearer_auth(&access)
+                    .header("chatgpt-account-id", account_id.as_str())
+                    .header("originator", "synaps")
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .body(body_bytes.clone())
+            },
+            cancel,
+            max_retries.saturating_sub(stream_retry),
+            &mut attempt,
+        )
+        .await?;
+        // Direct HTTP: upstream status and provider request id are observed.
+        let http_status = Some(resp.status().as_u16());
+        let trace_rid = tr::provider_request_id_from_headers(resp.headers());
 
-    let mut accumulated_text = String::new();
-    let mut parser = CodexSseDecoder::default();
-    let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
-    let mut stream = resp.bytes_stream();
+        let mut accumulated_text = String::new();
+        let mut parser = CodexSseDecoder::default();
+        let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
+        let mut stream = resp.bytes_stream();
 
-    while let Some(chunk) = tokio::select! {
-        chunk = stream.next() => chunk,
-        _ = cancel.cancelled() => {
-            attempt.finish_canceled(http_status, parser.trace_usage());
-            return Err("request canceled".into());
+        while let Some(chunk) = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = cancel.cancelled() => {
+                attempt.finish_canceled(http_status, parser.trace_usage());
+                return Err("request canceled".into());
+            }
+        } {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    attempt.mark_first_byte();
+                    chunk
+                }
+                Err(e) => {
+                    attempt.finish_failed("stream_error", http_status, trace_rid.clone());
+                    return Err(e.into());
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(nl) = memchr::memchr(b'\n', &buf) {
+                let line_bytes = buf.split_to(nl + 1);
+                let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+                parser.push_line(line, tx, &mut accumulated_text);
+            }
+            if parser.saw_model_event {
+                attempt.mark_first_model_event();
+            }
         }
-    } {
-        let chunk = match chunk {
-            Ok(chunk) => {
-                attempt.mark_first_byte();
-                chunk
-            }
-            Err(e) => {
-                attempt.finish_failed("stream_error", http_status, trace_rid.clone());
-                return Err(e.into());
-            }
-        };
-        buf.extend_from_slice(&chunk);
-        while let Some(nl) = memchr::memchr(b'\n', &buf) {
-            let line_bytes = buf.split_to(nl + 1);
-            let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+        if !buf.is_empty() {
+            let line = std::str::from_utf8(&buf).unwrap_or("");
             parser.push_line(line, tx, &mut accumulated_text);
         }
+        parser.finish();
+        // Trailing-buffer flush and finish() can surface the first (or only)
+        // model event — e.g. a payload dispatched by the tail line. Mark it so
+        // first_model_event_ms is honest even for tail-only streams.
         if parser.saw_model_event {
             attempt.mark_first_model_event();
         }
-    }
-    if !buf.is_empty() {
-        let line = std::str::from_utf8(&buf).unwrap_or("");
-        parser.push_line(line, tx, &mut accumulated_text);
-    }
-    parser.finish();
-    // Trailing-buffer flush and finish() can surface the first (or only)
-    // model event — e.g. a payload dispatched by the tail line. Mark it so
-    // first_model_event_ms is honest even for tail-only streams.
-    if parser.saw_model_event {
-        attempt.mark_first_model_event();
-    }
-    if let Err(failure) = parser.terminal_result() {
-        attempt.finish_failed(failure.code, http_status, trace_rid);
-        return Err(failure.message.into());
-    }
-    attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
+        if let Err(failure) = parser.terminal_result() {
+            if failure.code == "responses_empty" && stream_retry < max_retries {
+                stream_retry += 1;
+                let delay = retry_delay(stream_retry);
+                attempt.attempt_failed(
+                    crate::runtime::trace::RetryClass::Other,
+                    delay,
+                    http_status,
+                    trace_rid,
+                    failure.code,
+                );
+                tracing::warn!(
+                    "codex stream retry {stream_retry}/{max_retries} after {delay:?}: completed without usable output"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => {
+                        attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
+                }
+                attempt.restart_clock();
+                continue;
+            }
+            attempt.finish_failed(failure.code, http_status, trace_rid);
+            return Err(failure.message.into());
+        }
+        attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
 
-    let mut content: Vec<Value> = Vec::new();
-    if !accumulated_text.is_empty() {
-        content.push(json!({"type": "text", "text": accumulated_text}));
-    }
-    content.extend(translate::tool_calls_to_content_blocks(
-        &parser.completed_tools,
-        &name_map,
-    ));
+        let mut content: Vec<Value> = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(json!({"type": "text", "text": accumulated_text}));
+        }
+        content.extend(translate::tool_calls_to_content_blocks(
+            &parser.completed_tools,
+            &name_map,
+        ));
 
-    Ok(json!({
-        "role": "assistant",
-        "content": content,
-    }))
+        return Ok(json!({
+            "role": "assistant",
+            "content": content,
+        }));
+    }
 }
 
 /// Stable prompt-cache routing key for this conversation.
@@ -3052,6 +3078,47 @@ mod send_retry_tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_empty_then_success_codex() -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<bytes::Bytes>>>,
+    ) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post({
+                let counter = Arc::clone(&counter);
+                let bodies = Arc::clone(&bodies);
+                move |body: bytes::Bytes| {
+                    let counter = Arc::clone(&counter);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        bodies.lock().unwrap().push(body);
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        let response = if n == 0 {
+                            concat!(
+                                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        } else {
+                            CODEX_SSE_SUCCESS
+                        };
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            response,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter, bodies)
+    }
+
     async fn run_codex(
         base_url: &str,
         max_retries: u32,
@@ -3227,6 +3294,23 @@ mod send_retry_tests {
                 .starts_with("Codex response stream ended without a terminal event."),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_completed_without_output_retries_identical_bytes_then_succeeds() {
+        let (base_url, counter, bodies) = spawn_empty_then_success_codex().await;
+        let result = run_codex(&base_url, 1)
+            .await
+            .expect("one empty-success stream with retries available must not abort the turn");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "expected one retry");
+        let received = bodies.lock().unwrap();
+        assert_eq!(received.len(), 2, "both attempts must reach the endpoint");
+        assert_eq!(
+            received[0], received[1],
+            "the logical request must resend byte-identical content"
+        );
+        assert_eq!(result["content"][0]["text"], "hello");
     }
 
     #[tokio::test]
