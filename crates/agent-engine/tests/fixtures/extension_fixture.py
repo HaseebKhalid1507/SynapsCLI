@@ -91,11 +91,49 @@ def recall_response(params):
     """One MemoryContextContributionWire-shaped recall result (task B6).
 
     MODE "ok" echoes the host-authored project_id back with 2-3 synthetic
-    model_visible records carrying plausible rank reasons; the recall-*
-    failure modes produce exactly one typed failure shape each.
+    model_visible records carrying plausible rank reasons; "memory-store"
+    recalls the captured records persisted in the fixture's JSONL sidecar;
+    the recall-* failure modes produce exactly one typed failure shape each.
     """
     request_wire = params.get("input", params) or {}
     project_id = str(request_wire.get("project_id", "project-unknown"))
+    if MODE == "memory-store":
+        captures_path = SPY + ".captures.jsonl"
+        stored = []
+        try:
+            with open(captures_path, encoding="utf-8") as f:
+                stored = [json.loads(line) for line in f if line.strip()]
+        except OSError:
+            pass
+        turn_captures = [capture for capture in stored
+                         if capture.get("schema") == "chat_turn_capture/1"]
+        if turn_captures:
+            records = []
+            for index, capture in enumerate(turn_captures[-3:]):
+                body = "%s %s" % (capture.get("user", ""),
+                                   capture.get("assistant", ""))
+                records.append({
+                    "memory_id": "mem-f1-%04d" % (index + 1),
+                    "source": "chat_history",
+                    "timestamp": 1753000000 + index,
+                    "rank_reason": ["exact_topic"],
+                    "sensitivity": "model_visible",
+                    "retention": "standard",
+                    "content": body,
+                    "truncated": False,
+                })
+            return {
+                "schema": "contribution/1",
+                "provider_id": "project-memory",
+                "project_id": project_id,
+                "records": records,
+                "rendered": "\n".join(
+                    "%d. %s — %s" % (i + 1, r["memory_id"], r["content"])
+                    for i, r in enumerate(records)
+                ),
+                "accounting": {"candidates_considered": len(records),
+                               "withheld": 0, "truncated": 0},
+            }
     if MODE == "recall-timeout":
         # Sleep well past the host's 150ms spec-16.2 hard budget, then
         # answer normally: the host must already have failed open.
@@ -197,6 +235,13 @@ while True:
             log("recall:%d" % recall_calls)
         else:
             log("call:" + called)
+            if called == "memory_capture":
+                try:
+                    with open(SPY + ".captures.jsonl", "a", encoding="utf-8") as f:
+                        json.dump(request.get("params", {}).get("input", {}), f)
+                        f.write("\n")
+                except OSError:
+                    pass
     elif method == "context_provider.recall":
         recall_calls += 1
         log("recall:%d" % recall_calls)

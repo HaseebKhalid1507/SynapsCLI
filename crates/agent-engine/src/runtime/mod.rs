@@ -1816,6 +1816,84 @@ impl Runtime {
         self.apply_turn_memory_recall(messages).await;
     }
 
+    /// F1 headless seam for the production C3 terminal-capture path. The caller
+    /// supplies the canonical completed turn; lease selection, typed building,
+    /// bounded queueing, and exact extension dispatch are unchanged.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn capture_completed_turn_for_harness(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        turn_ordinal: u64,
+    ) -> std::result::Result<(), &'static str> {
+        let started_at = std::time::SystemTime::now();
+        let lease = self
+            .memory_context_lock()
+            .capture_lease_at(started_at)
+            .ok_or("capture lease unavailable")?;
+        let provider = self
+            .extension_capture_provider(&lease)
+            .ok_or("capture provider unavailable")?;
+        let mut history = terminal_capture_history(&lease, &messages, started_at);
+        history.turn_ordinal = turn_ordinal;
+        memory_capture_worker()
+            .submit_terminal(
+                &lease,
+                history,
+                memory_context::RetentionClass::Standard,
+                provider,
+            )
+            .map_err(|_| "capture build failed")?;
+        Ok(())
+    }
+
+    /// F1 headless seam for C4 summary capture with explicit source-range
+    /// provenance. All identifiers still come from the active host lease.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn capture_compaction_summary_for_harness(
+        &self,
+        first_turn_ordinal: u64,
+        last_turn_ordinal: u64,
+        source_digest: &str,
+        source_message_count: usize,
+        summary_text: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let summarized_at = std::time::SystemTime::now();
+        let lease = self
+            .memory_context_lock()
+            .capture_lease_at(summarized_at)
+            .ok_or("capture lease unavailable")?;
+        let source_digest = chat_capture::MessageRangeDigest::from_hex(source_digest)
+            .ok_or("invalid source digest")?;
+        let provider = self
+            .extension_capture_provider(&lease)
+            .ok_or("capture provider unavailable")?;
+        let source = chat_capture::CompactionSource {
+            schema: chat_capture::CompactionSchemaVersion::V1,
+            project_id: lease.project_id.clone(),
+            source_session_id: lease.session_id.clone(),
+            first_turn_ordinal,
+            last_turn_ordinal,
+            source_digest,
+            summary_origin: chat_capture::CompactionSummaryOrigin::LocalOnly,
+            prompt_stack_digest: chat_capture::PromptStackDigest::from_bytes([7; 32]),
+            redaction: chat_capture::RedactionPolicy::HostRedacted,
+            content_classes: vec![agent_core::compaction::ContentClass::UserText],
+            summarized_at,
+        };
+        memory_capture_worker()
+            .submit_summary(
+                &lease,
+                source,
+                source_message_count,
+                summary_text,
+                agent_core::compaction::RedactionPolicy::PolicyExclusions,
+                memory_context::RetentionClass::Standard,
+                provider,
+            )
+            .map_err(|_| "summary capture build failed")?;
+        Ok(())
+    }
+
     /// C5 cancellation seam: closes memory recall/capture authority and the
     /// backing extension lease synchronously from the caller's perspective.
     #[cfg(any(test, feature = "testing"))]

@@ -1620,6 +1620,7 @@ pub(crate) fn capture_request_wire(capture: &super::chat_capture::ChatTurnCaptur
         "session_id": capture.session_id.as_str(),
         "turn_id": capture.turn_id.as_str(),
         "turn_ordinal": capture.turn_ordinal,
+        "source_digest": capture.source_digest.to_hex(),
         "user": capture.user.content.text,
         "assistant": capture.assistant.content.text,
         "tools": capture.tools.iter().map(|tool| serde_json::json!({
