@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use synaps_cli::runtime::openai::catalog::{
-    parse_copilot_catalog_entries, selectable_copilot_entries, CopilotEndpoint,
-    CopilotPolicyState, COPILOT_FALLBACK_MODELS,
+    parse_copilot_catalog_entries, selectable_copilot_entries, CopilotEndpoint, CopilotPolicyState,
+    COPILOT_FALLBACK_MODELS,
 };
 use synaps_cli::runtime::openai::{resolve_route, AuthPolicy, WireProtocol};
 
@@ -114,7 +114,10 @@ fn every_fixture_row_matches_expected_selectability_and_endpoint_pick() {
 #[test]
 fn selectable_helper_matches_expected_set_and_excludes_only_unsupported_rows() {
     let selectable = selectable_copilot_entries(FIXTURE).expect("fixture parses");
-    let got: HashSet<_> = selectable.iter().map(|e| e.id.as_str().to_string()).collect();
+    let got: HashSet<_> = selectable
+        .iter()
+        .map(|e| e.id.as_str().to_string())
+        .collect();
     let want: HashSet<_> = expected()
         .into_iter()
         .filter(|(_, (selectable, _))| *selectable)
@@ -125,7 +128,12 @@ fn selectable_helper_matches_expected_set_and_excludes_only_unsupported_rows() {
     for visible in ["claude-fable-5", "claude-opus-4.8", "gpt-5.5"] {
         assert!(got.contains(visible), "`{visible}` must remain selectable");
     }
-    for banned in ["gemini-3-flash-preview", "trajectory-compaction", "text-embedding-3-small", "gpt-41-copilot"] {
+    for banned in [
+        "gemini-3-flash-preview",
+        "trajectory-compaction",
+        "text-embedding-3-small",
+        "gpt-41-copilot",
+    ] {
         assert!(!got.contains(banned), "`{banned}` must not be selectable");
     }
 }
@@ -149,11 +157,24 @@ fn resolve_route_matches_endpoint_evidence_for_every_selectable_id() {
 
 #[test]
 fn resolve_route_supports_opt_in_rows_and_fails_closed_for_unsupported_and_unknown() {
-    for id in ["claude-fable-5", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-4.8-fast", "gpt-5.5"] {
-        assert!(resolve_route(&format!("github-copilot/{id}")).is_some(), "`{id}` has a reviewed fixture endpoint");
+    for id in [
+        "claude-fable-5",
+        "claude-opus-4.7",
+        "claude-opus-4.8",
+        "claude-opus-4.8-fast",
+        "gpt-5.5",
+    ] {
+        assert!(
+            resolve_route(&format!("github-copilot/{id}")).is_some(),
+            "`{id}` has a reviewed fixture endpoint"
+        );
     }
     assert!(resolve_route("github-copilot/gemini-3-flash-preview").is_none());
-    for id in ["trajectory-compaction", "text-embedding-3-small", "gpt-41-copilot"] {
+    for id in [
+        "trajectory-compaction",
+        "text-embedding-3-small",
+        "gpt-41-copilot",
+    ] {
         assert!(resolve_route(&format!("github-copilot/{id}")).is_none());
     }
     for id in ["auto", "gpt-5.6-sol", "gpt-4.1", "gemini-3-pro"] {

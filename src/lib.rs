@@ -4,36 +4,41 @@ pub use agent_core::memory;
 pub use agent_core::pricing;
 
 // agent-engine is now a separate crate; re-export its modules as if they lived here
-pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help, orchestration};
+pub use agent_engine::{
+    engine, events, extensions, help, mcp, orchestration, runtime, sidecar, skills, tools,
+};
 
 // agent-tui is now a separate crate; re-export tui + toast so bin/cmd still resolve
-pub use agent_tui::{tui, toast};
+pub use agent_tui::{toast, tui};
 
 // Allow intra-crate self-reference via `synaps_cli::` (used in src/tui/**).
 extern crate self as synaps_cli;
 
 // Re-export core modules at crate root for backward compatibility
-pub use core::reasoning;
-pub use core::config;
-pub use core::session;
 pub use core::auth;
-pub use core::logging;
-pub use core::protocol;
-pub use core::error;
-pub use core::watcher_types;
-pub use core::models;
 pub use core::chain;
+pub use core::config;
+pub use core::error;
+pub use core::logging;
+pub use core::models;
+pub use core::protocol;
+pub use core::reasoning;
+pub use core::session;
+pub use core::watcher_types;
 
-pub use runtime::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 pub use agent_core::SharedMessage;
 pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
+pub use config::{load_config, resolve_system_prompt, SynapsConfig};
+pub use error::{Result, RuntimeError};
+pub use runtime::{AgentEvent, LlmEvent, Runtime, SessionEvent, StreamEvent};
+pub use session::{
+    find_session, find_session_by_name, latest_session, list_recent_sessions, list_sessions,
+    resolve_session, validate_name, Session, SessionInfo,
+};
 pub use tools::{Tool, ToolContext, ToolRegistry};
-pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, list_recent_sessions, resolve_session, find_session_by_name, validate_name};
-pub use error::{RuntimeError, Result};
-pub use config::{SynapsConfig, load_config, resolve_system_prompt};
 pub use watcher_types::{
-    AgentConfig, SessionLimits, HandoffState, ExitReason, SessionStats,
-    WatcherCommand, WatcherResponse, AgentStatusInfo
+    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, SessionLimits, SessionStats,
+    WatcherCommand, WatcherResponse,
 };
 
 // Re-export for convenience

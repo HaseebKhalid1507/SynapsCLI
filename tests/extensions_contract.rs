@@ -28,9 +28,7 @@ const ALL_PERMISSIONS: [Permission; 6] = [
     Permission::ProvidersRegister,
 ];
 
-const RESERVED_PERMISSIONS: [Permission; 1] = [
-    Permission::ToolsOverride,
-];
+const RESERVED_PERMISSIONS: [Permission; 1] = [Permission::ToolsOverride];
 
 fn extension_contract() -> Value {
     serde_json::from_str(include_str!("../docs/extensions/contract.json"))
@@ -49,10 +47,7 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
         .and_then(Value::as_array)
         .expect("contract should define permissions array");
 
-    let rust_hooks: HashSet<&'static str> = ALL_HOOK_KINDS
-        .iter()
-        .map(HookKind::as_str)
-        .collect();
+    let rust_hooks: HashSet<&'static str> = ALL_HOOK_KINDS.iter().map(HookKind::as_str).collect();
     let contract_hooks: HashSet<&str> = hooks.keys().map(String::as_str).collect();
     assert_eq!(contract_hooks, rust_hooks);
 
@@ -83,15 +78,13 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
             .map(|action| action.as_str().expect("action should be a string"))
             .collect();
         assert_eq!(contract_actions, hook.allowed_action_names());
-        assert!(permissions.iter().any(|permission| {
-            permission.as_str() == Some(contract_permission)
-        }));
+        assert!(permissions
+            .iter()
+            .any(|permission| { permission.as_str() == Some(contract_permission) }));
     }
 
-    let rust_permissions: HashSet<&'static str> = ALL_PERMISSIONS
-        .iter()
-        .map(Permission::as_str)
-        .collect();
+    let rust_permissions: HashSet<&'static str> =
+        ALL_PERMISSIONS.iter().map(Permission::as_str).collect();
     let contract_permissions: HashSet<&str> = permissions
         .iter()
         .map(|permission| permission.as_str().expect("permission should be a string"))
@@ -117,23 +110,20 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
         .and_then(Value::as_object)
         .expect("contract should define matchers object");
     let contract_matchers: HashSet<&str> = matchers.keys().map(String::as_str).collect();
-    let rust_matchers: HashSet<&'static str> = HookMatcher::SUPPORTED_KEYS.iter().copied().collect();
+    let rust_matchers: HashSet<&'static str> =
+        HookMatcher::SUPPORTED_KEYS.iter().copied().collect();
     assert_eq!(contract_matchers, rust_matchers);
 }
 
 #[test]
 fn permission_set_rejects_unknown_permissions() {
-    let result = PermissionSet::try_from_strings(&[
-        "tools.intercept".to_string(),
-        "tools.typo".to_string(),
-    ]);
+    let result =
+        PermissionSet::try_from_strings(&["tools.intercept".to_string(), "tools.typo".to_string()]);
 
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("Unknown extension permission: tools.typo")
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("Unknown extension permission: tools.typo"));
 }
 
 #[test]
@@ -146,7 +136,9 @@ fn after_tool_call_truncates_utf8_safely() {
 
     let event = HookEvent::after_tool_call("bash", serde_json::json!({}), output);
 
-    let truncated = event.tool_output.expect("after_tool_call should carry output");
+    let truncated = event
+        .tool_output
+        .expect("after_tool_call should carry output");
 
     // 1. Truncation must have fired — the sentinel suffix must be present.
     assert!(
@@ -171,7 +163,10 @@ fn after_tool_call_truncates_utf8_safely() {
 
 #[test]
 fn on_message_complete_event_carries_assistant_content_as_message() {
-    let event = HookEvent::on_message_complete("Final answer", serde_json::json!({"content_block_count": 1}));
+    let event = HookEvent::on_message_complete(
+        "Final answer",
+        serde_json::json!({"content_block_count": 1}),
+    );
 
     assert_eq!(event.kind, HookKind::OnMessageComplete);
     assert_eq!(event.message.as_deref(), Some("Final answer"));
@@ -208,9 +203,7 @@ fn on_compaction_event_carries_summary_metadata_without_transcript() {
 async fn manager_rejects_bad_manifest_before_spawning_process() {
     use std::sync::Arc;
     use synaps_cli::extensions::hooks::HookBus;
-    use synaps_cli::extensions::manifest::{
-        ExtensionManifest, ExtensionRuntime, HookSubscription,
-    };
+    use synaps_cli::extensions::manifest::{ExtensionManifest, ExtensionRuntime, HookSubscription};
 
     let bus = Arc::new(HookBus::new());
     let mut manager = ExtensionManager::new(bus);
@@ -252,7 +245,9 @@ async fn discovery_reports_malformed_extension_and_spawn_failures() {
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
-    let malformed_manifest = home.path().join("plugins/malformed/.synaps-plugin/plugin.json");
+    let malformed_manifest = home
+        .path()
+        .join("plugins/malformed/.synaps-plugin/plugin.json");
     fs::create_dir_all(malformed_manifest.parent().unwrap()).unwrap();
     fs::write(
         &malformed_manifest,
@@ -260,7 +255,9 @@ async fn discovery_reports_malformed_extension_and_spawn_failures() {
     )
     .unwrap();
 
-    let spawn_manifest = home.path().join("plugins/spawn-fail/.synaps-plugin/plugin.json");
+    let spawn_manifest = home
+        .path()
+        .join("plugins/spawn-fail/.synaps-plugin/plugin.json");
     fs::create_dir_all(spawn_manifest.parent().unwrap()).unwrap();
     fs::write(
         &spawn_manifest,
@@ -282,12 +279,20 @@ async fn discovery_reports_malformed_extension_and_spawn_failures() {
 
     assert_eq!(failed.len(), 2);
     let malformed = failed.iter().find(|f| f.plugin == "malformed").unwrap();
-    assert_eq!(malformed.manifest_path.as_deref(), Some(malformed_manifest.as_path()));
-    assert!(malformed.reason.contains("Failed to parse extension manifest"));
+    assert_eq!(
+        malformed.manifest_path.as_deref(),
+        Some(malformed_manifest.as_path())
+    );
+    assert!(malformed
+        .reason
+        .contains("Failed to parse extension manifest"));
     assert!(malformed.hint.contains("plugin validate"));
 
     let spawn = failed.iter().find(|f| f.plugin == "spawn-fail").unwrap();
-    assert_eq!(spawn.manifest_path.as_deref(), Some(spawn_manifest.as_path()));
+    assert_eq!(
+        spawn.manifest_path.as_deref(),
+        Some(spawn_manifest.as_path())
+    );
     assert!(spawn.reason.contains("Failed to spawn extension"));
     assert!(spawn.hint.contains("extension command is installed"));
 }

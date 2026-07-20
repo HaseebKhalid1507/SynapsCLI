@@ -318,11 +318,11 @@ pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
 /// assumption 5), and proof never derives from model text.
 pub fn memory_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
     use crate::runtime::memory_context::{mint_explicit_command_proof, MemoryContextMode};
-    let enable = |mode: MemoryContextMode| {
-        match runtime.memory_context_enable(mode, mint_explicit_command_proof()) {
-            Ok(status) => CommandResult::Output(status.render()),
-            Err(e) => CommandResult::Error(e.to_string()),
-        }
+    let enable = |mode: MemoryContextMode| match runtime
+        .memory_context_enable(mode, mint_explicit_command_proof())
+    {
+        Ok(status) => CommandResult::Output(status.render()),
+        Err(e) => CommandResult::Error(e.to_string()),
     };
     match arg.trim() {
         "on" => enable(MemoryContextMode::CaptureAndRecall),
@@ -889,10 +889,9 @@ mod tests {
                 "/memory {arg} output must name the mode; got: {text}"
             );
             match runtime.memory_context_status().durable {
-                DurableStatus::Active { mode: active, .. } => assert_eq!(
-                    active, mode,
-                    "/memory {arg} must install exactly {mode:?}"
-                ),
+                DurableStatus::Active { mode: active, .. } => {
+                    assert_eq!(active, mode, "/memory {arg} must install exactly {mode:?}")
+                }
                 DurableStatus::Off => panic!("/memory {arg} must install a session lease"),
             }
         }

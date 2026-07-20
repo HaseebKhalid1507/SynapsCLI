@@ -529,14 +529,12 @@ mod thinking_options_tests {
         assert_eq!(super::reasoning_type_for_model(rt.model()), "intrinsic");
         assert_eq!(thinking_options_for_model(rt.model()), vec!["adaptive"]);
 
-        super::defs::apply_setting_dispatch(
-            "model",
-            "openai-codex/gpt-5.6-sol",
-            &mut rt,
-            &mut app,
-        )
-        .unwrap();
-        assert_eq!(super::reasoning_type_for_model(rt.model()), "effort (named)");
+        super::defs::apply_setting_dispatch("model", "openai-codex/gpt-5.6-sol", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(
+            super::reasoning_type_for_model(rt.model()),
+            "effort (named)"
+        );
         assert!(thinking_options_for_model(rt.model()).contains(&"ultra".to_string()));
     }
 

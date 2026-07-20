@@ -104,7 +104,11 @@ async fn runtime_with(tool: Arc<dyn Tool>) -> Runtime {
 
 /// Drive one turn against a caller-owned cancellation token (so a tool can
 /// trip it mid-execute), returning every observed event.
-async fn drive_with_cancel(rt: &Runtime, prompt: &str, cancel: CancellationToken) -> Vec<StreamEvent> {
+async fn drive_with_cancel(
+    rt: &Runtime,
+    prompt: &str,
+    cancel: CancellationToken,
+) -> Vec<StreamEvent> {
     use futures::StreamExt;
     let mut stream = rt.run_stream(prompt.to_string(), cancel).await;
     let mut events = Vec::new();
@@ -136,8 +140,7 @@ fn terminal_outcome(events: &[StreamEvent]) -> Option<TurnOutcome> {
 #[serial]
 async fn cancel_after_committed_nonidempotent_yields_interrupted_no_rerun() {
     let _guard = HomeGuard::new();
-    let body: &'static str =
-        Box::leak(sse_one_call("commit_stub", "toolu_c1").into_boxed_str());
+    let body: &'static str = Box::leak(sse_one_call("commit_stub", "toolu_c1").into_boxed_str());
     let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
     let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -177,8 +180,7 @@ async fn cancel_after_committed_nonidempotent_yields_interrupted_no_rerun() {
 #[serial]
 async fn cancel_during_readonly_call_is_plain_cancellation() {
     let _guard = HomeGuard::new();
-    let body: &'static str =
-        Box::leak(sse_one_call("ro_stub", "toolu_r9").into_boxed_str());
+    let body: &'static str = Box::leak(sse_one_call("ro_stub", "toolu_r9").into_boxed_str());
     let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
     let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);

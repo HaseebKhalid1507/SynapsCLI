@@ -2,18 +2,18 @@ use rand::Rng;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KenoPhase {
-    Picking,   // Player selects numbers
-    Drawing,   // Numbers being drawn
+    Picking, // Player selects numbers
+    Drawing, // Numbers being drawn
     Result,
 }
 
 pub struct KenoGame {
     pub phase: KenoPhase,
-    pub picks: Vec<u8>,        // Player's selected numbers (1-80)
-    pub drawn: Vec<u8>,        // Drawn numbers (up to 20)
+    pub picks: Vec<u8>, // Player's selected numbers (1-80)
+    pub drawn: Vec<u8>, // Drawn numbers (up to 20)
     pub bet: u64,
     pub bet_input: String,
-    pub cursor: u8,            // Grid cursor (1-80)
+    pub cursor: u8, // Grid cursor (1-80)
     pub last_payout: i64,
     pub phase_timer: u64,
     pub hits: usize,
@@ -27,14 +27,40 @@ fn payout_multiplier(picks: usize, hits: usize) -> u64 {
     match (picks, hits) {
         (1, 1) => 3,
         (2, 2) => 9,
-        (3, 2) => 2, (3, 3) => 25,
-        (4, 2) => 1, (4, 3) => 5, (4, 4) => 75,
-        (5, 3) => 2, (5, 4) => 20, (5, 5) => 300,
-        (6, 3) => 1, (6, 4) => 8, (6, 5) => 60, (6, 6) => 1500,
-        (7, 3) => 1, (7, 4) => 4, (7, 5) => 20, (7, 6) => 100, (7, 7) => 5000,
-        (8, 4) => 2, (8, 5) => 10, (8, 6) => 50, (8, 7) => 500, (8, 8) => 10000,
-        (9, 4) => 1, (9, 5) => 5, (9, 6) => 25, (9, 7) => 200, (9, 8) => 3000, (9, 9) => 25000,
-        (10, 5) => 3, (10, 6) => 15, (10, 7) => 100, (10, 8) => 1000, (10, 9) => 5000, (10, 10) => 100000,
+        (3, 2) => 2,
+        (3, 3) => 25,
+        (4, 2) => 1,
+        (4, 3) => 5,
+        (4, 4) => 75,
+        (5, 3) => 2,
+        (5, 4) => 20,
+        (5, 5) => 300,
+        (6, 3) => 1,
+        (6, 4) => 8,
+        (6, 5) => 60,
+        (6, 6) => 1500,
+        (7, 3) => 1,
+        (7, 4) => 4,
+        (7, 5) => 20,
+        (7, 6) => 100,
+        (7, 7) => 5000,
+        (8, 4) => 2,
+        (8, 5) => 10,
+        (8, 6) => 50,
+        (8, 7) => 500,
+        (8, 8) => 10000,
+        (9, 4) => 1,
+        (9, 5) => 5,
+        (9, 6) => 25,
+        (9, 7) => 200,
+        (9, 8) => 3000,
+        (9, 9) => 25000,
+        (10, 5) => 3,
+        (10, 6) => 15,
+        (10, 7) => 100,
+        (10, 8) => 1000,
+        (10, 9) => 5000,
+        (10, 10) => 100000,
         _ => 0,
     }
 }
@@ -55,7 +81,9 @@ impl KenoGame {
     }
 
     pub fn toggle_pick(&mut self, num: u8) {
-        if !(1..=80).contains(&num) { return; }
+        if !(1..=80).contains(&num) {
+            return;
+        }
         if let Some(idx) = self.picks.iter().position(|&n| n == num) {
             self.picks.remove(idx);
         } else if self.picks.len() < MAX_PICKS {
@@ -64,7 +92,9 @@ impl KenoGame {
     }
 
     pub fn start_draw(&mut self, bet: u64) {
-        if self.picks.is_empty() { return; }
+        if self.picks.is_empty() {
+            return;
+        }
         self.bet = bet;
         self.drawn.clear();
         self.phase = KenoPhase::Drawing;

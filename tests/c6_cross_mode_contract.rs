@@ -20,7 +20,10 @@
 use agent_engine::engine::reactor::{
     drain_event_queue, event_payload_from_drained, EventDisposition,
 };
-use agent_engine::events::{types::{Event, Severity}, EventQueue};
+use agent_engine::events::{
+    types::{Event, Severity},
+    EventQueue,
+};
 use synaps_cli::core::rpc_protocol::RpcEvent;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -80,8 +83,14 @@ fn canonical_event_formats_identically_across_all_modes() {
     let payload_busy = event_payload_from_drained(&drained_busy[0]);
 
     // IDs must be the same real event ID — not fake UUIDs
-    assert_eq!(payload_idle.id, event_id, "idle payload id must be real event id");
-    assert_eq!(payload_busy.id, event_id, "busy payload id must be real event id");
+    assert_eq!(
+        payload_idle.id, event_id,
+        "idle payload id must be real event id"
+    );
+    assert_eq!(
+        payload_busy.id, event_id,
+        "busy payload id must be real event id"
+    );
 
     // Source must be real source — not "buffered"
     assert_eq!(payload_idle.source, "uptime-kuma");
@@ -92,8 +101,10 @@ fn canonical_event_formats_identically_across_all_modes() {
     assert_eq!(payload_busy.severity, "critical");
 
     // Formatted strings must be identical across modes
-    assert_eq!(payload_idle.formatted, payload_busy.formatted,
-        "payload.formatted must be identical across idle and busy drain paths");
+    assert_eq!(
+        payload_idle.formatted, payload_busy.formatted,
+        "payload.formatted must be identical across idle and busy drain paths"
+    );
 
     // Wire JSON equality (structural)
     let json_idle = serde_json::to_value(&payload_idle).unwrap();
@@ -106,12 +117,18 @@ fn canonical_event_formats_identically_across_all_modes() {
     assert_eq!(json_idle["text"], json_busy["text"]);
 
     // RpcEvent::Event wrapping produces same payload JSON
-    let rpc_idle = RpcEvent::Event { payload: Box::new(payload_idle) };
-    let rpc_busy = RpcEvent::Event { payload: Box::new(payload_busy) };
+    let rpc_idle = RpcEvent::Event {
+        payload: Box::new(payload_idle),
+    };
+    let rpc_busy = RpcEvent::Event {
+        payload: Box::new(payload_busy),
+    };
     let rpc_json_idle = serde_json::to_value(&rpc_idle).unwrap();
     let rpc_json_busy = serde_json::to_value(&rpc_busy).unwrap();
-    assert_eq!(rpc_json_idle["payload"], rpc_json_busy["payload"],
-        "RpcEvent::Event payload JSON must be structurally equal across modes");
+    assert_eq!(
+        rpc_json_idle["payload"], rpc_json_busy["payload"],
+        "RpcEvent::Event payload JSON must be structurally equal across modes"
+    );
 }
 
 // ─── T2: buffered_events_flush_without_duplication_or_metadata_loss ──────────
@@ -155,8 +172,14 @@ fn buffered_events_flush_without_duplication_or_metadata_loss() {
     match &drainer_frame {
         RpcEvent::Event { payload } => {
             assert_eq!(payload.id, real_id, "drainer frame must have real event id");
-            assert_eq!(payload.source, "grafana", "drainer frame must have real source");
-            assert_eq!(payload.severity, "high", "drainer frame must have real severity");
+            assert_eq!(
+                payload.source, "grafana",
+                "drainer frame must have real source"
+            );
+            assert_eq!(
+                payload.severity, "high",
+                "drainer frame must have real severity"
+            );
             assert_ne!(payload.source, "buffered", "source must NOT be 'buffered'");
         }
         _ => panic!("expected Event frame"),
@@ -175,21 +198,26 @@ fn buffered_events_flush_without_duplication_or_metadata_loss() {
     // FIXED behavior: inject content into api_messages only
     for formatted in std::mem::take(&mut pending_events) {
         api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted})
+            serde_json::json!({"role": "user", "content": formatted}),
         ));
         // CORRECT: no additional_wire_frames.push(...) here
     }
 
     // Verify: exactly ZERO additional wire frames from Done flush
     assert_eq!(
-        additional_wire_frames.len(), 0,
+        additional_wire_frames.len(),
+        0,
         "Done flush must NOT emit additional RpcEvent::Event frames — \
          would cause wire duplication. Got {} extra frames.",
         additional_wire_frames.len()
     );
 
     // Verify: api_messages now has the buffered content
-    assert_eq!(api_messages.len(), 1, "exactly one message injected at Done");
+    assert_eq!(
+        api_messages.len(),
+        1,
+        "exactly one message injected at Done"
+    );
     let injected = api_messages[0]["content"].as_str().unwrap();
     assert_eq!(
         injected, &canonical_formatted,
@@ -197,15 +225,21 @@ fn buffered_events_flush_without_duplication_or_metadata_loss() {
     );
 
     // Verify: the content is the canonical XML event format (not a JSON blob, not re-wrapped)
-    assert!(injected.starts_with("<event "), "injected content must be canonical XML event format");
+    assert!(
+        injected.starts_with("<event "),
+        "injected content must be canonical XML event format"
+    );
     assert!(injected.contains("source=\"grafana\""));
     assert!(injected.contains("severity=\"high\""));
     assert!(injected.ends_with("</event>"));
 
     // Total wire frames for this one event: exactly ONE (the drainer frame)
     let total_wire_frames = 1 + additional_wire_frames.len(); // 1 = drainer frame
-    assert_eq!(total_wire_frames, 1,
-        "exactly ONE wire frame total per buffered event — got {}", total_wire_frames);
+    assert_eq!(
+        total_wire_frames, 1,
+        "exactly ONE wire frame total per buffered event — got {}",
+        total_wire_frames
+    );
 }
 
 // ─── T3: real metadata preserved through full drain→payload pipeline ──────────
@@ -267,9 +301,14 @@ fn claim_auto_turn_uniform_boundary_semantics() {
     // 6th turn denied; counter must remain at cap.
     assert!(
         !claim_auto_turn(&mut counter),
-        "turn {} must be denied (cap = {})", AUTO_TURN_CAP + 1, AUTO_TURN_CAP
+        "turn {} must be denied (cap = {})",
+        AUTO_TURN_CAP + 1,
+        AUTO_TURN_CAP
     );
-    assert_eq!(counter, AUTO_TURN_CAP, "counter must remain at cap when denied");
+    assert_eq!(
+        counter, AUTO_TURN_CAP,
+        "counter must remain at cap when denied"
+    );
 
     // Repeated denials keep counter stable.
     for _ in 0..3 {

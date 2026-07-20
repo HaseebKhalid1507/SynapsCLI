@@ -597,13 +597,22 @@ mod tests {
         );
 
         // Every non-memory breakdown lane is unchanged.
-        assert_eq!(with.breakdown.system_tokens, without.breakdown.system_tokens);
+        assert_eq!(
+            with.breakdown.system_tokens,
+            without.breakdown.system_tokens
+        );
         assert_eq!(
             with.breakdown.tool_schema_tokens,
             without.breakdown.tool_schema_tokens
         );
-        assert_eq!(with.breakdown.history_tokens, without.breakdown.history_tokens);
-        assert_eq!(with.breakdown.framing_tokens, without.breakdown.framing_tokens);
+        assert_eq!(
+            with.breakdown.history_tokens,
+            without.breakdown.history_tokens
+        );
+        assert_eq!(
+            with.breakdown.framing_tokens,
+            without.breakdown.framing_tokens
+        );
         assert_eq!(with.breakdown.skill_tokens, without.breakdown.skill_tokens);
         assert_eq!(with.history_messages, without.history_messages);
 

@@ -228,8 +228,37 @@ impl StreamMethods {
             // Budget pre-flight: wall clock, then the exact round cap —
             // BEFORE any provider call is spent. History is valid here
             // (round boundaries always end on paired tool_results).
-            if let Err(dimension) = budget_meter.begin_round() {
-                finish_budget_exceeded!(dimension);
+            //
+            // Graceful continuation (spec §8.1): a bare provider-round
+            // exhaustion is a soft checkpoint, not a turn-ending failure —
+            // long, legitimate agentic tasks would otherwise die mid-flight.
+            // Renew the round allowance a bounded number of times and keep
+            // going; wall-clock (re-checked by begin_round) and the finite
+            // renewal cap still bound any true runaway. Every other dimension
+            // remains a hard stop.
+            match budget_meter.begin_round() {
+                Ok(()) => {}
+                Err(agent_core::BudgetDimension::ProviderRounds) => {
+                    match budget_meter.try_renew_rounds() {
+                        Some(remaining) => match budget_meter.begin_round() {
+                            Ok(()) => {
+                                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                    format!(
+                                        "Reached a provider-round checkpoint — work preserved, continuing automatically ({remaining} extension(s) left)."
+                                    ),
+                                )));
+                            }
+                            // Renewal granted but wall-clock (or another
+                            // dimension) now bars the round: hard-stop on that.
+                            Err(dimension) => finish_budget_exceeded!(dimension),
+                        },
+                        // Renewal budget exhausted: this is the real hard stop.
+                        None => {
+                            finish_budget_exceeded!(agent_core::BudgetDimension::ProviderRounds)
+                        }
+                    }
+                }
+                Err(dimension) => finish_budget_exceeded!(dimension),
             }
 
             // Refresh token before each API call in the tool loop — fixes stale

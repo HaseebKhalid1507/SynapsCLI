@@ -272,6 +272,11 @@ pub struct TurnBudgetOverrides {
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
+    /// Bounded auto-renewals of the provider-round allowance after it is
+    /// exhausted mid-turn (spec §8.1). Each renewal resets the round counter;
+    /// wall-clock is never renewed, so total turn time stays bounded. `0`
+    /// disables graceful continuation (hard stop at the first exhaustion).
+    pub max_round_renewals: Option<u32>,
 }
 
 /// Per-role turn budgets (foreground, autonomous/watcher, worker).
@@ -318,6 +323,7 @@ fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val:
         }
         "max_context_tokens" => set!(overrides.max_context_tokens, u64),
         "max_cost_usd" => set!(overrides.max_cost_usd, f64),
+        "max_round_renewals" => set!(overrides.max_round_renewals, u32),
         other => eprintln!("Warning: unknown turn_budget field '{other}'"),
     }
 }
@@ -434,7 +440,12 @@ fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
         "recall_max_records" => set_num!(memory.recall_max_records, u32),
         "recall_max_tokens" => set_num!(memory.recall_max_tokens, u32),
         "recall_timeout_ms" => set_num!(memory.recall_timeout_ms, u64),
-        "capture_tools" => parse_enum(&mut memory.capture_tools, key, val, &["off", "summary_only"]),
+        "capture_tools" => parse_enum(
+            &mut memory.capture_tools,
+            key,
+            val,
+            &["off", "summary_only"],
+        ),
         "capture_assistant" => parse_bool(&mut memory.capture_assistant, key, val),
         "capture_user" => parse_bool(&mut memory.capture_user, key, val),
         "auto_consolidate" => parse_enum(&mut memory.auto_consolidate, key, val, &["off", "on"]),
@@ -1200,6 +1211,7 @@ mod tests {
              turn_budget.worker.max_cost_usd = 0.25\n\
              turn_budget.autonomous.max_elapsed_secs = 90\n\
              turn_budget.foreground.max_tool_calls = 7\n\
+             turn_budget.foreground.max_round_renewals = 12\n\
              turn_budget.worker.max_provider_rounds_bogus = 1\n\
              turn_budget.nosuchrole.max_tool_calls = 1\n",
         );
@@ -1207,6 +1219,7 @@ mod tests {
         assert_eq!(config.turn_budgets.worker.max_cost_usd, Some(0.25));
         assert_eq!(config.turn_budgets.autonomous.max_elapsed_secs, Some(90));
         assert_eq!(config.turn_budgets.foreground.max_tool_calls, Some(7));
+        assert_eq!(config.turn_budgets.foreground.max_round_renewals, Some(12));
         // Unknown fields/roles warn and change nothing.
         assert_eq!(config.turn_budgets.worker.max_tool_calls, None);
         // Invalid values keep the default (None).
@@ -1290,8 +1303,7 @@ mod tests {
 
     #[test]
     fn memory_default_mode_without_consent_reverts_to_off() {
-        let config =
-            super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
+        let config = super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
         assert_eq!(config.memory.default_mode, "off");
         assert!(
             config

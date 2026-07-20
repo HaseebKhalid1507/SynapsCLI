@@ -62,7 +62,11 @@ async fn extension_can_set_and_read_own_plugin_config_file() {
         .await
         .expect("extension should set/read config during initialize");
 
-    let config_path = home.path().join("plugins").join("config-test-ext").join("config");
+    let config_path = home
+        .path()
+        .join("plugins")
+        .join("config-test-ext")
+        .join("config");
     let body = std::fs::read_to_string(config_path).expect("plugin config file should exist");
     assert!(body.contains("backend = cpu"), "body was: {body:?}");
 

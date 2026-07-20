@@ -310,11 +310,8 @@ mod tests {
     #[test]
     fn expanding_anthropic_still_requests_live_catalog() {
         let mut state = ModelsModalState::new();
-        let outcome = open_expanded_provider(
-            &mut state,
-            "anthropic".to_string(),
-            "Anthropic".to_string(),
-        );
+        let outcome =
+            open_expanded_provider(&mut state, "anthropic".to_string(), "Anthropic".to_string());
         assert_eq!(
             outcome,
             InputOutcome::ExpandProvider("anthropic".to_string())

@@ -263,7 +263,11 @@ mod cache_ttl_policy_tests {
             .expect("Runtime::new() must succeed in test environment");
         let fresh = subagent.memory_context_status();
         assert_eq!(fresh.durable, DurableStatus::Off, "fresh runtime is Off");
-        assert_eq!(fresh.one_shot, OneShotStatus::Idle, "fresh runtime has no one-shot");
+        assert_eq!(
+            fresh.one_shot,
+            OneShotStatus::Idle,
+            "fresh runtime has no one-shot"
+        );
 
         // ...and STAYS Off/no-lease after the subagent runtime policy runs.
         let config = crate::config::SynapsConfig::default();

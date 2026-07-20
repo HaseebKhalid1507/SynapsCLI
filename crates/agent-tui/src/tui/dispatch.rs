@@ -776,9 +776,9 @@ pub(crate) async fn handle_input_action(
                         }
                         for entry in &diag.entries {
                             let source_label = match &entry.source {
-                                synaps_cli::extensions::config::ConfigSource::HostContext(
-                                    name,
-                                ) => format!("host context ({})", name),
+                                synaps_cli::extensions::config::ConfigSource::HostContext(name) => {
+                                    format!("host context ({})", name)
+                                }
                                 synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => {
                                     format!("env override ({})", name)
                                 }

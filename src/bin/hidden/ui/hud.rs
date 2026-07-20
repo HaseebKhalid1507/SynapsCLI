@@ -1,7 +1,7 @@
+use super::theme;
+use crate::app::App;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use crate::app::App;
-use super::theme;
 
 pub fn draw_hud(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
@@ -30,12 +30,23 @@ pub fn draw_hud(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             format!("{}", app.tokens),
             Style::default()
-                .fg(if app.tokens > 200 { theme::GREEN } else if app.tokens > 50 { theme::AMBER } else { theme::RED })
+                .fg(if app.tokens > 200 {
+                    theme::GREEN
+                } else if app.tokens > 50 {
+                    theme::AMBER
+                } else {
+                    theme::RED
+                })
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" TOKENS", Style::default().fg(theme::GRAY)),
         Span::styled("  │  ", Style::default().fg(theme::AMBER_DIM)),
-        Span::styled(screen_name, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            screen_name,
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  │  ", Style::default().fg(theme::AMBER_DIM)),
         Span::styled("[Q]", Style::default().fg(theme::GRAY)),
         Span::styled(" QUIT", Style::default().fg(theme::GRAY)),

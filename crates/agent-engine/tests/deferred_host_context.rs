@@ -128,7 +128,10 @@ async fn legacy_alias_manifest_defers_spawns_once_and_receives_host_project_root
     let manifest = legacy_manifest(&spy, &tools_json);
 
     // Legacy aliases fold into the native deferred block at deserialize.
-    let deferred = manifest.deferred.as_ref().expect("aliases fold to deferred");
+    let deferred = manifest
+        .deferred
+        .as_ref()
+        .expect("aliases fold to deferred");
     assert_eq!(deferred.tools.len(), 2);
     assert!(deferred.providers.is_empty());
 
@@ -155,8 +158,7 @@ async fn legacy_alias_manifest_defers_spawns_once_and_receives_host_project_root
     .unwrap();
     ExecutionGate::authorize_wire_call(&reg, &set, "axel-shaped-plugin:memory_search").unwrap();
     assert!(
-        ExecutionGate::authorize_wire_call(&reg, &set, "axel-shaped-plugin:memory_forget")
-            .is_err(),
+        ExecutionGate::authorize_wire_call(&reg, &set, "axel-shaped-plugin:memory_forget").is_err(),
         "sibling must stay ungranted"
     );
     assert!(events(&spy).is_empty(), "activation alone must not spawn");
@@ -200,20 +202,21 @@ async fn legacy_alias_manifest_defers_spawns_once_and_receives_host_project_root
         &std::fs::read_to_string(dir.join("spy.log.init.json")).expect("init params captured"),
     )
     .unwrap();
-    let expected_root = agent_core::memory::store::ProjectScope::discover(
-        &std::env::current_dir().unwrap(),
-    )
-    .unwrap()
-    .root()
-    .display()
-    .to_string();
+    let expected_root =
+        agent_core::memory::store::ProjectScope::discover(&std::env::current_dir().unwrap())
+            .unwrap()
+            .root()
+            .display()
+            .to_string();
     assert_eq!(
         init.pointer("/config/project_root").and_then(Value::as_str),
         Some(expected_root.as_str()),
         "initialize must carry the host-owned trusted project root"
     );
     assert_eq!(
-        init.get("config").and_then(Value::as_object).map(|o| o.len()),
+        init.get("config")
+            .and_then(Value::as_object)
+            .map(|o| o.len()),
         Some(1),
         "resolved config carries ONLY the declared host-context key"
     );

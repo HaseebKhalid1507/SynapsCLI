@@ -1,8 +1,8 @@
-use ratatui::prelude::*;
-use ratatui::buffer::Buffer;
 use crate::app::App;
 use crate::games::keno::*;
 use crate::ui::theme;
+use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 
 // ── Keno Screen ─────────────────────────────────────────────────────
 
@@ -23,10 +23,14 @@ pub fn draw_keno(f: &mut Frame, app: &App, game: &KenoGame, area: Rect) {
     let board_bot = h.saturating_sub(4);
     for y in board_top..board_bot {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() { continue; }
+        if ay >= area.bottom() {
+            continue;
+        }
         for x in 2..(w.saturating_sub(2)) {
             let ax = area.left() + x as u16;
-            if ax >= area.right() { continue; }
+            if ax >= area.right() {
+                continue;
+            }
             buf[(ax, ay)].set_bg(Color::Rgb(10, 5, 15));
         }
     }
@@ -37,8 +41,12 @@ pub fn draw_keno(f: &mut Frame, app: &App, game: &KenoGame, area: Rect) {
         let at = area.top() + board_top as u16;
         let ab = area.top() + board_bot as u16;
         if ax < area.right() {
-            if at < area.bottom() { buf[(ax, at)].set_char('▓').set_fg(theme::MAGENTA); }
-            if ab < area.bottom() { buf[(ax, ab)].set_char('▓').set_fg(theme::MAGENTA); }
+            if at < area.bottom() {
+                buf[(ax, at)].set_char('▓').set_fg(theme::MAGENTA);
+            }
+            if ab < area.bottom() {
+                buf[(ax, ab)].set_char('▓').set_fg(theme::MAGENTA);
+            }
         }
     }
 
@@ -64,7 +72,9 @@ fn draw_picking(buf: &mut Buffer, area: Rect, game: &KenoGame, app: &App, w: usi
 
         let mut picks_line = String::new();
         for (i, &pick) in game.picks.iter().enumerate() {
-            if i > 0 { picks_line.push_str(", "); }
+            if i > 0 {
+                picks_line.push_str(", ");
+            }
             picks_line.push_str(&pick.to_string());
         }
         draw_str(buf, area, 4, h - 5, &picks_line, theme::WHITE);
@@ -103,7 +113,9 @@ fn draw_drawing(buf: &mut Buffer, area: Rect, game: &KenoGame, _app: &App, w: us
     if !game.drawn.is_empty() {
         let mut drawn_line = String::new();
         for (i, &num) in game.drawn.iter().enumerate() {
-            if i > 0 { drawn_line.push_str(", "); }
+            if i > 0 {
+                drawn_line.push_str(", ");
+            }
             drawn_line.push_str(&num.to_string());
         }
         draw_str(buf, area, 4, h - 3, &drawn_line, theme::WHITE);
@@ -127,10 +139,21 @@ fn draw_result_grid(buf: &mut Buffer, area: Rect, game: &KenoGame, _app: &App, w
     } else {
         format!("-{} TOKENS", game.bet)
     };
-    let payout_color = if game.last_payout > 0 { theme::GREEN } else { theme::RED };
+    let payout_color = if game.last_payout > 0 {
+        theme::GREEN
+    } else {
+        theme::RED
+    };
     draw_str(buf, area, 4, h - 4, &payout_str, payout_color);
 
-    draw_str(buf, area, (w - 28) / 2, h - 1, "[ENTER] New Round  ·  [ESC] Back", theme::DARK_GRAY);
+    draw_str(
+        buf,
+        area,
+        (w - 28) / 2,
+        h - 1,
+        "[ENTER] New Round  ·  [ESC] Back",
+        theme::DARK_GRAY,
+    );
 }
 
 fn draw_number_grid(buf: &mut Buffer, area: Rect, game: &KenoGame, w: usize, _h: usize) {
@@ -165,7 +188,9 @@ fn draw_number_grid(buf: &mut Buffer, area: Rect, game: &KenoGame, w: usize, _h:
             let cy = area.top() + y as u16;
             if cy < area.bottom() {
                 for ch in num_str.chars() {
-                    if cx >= area.right() { break; }
+                    if cx >= area.right() {
+                        break;
+                    }
                     buf[(cx, cy)].set_char(ch).set_fg(fg).set_bg(bg);
                     cx += 1;
                 }
@@ -177,9 +202,13 @@ fn draw_number_grid(buf: &mut Buffer, area: Rect, game: &KenoGame, w: usize, _h:
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() { return; }
+    if cy >= area.bottom() {
+        return;
+    }
     for ch in s.chars() {
-        if cx >= area.right() { break; }
+        if cx >= area.right() {
+            break;
+        }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }

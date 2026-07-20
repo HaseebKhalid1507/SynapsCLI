@@ -100,8 +100,14 @@ pub async fn run(
         mut boot_fx_sent,
         mut exit_fx_sent,
         mut last_draw,
-    } = run_setup::run_setup(continue_session, system, prompt_manifest, profile, no_extensions)
-        .await?;
+    } = run_setup::run_setup(
+        continue_session,
+        system,
+        prompt_manifest,
+        profile,
+        no_extensions,
+    )
+    .await?;
     // P16.1+P16.2: terminal capabilities — env detection merged with the
     // DA1-fenced query burst run inside run_setup() (after raw-mode enable,
     // BEFORE the EventStream above was created; see run_setup.rs). Still

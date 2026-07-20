@@ -1,14 +1,15 @@
 //! Stream event handling — processes StreamEvent variants from the runtime.
 
-
 use serde_json::json;
-use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
-use synaps_cli::engine::reactor::{claim_auto_turn, drain_event_queue, wake_action, WakeAction, EventDisposition, AUTO_TURN_CAP};
+use synaps_cli::engine::reactor::{
+    claim_auto_turn, drain_event_queue, wake_action, EventDisposition, WakeAction, AUTO_TURN_CAP,
+};
+use synaps_cli::{AgentEvent, CancellationToken, LlmEvent, Runtime, SessionEvent, StreamEvent};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
-use super::view_model::ViewInputs;
 use super::render_thread::RenderHandle;
+use super::view_model::ViewInputs;
 
 /// What the event loop should do after processing a stream event.
 pub(super) enum StreamAction {
@@ -22,15 +23,16 @@ pub(super) enum StreamAction {
 
 /// Returns true if the event should trigger an immediate redraw.
 pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
-    matches!(event,
+    matches!(
+        event,
         StreamEvent::Llm(LlmEvent::ToolUse { .. })
-        | StreamEvent::Llm(LlmEvent::ToolResult { .. })
-        | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
-        | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
-        | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
-        | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. })
-        | StreamEvent::Session(SessionEvent::Done)
-        | StreamEvent::Session(SessionEvent::Error(_))
+            | StreamEvent::Llm(LlmEvent::ToolResult { .. })
+            | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
+            | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
+            | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
+            | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. })
+            | StreamEvent::Session(SessionEvent::Done)
+            | StreamEvent::Session(SessionEvent::Error(_))
     )
 }
 
@@ -53,7 +55,11 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
             app.on_tool_use_delta(&tool_id, &delta);
         }
-        StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
+        StreamEvent::Llm(LlmEvent::ToolUse {
+            tool_name,
+            tool_id,
+            input,
+        }) => {
             let input_str = serde_json::to_string(&input).unwrap_or_default();
             app.on_tool_use_finalized(tool_id, tool_name, input_str);
             return StreamAction::Continue;
@@ -70,7 +76,11 @@ pub(super) async fn handle_stream_event(
             app.api_messages = history;
             app.save_session().await;
         }
-        StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
+        StreamEvent::Agent(AgentEvent::SubagentStart {
+            subagent_id,
+            agent_name,
+            task_preview,
+        }) => {
             app.subagents.push(SubagentState {
                 id: subagent_id,
                 name: agent_name,
@@ -82,13 +92,22 @@ pub(super) async fn handle_stream_event(
             });
             app.invalidate();
         }
-        StreamEvent::Agent(AgentEvent::SubagentUpdate { subagent_id, status, .. }) => {
+        StreamEvent::Agent(AgentEvent::SubagentUpdate {
+            subagent_id,
+            status,
+            ..
+        }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.status = status;
             }
             app.invalidate();
         }
-        StreamEvent::Agent(AgentEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. }) => {
+        StreamEvent::Agent(AgentEvent::SubagentDone {
+            subagent_id,
+            result_preview,
+            duration_secs,
+            ..
+        }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.done = true;
                 sa.duration_secs = Some(duration_secs);
@@ -154,8 +173,10 @@ pub(super) async fn handle_stream_event(
             // whose tx_events is now dead (stream dropped) but threads live on.
             // Poison-recovering lock: a panicked subagent thread must not block teardown.
             {
-                let rows = runtime.subagent_registry()
-                    .lock().unwrap_or_else(|p| p.into_inner())
+                let rows = runtime
+                    .subagent_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
                     .display_rows();
                 reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
             }
@@ -165,10 +186,11 @@ pub(super) async fn handle_stream_event(
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();
             for formatted in app.pending_events.drain(..) {
-                app.api_messages.push(std::sync::Arc::new(serde_json::json!({
-                    "role": "user",
-                    "content": formatted
-                })));
+                app.api_messages
+                    .push(std::sync::Arc::new(serde_json::json!({
+                        "role": "user",
+                        "content": formatted
+                    })));
             }
 
             // Check for queued message to auto-send
@@ -194,8 +216,10 @@ pub(super) async fn handle_stream_event(
             app.streaming = false;
             // Reconcile HUD against registry on error path too (same as Done).
             {
-                let rows = runtime.subagent_registry()
-                    .lock().unwrap_or_else(|p| p.into_inner())
+                let rows = runtime
+                    .subagent_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
                     .display_rows();
                 reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
             }
@@ -213,7 +237,6 @@ pub(super) async fn handle_stream_event(
     StreamAction::Continue
 }
 
-
 // ── P12.4: stream-lifecycle select! arms — pure code-motion from run(). ──
 // The select! arm EXPRESSIONS (the event-queue `notified()` wake and the
 // `stream.next()` polling future) stay inline in mod.rs; only the arm
@@ -225,8 +248,7 @@ pub(super) async fn handle_stream_event(
 /// The in-flight response stream, owned by the `run()` loop and lent to the
 /// arm handlers below so they can clear/replace it exactly as the inline
 /// arms did.
-pub(super) type ActiveStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
+pub(super) type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
 
 /// Event-bus wake arm body: drain queued engine events into the transcript,
 /// steer them into an active stream (or buffer), and auto-trigger a model
@@ -257,7 +279,9 @@ pub(super) async fn handle_event_queue_arm(
     // Presentation: push each event to the transcript and update the HUD.
     for de in &drained {
         let event = &de.event;
-        let severity_str = event.content.severity
+        let severity_str = event
+            .content
+            .severity
             .as_ref()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "medium".to_string());
@@ -325,13 +349,17 @@ pub(super) async fn handle_event_queue_arm(
                 app.streaming = true;
                 app.turn_baseline = app.api_messages.len();
                 app.spinner_frame = 0;
-                *stream = Some(runtime.run_stream_with_messages(
-                    app.api_messages.clone(),
-                    ct.clone(),
-                    Some(s_rx),
-                    Some(secret_prompt_handle.clone()),
-                    false,
-                ).await);
+                *stream = Some(
+                    runtime
+                        .run_stream_with_messages(
+                            app.api_messages.clone(),
+                            ct.clone(),
+                            Some(s_rx),
+                            Some(secret_prompt_handle.clone()),
+                            false,
+                        )
+                        .await,
+                );
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                 *cancel_token = Some(ct);
                 *steer_tx = Some(s_tx);
@@ -339,17 +367,17 @@ pub(super) async fn handle_event_queue_arm(
         }
         WakeAction::Forward => {
             // Check if we hit the cap (some Injected events but cap blocked RunTurn).
-            let hit_cap = drained.iter().any(|d| d.disposition == EventDisposition::Injected)
+            let hit_cap = drained
+                .iter()
+                .any(|d| d.disposition == EventDisposition::Injected)
                 && !busy
                 && auto_turn_enabled
                 && app.consecutive_auto_turns >= synaps_cli::engine::reactor::AUTO_TURN_CAP;
             if hit_cap {
-                app.push_msg(ChatMessage::System(
-                    format!(
-                        "auto-turn cap reached ({} consecutive) — waiting for your input",
-                        synaps_cli::engine::reactor::AUTO_TURN_CAP
-                    )
-                ));
+                app.push_msg(ChatMessage::System(format!(
+                    "auto-turn cap reached ({} consecutive) — waiting for your input",
+                    synaps_cli::engine::reactor::AUTO_TURN_CAP
+                )));
                 app.invalidate();
             }
         }
@@ -373,105 +401,143 @@ pub(super) async fn handle_stream_arm(
     cancel_token: &mut Option<CancellationToken>,
     steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
-                if let Some(event) = maybe_event {
-                    let do_draw = needs_immediate_draw(&event);
-                    let action = handle_stream_event(event, app, runtime).await;
+    if let Some(event) = maybe_event {
+        let do_draw = needs_immediate_draw(&event);
+        let action = handle_stream_event(event, app, runtime).await;
 
-                    match action {
-                        StreamAction::Continue => {
-                            // For Done/Error, clear stream state
-                            if !app.streaming {
-                                *stream = None;
-                                *cancel_token = None;
-                                *steer_tx = None;
-                                // Reclaim gamba if running — resume render thread
-                                // after reclaim restores the terminal.
-                                if let Some(msg) = app.reclaim_gamba() {
-                                    render_handle.resume();
-                                    app.push_msg(ChatMessage::System(msg));
-                                    app.invalidate();
-                                }
-                            }
-                        }
-                        StreamAction::AutoSendQueued(queued) => {
-                            // Drop old stream state (important for cleanup)
-                            drop(stream.take());
-                            drop(cancel_token.take());
-                            drop(steer_tx.take());
-                            // Reclaim gamba if running — resume render thread
-                            // after reclaim restores the terminal.
-                            if let Some(msg) = app.reclaim_gamba() {
-                                render_handle.resume();
-                                app.push_msg(ChatMessage::System(msg));
-                                app.invalidate();
-                            }
-                            // Auto-send the queued message (user-authored — reset auto-turn counter)
-                            app.consecutive_auto_turns = 0;
-                            app.push_msg(ChatMessage::User(queued.clone()));
-                            app.transcript.scroll_to_bottom();
-                            let api_content = if let Some(ref ctx) = app.abort_context {
-                                let combined = format!("{}\n\n{}", ctx, queued);
-                                app.abort_context = None;
-                                combined
-                            } else {
-                                queued
-                            };
-                            app.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": api_content})));
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.status_text = Some("connecting…".to_string());
-                            app.streaming = true;
-                            app.turn_baseline = app.api_messages.len();
-                            app.spinner_frame = 0;
-                            let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                            let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
-                            if let Some((model, patch)) = built {
-                                patch.apply(app);
-                                render_handle.publish(model);
-                            }
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.status_text = None;
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
-                        }
-                        StreamAction::AutoTriggerEvents => {
-                            drop(stream.take());
-                            drop(cancel_token.take());
-                            drop(steer_tx.take());
-
-                            // Use the central claim_auto_turn gate: allows turns 1-5
-                            // (counter < CAP), denies the 6th (counter == CAP).
-                            // Increment happens inside claim on success — no inline +=.
-                            if claim_auto_turn(&mut app.consecutive_auto_turns) {
-                                let ct = CancellationToken::new();
-                                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                                app.streaming = true;
-                                app.turn_baseline = app.api_messages.len();
-                                app.spinner_frame = 0;
-                                *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                                *cancel_token = Some(ct);
-                                *steer_tx = Some(s_tx);
-                            } else {
-                                app.push_msg(ChatMessage::System(format!(
-                                    "auto-turn cap reached ({} consecutive) — waiting for your input",
-                                    AUTO_TURN_CAP
-                                )));
-                                app.invalidate();
-                            }
-                        }
-                    }
-
-                    if do_draw {
-                        let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                        let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
-                        if let Some((model, patch)) = built {
-                            patch.apply(app);
-                            render_handle.publish(model);
-                        }
+        match action {
+            StreamAction::Continue => {
+                // For Done/Error, clear stream state
+                if !app.streaming {
+                    *stream = None;
+                    *cancel_token = None;
+                    *steer_tx = None;
+                    // Reclaim gamba if running — resume render thread
+                    // after reclaim restores the terminal.
+                    if let Some(msg) = app.reclaim_gamba() {
+                        render_handle.resume();
+                        app.push_msg(ChatMessage::System(msg));
+                        app.invalidate();
                     }
                 }
+            }
+            StreamAction::AutoSendQueued(queued) => {
+                // Drop old stream state (important for cleanup)
+                drop(stream.take());
+                drop(cancel_token.take());
+                drop(steer_tx.take());
+                // Reclaim gamba if running — resume render thread
+                // after reclaim restores the terminal.
+                if let Some(msg) = app.reclaim_gamba() {
+                    render_handle.resume();
+                    app.push_msg(ChatMessage::System(msg));
+                    app.invalidate();
+                }
+                // Auto-send the queued message (user-authored — reset auto-turn counter)
+                app.consecutive_auto_turns = 0;
+                app.push_msg(ChatMessage::User(queued.clone()));
+                app.transcript.scroll_to_bottom();
+                let api_content = if let Some(ref ctx) = app.abort_context {
+                    let combined = format!("{}\n\n{}", ctx, queued);
+                    app.abort_context = None;
+                    combined
+                } else {
+                    queued
+                };
+                app.api_messages.push(std::sync::Arc::new(
+                    json!({"role": "user", "content": api_content}),
+                ));
+                let ct = CancellationToken::new();
+                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                app.status_text = Some("connecting…".to_string());
+                app.streaming = true;
+                app.turn_baseline = app.api_messages.len();
+                app.spinner_frame = 0;
+                let term_size = crossterm::terminal::size()
+                    .map(|(w, h)| ratatui::layout::Size {
+                        width: w,
+                        height: h,
+                    })
+                    .unwrap_or_default();
+                let built = build_render_model(
+                    &mut ViewInputs::from_app(app),
+                    runtime,
+                    registry,
+                    term_size,
+                );
+                if let Some((model, patch)) = built {
+                    patch.apply(app);
+                    render_handle.publish(model);
+                }
+                *stream = Some(
+                    runtime
+                        .run_stream_with_messages(
+                            app.api_messages.clone(),
+                            ct.clone(),
+                            Some(s_rx),
+                            Some(secret_prompt_handle.clone()),
+                            false,
+                        )
+                        .await,
+                );
+                app.status_text = None;
+                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                *cancel_token = Some(ct);
+                *steer_tx = Some(s_tx);
+            }
+            StreamAction::AutoTriggerEvents => {
+                drop(stream.take());
+                drop(cancel_token.take());
+                drop(steer_tx.take());
+
+                // Use the central claim_auto_turn gate: allows turns 1-5
+                // (counter < CAP), denies the 6th (counter == CAP).
+                // Increment happens inside claim on success — no inline +=.
+                if claim_auto_turn(&mut app.consecutive_auto_turns) {
+                    let ct = CancellationToken::new();
+                    let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    app.streaming = true;
+                    app.turn_baseline = app.api_messages.len();
+                    app.spinner_frame = 0;
+                    *stream = Some(
+                        runtime
+                            .run_stream_with_messages(
+                                app.api_messages.clone(),
+                                ct.clone(),
+                                Some(s_rx),
+                                Some(secret_prompt_handle.clone()),
+                                false,
+                            )
+                            .await,
+                    );
+                    app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                    *cancel_token = Some(ct);
+                    *steer_tx = Some(s_tx);
+                } else {
+                    app.push_msg(ChatMessage::System(format!(
+                        "auto-turn cap reached ({} consecutive) — waiting for your input",
+                        AUTO_TURN_CAP
+                    )));
+                    app.invalidate();
+                }
+            }
+        }
+
+        if do_draw {
+            let term_size = crossterm::terminal::size()
+                .map(|(w, h)| ratatui::layout::Size {
+                    width: w,
+                    height: h,
+                })
+                .unwrap_or_default();
+            let built =
+                build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
+            if let Some((model, patch)) = built {
+                patch.apply(app);
+                render_handle.publish(model);
+            }
+        }
+    }
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text
@@ -538,7 +604,7 @@ pub(super) fn reconcile_subagents(
                         sa.status = match &row.status {
                             SubagentStatus::Completed => "\u{2714} done".to_string(),
                             SubagentStatus::Cancelled => "\u{26a0} cancelled".to_string(),
-                            SubagentStatus::TimedOut  => "\u{26a0} timed out".to_string(),
+                            SubagentStatus::TimedOut => "\u{26a0} timed out".to_string(),
                             SubagentStatus::Failed(r) => {
                                 let preview: String = r.chars().take(30).collect();
                                 format!("\u{2718} {}", preview)
@@ -617,11 +683,11 @@ mod tests {
 
 #[cfg(test)]
 mod reconcile_tests {
-    use super::{reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
     use super::super::app::SubagentState;
-    use synaps_cli::tools::SubagentDisplayRow;
-    use synaps_cli::runtime::subagent::SubagentStatus;
+    use super::{reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
     use std::time::{Duration, Instant};
+    use synaps_cli::runtime::subagent::SubagentStatus;
+    use synaps_cli::tools::SubagentDisplayRow;
 
     fn make_row(id: u64, status: SubagentStatus, cancel_requested: bool) -> SubagentDisplayRow {
         SubagentDisplayRow {
@@ -638,7 +704,11 @@ mod reconcile_tests {
         SubagentState {
             id,
             name: format!("agent-{id}"),
-            status: if done { "\u{2714} done".to_string() } else { "running".to_string() },
+            status: if done {
+                "\u{2714} done".to_string()
+            } else {
+                "running".to_string()
+            },
             start_time: Instant::now(),
             done,
             duration_secs: if done { Some(1.5) } else { None },
@@ -667,7 +737,11 @@ mod reconcile_tests {
         let mut hud = vec![make_hud_entry(99, false)]; // not in registry
         let rows: Vec<SubagentDisplayRow> = vec![]; // empty registry
         reconcile_subagents(&mut hud, &rows, now);
-        assert_eq!(hud.len(), 1, "in-flight oneshot must survive even if not in registry");
+        assert_eq!(
+            hud.len(),
+            1,
+            "in-flight oneshot must survive even if not in registry"
+        );
     }
 
     // R3: cancelling — cancel_requested && Running → status updated
@@ -678,7 +752,11 @@ mod reconcile_tests {
         let rows = vec![make_row(1, SubagentStatus::Running, true)]; // cancel_requested
         reconcile_subagents(&mut hud, &rows, now);
         assert_eq!(hud.len(), 1);
-        assert!(hud[0].status.contains("cancelling"), "status must say cancelling: {}", hud[0].status);
+        assert!(
+            hud[0].status.contains("cancelling"),
+            "status must say cancelling: {}",
+            hud[0].status
+        );
     }
 
     // R4: flash expiry — done entry with done_at > 5s → removed
@@ -720,7 +798,7 @@ mod reconcile_tests {
         let mut hud = vec![
             make_hud_entry(1, false), // running → will be completed
             make_hud_entry(2, false), // running → cancel_requested
-            sa3,                       // done + expired → remove
+            sa3,                      // done + expired → remove
         ];
 
         // Registry: sa_1 completed, sa_2 cancel_requested, sa_3 completed, sa_4 new running
@@ -739,13 +817,23 @@ mod reconcile_tests {
 
         // sa_2 must have cancelling status
         let sa2 = hud.iter().find(|s| s.id == 2).expect("sa_2 must exist");
-        assert!(sa2.status.contains("cancelling"), "sa2 status: {}", sa2.status);
+        assert!(
+            sa2.status.contains("cancelling"),
+            "sa2 status: {}",
+            sa2.status
+        );
 
         // sa_3 expired → removed
-        assert!(hud.iter().find(|s| s.id == 3).is_none(), "sa_3 expired flash must be removed");
+        assert!(
+            hud.iter().find(|s| s.id == 3).is_none(),
+            "sa_3 expired flash must be removed"
+        );
 
         // sa_4 inserted
-        assert!(hud.iter().find(|s| s.id == 4).is_some(), "sa_4 must be inserted");
+        assert!(
+            hud.iter().find(|s| s.id == 4).is_some(),
+            "sa_4 must be inserted"
+        );
     }
 
     // R7: done entry not in registry stays until flash expires (oneshot completed)
@@ -758,6 +846,10 @@ mod reconcile_tests {
         let mut hud = vec![entry];
         let rows: Vec<SubagentDisplayRow> = vec![];
         reconcile_subagents(&mut hud, &rows, now);
-        assert_eq!(hud.len(), 1, "recently-done entry not in registry must stay for flash");
+        assert_eq!(
+            hud.len(),
+            1,
+            "recently-done entry not in registry must stay for flash"
+        );
     }
 }

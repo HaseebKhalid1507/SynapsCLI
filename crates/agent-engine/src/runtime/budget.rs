@@ -24,6 +24,12 @@ pub struct TurnBudget {
     pub max_accumulated_tool_result_bytes: usize,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
+    /// Bounded auto-renewals of the provider-round allowance (spec §8.1).
+    /// On exhaustion the stream loop may reset the round counter this many
+    /// times so a long, legitimate task continues instead of hard-failing.
+    /// Wall-clock is NEVER renewed, so total turn time is still bounded; a
+    /// value of `0` means no graceful continuation (immediate hard stop).
+    pub max_round_renewals: u32,
 }
 
 /// Execution role a turn runs under.
@@ -50,6 +56,10 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: 32 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
+                // A human is watching and can interrupt; let long agentic
+                // tasks continue through several checkpoints, bounded overall
+                // by the 2h wall-clock.
+                max_round_renewals: 8,
             },
             TurnRole::Autonomous => Self {
                 max_provider_rounds: 24,
@@ -58,6 +68,9 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: 8 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
+                // Nobody is watching: no graceful extension — the round cap is
+                // a hard stop.
+                max_round_renewals: 0,
             },
             TurnRole::Worker => Self {
                 max_provider_rounds: 64,
@@ -66,6 +79,8 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: 16 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
+                // Bounded delegation under a supervising turn.
+                max_round_renewals: 2,
             },
         }
     }
@@ -96,6 +111,9 @@ impl TurnBudget {
         }
         if overrides.max_cost_usd.is_some() {
             budget.max_cost_usd = overrides.max_cost_usd;
+        }
+        if let Some(v) = overrides.max_round_renewals {
+            budget.max_round_renewals = v;
         }
         budget
     }
@@ -156,6 +174,7 @@ pub struct TurnBudgetMeter {
     rounds: u32,
     tool_calls: u32,
     tool_result_bytes: usize,
+    round_renewals: u32,
 }
 
 impl TurnBudgetMeter {
@@ -166,6 +185,7 @@ impl TurnBudgetMeter {
             rounds: 0,
             tool_calls: 0,
             tool_result_bytes: 0,
+            round_renewals: 0,
         }
     }
 
@@ -189,6 +209,26 @@ impl TurnBudgetMeter {
         }
         self.rounds += 1;
         Ok(())
+    }
+
+    /// Attempt a bounded graceful extension after the provider-round cap is
+    /// hit. Resets the round counter and returns the number of renewals still
+    /// remaining, or `None` when the renewal budget is exhausted. Wall-clock
+    /// is deliberately untouched — [`Self::begin_round`] re-checks it, so a
+    /// stale turn cannot extend past `max_elapsed`. Only meaningful right
+    /// after `begin_round` returned [`BudgetDimension::ProviderRounds`].
+    pub fn try_renew_rounds(&mut self) -> Option<u32> {
+        if self.round_renewals >= self.budget.max_round_renewals {
+            return None;
+        }
+        self.round_renewals += 1;
+        self.rounds = 0;
+        Some(self.budget.max_round_renewals - self.round_renewals)
+    }
+
+    /// Number of graceful round renewals already consumed this turn.
+    pub fn round_renewals_used(&self) -> u32 {
+        self.round_renewals
     }
 
     /// Remaining tool-call allowance (for exact-cap batch splitting).
@@ -247,6 +287,11 @@ mod tests {
         assert!(auto.max_elapsed < worker.max_elapsed);
         assert!(fg.max_context_tokens.is_none());
         assert!(fg.max_cost_usd.is_none());
+        // Graceful continuation is most generous for foreground (human
+        // watching) and disabled for autonomous (nobody watching).
+        assert_eq!(auto.max_round_renewals, 0);
+        assert!(worker.max_round_renewals > 0);
+        assert!(fg.max_round_renewals >= worker.max_round_renewals);
     }
 
     #[test]
@@ -254,9 +299,11 @@ mod tests {
         let mut cfg = agent_core::config::TurnBudgetsConfig::default();
         cfg.autonomous.max_provider_rounds = Some(2);
         cfg.autonomous.max_elapsed_secs = Some(9);
+        cfg.autonomous.max_round_renewals = Some(3);
         let budget = TurnBudget::from_config(TurnRole::Autonomous, &cfg);
         assert_eq!(budget.max_provider_rounds, 2);
         assert_eq!(budget.max_elapsed, Duration::from_secs(9));
+        assert_eq!(budget.max_round_renewals, 3);
         assert_eq!(
             budget.max_tool_calls,
             TurnBudget::for_role(TurnRole::Autonomous).max_tool_calls
@@ -279,6 +326,55 @@ mod tests {
         });
         // Wall clock outranks the round check.
         assert_eq!(stale.begin_round(), Err(BudgetDimension::WallClock));
+    }
+
+    #[test]
+    fn round_renewals_extend_a_bounded_number_of_times() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_provider_rounds: 1,
+            max_round_renewals: 2,
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        });
+        // First round of the base allowance.
+        assert!(meter.begin_round().is_ok());
+        // Exhausted → renew #1, then a fresh round is available.
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+        assert_eq!(meter.try_renew_rounds(), Some(1));
+        assert!(meter.begin_round().is_ok());
+        // Exhausted again → renew #2 (last one).
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+        assert_eq!(meter.try_renew_rounds(), Some(0));
+        assert!(meter.begin_round().is_ok());
+        // Exhausted a third time → no renewals left: hard stop.
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+        assert_eq!(meter.try_renew_rounds(), None);
+        assert_eq!(meter.round_renewals_used(), 2);
+    }
+
+    #[test]
+    fn wall_clock_still_bounds_a_renewed_turn() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_provider_rounds: 1,
+            max_round_renewals: 5,
+            max_elapsed: Duration::ZERO,
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        });
+        // Renewal resets the round counter, but begin_round re-checks the
+        // wall clock — a stale turn cannot extend past max_elapsed.
+        assert_eq!(meter.try_renew_rounds(), Some(4));
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+    }
+
+    #[test]
+    fn autonomous_role_has_no_graceful_renewals() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_provider_rounds: 1,
+            ..TurnBudget::for_role(TurnRole::Autonomous)
+        });
+        assert!(meter.begin_round().is_ok());
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+        // Nobody watching: the round cap is a hard stop.
+        assert_eq!(meter.try_renew_rounds(), None);
     }
 
     #[test]
