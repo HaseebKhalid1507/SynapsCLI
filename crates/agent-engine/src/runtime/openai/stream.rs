@@ -3029,6 +3029,70 @@ mod send_retry_tests {
         );
     }
 
+    /// A stream whose terminal event is `response.failed` must surface a
+    /// typed API failure at the transport boundary — never `Ok` with empty
+    /// content (the "model returned an empty response" misdiagnosis,
+    /// incident: sessions 20260720-022603-6c2a / turn-2629074-0). The
+    /// provider-controlled error body must not leak into the message.
+    #[tokio::test]
+    async fn codex_response_failed_event_is_a_terminal_error_not_empty_success() {
+        let base_url = spawn_codex_sse(concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"ECHOED:secret prompt\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("response.failed must fail the request");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Codex response failed in stream."),
+            "static failure message expected: {msg}"
+        );
+        assert!(
+            !msg.contains("ECHOED") && !msg.contains("secret prompt"),
+            "provider error body must never surface: {msg}"
+        );
+    }
+
+    /// `response.incomplete` is a terminal non-success: surfacing it as an
+    /// empty `Ok` poisoned the turn with the generic empty-response error.
+    #[tokio::test]
+    async fn codex_response_incomplete_event_is_a_terminal_error() {
+        let base_url = spawn_codex_sse(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("response.incomplete must fail the request");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response was incomplete."),
+            "got: {err}"
+        );
+    }
+
+    /// EOF without any terminal Responses event (mid-stream connection drop
+    /// after HTTP 200) must fail closed instead of returning empty content.
+    #[tokio::test]
+    async fn codex_eof_without_terminal_event_fails_closed() {
+        let base_url = spawn_codex_sse(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        )
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("EOF without terminal event must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response stream ended without a terminal event."),
+            "got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn codex_retries_transient_500_then_succeeds() {
         let (base_url, counter) = spawn_mock_codex(1, StatusCode::INTERNAL_SERVER_ERROR).await;
