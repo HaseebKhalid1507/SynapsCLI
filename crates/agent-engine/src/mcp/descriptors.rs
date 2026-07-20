@@ -181,7 +181,7 @@ pub(crate) fn read_bounded_regular_file(
                     DescriptorCacheError::NotRegularFile
                 } else if err.kind() == std::io::ErrorKind::NotFound {
                     DescriptorCacheError::NotFound
-                } else if err.kind() == std::io::ErrorKind::IsADirectory {
+                } else if err.raw_os_error() == Some(libc::EISDIR) {
                     DescriptorCacheError::NotRegularFile
                 } else {
                     DescriptorCacheError::Io(map_io(&err))

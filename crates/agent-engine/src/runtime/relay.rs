@@ -52,9 +52,9 @@ static RETAINED_DELTA_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEAK_RETAINED_DELTA_BYTES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RELAYS: AtomicU64 = AtomicU64::new(0);
 
-/// Point-in-time view of the global relay accounting. `produced == forwarded
-/// + dropped + retained` holds at quiescence; `retained` returns to zero
-/// when every relay has terminated.
+/// Point-in-time view of the global relay accounting. At quiescence,
+/// produced bytes equal forwarded plus dropped plus retained bytes;
+/// `retained` returns to zero when every relay has terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelaySnapshot {
     pub produced_delta_bytes: u64,

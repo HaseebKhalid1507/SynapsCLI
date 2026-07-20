@@ -312,6 +312,7 @@ pub async fn execute_provider_tool_use(
 /// reused for every tool call in every interior round — the registry stays
 /// read-locked for the whole outer provider call, so no catalog drift is
 /// possible inside this loop and one set snapshot governs all rounds.
+#[allow(clippy::too_many_arguments)] // explicit loop policy inputs; grouping would hide registry/session coupling
 pub async fn complete_provider_with_tools<F>(
     handler: Arc<dyn ExtensionHandler>,
     mut params: ProviderCompleteParams,

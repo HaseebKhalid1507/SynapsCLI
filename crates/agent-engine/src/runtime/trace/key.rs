@@ -220,9 +220,7 @@ pub fn load_or_create_digest_key_at(path: &Path) -> Result<TraceDigestKey, Trace
             use rand::TryRngCore as _;
             rand::rngs::OsRng
                 .try_fill_bytes(key.as_mut())
-                .map_err(|e| {
-                    TraceKeyError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-                })?;
+                .map_err(|e| TraceKeyError::Io(std::io::Error::other(e)))?;
         }
 
         // Write the full key to a private temp file, then publish atomically

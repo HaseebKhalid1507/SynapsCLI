@@ -47,7 +47,7 @@ pub struct CaptureFailure {
 }
 
 enum CapturePayload {
-    Turn(ChatTurnCapture),
+    Turn(Box<ChatTurnCapture>),
     Summary(ConversationSummaryCapture),
 }
 
@@ -61,7 +61,7 @@ impl CapturePayload {
 
     fn dispatch(&self, provider: &dyn CaptureProvider) -> Result<(), CaptureFailure> {
         match self {
-            Self::Turn(capture) => provider.capture(capture.clone()),
+            Self::Turn(capture) => provider.capture(capture.as_ref().clone()),
             Self::Summary(capture) => provider.capture_summary(capture.clone()),
         }
     }
@@ -161,7 +161,7 @@ impl CaptureWorker {
         let job = CaptureJob {
             provider_id: lease.provider_id.clone(),
             provider,
-            payload: CapturePayload::Turn(capture),
+            payload: CapturePayload::Turn(Box::new(capture)),
             committed: None,
         };
         match self.sender.try_send(job) {
@@ -212,7 +212,7 @@ impl CaptureWorker {
         let job = CaptureJob {
             provider_id: lease.provider_id.clone(),
             provider,
-            payload: CapturePayload::Turn(capture),
+            payload: CapturePayload::Turn(Box::new(capture)),
             committed,
         };
         match self.sender.try_send(job) {
@@ -226,6 +226,7 @@ impl CaptureWorker {
 
     /// Apply the same exact lease gate as turn capture, build a bounded
     /// first-class compaction memory, and attempt a nonblocking enqueue.
+    #[allow(clippy::too_many_arguments)] // first-class summary metadata stays explicit at this boundary
     pub fn submit_summary(
         &self,
         lease: &MemoryContextLease,

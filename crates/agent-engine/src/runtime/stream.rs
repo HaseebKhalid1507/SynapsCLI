@@ -514,7 +514,6 @@ impl StreamMethods {
                 // they receive synthetic valid tool_results (appended below
                 // in model order) and the turn finalizes as ToolCalls-
                 // exhausted after this round's results are recorded.
-                let mut tool_uses = tool_uses;
                 let remaining_calls = budget_meter.remaining_tool_calls() as usize;
                 let over_budget_tool_uses: Vec<Value> = if tool_uses.len() > remaining_calls {
                     tool_uses.split_off(remaining_calls)

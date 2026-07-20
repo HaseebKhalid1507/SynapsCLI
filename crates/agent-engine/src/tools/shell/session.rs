@@ -228,7 +228,7 @@ async fn wait_for_output(
 
             // Stream to TUI if requested (normalized)
             if let Some(tx) = tx_delta {
-                let _ = tx.send(normalize_output(&text));
+                tx.send(normalize_output(&text));
             }
         }
 
@@ -253,7 +253,7 @@ async fn wait_for_output(
 
                 // Stream remaining output to TUI
                 if let Some(tx) = tx_delta {
-                    let _ = tx.send(normalize_output(&remaining_text));
+                    tx.send(normalize_output(&remaining_text));
                 }
             }
             // PtyHandle doesn't expose exit codes currently — use None

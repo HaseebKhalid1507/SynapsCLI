@@ -164,6 +164,7 @@ pub struct ImportPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // public API kept stable; plans are short-lived consent tokens
 pub enum HistoryImportOutcome {
     Declined,
     Ready(ImportPlan),
@@ -514,6 +515,7 @@ pub(crate) fn import_history_from_dir(
 /// worker receives a provider acknowledgement (or idempotency reconciliation).
 /// Therefore a process killed between provider commit and checkpoint rename may
 /// replay at most one stable capture id, which the provider store deduplicates.
+#[allow(clippy::too_many_arguments)] // resumable import transaction dependencies remain explicit
 pub fn import_history_resumable_from_dir(
     plan: &ImportPlan,
     lease: &crate::runtime::memory_context::MemoryContextLease,

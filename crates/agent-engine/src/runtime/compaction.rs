@@ -730,12 +730,13 @@ pub fn transitions_applied() -> u64 {
 /// What the engine applied. Pure data — the frontend adopts these fields;
 /// all persistence already happened (successor-first save ordering).
 ///
-/// TYPED ENTRY (fix1 T36 strengthening): the private `_transition_proof`
-/// field makes this struct impossible to construct outside the engine —
-/// the ONLY way any frontend can hold an `AppliedCompaction` is to have
-/// called [`apply_compaction`], so "every frontend compacts through the
+/// TYPED ENTRY (fix1 T36 strengthening): `#[non_exhaustive]` prevents
+/// downstream crates from constructing this transition result directly —
+/// the supported way for a frontend to obtain an `AppliedCompaction` is to
+/// call [`apply_compaction`], so "every frontend compacts through the
 /// one engine transition" is compiler-enforced, not convention.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AppliedCompaction {
     /// Session to adopt (successor, or the in-place-updated session).
     pub session: agent_core::session::Session,
@@ -747,8 +748,6 @@ pub struct AppliedCompaction {
     pub chains_advanced: Vec<String>,
     /// The policy that was applied.
     pub policy: CompactionPolicy,
-    /// Private construction proof — see the struct docs.
-    _transition_proof: (),
 }
 
 /// Task 30 (spec §9.2): the ONE engine operation applying a successful
@@ -930,7 +929,6 @@ pub async fn apply_compaction(
         previous_session_id: current.id.clone(),
         chains_advanced,
         policy: transition.policy,
-        _transition_proof: (),
     })
 }
 

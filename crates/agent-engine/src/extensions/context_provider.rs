@@ -191,7 +191,7 @@ pub fn resolve_context_provider<'a>(
 ) -> Result<&'a RegisteredContextProviderDescriptor, ContextProviderLookupError> {
     let mut matches = catalog
         .iter()
-        .filter(|descriptor| requested.is_none_or(|id| descriptor.id() == id));
+        .filter(|descriptor| requested.map_or(true, |id| descriptor.id() == id));
     match (matches.next(), matches.next()) {
         (None, _) => Err(ContextProviderLookupError::NotRegistered),
         (Some(only), None) => Ok(only),
