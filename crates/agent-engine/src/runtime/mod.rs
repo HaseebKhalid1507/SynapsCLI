@@ -286,6 +286,18 @@ pub struct Runtime {
     /// exactly the next outgoing provider request, even when telemetry is
     /// Off, then auto-disarms. Shared across clones.
     trace_controls: std::sync::Arc<trace::TraceControls>,
+    /// Session-scoped continuous-memory context state (task A5, spec §7.3):
+    /// the single state machine every frontend's `/memory` command and the
+    /// task-A4 `memory_context` tool observe. Shared across `Clone`s —
+    /// clones are the same session, so all its streams see one truth — but
+    /// NEVER inherited by subagents: every subagent spawn path constructs a
+    /// brand-new `Runtime::new()` (then `apply_subagent_runtime_policy`,
+    /// see `tools/subagent/mod.rs`), and every `Runtime` constructor
+    /// initializes this slot to the Off/no-lease default via
+    /// [`fresh_memory_context_state`]. Do not add any code path that copies
+    /// memory-context state from a parent runtime into a freshly
+    /// constructed one.
+    memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
     /// Writer handle backing the most recent armed one-shot ephemeral
     /// trace context (telemetry Off + `/trace next`). Retained here — not
     /// only inside the request's cloned context — so the session exit
@@ -384,6 +396,52 @@ fn fresh_host_tool_session() -> crate::tools::activation::SessionId {
         uuid::Uuid::new_v4()
     ))
     .expect("generated runtime session id is always valid")
+}
+
+/// Fresh Off/no-lease memory-context state for a newly constructed runtime
+/// (task A5). CRITICAL INVARIANT: every `Runtime` constructor calls this,
+/// and subagent spawn paths build a brand-new `Runtime::new()` before
+/// `apply_subagent_runtime_policy` runs — so subagents always start with no
+/// memory lease. Memory-context state must never be copied from a parent
+/// runtime into a freshly constructed one.
+fn fresh_memory_context_state(
+) -> std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>> {
+    let session = memory_context::SessionId::parse(&format!(
+        "memctx-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated memory session id is always valid");
+    std::sync::Arc::new(std::sync::Mutex::new(
+        memory_context::SessionMemoryState::new(session),
+    ))
+}
+
+/// Host-derived project isolation identity (spec §5.2) recorded on
+/// command-granted memory leases: a bounded digest of the current working
+/// directory. Exact project-root resolution arrives with provider
+/// activation (task A6); the digest keeps the identity bounded and
+/// control-character free for any path.
+fn memory_project_id() -> memory_context::ProjectId {
+    use sha2::{Digest as _, Sha256};
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unresolved".to_string());
+    let digest = Sha256::digest(cwd.as_bytes());
+    let mut id = String::from("project-cwd-");
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(id, "{byte:02x}");
+    }
+    memory_context::ProjectId::parse(&id).expect("generated project id is always valid")
+}
+
+/// The spec-canonical continuous-memory provider identity (spec §17.3,
+/// Axel memory-manager). Command-granted leases record the exact provider
+/// they will activate; actual provider binding/activation is task A6.
+fn memory_provider_id() -> memory_context::ContextProviderId {
+    memory_context::ContextProviderId::parse("axel-memory")
+        .expect("static provider id is always valid")
 }
 
 /// Idle timeout for the runtime HTTP client: how long a request may go
@@ -494,6 +552,9 @@ impl Runtime {
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            // Off/no-lease default — subagents get a FRESH construction of
+            // this state (task A5 invariant), never a copy of the parent's.
+            memory_context_state: fresh_memory_context_state(),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir,
             cache_diagnostics: false,
@@ -580,6 +641,9 @@ impl Runtime {
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            // Off/no-lease default — subagents get a FRESH construction of
+            // this state (task A5 invariant), never a copy of the parent's.
+            memory_context_state: fresh_memory_context_state(),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: trace::default_capture_dir(),
             cache_diagnostics: false,
@@ -1625,6 +1689,121 @@ impl Runtime {
         }
     }
 
+    /// Lock the session-scoped memory-context state (task A5). Poison
+    /// recovery is sound for the same reason as
+    /// `memory_context::MemoryContextCapability::lock`: every
+    /// `SessionMemoryState` transition is check-then-single-assignment with
+    /// no panicking code between, so a poisoned lock still holds a
+    /// consistent state.
+    fn memory_context_lock(&self) -> std::sync::MutexGuard<'_, memory_context::SessionMemoryState> {
+        self.memory_context_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Typed `/memory status` snapshot — metadata-only, never spawns a
+    /// provider process (spec §7.2 "status does not spawn").
+    pub fn memory_context_status(&self) -> memory_context::MemoryContextStatus {
+        self.memory_context_lock().status()
+    }
+
+    /// Revoke this session's memory context (`/memory off`). Always locally
+    /// allowed (spec §7.2); idempotent — disabling an already-off session
+    /// reports `Off`.
+    pub fn memory_context_disable(&self) -> memory_context::MemoryContextStatus {
+        let mut state = self.memory_context_lock();
+        let session = state.session_id().clone();
+        match memory_context::apply_memory_context_action(
+            &mut state,
+            memory_context::AuthorizedMemoryAction::Disable { session },
+        ) {
+            Ok(status) => status,
+            // Unreachable by construction (the session identity is read
+            // from the state itself and `Disable` is total), but never
+            // panic on the fallback: report current status.
+            Err(_) => state.status(),
+        }
+    }
+
+    /// Install a durable session-lease memory mode (`/memory on|recall|
+    /// capture`, spec §7.3) under the caller-supplied host-owned intent
+    /// proof (spec §6.3). Mints the lease and applies the exhaustive
+    /// [`memory_context::apply_memory_context_action`] transition — on a
+    /// typed failure no lease is installed.
+    pub(crate) fn memory_context_enable(
+        &self,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
+        let mut state = self.memory_context_lock();
+        let lease = Self::grant_command_memory_lease(&state, mode, proof)?;
+        memory_context::apply_memory_context_action(
+            &mut state,
+            memory_context::AuthorizedMemoryAction::Enable { lease },
+        )
+    }
+
+    /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
+    /// the caller-supplied host-owned intent proof. Fails typed (e.g. a
+    /// one-shot already pending) without installing anything.
+    pub(crate) fn memory_context_recall_once(
+        &self,
+        proof: memory_context::UserIntentProof,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
+        let mut state = self.memory_context_lock();
+        let lease = Self::grant_command_memory_lease(
+            &state,
+            memory_context::MemoryContextMode::RecallOnce,
+            proof,
+        )?;
+        memory_context::apply_memory_context_action(
+            &mut state,
+            memory_context::AuthorizedMemoryAction::RecallOnce { lease },
+        )
+    }
+
+    /// Mint one host-owned lease for a `/memory` command grant: host-minted
+    /// lease ID, the state's own session identity, host-derived project and
+    /// provider identities. Session leases carry no hard expiry (until
+    /// revoked or session end); `/memory` has no expiry argument (spec §7.3).
+    fn grant_command_memory_lease(
+        state: &memory_context::SessionMemoryState,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+    ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
+    {
+        memory_context::MemoryContextLease::grant(
+            memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
+            state.session_id().clone(),
+            memory_project_id(),
+            memory_provider_id(),
+            mode,
+            memory_context::CapturePolicy::default(),
+            memory_context::RecallPolicy::default(),
+            proof,
+            std::time::SystemTime::now(),
+            None,
+        )
+    }
+
+    /// Test-only: intent proof recorded on the current durable lease.
+    #[cfg(test)]
+    pub(crate) fn memory_durable_proof_for_test(
+        &self,
+    ) -> Option<memory_context::UserIntentProof> {
+        self.memory_context_lock().durable_proof().cloned()
+    }
+
+    /// Test-only: intent proof recorded on the pending one-shot lease.
+    #[cfg(test)]
+    pub(crate) fn memory_one_shot_proof_for_test(
+        &self,
+    ) -> Option<memory_context::UserIntentProof> {
+        self.memory_context_lock().one_shot_pending_proof().cloned()
+    }
+
     /// Structured `/context` report (Task 12): counts, byte lengths, cache
     /// change/reuse estimates, and writer counters — never content.
     ///
@@ -2436,6 +2615,12 @@ impl Clone for Runtime {
             telemetry_writer: self.telemetry_writer.clone(),
             trace_ctx: self.trace_ctx.clone(),
             trace_controls: Arc::clone(&self.trace_controls),
+            // Clones are the SAME session: `/memory` state is one truth
+            // across a session's streams. Subagents are NOT clones — they
+            // are constructed via a fresh `Runtime::new()` (see
+            // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
+            // they always start Off/no-lease (task A5 invariant).
+            memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,

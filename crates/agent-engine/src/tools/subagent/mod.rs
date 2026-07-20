@@ -192,4 +192,58 @@ mod cache_ttl_policy_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Worker
         );
     }
+
+    /// Task A5 memory-context invariant: subagents never inherit a memory
+    /// lease. Subagent spawn paths build a brand-new `Runtime::new()` (not a
+    /// clone), so as long as every fresh construction starts Off/no-lease —
+    /// and `apply_subagent_runtime_policy` never copies memory-context state
+    /// from a parent — a parent's active `/memory` lease cannot leak into a
+    /// subagent.
+    #[tokio::test]
+    async fn subagent_memory_context_starts_off_no_lease_despite_active_parent_lease() {
+        use crate::runtime::memory_context::{
+            mint_explicit_command_proof, DurableStatus, MemoryContextMode, OneShotStatus,
+        };
+
+        // Parent session with an ACTIVE capture-and-recall lease.
+        let parent = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+        parent
+            .memory_context_enable(
+                MemoryContextMode::CaptureAndRecall,
+                mint_explicit_command_proof(),
+            )
+            .expect("parent enable succeeds");
+        assert!(matches!(
+            parent.memory_context_status().durable,
+            DurableStatus::Active { .. }
+        ));
+
+        // A freshly constructed Runtime::new() — what every subagent spawn
+        // path does — reports Off/no-lease.
+        let mut subagent = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+        let fresh = subagent.memory_context_status();
+        assert_eq!(fresh.durable, DurableStatus::Off, "fresh runtime is Off");
+        assert_eq!(fresh.one_shot, OneShotStatus::Idle, "fresh runtime has no one-shot");
+
+        // ...and STAYS Off/no-lease after the subagent runtime policy runs.
+        let config = crate::config::SynapsConfig::default();
+        apply_subagent_runtime_policy(&mut subagent, &config);
+        let after_policy = subagent.memory_context_status();
+        assert_eq!(
+            after_policy.durable,
+            DurableStatus::Off,
+            "subagent policy must not install or copy any memory lease"
+        );
+        assert_eq!(after_policy.one_shot, OneShotStatus::Idle);
+
+        // The parent's lease is untouched by the subagent construction.
+        assert!(matches!(
+            parent.memory_context_status().durable,
+            DurableStatus::Active { .. }
+        ));
+    }
 }

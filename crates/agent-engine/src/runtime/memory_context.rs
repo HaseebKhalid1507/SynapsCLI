@@ -200,6 +200,19 @@ pub enum ModeLifetime {
 }
 
 impl MemoryContextMode {
+    /// Canonical spec §6.1 mode string — the exact vocabulary the
+    /// `memory.default_mode` config surface (task A2) and the `/memory`
+    /// frontend command status output (task A5) share.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryContextMode::Off => "off",
+            MemoryContextMode::RecallOnce => "recall_once",
+            MemoryContextMode::RecallEachPrompt => "recall_each_prompt",
+            MemoryContextMode::CaptureOnly => "capture_only",
+            MemoryContextMode::CaptureAndRecall => "capture_and_recall",
+        }
+    }
+
     /// Automatic-recall semantics (spec §6.1 table, column 2). Exhaustive.
     pub fn automatic_recall(self) -> AutomaticRecall {
         match self {
@@ -261,6 +274,17 @@ pub enum UserIntentProof {
         /// Digest of that exact user message.
         user_message_digest: MessageDigest,
     },
+}
+
+/// Mint one host-owned `ExplicitCommand` intent proof for a `/memory`
+/// frontend command invocation (spec §6.3; spec assumption 5: a deterministic
+/// slash command is authoritative). Host code only — the command identity is
+/// generated here and never accepted from model or plugin text.
+pub(crate) fn mint_explicit_command_proof() -> UserIntentProof {
+    UserIntentProof::ExplicitCommand {
+        command_id: RequestId::parse(&format!("memcmd-{}", uuid::Uuid::new_v4()))
+            .expect("generated command id is always valid"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +473,11 @@ impl SessionMemoryState {
         }
     }
 
+    /// The session identity this state machine is scoped to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     /// The effective durable mode (`Off` when no session lease is installed).
     pub fn active_mode(&self) -> MemoryContextMode {
         match &self.durable {
@@ -622,6 +651,29 @@ impl SessionMemoryState {
             },
         }
     }
+
+    /// Test-only introspection: the intent proof recorded on the installed
+    /// durable session lease, if any. Lets crate-internal tests prove the
+    /// `/memory` command path (task A5) always grants under
+    /// [`UserIntentProof::ExplicitCommand`] without exposing lease internals
+    /// beyond tests.
+    #[cfg(test)]
+    pub(crate) fn durable_proof(&self) -> Option<&UserIntentProof> {
+        match &self.durable {
+            DurableSlot::Empty => None,
+            DurableSlot::Active(lease) => Some(&lease.granted_by),
+        }
+    }
+
+    /// Test-only introspection: the intent proof recorded on the pending
+    /// one-shot recall lease, if any.
+    #[cfg(test)]
+    pub(crate) fn one_shot_pending_proof(&self) -> Option<&UserIntentProof> {
+        match &self.one_shot {
+            OneShotSlot::Empty | OneShotSlot::Consumed(_) => None,
+            OneShotSlot::Pending(lease) => Some(&lease.granted_by),
+        }
+    }
 }
 
 /// Durable-slot component of [`MemoryContextStatus`].
@@ -666,6 +718,67 @@ pub struct MemoryContextStatus {
     pub durable: DurableStatus,
     /// One-shot recall state.
     pub one_shot: OneShotStatus,
+}
+
+impl MemoryContextStatus {
+    /// Human-readable `/memory status` text (task A5, spec §7.3).
+    /// Metadata-only, mirroring `TraceStatusReport::render`: mode, lease
+    /// identity, lease expiry, and one-shot slot — never memory content.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        match &self.durable {
+            DurableStatus::Off => {
+                let _ = writeln!(out, "memory: mode off (no session lease)");
+            }
+            DurableStatus::Active {
+                mode,
+                lease_id,
+                expires_at,
+            } => {
+                let _ = writeln!(out, "memory: mode {} (session lease)", mode.as_str());
+                let _ = writeln!(
+                    out,
+                    "  lease: {} — {}",
+                    lease_id.as_str(),
+                    render_lease_expiry(*expires_at),
+                );
+            }
+        }
+        match &self.one_shot {
+            OneShotStatus::Idle => {
+                let _ = writeln!(out, "  one-shot recall: none pending");
+            }
+            OneShotStatus::Pending { lease_id } => {
+                let _ = writeln!(
+                    out,
+                    "  one-shot recall: pending (lease {})",
+                    lease_id.as_str()
+                );
+            }
+            OneShotStatus::Consumed { lease_id } => {
+                let _ = writeln!(
+                    out,
+                    "  one-shot recall: consumed (lease {})",
+                    lease_id.as_str()
+                );
+            }
+        }
+        out.trim_end().to_string()
+    }
+}
+
+/// Render a lease's expiry column: relative seconds remaining, `expired`,
+/// or the no-expiry (until revoked) wording. Always mentions "expiry" so
+/// status text is self-describing.
+fn render_lease_expiry(expires_at: Option<SystemTime>) -> String {
+    match expires_at {
+        None => "no expiry (until revoked or session end)".to_string(),
+        Some(at) => match at.duration_since(SystemTime::now()) {
+            Ok(left) => format!("expiry in {}s", left.as_secs()),
+            Err(_) => "expiry passed (lease expired)".to_string(),
+        },
+    }
 }
 
 /// Typed memory-context failure. Deliberately content-free (spec §19: no
