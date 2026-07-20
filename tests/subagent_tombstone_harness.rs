@@ -81,6 +81,7 @@ fn tool_context(
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
+            memory_context: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

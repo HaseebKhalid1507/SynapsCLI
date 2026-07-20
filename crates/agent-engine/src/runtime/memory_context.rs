@@ -20,7 +20,8 @@
 //! no content-bearing errors.
 
 use agent_core::BoundedText;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 /// Byte ceiling for any single boundary-crossing identifier. Oversized or
 /// empty identifiers fail closed at parse time (spec §5.4 bounds).
@@ -710,6 +711,15 @@ pub enum MemoryContextError {
         /// Static name of the offending field.
         field: &'static str,
     },
+    /// The requested transition can only be committed under deterministic,
+    /// host-owned proof of user intent (spec §6.3 `ExplicitCommand` from the
+    /// `/memory` frontend command, task A5). A model tool call is a proposal
+    /// (spec §7.2 rules) and cannot carry such proof through JSON parameters,
+    /// so it is refused without installing any lease.
+    RequiresHostConfirmation,
+    /// No memory-context capability is wired into this execution context;
+    /// lease-granting actions are unavailable and nothing was mutated.
+    CapabilityUnavailable,
 }
 
 impl std::fmt::Display for MemoryContextError {
@@ -740,6 +750,15 @@ impl std::fmt::Display for MemoryContextError {
             MemoryContextError::InvalidIdentifier { field } => {
                 write!(f, "invalid memory-context identifier: {field}")
             }
+            MemoryContextError::RequiresHostConfirmation => write!(
+                f,
+                "memory transition requires deterministic host confirmation (run /memory); \
+                 a model tool call is a proposal and cannot commit it"
+            ),
+            MemoryContextError::CapabilityUnavailable => write!(
+                f,
+                "memory-context capability is unavailable in this context"
+            ),
         }
     }
 }
@@ -765,6 +784,128 @@ pub fn apply_memory_context_action(
             state.revoke(&session);
             Ok(state.status())
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 Session-scoped capability handle (task A4)
+// ---------------------------------------------------------------------------
+
+/// Session-scoped memory-context capability handed to tool contexts (task
+/// A4), mirroring the shape of [`crate::mcp::McpLeaseCapability`] and
+/// [`crate::extensions::lease::ExtensionLeaseCapability`]: a small `Clone`
+/// handle over the shared per-session [`SessionMemoryState`] that the
+/// `memory_context` builtin uses to read and mutate memory-context state.
+///
+/// Authority discipline: construction is `pub(crate)` — only host wiring can
+/// mint one — and every mutation routes through the exhaustive
+/// [`apply_memory_context_action`] transition table. The capability can only
+/// commit actions that are always locally safe/revocable (spec §7.2 rules:
+/// `disable`, `status`, one-shot `recall_once`); durable `enable` and
+/// `index_history` need deterministic host-owned proof (`ExplicitCommand`
+/// from `/memory`, task A5) that never flows through this handle.
+#[derive(Clone)]
+pub struct MemoryContextCapability {
+    /// Shared session state — the same `Arc` the host's `/memory` command
+    /// path mutates (task A5), so tool and frontend observe one truth.
+    state: Arc<Mutex<SessionMemoryState>>,
+    /// Project isolation boundary leases minted through this handle are
+    /// scoped to (spec §5.2).
+    project_id: ProjectId,
+    /// Exact context provider one-shot leases activate (spec §7.1).
+    provider_id: ContextProviderId,
+    /// Host-attributed provenance recorded on locally-safe one-shot grants.
+    /// Supplied by host wiring at construction — never by model JSON. Task
+    /// A5 replaces this with per-request `ExplicitCommand` /
+    /// `ExactCurrentRequest` proof plumbing.
+    one_shot_proof: UserIntentProof,
+}
+
+impl MemoryContextCapability {
+    /// Host-private construction (mirrors the [`MemoryContextLease::grant`]
+    /// gate): untrusted code cannot mint a capability, so a `None` slot in
+    /// `ToolCapabilities` can never be filled from outside the engine crate.
+    #[allow(dead_code)] // called by host session wiring in task A5
+    pub(crate) fn new(
+        state: Arc<Mutex<SessionMemoryState>>,
+        project_id: ProjectId,
+        provider_id: ContextProviderId,
+        one_shot_proof: UserIntentProof,
+    ) -> Self {
+        Self {
+            state,
+            project_id,
+            provider_id,
+            one_shot_proof,
+        }
+    }
+
+    /// Lock the shared state. Poison recovery is sound here: every
+    /// `SessionMemoryState` transition is a check-then-single-assignment with
+    /// no panicking code between, so a poisoned lock still holds a consistent
+    /// state and fail-open recovery cannot observe a half-applied transition.
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionMemoryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Typed status snapshot — metadata-only, never spawns a provider
+    /// (spec §7.2 "status does not spawn").
+    pub fn status(&self) -> MemoryContextStatus {
+        self.lock().status()
+    }
+
+    /// Revoke this session's memory context (spec §7.2 "`disable` is always
+    /// locally allowed"). Idempotent: revoking an already-off session is a
+    /// no-op that reports `Off`.
+    pub fn disable(&self) -> MemoryContextStatus {
+        let mut state = self.lock();
+        let session = state.session_id.clone();
+        // Infallible by construction: the session identity is read from the
+        // state itself, and `Disable` is total over the transition table.
+        match apply_memory_context_action(
+            &mut state,
+            AuthorizedMemoryAction::Disable { session },
+        ) {
+            Ok(status) => status,
+            Err(_) => state.status(),
+        }
+    }
+
+    /// Grant and install exactly one one-shot recall lease (spec §7.2
+    /// "`recall_once` grants a one-shot lease"). Locally safe: consumed by at
+    /// most one eligible prompt and revocable via [`Self::disable`]. Fails
+    /// typed when a one-shot is already pending or the expiry is invalid —
+    /// on failure no lease is installed.
+    pub(crate) fn recall_once(
+        &self,
+        expires_minutes: Option<u32>,
+    ) -> Result<MemoryContextStatus, MemoryContextError> {
+        let granted_at = SystemTime::now();
+        let expires_at =
+            expires_minutes.map(|m| granted_at + Duration::from_secs(u64::from(m) * 60));
+        let mut state = self.lock();
+        let lease = MemoryContextLease::grant(
+            MemoryLeaseId::parse(&format!("memctx-once-{}", uuid::Uuid::new_v4()))?,
+            state.session_id.clone(),
+            self.project_id.clone(),
+            self.provider_id.clone(),
+            MemoryContextMode::RecallOnce,
+            CapturePolicy::default(),
+            RecallPolicy::default(),
+            self.one_shot_proof.clone(),
+            granted_at,
+            expires_at,
+        )?;
+        apply_memory_context_action(&mut state, AuthorizedMemoryAction::RecallOnce { lease })
+    }
+}
+
+impl std::fmt::Debug for MemoryContextCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryContextCapability")
+            .finish_non_exhaustive()
     }
 }
 

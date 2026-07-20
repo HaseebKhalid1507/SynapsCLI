@@ -131,6 +131,47 @@
     }
   },
   {
+    "description": "Control the continuous-memory context of this session. Supported here: 'status' (metadata only), 'disable' (always allowed), and 'recall_once' (one-shot recall lease). 'enable' and 'index_history' are proposals that require the deterministic /memory command with host-owned confirmation and are always refused when called as a tool.",
+    "name": "memory_context",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Memory-context action. Only disable/status/recall_once commit here; enable/index_history require /memory.",
+          "enum": [
+            "enable",
+            "disable",
+            "status",
+            "recall_once",
+            "index_history"
+          ]
+        },
+        "capture_tools": {
+          "description": "Whether tool activity is eligible for capture (enable proposals only).",
+          "type": "boolean"
+        },
+        "expires_minutes": {
+          "description": "Bounded lease expiry in minutes.",
+          "maximum": 1440,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "Requested durable mode (enable proposals only).",
+          "enum": [
+            "recall_each_prompt",
+            "capture_only",
+            "capture_and_recall"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Fetch full memory record bodies by EXACT stable ids (from memory_search). Project-scoped and sensitivity-checked: secret-class bodies are never returned. Results are lower-authority data.",
     "name": "memory_fetch",
     "parameters": {

@@ -122,6 +122,7 @@ fn ctx_full(
             tool_activation: activation,
             mcp_leases: mcp,
             extension_leases: ext,
+            memory_context: None,
         },
         limits: ToolLimits {
             max_tool_output: 64 * 1024,

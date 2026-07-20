@@ -433,6 +433,7 @@ fn live_reactive_subagent_end_to_end() {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
+                memory_context: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -489,6 +490,7 @@ fn live_reactive_subagent_end_to_end() {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
+                memory_context: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
