@@ -1621,6 +1621,22 @@ impl ProcessExtension {
         .await
     }
 
+    /// Send one request only if the current child is still present. Teardown
+    /// must never resurrect a child that concurrent cancellation already
+    /// removed, so unlike [`Self::call`] this bypasses all spawn/restart paths.
+    async fn call_no_spawn(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _call_guard = self.call_lock.lock().await;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut state_guard = self.state.lock().await;
+        let Some(state) = state_guard.as_mut() else {
+            return Err(format!(
+                "Extension '{}' process is not running; '{}' refused (no respawn)",
+                self.id, method
+            ));
+        };
+        self.call_once_locked(state, method, params, id).await
+    }
+
     /// Task 20 lease path: one `tool.call` that NEVER (re)spawns. A missing
     /// process state fails typed instead of resurrecting a terminated
     /// child, and the restart machinery is bypassed entirely — a lease
@@ -2226,9 +2242,14 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn shutdown(&self) {
+        // Lease teardown is terminal for this ProcessExtension. In
+        // particular, a concurrent force_shutdown may already have removed
+        // the child; sending shutdown through the normal restart-capable
+        // call path would then spawn an unvalidated replacement solely to
+        // shut it down.
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            self.call("shutdown", Value::Null),
+            self.call_no_spawn("shutdown", Value::Null),
         )
         .await;
 

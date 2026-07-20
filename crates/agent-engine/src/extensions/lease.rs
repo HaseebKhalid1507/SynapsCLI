@@ -178,11 +178,20 @@ impl LeaseInner {
 
     fn interrupt(&self) {
         self.set_cancelled();
-        let handler = Arc::clone(&self.handler);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                handler.force_shutdown().await;
-            });
+
+        // An idle lease can take the normal bounded cleanup path and send a
+        // graceful shutdown frame. Only an in-flight call needs the hard
+        // interrupt to drain its pending responder; otherwise racing an
+        // unconditional force shutdown against graceful cleanup removes the
+        // child first and used to make shutdown's restart-capable call spawn
+        // a replacement process during teardown.
+        if self.call_permit.try_lock().is_err() {
+            let handler = Arc::clone(&self.handler);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    handler.force_shutdown().await;
+                });
+            }
         }
     }
 }
