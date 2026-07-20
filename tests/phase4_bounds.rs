@@ -370,6 +370,7 @@ async fn infinite_tool_loop_stops_at_exact_configured_budget() {
 
     let budget = TurnBudget {
         max_provider_rounds: 3,
+        max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let executions = Arc::new(AtomicUsize::new(0));
