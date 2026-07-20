@@ -131,13 +131,13 @@
     }
   },
   {
-    "description": "Control the continuous-memory context of this session. Supported here: 'status' (metadata only), 'disable' (always allowed), and 'recall_once' (one-shot recall lease). 'enable' and 'index_history' are proposals that require the deterministic /memory command with host-owned confirmation and are always refused when called as a tool.",
+    "description": "Control the continuous-memory context of this session. 'status', 'disable', and 'recall_once' commit locally safe actions. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call.",
     "name": "memory_context",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "action": {
-          "description": "Memory-context action. Only disable/status/recall_once commit here; enable/index_history require /memory.",
+          "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation.",
           "enum": [
             "enable",
             "disable",

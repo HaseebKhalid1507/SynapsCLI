@@ -3,7 +3,7 @@
 //! Spawns the real `synaps` binary (via CARGO_BIN_EXE_synaps) and asserts
 //! the contract described in the P13 acceptance criteria:
 //!   - Output is valid JSON
-//!   - Contains all 24 builtin tools
+//!   - Contains all 25 builtin tools
 //!   - Each tool's parameters is a valid JSON Schema (object-typed, has `properties`)
 //!   - Output is deterministic across runs (byte-identical)
 //!   - `--pretty` output matches the committed docs/tools.json (drift-check contract)
@@ -88,7 +88,7 @@ fn export_pretty_produces_valid_json() {
         .expect("`synaps tools export --pretty` output must be parseable as valid JSON");
 }
 
-// ─── Test 2: Output contains all 24 builtin tools ────────────────────────────
+// ─── Test 2: Output contains all 25 builtin tools ────────────────────────────
 
 #[test]
 fn export_contains_all_24_builtin_tools() {
@@ -96,8 +96,8 @@ fn export_contains_all_24_builtin_tools() {
     let manifest: Vec<serde_json::Value> = serde_json::from_str(&out)
         .expect("output must be a JSON array");
 
-    assert_eq!(manifest.len(), 24,
-        "export must contain exactly 24 builtin tools, got {}: {:?}",
+    assert_eq!(manifest.len(), 25,
+        "export must contain exactly 25 builtin tools, got {}: {:?}",
         manifest.len(),
         manifest.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>()
     );
