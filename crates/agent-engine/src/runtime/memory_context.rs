@@ -629,6 +629,23 @@ impl SessionMemoryState {
         };
     }
 
+    /// Snapshot the exact durable lease for one prompt's recall/capture work.
+    /// Expired or non-capture leases fail closed. Keeping the full lease (not
+    /// merely a provider id) prevents provider reselection between prompt and
+    /// terminal capture.
+    #[allow(dead_code)] // consumed by terminal-turn engine wiring
+    pub(crate) fn capture_lease_at(&self, now: SystemTime) -> Option<MemoryContextLease> {
+        match &self.durable {
+            DurableSlot::Active(lease)
+                if !lease.is_expired_at(now)
+                    && lease.mode.turn_capture() == TurnCapture::Enabled =>
+            {
+                Some(lease.clone())
+            }
+            DurableSlot::Empty | DurableSlot::Active(_) => None,
+        }
+    }
+
     /// Crate-private (task A6): provider identities bound to currently
     /// granted leases — the installed durable session lease plus any
     /// pending one-shot recall. The host disable/session-end revocation

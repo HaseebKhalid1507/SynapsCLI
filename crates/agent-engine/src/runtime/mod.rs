@@ -16,6 +16,7 @@ mod auth;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
+pub mod capture_worker;
 pub mod chat_capture;
 pub(crate) mod cloud_invoke;
 pub mod compaction;

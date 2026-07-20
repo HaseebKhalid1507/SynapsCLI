@@ -148,6 +148,29 @@ pub fn process_stream_event(
     pending_events: &mut Vec<String>,
     turn_baseline: usize,
 ) -> (EngineStreamEvent, StreamCompletion) {
+    process_stream_event_with_terminal_capture(
+        event,
+        messages,
+        subagents,
+        queued_message,
+        pending_events,
+        turn_baseline,
+        || {},
+    )
+}
+
+/// Process one stream event and invoke `terminal_capture` only after a typed,
+/// successful terminal turn. The hook is deliberately infallible: capture
+/// enqueue/build/provider failures cannot replace the completed outcome.
+pub fn process_stream_event_with_terminal_capture(
+    event: StreamEvent,
+    messages: &mut Vec<crate::SharedMessage>,
+    subagents: &mut Vec<SubagentTracker>,
+    queued_message: &mut Option<String>,
+    pending_events: &mut Vec<String>,
+    turn_baseline: usize,
+    terminal_capture: impl FnOnce(),
+) -> (EngineStreamEvent, StreamCompletion) {
     match event {
         StreamEvent::Llm(LlmEvent::Thinking(text)) => (
             EngineStreamEvent::Thinking(text),
@@ -285,6 +308,9 @@ pub fn process_stream_event(
             StreamCompletion::Continue,
         ),
         StreamEvent::Session(SessionEvent::Done) => {
+            // The canonical history has reached its typed successful terminal
+            // state. Capture is best-effort and cannot alter completion.
+            terminal_capture();
             subagents.clear();
 
             // Drain pending events into messages
@@ -356,6 +382,28 @@ mod tests {
             &mut pending,
             turn_baseline,
         )
+    }
+
+    #[test]
+    fn memory_terminal_capture_failure_cannot_change_completed_engine_turn() {
+        let mut messages = vec![msg(json!({"role": "user", "content": "hello"}))];
+        let mut subagents = Vec::new();
+        let mut queued = None;
+        let mut pending = Vec::new();
+        let (event, completion) = process_stream_event_with_terminal_capture(
+            StreamEvent::Session(SessionEvent::Done),
+            &mut messages,
+            &mut subagents,
+            &mut queued,
+            &mut pending,
+            1,
+            || {
+                // The capture boundary absorbs build/enqueue/provider failure.
+                let _: Result<(), &'static str> = Err("capture_failed");
+            },
+        );
+        assert!(matches!(event, EngineStreamEvent::Done));
+        assert!(matches!(completion, StreamCompletion::Done));
     }
 
     /// T3 criterion 4: a pre-existing trailing user message (the prompt that
