@@ -536,7 +536,7 @@ mod tests {
                 source: mc::MemorySource::ChatHistory,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 rank_reason: vec![mc::RankReason::ExactTopic],
-                sensitivity: mc::Sensitivity::Normal,
+                sensitivity: agent_core::core::disclosure::DisclosureClass::ModelVisible,
                 retention: mc::RetentionClass::Standard,
                 content: BoundedText::new("the project uses session-scoped authorization", 2048),
                 truncated: false,

@@ -19,6 +19,7 @@
 //! flags, no `serde_json::Value` past the boundary, no model-created lease IDs,
 //! no content-bearing errors.
 
+use agent_core::core::disclosure::{gate_for_model, DisclosureClass, ModelVisibility};
 use agent_core::BoundedText;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -874,6 +875,22 @@ pub enum MemoryContextError {
         /// Static name of the offending field.
         field: &'static str,
     },
+    /// A recall contribution repeated a `memory_id` across its records
+    /// (spec §6.5). Rejected fail-closed: duplicates defeat per-record
+    /// accounting and supersession semantics. Content-free by design.
+    ContributionDuplicateMemoryId,
+    /// A contribution record carried a NON-EMPTY body under a disclosure
+    /// class that [`gate_for_model`] withholds from model context
+    /// (spec §5.5 / §14.2). Defense in depth: a correct provider never
+    /// includes withheld content at all, so the whole contribution is
+    /// rejected. Content-free by design — the withheld body never appears
+    /// in the error.
+    ContributionWithheldContent,
+    /// A contribution record's disclosure class is not in the originating
+    /// recall request's [`DisclosureGrantSet`] (spec §6.4
+    /// `permitted_classes`): a provider cannot volunteer classes the host
+    /// never authorized. Content-free by design.
+    ContributionClassNotPermitted,
     /// The computed §10.3 recall budget is below the minimum useful floor —
     /// recall is skipped rather than reducing core reserves; nothing was
     /// held.
@@ -934,6 +951,20 @@ impl std::fmt::Display for MemoryContextError {
             MemoryContextError::ContributionOutOfBounds { field } => {
                 write!(f, "memory contribution exceeds its bound: {field}")
             }
+            MemoryContextError::ContributionDuplicateMemoryId => write!(
+                f,
+                "memory contribution repeats a memory id (rejected, nothing admitted)"
+            ),
+            MemoryContextError::ContributionWithheldContent => write!(
+                f,
+                "memory contribution carries content under a disclosure class withheld \
+                 from model context (rejected, nothing admitted)"
+            ),
+            MemoryContextError::ContributionClassNotPermitted => write!(
+                f,
+                "memory contribution carries a disclosure class the recall request \
+                 never permitted (rejected, nothing admitted)"
+            ),
             MemoryContextError::RecallBudgetBelowMinimum => write!(
                 f,
                 "memory recall budget is below the minimum useful floor; recall skipped"
@@ -1089,6 +1120,176 @@ impl std::fmt::Debug for MemoryContextCapability {
 }
 
 // ---------------------------------------------------------------------------
+// §6.4 Recall request — bounded, parse-constructed, host-minted
+// ---------------------------------------------------------------------------
+
+bounded_identifier!(
+    /// Version of the recall-request schema the host produced (spec §6.4).
+    RecallSchemaVersion,
+    "recall_schema"
+);
+bounded_identifier!(
+    /// Identity of the chat turn a recall request targets (spec §6.4).
+    TurnId,
+    "turn_id"
+);
+
+/// Byte ceiling for the recall query derived from the current user prompt
+/// (spec §6.4: the request never carries an unbounded transcript).
+pub const MEMORY_QUERY_MAX_BYTES: usize = 4096;
+
+/// Bounded recall query (spec §6.4). Host-derived from the current user
+/// prompt and byte-bounded at construction through the workspace-standard
+/// [`BoundedText`] budgeting utility — truncation is safe here (the host is
+/// shrinking its OWN outbound query, not repairing untrusted input) and is
+/// recorded, never silent. No raw `String` escapes the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedUserQuery(BoundedText);
+
+impl BoundedUserQuery {
+    /// Bound a host-derived query to [`MEMORY_QUERY_MAX_BYTES`].
+    #[allow(dead_code)] // consumed by the recall dispatch wiring in task B3
+    pub(crate) fn new(raw: &str) -> Self {
+        Self(BoundedText::new(raw, MEMORY_QUERY_MAX_BYTES))
+    }
+
+    /// The bounded query text.
+    pub fn as_str(&self) -> &str {
+        &self.0.text
+    }
+
+    /// Whether bounding truncated the original query.
+    pub fn truncated(&self) -> bool {
+        self.0.truncated
+    }
+}
+
+/// Fixed-size digest of the recent context window (spec §6.4) — proves what
+/// the host summarized without shipping the transcript. Host-computed only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextDigest([u8; 32]);
+
+impl ContextDigest {
+    /// Wrap a host-computed digest of the recent context.
+    #[allow(dead_code)] // consumed by the recall dispatch wiring in task B3
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw digest bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Engine-authored recall budget (spec §6.4, §10.3). Parse-constructed from
+/// the ENGINE'S own [`memory_budget_tokens`] output — a provider never
+/// chooses its budget, and a value outside the §10.3 floor/ceiling fails
+/// closed at construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecallBudget {
+    max_records: usize,
+    max_rendered_tokens: u64,
+}
+
+impl RecallBudget {
+    /// Build a budget from the engine-computed rendered-token allowance.
+    /// Fails closed below [`MEMORY_BUDGET_MIN_TOKENS`] (recall is skipped,
+    /// spec §10.3) and above [`MEMORY_BUDGET_MAX_TOKENS`] (never minted).
+    #[allow(dead_code)] // consumed by the recall dispatch wiring in task B3
+    pub(crate) fn from_engine_tokens(
+        max_rendered_tokens: u64,
+    ) -> Result<Self, MemoryContextError> {
+        if max_rendered_tokens < MEMORY_BUDGET_MIN_TOKENS {
+            return Err(MemoryContextError::RecallBudgetBelowMinimum);
+        }
+        if max_rendered_tokens > MEMORY_BUDGET_MAX_TOKENS {
+            return Err(MemoryContextError::ContributionOutOfBounds { field: "budget" });
+        }
+        Ok(Self {
+            max_records: MEMORY_MAX_SELECTED_RECORDS,
+            max_rendered_tokens,
+        })
+    }
+
+    /// Maximum records the provider may select (spec §10.3).
+    pub fn max_records(&self) -> usize {
+        self.max_records
+    }
+
+    /// Maximum rendered tokens the provider may return (spec §10.3).
+    pub fn max_rendered_tokens(&self) -> u64 {
+        self.max_rendered_tokens
+    }
+}
+
+/// Bounded set of [`DisclosureClass`] values the host is willing to accept
+/// back in a contribution (spec §6.4 `permitted_classes`). Deduplicated at
+/// construction; bounded by the closed six-variant vocabulary itself. A
+/// provider record whose class is outside this set is rejected by
+/// [`validate_contribution`] — a plugin cannot volunteer classes the host
+/// never authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureGrantSet(Vec<DisclosureClass>);
+
+impl DisclosureGrantSet {
+    /// Build a grant set from host-chosen classes (deduplicated, order
+    /// preserving; the closed enum bounds the size at six).
+    pub(crate) fn new(classes: &[DisclosureClass]) -> Self {
+        let mut granted: Vec<DisclosureClass> = Vec::with_capacity(classes.len().min(6));
+        for class in classes {
+            if !granted.contains(class) {
+                granted.push(*class);
+            }
+        }
+        Self(granted)
+    }
+
+    /// The host's conservative default: only baseline
+    /// [`DisclosureClass::ModelVisible`] records are accepted back.
+    pub(crate) fn model_visible_only() -> Self {
+        Self::new(&[DisclosureClass::ModelVisible])
+    }
+
+    /// Whether the host authorized this class for recall contributions.
+    pub fn permits(&self, class: DisclosureClass) -> bool {
+        self.0.contains(&class)
+    }
+
+    /// The granted classes.
+    pub fn classes(&self) -> &[DisclosureClass] {
+        &self.0
+    }
+}
+
+/// One recall request the host sends a context provider (spec §6.4,
+/// verbatim shape). Every field is a bounded, parse-constructed type with a
+/// crate-private constructor, so the request can only be assembled by host
+/// code: it carries no credentials, no unrelated project paths, no hidden
+/// system instructions, and no unbounded transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallRequest {
+    /// Recall-request schema version the host produced.
+    pub schema: RecallSchemaVersion,
+    /// The host-minted lease authorizing this recall (spec §6.2).
+    pub lease_id: MemoryLeaseId,
+    /// Project isolation boundary (spec §5.2).
+    pub project_id: ProjectId,
+    /// Session the recall belongs to.
+    pub session_id: SessionId,
+    /// Chat turn the recall targets.
+    pub turn_id: TurnId,
+    /// Bounded query derived from the current user prompt.
+    pub query: BoundedUserQuery,
+    /// Digest of the recent context window — never the transcript itself.
+    pub recent_context_digest: ContextDigest,
+    /// Engine-authored §10.3 budget the provider must fit.
+    pub budget: RecallBudget,
+    /// Disclosure classes the host will accept back (spec §5.5).
+    pub permitted_classes: DisclosureGrantSet,
+}
+
+// ---------------------------------------------------------------------------
 // §6.5 / §10.1 Recall contribution — typed segment, never raw text
 // ---------------------------------------------------------------------------
 
@@ -1127,17 +1328,6 @@ pub enum RankReason {
     Recency,
 }
 
-/// Sensitivity class of a recalled record (spec §6.5). Mirrors the workspace
-/// memory-store vocabulary; disclosure enforcement lands in task B1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Sensitivity {
-    /// Ordinary project data.
-    #[default]
-    Normal,
-    /// Secret-class content — bodies are never disclosed in rendered output.
-    Secret,
-}
-
 /// Retention class of a recalled record (spec §6.5). Placeholder single
 /// variant until the consolidation/retention flow lands (spec §11, Phase B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1172,8 +1362,11 @@ pub struct MemoryContributionRecord {
     pub timestamp: SystemTime,
     /// Why the provider ranked this record in (explainability, spec §10.4).
     pub rank_reason: Vec<RankReason>,
-    /// Sensitivity class of the record.
-    pub sensitivity: Sensitivity,
+    /// Disclosure class of the record (spec §5.5) — the ONE typed
+    /// vocabulary from [`agent_core::core::disclosure`]. The host's
+    /// [`validate_contribution`] gates every record body through
+    /// [`gate_for_model`] before acceptance (task B1).
+    pub sensitivity: DisclosureClass,
     /// Retention class of the record.
     pub retention: RetentionClass,
     /// Bounded record body.
@@ -1262,25 +1455,36 @@ pub fn memory_budget_tokens(effective_provider_input_capacity: u64) -> Option<u6
     (budget >= MEMORY_BUDGET_MIN_TOKENS).then_some(budget)
 }
 
-/// Host-side contribution acceptance gate (spec §6.5: "The host validates
-/// project ID, record count, record sizes, total size, disclosure classes,
-/// and schema version"). Phase A scope — minimal but real:
+/// Host-side contribution acceptance gate — the FULL spec §6.5 rejection
+/// matrix (task B1): "The host validates project ID, record count, record
+/// sizes, total size, disclosure classes, and schema version".
 ///
-/// - project identity mismatch fails closed (spec §5.2 isolation is a
-///   Phase A invariant, never deferred);
+/// - project identity mismatch fails closed (spec §5.2 isolation);
 /// - schema version must be non-empty (already guaranteed by the
 ///   [`ContributionSchemaVersion`] parse gate; re-checked here so the
-///   validator stays the single acceptance authority when task B1 adds
+///   validator stays the single acceptance authority when task B3 adds
 ///   boundary deserialization);
 /// - record count, per-record size, and total rendered size are bounded
 ///   (`max_rendered_tokens` is the ENGINE-provided budget from
-///   [`memory_budget_tokens`] — never plugin-chosen).
+///   [`memory_budget_tokens`] — never plugin-chosen);
+/// - duplicate `memory_id` values across records are rejected;
+/// - every record's disclosure class must be inside the originating recall
+///   request's `permitted_classes` grant (spec §6.4) — a provider cannot
+///   volunteer classes the host never authorized;
+/// - every non-empty record body is gated through the ONE model-visibility
+///   gate, [`gate_for_model`] (spec §5.5 / §14.2), with fail-closed inputs
+///   (no consent, no redactor): if the class would be withheld yet the body
+///   is non-empty, the WHOLE contribution is rejected — defense in depth
+///   against a compromised or buggy plugin leaking withheld content. A
+///   correct provider never includes such a record at all.
 ///
-/// Disclosure-class and duplicate-ID checks belong to task B1.
+/// One failure rejects everything: no partial admission, and no rejected
+/// content ever influences budgeting or request assembly.
 pub fn validate_contribution(
     contribution: &MemoryContextContribution,
     expected_project: &ProjectId,
     max_rendered_tokens: u64,
+    permitted_classes: &DisclosureGrantSet,
 ) -> Result<(), MemoryContextError> {
     if contribution.project_id != *expected_project {
         return Err(MemoryContextError::ContributionProjectMismatch);
@@ -1291,11 +1495,30 @@ pub fn validate_contribution(
     if contribution.records.len() > MEMORY_MAX_SELECTED_RECORDS {
         return Err(MemoryContextError::ContributionOutOfBounds { field: "records" });
     }
+    let mut seen_ids: std::collections::HashSet<&MemoryId> =
+        std::collections::HashSet::with_capacity(contribution.records.len());
     for record in &contribution.records {
+        if !seen_ids.insert(&record.memory_id) {
+            return Err(MemoryContextError::ContributionDuplicateMemoryId);
+        }
         if record.content.retained_bytes > MEMORY_MAX_RENDERED_RECORD_BYTES {
             return Err(MemoryContextError::ContributionOutOfBounds {
                 field: "record_content",
             });
+        }
+        if !permitted_classes.permits(record.sensitivity) {
+            return Err(MemoryContextError::ContributionClassNotPermitted);
+        }
+        // THE model-visibility gate (spec §5.5), fail-closed at this
+        // boundary: no per-item consent exists here and no redactor is
+        // configured, so consent/redaction-dependent classes gate to
+        // Withheld exactly as they would at injection time.
+        if !record.content.text.is_empty() {
+            if let ModelVisibility::Withheld(_) =
+                gate_for_model(record.sensitivity, &record.content.text, false, None)
+            {
+                return Err(MemoryContextError::ContributionWithheldContent);
+            }
         }
     }
     let rendered_tokens =
@@ -1782,7 +2005,7 @@ mod tests {
                 source: MemorySource::ChatHistory,
                 timestamp: SystemTime::UNIX_EPOCH,
                 rank_reason: vec![RankReason::ExactTopic, RankReason::Recency],
-                sensitivity: Sensitivity::Normal,
+                sensitivity: DisclosureClass::ModelVisible,
                 retention: RetentionClass::Standard,
                 content: BoundedText::new("session-scoped authorization decision", 2048),
                 truncated: false,
@@ -1799,6 +2022,11 @@ mod tests {
 
     fn pid(raw: &str) -> ProjectId {
         ProjectId::parse(raw).expect("valid project id")
+    }
+
+    /// Baseline grant for validator tests: only `ModelVisible` accepted.
+    fn grant_model_visible() -> DisclosureGrantSet {
+        DisclosureGrantSet::model_visible_only()
     }
 
     /// Spec §10.3 exactly: `min(4096, 10% of capacity)` at several window
@@ -1836,11 +2064,16 @@ mod tests {
         let project = pid("project-a");
         let contribution = synthetic_contribution(&project, "rendered memory text");
         assert_eq!(
-            validate_contribution(&contribution, &project, 4_096),
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
             Ok(())
         );
         assert_eq!(
-            validate_contribution(&contribution, &pid("project-b"), 4_096),
+            validate_contribution(
+                &contribution,
+                &pid("project-b"),
+                4_096,
+                &grant_model_visible()
+            ),
             Err(MemoryContextError::ContributionProjectMismatch)
         );
     }
@@ -1856,7 +2089,7 @@ mod tests {
         let record = too_many.records[0].clone();
         too_many.records = vec![record; MEMORY_MAX_SELECTED_RECORDS + 1];
         assert_eq!(
-            validate_contribution(&too_many, &project, 4_096),
+            validate_contribution(&too_many, &project, 4_096, &grant_model_visible()),
             Err(MemoryContextError::ContributionOutOfBounds { field: "records" })
         );
 
@@ -1866,7 +2099,7 @@ mod tests {
             MEMORY_MAX_RENDERED_RECORD_BYTES * 2,
         );
         assert_eq!(
-            validate_contribution(&oversized_record, &project, 4_096),
+            validate_contribution(&oversized_record, &project, 4_096, &grant_model_visible()),
             Err(MemoryContextError::ContributionOutOfBounds {
                 field: "record_content"
             })
@@ -1875,14 +2108,219 @@ mod tests {
         // 4_000 ASCII chars ⇒ 1_600 estimated tokens > a 512-token budget.
         let oversized_rendered = synthetic_contribution(&project, &"y".repeat(4_000));
         assert_eq!(
-            validate_contribution(&oversized_rendered, &project, 512),
+            validate_contribution(&oversized_rendered, &project, 512, &grant_model_visible()),
             Err(MemoryContextError::ContributionOutOfBounds { field: "rendered" })
         );
         // The same contribution passes under a budget that covers it.
         assert_eq!(
-            validate_contribution(&oversized_rendered, &project, 4_096),
+            validate_contribution(&oversized_rendered, &project, 4_096, &grant_model_visible()),
             Ok(())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task B1 — §6.4 recall request types and the full §6.5 rejection matrix
+    // -----------------------------------------------------------------------
+
+    /// Build one record with the given identity, class, and body.
+    fn record_with(id: &str, class: DisclosureClass, content: &str) -> MemoryContributionRecord {
+        MemoryContributionRecord {
+            memory_id: MemoryId::parse(id).expect("valid memory id"),
+            source: MemorySource::ChatHistory,
+            timestamp: SystemTime::UNIX_EPOCH,
+            rank_reason: vec![RankReason::Recency],
+            sensitivity: class,
+            retention: RetentionClass::Standard,
+            content: BoundedText::new(content, MEMORY_MAX_RENDERED_RECORD_BYTES),
+            truncated: false,
+            supersedes: None,
+        }
+    }
+
+    /// Duplicate `memory_id` values across records reject the WHOLE
+    /// contribution; the same records under distinct identities accept.
+    #[test]
+    fn validate_contribution_rejects_duplicate_memory_ids() {
+        let project = pid("project-a");
+        let mut contribution = synthetic_contribution(&project, "rendered");
+        contribution.records = vec![
+            record_with("mem-1", DisclosureClass::ModelVisible, "first body"),
+            record_with("mem-1", DisclosureClass::ModelVisible, "second body"),
+        ];
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
+            Err(MemoryContextError::ContributionDuplicateMemoryId)
+        );
+
+        contribution.records[1].memory_id = MemoryId::parse("mem-2").unwrap();
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
+            Ok(())
+        );
+    }
+
+    /// Withheld-content defense in depth, checked against the REAL
+    /// [`gate_for_model`] semantics (fail-closed inputs: no consent, no
+    /// redactor): `LocalOnly`, `ModelVisibleAfterRedaction`,
+    /// `ModelVisibleAfterConsent`, and `PersistNeverTransmit` all gate to
+    /// `Withheld`, so a non-empty body under any of them rejects the whole
+    /// contribution even when the class itself is granted. `NeverPersist`
+    /// gates to `Visible` (its restriction is persistence, not visibility),
+    /// so a granted `NeverPersist` body is accepted. An EMPTY body under a
+    /// withheld class is a marker-only record and passes the gate check.
+    #[test]
+    fn validate_contribution_rejects_withheld_class_content_per_real_gate_semantics() {
+        let project = pid("project-a");
+        let withheld_classes = [
+            DisclosureClass::LocalOnly,
+            DisclosureClass::ModelVisibleAfterRedaction,
+            DisclosureClass::ModelVisibleAfterConsent,
+            DisclosureClass::PersistNeverTransmit,
+        ];
+        for class in withheld_classes {
+            // Grant the class explicitly so THIS check (not the grant-set
+            // check) is what rejects.
+            let grant = DisclosureGrantSet::new(&[DisclosureClass::ModelVisible, class]);
+            let mut contribution = synthetic_contribution(&project, "rendered");
+            contribution.records = vec![record_with("mem-1", class, "withheld body")];
+            assert_eq!(
+                validate_contribution(&contribution, &project, 4_096, &grant),
+                Err(MemoryContextError::ContributionWithheldContent),
+                "class {class:?} with a non-empty body must reject"
+            );
+
+            // The same class with an EMPTY body is a marker-only record.
+            contribution.records = vec![record_with("mem-1", class, "")];
+            assert_eq!(
+                validate_contribution(&contribution, &project, 4_096, &grant),
+                Ok(()),
+                "class {class:?} with an empty body must accept"
+            );
+        }
+
+        // NeverPersist actually gates VISIBLE per gate_for_model (its match
+        // arm groups it with ModelVisible): content under it is admissible
+        // when the class is granted.
+        let grant =
+            DisclosureGrantSet::new(&[DisclosureClass::ModelVisible, DisclosureClass::NeverPersist]);
+        let mut contribution = synthetic_contribution(&project, "rendered");
+        contribution.records = vec![record_with(
+            "mem-1",
+            DisclosureClass::NeverPersist,
+            "ephemeral but visible body",
+        )];
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant),
+            Ok(())
+        );
+    }
+
+    /// A provider cannot volunteer disclosure classes the originating
+    /// request never authorized (spec §6.4 `permitted_classes`) — even for
+    /// classes the gate would otherwise show, and even for empty bodies.
+    #[test]
+    fn validate_contribution_rejects_classes_outside_the_grant_set() {
+        let project = pid("project-a");
+
+        // NeverPersist gates Visible, but it was never granted.
+        let mut contribution = synthetic_contribution(&project, "rendered");
+        contribution.records =
+            vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
+            Err(MemoryContextError::ContributionClassNotPermitted)
+        );
+
+        // Ungranted class with an EMPTY body still rejects: the grant set
+        // bounds the vocabulary itself, not just content.
+        contribution.records = vec![record_with("mem-1", DisclosureClass::LocalOnly, "")];
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
+            Err(MemoryContextError::ContributionClassNotPermitted)
+        );
+
+        // Granting the class admits it again.
+        contribution.records =
+            vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
+        let grant =
+            DisclosureGrantSet::new(&[DisclosureClass::ModelVisible, DisclosureClass::NeverPersist]);
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant),
+            Ok(())
+        );
+    }
+
+    /// Positive control: a fully in-bounds, granted, model-visible
+    /// contribution still accepts under the full B1 rejection matrix.
+    #[test]
+    fn validate_contribution_accepts_a_fully_valid_contribution() {
+        let project = pid("project-a");
+        let mut contribution = synthetic_contribution(&project, "rendered memory text");
+        contribution.records = vec![
+            record_with("mem-1", DisclosureClass::ModelVisible, "first fact"),
+            record_with("mem-2", DisclosureClass::ModelVisible, "second fact"),
+        ];
+        assert_eq!(
+            validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
+            Ok(())
+        );
+    }
+
+    /// §6.4 recall-request assembly: every field is parse-constructed and
+    /// bounded; the grant set deduplicates; the budget enforces the §10.3
+    /// floor and ceiling; the query is byte-bounded with truncation
+    /// accounting.
+    #[test]
+    fn recall_request_types_are_bounded_and_parse_constructed() {
+        // Budget: engine-provided tokens only, floor and ceiling enforced.
+        assert_eq!(
+            RecallBudget::from_engine_tokens(MEMORY_BUDGET_MIN_TOKENS - 1),
+            Err(MemoryContextError::RecallBudgetBelowMinimum)
+        );
+        assert_eq!(
+            RecallBudget::from_engine_tokens(MEMORY_BUDGET_MAX_TOKENS + 1),
+            Err(MemoryContextError::ContributionOutOfBounds { field: "budget" })
+        );
+        let budget = RecallBudget::from_engine_tokens(4_096).expect("in-range budget");
+        assert_eq!(budget.max_records(), MEMORY_MAX_SELECTED_RECORDS);
+        assert_eq!(budget.max_rendered_tokens(), 4_096);
+
+        // Grant set deduplicates and answers membership exactly.
+        let grant = DisclosureGrantSet::new(&[
+            DisclosureClass::ModelVisible,
+            DisclosureClass::ModelVisible,
+            DisclosureClass::NeverPersist,
+        ]);
+        assert_eq!(
+            grant.classes(),
+            &[DisclosureClass::ModelVisible, DisclosureClass::NeverPersist]
+        );
+        assert!(grant.permits(DisclosureClass::NeverPersist));
+        assert!(!grant.permits(DisclosureClass::LocalOnly));
+
+        // Query: bounded with explicit truncation accounting.
+        let short = BoundedUserQuery::new("how is auth scoped?");
+        assert_eq!(short.as_str(), "how is auth scoped?");
+        assert!(!short.truncated());
+        let long = BoundedUserQuery::new(&"q".repeat(MEMORY_QUERY_MAX_BYTES + 100));
+        assert!(long.truncated());
+        assert!(long.as_str().len() <= MEMORY_QUERY_MAX_BYTES);
+
+        // Full request assembly per the spec §6.4 shape.
+        let request = RecallRequest {
+            schema: RecallSchemaVersion::parse("recall/1").expect("valid schema"),
+            lease_id: MemoryLeaseId::parse("lease-1").expect("valid lease id"),
+            project_id: pid("project-a"),
+            session_id: sid("sess-1"),
+            turn_id: TurnId::parse("turn-7").expect("valid turn id"),
+            query: short,
+            recent_context_digest: ContextDigest::from_bytes([7u8; 32]),
+            budget,
+            permitted_classes: grant,
+        };
+        assert_eq!(request.schema.as_str(), "recall/1");
+        assert_eq!(request.recent_context_digest.as_bytes(), &[7u8; 32]);
+        assert!(request.permitted_classes.permits(DisclosureClass::ModelVisible));
     }
 
     /// The typed segment (spec §10.1) exposes exactly the bounded rendered

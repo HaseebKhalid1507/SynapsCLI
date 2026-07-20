@@ -1487,7 +1487,15 @@ impl Runtime {
     ) -> std::result::Result<(), memory_context::MemoryContextError> {
         let budget = memory_context::memory_budget_tokens(self.context_window())
             .ok_or(memory_context::MemoryContextError::RecallBudgetBelowMinimum)?;
-        memory_context::validate_contribution(&contribution, &memory_project_id(), budget)?;
+        // Phase A hold path: until task B3 threads a real `RecallRequest`
+        // through dispatch, the host's conservative default grant applies —
+        // only baseline model-visible records are accepted back.
+        memory_context::validate_contribution(
+            &contribution,
+            &memory_project_id(),
+            budget,
+            &memory_context::DisclosureGrantSet::model_visible_only(),
+        )?;
         *self
             .pending_memory_segment
             .lock()
