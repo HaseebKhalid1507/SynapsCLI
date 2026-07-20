@@ -439,7 +439,7 @@ pub fn sweep_at(
                 let age = mtime_ms(&path).unwrap_or(u64::MAX);
                 candidates.push((age, path, false));
             }
-            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            candidates.sort_by_key(|item| item.0);
             for (_, path, is_protected) in candidates {
                 if total_now(roots) <= budget {
                     break;
@@ -511,7 +511,7 @@ fn evict_oldest_memory_records(
             }
         }
     }
-    live.sort_by(|a, b| a.0.cmp(&b.0));
+    live.sort_by_key(|item| item.0);
 
     let mut freed: u64 = 0;
     let mut victims: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
@@ -756,7 +756,7 @@ pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> 
             if !entry.is_file || !entry.name.starts_with("synaps.log") {
                 continue;
             }
-            match logs_root.open_file(&[entry.name.clone()]) {
+            match logs_root.open_file(std::slice::from_ref(&entry.name)) {
                 Ok(source) => {
                     let bytes = copy_opened_into_confined(source, &logs_out, &entry.name)?;
                     summary.bytes += bytes;
@@ -810,7 +810,7 @@ fn export_tree_from_handles(
     }
     for entry in source.entries()? {
         if entry.is_file {
-            match source.open_file(&[entry.name.clone()]) {
+            match source.open_file(std::slice::from_ref(&entry.name)) {
                 Ok(opened) => {
                     let bytes = copy_opened_into_confined(opened, destination, &entry.name)?;
                     summary.bytes += bytes;
@@ -819,7 +819,7 @@ fn export_tree_from_handles(
                 Err(_) => continue,
             }
         } else if entry.is_dir {
-            let source_child = match source.open_dirs(&[entry.name.clone()]) {
+            let source_child = match source.open_dirs(std::slice::from_ref(&entry.name)) {
                 Ok(child) => child,
                 Err(_) => continue,
             };

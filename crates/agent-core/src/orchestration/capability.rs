@@ -303,7 +303,7 @@ impl SchemaDigest {
                         // map iterates in insertion order, which must not
                         // change the digest.
                         let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-                        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        entries.sort_by_key(|(key, _)| *key);
                         for (key, child) in entries.into_iter().rev() {
                             stack.push(Task::Value(child));
                             stack.push(Task::Key(key));

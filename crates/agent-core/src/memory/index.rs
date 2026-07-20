@@ -470,8 +470,7 @@ pub fn search_index_in(
     let limit = query
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
-        .min(MAX_SEARCH_LIMIT)
-        .max(1);
+        .clamp(1, MAX_SEARCH_LIMIT);
     let wanted_terms: Vec<String> = query.terms.iter().flat_map(|t| terms_of(t)).collect();
 
     // Open streams for segments that can overlap the time range.

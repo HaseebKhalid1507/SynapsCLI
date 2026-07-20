@@ -322,7 +322,7 @@ enum JournalRecord {
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
-    Meta { v: u8, meta: SessionMeta },
+    Meta { v: u8, meta: Box<SessionMeta> },
 }
 
 /// Mirror of [`Session`] WITHOUT `api_messages`, with identical serde
@@ -560,7 +560,7 @@ fn save_journal_mode(
     }
     let meta = JournalRecord::Meta {
         v: JOURNAL_SCHEMA_VERSION,
-        meta: SessionMeta::of(session),
+        meta: Box::new(SessionMeta::of(session)),
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -728,6 +728,7 @@ fn remove_artifact_if_exists(handle: &SessionsDirHandle, name: &str) -> std::io:
 /// Strict-handle snapshot write shared with the legacy
 /// `session::save_json_in_dir` path (fix2): same root resolution and the
 /// same handle-relative atomic private write as every journal operation.
+#[cfg(test)]
 pub(crate) fn write_json_snapshot(dir: &Path, id: &str, json: &[u8]) -> std::io::Result<()> {
     let handle = create_sessions_dir(dir)?;
     handle.write_atomic(&format!("{id}.json"), json)

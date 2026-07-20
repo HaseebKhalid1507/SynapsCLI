@@ -214,6 +214,7 @@ impl Session {
 /// Blocking body of [`Session::save`]: create the sessions dir (0700), then
 /// write `<id>.json` atomically via `private_fs` (temp file created with mode
 /// 0600 — never create-then-chmod — then renamed; symlink targets refused).
+#[cfg(test)]
 pub(crate) fn save_json_in_dir(
     dir: &std::path::Path,
     id: &str,
