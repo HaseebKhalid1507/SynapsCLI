@@ -627,6 +627,25 @@ impl SessionMemoryState {
         };
     }
 
+    /// Crate-private (task A6): provider identities bound to currently
+    /// granted leases — the installed durable session lease plus any
+    /// pending one-shot recall. The host disable/session-end revocation
+    /// path uses these to defensively revoke the backing extension runtime
+    /// lease for each bound `extension:<plugin>:<id>` address (an
+    /// idempotent no-op while nothing has ever spawned, exact reap once
+    /// Phase B routes real calls). A consumed one-shot marker carries no
+    /// live authority and is deliberately excluded.
+    pub(crate) fn bound_provider_ids(&self) -> Vec<ContextProviderId> {
+        let mut bound = Vec::new();
+        if let DurableSlot::Active(lease) = &self.durable {
+            bound.push(lease.provider_id.clone());
+        }
+        if let OneShotSlot::Pending(lease) = &self.one_shot {
+            bound.push(lease.provider_id.clone());
+        }
+        bound
+    }
+
     /// Typed status snapshot — safe to surface without spawning any provider
     /// process (spec §7.2 "status does not spawn").
     pub fn status(&self) -> MemoryContextStatus {
@@ -833,6 +852,17 @@ pub enum MemoryContextError {
     /// No memory-context capability is wired into this execution context;
     /// lease-granting actions are unavailable and nothing was mutated.
     CapabilityUnavailable,
+    /// Enable-time provider validation failed (task A6, spec §7.1): no
+    /// loaded extension declares the requested context provider as a
+    /// validated `deferred.context_providers` capability. Fail closed —
+    /// nothing was granted.
+    ProviderNotRegistered,
+    /// Enable-time provider validation failed (task A6): more than one
+    /// installed extension declares an overlapping context-provider
+    /// capability and no explicit provider id disambiguates the request.
+    /// Fail closed — the host never picks one arbitrarily, and nothing
+    /// was granted.
+    ProviderAmbiguous,
 }
 
 impl std::fmt::Display for MemoryContextError {
@@ -871,6 +901,16 @@ impl std::fmt::Display for MemoryContextError {
             MemoryContextError::CapabilityUnavailable => write!(
                 f,
                 "memory-context capability is unavailable in this context"
+            ),
+            MemoryContextError::ProviderNotRegistered => write!(
+                f,
+                "no installed extension declares the requested memory context provider \
+                 (nothing was granted)"
+            ),
+            MemoryContextError::ProviderAmbiguous => write!(
+                f,
+                "multiple installed extensions declare overlapping memory context providers; \
+                 an exact provider id is required (nothing was granted)"
             ),
         }
     }

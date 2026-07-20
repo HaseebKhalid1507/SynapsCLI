@@ -199,16 +199,47 @@ mod cache_ttl_policy_tests {
     /// and `apply_subagent_runtime_policy` never copies memory-context state
     /// from a parent — a parent's active `/memory` lease cannot leak into a
     /// subagent.
+    ///
+    /// Task A6 extension: the parent runtime now has the extension runtime
+    /// installed with exactly ONE declared context provider, so its enable
+    /// goes through the NEW catalog-validation code path (recording the
+    /// exact composed provider address) — and the invariant still holds.
     #[tokio::test]
     async fn subagent_memory_context_starts_off_no_lease_despite_active_parent_lease() {
         use crate::runtime::memory_context::{
             mint_explicit_command_proof, DurableStatus, MemoryContextMode, OneShotStatus,
         };
+        use std::sync::Arc;
 
-        // Parent session with an ACTIVE capture-and-recall lease.
-        let parent = crate::Runtime::new()
+        // Parent session with an ACTIVE capture-and-recall lease, granted
+        // through task A6 provider validation against a loaded catalog.
+        let mut manager = crate::extensions::manager::ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ));
+        manager.set_progressive_deferral(true);
+        let manifest: crate::extensions::manifest::ExtensionManifest =
+            serde_json::from_value(serde_json::json!({
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": ["context_providers.register"],
+                "deferred": {
+                    "context_providers": [{
+                        "id": "project-memory",
+                        "capability": "project-memory",
+                        "description": "test context provider",
+                        "schema_version": 1
+                    }]
+                }
+            }))
+            .expect("manifest parses");
+        manager
+            .load("axel-memory-manager", &manifest)
+            .await
+            .expect("deferred context-provider load never spawns");
+        let mut parent = crate::Runtime::new()
             .await
             .expect("Runtime::new() must succeed in test environment");
+        parent.install_extension_runtime(manager.extension_runtime());
         parent
             .memory_context_enable(
                 MemoryContextMode::CaptureAndRecall,
@@ -219,6 +250,11 @@ mod cache_ttl_policy_tests {
             parent.memory_context_status().durable,
             DurableStatus::Active { .. }
         ));
+        // The A6 validation path bound the exact declared provider address.
+        assert_eq!(
+            parent.memory_bound_providers_for_test()[0].as_str(),
+            "extension:axel-memory-manager:project-memory"
+        );
 
         // A freshly constructed Runtime::new() — what every subagent spawn
         // path does — reports Off/no-lease.

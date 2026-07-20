@@ -437,8 +437,13 @@ fn memory_project_id() -> memory_context::ProjectId {
 }
 
 /// The spec-canonical continuous-memory provider identity (spec §17.3,
-/// Axel memory-manager). Command-granted leases record the exact provider
-/// they will activate; actual provider binding/activation is task A6.
+/// Axel memory-manager). FALLBACK ONLY as of task A6: it is recorded on
+/// command-granted leases exclusively when NO extension subsystem is wired
+/// into the runtime (legacy/flag-off construction — see
+/// [`Runtime::resolve_memory_provider`]). When the extension runtime is
+/// installed, enable-time validation resolves the exact declared provider
+/// from the loaded catalog instead, failing closed on zero or ambiguous
+/// matches.
 fn memory_provider_id() -> memory_context::ContextProviderId {
     memory_context::ContextProviderId::parse("axel-memory")
         .expect("static provider id is always valid")
@@ -1710,34 +1715,142 @@ impl Runtime {
     /// Revoke this session's memory context (`/memory off`). Always locally
     /// allowed (spec §7.2); idempotent — disabling an already-off session
     /// reports `Off`.
+    ///
+    /// Task A6 revocation wiring: after the session state transition, the
+    /// extension runtime lease backing each bound provider is defensively
+    /// revoked through the SAME [`ExtensionRuntimeManager`] mechanism the
+    /// deferred tool/handler lifecycle uses ([`Self::install_extension_runtime`]
+    /// / `ExtensionSessionEndGuard`). While Phase A never spawns, this is an
+    /// idempotent no-op; once Phase B routes real recall/capture calls under
+    /// this runtime's tool session, disable reaps the provider child exactly.
+    ///
+    /// [`ExtensionRuntimeManager`]: crate::extensions::lease::ExtensionRuntimeManager
     pub fn memory_context_disable(&self) -> memory_context::MemoryContextStatus {
-        let mut state = self.memory_context_lock();
-        let session = state.session_id().clone();
-        match memory_context::apply_memory_context_action(
-            &mut state,
-            memory_context::AuthorizedMemoryAction::Disable { session },
-        ) {
-            Ok(status) => status,
-            // Unreachable by construction (the session identity is read
-            // from the state itself and `Disable` is total), but never
-            // panic on the fallback: report current status.
-            Err(_) => state.status(),
+        let (status, bound) = {
+            let mut state = self.memory_context_lock();
+            let session = state.session_id().clone();
+            let bound = state.bound_provider_ids();
+            let status = match memory_context::apply_memory_context_action(
+                &mut state,
+                memory_context::AuthorizedMemoryAction::Disable { session },
+            ) {
+                Ok(status) => status,
+                // Unreachable by construction (the session identity is read
+                // from the state itself and `Disable` is total), but never
+                // panic on the fallback: report current status.
+                Err(_) => state.status(),
+            };
+            (status, bound)
+        };
+        // State mutex released before touching the lease manager: the
+        // revocation below locks only the lease map (idempotent no-op when
+        // nothing was ever spawned).
+        self.revoke_memory_provider_leases(&bound);
+        status
+    }
+
+    /// Task A6: defensively revoke the extension runtime lease backing each
+    /// bound memory provider for THIS runtime's tool session. Confirmed
+    /// idempotent — `ExtensionRuntimeManager::revoke_plugin_lease` is a map
+    /// remove that finds nothing when no lease was ever acquired, so calling
+    /// it before Phase B ever spawns is a safe no-op. Provider identities
+    /// that are not composed `extension:<plugin>:<id>` runtime addresses
+    /// (the legacy canonical fallback) name no plugin child and are skipped.
+    fn revoke_memory_provider_leases(&self, bound: &[memory_context::ContextProviderId]) {
+        let Some(extension_runtime) = &self.extension_runtime else {
+            return;
+        };
+        for provider in bound {
+            let mut parts = provider.as_str().splitn(3, ':');
+            if let (Some("extension"), Some(plugin), Some(_local_id)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                if !plugin.is_empty() {
+                    extension_runtime.revoke_plugin_lease(&self.host_tool_session, plugin);
+                }
+            }
+        }
+    }
+
+    /// Task A6 enable-time provider validation: resolve the provider a
+    /// `/memory` grant binds to. With the extension runtime installed
+    /// ([`Self::install_extension_runtime`] — the same wiring point that
+    /// backs `extension_leases` capabilities), resolution is MANDATORY and
+    /// fail-closed against the loaded context-provider catalog (pure
+    /// catalog read, never spawns): exactly one matching declared provider
+    /// resolves to its composed `extension:<plugin>:<id>` runtime address;
+    /// zero matches fail [`memory_context::MemoryContextError::ProviderNotRegistered`]
+    /// and overlapping declarations without an exact requested id fail
+    /// [`memory_context::MemoryContextError::ProviderAmbiguous`] — the
+    /// exact-scope precedent of `validate_deferred` and
+    /// `crate::orchestration::validate_user_authorizable_model`.
+    ///
+    /// Without an extension subsystem (legacy/flag-off constructions and
+    /// headless unit runtimes) the A5 spec-canonical identity is kept:
+    /// there is no catalog to validate against, Phase A grants are inert
+    /// metadata, and Phase B activation independently re-validates through
+    /// `ExtensionLeaseCapability::call_exact` against retained launch
+    /// records — an unbacked identity can never start a process.
+    fn resolve_memory_provider(
+        &self,
+        requested: Option<&str>,
+    ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
+    {
+        use crate::extensions::context_provider as ext_cp;
+        let Some(extension_runtime) = &self.extension_runtime else {
+            return Ok(memory_provider_id());
+        };
+        let requested_id = match requested {
+            None => None,
+            // An id that cannot even parse as a declared provider identity
+            // can never be registered: fail closed as not-registered.
+            Some(raw) => Some(
+                ext_cp::ContextProviderId::parse(raw)
+                    .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?,
+            ),
+        };
+        match extension_runtime.resolve_context_provider(requested_id.as_ref()) {
+            Ok(descriptor) => {
+                memory_context::ContextProviderId::parse(&descriptor.runtime_address())
+            }
+            Err(ext_cp::ContextProviderLookupError::NotRegistered) => {
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            }
+            Err(ext_cp::ContextProviderLookupError::Ambiguous) => {
+                Err(memory_context::MemoryContextError::ProviderAmbiguous)
+            }
         }
     }
 
     /// Install a durable session-lease memory mode (`/memory on|recall|
     /// capture`, spec §7.3) under the caller-supplied host-owned intent
-    /// proof (spec §6.3). Mints the lease and applies the exhaustive
-    /// [`memory_context::apply_memory_context_action`] transition — on a
-    /// typed failure no lease is installed.
+    /// proof (spec §6.3). Task A6: the target provider is resolved and
+    /// validated FIRST ([`Self::resolve_memory_provider`], fail-closed) —
+    /// then the lease is minted and the exhaustive
+    /// [`memory_context::apply_memory_context_action`] transition applied.
+    /// On any typed failure no lease is installed.
     pub(crate) fn memory_context_enable(
         &self,
         mode: memory_context::MemoryContextMode,
         proof: memory_context::UserIntentProof,
     ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
     {
+        self.memory_context_enable_resolved(mode, proof, None)
+    }
+
+    /// [`Self::memory_context_enable`] with an explicit requested provider
+    /// id (exact declared id; `None` requires a uniquely-declared provider
+    /// when the extension subsystem is installed). Crate-internal: the
+    /// `/memory` frontend forms currently pass `None`.
+    pub(crate) fn memory_context_enable_resolved(
+        &self,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+        requested_provider: Option<&str>,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
         let mut state = self.memory_context_lock();
-        let lease = Self::grant_command_memory_lease(&state, mode, proof)?;
+        let lease = self.grant_command_memory_lease(&state, mode, proof, requested_provider)?;
         memory_context::apply_memory_context_action(
             &mut state,
             memory_context::AuthorizedMemoryAction::Enable { lease },
@@ -1745,18 +1858,20 @@ impl Runtime {
     }
 
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
-    /// the caller-supplied host-owned intent proof. Fails typed (e.g. a
-    /// one-shot already pending) without installing anything.
+    /// the caller-supplied host-owned intent proof. Provider-validated
+    /// exactly like [`Self::memory_context_enable`] (task A6). Fails typed
+    /// (e.g. a one-shot already pending) without installing anything.
     pub(crate) fn memory_context_recall_once(
         &self,
         proof: memory_context::UserIntentProof,
     ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
     {
         let mut state = self.memory_context_lock();
-        let lease = Self::grant_command_memory_lease(
+        let lease = self.grant_command_memory_lease(
             &state,
             memory_context::MemoryContextMode::RecallOnce,
             proof,
+            None,
         )?;
         memory_context::apply_memory_context_action(
             &mut state,
@@ -1765,20 +1880,25 @@ impl Runtime {
     }
 
     /// Mint one host-owned lease for a `/memory` command grant: host-minted
-    /// lease ID, the state's own session identity, host-derived project and
-    /// provider identities. Session leases carry no hard expiry (until
+    /// lease ID, the state's own session identity, host-derived project
+    /// identity, and the task-A6 catalog-validated provider identity
+    /// ([`Self::resolve_memory_provider`] — fail-closed; on a resolution
+    /// error nothing is minted). Session leases carry no hard expiry (until
     /// revoked or session end); `/memory` has no expiry argument (spec §7.3).
     fn grant_command_memory_lease(
+        &self,
         state: &memory_context::SessionMemoryState,
         mode: memory_context::MemoryContextMode,
         proof: memory_context::UserIntentProof,
+        requested_provider: Option<&str>,
     ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
     {
+        let provider_id = self.resolve_memory_provider(requested_provider)?;
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
             state.session_id().clone(),
             memory_project_id(),
-            memory_provider_id(),
+            provider_id,
             mode,
             memory_context::CapturePolicy::default(),
             memory_context::RecallPolicy::default(),
@@ -1802,6 +1922,15 @@ impl Runtime {
         &self,
     ) -> Option<memory_context::UserIntentProof> {
         self.memory_context_lock().one_shot_pending_proof().cloned()
+    }
+
+    /// Test-only: provider identities bound to the currently granted
+    /// leases (durable + pending one-shot), in that order.
+    #[cfg(test)]
+    pub(crate) fn memory_bound_providers_for_test(
+        &self,
+    ) -> Vec<memory_context::ContextProviderId> {
+        self.memory_context_lock().bound_provider_ids()
     }
 
     /// Structured `/context` report (Task 12): counts, byte lengths, cache
@@ -3994,5 +4123,249 @@ mod http_client_timeout_tests {
             start.elapsed()
         );
         assert!(err.is_timeout(), "must be a timeout: {err:?}");
+    }
+}
+
+/// Task A6: memory-context provider validation + revocation wiring.
+#[cfg(test)]
+mod memory_context_provider_tests {
+    use super::{memory_context, Runtime};
+    use std::sync::Arc;
+
+    // ── task A6: memory-context provider validation + revocation wiring ──
+
+    /// Build a headless Runtime with the extension runtime installed (the
+    /// exact `install_extension_runtime` wiring point the engine uses at
+    /// boot) and one deferred context-provider-only extension loaded per
+    /// `(plugin, provider-id)` pair. Nothing spawns: context-provider
+    /// manifests classify as deferred and stay dormant.
+    async fn memory_runtime_with_providers(
+        plugins: &[(&str, &str)],
+    ) -> (
+        Runtime,
+        std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    ) {
+        let mut manager = crate::extensions::manager::ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ));
+        manager.set_progressive_deferral(true);
+        for (plugin, provider) in plugins {
+            let manifest: crate::extensions::manifest::ExtensionManifest =
+                serde_json::from_value(serde_json::json!({
+                    "runtime": "process",
+                    "command": "/bin/false",
+                    "permissions": ["context_providers.register"],
+                    "deferred": {
+                        "context_providers": [{
+                            "id": provider,
+                            "capability": "project-memory",
+                            "description": "test context provider",
+                            "schema_version": 1
+                        }]
+                    }
+                }))
+                .expect("manifest parses");
+            manager
+                .load(plugin, &manifest)
+                .await
+                .expect("deferred context-provider load succeeds without spawning");
+        }
+        let extension_runtime = manager.extension_runtime();
+        let mut runtime = Runtime::new_headless();
+        runtime.install_extension_runtime(std::sync::Arc::clone(&extension_runtime));
+        (runtime, extension_runtime)
+    }
+
+    fn assert_memory_off_no_lease(runtime: &Runtime) {
+        let status = runtime.memory_context_status();
+        assert_eq!(
+            status.durable,
+            memory_context::DurableStatus::Off,
+            "state must stay Off"
+        );
+        assert_eq!(
+            status.one_shot,
+            memory_context::OneShotStatus::Idle,
+            "no one-shot lease may exist"
+        );
+        assert!(
+            runtime.memory_bound_providers_for_test().is_empty(),
+            "no provider may be bound"
+        );
+    }
+
+    /// Task A6: enabling against a catalog that does not contain the
+    /// requested provider fails closed — typed error, nothing granted,
+    /// `SessionMemoryState` unchanged (Off/no-lease) — both for an
+    /// explicitly requested nonexistent id and for an id-less request
+    /// against an empty catalog.
+    #[tokio::test]
+    async fn memory_enable_unregistered_provider_fails_closed_grants_nothing() {
+        // Explicit nonexistent id against a catalog with one real provider.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        for requested in ["no-such-provider", "bad:id"] {
+            let err = runtime
+                .memory_context_enable_resolved(
+                    memory_context::MemoryContextMode::CaptureAndRecall,
+                    memory_context::mint_explicit_command_proof(),
+                    Some(requested),
+                )
+                .expect_err("unregistered provider must fail closed");
+            assert_eq!(
+                err,
+                memory_context::MemoryContextError::ProviderNotRegistered
+            );
+            assert_memory_off_no_lease(&runtime);
+        }
+
+        // Id-less request against an EMPTY catalog (extension subsystem
+        // installed, no context-provider extension loaded).
+        let (runtime, _ext) = memory_runtime_with_providers(&[]).await;
+        let err = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("empty catalog must fail closed");
+        assert_eq!(
+            err,
+            memory_context::MemoryContextError::ProviderNotRegistered
+        );
+        assert_memory_off_no_lease(&runtime);
+        // One-shot grants run the same validation.
+        let err = runtime
+            .memory_context_recall_once(memory_context::mint_explicit_command_proof())
+            .expect_err("one-shot grant must validate the provider too");
+        assert_eq!(
+            err,
+            memory_context::MemoryContextError::ProviderNotRegistered
+        );
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// Task A6: with exactly one matching declared provider the grant
+    /// succeeds and records THAT provider's exact composed runtime
+    /// address — for the default id-less request and the explicit exact id.
+    #[tokio::test]
+    async fn memory_enable_exactly_one_declared_provider_records_exact_identity() {
+        const ADDRESS: &str = "extension:axel-memory-manager:project-memory";
+        // Default (id-less) request.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        let status = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("unique declared provider must resolve");
+        assert!(matches!(
+            status.durable,
+            memory_context::DurableStatus::Active { .. }
+        ));
+        let bound = runtime.memory_bound_providers_for_test();
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].as_str(), ADDRESS, "exact runtime address recorded");
+
+        // Explicit exact id resolves to the same identity.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable_resolved(
+                memory_context::MemoryContextMode::RecallEachPrompt,
+                memory_context::mint_explicit_command_proof(),
+                Some("project-memory"),
+            )
+            .expect("explicit exact id must resolve");
+        assert_eq!(runtime.memory_bound_providers_for_test()[0].as_str(), ADDRESS);
+    }
+
+    /// Task A6: two installed extensions declaring overlapping context
+    /// providers make both the id-less request AND a request for the
+    /// overlapping id ambiguous — fail closed, nothing granted.
+    #[tokio::test]
+    async fn memory_enable_ambiguous_overlapping_declarations_fails_closed() {
+        let (runtime, _ext) = memory_runtime_with_providers(&[
+            ("mem-a", "project-memory"),
+            ("mem-b", "project-memory"),
+        ])
+        .await;
+        let err = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("overlapping declarations must fail closed");
+        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
+        assert_memory_off_no_lease(&runtime);
+
+        // The overlapping exact id cannot disambiguate two owners either.
+        let err = runtime
+            .memory_context_enable_resolved(
+                memory_context::MemoryContextMode::CaptureOnly,
+                memory_context::mint_explicit_command_proof(),
+                Some("project-memory"),
+            )
+            .expect_err("same id declared by two plugins is ambiguous");
+        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// Task A6 revocation wiring: disable revokes the granted lease from
+    /// `SessionMemoryState` AND defensively calls
+    /// `ExtensionRuntimeManager::revoke_plugin_lease` for the bound
+    /// plugin/session pair — an idempotent no-op (no panic) when nothing
+    /// was ever spawned.
+    #[tokio::test]
+    async fn memory_disable_revokes_runtime_lease_without_spawn_no_panic() {
+        let (runtime, ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        assert_eq!(ext.lease_count(), 0, "granting a memory lease spawns nothing");
+
+        let status = runtime.memory_context_disable();
+        assert_eq!(status.durable, memory_context::DurableStatus::Off);
+        assert_memory_off_no_lease(&runtime);
+        assert_eq!(ext.lease_count(), 0, "revocation of a never-spawned lease is a no-op");
+
+        // Idempotent: disabling again is safe and stays Off.
+        let status = runtime.memory_context_disable();
+        assert_eq!(status.durable, memory_context::DurableStatus::Off);
+        assert_eq!(ext.lease_count(), 0);
+    }
+
+    /// Task A6 session-end plumbing: dropping the LAST runtime owner runs
+    /// the shared `ExtensionSessionEndGuard` (terminate_session — the SAME
+    /// reap mechanism deferred tools/handlers use), and a fresh
+    /// construction against the same extension runtime starts Off with no
+    /// lease of any kind.
+    #[tokio::test]
+    async fn memory_session_end_guard_drop_fresh_construction_is_off_no_lease() {
+        let (runtime, ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        // True session end: the last owner drop fires the guard.
+        drop(runtime);
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "session end must leave no runtime lease (never-spawned reap is a no-op)"
+        );
+
+        // A fresh construction (what any new session does) is Off/no-lease.
+        let mut fresh = Runtime::new_headless();
+        fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
+        assert_memory_off_no_lease(&fresh);
+        assert_eq!(ext.lease_count(), 0);
     }
 }

@@ -43,6 +43,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use thiserror::Error;
 
+use super::context_provider::{
+    resolve_context_provider, ContextProviderId, ContextProviderLookupError,
+    RegisteredContextProviderDescriptor, SharedContextProviderCatalog,
+};
 use super::lifecycle::{
     validate_runtime_provider_declarations, validate_runtime_tool_declarations,
 };
@@ -189,6 +193,11 @@ pub struct ExtensionRuntimeManager {
     /// The `ExtensionManager`'s retained internal launch records (shared
     /// handle; sync lock held only for map operations, never across I/O).
     records: SharedDeferredRecords,
+    /// The `ExtensionManager`'s published context-provider catalog
+    /// snapshot (task A6; same sharing discipline as `records`). Read by
+    /// [`Self::resolve_context_provider`] for enable-time memory-context
+    /// provider validation — a PURE catalog read that never spawns.
+    context_catalog: SharedContextProviderCatalog,
     idle_max: Duration,
     next_token: std::sync::atomic::AtomicU64,
     /// Host-scope session identity for HANDLER-based acquisition (hook
@@ -201,14 +210,39 @@ pub struct ExtensionRuntimeManager {
 }
 
 impl ExtensionRuntimeManager {
-    pub(crate) fn new(records: SharedDeferredRecords, idle_max: Duration) -> Self {
+    pub(crate) fn new(
+        records: SharedDeferredRecords,
+        context_catalog: SharedContextProviderCatalog,
+        idle_max: Duration,
+    ) -> Self {
         Self {
             leases: std::sync::Mutex::new(HashMap::new()),
             records,
+            context_catalog,
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
             host_scope: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Task A6: resolve one memory-context provider request against the
+    /// published catalog of loaded extensions' declared context providers.
+    /// PURE CATALOG READ — never spawns a process, never touches lease
+    /// state (consistent with "discovery/status spawn zero processes").
+    /// Exact-scope, fail-closed matching per
+    /// [`resolve_context_provider`]: `Ok` only when exactly one loaded
+    /// declaration matches; zero matches fail `NotRegistered` and
+    /// overlapping declarations fail `Ambiguous`. Returns an owned clone
+    /// of the dormant descriptor (bounded metadata only).
+    pub fn resolve_context_provider(
+        &self,
+        requested: Option<&ContextProviderId>,
+    ) -> Result<RegisteredContextProviderDescriptor, ContextProviderLookupError> {
+        let catalog = self
+            .context_catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_context_provider(&catalog, requested).cloned()
     }
 
     /// Bind the host-scope session identity used by handler-based

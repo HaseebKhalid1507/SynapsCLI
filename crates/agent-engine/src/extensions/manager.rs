@@ -8,6 +8,10 @@ use super::capability::{
     ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry,
 };
 use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
+use super::context_provider::{
+    dormant_context_provider_descriptors, resolve_context_provider, ContextProviderId,
+    RegisteredContextProviderDescriptor, SharedContextProviderCatalog,
+};
 use super::hooks::HookBus;
 use super::info::PluginInfo;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
@@ -159,6 +163,21 @@ pub struct ExtensionManager {
     /// Commit B). One instance shared by this manager (unload revocation)
     /// and the `Runtime` (per-session capabilities + session-end scope).
     extension_runtime: std::sync::OnceLock<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
+    /// Task A6: DORMANT context-provider descriptors declared by loaded
+    /// extensions (`deferred.context_providers`, task A3) — the OWNED
+    /// catalog behind [`Self::context_providers`]/[`Self::context_provider`],
+    /// mirroring how `providers` backs the model-provider catalog reads.
+    /// Pure metadata: cataloging a descriptor spawns nothing (discovery/
+    /// status spawn zero processes); the only activation path is a future
+    /// exact memory-context lease routed through the lease manager.
+    context_providers: Vec<RegisteredContextProviderDescriptor>,
+    /// Published snapshot of `context_providers`, shared with the lease
+    /// manager exactly like `deferred_tool_only`: every catalog mutation
+    /// republishes via [`Self::publish_context_providers`], and the
+    /// `Runtime` memory-context enable path reads the CURRENT snapshot
+    /// through `ExtensionRuntimeManager::resolve_context_provider` (sync
+    /// lock, slice ops only, never held across I/O, never spawning).
+    context_provider_catalog: SharedContextProviderCatalog,
     /// HOST-OWNED trusted project root, recorded ONCE per manager on first
     /// use (canonical `ProjectScope::discover` walk from the host's own
     /// working directory). Injected into resolved config for manifest
@@ -203,6 +222,8 @@ impl ExtensionManager {
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
             extension_runtime: std::sync::OnceLock::new(),
+            context_providers: Vec::new(),
+            context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             host_project_root: std::sync::OnceLock::new(),
         }
     }
@@ -224,6 +245,8 @@ impl ExtensionManager {
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
             extension_runtime: std::sync::OnceLock::new(),
+            context_providers: Vec::new(),
+            context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             host_project_root: std::sync::OnceLock::new(),
         }
     }
@@ -299,6 +322,44 @@ impl ExtensionManager {
         &self.deferred_tool_only
     }
 
+    /// Republish the owned context-provider catalog into the shared
+    /// snapshot the lease manager reads (task A6). Called after EVERY
+    /// catalog mutation so `resolve_context_provider` always observes the
+    /// current loaded set — a removed extension's providers can never be
+    /// resolved from a stale snapshot.
+    fn publish_context_providers(&self) {
+        let mut published = self
+            .context_provider_catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *published = self.context_providers.clone();
+    }
+
+    /// Catalog one loaded extension's DORMANT context-provider
+    /// declarations (task A6) via the task-A3 validated builder. Pure
+    /// metadata registration — spawns nothing; invalid or ungated
+    /// declaration sets yield no descriptors (fail closed inside
+    /// [`dormant_context_provider_descriptors`]).
+    fn catalog_context_providers(&mut self, id: &str, manifest: &ExtensionManifest) {
+        let descriptors = dormant_context_provider_descriptors(id, manifest);
+        if descriptors.is_empty() {
+            return;
+        }
+        self.context_providers.extend(descriptors);
+        self.publish_context_providers();
+    }
+
+    /// Drop every cataloged context-provider descriptor owned by one
+    /// extension (unload/teardown path, task A6) and republish.
+    fn uncatalog_context_providers(&mut self, id: &str) {
+        let before = self.context_providers.len();
+        self.context_providers
+            .retain(|descriptor| descriptor.extension_id() != id);
+        if self.context_providers.len() != before {
+            self.publish_context_providers();
+        }
+    }
+
     /// The SHARED extension runtime lease manager (Task 20 Commit B),
     /// created on first use against this manager's retained launch
     /// records. The engine installs the same instance on the `Runtime`
@@ -319,6 +380,7 @@ impl ExtensionManager {
         Arc::clone(self.extension_runtime.get_or_init(|| {
             Arc::new(crate::extensions::lease::ExtensionRuntimeManager::new(
                 Arc::clone(&self.deferred_tool_only),
+                Arc::clone(&self.context_provider_catalog),
                 idle_max,
             ))
         }))
@@ -546,8 +608,14 @@ impl ExtensionManager {
                 self.manifest_theme_tokens
                     .insert(id.to_string(), manifest.theme_tokens.clone());
             }
+            // Task A6: catalog DORMANT context-provider declarations LAST —
+            // every fallible registration step above has succeeded, so the
+            // unwind path never needs to reason about a half-published
+            // catalog. Metadata only; nothing spawns.
+            self.catalog_context_providers(id, manifest);
             tracing::info!(extension = %id, class = ?class, tools = tool_count,
                 providers = registered_provider_ids.len(), hooks = manifest.hooks.len(),
+                context_providers = self.context_providers.iter().filter(|d| d.extension_id() == id).count(),
                 "Extension deferred: passive surfaces registered, no process started");
             return Ok(());
         }
@@ -726,6 +794,12 @@ impl ExtensionManager {
         if let Some(info) = info {
             self.plugin_info.insert(id.to_string(), info);
         }
+        // Task A6: catalog validated DORMANT `deferred.context_providers`
+        // declarations for eagerly-loaded extensions too, so the context-
+        // provider catalog reflects EVERY loaded extension regardless of
+        // lifecycle class. Metadata only — the process above was spawned by
+        // the legacy eager path, never by this catalog write.
+        self.catalog_context_providers(id, manifest);
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
     }
@@ -882,6 +956,10 @@ impl ExtensionManager {
         if let Some(record) = deferred {
             // Record removed FIRST: any concurrent lease acquisition now
             // fails closed (NotDeferred) regardless of the steps below.
+            // Context providers go with it (task A6): once unloading has
+            // begun, a memory-context enable can no longer resolve this
+            // extension's declared providers.
+            self.uncatalog_context_providers(id);
             if let Some(runtime) = self.extension_runtime.get() {
                 let revoked = runtime.revoke_plugin_all_sessions(id);
                 if revoked > 0 {
@@ -922,6 +1000,9 @@ impl ExtensionManager {
             .extensions
             .remove(id)
             .ok_or_else(|| format!("Extension '{}' not found", id))?;
+        // Task A6: cataloged context providers of a live extension are
+        // removed with it.
+        self.uncatalog_context_providers(id);
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
@@ -1037,6 +1118,31 @@ impl ExtensionManager {
     /// Return registered provider metadata by runtime id.
     pub fn provider(&self, runtime_id: &str) -> Option<&RegisteredProvider> {
         self.providers.get(runtime_id)
+    }
+
+    /// Return DORMANT context-provider descriptors declared by loaded
+    /// extensions, sorted by runtime address (task A6; mirrors
+    /// [`Self::providers`] for the UNRELATED model-provider catalog).
+    /// Pure catalog read — discovery/status spawn zero processes, and
+    /// holding a descriptor grants nothing.
+    pub fn context_providers(&self) -> Vec<&RegisteredContextProviderDescriptor> {
+        let mut out: Vec<&RegisteredContextProviderDescriptor> =
+            self.context_providers.iter().collect();
+        out.sort_by_key(|descriptor| descriptor.runtime_address());
+        out
+    }
+
+    /// Exact context-provider lookup by declared id (task A6; mirrors
+    /// [`Self::provider`]). `Some` iff EXACTLY ONE loaded extension
+    /// declares `provider_id` — zero matches and overlapping declarations
+    /// (the same id declared by multiple installed extensions) both
+    /// resolve to `None`, fail closed, no partial matches. Pure catalog
+    /// read — never spawns.
+    pub fn context_provider(
+        &self,
+        provider_id: &ContextProviderId,
+    ) -> Option<&RegisteredContextProviderDescriptor> {
+        resolve_context_provider(&self.context_providers, Some(provider_id)).ok()
     }
 
     /// Return optional cached plugin info reported by `info.get`.
@@ -1728,6 +1834,99 @@ mod invoke_command_collected_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task A6: context-provider manifest for one plugin (no tools, no
+    /// hooks — classifies as `ContextProvider` and defers without spawn).
+    fn context_provider_manifest(provider_id: &str) -> ExtensionManifest {
+        serde_json::from_value(serde_json::json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["context_providers.register"],
+            "deferred": {
+                "context_providers": [{
+                    "id": provider_id,
+                    "capability": "project-memory",
+                    "description": "test context provider",
+                    "schema_version": 1
+                }]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Task A6: the context-provider catalog mirrors the model-provider
+    /// catalog shape — populated at load, exact fail-closed lookup, kept
+    /// current across unload, shared with the lease manager — and every
+    /// read is pure metadata: zero processes are ever started.
+    #[tokio::test]
+    async fn context_provider_catalog_lists_resolves_and_unloads_exactly() {
+        let mut mgr = ExtensionManager::new(Arc::new(HookBus::new()));
+        mgr.set_progressive_deferral(true);
+        mgr.load("mem-a", &context_provider_manifest("alpha"))
+            .await
+            .unwrap();
+        mgr.load("mem-b", &context_provider_manifest("beta"))
+            .await
+            .unwrap();
+
+        // Catalog reads: sorted by runtime address, exact ids only.
+        let listed: Vec<String> = mgr
+            .context_providers()
+            .iter()
+            .map(|d| d.runtime_address())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "extension:mem-a:alpha".to_string(),
+                "extension:mem-b:beta".to_string(),
+            ]
+        );
+        let alpha = super::super::context_provider::ContextProviderId::parse("alpha").unwrap();
+        assert_eq!(
+            mgr.context_provider(&alpha).map(|d| d.extension_id()),
+            Some("mem-a")
+        );
+        let unknown = super::super::context_provider::ContextProviderId::parse("nope").unwrap();
+        assert!(mgr.context_provider(&unknown).is_none(), "fail closed");
+
+        // The shared lease-manager handle observes the same catalog.
+        let runtime = mgr.extension_runtime();
+        assert_eq!(
+            runtime
+                .resolve_context_provider(Some(&alpha))
+                .map(|d| d.runtime_address()),
+            Ok("extension:mem-a:alpha".to_string())
+        );
+
+        // An overlapping declaration makes the id ambiguous — fail closed
+        // on BOTH read surfaces, never an arbitrary pick.
+        mgr.load("mem-c", &context_provider_manifest("alpha"))
+            .await
+            .unwrap();
+        assert!(mgr.context_provider(&alpha).is_none(), "ambiguous → None");
+        assert_eq!(
+            runtime.resolve_context_provider(Some(&alpha)),
+            Err(super::super::context_provider::ContextProviderLookupError::Ambiguous)
+        );
+
+        // Unload removes exactly the owner's descriptors and republishes.
+        mgr.unload("mem-c").await.unwrap();
+        assert_eq!(
+            mgr.context_provider(&alpha).map(|d| d.extension_id()),
+            Some("mem-a")
+        );
+        mgr.unload("mem-a").await.unwrap();
+        assert_eq!(
+            runtime.resolve_context_provider(Some(&alpha)),
+            Err(super::super::context_provider::ContextProviderLookupError::NotRegistered)
+        );
+        assert_eq!(mgr.context_providers().len(), 1, "mem-b remains");
+
+        // Pure catalog discipline: nothing above started a process.
+        assert_eq!(mgr.count(), 0, "no live extension handlers");
+        assert_eq!(runtime.lease_count(), 0, "no runtime leases");
+    }
 
     #[tokio::test]
     async fn capability_snapshots_empty_when_no_extensions() {
