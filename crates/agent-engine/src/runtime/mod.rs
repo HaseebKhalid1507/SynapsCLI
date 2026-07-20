@@ -310,7 +310,8 @@ pub struct Runtime {
     /// truth) but NEVER inherited by subagents — every constructor
     /// initializes the slot empty, same invariant as `memory_context_state`
     /// above.
-    pending_memory_segment: std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
+    pending_memory_segment:
+        std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
     /// Task B4 (spec §7.4): the accepted recall retained for the CURRENT
     /// logical request — the contribution reused verbatim by retries of the
     /// same request (never a second provider call) plus the §10.4
@@ -465,6 +466,94 @@ fn memory_project_id() -> memory_context::ProjectId {
 /// installed, enable-time validation resolves the exact declared provider
 /// from the loaded catalog instead, failing closed on zero or ambiguous
 /// matches.
+fn memory_capture_worker() -> &'static capture_worker::CaptureWorker {
+    static WORKER: std::sync::OnceLock<capture_worker::CaptureWorker> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| capture_worker::CaptureWorker::new(32))
+}
+
+struct ExtensionCaptureProvider {
+    manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    session: crate::tools::activation::SessionId,
+    plugin: String,
+    digest: crate::tools::catalog::SchemaDigest,
+    handle: tokio::runtime::Handle,
+}
+
+impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
+    fn capture(
+        &self,
+        capture: chat_capture::ChatTurnCapture,
+    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
+        let params = memory_context::capture_request_wire(&capture);
+        self.handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    params,
+                ),
+            )
+            .map(|_| ())
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_call_failed",
+            })
+    }
+}
+
+fn terminal_capture_history(
+    lease: &memory_context::MemoryContextLease,
+    messages: &[crate::SharedMessage],
+    started_at: std::time::SystemTime,
+) -> chat_capture::TerminalTurnHistory {
+    use agent_core::core::disclosure::DisclosureClass;
+    let mut items = Vec::new();
+    for message in messages {
+        let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let class = match role {
+            "user" => chat_capture::CaptureContentClass::UserMessage,
+            "assistant" => chat_capture::CaptureContentClass::AssistantFinal,
+            _ => continue,
+        };
+        let text = message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                message
+                    .get("content")
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            });
+        items.push(chat_capture::CanonicalCaptureItem {
+            project_id: lease.project_id.clone(),
+            class,
+            disclosure: DisclosureClass::ModelVisible,
+            sensitivity: chat_capture::Sensitivity::Normal,
+            text,
+            tool_name: None,
+        });
+    }
+    chat_capture::TerminalTurnHistory {
+        project_id: lease.project_id.clone(),
+        session_id: lease.session_id.clone(),
+        turn_id: memory_context::TurnId::parse(&format!("turn-{}", uuid::Uuid::new_v4()))
+            .expect("generated turn id"),
+        turn_ordinal: 0,
+        started_at,
+        completed_at: std::time::SystemTime::now(),
+        outcome: agent_core::TurnOutcome::Completed,
+        items,
+        compaction: None,
+    }
+}
+
 fn memory_provider_id() -> memory_context::ContextProviderId {
     memory_context::ContextProviderId::parse("axel-memory")
         .expect("static provider id is always valid")
@@ -1578,8 +1667,8 @@ impl Runtime {
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
-                let Some(digest) = manager
-                    .declared_tool_digest(plugin, memory_context::MEMORY_RECALL_TOOL_NAME)
+                let Some(digest) =
+                    manager.declared_tool_digest(plugin, memory_context::MEMORY_RECALL_TOOL_NAME)
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
@@ -2144,26 +2233,20 @@ impl Runtime {
 
     /// Test-only: intent proof recorded on the current durable lease.
     #[cfg(test)]
-    pub(crate) fn memory_durable_proof_for_test(
-        &self,
-    ) -> Option<memory_context::UserIntentProof> {
+    pub(crate) fn memory_durable_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
         self.memory_context_lock().durable_proof().cloned()
     }
 
     /// Test-only: intent proof recorded on the pending one-shot lease.
     #[cfg(test)]
-    pub(crate) fn memory_one_shot_proof_for_test(
-        &self,
-    ) -> Option<memory_context::UserIntentProof> {
+    pub(crate) fn memory_one_shot_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
         self.memory_context_lock().one_shot_pending_proof().cloned()
     }
 
     /// Test-only: provider identities bound to the currently granted
     /// leases (durable + pending one-shot), in that order.
     #[cfg(test)]
-    pub(crate) fn memory_bound_providers_for_test(
-        &self,
-    ) -> Vec<memory_context::ContextProviderId> {
+    pub(crate) fn memory_bound_providers_for_test(&self) -> Vec<memory_context::ContextProviderId> {
         self.memory_context_lock().bound_provider_ids()
     }
 
@@ -2837,6 +2920,12 @@ impl Runtime {
         // message is ever inserted — and the disabled path performs zero
         // extension calls. Every recall failure fails OPEN: the turn itself
         // is never blocked or failed by memory.
+        let capture_started_at = std::time::SystemTime::now();
+        // Snapshot the full prompt-time lease: terminal dispatch must never
+        // reselect a provider after the user changes memory state.
+        let capture_lease = self
+            .memory_context_lock()
+            .capture_lease_at(capture_started_at);
         let mut messages = messages;
         self.apply_turn_memory_recall(&mut messages).await;
         let messages = messages;
@@ -2868,6 +2957,8 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
+        let capture_runtime = self.extension_runtime.clone();
+        let capture_session = self.host_tool_session.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -2935,10 +3026,46 @@ impl Runtime {
         };
 
         tokio::spawn(async move {
-            if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                    helpers::turn_error_for(&e, &turn_correlation_id),
-                )));
+            let capture_messages = messages.clone();
+            let completed = match StreamMethods::run_stream_internal(session, messages).await {
+                Ok(()) => true,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                        helpers::turn_error_for(&e, &turn_correlation_id),
+                    )));
+                    false
+                }
+            };
+            if completed {
+                if let (Some(lease), Some(manager)) = (capture_lease, capture_runtime) {
+                    let mut parts = lease.provider_id.as_str().splitn(3, ':');
+                    if let (Some("extension"), Some(plugin), Some(_)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        if let Some(digest) = manager
+                            .declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)
+                        {
+                            let provider = std::sync::Arc::new(ExtensionCaptureProvider {
+                                manager,
+                                session: capture_session,
+                                plugin: plugin.to_owned(),
+                                digest,
+                                handle: tokio::runtime::Handle::current(),
+                            });
+                            let history = terminal_capture_history(
+                                &lease,
+                                &capture_messages,
+                                capture_started_at,
+                            );
+                            let _ = memory_capture_worker().submit_terminal(
+                                &lease,
+                                history,
+                                memory_context::RetentionClass::Standard,
+                                provider,
+                            );
+                        }
+                    }
+                }
             }
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
@@ -4530,7 +4657,10 @@ mod memory_context_provider_tests {
                 Some("project-memory"),
             )
             .expect("explicit exact id must resolve");
-        assert_eq!(runtime.memory_bound_providers_for_test()[0].as_str(), ADDRESS);
+        assert_eq!(
+            runtime.memory_bound_providers_for_test()[0].as_str(),
+            ADDRESS
+        );
     }
 
     /// Task A6: two installed extensions declaring overlapping context
@@ -4579,12 +4709,20 @@ mod memory_context_provider_tests {
                 memory_context::mint_explicit_command_proof(),
             )
             .expect("enable succeeds");
-        assert_eq!(ext.lease_count(), 0, "granting a memory lease spawns nothing");
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "granting a memory lease spawns nothing"
+        );
 
         let status = runtime.memory_context_disable();
         assert_eq!(status.durable, memory_context::DurableStatus::Off);
         assert_memory_off_no_lease(&runtime);
-        assert_eq!(ext.lease_count(), 0, "revocation of a never-spawned lease is a no-op");
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "revocation of a never-spawned lease is a no-op"
+        );
 
         // Idempotent: disabling again is safe and stays Off.
         let status = runtime.memory_context_disable();

@@ -22,6 +22,7 @@ pub struct CaptureFailure {
 
 struct CaptureJob {
     provider_id: ContextProviderId,
+    provider: Arc<dyn CaptureProvider>,
     capture: ChatTurnCapture,
 }
 
@@ -34,11 +35,7 @@ pub struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    pub fn new(
-        capacity: usize,
-        provider_id: ContextProviderId,
-        provider: Arc<dyn CaptureProvider>,
-    ) -> Self {
+    pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capture queue capacity must be nonzero");
         let (sender, receiver) = mpsc::sync_channel::<CaptureJob>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -49,18 +46,16 @@ impl CaptureWorker {
             .spawn(move || {
                 let mut submitted = HashSet::new();
                 while let Ok(job) = receiver.recv() {
-                    // Never route to a merely available provider: the job must
-                    // name the provider this worker was bound to.
-                    if job.provider_id != provider_id {
-                        worker_failures.fetch_add(1, Ordering::Relaxed);
+                    let id = (job.provider_id.clone(), *job.capture.capture_id.as_bytes());
+                    if submitted.contains(&id) {
                         continue;
                     }
-                    let id = *job.capture.capture_id.as_bytes();
-                    if !submitted.insert(id) {
-                        continue;
-                    }
-                    if provider.capture(job.capture).is_err() {
+                    if job.provider.capture(job.capture).is_err() {
+                        // No automatic retry: completion stays decoupled. Because a
+                        // failed ID is not committed, an explicit retry remains safe.
                         worker_failures.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        submitted.insert(id);
                     }
                 }
             })
@@ -79,6 +74,7 @@ impl CaptureWorker {
         lease: &MemoryContextLease,
         history: TerminalTurnHistory,
         retention: RetentionClass,
+        provider: Arc<dyn CaptureProvider>,
     ) -> Result<bool, CaptureBuildError> {
         if lease.mode.turn_capture() != TurnCapture::Enabled
             || lease.project_id != history.project_id
@@ -89,6 +85,7 @@ impl CaptureWorker {
         let capture = build_chat_turn_capture(&lease.project_id, history, retention)?;
         let job = CaptureJob {
             provider_id: lease.provider_id.clone(),
+            provider,
             capture,
         };
         match self.sender.try_send(job) {
@@ -135,7 +132,9 @@ mod tests {
                 let _ = receiver.recv();
             }
             if self.fail.load(Ordering::SeqCst) {
-                Err(CaptureFailure { code: "fixture_failure" })
+                Err(CaptureFailure {
+                    code: "fixture_failure",
+                })
             } else {
                 Ok(())
             }
@@ -207,9 +206,23 @@ mod tests {
             fail: AtomicBool::new(false),
             block: Mutex::new(None),
         });
-        let worker = CaptureWorker::new(4, lease().provider_id.clone(), provider.clone());
-        worker.submit_terminal(&lease(), history(1), RetentionClass::Standard).unwrap();
-        worker.submit_terminal(&lease(), history(1), RetentionClass::Standard).unwrap();
+        let worker = CaptureWorker::new(4);
+        worker
+            .submit_terminal(
+                &lease(),
+                history(1),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
+        worker
+            .submit_terminal(
+                &lease(),
+                history(1),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
         wait_until(|| provider.calls.load(Ordering::SeqCst) == 1);
         thread::sleep(Duration::from_millis(10));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -223,17 +236,67 @@ mod tests {
             fail: AtomicBool::new(false),
             block: Mutex::new(Some(release_rx)),
         });
-        let worker = CaptureWorker::new(1, lease().provider_id.clone(), provider.clone());
-        worker.submit_terminal(&lease(), history(1), RetentionClass::Standard).unwrap();
+        let worker = CaptureWorker::new(1);
+        worker
+            .submit_terminal(
+                &lease(),
+                history(1),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
         wait_until(|| provider.calls.load(Ordering::SeqCst) == 1);
-        worker.submit_terminal(&lease(), history(2), RetentionClass::Standard).unwrap();
+        worker
+            .submit_terminal(
+                &lease(),
+                history(2),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
         let started = Instant::now();
         for turn in 3..103 {
-            worker.submit_terminal(&lease(), history(turn), RetentionClass::Standard).unwrap();
+            worker
+                .submit_terminal(
+                    &lease(),
+                    history(turn),
+                    RetentionClass::Standard,
+                    provider.clone(),
+                )
+                .unwrap();
         }
         assert!(started.elapsed() < Duration::from_millis(50));
         assert_eq!(worker.overflow_drops(), 100);
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn memory_failed_capture_id_can_be_explicitly_retried() {
+        let provider = Arc::new(ProviderDouble {
+            calls: AtomicU64::new(0),
+            fail: AtomicBool::new(true),
+            block: Mutex::new(None),
+        });
+        let worker = CaptureWorker::new(2);
+        worker
+            .submit_terminal(
+                &lease(),
+                history(7),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
+        wait_until(|| worker.provider_failures() == 1);
+        provider.fail.store(false, Ordering::SeqCst);
+        worker
+            .submit_terminal(
+                &lease(),
+                history(7),
+                RetentionClass::Standard,
+                provider.clone(),
+            )
+            .unwrap();
+        wait_until(|| provider.calls.load(Ordering::SeqCst) == 2);
     }
 
     #[test]
@@ -243,10 +306,17 @@ mod tests {
             fail: AtomicBool::new(true),
             block: Mutex::new(None),
         });
-        let worker = CaptureWorker::new(1, lease().provider_id.clone(), provider);
+        let worker = CaptureWorker::new(1);
         let terminal = history(1);
         assert_eq!(terminal.outcome, TurnOutcome::Completed);
-        assert!(worker.submit_terminal(&lease(), terminal, RetentionClass::Standard).unwrap());
+        assert!(worker
+            .submit_terminal(
+                &lease(),
+                terminal,
+                RetentionClass::Standard,
+                provider.clone()
+            )
+            .unwrap());
         wait_until(|| worker.provider_failures() == 1);
     }
 }

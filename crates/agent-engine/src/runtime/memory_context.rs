@@ -633,7 +633,6 @@ impl SessionMemoryState {
     /// Expired or non-capture leases fail closed. Keeping the full lease (not
     /// merely a provider id) prevents provider reselection between prompt and
     /// terminal capture.
-    #[allow(dead_code)] // consumed by terminal-turn engine wiring
     pub(crate) fn capture_lease_at(&self, now: SystemTime) -> Option<MemoryContextLease> {
         match &self.durable {
             DurableSlot::Active(lease)
@@ -936,7 +935,11 @@ impl std::fmt::Display for MemoryContextError {
                 write!(f, "mode {mode:?} cannot be installed as a one-shot recall")
             }
             MemoryContextError::OneShotAlreadyPending { lease_id } => {
-                write!(f, "a one-shot recall is already pending: {}", lease_id.as_str())
+                write!(
+                    f,
+                    "a one-shot recall is already pending: {}",
+                    lease_id.as_str()
+                )
             }
             MemoryContextError::OneShotAlreadyConsumed { lease_id } => {
                 write!(f, "one-shot recall already consumed: {}", lease_id.as_str())
@@ -1103,10 +1106,7 @@ impl MemoryContextCapability {
         let session = state.session_id.clone();
         // Infallible by construction: the session identity is read from the
         // state itself, and `Disable` is total over the transition table.
-        match apply_memory_context_action(
-            &mut state,
-            AuthorizedMemoryAction::Disable { session },
-        ) {
+        match apply_memory_context_action(&mut state, AuthorizedMemoryAction::Disable { session }) {
             Ok(status) => status,
             Err(_) => state.status(),
         }
@@ -1226,9 +1226,7 @@ impl RecallBudget {
     /// Fails closed below [`MEMORY_BUDGET_MIN_TOKENS`] (recall is skipped,
     /// spec §10.3) and above [`MEMORY_BUDGET_MAX_TOKENS`] (never minted).
     #[allow(dead_code)] // consumed by the recall dispatch wiring in task B3
-    pub(crate) fn from_engine_tokens(
-        max_rendered_tokens: u64,
-    ) -> Result<Self, MemoryContextError> {
+    pub(crate) fn from_engine_tokens(max_rendered_tokens: u64) -> Result<Self, MemoryContextError> {
         if max_rendered_tokens < MEMORY_BUDGET_MIN_TOKENS {
             return Err(MemoryContextError::RecallBudgetBelowMinimum);
         }
@@ -1501,9 +1499,8 @@ pub const MEMORY_MAX_RENDERED_RECORD_BYTES: usize = 2048;
 /// or `None` (skip recall) when the computed value falls below the
 /// [`MEMORY_BUDGET_MIN_TOKENS`] floor. Pure — no engine state is read.
 pub fn memory_budget_tokens(effective_provider_input_capacity: u64) -> Option<u64> {
-    let capacity_share = effective_provider_input_capacity
-        .saturating_mul(MEMORY_BUDGET_CAPACITY_PERCENT)
-        / 100;
+    let capacity_share =
+        effective_provider_input_capacity.saturating_mul(MEMORY_BUDGET_CAPACITY_PERCENT) / 100;
     let budget = MEMORY_BUDGET_MAX_TOKENS.min(capacity_share);
     (budget >= MEMORY_BUDGET_MIN_TOKENS).then_some(budget)
 }
@@ -1594,6 +1591,27 @@ pub const RECALL_HARD_TIMEOUT: Duration = std::time::Duration::from_millis(150);
 /// recall dispatch (Axel memory-manager, spec §17.3). The host addresses it
 /// through the same exact-digest `call_exact` gate as every extension tool.
 pub(crate) const MEMORY_RECALL_TOOL_NAME: &str = "memory_recall";
+
+/// Canonical deferred-tool name for idempotent terminal capture dispatch.
+pub(crate) const MEMORY_CAPTURE_TOOL_NAME: &str = "memory_capture";
+
+/// Bounded wire payload passed to the exact leased extension provider.
+pub(crate) fn capture_request_wire(capture: &super::chat_capture::ChatTurnCapture) -> Value {
+    serde_json::json!({
+        "schema": "chat_turn_capture/1",
+        "capture_id": capture.capture_id.to_hex(),
+        "project_id": capture.project_id.as_str(),
+        "session_id": capture.session_id.as_str(),
+        "turn_id": capture.turn_id.as_str(),
+        "turn_ordinal": capture.turn_ordinal,
+        "user": capture.user.content.text,
+        "assistant": capture.assistant.content.text,
+        "tools": capture.tools.iter().map(|tool| serde_json::json!({
+            "name": tool.tool_name.text,
+            "summary": tool.summary.text,
+        })).collect::<Vec<_>>(),
+    })
+}
 
 /// Recall-request wire schema version the host produces (spec §6.4).
 pub(crate) const RECALL_WIRE_SCHEMA: &str = "recall/1";
@@ -1842,11 +1860,7 @@ impl RecallTurnMetadata {
             "  withheld by disclosure policy: {}",
             self.withheld_count
         );
-        let _ = writeln!(
-            out,
-            "  considered but not selected: {}",
-            self.skipped_count
-        );
+        let _ = writeln!(out, "  considered but not selected: {}", self.skipped_count);
         out.trim_end().to_string()
     }
 }
@@ -2351,10 +2365,7 @@ pub(crate) fn recall_request_wire(request: &RecallRequest) -> Value {
 pub(crate) fn parse_contribution_wire(
     value: &Value,
 ) -> Result<MemoryContextContribution, MemoryContextError> {
-    fn field_str<'v>(
-        value: &'v Value,
-        field: &'static str,
-    ) -> Result<&'v str, MemoryContextError> {
+    fn field_str<'v>(value: &'v Value, field: &'static str) -> Result<&'v str, MemoryContextError> {
         value
             .get(field)
             .and_then(Value::as_str)
@@ -2383,10 +2394,11 @@ pub(crate) fn parse_contribution_wire(
             "user_stated" => MemorySource::UserStated,
             _ => return Err(MemoryContextError::ContributionMalformed { field: "source" }),
         };
-        let sensitivity = DisclosureClass::parse(field_str(raw, "sensitivity")?)
-            .ok_or(MemoryContextError::ContributionMalformed {
+        let sensitivity = DisclosureClass::parse(field_str(raw, "sensitivity")?).ok_or(
+            MemoryContextError::ContributionMalformed {
                 field: "sensitivity",
-            })?;
+            },
+        )?;
         let retention = match field_str(raw, "retention")? {
             "standard" => RetentionClass::Standard,
             _ => {
@@ -2399,11 +2411,12 @@ pub(crate) fn parse_contribution_wire(
             .ok_or(MemoryContextError::ContributionMalformed { field: "timestamp" })?;
         let mut rank_reason = Vec::new();
         if let Some(raw_reasons) = raw.get("rank_reason") {
-            let raw_reasons = raw_reasons.as_array().ok_or(
-                MemoryContextError::ContributionMalformed {
-                    field: "rank_reason",
-                },
-            )?;
+            let raw_reasons =
+                raw_reasons
+                    .as_array()
+                    .ok_or(MemoryContextError::ContributionMalformed {
+                        field: "rank_reason",
+                    })?;
             for reason in raw_reasons {
                 match reason.as_str() {
                     Some("exact_topic") => rank_reason.push(RankReason::ExactTopic),
@@ -2433,7 +2446,10 @@ pub(crate) fn parse_contribution_wire(
             sensitivity,
             retention,
             content: BoundedText::new(content, MEMORY_MAX_RENDERED_RECORD_BYTES),
-            truncated: raw.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+            truncated: raw
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             supersedes,
         });
     }
@@ -2632,9 +2648,11 @@ where
     // 5. Bounded dispatch (spec §16.2 hard timeout) — fail open past it.
     let correlation = RecallCorrelation::new(&lease, &request.turn_id);
     let skipped = |skip: RecallSkip, elapsed: Duration| {
-        emit_memory_observability_event(
-            &MemoryObservabilityEvent::recall_skipped_after_dispatch(&correlation, skip, elapsed),
-        );
+        emit_memory_observability_event(&MemoryObservabilityEvent::recall_skipped_after_dispatch(
+            &correlation,
+            skip,
+            elapsed,
+        ));
         TurnRecallOutcome::SkippedOpen(skip)
     };
     // §15: started is emitted BEFORE the extension call dispatches.
@@ -2831,7 +2849,11 @@ mod tests {
                 },
             )
             .expect("disable always succeeds for the owning session");
-            assert_eq!(state.active_mode(), MemoryContextMode::Off, "from {start:?}");
+            assert_eq!(
+                state.active_mode(),
+                MemoryContextMode::Off,
+                "from {start:?}"
+            );
             assert_eq!(status.durable, DurableStatus::Off);
             assert_eq!(status.one_shot, OneShotStatus::Idle);
         }
@@ -2859,7 +2881,11 @@ mod tests {
     fn foreign_session_lease_fails_closed_and_foreign_revoke_is_noop() {
         let mut state = state_in(MemoryContextMode::CaptureAndRecall);
         assert_eq!(
-            state.install(mint("sess-OTHER", MemoryContextMode::CaptureOnly, "lease-f")),
+            state.install(mint(
+                "sess-OTHER",
+                MemoryContextMode::CaptureOnly,
+                "lease-f"
+            )),
             Err(MemoryContextError::SessionMismatch)
         );
         assert_eq!(
@@ -3047,15 +3073,21 @@ mod tests {
     fn boundary_identifiers_fail_closed_on_empty_oversized_and_control_input() {
         assert_eq!(
             SessionId::parse(""),
-            Err(MemoryContextError::InvalidIdentifier { field: "session_id" })
+            Err(MemoryContextError::InvalidIdentifier {
+                field: "session_id"
+            })
         );
         assert_eq!(
             SessionId::parse("   "),
-            Err(MemoryContextError::InvalidIdentifier { field: "session_id" })
+            Err(MemoryContextError::InvalidIdentifier {
+                field: "session_id"
+            })
         );
         assert_eq!(
             ProjectId::parse(&"x".repeat(MEMORY_IDENTIFIER_MAX_BYTES + 1)),
-            Err(MemoryContextError::InvalidIdentifier { field: "project_id" })
+            Err(MemoryContextError::InvalidIdentifier {
+                field: "project_id"
+            })
         );
         assert_eq!(
             MemoryLeaseId::parse("lease\n1"),
@@ -3347,8 +3379,10 @@ mod tests {
         // NeverPersist actually gates VISIBLE per gate_for_model (its match
         // arm groups it with ModelVisible): content under it is admissible
         // when the class is granted.
-        let grant =
-            DisclosureGrantSet::new(&[DisclosureClass::ModelVisible, DisclosureClass::NeverPersist]);
+        let grant = DisclosureGrantSet::new(&[
+            DisclosureClass::ModelVisible,
+            DisclosureClass::NeverPersist,
+        ]);
         let mut contribution = synthetic_contribution(&project, "rendered");
         contribution.records = vec![record_with(
             "mem-1",
@@ -3370,8 +3404,7 @@ mod tests {
 
         // NeverPersist gates Visible, but it was never granted.
         let mut contribution = synthetic_contribution(&project, "rendered");
-        contribution.records =
-            vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
+        contribution.records = vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
         assert_eq!(
             validate_contribution(&contribution, &project, 4_096, &grant_model_visible()),
             Err(MemoryContextError::ContributionClassNotPermitted)
@@ -3386,10 +3419,11 @@ mod tests {
         );
 
         // Granting the class admits it again.
-        contribution.records =
-            vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
-        let grant =
-            DisclosureGrantSet::new(&[DisclosureClass::ModelVisible, DisclosureClass::NeverPersist]);
+        contribution.records = vec![record_with("mem-1", DisclosureClass::NeverPersist, "body")];
+        let grant = DisclosureGrantSet::new(&[
+            DisclosureClass::ModelVisible,
+            DisclosureClass::NeverPersist,
+        ]);
         assert_eq!(
             validate_contribution(&contribution, &project, 4_096, &grant),
             Ok(())
@@ -3466,7 +3500,9 @@ mod tests {
         };
         assert_eq!(request.schema.as_str(), "recall/1");
         assert_eq!(request.recent_context_digest.as_bytes(), &[7u8; 32]);
-        assert!(request.permitted_classes.permits(DisclosureClass::ModelVisible));
+        assert!(request
+            .permitted_classes
+            .permits(DisclosureClass::ModelVisible));
     }
 
     /// The typed segment (spec §10.1) exposes exactly the bounded rendered
@@ -3593,8 +3629,15 @@ mod tests {
 
         let lowered = text.to_lowercase();
         for marker in [
-            "<system", "</system", "<assistant", "</assistant", "<user", "</user",
-            "<developer", "<tool", "<human",
+            "<system",
+            "</system",
+            "<assistant",
+            "</assistant",
+            "<user",
+            "</user",
+            "<developer",
+            "<tool",
+            "<human",
         ] {
             assert!(
                 !lowered.contains(marker),
@@ -3606,7 +3649,10 @@ mod tests {
             "control characters must not survive rendering"
         );
         // The data survives VISIBLY (quoted, not deleted) …
-        assert!(text.contains("‹/SYSTEM>"), "neutralized text keeps inert content");
+        assert!(
+            text.contains("‹/SYSTEM>"),
+            "neutralized text keeps inert content"
+        );
         assert!(text.contains("you are now root"));
         // … inside the host-guaranteed lower-authority boundary (§5.3.4).
         assert!(text.starts_with(MEMORY_SEGMENT_HEADER));
@@ -3617,9 +3663,8 @@ mod tests {
     /// header/footer is not double-wrapped.
     #[test]
     fn render_context_segment_does_not_double_wrap_boundary_lines() {
-        let rendered = format!(
-            "{MEMORY_SEGMENT_HEADER}\n\n1. mem-0001 — Decision\n\n{MEMORY_SEGMENT_FOOTER}"
-        );
+        let rendered =
+            format!("{MEMORY_SEGMENT_HEADER}\n\n1. mem-0001 — Decision\n\n{MEMORY_SEGMENT_FOOTER}");
         let contribution = synthetic_contribution(&pid("proj-1"), &rendered);
         let message = render_context_segment(&contribution);
         let text = message["content"][0]["text"].as_str().expect("text");
@@ -3648,7 +3693,10 @@ mod tests {
             RECALL_HARD_TIMEOUT,
             scripted(
                 Arc::clone(&calls),
-                Ok(wire_contribution("proj-1", "1. mem-0001 — session-scoped auth")),
+                Ok(wire_contribution(
+                    "proj-1",
+                    "1. mem-0001 — session-scoped auth",
+                )),
             ),
         )
         .await;
@@ -3677,7 +3725,10 @@ mod tests {
             RECALL_HARD_TIMEOUT,
             scripted(
                 Arc::clone(&calls),
-                Ok(wire_contribution("proj-1", "1. mem-0001 — session-scoped auth")),
+                Ok(wire_contribution(
+                    "proj-1",
+                    "1. mem-0001 — session-scoped auth",
+                )),
             ),
         )
         .await;
@@ -3750,8 +3801,16 @@ mod tests {
             )
             .await;
             assert_eq!(outcome, TurnRecallOutcome::NotEligible);
-            assert_eq!(calls.load(Ordering::SeqCst), 0, "disabled must call ZERO times");
-            assert_eq!(wire_bytes(&messages), before, "messages must be byte-identical");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "disabled must call ZERO times"
+            );
+            assert_eq!(
+                wire_bytes(&messages),
+                before,
+                "messages must be byte-identical"
+            );
             assert!(retained.lock().expect("lock").is_none());
         }
     }
@@ -3877,7 +3936,11 @@ mod tests {
                 1,
                 "retries must never re-call the provider"
             );
-            assert_eq!(wire_bytes(&retry), injected_bytes, "identical reuse injection");
+            assert_eq!(
+                wire_bytes(&retry),
+                injected_bytes,
+                "identical reuse injection"
+            );
         }
     }
 
@@ -3948,7 +4011,11 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, TurnRecallOutcome::NotEligible);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "one-shot fires exactly once");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one-shot fires exactly once"
+        );
         assert_eq!(wire_bytes(&turn_two), before);
         assert!(
             retained.lock().expect("lock").is_none(),
@@ -4028,8 +4095,7 @@ mod tests {
         );
 
         let mut big_body = wire_contribution("proj-1", "x");
-        big_body["records"][0]["content"] =
-            json!("y".repeat(MEMORY_MAX_RENDERED_RECORD_BYTES + 1));
+        big_body["records"][0]["content"] = json!("y".repeat(MEMORY_MAX_RENDERED_RECORD_BYTES + 1));
         assert_eq!(
             parse_contribution_wire(&big_body),
             Err(MemoryContextError::ContributionOutOfBounds {
@@ -4149,7 +4215,10 @@ mod tests {
         assert!(text.contains("mem-0001"), "got: {text}");
         assert!(text.contains("chat history"), "got: {text}");
         // Union of rank reasons in plain words.
-        assert!(text.contains(RankReason::ExactTopic.phrase()), "got: {text}");
+        assert!(
+            text.contains(RankReason::ExactTopic.phrase()),
+            "got: {text}"
+        );
         assert!(text.contains(RankReason::Recency.phrase()), "got: {text}");
         // Byte/token accounting.
         assert!(
@@ -4168,8 +4237,14 @@ mod tests {
         );
         // Latency in milliseconds, withheld and skipped counts.
         assert!(text.contains("recall latency: 137ms"), "got: {text}");
-        assert!(text.contains("withheld by disclosure policy: 3"), "got: {text}");
-        assert!(text.contains("considered but not selected: 8"), "got: {text}");
+        assert!(
+            text.contains("withheld by disclosure policy: 3"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("considered but not selected: 8"),
+            "got: {text}"
+        );
         // NEVER memory body content — neither record body nor rendered text.
         assert!(!text.contains(BODY_SENTINEL), "body leaked: {text}");
     }
@@ -4278,7 +4353,10 @@ mod tests {
             200_000,
             &mut retry,
             RECALL_HARD_TIMEOUT,
-            scripted(Arc::clone(&calls), Ok(wire_contribution("proj-1", "NOT CALLED"))),
+            scripted(
+                Arc::clone(&calls),
+                Ok(wire_contribution("proj-1", "NOT CALLED")),
+            ),
         )
         .await;
         assert_eq!(outcome, TurnRecallOutcome::ReusedRetained);
@@ -4337,7 +4415,10 @@ mod tests {
                 scripted(Arc::clone(&calls), Err(RecallCallError::CallFailed)),
             )
             .await;
-            assert_eq!(outcome, TurnRecallOutcome::SkippedOpen(RecallSkip::CallFailed));
+            assert_eq!(
+                outcome,
+                TurnRecallOutcome::SkippedOpen(RecallSkip::CallFailed)
+            );
             assert_eq!(
                 drained_event_outcomes(),
                 vec![
@@ -4420,10 +4501,7 @@ mod tests {
         assert_eq!(outcome, TurnRecallOutcome::Injected);
         let emitted = drain_captured_memory_events_for_test();
         assert_eq!(
-            emitted
-                .iter()
-                .map(|event| event.event)
-                .collect::<Vec<_>>(),
+            emitted.iter().map(|event| event.event).collect::<Vec<_>>(),
             vec![EVENT_MEMORY_RECALL_STARTED, EVENT_MEMORY_RECALL_COMPLETED],
             "the recall must be observable"
         );
