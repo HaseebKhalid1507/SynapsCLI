@@ -29,6 +29,36 @@ fn project_plugins_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a `plugins/` directory entry name denotes an INERT copy of a
+/// plugin — a backup, disabled, or temporary directory — rather than an
+/// installed plugin. Inert directories are excluded from discovery so a
+/// stale copy can never register tools or execute alongside the real one
+/// (user incident: `axel-memory-manager.backup.<TS>` dirs were discovered
+/// as live plugins and their binaries spawned next to the real v0.3).
+///
+/// Name-based and conservative: only well-known suffix conventions (plus
+/// the timestamped `.backup.<...>` infix) are excluded, so legitimate
+/// dotted/hyphenated plugin names (`com.example.notes`, `backup-manager`)
+/// stay discoverable. Exact plugin IDs of surviving plugins are untouched.
+fn is_inert_plugin_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // Timestamped backups: `<plugin>.backup.20260720101416`.
+    if lower.contains(".backup.") {
+        return true;
+    }
+    const INERT_SUFFIXES: &[&str] = &[
+        ".backup",
+        ".update-backup", // written by the plugin updater
+        ".bak",
+        ".disabled",
+        ".old",
+        ".orig",
+        ".tmp",
+        ".temp",
+    ];
+    INERT_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
+
 fn installed_plugin_setup_failure_in(
     state: &crate::skills::state::PluginsState,
     plugin_name: &str,
@@ -1567,6 +1597,14 @@ impl ExtensionManager {
 
             for entry in entries.flatten() {
                 let plugin_name = entry.file_name().to_string_lossy().to_string();
+                if is_inert_plugin_dir_name(&plugin_name) {
+                    tracing::debug!(
+                        plugin = %plugin_name,
+                        path = %entry.path().display(),
+                        "Skipping backup/disabled/temp plugin directory"
+                    );
+                    continue;
+                }
                 plugin_dirs.insert(plugin_name, entry.path());
             }
         }
@@ -2464,5 +2502,147 @@ mod tests {
             Some("setup.sh"),
         );
         assert!(hint.contains("Extension binary missing"), "got {hint}");
+    }
+
+    // ── bugfix: installed-plugin backup discovery ───────────────────────────
+
+    /// Minimal deferred tool-only plugin.json (Axel-shaped: `memory_fetch`
+    /// takes a single `{id}`), written under `<dir>/.synaps-plugin/`.
+    fn write_installed_plugin(plugins_root: &std::path::Path, dir_name: &str) {
+        let plugin_dir = plugins_root.join(dir_name).join(".synaps-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let manifest = serde_json::json!({
+            "extension": {
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": ["tools.register"],
+                "deferred": {
+                    "tools": [{
+                        "name": "memory_fetch",
+                        "description": "Fetch one memory by exact ID.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}},
+                            "required": ["id"]
+                        }
+                    }]
+                }
+            }
+        });
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Regression (user incident, session 20260720-141844-fb5a): `plugins/`
+    /// held the installed `axel-memory-manager` AND timestamped copies
+    /// (`axel-memory-manager.backup.<TS>`). Discovery treated every
+    /// directory with a valid manifest as a live plugin, so the backups
+    /// were loaded and their binaries executed alongside the real one.
+    /// Backup/disabled/temp directory names must never be discovered: only
+    /// active plugins load, backup tools are never cataloged, and (since a
+    /// backup that is never loaded owns no lease) a backup process can
+    /// never be spawned.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn discover_and_load_skips_backup_and_disabled_plugin_directories() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _no_project_plugins =
+            crate::test_env::EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
+        let plugins_root = base.path().join("plugins");
+
+        write_installed_plugin(&plugins_root, "axel-memory-manager");
+        // The two timestamped backups from the incident, the updater's own
+        // `.update-backup` convention, and common manual conventions.
+        for inert in [
+            "axel-memory-manager.backup.20260719210053",
+            "axel-memory-manager.backup.20260720101416",
+            "axel-memory-manager.update-backup",
+            "axel-memory-manager.backup",
+            "axel-memory-manager.bak",
+            "axel-memory-manager.disabled",
+            "axel-memory-manager.old",
+            "axel-memory-manager.orig",
+            "axel-memory-manager.tmp",
+        ] {
+            write_installed_plugin(&plugins_root, inert);
+        }
+        // Dotted names that are NOT backups stay discoverable.
+        write_installed_plugin(&plugins_root, "com.example.notes");
+
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::ToolRegistry::without_subagent(),
+        ));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry.clone());
+        mgr.set_progressive_deferral(true);
+
+        let (mut loaded, failed) = mgr.discover_and_load().await;
+        loaded.sort();
+
+        assert!(failed.is_empty(), "no failures expected: {failed:?}");
+        assert_eq!(
+            loaded,
+            vec![
+                "axel-memory-manager".to_string(),
+                "com.example.notes".to_string()
+            ],
+            "backup/disabled/temp plugin directories must not be discovered"
+        );
+
+        let reg = registry.read().await;
+        assert!(reg.get("axel-memory-manager:memory_fetch").is_some());
+        assert!(reg.get("com.example.notes:memory_fetch").is_some());
+        assert!(
+            reg.get("axel-memory-manager.backup.20260719210053:memory_fetch")
+                .is_none(),
+            "backup plugin tools must never be cataloged"
+        );
+        assert!(reg
+            .get("axel-memory-manager.backup.20260720101416:memory_fetch")
+            .is_none());
+        drop(reg);
+
+        // Deferred lifecycle + no backup load ⇒ zero live extension
+        // processes were started by discovery.
+        assert_eq!(mgr.count(), 0, "discovery must spawn nothing");
+    }
+
+    /// The exclusion helper is name-based and conservative: it must catch
+    /// known backup/disabled/temp conventions without swallowing
+    /// legitimate dotted or hyphenated plugin names.
+    #[test]
+    fn inert_plugin_dir_name_filter_is_exact() {
+        for inert in [
+            "axel-memory-manager.backup.20260720101416",
+            "axel-memory-manager.BACKUP.1",
+            "axel-memory-manager.backup",
+            "axel-memory-manager.update-backup",
+            "axel-memory-manager.bak",
+            "axel-memory-manager.disabled",
+            "axel-memory-manager.old",
+            "axel-memory-manager.orig",
+            "axel-memory-manager.tmp",
+            "axel-memory-manager.temp",
+        ] {
+            assert!(
+                is_inert_plugin_dir_name(inert),
+                "{inert} should be excluded from discovery"
+            );
+        }
+        for live in [
+            "axel-memory-manager",
+            "com.example.notes",
+            "backup-manager",
+            "old-school-tools",
+            "tmpfs-inspector",
+            "my.backups.viewer",
+        ] {
+            assert!(
+                !is_inert_plugin_dir_name(live),
+                "{live} is a legitimate plugin name and must stay discoverable"
+            );
+        }
     }
 }

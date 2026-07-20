@@ -343,11 +343,28 @@ impl ToolRegistry {
         let mut input_name_maps = HashMap::new();
         let mut schema = Vec::with_capacity(self.tools.len());
 
-        // Sort by runtime name for deterministic API name assignment.
-        // HashMap iteration is random, so without sorting, collision suffixes
-        // (_2, _3) could change between rebuilds, breaking in-flight conversations.
+        // Sort by (origin class, runtime name) for deterministic API name
+        // assignment. HashMap iteration is random, so without sorting,
+        // collision suffixes (_2, _3) could change between rebuilds,
+        // breaking in-flight conversations.
+        //
+        // Built-ins claim their API names FIRST (memory-fetch schema
+        // collision bugfix): an extension/MCP runtime name like
+        // `memory:fetch` sanitizes to `memory_fetch`, and pure
+        // lexicographic order let it win the built-in's exact wire name
+        // (':' sorts before '_'), demoting the built-in to `memory_fetch_2`
+        // and exposing the extension's schema under the built-in's name.
+        // With class priority the built-in keeps its name and the colliding
+        // non-built-in gets the deterministic suffix. This only reorders
+        // NAME ASSIGNMENT; execution-gate resolution is unchanged.
         let mut sorted_tools: Vec<_> = self.tools.values().collect();
-        sorted_tools.sort_by_key(|t| t.name().to_string());
+        sorted_tools.sort_by_key(|t| {
+            let builtin_first = match t.origin() {
+                crate::tools::ToolOrigin::Builtin => 0u8,
+                _ => 1u8,
+            };
+            (builtin_first, t.name().to_string())
+        });
 
         for tool in sorted_tools {
             let runtime_name = tool.name();
@@ -711,6 +728,98 @@ mod tests {
             registry.runtime_name_for_api("plugin_skill_tool"),
             "plugin:skill.tool"
         );
+    }
+
+    /// Regression (memory-fetch schema collision): an extension runtime
+    /// name that SANITIZES to a built-in wire name (`memory:fetch` →
+    /// `memory_fetch`) must never claim the built-in's API name — pure
+    /// lexicographic assignment let it (':' sorts before '_'), demoting the
+    /// built-in to `memory_fetch_2` and inviting models to call the
+    /// extension `{id}` schema as if it were the built-in `{ids}` tool.
+    /// Built-ins get naming priority; extension tools keep stable
+    /// NAMESPACED API names derived from their `<plugin>:<tool>` runtime
+    /// names and never surface a bare leaf name.
+    #[test]
+    fn extension_leaf_name_never_shadows_builtin_memory_fetch_api_name() {
+        struct ExtMemoryTool {
+            runtime: &'static str,
+            ext: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Tool for ExtMemoryTool {
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Extension {
+                    extension_id: self.ext.to_string(),
+                }
+            }
+            fn extension_id(&self) -> Option<&str> {
+                Some(self.ext)
+            }
+            fn name(&self) -> &str {
+                self.runtime
+            }
+            fn description(&self) -> &str {
+                "extension memory tool (single-id schema)"
+            }
+            fn parameters(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                })
+            }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                Ok("ok".to_string())
+            }
+        }
+
+        let registry = ToolRegistry::from_tools(vec![
+            Arc::new(crate::tools::memory::MemoryFetchTool),
+            // Adversarial: sanitizes to exactly `memory_fetch`.
+            Arc::new(ExtMemoryTool {
+                runtime: "memory:fetch",
+                ext: "memory",
+            }),
+            // Realistic Axel shape: distinct namespaced API name.
+            Arc::new(ExtMemoryTool {
+                runtime: "axel-memory-manager:memory_fetch",
+                ext: "axel-memory-manager",
+            }),
+        ]);
+
+        // The built-in keeps its exact wire name and its `{ids}` schema.
+        assert_eq!(
+            registry.runtime_name_for_api("memory_fetch"),
+            "memory_fetch",
+            "wire name `memory_fetch` must resolve to the built-in"
+        );
+        let schema = registry.tools_schema();
+        let builtin = schema
+            .iter()
+            .find(|e| e["name"] == "memory_fetch")
+            .expect("built-in memory_fetch exposed");
+        assert_eq!(
+            builtin["input_schema"]["required"],
+            json!(["ids"]),
+            "built-in memory_fetch schema must remain {{ids: [...]}}"
+        );
+
+        // Extension tools surface only under namespaced API names.
+        let axel = schema
+            .iter()
+            .find(|e| e["name"] == "axel-memory-manager_memory_fetch")
+            .expect("extension tool exposed under namespaced API name");
+        assert_eq!(axel["input_schema"]["required"], json!(["id"]));
+        // The adversarial collision gets a deterministic suffix — never
+        // the built-in's exact name.
+        assert_eq!(
+            registry.runtime_name_for_api("memory_fetch_2"),
+            "memory:fetch"
+        );
+        // And wire-call resolution for the built-in name reaches the
+        // built-in tool identity, not the extension.
+        let resolved = registry.resolve_wire_call("memory_fetch").unwrap();
+        assert_eq!(resolved.runtime_name(), "memory_fetch");
     }
 
     #[test]
@@ -1078,7 +1187,9 @@ mod tests {
     #[test]
     fn memory_context_present_in_primary_registry_absent_in_recursive_ones() {
         assert!(ToolRegistry::new().get("memory_context").is_some());
-        assert!(ToolRegistry::without_subagent().get("memory_context").is_none());
+        assert!(ToolRegistry::without_subagent()
+            .get("memory_context")
+            .is_none());
 
         let merged = ToolRegistry::without_subagent_with_extensions(&ToolRegistry::new());
         assert!(
