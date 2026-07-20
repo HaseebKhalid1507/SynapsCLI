@@ -322,6 +322,128 @@ fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val:
     }
 }
 
+/// Continuous-memory settings surface (Task A2, spec §12). Every field is
+/// fail-closed: unknown or invalid values warn and keep the compiled default.
+///
+/// By construction this struct is the complete `memory.*` config surface.
+/// Secret handling, retention, and project-scope rules are deliberately NOT
+/// fields here — they are not configurable at all (spec §12: "Secret,
+/// retention, and project rules are not configurable to fail open").
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryConfig {
+    /// Durable default memory mode. "off" unless the operator explicitly
+    /// consents via `memory.default_mode_confirmed = true` in the same
+    /// config parse pass (spec §12 operator-consent rule). Known values:
+    /// off | recall_once | recall_each_prompt | capture_only |
+    /// capture_and_recall (spec §6.1).
+    pub default_mode: String,
+    /// Operator-consent latch for `default_mode` (spec §12). Must be set to
+    /// `true` in the same parse pass for a non-"off" `default_mode` to take
+    /// effect; otherwise `default_mode` reverts to "off" with a warning.
+    pub default_mode_confirmed: bool,
+    /// Max records surfaced per recall (spec §10.3 budget).
+    pub recall_max_records: u32,
+    /// Max tokens surfaced per recall (spec §10.3 budget).
+    pub recall_max_tokens: u32,
+    /// Recall time budget in milliseconds (spec §16).
+    pub recall_timeout_ms: u64,
+    /// Tool-result capture policy: off | summary_only (spec §11).
+    pub capture_tools: String,
+    /// Capture assistant turns (spec §8.2).
+    pub capture_assistant: bool,
+    /// Capture user turns (spec §8.2).
+    pub capture_user: bool,
+    /// Background consolidation: off | on (spec §11.3, explicit opt-in).
+    pub auto_consolidate: String,
+    /// Local embedding models: off | on (spec §11.2, never implicit).
+    pub local_embeddings: String,
+    /// GLiNER entity extraction: off | on (spec §11.2, never implicit).
+    pub gliner: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: "off".to_string(),
+            default_mode_confirmed: false,
+            recall_max_records: 8,
+            recall_max_tokens: 4096,
+            recall_timeout_ms: 150,
+            capture_tools: "summary_only".to_string(),
+            capture_assistant: true,
+            capture_user: true,
+            auto_consolidate: "off".to_string(),
+            local_embeddings: "off".to_string(),
+            gliner: "off".to_string(),
+        }
+    }
+}
+
+/// Memory mode strings accepted by `memory.default_mode` (spec §6.1,
+/// snake_case of `MemoryContextMode`). Anything else fails closed to the
+/// current value — `default_mode` can never silently become a non-off mode
+/// through an unrecognised string.
+const KNOWN_MEMORY_MODES: &[&str] = &[
+    "off",
+    "recall_once",
+    "recall_each_prompt",
+    "capture_only",
+    "capture_and_recall",
+];
+
+/// Parse `memory.<field>` keys (Task A2, spec §12). Invalid values warn and
+/// keep the default (parity with turn_budget.* parsing) — never fail open.
+fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
+    let Some(field) = key.strip_prefix("memory.") else {
+        return;
+    };
+    /// Strict boolean: recognised forms parse; anything else warns and
+    /// keeps the current (default) value.
+    fn parse_bool(slot: &mut bool, key: &str, val: &str) {
+        match val {
+            "true" | "1" | "yes" | "on" => *slot = true,
+            "false" | "0" | "no" | "off" => *slot = false,
+            other => eprintln!(
+                "Warning: invalid value for {key}: '{other}', expected true/false — using default"
+            ),
+        }
+    }
+    /// Closed string-enum: value must be in `allowed`, else warn and keep
+    /// the current (default) value.
+    fn parse_enum(slot: &mut String, key: &str, val: &str, allowed: &[&str]) {
+        if allowed.contains(&val) {
+            *slot = val.to_string();
+        } else {
+            eprintln!(
+                "Warning: invalid value for {key}: '{val}', expected one of {} — using default",
+                allowed.join("|")
+            );
+        }
+    }
+    macro_rules! set_num {
+        ($slot:expr, $ty:ty) => {
+            match val.parse::<$ty>() {
+                Ok(parsed) => $slot = parsed,
+                Err(_) => eprintln!("Warning: invalid value for {key}: '{val}', using default"),
+            }
+        };
+    }
+    match field {
+        "default_mode" => parse_enum(&mut memory.default_mode, key, val, KNOWN_MEMORY_MODES),
+        "default_mode_confirmed" => parse_bool(&mut memory.default_mode_confirmed, key, val),
+        "recall_max_records" => set_num!(memory.recall_max_records, u32),
+        "recall_max_tokens" => set_num!(memory.recall_max_tokens, u32),
+        "recall_timeout_ms" => set_num!(memory.recall_timeout_ms, u64),
+        "capture_tools" => parse_enum(&mut memory.capture_tools, key, val, &["off", "summary_only"]),
+        "capture_assistant" => parse_bool(&mut memory.capture_assistant, key, val),
+        "capture_user" => parse_bool(&mut memory.capture_user, key, val),
+        "auto_consolidate" => parse_enum(&mut memory.auto_consolidate, key, val, &["off", "on"]),
+        "local_embeddings" => parse_enum(&mut memory.local_embeddings, key, val, &["off", "on"]),
+        "gliner" => parse_enum(&mut memory.gliner, key, val, &["off", "on"]),
+        other => eprintln!("Warning: unknown memory field '{other}'"),
+    }
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -384,6 +506,8 @@ pub struct SynapsConfig {
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
     pub turn_budgets: TurnBudgetsConfig,
+    /// Continuous-memory settings surface (Task A2, spec §12).
+    pub memory: MemoryConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
@@ -427,6 +551,7 @@ impl Default for SynapsConfig {
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
+            memory: MemoryConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -895,6 +1020,8 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     parse_events_config_key(&mut config.events, key, val);
                 } else if key.starts_with("turn_budget.") {
                     parse_turn_budget_config_key(&mut config.turn_budgets, key, val);
+                } else if key.starts_with("memory.") {
+                    parse_memory_config_key(&mut config.memory, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config
                         .provider_keys
@@ -920,6 +1047,19 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 }
             }
         }
+    }
+
+    // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
+    // `memory.default_mode` takes effect only when the operator also set
+    // `memory.default_mode_confirmed = true` in this same parse pass.
+    // Checked after the loop so key order never matters.
+    if config.memory.default_mode != "off" && !config.memory.default_mode_confirmed {
+        config.warnings.push(format!(
+            "memory.default_mode = {} requires memory.default_mode_confirmed = true \
+             in the same config; reverting to off",
+            config.memory.default_mode
+        ));
+        config.memory.default_mode = "off".to_string();
     }
 
     // Derive max_message_size from context_window if not explicitly set.
@@ -1072,6 +1212,149 @@ mod tests {
         // Invalid values keep the default (None).
         let bad = super::load_config_from_str("turn_budget.worker.max_provider_rounds = nope\n");
         assert_eq!(bad.turn_budgets.worker.max_provider_rounds, None);
+    }
+
+    #[test]
+    fn memory_keys_all_parse_with_consent() {
+        let config = super::load_config_from_str(
+            "memory.default_mode = capture_and_recall\n\
+             memory.default_mode_confirmed = true\n\
+             memory.recall_max_records = 12\n\
+             memory.recall_max_tokens = 2048\n\
+             memory.recall_timeout_ms = 250\n\
+             memory.capture_tools = off\n\
+             memory.capture_assistant = false\n\
+             memory.capture_user = false\n\
+             memory.auto_consolidate = on\n\
+             memory.local_embeddings = on\n\
+             memory.gliner = on\n",
+        );
+        assert_eq!(config.memory.default_mode, "capture_and_recall");
+        assert!(config.memory.default_mode_confirmed);
+        assert_eq!(config.memory.recall_max_records, 12);
+        assert_eq!(config.memory.recall_max_tokens, 2048);
+        assert_eq!(config.memory.recall_timeout_ms, 250);
+        assert_eq!(config.memory.capture_tools, "off");
+        assert!(!config.memory.capture_assistant);
+        assert!(!config.memory.capture_user);
+        assert_eq!(config.memory.auto_consolidate, "on");
+        assert_eq!(config.memory.local_embeddings, "on");
+        assert_eq!(config.memory.gliner, "on");
+    }
+
+    #[test]
+    fn memory_defaults_match_spec_12() {
+        let config = super::load_config_from_str("");
+        assert_eq!(config.memory, super::MemoryConfig::default());
+        assert_eq!(config.memory.default_mode, "off");
+        assert!(!config.memory.default_mode_confirmed);
+        assert_eq!(config.memory.recall_max_records, 8);
+        assert_eq!(config.memory.recall_max_tokens, 4096);
+        assert_eq!(config.memory.recall_timeout_ms, 150);
+        assert_eq!(config.memory.capture_tools, "summary_only");
+        assert!(config.memory.capture_assistant);
+        assert!(config.memory.capture_user);
+        assert_eq!(config.memory.auto_consolidate, "off");
+        assert_eq!(config.memory.local_embeddings, "off");
+        assert_eq!(config.memory.gliner, "off");
+    }
+
+    #[test]
+    fn memory_unknown_values_fail_closed_to_defaults() {
+        let config = super::load_config_from_str(
+            "memory.default_mode = recall_everything_forever\n\
+             memory.default_mode_confirmed = true\n\
+             memory.recall_max_records = lots\n\
+             memory.recall_max_tokens = -5\n\
+             memory.recall_timeout_ms = fast\n\
+             memory.capture_tools = full\n\
+             memory.capture_assistant = maybe\n\
+             memory.capture_user = sometimes\n\
+             memory.auto_consolidate = aggressive\n\
+             memory.local_embeddings = auto\n\
+             memory.gliner = download\n\
+             memory.nosuchfield = 1\n",
+        );
+        // Unrecognised mode string must stay "off" — never a non-off mode.
+        assert_eq!(config.memory.default_mode, "off");
+        assert_eq!(config.memory.recall_max_records, 8);
+        assert_eq!(config.memory.recall_max_tokens, 4096);
+        assert_eq!(config.memory.recall_timeout_ms, 150);
+        assert_eq!(config.memory.capture_tools, "summary_only");
+        assert!(config.memory.capture_assistant);
+        assert!(config.memory.capture_user);
+        assert_eq!(config.memory.auto_consolidate, "off");
+        assert_eq!(config.memory.local_embeddings, "off");
+        assert_eq!(config.memory.gliner, "off");
+    }
+
+    #[test]
+    fn memory_default_mode_without_consent_reverts_to_off() {
+        let config =
+            super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
+        assert_eq!(config.memory.default_mode, "off");
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("memory.default_mode_confirmed")),
+            "reversion must surface a warning; got: {:?}",
+            config.warnings
+        );
+
+        // Explicit false consent is not consent.
+        let denied = super::load_config_from_str(
+            "memory.default_mode = capture_only\n\
+             memory.default_mode_confirmed = false\n",
+        );
+        assert_eq!(denied.memory.default_mode, "off");
+
+        // Garbage consent value fails closed — not consent.
+        let garbage = super::load_config_from_str(
+            "memory.default_mode = capture_only\n\
+             memory.default_mode_confirmed = definitely\n",
+        );
+        assert_eq!(garbage.memory.default_mode, "off");
+    }
+
+    #[test]
+    fn memory_consent_is_order_independent() {
+        // Consent key before the mode key.
+        let before = super::load_config_from_str(
+            "memory.default_mode_confirmed = true\n\
+             memory.default_mode = recall_once\n",
+        );
+        assert_eq!(before.memory.default_mode, "recall_once");
+        // Consent key after the mode key.
+        let after = super::load_config_from_str(
+            "memory.default_mode = recall_once\n\
+             memory.default_mode_confirmed = true\n",
+        );
+        assert_eq!(after.memory.default_mode, "recall_once");
+    }
+
+    #[test]
+    fn memory_config_surface_is_closed_by_construction() {
+        // Exhaustive struct literal — no `..Default::default()` spread. This
+        // fails to COMPILE if any field is added to or removed from
+        // MemoryConfig, pinning the exact memory.* config surface. Secret,
+        // retention, and project-scope semantics have no field here, so no
+        // `memory.secret*` / `memory.retention*` / `memory.project*` config
+        // key can exist (spec §12: those rules are not configurable to fail
+        // open). Asserted by construction, not by test disproof.
+        let _closed_surface = super::MemoryConfig {
+            default_mode: "off".to_string(),
+            default_mode_confirmed: false,
+            recall_max_records: 8,
+            recall_max_tokens: 4096,
+            recall_timeout_ms: 150,
+            capture_tools: "summary_only".to_string(),
+            capture_assistant: true,
+            capture_user: true,
+            auto_consolidate: "off".to_string(),
+            local_embeddings: "off".to_string(),
+            gliner: "off".to_string(),
+        };
     }
 
     use super::*;
