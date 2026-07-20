@@ -275,7 +275,7 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
             let frags: Vec<Bytes> = body
                 .as_bytes()
                 .chunks(7)
-                .map(|c| Bytes::copy_from_slice(c))
+                .map(Bytes::copy_from_slice)
                 .collect();
             let first_byte_delay = *first_byte_delay;
             let event_delay = *event_delay;
