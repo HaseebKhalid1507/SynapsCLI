@@ -148,6 +148,7 @@ impl TryFrom<RawExtensionManifest> for ExtensionManifest {
                 tools: raw.tools,
                 providers: Vec::new(),
                 lifecycle: None,
+                context_providers: Vec::new(),
             })
         } else {
             raw.deferred
@@ -263,6 +264,7 @@ impl ExtensionManifest {
                 permission.as_str(),
                 "tools.register"
                     | "providers.register"
+                    | "context_providers.register"
                     | "memory.read"
                     | "memory.write"
                     | "config.write"

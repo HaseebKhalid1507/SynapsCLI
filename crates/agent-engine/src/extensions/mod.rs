@@ -20,6 +20,7 @@ pub mod capability;
 pub mod commands;
 pub mod config;
 pub mod config_store;
+pub mod context_provider;
 pub mod hooks;
 pub mod info;
 pub mod invoke_output;
