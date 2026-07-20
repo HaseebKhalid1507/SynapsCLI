@@ -360,6 +360,7 @@ fn fixture_classes() -> Vec<FixtureClass> {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn s9_2_estimator_is_conservative_for_every_fixture_class() {
     assert!(
         SAFETY_MARGIN_PERCENT >= 10,
@@ -718,9 +719,11 @@ fn s9_7_retrieval_memory_is_proportional_to_result_limit() {
         .unwrap();
     }
     ensure_index_in(tmp.path(), &scope).unwrap();
-    let mut q = IndexQuery::default();
-    q.terms = vec!["budget".into()];
-    q.limit = Some(10);
+    let q = IndexQuery {
+        terms: vec!["budget".into()],
+        limit: Some(10),
+        ..Default::default()
+    };
     let page = search_index_in(tmp.path(), &scope, &q).unwrap();
     assert_eq!(page.hits.len(), 10);
     assert!(
@@ -734,10 +737,12 @@ fn s9_7_retrieval_memory_is_proportional_to_result_limit() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = None;
     loop {
-        let mut q = IndexQuery::default();
-        q.terms = vec!["budget".into()];
-        q.limit = Some(10);
-        q.cursor = cursor;
+        let q = IndexQuery {
+            terms: vec!["budget".into()],
+            limit: Some(10),
+            cursor,
+            ..Default::default()
+        };
         let page = search_index_in(tmp.path(), &scope, &q).unwrap();
         assert!(
             page.stats.max_resident_hits <= 10,

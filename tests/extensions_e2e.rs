@@ -758,7 +758,8 @@ async fn declared_secret_env_survives_extension_restart_without_persistence() {
         prebuilt: ::std::collections::HashMap::new(), args: vec![fixture, "--exit-on-hook-once".to_string()],
         permissions: vec!["tools.intercept".to_string()],
         hooks: vec![synaps_cli::extensions::manifest::HookSubscription { hook: "before_tool_call".to_string(), tool: Some("bash".to_string()), matcher: None }],
-        config: vec![ExtensionConfigEntry { key: "pria_agent_tool_token".to_string(), value_type: None, description: None, required: true, default: None, secret_env: Some("PRIA_AGENT_TOOL_TOKEN".to_string()) }],
+        config: vec![ExtensionConfigEntry { key: "pria_agent_tool_token".to_string(), value_type: None, description: None, required: true, default: None, secret_env: Some("PRIA_AGENT_TOOL_TOKEN".to_string()), host_context: None }],
+        deferred: None,
     };
     manager.load_with_cwd("knowledge", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
     assert_eq!(manager.hook_bus().emit(&HookEvent::before_tool_call("bash", json!({}))).await, HookResult::Continue);
