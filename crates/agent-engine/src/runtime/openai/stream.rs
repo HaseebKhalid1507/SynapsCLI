@@ -896,6 +896,43 @@ fn parse_tool_arguments(raw: &str) -> Value {
     }
 }
 
+/// Reduce a provider-supplied error identifier (`error.type`, `error.code`,
+/// `incomplete_details.reason`) to a short enum-like token safe for local
+/// logs. Providers use snake_case identifiers here (`server_error`,
+/// `rate_limit_exceeded`, `max_output_tokens`); anything outside a strict
+/// identifier charset — or longer than 64 bytes — is replaced so free-text
+/// (which can echo request content) can never leak into the log stream.
+fn sanitize_error_identifier(raw: Option<&str>) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "server_error",
+        "rate_limit_exceeded",
+        "usage_limit_reached",
+        "usage_not_included",
+        "invalid_prompt",
+        "invalid_request_error",
+        "max_output_tokens",
+        "content_filter",
+        "quota_exceeded",
+    ];
+    match raw {
+        None => "absent",
+        Some(s) => {
+            if let Some(k) = KNOWN.iter().find(|k| **k == s) {
+                k
+            } else if s.len() <= 64
+                && !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+            {
+                // Identifier-shaped but not in the allowlist: report shape only.
+                "unlisted_identifier"
+            } else {
+                "unsafe_or_freeform"
+            }
+        }
+    }
+}
+
 impl CodexSseDecoder {
     fn push_line(
         &mut self,
@@ -1011,6 +1048,30 @@ impl CodexSseDecoder {
             }
             "response.failed" | "error" => {
                 self.push_usage(&event, tx);
+                // Local-only diagnostics: log the provider's enum-like error
+                // identifiers (`type` / `code`) after sanitizing them down to a
+                // short identifier charset. The free-text `message` field is
+                // never logged or surfaced — it can echo request content.
+                let error_obj = event
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .or_else(|| event.get("error"));
+                let error_kind = sanitize_error_identifier(
+                    error_obj
+                        .and_then(|e| e.get("type"))
+                        .and_then(Value::as_str),
+                );
+                let error_code = sanitize_error_identifier(
+                    error_obj
+                        .and_then(|e| e.get("code"))
+                        .and_then(Value::as_str),
+                );
+                tracing::warn!(
+                    event_type,
+                    error_kind,
+                    error_code,
+                    "codex stream terminal failure (provider message withheld)"
+                );
                 self.terminal_failure = Some(ResponsesStreamFailure {
                     code: "responses_failed",
                     message: "Codex response failed in stream. Provider error details withheld because they can echo request content.",
@@ -1019,6 +1080,14 @@ impl CodexSseDecoder {
             }
             "response.incomplete" => {
                 self.push_usage(&event, tx);
+                let reason = sanitize_error_identifier(
+                    event
+                        .get("response")
+                        .and_then(|r| r.get("incomplete_details"))
+                        .and_then(|d| d.get("reason"))
+                        .and_then(Value::as_str),
+                );
+                tracing::warn!(reason, "codex stream terminal incomplete");
                 self.terminal_failure = Some(ResponsesStreamFailure {
                     code: "responses_incomplete",
                     message: "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
@@ -1726,6 +1795,33 @@ mod codex_decoder_tests {
             decoder.terminal_result().expect_err("must fail").code,
             "responses_missing_terminal"
         );
+    }
+
+    /// The local-log sanitizer must map known enum identifiers through
+    /// verbatim, collapse unknown-but-identifier-shaped values to a shape
+    /// marker, and never emit free-form provider text.
+    #[test]
+    fn error_identifier_sanitizer_never_passes_freeform_text() {
+        assert_eq!(sanitize_error_identifier(None), "absent");
+        assert_eq!(
+            sanitize_error_identifier(Some("rate_limit_exceeded")),
+            "rate_limit_exceeded"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("max_output_tokens")),
+            "max_output_tokens"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("some_new_code")),
+            "unlisted_identifier"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("ECHOED: user secret prompt")),
+            "unsafe_or_freeform"
+        );
+        assert_eq!(sanitize_error_identifier(Some("")), "unsafe_or_freeform");
+        let long = "a".repeat(65);
+        assert_eq!(sanitize_error_identifier(Some(&long)), "unsafe_or_freeform");
     }
 
     #[test]
