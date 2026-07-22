@@ -343,6 +343,7 @@ pub async fn load_code_assist<B: CredentialBroker + ?Sized>(
             path: "/v1internal:loadCodeAssist".into(),
             body: Some(serde_json::to_value(&body).map_err(|_| SetupError::InvalidResponse)?),
             stream: false,
+            body_bytes: None,
         })
         .await?;
     parse_success::<LoadCodeAssistResponse>(resp)
@@ -359,6 +360,7 @@ pub async fn onboard_user<B: CredentialBroker + ?Sized>(
             path: "/v1internal:onboardUser".into(),
             body: Some(serde_json::to_value(req).map_err(|_| SetupError::InvalidResponse)?),
             stream: false,
+            body_bytes: None,
         })
         .await?;
     parse_success::<OperationResponse>(resp)
@@ -389,6 +391,7 @@ pub async fn get_operation<B: CredentialBroker + ?Sized>(
             path,
             body: None,
             stream: false,
+            body_bytes: None,
         })
         .await?;
     parse_success::<OperationResponse>(resp)

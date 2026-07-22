@@ -48,6 +48,7 @@ fn request(provider: &str, path: &str) -> ProxyRequest {
         path: path.into(),
         body: Some(serde_json::json!({"model":"grok-4.5","input":"hello"})),
         stream: true,
+        body_bytes: None,
     }
 }
 
@@ -98,6 +99,43 @@ async fn local_and_remote_broker_stream_without_secret_egress() {
     assert!(!wire[0].2.contains("refresh-secret"));
     assert!(!wire[0].2.contains("raw-static-secret"));
     assert!(!wire[0].2.contains("machine-only"));
+}
+
+#[tokio::test]
+async fn local_broker_sends_exact_body_bytes_verbatim() {
+    // Exact-byte handoff (request-trace spec §6.2): the upstream must receive
+    // the very buffer the caller serialized. The fixture bytes deliberately
+    // use a key order serde_json would NOT reproduce from the parsed Value
+    // ("b" before "a"), so any internal re-serialization fails this test.
+    let seen = Seen::default();
+    let upstream = serve(
+        Router::new()
+            .route("/chat/completions", post(capture))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let exact: &[u8] = b"{\"b\":1,\"a\":2,\"model\":\"grok-4.5\"}";
+    let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), upstream);
+    let mut stream = broker
+        .proxy_stream(ProxyRequest {
+            provider: "local".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: Some(serde_json::from_slice(exact).unwrap()),
+            stream: true,
+            body_bytes: Some(bytes::Bytes::from_static(exact)),
+        })
+        .await
+        .unwrap();
+    while let Some(v) = stream.next().await {
+        v.unwrap();
+    }
+    let wire = seen.0.lock().unwrap();
+    assert_eq!(
+        wire[0].2.as_bytes(),
+        exact,
+        "broker must forward the caller-serialized bytes verbatim"
+    );
 }
 
 #[tokio::test]

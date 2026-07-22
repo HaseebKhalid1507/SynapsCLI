@@ -76,6 +76,7 @@ fn broker_allowlists_only_reviewed_github_copilot_runtime_paths() {
         path: "/models".into(),
         body: None,
         stream: false,
+        body_bytes: None,
     };
     assert!(ok.validate().is_ok());
 
@@ -86,6 +87,7 @@ fn broker_allowlists_only_reviewed_github_copilot_runtime_paths() {
             path: path.into(),
             body: Some(serde_json::json!({"model":"fixture","stream":true})),
             stream: true,
+            body_bytes: None,
         };
         assert!(
             allowed.validate().is_ok(),
@@ -99,6 +101,7 @@ fn broker_allowlists_only_reviewed_github_copilot_runtime_paths() {
             path: path.into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(denied.validate().is_err(), "{path} must remain deny-listed");
     }
@@ -111,6 +114,7 @@ fn broker_allowlists_only_reviewed_github_copilot_runtime_paths() {
             path: "/models".into(),
             body: None,
             stream: false,
+            body_bytes: None,
         };
         assert!(req.validate().is_err(), "{provider} must not be proxyable");
     }

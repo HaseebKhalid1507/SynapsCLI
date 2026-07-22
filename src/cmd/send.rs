@@ -1,8 +1,10 @@
 //! `synaps send` — deliver an event via Unix socket, falling back to inbox file-drop.
 
-use synaps_cli::events::{Event, EventChannel, EventContent, EventSource, Severity};
-use synaps_cli::events::registry::{find_session_registration, list_active_sessions, SessionRegistration};
 use chrono::Utc;
+use synaps_cli::events::registry::{
+    find_session_registration, list_active_sessions, SessionRegistration,
+};
+use synaps_cli::events::{Event, EventChannel, EventContent, EventSource, Severity};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
@@ -49,7 +51,10 @@ pub async fn run(
             if sessions.is_empty() {
                 eprintln!("No active sessions — writing to inbox.");
             } else {
-                eprintln!("{} active sessions, ambiguous — writing to inbox.", sessions.len());
+                eprintln!(
+                    "{} active sessions, ambiguous — writing to inbox.",
+                    sessions.len()
+                );
             }
             write_inbox(&event)?;
         }
@@ -75,13 +80,17 @@ fn build_event(
             name: source,
             callback: None,
         },
-        channel: channel.map(|c| EventChannel { id: c.clone(), name: c }),
+        channel: channel.map(|c| EventChannel {
+            id: c.clone(),
+            name: c,
+        }),
         sender: None,
         content: EventContent {
             text: message,
             content_type,
             severity: Some(Severity::from_str(&severity)),
             data: None,
+            disclosure: None,
         },
         expects_response: false,
         reply_to: None,
@@ -109,7 +118,10 @@ async fn send_via_socket(socket_path: &str, json: &str) -> anyhow::Result<()> {
     let sock = std::path::Path::new(socket_path);
     let run_dir = synaps_cli::events::registry::registry_dir();
     if !sock.starts_with(&run_dir) {
-        anyhow::bail!("socket path {:?} is outside registry dir — refusing to connect", socket_path);
+        anyhow::bail!(
+            "socket path {:?} is outside registry dir — refusing to connect",
+            socket_path
+        );
     }
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(json.as_bytes()).await?;

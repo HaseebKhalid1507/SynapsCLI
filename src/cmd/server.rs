@@ -1,4 +1,5 @@
 use anyhow::Context;
+use axum::extract::Query;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -9,19 +10,18 @@ use axum::{
 };
 use chrono::Local;
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
+use synaps_cli::core::config::load_config;
+use synaps_cli::core::config::resolve_write_path;
 use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
-use axum::extract::Query;
-use rand::Rng;
-use std::collections::HashMap;
-use synaps_cli::core::config::load_config;
-use synaps_cli::core::config::resolve_write_path;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Shared server state
@@ -111,8 +111,13 @@ impl ServerState {
     ) {
         let mut conv = self.conv.write().await;
         conv.add_usage(
-            input_tokens, output_tokens, cache_read, cache_creation,
-            cache_creation_5m, cache_creation_1h, model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
+            model,
         );
     }
 
@@ -225,7 +230,11 @@ pub async fn run(
     let config = load_config();
     // CLI overrides take precedence over config file values.
     let allowed_origins = if let Some(ref origins) = allowed_origins_override {
-        origins.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        origins
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     } else {
         config.server.allowed_origins.clone()
     };
@@ -254,7 +263,8 @@ pub async fn run(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+                    let _ =
+                        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
                 }
                 let _ = std::fs::rename(&tmp_path, &token_path);
             }
@@ -318,7 +328,8 @@ pub async fn run(
                         busy,
                         None,
                     );
-                    let consecutive = state_d.consecutive_auto_turns
+                    let consecutive = state_d
+                        .consecutive_auto_turns
                         .load(std::sync::atomic::Ordering::Acquire);
                     wake_action(
                         &drained,
@@ -391,7 +402,7 @@ pub async fn run(
     // until systemd's 90 s SIGKILL fires.
     //
     // Timing constants mirror signals.rs (SAVE_TIMEOUT=2s, HOOKS_TIMEOUT=5s).
-    const SAVE_TIMEOUT_SECS:  u64 = 2;
+    const SAVE_TIMEOUT_SECS: u64 = 2;
     const HOOKS_TIMEOUT_SECS: u64 = 5;
 
     eprintln!("\n↓ graceful shutdown — saving session, firing hooks, unregistering.");
@@ -425,6 +436,29 @@ pub async fn run(
                 "  ⚠ on_session_end hooks timed out after {}s — extensions may not have flushed",
                 HOOKS_TIMEOUT_SECS
             ),
+        }
+    }
+
+    // STEP 3: Bounded observability flush — after axum's graceful drain
+    // (no request handler is still producing records) and after hooks.
+    // Task 11: telemetry `off` → no writer → `None`, a true no-op.
+    // "Flushed" means appended into OS file buffers (no fsync). A timeout
+    // prints metadata-only stats and teardown continues — trace loss never
+    // fails a clean shutdown.
+    {
+        let runtime = state.runtime.lock().await;
+        match runtime
+            .shutdown_observability_async(
+                synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+            )
+            .await
+        {
+            Some(outcome) if outcome.is_flushed() => eprintln!("  ✓ observability flushed"),
+            Some(outcome) => eprintln!(
+                "  ⚠ observability flush timed out — detached worker keeps draining ({:?})",
+                outcome.stats()
+            ),
+            None => {} // telemetry off — nothing to flush
         }
     }
 
@@ -504,7 +538,11 @@ async fn ws_handler(
                 // Constant-time comparison to prevent timing attacks.
                 let a = tok.as_bytes();
                 let b = expected.as_bytes();
-                a.len() == b.len() && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                        == 0
             }
             None => false,
         };
@@ -664,7 +702,9 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
 
 async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     // Reset consecutive auto-turn counter — real user message breaks the chain.
-    state.consecutive_auto_turns.store(0, std::sync::atomic::Ordering::Release);
+    state
+        .consecutive_auto_turns
+        .store(0, std::sync::atomic::Ordering::Release);
 
     // Atomic check-then-set: if `streaming` was already true, reject.
     // AcqRel gives us happens-before ordering on the flag toggle without the
@@ -697,8 +737,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     // Push initial user message into conv.api_messages (single source of truth).
     {
         let mut conv = state.conv.write().await;
-        conv.api_messages
-            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
+        conv.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": content}),
+        ));
     }
 
     // Server-local subagent tracker — chat.rs has the same. queued_message
@@ -724,8 +765,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     'turn: loop {
         // Snapshot messages and set up a fresh cancel token for this turn.
         // Vec<SharedMessage> clone = pointer bumps only.
-        let messages: Vec<synaps_cli::SharedMessage> =
-            state.conv.read().await.api_messages.clone();
+        let messages: Vec<synaps_cli::SharedMessage> = state.conv.read().await.api_messages.clone();
+        // Failure repair may only remove messages appended by this turn.
+        let turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -751,6 +793,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 )
             };
 
@@ -766,13 +809,17 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     state.save_session().await;
                     break 'turn;
                 }
-                StreamCompletion::Error(ref err_msg) => {
-                    // process_stream_event has already trimmed dangling
-                    // messages and emitted EngineStreamEvent::Error which
-                    // we translated to a ServerMessage::Error above. Log
-                    // for traceability instead of silently dropping the
-                    // string with `_`.
-                    tracing::debug!(error = %err_msg, "stream completed with error");
+                StreamCompletion::Error(ref err) => {
+                    // process_stream_event has already repaired the history
+                    // (turn-appended invalid messages only) and emitted
+                    // EngineStreamEvent::Error which we translated to a
+                    // ServerMessage::Error above. Log the typed terminal
+                    // category + correlation ID for traceability.
+                    tracing::debug!(
+                        error = %err.message,
+                        outcome = %err.category_label(),
+                        "stream completed with error"
+                    );
                     state.save_session().await;
                     break 'turn;
                 }
@@ -798,7 +845,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                         state.save_session().await;
                         break 'turn;
                     }
-                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let cur = state
+                        .consecutive_auto_turns
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     if cur >= AUTO_TURN_CAP {
                         tracing::info!(
                             cap = AUTO_TURN_CAP,
@@ -1018,7 +1067,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
         .streaming
         .swap(true, std::sync::atomic::Ordering::AcqRel)
     {
-        tracing::debug!("server: auto-turn skipped — stream already active; event stays in history");
+        tracing::debug!(
+            "server: auto-turn skipped — stream already active; event stays in history"
+        );
         return;
     }
     // RAII: clears `streaming` on every return path.
@@ -1031,8 +1082,7 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     // are silently parked — no turn started.
     {
         let conv = state.conv.read().await;
-        let last_role = conv.api_messages.last()
-            .and_then(|m| m["role"].as_str());
+        let last_role = conv.api_messages.last().and_then(|m| m["role"].as_str());
         if last_role != Some("user") {
             tracing::debug!("server: auto-turn parked — last message is not role=user");
             return;
@@ -1043,7 +1093,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     // Only handle_user_message resets the counter so the cap stays latched
     // until real user input arrives — preventing a looping event source from
     // immediately re-saturating after a reset.
-    let prev = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let prev = state
+        .consecutive_auto_turns
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if prev >= AUTO_TURN_CAP {
         // Saturate at cap — leave counter elevated so further signals are
         // also discarded. handle_user_message is the only reset path.
@@ -1064,8 +1116,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     // Turn loop — mirrors handle_user_message's loop but no history entry
     // and no initial message push (event is already in api_messages).
     'turn: loop {
-        let messages: Vec<synaps_cli::SharedMessage> =
-            state.conv.read().await.api_messages.clone();
+        let messages: Vec<synaps_cli::SharedMessage> = state.conv.read().await.api_messages.clone();
+        // Failure repair may only remove messages appended by this turn.
+        let turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -1087,6 +1140,7 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 )
             };
 
@@ -1102,8 +1156,12 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     state.save_session().await;
                     break 'turn;
                 }
-                StreamCompletion::Error(ref err_msg) => {
-                    tracing::debug!(error = %err_msg, "auto-turn stream completed with error");
+                StreamCompletion::Error(ref err) => {
+                    tracing::debug!(
+                        error = %err.message,
+                        outcome = %err.category_label(),
+                        "auto-turn stream completed with error"
+                    );
                     state.save_session().await;
                     break 'turn;
                 }
@@ -1125,7 +1183,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                         state.save_session().await;
                         break 'turn;
                     }
-                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let cur = state
+                        .consecutive_auto_turns
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     if cur >= AUTO_TURN_CAP {
                         // Saturate — leave counter elevated until real user input.
                         tracing::info!(
@@ -1205,13 +1265,87 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                         .to_string(),
                 });
             }
-            CommandResult::Compact { .. } => {
+            CommandResult::Compact {
+                custom_instructions,
+            } => {
+                // T30 (spec §9.2): server compaction routes through the ONE
+                // engine transition with the in-place policy. Snapshot under
+                // brief locks; the LLM round-trip runs with no lock held.
+                let (msgs, session, rt) = {
+                    let conv = state.conv.read().await;
+                    (conv.api_messages.clone(), conv.session.clone(), {
+                        let rt = state.runtime.lock().await;
+                        rt.clone()
+                    })
+                };
+                if msgs.len() < 4 {
+                    let _ = broadcast.send(ServerMessage::System {
+                        message: "nothing to compact (need at least 2 turns)".to_string(),
+                    });
+                    return;
+                }
                 let _ = broadcast.send(ServerMessage::System {
-                    message: "/compact not yet wired in server mode".to_string(),
+                    message: "compacting conversation...".to_string(),
                 });
+                // Spec §9.4: surface provider/model and approximate
+                // disclosure BEFORE the summarization dispatch.
+                let _ = broadcast.send(ServerMessage::System {
+                    message: synaps_cli::runtime::compaction::preview_compaction_disclosure(
+                        &rt, &msgs,
+                    )
+                    .render_line(),
+                });
+                let applied = match synaps_cli::runtime::compaction::compact_conversation(
+                    &msgs,
+                    &rt,
+                    custom_instructions.as_deref(),
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        synaps_cli::runtime::compaction::apply_compaction(
+                            &rt,
+                            &session,
+                            &msgs,
+                            &outcome,
+                            synaps_cli::runtime::compaction::CompactionTransition {
+                                policy: synaps_cli::runtime::compaction::CompactionPolicy::InPlace,
+                                pending_events: Vec::new(),
+                                queued_message: None,
+                                hook_source: "manual".to_string(),
+                            },
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match applied {
+                    Ok(applied) => {
+                        let compacted_from = msgs.len();
+                        {
+                            let mut conv = state.conv.write().await;
+                            conv.session = applied.session;
+                            conv.api_messages = applied.api_messages;
+                        }
+                        let _ = broadcast.send(ServerMessage::System {
+                            message: format!(
+                                "✓ compacted {} messages into a summary context",
+                                compacted_from
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = broadcast.send(ServerMessage::Error {
+                            message: format!("compaction failed: {e}"),
+                        });
+                    }
+                }
             }
             CommandResult::Error(msg) => {
                 let _ = broadcast.send(ServerMessage::Error { message: msg });
+            }
+            CommandResult::Output(text) => {
+                let _ = broadcast.send(ServerMessage::System { message: text });
             }
             other => {
                 tracing::debug!(?other, "engine command result not handled by server");

@@ -9,6 +9,10 @@ pub struct SubagentTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "subagent"
     }
@@ -292,7 +296,10 @@ impl Tool for SubagentTool {
                                     crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                 }
                                 crate::StreamEvent::Session(SessionEvent::Error(e)) => {
-                                    return Err(e);
+                                    // Typed outcome from the engine — keep the
+                                    // terminal category + correlation ID in the
+                                    // subagent's failure state (spec §5.2).
+                                    return Err(format!("{} [{}]", e.message, e.category_label()));
                                 }
                                 crate::StreamEvent::Session(SessionEvent::Done) => break,
                                 _ => {}

@@ -64,9 +64,170 @@ pub enum SessionEvent {
         model: Option<String>,
     },
     Done,
-    Error(String),
+    Error(TurnError),
     /// Transient status line — display-only, never persisted.
     Notice(String),
+}
+
+/// Budget dimension placeholder (spec §5.2). The full turn-budget system is
+/// later work (spec §8.1); only the typed surface lands here so
+/// `TurnOutcome::BudgetExceeded` is representable without re-plumbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDimension {
+    InputTokens,
+    OutputTokens,
+    ToolCalls,
+    WallClock,
+    /// Provider rounds within one stream turn (spec §8.1).
+    ProviderRounds,
+    /// Accumulated tool-result bytes within one stream turn (spec §8.1).
+    ToolResultBytes,
+    /// Accumulated estimated USD cost within one stream turn (spec §8.1).
+    CostUsd,
+}
+
+impl BudgetDimension {
+    /// Stable wire/diagnostic label (matches the serde snake_case form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::ToolCalls => "tool_calls",
+            Self::WallClock => "wall_clock",
+            Self::ProviderRounds => "provider_rounds",
+            Self::ToolResultBytes => "tool_result_bytes",
+            Self::CostUsd => "cost_usd",
+        }
+    }
+}
+
+/// Typed terminal outcome of a model turn (spec §5.2). Produced ONCE by the
+/// engine; every frontend (chat, TUI, RPC, server, watcher, subagents)
+/// receives the same value and must never re-derive it from message text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed,
+    Canceled,
+    ProviderFailed {
+        code: String,
+        correlation_id: String,
+    },
+    ToolFailed {
+        tool_id: String,
+        correlation_id: String,
+    },
+    BudgetExceeded {
+        dimension: BudgetDimension,
+    },
+    InterruptedAfterSideEffect {
+        call_id: String,
+    },
+}
+
+impl TurnOutcome {
+    /// The correlation ID tying this outcome to engine trace/log lines,
+    /// when the variant carries one.
+    pub fn correlation_id(&self) -> Option<&str> {
+        match self {
+            TurnOutcome::ProviderFailed { correlation_id, .. }
+            | TurnOutcome::ToolFailed { correlation_id, .. } => Some(correlation_id),
+            _ => None,
+        }
+    }
+
+    /// True for outcomes that must surface as a non-success terminal state.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self, TurnOutcome::Completed | TurnOutcome::Canceled)
+    }
+}
+
+/// Typed terminal failure carried by [`SessionEvent::Error`]: the
+/// human-readable message plus the spec §5.2 [`TurnOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnError {
+    pub message: String,
+    pub outcome: TurnOutcome,
+}
+
+impl TurnError {
+    /// Typed budget exhaustion (spec §8.1): static message naming the
+    /// dimension only — no counts, no content.
+    pub fn budget(dimension: BudgetDimension) -> Self {
+        Self {
+            message: format!("turn budget exhausted ({})", dimension.as_str()),
+            outcome: TurnOutcome::BudgetExceeded { dimension },
+        }
+    }
+
+    /// Provider-category failure with an explicit correlation ID.
+    pub fn provider(
+        message: impl Into<String>,
+        code: impl Into<String>,
+        correlation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            outcome: TurnOutcome::ProviderFailed {
+                code: code.into(),
+                correlation_id: correlation_id.into(),
+            },
+        }
+    }
+
+    /// Interrupted after a possible-but-unconfirmed side effect (spec §8.3):
+    /// cancellation or transport failure landed with a call that had started
+    /// (side effect possible) but not recorded a result. Metadata only — the
+    /// static message names the interrupted call, never its content. The
+    /// operation is never automatically rerun.
+    pub fn interrupted_after_side_effect(call_id: impl Into<String>) -> Self {
+        let call_id = call_id.into();
+        Self {
+            message: format!(
+                "tool call interrupted after a possible side effect (call {call_id}); not rerun"
+            ),
+            outcome: TurnOutcome::InterruptedAfterSideEffect { call_id },
+        }
+    }
+
+    /// Uniform terminal-category suffix shared by every frontend, e.g.
+    /// `provider_failed code=auth_error correlation=turn-123-0`. Metadata
+    /// only — never includes message content.
+    pub fn category_label(&self) -> String {
+        match &self.outcome {
+            TurnOutcome::Completed => "completed".to_string(),
+            TurnOutcome::Canceled => "canceled".to_string(),
+            TurnOutcome::ProviderFailed {
+                code,
+                correlation_id,
+            } => format!("provider_failed code={code} correlation={correlation_id}"),
+            TurnOutcome::ToolFailed {
+                tool_id,
+                correlation_id,
+            } => format!("tool_failed tool={tool_id} correlation={correlation_id}"),
+            TurnOutcome::BudgetExceeded { dimension } => {
+                format!("budget_exceeded dimension={dimension:?}")
+            }
+            TurnOutcome::InterruptedAfterSideEffect { call_id } => {
+                format!("interrupted_after_side_effect call={call_id}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Process-unique correlation ID for one engine turn. Ties the typed
+/// terminal outcome to metadata-only trace/log lines for the same turn.
+pub fn next_turn_correlation_id() -> String {
+    static TURN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TURN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("turn-{}-{}", std::process::id(), seq)
 }
 
 #[derive(Debug, Clone)]

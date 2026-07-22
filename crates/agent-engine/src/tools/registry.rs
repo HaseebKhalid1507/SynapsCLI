@@ -1,4 +1,5 @@
 //! Tool registry — maintains name→tool map and cached JSON schema for the API.
+use crate::tools::catalog::{tool_id_for, CapabilityRecord, CatalogError, ToolCatalog};
 use crate::tools::Tool;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,10 @@ pub struct ToolRegistry {
     api_to_runtime_names: HashMap<String, String>,
     /// Per-tool mapping from API-safe input property names back to runtime names.
     input_name_maps: HashMap<String, SchemaNameMap>,
+    /// Passive capability inventory kept truthful across every construction
+    /// and mutation path. Reads never change the exposed schema; mutations
+    /// advance the catalog generation fail-closed (Task 14).
+    catalog: ToolCatalog,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -49,9 +54,27 @@ impl ToolRegistry {
             Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
             Arc::new(crate::tools::subagent::collect::SubagentCollectTool),
             Arc::new(crate::tools::subagent::resume::SubagentResumeTool),
+            // Task A4 continuous-memory control tool (spec §7.2). Like the
+            // authorization gateways above, primary-registry only: recursive
+            // subagent registries exclude it so a delegated model can never
+            // steer the session's memory-context leases.
+            Arc::new(crate::tools::memory_context::MemoryContextTool),
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
+            // Task 17 discovery/authorization gateways (spec §7.2). Present
+            // in the primary runtime registry only; subagent registries
+            // (`without_subagent*`) deliberately exclude them so recursive
+            // runtimes cannot gain broader authorization surfaces.
+            Arc::new(crate::tools::discovery::SearchToolsTool),
+            Arc::new(crate::tools::discovery::ActivateToolsTool),
+            // Task 32 project-scoped memory primitives (spec §9.5). Not in
+            // the progressive essential core — deferred until exact
+            // activation under progressive disclosure.
+            Arc::new(crate::tools::memory::MemorySearchTool),
+            Arc::new(crate::tools::memory::MemoryFetchTool),
+            Arc::new(crate::tools::memory::MemoryStoreTool),
+            Arc::new(crate::tools::memory::MemoryForgetTool),
         ];
         Self::from_tools(tools)
     }
@@ -62,11 +85,30 @@ impl ToolRegistry {
         Self::from_tools(Vec::new())
     }
 
-    /// Remove built-in tools by runtime name (config `disabled_tools`), then
-    /// rebuild the cached schema and name maps. Unknown names are ignored.
+    /// Remove built-in tools by runtime name (config `disabled_tools`).
+    ///
+    /// Compatibility wrapper over [`Self::try_disable`]; the only failure
+    /// mode is catalog generation exhaustion, on which this fails closed by
+    /// panicking with the registry left fully unchanged.
     pub fn disable(&mut self, names: &[String]) {
+        self.try_disable(names).expect(CATALOG_REJECTED_MSG);
+    }
+
+    /// Fallible disable: remove built-in tools by runtime name, then rebuild
+    /// the cached schema, name maps, and capability catalog. Unknown names
+    /// are ignored; a call that removes nothing is a no-op and does not
+    /// advance the catalog generation. A call that removes tools advances
+    /// the catalog generation strictly past its prior value, so grants
+    /// issued against removed capabilities cannot stay valid.
+    ///
+    /// The rebuilt candidate is fully constructed and generation-rebased
+    /// BEFORE it is committed to `self`: on any failure the live registry
+    /// (tools, schema, catalog entries, generation) is left untouched, so a
+    /// generation-exhausted disable can never leave a generation-rewound,
+    /// partially changed registry behind a non-poisoning lock.
+    pub fn try_disable(&mut self, names: &[String]) -> Result<(), CatalogError> {
         if names.is_empty() {
-            return;
+            return Ok(());
         }
         let remaining: Vec<Arc<dyn Tool>> = self
             .tools
@@ -74,7 +116,14 @@ impl ToolRegistry {
             .filter(|t| !names.iter().any(|n| n == t.name()))
             .cloned()
             .collect();
-        *self = Self::from_tools(remaining);
+        if remaining.len() == self.tools.len() {
+            return Ok(());
+        }
+        let prior = self.catalog.generation();
+        let mut candidate = Self::try_from_tools(remaining)?;
+        candidate.catalog.rebase_past(prior)?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
@@ -105,19 +154,39 @@ impl ToolRegistry {
         let mut combined = Self::without_subagent();
         for tool in extension_tools.tools.values() {
             if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
-                combined.tools.insert(tool.name().to_string(), tool.clone());
+                combined
+                    .insert_tool_with_catalog(tool.clone())
+                    .expect(CATALOG_REJECTED_MSG);
             }
         }
         combined.rebuild_schema();
         combined
     }
 
+    /// Infallible construction wrapper over [`Self::try_from_tools`] for
+    /// compiled-in tool lists. A typed failure here (duplicate capability
+    /// identity or generation exhaustion) means the constructed set itself
+    /// is inconsistent, so this fails closed by panicking rather than
+    /// exposing live tools the catalog could not truthfully record.
     fn from_tools(tool_list: Vec<Arc<dyn Tool>>) -> Self {
+        Self::try_from_tools(tool_list).expect(CATALOG_REJECTED_MSG)
+    }
+
+    /// Integration-test construction seam: build one registry in a single
+    /// deterministic pass so dormant-catalog scaling tests do not exercise
+    /// the intentionally compatibility-oriented per-registration rebuild.
+    #[doc(hidden)]
+    pub fn from_tools_for_tests(tool_list: Vec<Arc<dyn Tool>>) -> Self {
+        Self::from_tools(tool_list)
+    }
+
+    fn try_from_tools(tool_list: Vec<Arc<dyn Tool>>) -> Result<Self, CatalogError> {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),
             cached_schema: Arc::new(Vec::new()),
             api_to_runtime_names: HashMap::new(),
             input_name_maps: HashMap::new(),
+            catalog: ToolCatalog::empty(),
         };
         // Insert all tools first, then rebuild schema once.
         // Calling register() in a loop would rebuild_schema() on every
@@ -126,8 +195,19 @@ impl ToolRegistry {
             let name = tool.name().to_string();
             registry.tools.insert(name, tool);
         }
+        // Catalog the constructed set in deterministic name order. Purely
+        // passive: reads in-process metadata only, invokes no factory,
+        // starts no process, exposes no schema, issues no grant. Distinct
+        // runtime names collapsing onto one capability identity fail typed —
+        // construction must never hide an uncataloged live tool.
+        let sorted: Vec<Arc<dyn Tool>> =
+            registry.iter_tools_sorted().into_iter().cloned().collect();
+        for tool in sorted {
+            let record = CapabilityRecord::for_registered_tool(&tool);
+            registry.catalog.upsert(None, record)?;
+        }
         registry.rebuild_schema();
-        registry
+        Ok(registry)
     }
 
     fn api_safe_name(name: &str, used: &HashSet<String>) -> String {
@@ -263,11 +343,28 @@ impl ToolRegistry {
         let mut input_name_maps = HashMap::new();
         let mut schema = Vec::with_capacity(self.tools.len());
 
-        // Sort by runtime name for deterministic API name assignment.
-        // HashMap iteration is random, so without sorting, collision suffixes
-        // (_2, _3) could change between rebuilds, breaking in-flight conversations.
+        // Sort by (origin class, runtime name) for deterministic API name
+        // assignment. HashMap iteration is random, so without sorting,
+        // collision suffixes (_2, _3) could change between rebuilds,
+        // breaking in-flight conversations.
+        //
+        // Built-ins claim their API names FIRST (memory-fetch schema
+        // collision bugfix): an extension/MCP runtime name like
+        // `memory:fetch` sanitizes to `memory_fetch`, and pure
+        // lexicographic order let it win the built-in's exact wire name
+        // (':' sorts before '_'), demoting the built-in to `memory_fetch_2`
+        // and exposing the extension's schema under the built-in's name.
+        // With class priority the built-in keeps its name and the colliding
+        // non-built-in gets the deterministic suffix. This only reorders
+        // NAME ASSIGNMENT; execution-gate resolution is unchanged.
         let mut sorted_tools: Vec<_> = self.tools.values().collect();
-        sorted_tools.sort_by_key(|t| t.name().to_string());
+        sorted_tools.sort_by_key(|t| {
+            let builtin_first = match t.origin() {
+                crate::tools::ToolOrigin::Builtin => 0u8,
+                _ => 1u8,
+            };
+            (builtin_first, t.name().to_string())
+        });
 
         for tool in sorted_tools {
             let runtime_name = tool.name();
@@ -290,10 +387,110 @@ impl ToolRegistry {
 
     /// Register an additional tool at runtime (e.g. MCP tools, custom tools).
     /// If a tool with the same name exists, it is replaced.
+    ///
+    /// Compatibility wrapper over [`Self::try_register`]. The only failure
+    /// mode is catalog generation exhaustion (a `u64` mutation counter),
+    /// which is unreachable in practice; if it ever occurs this wrapper
+    /// fails closed by panicking rather than exposing a tool the catalog
+    /// could not record. Callers that can surface errors should prefer
+    /// [`Self::try_register`].
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        self.try_register(tool).expect(CATALOG_REJECTED_MSG);
+    }
+
+    /// Fallible registration: catalog the tool first (fail-closed — on error
+    /// nothing is mutated and no schema is exposed), then insert it into the
+    /// live map and rebuild the exposed schema. Replacing a tool whose
+    /// capability identity changes drops the stale catalog entry in the same
+    /// generation advance.
+    pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
+        self.insert_tool_with_catalog(tool)?;
         self.rebuild_schema();
+        Ok(())
+    }
+
+    /// Atomically register a whole batch (Task 19 boot-time dormant MCP
+    /// entries). STRICTLY ADDITIVE: before any mutation, every member's
+    /// runtime name AND capability identity is preflighted against both the
+    /// live registry and the rest of the batch — an existing tool can never
+    /// be replaced through a batch, and two members whose distinct
+    /// identities collapse onto one runtime name (e.g. `ext__` separator
+    /// collisions) are rejected typed. Only after preflight is the FULL
+    /// candidate registry built (per-tool catalog mutations plus a single
+    /// schema rebuild) and committed on complete success. Any failure
+    /// rejects the ENTIRE batch and leaves the live registry — tools,
+    /// schema, catalog entries, and generation — byte-identically
+    /// unchanged; no partial batch can ever be observed. Never invokes any
+    /// tool, factory, extension handler, or MCP connection.
+    pub fn try_register_batch(
+        &mut self,
+        tool_list: Vec<Arc<dyn Tool>>,
+    ) -> Result<usize, CatalogError> {
+        if tool_list.is_empty() {
+            return Ok(0);
+        }
+        let mut batch_names: HashSet<String> = HashSet::new();
+        let mut batch_ids: HashSet<crate::tools::catalog::ToolId> = HashSet::new();
+        for tool in &tool_list {
+            let name = tool.name();
+            if self.tools.contains_key(name) || !batch_names.insert(name.to_string()) {
+                return Err(CatalogError::DuplicateRuntimeName(
+                    agent_core::BoundedText::new(name, 128).text,
+                ));
+            }
+            let id = tool_id_for(tool.as_ref());
+            if self.catalog.get(&id).is_some() || !batch_ids.insert(id.clone()) {
+                return Err(CatalogError::DuplicateToolId(id));
+            }
+        }
+        let count = tool_list.len();
+        let mut candidate = self.clone();
+        for tool in tool_list {
+            candidate.insert_tool_with_catalog(tool)?;
+        }
+        candidate.rebuild_schema();
+        *self = candidate;
+        Ok(count)
+    }
+
+    /// Shared fail-closed mutation core: catalog mutation happens before the
+    /// tools-map mutation, so a catalog failure leaves the registry (and the
+    /// exposed schema) untouched. A capability identity already owned by a
+    /// DIFFERENT runtime name fails typed (`CatalogError::DuplicateToolId`)
+    /// instead of silently diverging live tools from the catalog; only the
+    /// same-runtime-name tool being replaced may keep its identity. Never
+    /// invokes the tool, its factory, any extension handler, or any MCP
+    /// connection method.
+    fn insert_tool_with_catalog(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
+        let record = CapabilityRecord::for_registered_tool(&tool);
+        let replaced = self
+            .tools
+            .get(tool.name())
+            .map(|old| tool_id_for(old.as_ref()));
+        self.catalog.upsert(replaced.as_ref(), record)?;
+        self.tools.insert(tool.name().to_string(), tool);
+        Ok(())
+    }
+
+    /// Read-only view of the capability catalog. Reading never mutates
+    /// registry state; the exposed `tools_schema()` stays byte-identical.
+    pub fn catalog(&self) -> &ToolCatalog {
+        &self.catalog
+    }
+
+    /// Boundary-test support: resume the catalog generation counter at an
+    /// explicit value. Grants nothing, exposes nothing, and changes no
+    /// tools, schema, or catalog entries; only the counter consulted by
+    /// fail-closed mutation checks is overwritten. Doc-hidden instead of
+    /// cfg-gated: this crate's integration tests (e.g.
+    /// `tests/execution_gate.rs`) run without the `testing` feature, so
+    /// `#[cfg(any(test, feature = "testing"))]` would break their imports.
+    #[doc(hidden)]
+    pub fn resume_catalog_generation_for_tests(
+        &mut self,
+        generation: crate::tools::catalog::CatalogGeneration,
+    ) {
+        self.catalog.set_generation_for_tests(generation);
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -312,6 +509,32 @@ impl ToolRegistry {
             .unwrap_or(name)
     }
 
+    /// Atomic wire-name resolution for the execution gate (Task 16): map
+    /// the incoming API/wire name through the deterministic sanitized-name
+    /// reverse mapping to the exact live runtime tool, then derive its
+    /// catalog [`crate::tools::catalog::ToolId`] from the resolved tool
+    /// instance itself — never from the alias string. Because this runs on
+    /// one `&self` borrow (i.e. under the caller's registry read lock), the
+    /// resolution, the catalog reachable via [`Self::catalog`], and any
+    /// subsequent implementation acquisition observe one consistent
+    /// registry snapshot.
+    pub fn resolve_wire_call(
+        &self,
+        wire_name: &str,
+    ) -> Option<crate::tools::activation::ResolvedToolCall> {
+        let runtime_name = self
+            .api_to_runtime_names
+            .get(wire_name)
+            .map(String::as_str)
+            .unwrap_or(wire_name);
+        let tool = self.tools.get(runtime_name)?;
+        Some(crate::tools::activation::ResolvedToolCall::new(
+            wire_name,
+            runtime_name,
+            tool_id_for(tool.as_ref()),
+        ))
+    }
+
     pub fn translate_input_for_api_tool(&self, tool_name: &str, input: Value) -> Value {
         if let Some(map) = self.input_name_maps.get(tool_name) {
             Self::translate_input_names(input, map)
@@ -322,6 +545,53 @@ impl ToolRegistry {
 
     pub fn tools_schema(&self) -> Arc<Vec<Value>> {
         Arc::clone(&self.cached_schema)
+    }
+
+    /// Deterministic session schema projection (Task 17, spec §7.7): select
+    /// from the EXISTING cached exposed schema exactly the entries whose
+    /// capability identity is core or exactly-activated in `session`,
+    /// preserving cached byte ordering, API-safe names, and collision
+    /// suffixes. Pure read: no catalog insertion, no schema rebuild, no
+    /// factory invocation, no process/network. Catalog generation drift or
+    /// a changed pinned schema digest fails typed instead of serving a
+    /// stale projection. Default runtime exposure (`tools_schema`) is
+    /// unaffected until Task 18 opts in.
+    pub fn session_tools_schema(
+        &self,
+        session: &crate::tools::activation::SessionToolSet,
+    ) -> Result<Vec<Value>, SessionSchemaError> {
+        if session.is_stale(&self.catalog) {
+            return Err(SessionSchemaError::StaleSessionSet {
+                set: session.catalog_generation(),
+                catalog: self.catalog.generation(),
+            });
+        }
+        let mut projected = Vec::new();
+        for entry in self.cached_schema.iter() {
+            let Some(api_name) = entry["name"].as_str() else {
+                continue;
+            };
+            let runtime_name = self.runtime_name_for_api(api_name);
+            let Some(tool) = self.tools.get(runtime_name) else {
+                continue;
+            };
+            let id = tool_id_for(tool.as_ref());
+            let pinned = session
+                .core_schema_digest(&id)
+                .or_else(|| session.activation(&id).map(|a| a.schema_digest()));
+            let Some(pinned) = pinned else {
+                continue; // not part of this session's set — absent.
+            };
+            let record = self
+                .catalog
+                .get(&id)
+                .ok_or_else(|| SessionSchemaError::NotCataloged(id.clone()))?;
+            if pinned != record.schema_digest() {
+                return Err(SessionSchemaError::SchemaDigestMismatch(id));
+            }
+            projected.push(entry.clone());
+        }
+        Ok(projected)
     }
 
     /// Return runtime names of tools owned by the given extension id, sorted ascending.
@@ -346,6 +616,33 @@ impl ToolRegistry {
     }
 }
 
+/// Typed failure for [`ToolRegistry::session_tools_schema`]. Metadata-only:
+/// bounded identities and generation counters, never schema bytes.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SessionSchemaError {
+    #[error(
+        "session tool set generation {} is stale against catalog generation {}",
+        set.value(),
+        catalog.value()
+    )]
+    StaleSessionSet {
+        set: crate::tools::catalog::CatalogGeneration,
+        catalog: crate::tools::catalog::CatalogGeneration,
+    },
+    #[error("session member is not cataloged: {0}")]
+    NotCataloged(crate::tools::catalog::ToolId),
+    #[error("schema digest changed since the session pinned it: {0}")]
+    SchemaDigestMismatch(crate::tools::catalog::ToolId),
+}
+
+/// Fail-closed message for infallible compatibility wrappers over typed
+/// catalog mutations. Failure means either generation exhaustion (a `u64`
+/// mutation counter, unreachable in practice) or a duplicate capability
+/// identity across distinct runtime names; both panic here rather than
+/// exposing a live tool the catalog could not truthfully record.
+const CATALOG_REJECTED_MSG: &str =
+    "tool catalog rejected mutation: refusing to expose a tool the catalog could not record";
+
 fn is_recursive_subagent_tool_name(name: &str) -> bool {
     let api_name = ToolRegistry::api_safe_name(name, &HashSet::new());
     matches!(
@@ -358,6 +655,10 @@ fn is_recursive_subagent_tool_name(name: &str) -> bool {
             | "subagent_resume"
             | "subagent_model_authorize"
             | "subagent_models"
+            // Task A4: the continuous-memory control tool follows the exact
+            // subagent_model_authorize precedent — recursive subagents must
+            // never see it (nor an extension tool squatting on its name).
+            | "memory_context"
     )
 }
 #[cfg(test)]
@@ -427,6 +728,98 @@ mod tests {
             registry.runtime_name_for_api("plugin_skill_tool"),
             "plugin:skill.tool"
         );
+    }
+
+    /// Regression (memory-fetch schema collision): an extension runtime
+    /// name that SANITIZES to a built-in wire name (`memory:fetch` →
+    /// `memory_fetch`) must never claim the built-in's API name — pure
+    /// lexicographic assignment let it (':' sorts before '_'), demoting the
+    /// built-in to `memory_fetch_2` and inviting models to call the
+    /// extension `{id}` schema as if it were the built-in `{ids}` tool.
+    /// Built-ins get naming priority; extension tools keep stable
+    /// NAMESPACED API names derived from their `<plugin>:<tool>` runtime
+    /// names and never surface a bare leaf name.
+    #[test]
+    fn extension_leaf_name_never_shadows_builtin_memory_fetch_api_name() {
+        struct ExtMemoryTool {
+            runtime: &'static str,
+            ext: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Tool for ExtMemoryTool {
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Extension {
+                    extension_id: self.ext.to_string(),
+                }
+            }
+            fn extension_id(&self) -> Option<&str> {
+                Some(self.ext)
+            }
+            fn name(&self) -> &str {
+                self.runtime
+            }
+            fn description(&self) -> &str {
+                "extension memory tool (single-id schema)"
+            }
+            fn parameters(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                })
+            }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                Ok("ok".to_string())
+            }
+        }
+
+        let registry = ToolRegistry::from_tools(vec![
+            Arc::new(crate::tools::memory::MemoryFetchTool),
+            // Adversarial: sanitizes to exactly `memory_fetch`.
+            Arc::new(ExtMemoryTool {
+                runtime: "memory:fetch",
+                ext: "memory",
+            }),
+            // Realistic Axel shape: distinct namespaced API name.
+            Arc::new(ExtMemoryTool {
+                runtime: "axel-memory-manager:memory_fetch",
+                ext: "axel-memory-manager",
+            }),
+        ]);
+
+        // The built-in keeps its exact wire name and its `{ids}` schema.
+        assert_eq!(
+            registry.runtime_name_for_api("memory_fetch"),
+            "memory_fetch",
+            "wire name `memory_fetch` must resolve to the built-in"
+        );
+        let schema = registry.tools_schema();
+        let builtin = schema
+            .iter()
+            .find(|e| e["name"] == "memory_fetch")
+            .expect("built-in memory_fetch exposed");
+        assert_eq!(
+            builtin["input_schema"]["required"],
+            json!(["ids"]),
+            "built-in memory_fetch schema must remain {{ids: [...]}}"
+        );
+
+        // Extension tools surface only under namespaced API names.
+        let axel = schema
+            .iter()
+            .find(|e| e["name"] == "axel-memory-manager_memory_fetch")
+            .expect("extension tool exposed under namespaced API name");
+        assert_eq!(axel["input_schema"]["required"], json!(["id"]));
+        // The adversarial collision gets a deterministic suffix — never
+        // the built-in's exact name.
+        assert_eq!(
+            registry.runtime_name_for_api("memory_fetch_2"),
+            "memory:fetch"
+        );
+        // And wire-call resolution for the built-in name reaches the
+        // built-in tool identity, not the extension.
+        let resolved = registry.resolve_wire_call("memory_fetch").unwrap();
+        assert_eq!(resolved.runtime_name(), "memory_fetch");
     }
 
     #[test]
@@ -505,8 +898,12 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Includes read-only model discovery plus session authorization.
-        assert_eq!(registry.tools_schema().len(), 18);
+        // Includes read-only model discovery plus session authorization
+        // (Task 17 adds `search_tools` + `activate_tools`), the Task 32
+        // project-scoped memory primitives (4 tools, deferred under
+        // progressive disclosure), and the Task A4 `memory_context`
+        // control tool.
+        assert_eq!(registry.tools_schema().len(), 25);
 
         // Should find bash tool
         assert!(registry.get("bash").is_some());
@@ -729,6 +1126,7 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
+            "memory_context",
         ] {
             other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
         }
@@ -743,6 +1141,7 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
+            "memory_context",
         ] {
             assert!(merged.get(name).is_none(), "{name} must stay unavailable");
         }
@@ -759,6 +1158,7 @@ mod tests {
             "subagent:resume",
             "subagent:model:authorize",
             "subagent:models",
+            "memory:context",
         ] {
             other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
         }
@@ -772,12 +1172,30 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
+            "memory_context",
         ] {
             assert!(
                 merged.get(api_name).is_none(),
                 "API-safe recursive name {api_name} must stay unavailable"
             );
         }
+    }
+
+    /// Task A4: `memory_context` mirrors the `subagent_model_authorize`
+    /// precedent — present in the primary registry, absent from every
+    /// recursive subagent registry.
+    #[test]
+    fn memory_context_present_in_primary_registry_absent_in_recursive_ones() {
+        assert!(ToolRegistry::new().get("memory_context").is_some());
+        assert!(ToolRegistry::without_subagent()
+            .get("memory_context")
+            .is_none());
+
+        let merged = ToolRegistry::without_subagent_with_extensions(&ToolRegistry::new());
+        assert!(
+            merged.get("memory_context").is_none(),
+            "recursive registries must never expose memory_context"
+        );
     }
 
     #[test]
@@ -794,5 +1212,42 @@ mod tests {
         assert!(merged.get("ext:custom").is_some());
         assert!(merged.get("bash").is_some());
         assert!(merged.get("bash").unwrap().extension_id().is_none());
+    }
+
+    /// Two distinct runtime names declaring the same capability identity.
+    struct McpTwin(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for McpTwin {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mcp twin"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("ok".to_string())
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Mcp {
+                server_id: "srv".to_string(),
+                server_tool_name: "shared".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "tool catalog rejected mutation")]
+    fn from_tools_with_duplicate_capability_identity_fails_closed() {
+        // Initial construction must not silently hide an uncataloged tool:
+        // two distinct runtime names collapsing to one capability identity
+        // must abort construction, never diverge live tools from the catalog.
+        let _ = ToolRegistry::from_tools(vec![
+            Arc::new(McpTwin("twin_one")),
+            Arc::new(McpTwin("twin_two")),
+        ]);
     }
 }

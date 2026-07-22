@@ -1,11 +1,31 @@
-use ratatui::prelude::*;
-use ratatui::buffer::Buffer;
-use crate::app::App;
 use super::theme;
+use crate::app::App;
+use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 
 /// The hub selection index
-const TABLES: &[&str] = &["BLACKJACK", "SLOTS", "ROULETTE", "WAR", "BACCARAT", "V.POKER", "KENO", "SIC BO", "CRAPS"];
-const TABLE_ICONS: &[&str] = &["♠ ♥ ♣ ♦", "⟐ ⟐ ⟐", "◎ ◎ ◎", "⚔ ⚔", "9 9 9", "♠ HOLD", "● ● ●", "⚄ ⚄ ⚄", "⚃ ⚁"];
+const TABLES: &[&str] = &[
+    "BLACKJACK",
+    "SLOTS",
+    "ROULETTE",
+    "WAR",
+    "BACCARAT",
+    "V.POKER",
+    "KENO",
+    "SIC BO",
+    "CRAPS",
+];
+const TABLE_ICONS: &[&str] = &[
+    "♠ ♥ ♣ ♦",
+    "⟐ ⟐ ⟐",
+    "◎ ◎ ◎",
+    "⚔ ⚔",
+    "9 9 9",
+    "♠ HOLD",
+    "● ● ●",
+    "⚄ ⚄ ⚄",
+    "⚃ ⚁",
+];
 
 /// Draw the casino floor with 3D perspective
 pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
@@ -50,9 +70,18 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
         for x in (left + 1)..right {
             let ax = area.left() + x as u16;
             if ay < area.bottom() && ax < area.right() {
-                let ch = if y == 0 { '░' } else if y < 2 { '·' } else { ' ' };
+                let ch = if y == 0 {
+                    '░'
+                } else if y < 2 {
+                    '·'
+                } else {
+                    ' '
+                };
                 let brightness = if y == 0 { theme::DARK_GRAY } else { theme::BG };
-                buf[(ax, ay)].set_char(ch).set_fg(theme::DARK_GRAY).set_bg(brightness);
+                buf[(ax, ay)]
+                    .set_char(ch)
+                    .set_fg(theme::DARK_GRAY)
+                    .set_bg(brightness);
             }
         }
     }
@@ -71,7 +100,11 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
             if ay < area.bottom() && ax < area.right() {
                 let checker = ((x / 3) + (y / 2)) % 2 == 0;
                 let ch = if checker { '▓' } else { '░' };
-                let fg = if checker { Color::Rgb(25, 25, 30) } else { Color::Rgb(15, 15, 20) };
+                let fg = if checker {
+                    Color::Rgb(25, 25, 30)
+                } else {
+                    Color::Rgb(15, 15, 20)
+                };
                 buf[(ax, ay)].set_char(ch).set_fg(fg).set_bg(theme::BG);
             }
         }
@@ -85,7 +118,11 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
 
     // Neon flicker effect
     let flicker = (app.frame / 8) % 20 != 0; // occasional flicker off
-    let sign_color = if flicker { theme::MAGENTA } else { theme::DARK_GRAY };
+    let sign_color = if flicker {
+        theme::MAGENTA
+    } else {
+        theme::DARK_GRAY
+    };
 
     // Sign border
     let border_w = sign_w + 4;
@@ -94,7 +131,14 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
     let bot_border = format!("╚{}╝", "═".repeat(border_w - 2));
 
     draw_str(buf, area, border_x, sign_y, &top_border, sign_color);
-    draw_str(buf, area, border_x, sign_y + 1, &format!("║ {} ║", sign_text), sign_color);
+    draw_str(
+        buf,
+        area,
+        border_x,
+        sign_y + 1,
+        &format!("║ {} ║", sign_text),
+        sign_color,
+    );
     draw_str(buf, area, border_x, sign_y + 2, &bot_border, sign_color);
 
     // Neon glow on surrounding cells
@@ -131,7 +175,11 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
         let ty = start_y + row * (table_h + gap_y);
         let selected = app.hub_selection == i;
 
-        let border_color = if selected { theme::CYAN } else { theme::AMBER_DIM };
+        let border_color = if selected {
+            theme::CYAN
+        } else {
+            theme::AMBER_DIM
+        };
         let name_color = if selected { theme::WHITE } else { theme::GRAY };
         let icon_color = if selected {
             match i % 6 {
@@ -147,8 +195,16 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
         };
 
         // Compact table box
-        let top = if selected { format!("╔{}╗", "═".repeat(table_w - 2)) } else { format!("┌{}┐", "─".repeat(table_w - 2)) };
-        let bot = if selected { format!("╚{}╝", "═".repeat(table_w - 2)) } else { format!("└{}┘", "─".repeat(table_w - 2)) };
+        let top = if selected {
+            format!("╔{}╗", "═".repeat(table_w - 2))
+        } else {
+            format!("┌{}┐", "─".repeat(table_w - 2))
+        };
+        let bot = if selected {
+            format!("╚{}╝", "═".repeat(table_w - 2))
+        } else {
+            format!("└{}┘", "─".repeat(table_w - 2))
+        };
         let sl = if selected { "║" } else { "│" };
         let sr = sl;
 
@@ -157,20 +213,72 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
         // Icon row
         let icon = TABLE_ICONS[i];
         let ipad = (table_w - 2).saturating_sub(icon.chars().count()) / 2;
-        let icon_line = format!("{}{}{}{}{}", sl, " ".repeat(ipad), icon, " ".repeat((table_w - 2).saturating_sub(ipad + icon.chars().count())), sr);
-        draw_str_two(buf, area, tx, ty + 1, &icon_line, border_color, icon_color, icon);
+        let icon_line = format!(
+            "{}{}{}{}{}",
+            sl,
+            " ".repeat(ipad),
+            icon,
+            " ".repeat((table_w - 2).saturating_sub(ipad + icon.chars().count())),
+            sr
+        );
+        draw_str_two(
+            buf,
+            area,
+            tx,
+            ty + 1,
+            &icon_line,
+            border_color,
+            icon_color,
+            icon,
+        );
 
         // Name row
         let npad = (table_w - 2).saturating_sub(name.len()) / 2;
-        let name_line = format!("{}{}{}{}{}", sl, " ".repeat(npad), name, " ".repeat((table_w - 2).saturating_sub(npad + name.len())), sr);
-        draw_str_two(buf, area, tx, ty + 2, &name_line, border_color, name_color, name);
+        let name_line = format!(
+            "{}{}{}{}{}",
+            sl,
+            " ".repeat(npad),
+            name,
+            " ".repeat((table_w - 2).saturating_sub(npad + name.len())),
+            sr
+        );
+        draw_str_two(
+            buf,
+            area,
+            tx,
+            ty + 2,
+            &name_line,
+            border_color,
+            name_color,
+            name,
+        );
 
         // Key row
         let key_label = format!("[{}]", i + 1);
         let kpad = (table_w - 2).saturating_sub(key_label.len()) / 2;
-        let key_line = format!("{}{}{}{}{}", sl, " ".repeat(kpad), key_label, " ".repeat((table_w - 2).saturating_sub(kpad + key_label.len())), sr);
-        let key_color = if selected { theme::GREEN } else { theme::DARK_GRAY };
-        draw_str_two(buf, area, tx, ty + 3, &key_line, border_color, key_color, &key_label);
+        let key_line = format!(
+            "{}{}{}{}{}",
+            sl,
+            " ".repeat(kpad),
+            key_label,
+            " ".repeat((table_w - 2).saturating_sub(kpad + key_label.len())),
+            sr
+        );
+        let key_color = if selected {
+            theme::GREEN
+        } else {
+            theme::DARK_GRAY
+        };
+        draw_str_two(
+            buf,
+            area,
+            tx,
+            ty + 3,
+            &key_line,
+            border_color,
+            key_color,
+            &key_label,
+        );
 
         draw_str(buf, area, tx, ty + 4, &bot, border_color);
     }
@@ -195,7 +303,9 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
             let cell = &buf[(ax, ay)];
             // Only draw on empty/background cells
             if cell.symbol() == " " || cell.symbol() == "░" || cell.symbol() == "·" {
-                buf[(ax, ay)].set_char(ch.chars().next().unwrap()).set_fg(color);
+                buf[(ax, ay)]
+                    .set_char(ch.chars().next().unwrap())
+                    .set_fg(color);
             }
         }
     }
@@ -203,9 +313,30 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
     // ── LIFETIME STATS (left side) ──────────────────────────────────
     let stats_x = 3;
     let stats_y = h.saturating_sub(8);
-    draw_str(buf, area, stats_x, stats_y, "┌─────────────────────┐", theme::DARK_GRAY);
-    draw_str(buf, area, stats_x, stats_y + 1, "│  LIFETIME STATS     │", theme::GRAY);
-    draw_str(buf, area, stats_x, stats_y + 2, "├─────────────────────┤", theme::DARK_GRAY);
+    draw_str(
+        buf,
+        area,
+        stats_x,
+        stats_y,
+        "┌─────────────────────┐",
+        theme::DARK_GRAY,
+    );
+    draw_str(
+        buf,
+        area,
+        stats_x,
+        stats_y + 1,
+        "│  LIFETIME STATS     │",
+        theme::GRAY,
+    );
+    draw_str(
+        buf,
+        area,
+        stats_x,
+        stats_y + 2,
+        "├─────────────────────┤",
+        theme::DARK_GRAY,
+    );
     let games = format!("│  Games: {:>10}  │", app.save.games_played);
     draw_str(buf, area, stats_x, stats_y + 3, &games, theme::GRAY);
     let earned = format!("│  Won:   {:>10}  │", app.save.total_earned);
@@ -214,7 +345,14 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
     draw_str(buf, area, stats_x, stats_y + 5, &lost, theme::RED_DIM);
     let resets = format!("│  Resets:{:>10}  │", app.save.resets);
     draw_str(buf, area, stats_x, stats_y + 6, &resets, theme::AMBER_DIM);
-    draw_str(buf, area, stats_x, stats_y + 7, "└─────────────────────┘", theme::DARK_GRAY);
+    draw_str(
+        buf,
+        area,
+        stats_x,
+        stats_y + 7,
+        "└─────────────────────┘",
+        theme::DARK_GRAY,
+    );
 
     // ── BOTTOM INFO ─────────────────────────────────────────────────
     let info_y = h.saturating_sub(2);
@@ -227,26 +365,47 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() { return; }
+    if cy >= area.bottom() {
+        return;
+    }
     for ch in s.chars() {
-        if cx >= area.right() { break; }
+        if cx >= area.right() {
+            break;
+        }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }
 }
 
 // ── Helper: draw a string with two colors (border + content) ────────
-fn draw_str_two(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, border_fg: Color, content_fg: Color, content: &str) {
+fn draw_str_two(
+    buf: &mut Buffer,
+    area: Rect,
+    x: usize,
+    y: usize,
+    s: &str,
+    border_fg: Color,
+    content_fg: Color,
+    content: &str,
+) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() { return; }
+    if cy >= area.bottom() {
+        return;
+    }
 
     let content_start = s.find(content).unwrap_or(s.len());
     let content_end = content_start + content.len();
 
     for (i, ch) in s.chars().enumerate() {
-        if cx >= area.right() { break; }
-        let fg = if i >= content_start && i < content_end { content_fg } else { border_fg };
+        if cx >= area.right() {
+            break;
+        }
+        let fg = if i >= content_start && i < content_end {
+            content_fg
+        } else {
+            border_fg
+        };
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }

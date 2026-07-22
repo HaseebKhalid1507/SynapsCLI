@@ -385,6 +385,7 @@ pub async fn fetch_provider_models(provider_key: &str) -> Result<Vec<ProviderMod
             path: "/models".to_string(),
             body: None,
             stream: false,
+            body_bytes: None,
         })
         .await
         .map_err(|e| e.to_string())?;

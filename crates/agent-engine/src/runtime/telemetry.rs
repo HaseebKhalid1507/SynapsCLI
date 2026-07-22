@@ -7,11 +7,22 @@
 //! `basic` records timing + usage + cost. `full` additionally records
 //! rate-limit headers and cache-diagnostics results when available.
 //!
-//! Writes are best-effort: a broken log path must never break the request
-//! pipeline. All errors are silently dropped (matching `log_usage`).
+//! Writes are best-effort and non-blocking: persistence goes through the
+//! bounded background [`writer`] (Task 11, spec §6.5), so a slow or broken
+//! log path can never delay or fail the request pipeline. Failures are
+//! counted (never silent-and-invisible) with one warning per persistent
+//! failure class.
 
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub mod writer;
+
+pub use writer::{
+    default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
+    WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES, DEFAULT_QUEUE_CAPACITY,
+    DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+};
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -262,55 +273,6 @@ pub fn retry_delay_from_headers(
     // ── 3. Exponential back-off fallback ────────────────────────────────────
     let d = Duration::from_millis(1000 * 2u64.pow(attempt.saturating_sub(1)));
     (d, false)
-}
-
-/// Default telemetry log path: `~/.cache/synaps/api-log.jsonl`.
-fn default_log_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".cache/synaps/api-log.jsonl"))
-}
-
-/// Append a record to the telemetry log. Best-effort — all errors are
-/// silently dropped so a broken log path never breaks the request pipeline.
-///
-/// File is created 0600 with O_NOFOLLOW (CWE-59 hardening, matching
-/// `HelperMethods::log_usage`).
-pub fn write_record(record: &TelemetryRecord) {
-    let Some(path) = default_log_path() else {
-        return;
-    };
-    let Ok(line) = serde_json::to_string(record) else {
-        return;
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Size-capped rotation: at >50MB, rename to <path>.1 (clobbering any old
-    // .1) before appending. One generation is enough — this is a diagnostic
-    // log, not an audit trail. Errors silently dropped (best-effort contract).
-    const MAX_BYTES: u64 = 50 * 1024 * 1024;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_BYTES {
-            let mut rotated = path.as_os_str().to_owned();
-            rotated.push(".1");
-            let _ = std::fs::rename(&path, std::path::PathBuf::from(rotated));
-        }
-    }
-
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path);
-    if let Ok(mut f) = result {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
-    }
 }
 
 #[cfg(test)]

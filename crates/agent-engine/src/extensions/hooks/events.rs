@@ -196,17 +196,11 @@ impl HookEvent {
     /// truncation to `max_tool_output` happens AFTER the hook in
     /// `emit_after_tool_call` (compress-then-truncate).
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
-        let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
-            let boundary = output
-                .char_indices()
-                .map(|(idx, _)| idx)
-                .take_while(|idx| *idx <= MAX_HOOK_OUTPUT)
-                .last()
-                .unwrap_or(0);
+        let bounded = agent_core::BoundedText::new(&output, MAX_HOOK_OUTPUT);
+        let truncated_output = if bounded.truncated {
             format!(
                 "{}…[truncated, {} total bytes]",
-                &output[..boundary],
-                output.len()
+                bounded.text, bounded.original_bytes
             )
         } else {
             output

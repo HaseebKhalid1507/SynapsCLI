@@ -29,6 +29,10 @@ pub struct Session {
     pub compacted_into: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_provenance: Option<crate::prompt::PromptProvenance>,
+    /// Typed compaction summary provenance (spec §9.3). Present on sessions
+    /// produced by (or updated in place by) a compaction transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::CompactionRecord>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -70,11 +74,20 @@ impl Session {
             parent_session: None,
             compacted_into: None,
             prompt_provenance: None,
+            compaction: None,
         }
     }
 
-    /// Create a new session from a compaction summary, linked to the parent.
-    pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
+    /// Create a successor session from a compaction transition (spec §9.3).
+    /// The summary enters context through the canonical sanitized rendering
+    /// ([`crate::compaction::compaction_context_messages`]); the parent's
+    /// system prompt stays TYPED metadata — the successor's `system_prompt`
+    /// field and the provenance record — never plain user text.
+    pub fn from_compaction_record(
+        parent: &Session,
+        summary_text: &str,
+        record: crate::compaction::CompactionRecord,
+    ) -> Self {
         let now = Utc::now();
         let id = format!(
             "{}-{}",
@@ -85,14 +98,6 @@ impl Session {
         // continuation, so the name should follow. Parent's name will be
         // cleared when the caller saves it with compacted_into set.
         let name = parent.name.clone();
-        let mut summary_parts = String::new();
-        if let Some(ref sp) = parent.system_prompt {
-            summary_parts.push_str(&format!("<system-prompt>\n{}\n</system-prompt>\n\n", sp));
-        }
-        summary_parts.push_str(&format!(
-            "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary and system prompt above contain all the context you need.",
-            summary
-        ));
         Session {
             id,
             title: format!(
@@ -112,16 +117,12 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
-            api_messages: vec![
-                SharedMessage::new(serde_json::json!({"role": "user", "content": summary_parts})),
-                SharedMessage::new(
-                    serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
-                ),
-            ],
+            api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
             prompt_provenance: None,
+            compaction: Some(record),
         }
     }
 
@@ -140,20 +141,29 @@ impl Session {
         }
     }
 
+    /// Persist this session under the configured persistence mode
+    /// (`session_persistence` config key; default is the unchanged legacy
+    /// JSON path — see Task 35 / `crate::core::session_journal`).
     pub async fn save(&self) -> std::io::Result<()> {
         let dir = crate::config::resolve_write_path("sessions");
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{}.json", self.id));
-        let tmp = path.with_extension("tmp");
-        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        tokio::fs::write(&tmp, &json).await?;
-        tokio::fs::rename(&tmp, &path).await
+        let mode = crate::config::load_config().session_persistence;
+        let session = self.clone(); // messages are Arc-shared — cheap clone
+        tokio::task::spawn_blocking(move || {
+            crate::core::session_journal::save_session_in_dir(&dir, &session, mode).map(|_| ())
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {
-        let path = sessions_dir().join(format!("{}.json", id));
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(std::io::Error::other)
+        Self::load_from_dir(&sessions_dir(), id)
+    }
+
+    /// Canonical backward-compatible host load for a caller-selected sessions
+    /// directory. Both legacy snapshots and journal-backed sessions resolve
+    /// through the same journal overlay implementation.
+    pub fn load_from_dir(dir: &std::path::Path, id: &str) -> std::io::Result<Self> {
+        crate::core::session_journal::load_session_in_dir(dir, id)
     }
 
     pub fn info(&self) -> SessionInfo {
@@ -201,6 +211,20 @@ impl Session {
     }
 }
 
+/// Blocking body of [`Session::save`]: create the sessions dir (0700), then
+/// write `<id>.json` atomically via `private_fs` (temp file created with mode
+/// 0600 — never create-then-chmod — then renamed; symlink targets refused).
+#[cfg(test)]
+pub(crate) fn save_json_in_dir(
+    dir: &std::path::Path,
+    id: &str,
+    json: &[u8],
+) -> std::io::Result<()> {
+    // fix2: the SAME strict no-symlink root resolution and handle-relative
+    // atomic write as every journal operation (see `session_journal`).
+    crate::core::session_journal::write_json_snapshot(dir, id, json)
+}
+
 /// Find a session by full or partial ID match
 pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
     let dir = sessions_dir();
@@ -211,19 +235,22 @@ pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
         ));
     }
 
+    // fix2: strict handle-relative enumeration for both match phases.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+
     // Try exact match first
-    let exact = dir.join(format!("{}.json", partial_id));
-    if exact.exists() {
+    if entries
+        .iter()
+        .any(|e| e.name == format!("{partial_id}.json"))
+    {
         return Session::load(partial_id);
     }
 
     // Partial match — find all that contain the partial ID
     let mut matches: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".json") {
-            let id = name.trim_end_matches(".json");
+    for entry in &entries {
+        if entry.name.ends_with(".json") {
+            let id = entry.name.trim_end_matches(".json");
             if id.contains(partial_id) {
                 matches.push(id.to_string());
             }
@@ -259,25 +286,35 @@ pub fn latest_session() -> std::io::Result<Session> {
             "no sessions found",
         ));
     }
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
-                    newest = Some((mtime, path));
-                }
+    // fix2: strict handle-relative enumeration — a symlinked ancestor
+    // refuses instead of being followed.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+    let names: std::collections::HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in &entries {
+        // A journal append IS a save of its session (Task 35): attribute the
+        // journal's mtime to the sibling snapshot so "latest" stays exact
+        // when snapshots lag behind appends.
+        let id = if let Some(id) = entry.name.strip_suffix(".json") {
+            id
+        } else if let Some(id) = entry.name.strip_suffix(".journal") {
+            if !names.contains(format!("{id}.json").as_str()) {
+                continue; // orphan journal — not loadable
+            }
+            id
+        } else {
+            continue;
+        };
+        if let Some(mtime) = entry.mtime {
+            if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                newest = Some((mtime, id.to_string()));
             }
         }
     }
-    let path = newest
-        .map(|(_, p)| p)
+    let id = newest
+        .map(|(_, id)| id)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found"))?;
-    let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad session filename")
-    })?;
-    Session::load(id)
+    Session::load(&id)
 }
 
 /// List all sessions, sorted by most recently updated.
@@ -292,11 +329,9 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
         return Ok(Vec::new());
     }
     let mut sessions: Vec<SessionInfo> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Some(info) = parse_session_header(&path) {
+    for entry in crate::core::session_journal::session_dir_entries(&dir)? {
+        if entry.name.ends_with(".json") {
+            if let Some(info) = parse_session_header(&dir, &entry.name) {
                 sessions.push(info);
             }
         }
@@ -315,21 +350,39 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                files.push((mtime, path));
+    // fix2: strict handle-relative enumeration.
+    let entries = crate::core::session_journal::session_dir_entries(&dir)?;
+    let names: std::collections::HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let mut by_snapshot: std::collections::HashMap<String, std::time::SystemTime> =
+        std::collections::HashMap::new();
+    for entry in &entries {
+        // Journal mtimes attribute to their session snapshot (Task 35).
+        let id = if let Some(id) = entry.name.strip_suffix(".json") {
+            id
+        } else if let Some(id) = entry.name.strip_suffix(".journal") {
+            if !names.contains(format!("{id}.json").as_str()) {
+                continue;
+            }
+            id
+        } else {
+            continue;
+        };
+        if let Some(mtime) = entry.mtime {
+            let slot = by_snapshot
+                .entry(id.to_string())
+                .or_insert(std::time::SystemTime::UNIX_EPOCH);
+            if mtime > *slot {
+                *slot = mtime;
             }
         }
     }
+    let mut files: Vec<(std::time::SystemTime, String)> =
+        by_snapshot.into_iter().map(|(id, t)| (t, id)).collect();
     files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     files.truncate(limit);
     let mut sessions: Vec<SessionInfo> = Vec::new();
-    for (_, path) in files {
-        if let Some(info) = parse_session_header(&path) {
+    for (_, id) in files {
+        if let Some(info) = parse_session_header(&dir, &format!("{id}.json")) {
             sessions.push(info);
         }
     }
@@ -339,7 +392,7 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
 /// Read + parse just the metadata header of one session file into a
 /// [`SessionInfo`] (no message history). `message_count` is left 0 — it isn't
 /// parsed in the header read; use [`Session::info`] when an exact count matters.
-fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
+fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<SessionInfo> {
     #[derive(Deserialize)]
     struct SessionMetadata {
         id: String,
@@ -353,9 +406,9 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
         #[serde(default)]
         session_cost: f64,
     }
-    let header = read_session_header(path)?;
+    let header = read_session_header(dir, file_name)?;
     let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
-    Some(SessionInfo {
+    let mut info = SessionInfo {
         id: meta.id,
         title: meta.title,
         name: meta.name,
@@ -364,7 +417,17 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
         updated_at: meta.updated_at,
         session_cost: meta.session_cost,
         message_count: 0,
-    })
+    };
+    // Journal freshness overlay (Task 35): when an opt-in journal exists,
+    // its bounded meta tail is newer than the (possibly lagging) snapshot
+    // header. Legacy sessions have no journal — zero extra I/O.
+    if let Some(tail) = crate::core::session_journal::journal_meta_tail(dir, &info.id) {
+        if tail.updated_at > info.updated_at {
+            info.updated_at = tail.updated_at;
+            info.session_cost = tail.session_cost;
+        }
+    }
+    Some(info)
 }
 
 /// Read just the metadata header of a session file — everything BEFORE the
@@ -374,12 +437,15 @@ fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
 /// history. Falls back to the whole file if the key isn't found (small/new
 /// sessions). This is what keeps `list_sessions()` O(#sessions) instead of
 /// O(total bytes on disk).
-fn read_session_header(path: &std::path::Path) -> Option<String> {
+fn read_session_header(dir: &std::path::Path, file_name: &str) -> Option<String> {
     use std::io::Read;
     const KEY: &[u8] = b"\"api_messages\"";
     const MAX_HEADER: usize = 256 * 1024; // safety cap if the key is never found
 
-    let mut file = std::fs::File::open(path).ok()?;
+    // fix2: confined strict open — same root resolution as every other
+    // session read; a symlinked ancestor or artifact yields None, never
+    // foreign bytes.
+    let mut file = crate::core::session_journal::confined_open(dir, file_name).ok()??;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut cut: Option<usize> = None;
@@ -411,6 +477,13 @@ fn sessions_dir() -> PathBuf {
     crate::config::get_active_config_dir().join("sessions")
 }
 
+/// Remove a persisted session file (compaction-transition rollback) AND its
+/// journal, when one exists (Task 35) — a session and its journal live and
+/// die together. A missing file is not an error — rollback must be idempotent.
+pub fn delete_session_file(id: &str) -> std::io::Result<()> {
+    crate::core::session_journal::delete_session_files_in_dir(&sessions_dir(), id)
+}
+
 /// Validate a session or chain name: [a-z0-9-]{1,40}.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -436,17 +509,13 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 /// avoiding a full directory scan when the named session appears early.
 pub fn find_session_by_name(name: &str) -> std::io::Result<Session> {
     let dir = sessions_dir();
-    if dir.exists() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "json") {
-                continue;
-            }
-            if let Some(info) = parse_session_header(&path) {
-                if info.name.as_deref() == Some(name) {
-                    return Session::load(&info.id);
-                }
+    for entry in crate::core::session_journal::session_dir_entries(&dir)? {
+        if !entry.name.ends_with(".json") {
+            continue;
+        }
+        if let Some(info) = parse_session_header(&dir, &entry.name) {
+            if info.name.as_deref() == Some(name) {
+                return Session::load(&info.id);
             }
         }
     }
@@ -487,6 +556,24 @@ pub fn resolve_session(query: &str) -> std::io::Result<Session> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Minimal typed provenance for constructor tests.
+    fn test_record(parent: &Session) -> crate::compaction::CompactionRecord {
+        crate::compaction::CompactionRecord {
+            schema_version: crate::compaction::COMPACTION_SUMMARY_SCHEMA_VERSION,
+            source_session: parent.id.clone(),
+            source_message_count: parent.api_messages.len(),
+            source_range_digest: crate::compaction::message_range_digest(&parent.api_messages),
+            summary_provider: "anthropic".into(),
+            summary_model: "claude-sonnet-4-6".into(),
+            created_at: Utc::now(),
+            prompt_stack_digest: crate::compaction::prompt_stack_digest(&["test"]),
+            included_classes: crate::compaction::ContentClass::ALL.to_vec(),
+            excluded_classes: Vec::new(),
+            redaction_policy: crate::compaction::RedactionPolicy::TruncationOnly,
+            prior_system_prompt: parent.system_prompt.clone(),
+        }
+    }
 
     #[test]
     fn test_session_new() {
@@ -673,7 +760,8 @@ mod tests {
         assert_eq!(restored.model, "openai-codex/gpt-5.6-sol");
         assert_eq!(restored.thinking_level, "ultra");
 
-        let compacted = Session::new_from_compaction(&restored, "summary".to_string());
+        let compacted =
+            Session::from_compaction_record(&restored, "summary", test_record(&restored));
         assert_eq!(compacted.model, restored.model);
         assert_eq!(compacted.thinking_level, "ultra");
         assert_eq!(
@@ -882,7 +970,8 @@ mod tests {
         for other in ["ultra", "max", "xhigh"] {
             assert_ne!(restored.thinking_level, other);
         }
-        let compacted = Session::new_from_compaction(&restored, "summary".into());
+        let compacted =
+            Session::from_compaction_record(&restored, "summary", test_record(&restored));
         let resumed: Session =
             serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
         assert_eq!(resumed.thinking_level, "ultracode");
@@ -890,5 +979,53 @@ mod tests {
             resumed.parent_session.as_deref(),
             Some(original.id.as_str())
         );
+    }
+
+    /// Private-mode tests (spec §5.4). Umask isolation: `#[serial(umask)]`
+    /// serializes umask-mutating tests crate-wide; `UmaskGuard` restores the
+    /// previous mask on drop (panic-safe). These exercise the blocking body
+    /// of `Session::save` directly with a temp dir — no env mutation.
+    #[cfg(unix)]
+    mod private_modes {
+        use super::*;
+        use crate::core::private_fs::test_support::UmaskGuard;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn save_creates_0600_session_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            save_json_in_dir(&dir, "sess-1", b"{}").unwrap();
+            assert_eq!(mode_of(&dir), 0o700, "sessions dir must be 0700");
+            assert_eq!(
+                mode_of(&dir.join("sess-1.json")),
+                0o600,
+                "session file must be 0600"
+            );
+        }
+
+        #[test]
+        fn save_refuses_symlink_target() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.json");
+            std::fs::write(&victim, "original").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("sess-1.json")).unwrap();
+            let res = save_json_in_dir(&dir, "sess-1", b"{}");
+            assert!(res.is_err(), "save onto a symlink must fail");
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "original",
+                "no bytes may be written through the planted symlink"
+            );
+        }
     }
 }

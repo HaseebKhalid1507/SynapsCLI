@@ -6,6 +6,26 @@ pub struct WriteTool;
 
 #[async_trait::async_trait]
 impl Tool for WriteTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::IdempotentWrite
+    }
+
+    fn concurrency_key(
+        &self,
+        validated_input: &serde_json::Value,
+    ) -> Option<super::ConcurrencyKey> {
+        Some(
+            match super::util::canonical_path_key(validated_input["path"].as_str()?) {
+                Some(key) => super::ConcurrencyKey::Key(key),
+                None => super::ConcurrencyKey::Serialize,
+            },
+        )
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "write"
     }

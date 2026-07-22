@@ -75,8 +75,13 @@ fn tool_context(
             session_manager: None,
             subagent_registry: Some(registry),
             event_queue: None,
+            delegation_parent: None,
             secret_prompt: None,
             orchestration: Some(orchestration),
+            tool_activation: None,
+            mcp_leases: None,
+            extension_leases: None,
+            memory_context: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

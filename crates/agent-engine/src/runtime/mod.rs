@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 mod api;
@@ -16,17 +15,27 @@ mod api_sync;
 mod auth;
 #[cfg(test)]
 mod body_golden;
+pub mod budget;
+pub mod capture_worker;
+pub mod chat_capture;
+pub(crate) mod cloud_invoke;
 pub mod compaction;
+pub mod context;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
+pub mod memory_context;
+pub mod memory_history;
 pub mod openai;
+pub mod relay;
 mod request;
 mod sse;
 mod sse_types;
 mod stream;
 pub mod subagent;
 pub mod telemetry;
+pub mod trace;
+pub(crate) mod transport;
 mod types;
 
 use api::ApiMethods;
@@ -239,6 +248,15 @@ pub struct Runtime {
     context_window_override: Option<u64>,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
+    /// Where compaction summarization runs (spec §9.4).
+    compaction_mode: agent_core::compaction::CompactionMode,
+    /// Content classes excluded from remote compaction disclosure.
+    compaction_exclusions: Vec<agent_core::compaction::ContentClass>,
+    /// Transport-construction seam (spec §9.4 / CP-12 M3): incremented at
+    /// the SINGLE remote-summarization entry point before any preflight,
+    /// auth, or HTTP request construction. Shared across clones so the
+    /// local-only zero-network proof observes every path.
+    remote_summarization_attempts: Arc<std::sync::atomic::AtomicU64>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     /// Session-scoped orchestration enforcement installed during boot.
@@ -256,6 +274,82 @@ pub struct Runtime {
     refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Session-shared bounded observability writer (Task 11, spec §6.5).
+    /// `Some` iff `telemetry_level` is Basic/Full. Cloned runtimes
+    /// (subagents) share the same handle — one worker per session, never
+    /// per request. Dropping the last handle detaches the worker (it drains
+    /// and exits on its own), so `Drop` can never hang.
+    telemetry_writer: Option<crate::runtime::telemetry::TelemetryWriter>,
+    /// Trace context handed to every `ApiOptions` site. Enabled (writer
+    /// sink) iff `telemetry_writer` is `Some`; otherwise the no-op sink.
+    /// Shared across clones so all requests of the session carry the same
+    /// session-scoped context IDs.
+    trace_ctx: trace::TraceContext,
+    /// Explicit one-shot trace controls (Task 12): `/trace next` arms
+    /// exactly the next outgoing provider request, even when telemetry is
+    /// Off, then auto-disarms. Shared across clones.
+    trace_controls: std::sync::Arc<trace::TraceControls>,
+    /// Session-scoped continuous-memory context state (task A5, spec §7.3):
+    /// the single state machine every frontend's `/memory` command and the
+    /// task-A4 `memory_context` tool observe. Shared across `Clone`s —
+    /// clones are the same session, so all its streams see one truth — but
+    /// NEVER inherited by subagents: every subagent spawn path constructs a
+    /// brand-new `Runtime::new()` (then `apply_subagent_runtime_policy`,
+    /// see `tools/subagent/mod.rs`), and every `Runtime` constructor
+    /// initializes this slot to the Off/no-lease default via
+    /// [`fresh_memory_context_state`]. Do not add any code path that copies
+    /// memory-context state from a parent runtime into a freshly
+    /// constructed one.
+    memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// Production resolves the exact leased extension provider at dispatch.
+    /// Tests may install this in-process provider to observe the same worker
+    /// boundary without spawning an extension process.
+    #[cfg(any(test, feature = "testing"))]
+    capture_provider_for_test: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<dyn capture_worker::CaptureProvider>>>,
+    >,
+    /// Pending D1 disclosure awaiting an explicit `/memory index-history
+    /// confirm|decline` decision. Same-session clones share one pending preview;
+    /// fresh runtimes and subagents start with none.
+    pending_history_import_preview:
+        std::sync::Arc<std::sync::Mutex<Option<memory_history::HistoryImportPreview>>>,
+    /// The last explicitly confirmed D1 plan, retained for D2 to consume.
+    history_import_plan: std::sync::Arc<std::sync::Mutex<Option<memory_history::ImportPlan>>>,
+    /// The validated recall contribution held for the CURRENT turn, if any
+    /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
+    /// never raw text — admitted only through the
+    /// [`memory_context::validate_contribution`] gate. It feeds the T29
+    /// context-budget `memory_contents` lane in [`Runtime::assess_context`];
+    /// as of task B4 the per-turn recall flow keeps it in sync with the
+    /// injected wire segment. Shared across `Clone`s (same session, one
+    /// truth) but NEVER inherited by subagents — every constructor
+    /// initializes the slot empty, same invariant as `memory_context_state`
+    /// above.
+    pending_memory_segment:
+        std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
+    /// Task B4 (spec §7.4): the accepted recall retained for the CURRENT
+    /// logical request — the contribution reused verbatim by retries of the
+    /// same request (never a second provider call) plus the §10.4
+    /// explainability metadata behind `/memory why` (task B5). Shared
+    /// across `Clone`s; never inherited by subagents (fresh empty slot in
+    /// every constructor, same invariant as `pending_memory_segment`).
+    retained_recall_turn:
+        std::sync::Arc<std::sync::Mutex<Option<memory_context::RetainedRecallTurn>>>,
+    /// Writer handle backing the most recent armed one-shot ephemeral
+    /// trace context (telemetry Off + `/trace next`). Retained here — not
+    /// only inside the request's cloned context — so the session exit
+    /// epilogue (`shutdown_observability*`) can drain the armed record
+    /// even if the process exits right after the request. Replaced on
+    /// re-arm; never touched on the request path beyond one mutex store.
+    /// Shared across clones.
+    one_shot_trace_writer:
+        std::sync::Arc<std::sync::Mutex<Option<crate::runtime::telemetry::TelemetryWriter>>>,
+    /// Content-capture root, bound ONCE at construction (fix1 I2b): every
+    /// sweep — startup, status, sync and async shutdown epilogues — and the
+    /// one-shot content capture use THIS path, never a late ambient
+    /// `SYNAPS_BASE_DIR` read, so post-construction env churn (parallel
+    /// tests, profile switches) can never redirect capture I/O.
+    capture_dir: std::path::PathBuf,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
@@ -292,6 +386,252 @@ pub struct Runtime {
     /// These seed the session policy and are replayed when a manifestless
     /// foreground model change replaces that policy snapshot.
     trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+    /// True when this stream should expose only its session projection rather
+    /// than the legacy full tool schema. Opt-in and false by default so the
+    /// flag-off request bytes stay unchanged (Task 18).
+    progressive_tool_disclosure: bool,
+    /// Current worker handle for bounded delegation-tree accounting. `None`
+    /// for foreground roots.
+    delegation_parent: Option<String>,
+    /// Shared exact MCP lease manager (Task 19). Installed at engine boot
+    /// when MCP exact mode is active; streams mint per-session capabilities
+    /// and RAII guards from it.
+    mcp_runtime: Option<std::sync::Arc<crate::mcp::McpRuntimeManager>>,
+    /// Durable shared session-scope guard (Task 19 review): terminates this
+    /// runtime session's MCP leases only when the LAST owner (runtime clone
+    /// or in-flight stream) drops — never per provider turn.
+    mcp_session_scope: Option<std::sync::Arc<crate::mcp::McpSessionEndGuard>>,
+    /// Shared exact EXTENSION lease manager (Task 20). Installed at engine
+    /// boot under progressive disclosure; streams mint per-session
+    /// capabilities and hold the durable scope below.
+    extension_runtime: Option<std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
+    /// Durable shared session-scope guard for extension leases (Task 20):
+    /// terminates this runtime session's extension leases only when the
+    /// LAST owner (runtime clone or in-flight stream) drops.
+    extension_session_scope:
+        Option<std::sync::Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
+    /// Per-turn budget (Task 23, spec §8.1). Resolved from role + typed
+    /// config at boot; every stream turn is metered against it.
+    turn_budget: crate::runtime::budget::TurnBudget,
+    /// Private runtime-scoped tool-session identity (Task 16). Scopes the
+    /// per-stream `SessionToolSet` the execution gate authorizes against.
+    /// Minted fresh per constructed `Runtime` — two independently
+    /// constructed runtimes can never share session grants — and shared by
+    /// `Clone` because clones share the same live tool registry (the
+    /// existing shared-session behavior). Never persisted; unrelated to
+    /// saved session IDs.
+    host_tool_session: crate::tools::activation::SessionId,
+}
+
+/// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
+/// keeps it unique across runtimes and restarts; the parse cannot fail on
+/// this generated shape.
+fn fresh_host_tool_session() -> crate::tools::activation::SessionId {
+    crate::tools::activation::SessionId::parse(&format!(
+        "runtime-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated runtime session id is always valid")
+}
+
+/// Fresh Off/no-lease memory-context state for a newly constructed runtime
+/// (task A5). CRITICAL INVARIANT: every `Runtime` constructor calls this,
+/// and subagent spawn paths build a brand-new `Runtime::new()` before
+/// `apply_subagent_runtime_policy` runs — so subagents always start with no
+/// memory lease. Memory-context state must never be copied from a parent
+/// runtime into a freshly constructed one.
+fn fresh_memory_context_state(
+) -> std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>> {
+    let session = memory_context::SessionId::parse(&format!(
+        "memctx-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .expect("generated memory session id is always valid");
+    std::sync::Arc::new(std::sync::Mutex::new(
+        memory_context::SessionMemoryState::new(session),
+    ))
+}
+
+/// Host-derived project isolation identity (spec §5.2) recorded on
+/// command-granted memory leases: the stable scope discovered from the current
+/// working directory (or `SYNAPS_PROJECT_ROOT`).
+fn memory_project_scope() -> std::result::Result<agent_core::memory::store::ProjectScope, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot resolve current project directory: {error}"))?;
+    agent_core::memory::store::ProjectScope::discover(&cwd)
+        .map_err(|error| format!("cannot resolve project scope: {error}"))
+}
+
+fn memory_project_id() -> memory_context::ProjectId {
+    match memory_project_scope() {
+        Ok(scope) => memory_context::ProjectId::parse(scope.key())
+            .expect("host project scope key is always a valid identifier"),
+        Err(_) => memory_context::ProjectId::parse("project-unresolved")
+            .expect("static fallback project id is valid"),
+    }
+}
+
+/// The spec-canonical continuous-memory provider identity (spec §17.3,
+/// Axel memory-manager). FALLBACK ONLY as of task A6: it is recorded on
+/// command-granted leases exclusively when NO extension subsystem is wired
+/// into the runtime (legacy/flag-off construction — see
+/// [`Runtime::resolve_memory_provider`]). When the extension runtime is
+/// installed, enable-time validation resolves the exact declared provider
+/// from the loaded catalog instead, failing closed on zero or ambiguous
+/// matches.
+fn memory_capture_worker() -> &'static capture_worker::CaptureWorker {
+    static WORKER: std::sync::OnceLock<capture_worker::CaptureWorker> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| capture_worker::CaptureWorker::new(32))
+}
+
+struct ExtensionCaptureProvider {
+    manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    session: crate::tools::activation::SessionId,
+    plugin: String,
+    digest: crate::tools::catalog::SchemaDigest,
+    handle: tokio::runtime::Handle,
+}
+
+impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
+    fn capture(
+        &self,
+        capture: chat_capture::ChatTurnCapture,
+    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
+        let params = memory_context::capture_request_wire(&capture);
+        self.handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    params,
+                ),
+            )
+            .map(|_| ())
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_call_failed",
+            })
+    }
+
+    fn contains_capture(
+        &self,
+        capture_id: &[u8; 32],
+    ) -> std::result::Result<capture_worker::CaptureCommitState, capture_worker::CaptureFailure>
+    {
+        let capture_id = chat_capture::CaptureId::from_bytes(*capture_id);
+        let response = self
+            .handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    memory_context::capture_query_wire(&capture_id),
+                ),
+            )
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_query_failed",
+            })?;
+        Ok(
+            if response
+                .get("committed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                capture_worker::CaptureCommitState::Committed
+            } else {
+                capture_worker::CaptureCommitState::Absent
+            },
+        )
+    }
+
+    fn capture_summary(
+        &self,
+        capture: chat_capture::ConversationSummaryCapture,
+    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
+        let params = memory_context::summary_capture_request_wire(&capture);
+        self.handle
+            .block_on(
+                crate::extensions::lease::ExtensionLeaseCapability::new(
+                    self.session.clone(),
+                    self.manager.clone(),
+                )
+                .call_exact(
+                    &self.plugin,
+                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
+                    &self.digest,
+                    params,
+                ),
+            )
+            .map(|_| ())
+            .map_err(|_| capture_worker::CaptureFailure {
+                code: "provider_call_failed",
+            })
+    }
+}
+
+fn terminal_capture_history(
+    lease: &memory_context::MemoryContextLease,
+    messages: &[crate::SharedMessage],
+    started_at: std::time::SystemTime,
+) -> chat_capture::TerminalTurnHistory {
+    use agent_core::core::disclosure::DisclosureClass;
+    let mut items = Vec::new();
+    for message in messages {
+        let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let class = match role {
+            "user" => chat_capture::CaptureContentClass::UserMessage,
+            "assistant" => chat_capture::CaptureContentClass::AssistantFinal,
+            _ => continue,
+        };
+        let text = message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                message
+                    .get("content")
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            });
+        items.push(chat_capture::CanonicalCaptureItem {
+            project_id: lease.project_id.clone(),
+            class,
+            disclosure: DisclosureClass::ModelVisible,
+            sensitivity: chat_capture::Sensitivity::Normal,
+            text,
+            tool_name: None,
+        });
+    }
+    chat_capture::TerminalTurnHistory {
+        project_id: lease.project_id.clone(),
+        session_id: lease.session_id.clone(),
+        turn_id: memory_context::TurnId::parse(&format!("turn-{}", uuid::Uuid::new_v4()))
+            .expect("generated turn id"),
+        turn_ordinal: 0,
+        started_at,
+        completed_at: std::time::SystemTime::now(),
+        outcome: agent_core::TurnOutcome::Completed,
+        items,
+        compaction: None,
+    }
+}
+
+fn memory_provider_id() -> memory_context::ContextProviderId {
+    memory_context::ContextProviderId::parse("axel-memory")
+        .expect("static provider id is always valid")
 }
 
 /// Idle timeout for the runtime HTTP client: how long a request may go
@@ -346,6 +686,13 @@ impl Runtime {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
+        // Operational retention (Task 12): physically remove expired
+        // content-capture bundles at session startup — bounded, fail-soft,
+        // confined to the private capture dir. The root resolved here is
+        // the SAME value bound into `capture_dir` below (fix1 I2b).
+        let capture_dir = trace::default_capture_dir();
+        let _ = trace::sweep_expired_captures(&capture_dir);
+
         let session_manager = {
             let config = crate::tools::shell::ShellConfig::default();
             crate::tools::shell::SessionManager::new(config)
@@ -376,6 +723,9 @@ impl Runtime {
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
+            compaction_mode: agent_core::compaction::CompactionMode::default(),
+            compaction_exclusions: Vec::new(),
+            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -389,6 +739,22 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_writer: None,
+            trace_ctx: trace::TraceContext::disabled(),
+            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            // Off/no-lease default — subagents get a FRESH construction of
+            // this state (task A5 invariant), never a copy of the parent's.
+            memory_context_state: fresh_memory_context_state(),
+            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // Empty per construction — a held recall segment is turn-scoped
+            // session state and is never copied into a fresh runtime.
+            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -401,6 +767,16 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            progressive_tool_disclosure: false,
+            delegation_parent: None,
+            mcp_runtime: None,
+            mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
+            host_tool_session: fresh_host_tool_session(),
         })
     }
 
@@ -444,6 +820,9 @@ impl Runtime {
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
             compaction_model: None,
+            compaction_mode: agent_core::compaction::CompactionMode::default(),
+            compaction_exclusions: Vec::new(),
+            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subagent_registry: Arc::new(Mutex::new(
                 crate::runtime::subagent::SubagentRegistry::new(),
             )),
@@ -457,6 +836,22 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_writer: None,
+            trace_ctx: trace::TraceContext::disabled(),
+            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
+            // Off/no-lease default — subagents get a FRESH construction of
+            // this state (task A5 invariant), never a copy of the parent's.
+            memory_context_state: fresh_memory_context_state(),
+            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // Empty per construction — a held recall segment is turn-scoped
+            // session state and is never copied into a fresh runtime.
+            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            capture_dir: trace::default_capture_dir(),
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -469,6 +864,16 @@ impl Runtime {
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
             trusted_worker_models: Vec::new(),
+            progressive_tool_disclosure: false,
+            delegation_parent: None,
+            mcp_runtime: None,
+            mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
+            host_tool_session: fresh_host_tool_session(),
         }
     }
 
@@ -607,6 +1012,51 @@ impl Runtime {
         })
     }
 
+    /// Install the shared exact MCP lease manager (Task 19, engine boot).
+    /// Also mints ONE durable session-scope guard for the runtime's tool
+    /// session, shared by every clone and stream; only the LAST owner's
+    /// drop terminates leases.
+    pub fn install_mcp_runtime(&mut self, manager: std::sync::Arc<crate::mcp::McpRuntimeManager>) {
+        self.mcp_session_scope = Some(std::sync::Arc::new(crate::mcp::McpSessionEndGuard::new(
+            self.host_tool_session.clone(),
+            std::sync::Arc::clone(&manager),
+        )));
+        self.mcp_runtime = Some(manager);
+    }
+
+    /// Set this runtime's per-turn budget (Task 23). The engine resolves
+    /// role + typed config at boot; subagent/watcher constructions pass
+    /// their role's budget explicitly.
+    pub fn set_turn_budget(&mut self, budget: crate::runtime::budget::TurnBudget) {
+        self.turn_budget = budget;
+    }
+
+    /// The currently configured per-turn budget.
+    pub fn turn_budget(&self) -> &crate::runtime::budget::TurnBudget {
+        &self.turn_budget
+    }
+
+    /// Install the shared exact EXTENSION lease manager (Task 20, engine
+    /// boot). Also mints ONE durable session-scope guard for the runtime's
+    /// tool session, shared by every clone and stream; only the LAST
+    /// owner's drop terminates leases.
+    pub fn install_extension_runtime(
+        &mut self,
+        manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    ) {
+        // Bind the handler host scope to THIS runtime's durable tool
+        // session: a Mixed extension's tool leases and hook/provider/user
+        // handler leases share one key — ONE shared child per plugin.
+        manager.bind_host_scope(self.host_tool_session.clone());
+        self.extension_session_scope = Some(std::sync::Arc::new(
+            crate::extensions::lease::ExtensionSessionEndGuard::new(
+                self.host_tool_session.clone(),
+                std::sync::Arc::clone(&manager),
+            ),
+        ));
+        self.extension_runtime = Some(manager);
+    }
+
     pub fn install_orchestration(
         &mut self,
         runtime: Arc<crate::orchestration::OrchestrationRuntime>,
@@ -621,6 +1071,22 @@ impl Runtime {
             }
         }
         self.orchestration = Some(runtime);
+    }
+
+    /// A runtime spawned for a worker shares only this session's bounded
+    /// dispatch/tree authority. It must not replay process-global favorite
+    /// models: doing so would turn a child construction into a fresh grant
+    /// source. The child can dispatch only identities already authorized by
+    /// this installed session policy.
+    pub fn install_worker_orchestration(
+        &mut self,
+        runtime: Arc<crate::orchestration::OrchestrationRuntime>,
+    ) {
+        self.orchestration = Some(runtime);
+    }
+
+    pub fn set_delegation_parent(&mut self, parent: Option<String>) {
+        self.delegation_parent = parent;
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -737,6 +1203,13 @@ impl Runtime {
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus
+    }
+
+    /// Runtime-scoped tool-session identity used by the stream execution
+    /// gate (Task 16). Shared by clones (which share the tool registry);
+    /// fresh per independently constructed `Runtime`.
+    pub fn host_tool_session_id(&self) -> &crate::tools::activation::SessionId {
+        &self.host_tool_session
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -1086,6 +1559,35 @@ impl Runtime {
         self.compaction_model = model;
     }
 
+    /// Set where compaction summarization runs (spec §9.4).
+    pub fn set_compaction_mode(&mut self, mode: agent_core::compaction::CompactionMode) {
+        self.compaction_mode = mode;
+    }
+
+    /// Set the content classes withheld from remote compaction disclosure.
+    pub fn set_compaction_exclusions(
+        &mut self,
+        exclude: Vec<agent_core::compaction::ContentClass>,
+    ) {
+        self.compaction_exclusions = exclude;
+    }
+
+    /// Number of times the remote-summarization transport seam was entered
+    /// (CP-12 M3). Local-only compaction must leave this at zero.
+    pub fn remote_summarization_attempts(&self) -> u64 {
+        self.remote_summarization_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The session's compaction disclosure policy (spec §9.4) — consumed by
+    /// `runtime::compaction` for both the preview and the dispatch path.
+    pub fn compaction_policy(&self) -> crate::runtime::compaction::DisclosurePolicy {
+        crate::runtime::compaction::DisclosurePolicy {
+            mode: self.compaction_mode,
+            exclude: self.compaction_exclusions.clone(),
+        }
+    }
+
     pub fn set_context_window(&mut self, window: Option<u64>) {
         self.context_window_override = window;
     }
@@ -1103,6 +1605,311 @@ impl Runtime {
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
     }
 
+    /// Task 29 (spec §9.1): the ONE request-aware context assessment every
+    /// frontend consumes on its compaction trigger path. Reads the segments
+    /// the next request will actually carry — the effective system prompt,
+    /// the exposed tool-schema set, the supplied history — and the runtime's
+    /// configured reserves (thinking budget, tool-result cap, model output
+    /// reserve, provider window with the documented safety margin).
+    ///
+    /// Skill bodies that reach the request do so through the system prompt
+    /// or history today, so they are already accounted there; the skill lane
+    /// is fed once loaders hand the engine distinct segments. The memory
+    /// lane is live as of task A7: a validated recall segment held for the
+    /// current turn is charged to `ContextBreakdown::memory_tokens` (spec
+    /// §10.3 — memory competes for budget headroom only, never reserves).
+    pub async fn assess_context(
+        &self,
+        messages: &[crate::SharedMessage],
+    ) -> context::ContextAssessment {
+        let system = self.effective_system_prompt().await;
+        let schema = self.tools.read().await.tools_schema();
+        // Task A7 (spec §10.1/§10.3): the T29 memory lane is fed by the
+        // validated recall segment held for this turn, if any. No held
+        // segment ⇒ the lane stays empty — byte-identical to the pre-A7
+        // assessment. Cloned out so no lock is held across the estimate.
+        let memory_rendered: Option<String> = self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|segment| segment.rendered_text().to_string());
+        let memory_contents: Vec<&str> = memory_rendered.as_deref().into_iter().collect();
+        context::assess(&context::ContextBudgetInputs {
+            model: &self.model,
+            provider_window: self.context_window(),
+            system_prompt: system.as_deref(),
+            tools_schema: &schema,
+            messages,
+            skill_contents: &[],
+            memory_contents: &memory_contents,
+            thinking_budget_tokens: self.thinking_budget as u64,
+            next_tool_result_bytes: self.max_tool_output as u64,
+            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
+        })
+    }
+
+    /// Task A7: hold a validated recall contribution for the current turn as
+    /// a typed [`memory_context::ContextSegment`] (spec §10.1 — typed
+    /// segment, never raw text). Fail-closed acceptance gate:
+    ///
+    /// - the §10.3 budget must clear its minimum floor for the session's
+    ///   provider window ([`memory_context::memory_budget_tokens`]) —
+    ///   otherwise recall is skipped and nothing is held;
+    /// - [`memory_context::validate_contribution`] must pass — project
+    ///   identity (spec §5.2), schema, and bounds — otherwise nothing is
+    ///   held.
+    ///
+    /// Phase A scope: a held segment feeds ONLY the T29 budget lane in
+    /// [`Self::assess_context`]; per-provider wire injection is task B4.
+    /// Hold-time uses the provider window as the capacity input — the
+    /// conservative upper bound available before a request exists; B4's
+    /// injection path re-checks against the request-aware effective budget.
+    #[allow(dead_code)] // exercised by tests until task B4 routes real recall
+    pub(crate) fn hold_memory_contribution(
+        &self,
+        contribution: memory_context::MemoryContextContribution,
+    ) -> std::result::Result<(), memory_context::MemoryContextError> {
+        let budget = memory_context::memory_budget_tokens(self.context_window())
+            .ok_or(memory_context::MemoryContextError::RecallBudgetBelowMinimum)?;
+        // Phase A hold path: until task B3 threads a real `RecallRequest`
+        // through dispatch, the host's conservative default grant applies —
+        // only baseline model-visible records are accepted back.
+        memory_context::validate_contribution(
+            &contribution,
+            &memory_project_id(),
+            budget,
+            &memory_context::DisclosureGrantSet::model_visible_only(),
+        )?;
+        *self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(memory_context::ContextSegment::Memory(contribution));
+        Ok(())
+    }
+
+    /// Task A7: drop any recall segment held for the current turn. Idempotent.
+    /// Task B4 calls this on every turn that carries no accepted recall; the
+    /// disable/revocation path may also use it defensively.
+    pub(crate) fn clear_memory_contribution(&self) {
+        *self
+            .pending_memory_segment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Task B4 (spec §10.4): explainability metadata retained for the
+    /// current turn's accepted recall, if any. Metadata only — selected IDs,
+    /// source classes, rank reasons, byte/token accounting, latency, and
+    /// withheld/skipped counts; never memory content. Rendered for
+    /// `/memory why` by [`memory_context::render_recall_why`] (task B5).
+    pub fn memory_recall_why(&self) -> Option<memory_context::RecallTurnMetadata> {
+        self.retained_recall_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|retained| retained.why.clone())
+    }
+
+    /// Task B4 (spec §7.4): the ONE provider-agnostic per-prompt recall
+    /// point, run on the owned turn `messages` BEFORE any per-provider wire
+    /// translation forks. Delegates every decision to
+    /// [`memory_context::resolve_turn_recall`] (eligibility, retry-exact
+    /// reuse, §10.3 budget floor, §16.2 hard timeout, fail-open skips) and
+    /// then syncs the T29 budget lane:
+    ///
+    /// - accepted/reused recall ⇒ the held segment mirrors the injected
+    ///   synthetic message;
+    /// - everything else ⇒ the held segment is cleared, so `messages` and
+    ///   the assessment are byte-identical to the pre-task behavior.
+    ///
+    /// Dispatch routes through the granted provider's
+    /// [`crate::extensions::lease::ExtensionLeaseCapability::call_exact`]
+    /// (task A6 wiring): the lease's composed `extension:<plugin>:<id>`
+    /// address plus the plugin's declared recall tool digest — an unroutable
+    /// provider fails open as `provider_unavailable` without ever spawning.
+    async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
+        let extension_runtime = self.extension_runtime.clone();
+        let session = self.host_tool_session.clone();
+        let outcome = memory_context::resolve_turn_recall(
+            &self.memory_context_state,
+            &self.retained_recall_turn,
+            &memory_project_id(),
+            self.context_window(),
+            messages,
+            memory_context::RECALL_HARD_TIMEOUT,
+            move |lease: memory_context::MemoryContextLease,
+                  request: memory_context::RecallRequest| async move {
+                let Some(manager) = extension_runtime else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                let mut parts = lease.provider_id.as_str().splitn(3, ':');
+                let (Some("extension"), Some(plugin), Some(_local)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                let Some(digest) =
+                    manager.declared_tool_digest(plugin, memory_context::MEMORY_RECALL_TOOL_NAME)
+                else {
+                    return Err(memory_context::RecallCallError::ProviderUnavailable);
+                };
+                crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
+                    .call_exact(
+                        plugin,
+                        memory_context::MEMORY_RECALL_TOOL_NAME,
+                        &digest,
+                        memory_context::recall_request_wire(&request),
+                    )
+                    .await
+                    .map_err(|_| memory_context::RecallCallError::CallFailed)
+            },
+        )
+        .await;
+        match outcome {
+            memory_context::TurnRecallOutcome::Injected
+            | memory_context::TurnRecallOutcome::ReusedRetained => {
+                let contribution = self
+                    .retained_recall_turn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|retained| retained.contribution.clone());
+                if let Some(contribution) = contribution {
+                    *self
+                        .pending_memory_segment
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(memory_context::ContextSegment::Memory(contribution));
+                }
+            }
+            memory_context::TurnRecallOutcome::NotEligible => {
+                self.clear_memory_contribution();
+            }
+            memory_context::TurnRecallOutcome::SkippedOpen(reason) => {
+                self.clear_memory_contribution();
+                // Bounded metadata diagnostic (spec §13.1) — reason key
+                // only, never content. Fail open: the turn proceeds.
+                tracing::debug!(
+                    reason = reason.as_str(),
+                    "memory recall skipped; turn proceeds without memory"
+                );
+            }
+        }
+    }
+
+    /// Task B6 harness seam: the EXACT per-prompt recall entry point the
+    /// stream path runs ([`Self::apply_turn_memory_recall`], the single
+    /// hook `run_stream_with_messages` calls before any per-provider wire
+    /// translation), exposed so the headless Phase B end-to-end harness
+    /// (`tests/memory_context_e2e.rs`) can drive the REAL engine recall
+    /// flow — real [`crate::extensions::lease::ExtensionLeaseCapability`],
+    /// real child process, real §16.2 timeout — without provider
+    /// credentials for the outer HTTP call. Compiled only for tests and
+    /// `testing` builds, mirroring [`Runtime::new_headless`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn apply_turn_memory_recall_for_harness(
+        &self,
+        messages: &mut Vec<crate::SharedMessage>,
+    ) {
+        self.apply_turn_memory_recall(messages).await;
+    }
+
+    /// F1 headless seam for the production C3 terminal-capture path. The caller
+    /// supplies the canonical completed turn; lease selection, typed building,
+    /// bounded queueing, and exact extension dispatch are unchanged.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn capture_completed_turn_for_harness(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        turn_ordinal: u64,
+    ) -> std::result::Result<(), &'static str> {
+        let started_at = std::time::SystemTime::now();
+        let lease = self
+            .memory_context_lock()
+            .capture_lease_at(started_at)
+            .ok_or("capture lease unavailable")?;
+        let provider = self
+            .extension_capture_provider(&lease)
+            .ok_or("capture provider unavailable")?;
+        let mut history = terminal_capture_history(&lease, &messages, started_at);
+        history.turn_ordinal = turn_ordinal;
+        memory_capture_worker()
+            .submit_terminal(
+                &lease,
+                history,
+                memory_context::RetentionClass::Standard,
+                provider,
+            )
+            .map_err(|_| "capture build failed")?;
+        Ok(())
+    }
+
+    /// F1 headless seam for C4 summary capture with explicit source-range
+    /// provenance. All identifiers still come from the active host lease.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn capture_compaction_summary_for_harness(
+        &self,
+        first_turn_ordinal: u64,
+        last_turn_ordinal: u64,
+        source_digest: &str,
+        source_message_count: usize,
+        summary_text: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let summarized_at = std::time::SystemTime::now();
+        let lease = self
+            .memory_context_lock()
+            .capture_lease_at(summarized_at)
+            .ok_or("capture lease unavailable")?;
+        let source_digest = chat_capture::MessageRangeDigest::from_hex(source_digest)
+            .ok_or("invalid source digest")?;
+        let provider = self
+            .extension_capture_provider(&lease)
+            .ok_or("capture provider unavailable")?;
+        let source = chat_capture::CompactionSource {
+            schema: chat_capture::CompactionSchemaVersion::V1,
+            project_id: lease.project_id.clone(),
+            source_session_id: lease.session_id.clone(),
+            first_turn_ordinal,
+            last_turn_ordinal,
+            source_digest,
+            summary_origin: chat_capture::CompactionSummaryOrigin::LocalOnly,
+            prompt_stack_digest: chat_capture::PromptStackDigest::from_bytes([7; 32]),
+            redaction: chat_capture::RedactionPolicy::HostRedacted,
+            content_classes: vec![agent_core::compaction::ContentClass::UserText],
+            summarized_at,
+        };
+        memory_capture_worker()
+            .submit_summary(
+                &lease,
+                source,
+                source_message_count,
+                summary_text,
+                agent_core::compaction::RedactionPolicy::PolicyExclusions,
+                memory_context::RetentionClass::Standard,
+                provider,
+            )
+            .map_err(|_| "summary capture build failed")?;
+        Ok(())
+    }
+
+    /// C5 cancellation seam: closes memory recall/capture authority and the
+    /// backing extension lease synchronously from the caller's perspective.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn cancel_memory_forwarding_for_harness(&self) {
+        self.clear_memory_contribution();
+        self.memory_context_disable();
+    }
+
+    /// C5 lease-release assertion seam (metadata only).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn extension_lease_count_for_harness(&self) -> usize {
+        self.extension_runtime
+            .as_ref()
+            .map_or(0, |manager| manager.lease_count())
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
         if let Some(ref model) = config.model {
@@ -1117,6 +1924,8 @@ impl Runtime {
         }
         self.context_window_override = config.context_window;
         self.compaction_model = config.compaction_model.clone();
+        self.compaction_mode = config.compaction_mode;
+        self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -1125,8 +1934,10 @@ impl Runtime {
         self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.progressive_tool_disclosure = config.progressive_tool_disclosure;
         self.trusted_worker_models = config
             .favorite_models
             .iter()
@@ -1248,6 +2059,720 @@ impl Runtime {
 
     pub fn set_telemetry_level(&mut self, level: crate::runtime::telemetry::TelemetryLevel) {
         self.telemetry_level = level;
+        self.sync_observability();
+    }
+
+    /// Reconcile the shared observability writer + trace sink with the
+    /// telemetry level (Task 11 config rule, documented until Task 12 adds
+    /// explicit trace config/UI): `basic`/`full` enables BOTH legacy
+    /// telemetry persistence and metadata-only trace persistence through
+    /// one bounded session writer; `off` disables both. The trace schema is
+    /// structurally metadata-only, so this never persists raw content.
+    fn sync_observability(&mut self) {
+        if self.telemetry_level.enabled() {
+            if self.telemetry_writer.is_none() {
+                let writer = crate::runtime::telemetry::TelemetryWriter::new(
+                    crate::runtime::telemetry::WriterOptions::default(),
+                );
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                self.telemetry_writer = Some(writer);
+            }
+        } else {
+            // Dropping this handle detaches the worker: it drains whatever
+            // is queued and exits on its own — never a hang. In-flight
+            // requests holding a cloned handle keep enqueueing harmlessly.
+            self.telemetry_writer = None;
+            self.trace_ctx = trace::TraceContext::disabled();
+        }
+    }
+
+    /// The session trace context handed to every request (cheap clone).
+    pub fn trace_context(&self) -> trace::TraceContext {
+        self.trace_ctx.clone()
+    }
+
+    /// Effective trace context for the next outgoing model request:
+    /// consumes a pending one-shot arm (`/trace next [content]`, Task 12).
+    ///
+    /// One-shot semantics (B1): the arm covers exactly one *logical
+    /// request* — the returned armed context carries a one-shot request
+    /// gate consumed inside `RequestTracer::begin`, so the first request
+    /// through it (all retry attempts included) emits records and every
+    /// subsequent request sharing the same `ApiOptions` (tool-loop
+    /// continuations) is disabled. Normal Basic/Full session contexts are
+    /// never gated.
+    ///
+    /// When the session sink is disabled the one-shot record rides an
+    /// ephemeral writer forked from the session context (same session ID,
+    /// digest key, degradation counters, and §6.6 cache snapshot store —
+    /// so `/context` sees the armed request's diagnostics). The writer
+    /// handle is retained in `one_shot_trace_writer` until replaced or
+    /// drained by the shutdown epilogue, guaranteeing the armed record
+    /// flushes on session exit. With the session sink already enabled
+    /// (telemetry Basic/Full) the arm only adds the optional content
+    /// capture.
+    pub(crate) fn effective_trace_context(&self) -> trace::TraceContext {
+        match self.trace_controls.consume() {
+            None => self.trace_ctx.clone(),
+            Some(with_content) => {
+                let base = if self.trace_ctx.enabled() {
+                    self.trace_ctx.clone()
+                } else {
+                    let writer = crate::runtime::telemetry::TelemetryWriter::new(
+                        crate::runtime::telemetry::WriterOptions::default(),
+                    );
+                    // Retain the writer for the exit epilogue (drops any
+                    // previously retained one-shot writer, whose worker
+                    // keeps draining in the background).
+                    *self
+                        .one_shot_trace_writer
+                        .lock()
+                        .expect("one-shot trace writer lock poisoned") = Some(writer.clone());
+                    self.trace_ctx
+                        .fork_with_sink(Arc::new(crate::runtime::telemetry::WriterTraceSink::new(
+                            writer,
+                        )))
+                        .with_one_shot_request_gate()
+                };
+                if with_content {
+                    base.with_content_capture(Arc::new(trace::ContentCapture::new(
+                        self.capture_dir.clone(),
+                    )))
+                } else {
+                    base
+                }
+            }
+        }
+    }
+
+    /// Arm tracing for exactly the next outgoing provider request
+    /// (`/trace next`; `with_content` adds the one-request redacted
+    /// content capture for `/trace next content`).
+    pub fn trace_arm_next(&self, with_content: bool) {
+        self.trace_controls.arm_next(with_content);
+    }
+
+    /// Metadata-only `/trace status` report: mode, persistence path,
+    /// counters. Never secrets or content. Also performs the opportunistic
+    /// expired-capture sweep (B2): status is a trace interaction, so stale
+    /// content-capture bundles are physically removed here too.
+    pub fn trace_status(&self) -> trace::TraceStatusReport {
+        let _ = trace::sweep_expired_captures(&self.capture_dir);
+        trace::TraceStatusReport {
+            persistent_enabled: self.telemetry_writer.is_some(),
+            arm: self.trace_controls.peek(),
+            trace_path: crate::runtime::telemetry::default_trace_log_path(),
+            writer_stats: self.telemetry_writer.as_ref().map(|w| w.stats()),
+            degraded_records: self.trace_ctx.degraded_records(),
+        }
+    }
+
+    /// Lock the session-scoped memory-context state (task A5). Poison
+    /// recovery is sound for the same reason as
+    /// `memory_context::MemoryContextCapability::lock`: every
+    /// `SessionMemoryState` transition is check-then-single-assignment with
+    /// no panicking code between, so a poisoned lock still holds a
+    /// consistent state.
+    fn memory_context_lock(&self) -> std::sync::MutexGuard<'_, memory_context::SessionMemoryState> {
+        self.memory_context_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Typed `/memory status` snapshot — metadata-only, never spawns a
+    /// provider process (spec §7.2 "status does not spawn").
+    pub fn memory_context_status(&self) -> memory_context::MemoryContextStatus {
+        self.memory_context_lock().status()
+    }
+
+    /// Revoke this session's memory context (`/memory off`). Always locally
+    /// allowed (spec §7.2); idempotent — disabling an already-off session
+    /// reports `Off`.
+    ///
+    /// Task A6 revocation wiring: after the session state transition, the
+    /// extension runtime lease backing each bound provider is defensively
+    /// revoked through the SAME [`ExtensionRuntimeManager`] mechanism the
+    /// deferred tool/handler lifecycle uses ([`Self::install_extension_runtime`]
+    /// / `ExtensionSessionEndGuard`). While Phase A never spawns, this is an
+    /// idempotent no-op; once Phase B routes real recall/capture calls under
+    /// this runtime's tool session, disable reaps the provider child exactly.
+    ///
+    /// [`ExtensionRuntimeManager`]: crate::extensions::lease::ExtensionRuntimeManager
+    pub fn memory_context_disable(&self) -> memory_context::MemoryContextStatus {
+        let (status, bound, session) = {
+            let mut state = self.memory_context_lock();
+            let session = state.session_id().clone();
+            let bound = state.bound_provider_ids();
+            let status = match memory_context::apply_memory_context_action(
+                &mut state,
+                memory_context::AuthorizedMemoryAction::Disable {
+                    session: session.clone(),
+                },
+            ) {
+                Ok(status) => status,
+                // Unreachable by construction (the session identity is read
+                // from the state itself and `Disable` is total), but never
+                // panic on the fallback: report current status.
+                Err(_) => state.status(),
+            };
+            (status, bound, session)
+        };
+        // §15 `memory_context.disabled` (task B5): emitted after the state
+        // transition applied — session + project digest identities only.
+        memory_context::emit_memory_observability_event(
+            &memory_context::MemoryObservabilityEvent::context_disabled(
+                &session,
+                &memory_project_id(),
+            ),
+        );
+        // State mutex released before touching the lease manager: the
+        // revocation below locks only the lease map (idempotent no-op when
+        // nothing was ever spawned).
+        self.revoke_memory_provider_leases(&bound);
+        status
+    }
+
+    /// Task A6: defensively revoke the extension runtime lease backing each
+    /// bound memory provider for THIS runtime's tool session. Confirmed
+    /// idempotent — `ExtensionRuntimeManager::revoke_plugin_lease` is a map
+    /// remove that finds nothing when no lease was ever acquired, so calling
+    /// it before Phase B ever spawns is a safe no-op. Provider identities
+    /// that are not composed `extension:<plugin>:<id>` runtime addresses
+    /// (the legacy canonical fallback) name no plugin child and are skipped.
+    fn revoke_memory_provider_leases(&self, bound: &[memory_context::ContextProviderId]) {
+        let Some(extension_runtime) = &self.extension_runtime else {
+            return;
+        };
+        for provider in bound {
+            let mut parts = provider.as_str().splitn(3, ':');
+            if let (Some("extension"), Some(plugin), Some(_local_id)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                if !plugin.is_empty() {
+                    extension_runtime.revoke_plugin_lease(&self.host_tool_session, plugin);
+                }
+            }
+        }
+    }
+
+    /// Task A6 enable-time provider validation: resolve the provider a
+    /// `/memory` grant binds to. With the extension runtime installed
+    /// ([`Self::install_extension_runtime`] — the same wiring point that
+    /// backs `extension_leases` capabilities), resolution is MANDATORY and
+    /// fail-closed against the loaded context-provider catalog (pure
+    /// catalog read, never spawns): exactly one matching declared provider
+    /// resolves to its composed `extension:<plugin>:<id>` runtime address;
+    /// zero matches fail [`memory_context::MemoryContextError::ProviderNotRegistered`]
+    /// and overlapping declarations without an exact requested id fail
+    /// [`memory_context::MemoryContextError::ProviderAmbiguous`] — the
+    /// exact-scope precedent of `validate_deferred` and
+    /// `crate::orchestration::validate_user_authorizable_model`.
+    ///
+    /// Without an extension subsystem (legacy/flag-off constructions and
+    /// headless unit runtimes) the A5 spec-canonical identity is kept:
+    /// there is no catalog to validate against, Phase A grants are inert
+    /// metadata, and Phase B activation independently re-validates through
+    /// `ExtensionLeaseCapability::call_exact` against retained launch
+    /// records — an unbacked identity can never start a process.
+    fn resolve_memory_provider(
+        &self,
+        requested: Option<&str>,
+    ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
+    {
+        use crate::extensions::context_provider as ext_cp;
+        let Some(extension_runtime) = &self.extension_runtime else {
+            return Ok(memory_provider_id());
+        };
+        let requested_id = match requested {
+            None => None,
+            // An id that cannot even parse as a declared provider identity
+            // can never be registered: fail closed as not-registered.
+            Some(raw) => Some(
+                ext_cp::ContextProviderId::parse(raw)
+                    .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?,
+            ),
+        };
+        match extension_runtime.resolve_context_provider(requested_id.as_ref()) {
+            Ok(descriptor) => {
+                memory_context::ContextProviderId::parse(&descriptor.runtime_address())
+            }
+            Err(ext_cp::ContextProviderLookupError::NotRegistered) => {
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            }
+            Err(ext_cp::ContextProviderLookupError::Ambiguous) => {
+                Err(memory_context::MemoryContextError::ProviderAmbiguous)
+            }
+        }
+    }
+
+    /// Install a durable session-lease memory mode (`/memory on|recall|
+    /// capture`, spec §7.3) under the caller-supplied host-owned intent
+    /// proof (spec §6.3). Task A6: the target provider is resolved and
+    /// validated FIRST ([`Self::resolve_memory_provider`], fail-closed) —
+    /// then the lease is minted and the exhaustive
+    /// [`memory_context::apply_memory_context_action`] transition applied.
+    /// On any typed failure no lease is installed.
+    pub(crate) fn memory_context_enable(
+        &self,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
+        self.memory_context_enable_resolved(mode, proof, None)
+    }
+
+    /// [`Self::memory_context_enable`] with an explicit requested provider
+    /// id (exact declared id; `None` requires a uniquely-declared provider
+    /// when the extension subsystem is installed). Crate-internal: the
+    /// `/memory` frontend forms currently pass `None`.
+    pub(crate) fn memory_context_enable_resolved(
+        &self,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+        requested_provider: Option<&str>,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
+        let mut state = self.memory_context_lock();
+        let lease = self.grant_command_memory_lease(&state, mode, proof, requested_provider)?;
+        // §15 `memory_context.enabled` (task B5): metadata-only snapshot of
+        // the lease identities, captured before `apply` consumes the lease
+        // and emitted only on a successful install.
+        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
+        let result = memory_context::apply_memory_context_action(
+            &mut state,
+            memory_context::AuthorizedMemoryAction::Enable { lease },
+        );
+        if result.is_ok() {
+            memory_context::emit_memory_observability_event(&enabled_event);
+        }
+        result
+    }
+
+    /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
+    /// the caller-supplied host-owned intent proof. Provider-validated
+    /// exactly like [`Self::memory_context_enable`] (task A6). Fails typed
+    /// (e.g. a one-shot already pending) without installing anything.
+    pub(crate) fn memory_context_recall_once(
+        &self,
+        proof: memory_context::UserIntentProof,
+    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
+    {
+        let mut state = self.memory_context_lock();
+        let lease = self.grant_command_memory_lease(
+            &state,
+            memory_context::MemoryContextMode::RecallOnce,
+            proof,
+            None,
+        )?;
+        // §15 `memory_context.enabled` (task B5): the one-shot grant is an
+        // enable of `recall_once` — emitted only on a successful install.
+        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
+        let result = memory_context::apply_memory_context_action(
+            &mut state,
+            memory_context::AuthorizedMemoryAction::RecallOnce { lease },
+        );
+        if result.is_ok() {
+            memory_context::emit_memory_observability_event(&enabled_event);
+        }
+        result
+    }
+
+    /// Mint one host-owned lease for a `/memory` command grant: host-minted
+    /// lease ID, the state's own session identity, host-derived project
+    /// identity, and the task-A6 catalog-validated provider identity
+    /// ([`Self::resolve_memory_provider`] — fail-closed; on a resolution
+    /// error nothing is minted). Session leases carry no hard expiry (until
+    /// revoked or session end); `/memory` has no expiry argument (spec §7.3).
+    fn grant_command_memory_lease(
+        &self,
+        state: &memory_context::SessionMemoryState,
+        mode: memory_context::MemoryContextMode,
+        proof: memory_context::UserIntentProof,
+        requested_provider: Option<&str>,
+    ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
+    {
+        let provider_id = self.resolve_memory_provider(requested_provider)?;
+        memory_context::MemoryContextLease::grant(
+            memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
+            state.session_id().clone(),
+            memory_project_id(),
+            provider_id,
+            mode,
+            memory_context::CapturePolicy::default(),
+            memory_context::RecallPolicy::default(),
+            proof,
+            std::time::SystemTime::now(),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_capture_provider_for_test(
+        &self,
+        provider: std::sync::Arc<dyn capture_worker::CaptureProvider>,
+    ) {
+        *self
+            .capture_provider_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider);
+    }
+
+    pub(crate) fn compaction_capture_lease_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<memory_context::MemoryContextLease> {
+        self.memory_context_lock().capture_lease_at(now)
+    }
+
+    pub(crate) fn submit_compaction_summary_capture(
+        &self,
+        capture_lease: Option<memory_context::MemoryContextLease>,
+        current: &agent_core::session::Session,
+        api_messages: &[crate::SharedMessage],
+        outcome: &compaction::CompactionOutcome,
+        summarized_at: std::time::SystemTime,
+    ) {
+        let Some(lease) = capture_lease else {
+            return;
+        };
+        let Ok(source_session_id) = memory_context::SessionId::parse(&current.id) else {
+            return;
+        };
+        // A compaction source range is the exact pre-transition message range.
+        // Legacy session messages have no durable turn ordinals, so this
+        // inclusive range uses canonical message positions and the digest
+        // binds the exact ordered content.
+        if api_messages.is_empty() {
+            return;
+        }
+        let first_turn_ordinal = 0;
+        let last_turn_ordinal = (api_messages.len() - 1) as u64;
+        let Some(source_digest) = chat_capture::MessageRangeDigest::from_hex(
+            &agent_core::compaction::message_range_digest(api_messages),
+        ) else {
+            return;
+        };
+        let Some(prompt_stack_digest) =
+            chat_capture::PromptStackDigest::from_hex(&outcome.prompt_stack_digest)
+        else {
+            return;
+        };
+        let summary_origin = if outcome.local_only {
+            chat_capture::CompactionSummaryOrigin::LocalOnly
+        } else {
+            chat_capture::CompactionSummaryOrigin::Provider {
+                provider_id: outcome.summary_provider.clone(),
+                model_id: outcome.summary_model.clone(),
+            }
+        };
+        let content_classes = outcome.included_classes.clone();
+        let source = chat_capture::CompactionSource {
+            schema: chat_capture::CompactionSchemaVersion::V1,
+            project_id: lease.project_id.clone(),
+            source_session_id,
+            first_turn_ordinal,
+            last_turn_ordinal,
+            source_digest,
+            summary_origin,
+            prompt_stack_digest,
+            redaction: match outcome.redaction_policy {
+                agent_core::compaction::RedactionPolicy::TruncationOnly => {
+                    chat_capture::RedactionPolicy::None
+                }
+                agent_core::compaction::RedactionPolicy::PolicyExclusions => {
+                    chat_capture::RedactionPolicy::HostRedacted
+                }
+            },
+            content_classes,
+            summarized_at,
+        };
+
+        #[cfg(any(test, feature = "testing"))]
+        let test_provider = self
+            .capture_provider_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(not(any(test, feature = "testing")))]
+        let test_provider: Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> = None;
+        let provider = test_provider.or_else(|| self.extension_capture_provider(&lease));
+        if let Some(provider) = provider {
+            let _ = memory_capture_worker().submit_summary(
+                &lease,
+                source,
+                api_messages.len(),
+                &outcome.summary_text,
+                outcome.redaction_policy,
+                memory_context::RetentionClass::Standard,
+                provider,
+            );
+        }
+    }
+
+    fn extension_capture_provider(
+        &self,
+        lease: &memory_context::MemoryContextLease,
+    ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
+        let manager = self.extension_runtime.clone()?;
+        let mut parts = lease.provider_id.as_str().splitn(3, ':');
+        let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let digest =
+            manager.declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)?;
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        Some(std::sync::Arc::new(ExtensionCaptureProvider {
+            manager,
+            session: self.host_tool_session.clone(),
+            plugin: plugin.to_owned(),
+            digest,
+            handle,
+        }))
+    }
+
+    /// Return the history-import disclosure preview. This is D1's production
+    /// entry point: metadata is scanned, but session bodies and Axel are never
+    /// opened. All frontends share this runtime implementation.
+    pub fn memory_history_preview(
+        &self,
+    ) -> std::result::Result<memory_history::HistoryImportPreview, memory_history::HistoryImportError>
+    {
+        let host = memory_history::HistoryImportHostState::from_current_host()?;
+        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
+        let preview = memory_history::preview_history_import(&host, &mut io)?;
+        *self
+            .pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned") = Some(preview.clone());
+        Ok(preview)
+    }
+
+    /// Bind the pending, already-presented history preview to an explicit
+    /// frontend command. D1 returns only a typed plan; D2 owns all content
+    /// streaming.
+    pub(crate) fn memory_history_confirm(
+        &self,
+    ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
+    {
+        let preview = self
+            .pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned")
+            .take()
+            .ok_or(memory_history::HistoryImportError::ConsentRequired)?;
+        let intent = memory_history::ConfirmedUserIntent::from_explicit_command(
+            memory_context::mint_explicit_command_id(),
+        );
+        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
+        match memory_history::authorize_history_import(
+            preview,
+            memory_history::HistoryImportConsent::Confirmed(intent),
+            memory_history::RequestAuthority::UserFrontend,
+            &mut io,
+        )? {
+            memory_history::HistoryImportOutcome::Ready(plan) => {
+                *self
+                    .history_import_plan
+                    .lock()
+                    .expect("history plan mutex poisoned") = Some(plan.clone());
+                let lease = self
+                    .memory_context_lock()
+                    .capture_lease_at(std::time::SystemTime::now())
+                    .ok_or(memory_history::HistoryImportError::CaptureLeaseUnavailable)?;
+                // This resolves only a manifest-declared extension sidecar. No
+                // HTTP client or network transport is built by history import.
+                let provider = self
+                    .extension_capture_provider(&lease)
+                    .ok_or(memory_history::HistoryImportError::CaptureProviderUnavailable)?;
+                let sessions_dir = agent_core::config::get_active_config_dir().join("sessions");
+                memory_history::import_history_from_dir(
+                    &plan,
+                    &lease,
+                    &sessions_dir,
+                    memory_history::IMPORT_BATCH_MAX_RECORDS,
+                    memory_capture_worker(),
+                    provider,
+                )
+            }
+            memory_history::HistoryImportOutcome::Declined => {
+                Err(memory_history::HistoryImportError::ConsentRequired)
+            }
+        }
+    }
+
+    /// Decline and clear a pending preview without any content reads or writes.
+    pub(crate) fn memory_history_decline(&self) -> bool {
+        self.pending_history_import_preview
+            .lock()
+            .expect("history preview mutex poisoned")
+            .take()
+            .is_some()
+    }
+
+    /// Test-only: intent proof recorded on the current durable lease.
+    #[cfg(test)]
+    pub(crate) fn memory_durable_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
+        self.memory_context_lock().durable_proof().cloned()
+    }
+
+    /// Test-only: intent proof recorded on the pending one-shot lease.
+    #[cfg(test)]
+    pub(crate) fn memory_one_shot_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
+        self.memory_context_lock().one_shot_pending_proof().cloned()
+    }
+
+    /// Test-only: provider identities bound to the currently granted
+    /// leases (durable + pending one-shot), in that order.
+    #[cfg(test)]
+    pub(crate) fn memory_bound_providers_for_test(&self) -> Vec<memory_context::ContextProviderId> {
+        self.memory_context_lock().bound_provider_ids()
+    }
+
+    /// Structured `/context` report (Task 12): counts, byte lengths, cache
+    /// change/reuse estimates, and writer counters — never content.
+    ///
+    /// `history` is the conversation owned by the calling surface (TUI /
+    /// headless); when it is not provided the history lines honestly read
+    /// `unavailable` rather than fabricating zeros. Loaded skills/memories
+    /// are session-surface state the runtime cannot enumerate, so they are
+    /// reported `unavailable` with that provenance.
+    pub fn context_report(&self, history: Option<&[crate::SharedMessage]>) -> trace::ContextReport {
+        use trace::ReportValue;
+        let (history_messages, history_bytes) = match history {
+            Some(msgs) => (
+                ReportValue::Count(msgs.len() as u64),
+                ReportValue::Count(
+                    msgs.iter()
+                        .map(|m| {
+                            serde_json::to_vec(&**m)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0)
+                        })
+                        .sum(),
+                ),
+            ),
+            None => (ReportValue::Unavailable, ReportValue::Unavailable),
+        };
+        // Non-blocking view of the tool registry: if it is momentarily
+        // write-locked, report honestly instead of blocking or guessing.
+        let tool_count = match self.tools.try_read() {
+            Ok(tools) => ReportValue::Count(tools.iter_tools_sorted().len() as u64),
+            Err(_) => ReportValue::Unavailable,
+        };
+        trace::ContextReport {
+            model: self.model.clone(),
+            system_prompt_bytes: ReportValue::Count(
+                self.system_prompt().map(|s| s.len() as u64).unwrap_or(0),
+            ),
+            tool_count,
+            history_messages,
+            history_bytes,
+            loaded_skills: ReportValue::Unavailable,
+            loaded_memories: ReportValue::Unavailable,
+            cache: self.trace_ctx.cache_snapshots().last_activity(),
+            trace_enabled: self.trace_ctx.enabled(),
+            writer_stats: self.telemetry_writer.as_ref().map(|w| w.stats()),
+            degraded_records: self.trace_ctx.degraded_records(),
+        }
+    }
+
+    /// The shared observability writer, when telemetry is enabled.
+    pub fn telemetry_writer(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
+        self.telemetry_writer.clone()
+    }
+
+    /// Bounded shutdown flush of the observability writer: stop intake,
+    /// drain until `timeout`, return typed stats (`None` when telemetry is
+    /// off). Sync and bounded — safe from shutdown paths that cannot await;
+    /// async callers should use [`Self::shutdown_observability_async`].
+    ///
+    /// Semantics (Task 11):
+    /// - telemetry `off` → no writer exists → `None`, a true no-op;
+    /// - "flushed" means every queued record was appended into OS file
+    ///   buffers (`write(2)` returned) — deliberately no `fsync`, these are
+    ///   best-effort diagnostic logs;
+    /// - on timeout the worker stays detached and keeps draining in the
+    ///   background; the caller logs metadata-only stats and continues —
+    ///   trace loss must never fail or abort a clean exit.
+    pub fn shutdown_observability(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        // Operational retention (Task 12): the exit epilogue also removes
+        // expired content-capture bundles — bounded, fail-soft, so a stale
+        // bundle never has to wait for the next trace interaction. Swept at
+        // the CONSTRUCTION-BOUND root (fix1 I2b), immune to env churn.
+        let _ = trace::sweep_expired_captures(&self.capture_dir);
+        // Drain a retained one-shot ephemeral writer first (Task 12 fix:
+        // an armed `/trace next` record written with telemetry Off must
+        // survive session exit). Its outcome is returned only when no
+        // session writer exists — the session writer's stats remain the
+        // primary signal.
+        let ephemeral = self
+            .one_shot_trace_writer
+            .lock()
+            .expect("one-shot trace writer lock poisoned")
+            .take();
+        let ephemeral_outcome = ephemeral.map(|w| w.shutdown(timeout));
+        self.telemetry_writer
+            .as_ref()
+            .map(|w| w.shutdown(timeout))
+            .or(ephemeral_outcome)
+    }
+
+    /// Async epilogue helper for every clean process/runtime exit path that
+    /// owns a `Runtime` (headless chat, TUI teardown, autonomous agent,
+    /// RPC/server graceful shutdown): clones the writer handle and runs the
+    /// bounded [`Self::shutdown_observability`] on the blocking pool, so an
+    /// executor thread is never parked. Same `None`/no-fsync/timeout
+    /// semantics as the sync variant. Idempotent — a second call finds the
+    /// intake already closed and returns immediately.
+    ///
+    /// Note: the writer is shared across `Runtime` clones (subagents). Call
+    /// this only from the session owner's exit epilogue, after in-flight
+    /// work has drained — cloned runtimes still serving requests would see
+    /// their subsequent records counted as drops.
+    pub async fn shutdown_observability_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<crate::runtime::telemetry::ShutdownOutcome> {
+        // Same operational retention sweep as the sync epilogue, off the
+        // executor (bounded filesystem work, fail-soft on a failed spawn).
+        // Construction-bound root (fix1 I2b).
+        let capture_dir = self.capture_dir.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || trace::sweep_expired_captures(&capture_dir)).await;
+        // Same one-shot ephemeral drain as the sync variant.
+        let ephemeral = self
+            .one_shot_trace_writer
+            .lock()
+            .expect("one-shot trace writer lock poisoned")
+            .take();
+        let ephemeral_outcome = match ephemeral {
+            Some(writer) => Some(writer.shutdown_async(timeout).await),
+            None => None,
+        };
+        match self.telemetry_writer.clone() {
+            Some(writer) => Some(writer.shutdown_async(timeout).await),
+            None => ephemeral_outcome,
+        }
+    }
+
+    /// Test seam: install a custom writer (e.g. temp paths, artificial
+    /// write delay) as the session observability sink, exactly as
+    /// `sync_observability` would for a production writer.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn install_observability_for_tests(
+        &mut self,
+        writer: crate::runtime::telemetry::TelemetryWriter,
+    ) {
+        self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+            crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+        ));
+        self.telemetry_writer = Some(writer);
     }
 
     pub fn cache_diagnostics(&self) -> bool {
@@ -1304,6 +2829,10 @@ impl Runtime {
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
     pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
+        // Transport-construction seam: counted BEFORE preflight, auth
+        // refresh, or any request assembly (CP-12 M3).
+        self.remote_summarization_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let model = self.compaction_model();
         self.validate_request_preflight_for(
             model,
@@ -1323,6 +2852,16 @@ impl Runtime {
             self.reasoning_level(),
             &messages,
             self.api_retries,
+            // Default options preserve this path's historical beta gating
+            // and endpoint; only the session observability seams are wired
+            // (Task 11) so compaction requests trace/persist like any other.
+            // Deliberately the BASE context: an internal compaction request
+            // must not consume a user's one-shot `/trace next` arm.
+            &api::ApiOptions {
+                trace: self.trace_ctx.clone(),
+                telemetry: self.telemetry_writer.clone(),
+                ..api::ApiOptions::default()
+            },
         )
         .await
     }
@@ -1361,6 +2900,27 @@ impl Runtime {
                     anthropic_base_url: None,
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
+                    // Consistent with the streaming path: a pending
+                    // `/trace next` arm covers the first request of this
+                    // loop too (the one-shot gate inside the armed context
+                    // limits it to exactly one logical request).
+                    trace: self.effective_trace_context(),
+                    request_correlation: None,
+                    suppress_stream_deltas: true,
+                    telemetry: self.telemetry_writer.clone(),
+                    // Non-stream path note (Task 16 review): threading the
+                    // host session here gates extension-provider interior
+                    // tool loops identically to stream turns. The built-in
+                    // tool dispatch below (registry.get) remains the legacy
+                    // non-stream path — tracked; the required pass gate is
+                    // all STREAM-turn execution paths.
+                    tool_session_id: Some(self.host_tool_session.clone()),
+                    // Non-stream legacy loop: no retained per-stream set;
+                    // the extension route falls back per its documented
+                    // policy (fresh default-core, zero activations).
+                    session_tool_set: None,
+                    request_tools_schema: None,
+                    usage_counters: None,
                 },
             )
             .await?;
@@ -1440,9 +3000,14 @@ impl Runtime {
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
+                                        delegation_parent: None,
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
+                                        tool_activation: None,
+                                        mcp_leases: None,
+                                        extension_leases: None,
+                                        memory_context: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -1573,9 +3138,14 @@ impl Runtime {
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
+                                                    delegation_parent: None,
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
+                                                    tool_activation: None,
+                                                    mcp_leases: None,
+                                                    extension_leases: None,
+                                                    memory_context: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -1681,29 +3251,65 @@ impl Runtime {
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // CP-11 fix-2 (A): the caller-facing boundary is BOUNDED. The
+        // internal producer keeps an unbounded sender for API stability;
+        // the relay drains it eagerly, enforces the fixed preview-delta
+        // retention budget, and cancels the turn when the caller stream
+        // is dropped (releasing provider tasks).
+        let (tx, internal_rx) = mpsc::unbounded_channel();
+        let bounded_rx =
+            crate::runtime::relay::spawn_bounded_stream_relay(internal_rx, cancel.clone());
+
+        // One correlation ID per turn: carried by the typed terminal outcome
+        // (spec §5.2) so every frontend can tie the failure to trace lines.
+        let turn_correlation_id = agent_core::next_turn_correlation_id();
 
         if let Err(error) = self.validate_request_preflight().await {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&error, &turn_correlation_id),
+            )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-            return Box::pin(UnboundedReceiverStream::new(rx));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
 
         let anthropic_execution_plan = match self.authorized_anthropic_plan().await {
             Ok(plan) => plan,
             Err(error) => {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(error.to_string())));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                    helpers::turn_error_for(&error, &turn_correlation_id),
+                )));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-                return Box::pin(UnboundedReceiverStream::new(rx));
+                return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
             }
         };
 
         // Refresh OAuth token if expired after capability preflight.
         if let Err(e) = self.refresh_if_needed().await {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&e, &turn_correlation_id),
+            )));
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-            return Box::pin(UnboundedReceiverStream::new(rx));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
+
+        // Task B4 (spec §7.4): resolve this turn's memory recall HERE — the
+        // single provider-agnostic point where the owned turn Vec exists but
+        // has not yet been read, borrowed, or forked into any per-provider
+        // wire translation (`run_stream_internal` and everything below it
+        // only ever borrows from this Vec). When no contribution applies the
+        // Vec is returned byte-identical — no empty or no-op synthetic
+        // message is ever inserted — and the disabled path performs zero
+        // extension calls. Every recall failure fails OPEN: the turn itself
+        // is never blocked or failed by memory.
+        let capture_started_at = std::time::SystemTime::now();
+        // Snapshot the full prompt-time lease: terminal dispatch must never
+        // reselect a provider after the user changes memory state.
+        let capture_lease = self
+            .memory_context_lock()
+            .capture_lease_at(capture_started_at);
+        let mut messages = messages;
+        self.apply_turn_memory_recall(&mut messages).await;
+        let messages = messages;
 
         // Clone the Arc, not the whole Runtime — the spawned task shares the
         // same AuthState so mid-loop token refreshes are visible immediately.
@@ -1732,6 +3338,8 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
+        let capture_runtime = self.extension_runtime.clone();
+        let capture_session = self.host_tool_session.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -1743,6 +3351,19 @@ impl Runtime {
             anthropic_base_url: None,
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            trace: self.effective_trace_context(),
+            request_correlation: None,
+            suppress_stream_deltas: false,
+            telemetry: self.telemetry_writer.clone(),
+            // Threads the runtime-scoped gate identity into extension-
+            // provider interior tool loops (Task 16).
+            tool_session_id: Some(self.host_tool_session.clone()),
+            // Placeholder: the stream loop installs its RETAINED shared
+            // session tool set handle and request schema projection before
+            // the first provider round.
+            session_tool_set: None,
+            request_tools_schema: None,
+            usage_counters: None,
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -1774,11 +3395,58 @@ impl Runtime {
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
+            delegation_parent: self.delegation_parent.clone(),
+            turn_correlation_id: turn_correlation_id.clone(),
+            progressive_tool_disclosure: self.progressive_tool_disclosure,
+            tool_session_id: self.host_tool_session.clone(),
+            mcp_runtime: self.mcp_runtime.clone(),
+            mcp_session_scope: self.mcp_session_scope.clone(),
+            extension_runtime: self.extension_runtime.clone(),
+            extension_session_scope: self.extension_session_scope.clone(),
+            turn_budget: self.turn_budget.clone(),
         };
 
         tokio::spawn(async move {
-            if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+            let capture_messages = messages.clone();
+            let completed = match StreamMethods::run_stream_internal(session, messages).await {
+                Ok(()) => true,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                        helpers::turn_error_for(&e, &turn_correlation_id),
+                    )));
+                    false
+                }
+            };
+            if completed {
+                if let (Some(lease), Some(manager)) = (capture_lease, capture_runtime) {
+                    let mut parts = lease.provider_id.as_str().splitn(3, ':');
+                    if let (Some("extension"), Some(plugin), Some(_)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        if let Some(digest) = manager
+                            .declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)
+                        {
+                            let provider = std::sync::Arc::new(ExtensionCaptureProvider {
+                                manager,
+                                session: capture_session,
+                                plugin: plugin.to_owned(),
+                                digest,
+                                handle: tokio::runtime::Handle::current(),
+                            });
+                            let history = terminal_capture_history(
+                                &lease,
+                                &capture_messages,
+                                capture_started_at,
+                            );
+                            let _ = memory_capture_worker().submit_terminal(
+                                &lease,
+                                history,
+                                memory_context::RetentionClass::Standard,
+                                provider,
+                            );
+                        }
+                    }
+                }
             }
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
@@ -1790,7 +3458,7 @@ impl Runtime {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
-        Box::pin(UnboundedReceiverStream::new(rx))
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx))
     }
 }
 
@@ -1811,6 +3479,9 @@ impl Clone for Runtime {
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
+            compaction_mode: self.compaction_mode,
+            compaction_exclusions: self.compaction_exclusions.clone(),
+            remote_summarization_attempts: Arc::clone(&self.remote_summarization_attempts),
             subagent_registry: self.subagent_registry.clone(),
             orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),
@@ -1822,6 +3493,32 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
+            // Shared session observability: clones (subagents) enqueue into
+            // the SAME bounded writer and trace context — one worker and one
+            // set of session-scoped context IDs per session.
+            telemetry_writer: self.telemetry_writer.clone(),
+            trace_ctx: self.trace_ctx.clone(),
+            trace_controls: Arc::clone(&self.trace_controls),
+            // Clones are the SAME session: `/memory` state is one truth
+            // across a session's streams. Subagents are NOT clones — they
+            // are constructed via a fresh `Runtime::new()` (see
+            // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
+            // they always start Off/no-lease (task A5 invariant).
+            memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            pending_history_import_preview: std::sync::Arc::clone(
+                &self.pending_history_import_preview,
+            ),
+            history_import_plan: std::sync::Arc::clone(&self.history_import_plan),
+            #[cfg(any(test, feature = "testing"))]
+            capture_provider_for_test: std::sync::Arc::clone(&self.capture_provider_for_test),
+            // Clones are the same session: they observe the same held
+            // recall segment (one truth), like memory_context_state above.
+            pending_memory_segment: std::sync::Arc::clone(&self.pending_memory_segment),
+            // Same-session truth for retry-exact reuse and `/memory why`
+            // (task B4): clones share ONE retained recall per request.
+            retained_recall_turn: std::sync::Arc::clone(&self.retained_recall_turn),
+            one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
+            capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
             // Subagents are their own session — fresh latches so a downgrade
@@ -1839,6 +3536,21 @@ impl Clone for Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
+            progressive_tool_disclosure: self.progressive_tool_disclosure,
+            delegation_parent: self.delegation_parent.clone(),
+            mcp_runtime: self.mcp_runtime.clone(),
+            // Clones SHARE the durable session scope: dropping one clone or
+            // one stream can never kill a sibling's leases.
+            mcp_session_scope: self.mcp_session_scope.clone(),
+            extension_runtime: self.extension_runtime.clone(),
+            // Same durable shared-scope rule for extension leases.
+            extension_session_scope: self.extension_session_scope.clone(),
+            turn_budget: self.turn_budget.clone(),
+            // Clones share the live tool registry, so they share the SAME
+            // host tool session (matching existing shared-session behavior);
+            // independently constructed runtimes mint fresh identities and
+            // can never share session grants.
+            host_tool_session: self.host_tool_session.clone(),
         }
     }
 }
@@ -1846,6 +3558,299 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 16 session identity semantics: clones of one Runtime share the
+    /// live tool registry, so they share the same host tool session;
+    /// independently constructed runtimes mint fresh identities and can
+    /// never share session grants.
+    #[test]
+    fn host_tool_session_shared_by_clones_fresh_per_runtime() {
+        let rt = Runtime::new_headless();
+        let clone = rt.clone();
+        assert_eq!(
+            rt.host_tool_session_id(),
+            clone.host_tool_session_id(),
+            "clones share the live registry and therefore the host session"
+        );
+
+        let other = Runtime::new_headless();
+        assert_ne!(
+            rt.host_tool_session_id(),
+            other.host_tool_session_id(),
+            "independently constructed runtimes must never share a session"
+        );
+    }
+
+    /// Task 11 config rule (documented until Task 12 adds explicit trace
+    /// config): telemetry `basic`/`full` enables the shared session writer
+    /// sink — legacy telemetry AND metadata-only trace persistence; `off`
+    /// disables both (trace context reverts to the no-op sink).
+    #[test]
+    fn telemetry_level_gates_shared_observability_sink() {
+        let mut rt = Runtime::new_headless();
+        assert!(!rt.trace_context().enabled(), "off by default");
+        assert!(rt.telemetry_writer().is_none());
+
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Basic);
+        assert!(rt.trace_context().enabled(), "basic enables the trace sink");
+        assert!(rt.telemetry_writer().is_some());
+
+        // Same level again: the writer/session context is not recreated.
+        let ctx_before = format!("{:?}", rt.trace_context());
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Full);
+        assert_eq!(format!("{:?}", rt.trace_context()), ctx_before);
+
+        // Clones (subagents) share the same writer sink + session context.
+        let clone = rt.clone();
+        assert!(clone.trace_context().enabled());
+        assert_eq!(format!("{:?}", clone.trace_context()), ctx_before);
+        assert!(clone.telemetry_writer().is_some());
+
+        rt.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off);
+        assert!(!rt.trace_context().enabled(), "off disables both");
+        assert!(rt.telemetry_writer().is_none());
+        assert!(rt
+            .shutdown_observability(std::time::Duration::ZERO)
+            .is_none());
+    }
+
+    /// Owner-epilogue contract (Task 11): with telemetry Off the async
+    /// flush is a `None` no-op and idempotent; with a writer installed, a
+    /// chat-like epilogue (final record queued, then bounded flush) must
+    /// persist the record; and a slow writer must return within the budget
+    /// (TimedOut) instead of blocking exit.
+    #[tokio::test]
+    async fn shutdown_observability_async_epilogue_contract() {
+        // Off → None, twice (idempotent no-op, no writer ever created).
+        let rt = Runtime::new_headless();
+        let budget = crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT;
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
+
+        // Chat-like shutdown: the final queued record is persisted.
+        let tmp = tempfile::tempdir().unwrap();
+        let telemetry_path = tmp.path().join("synaps/api-log.jsonl");
+        let mut rt = Runtime::new_headless();
+        let writer = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(telemetry_path.clone()),
+                trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+                ..Default::default()
+            },
+        );
+        rt.install_observability_for_tests(writer.clone());
+        writer.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord {
+            ts: 7,
+            model: "claude-sonnet-4-6".to_string(),
+            ..Default::default()
+        });
+        let outcome = rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("writer installed");
+        assert!(outcome.is_flushed());
+        assert_eq!(outcome.stats().written, 1);
+        assert_eq!(
+            std::fs::read_to_string(&telemetry_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "queued final record must be on disk after the epilogue flush"
+        );
+        // Idempotent second call: intake already closed, still Flushed.
+        assert!(rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("writer still installed")
+            .is_flushed());
+
+        // Slow writer: the epilogue returns within its bounded budget.
+        let mut rt = Runtime::new_headless();
+        let slow = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(tmp.path().join("slow/api-log.jsonl")),
+                trace_path: Some(tmp.path().join("slow/request-trace.jsonl")),
+                write_delay: Some(std::time::Duration::from_millis(300)),
+                ..Default::default()
+            },
+        );
+        rt.install_observability_for_tests(slow.clone());
+        for _ in 0..10 {
+            slow.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord::default());
+        }
+        let start = std::time::Instant::now();
+        let outcome = rt
+            .shutdown_observability_async(std::time::Duration::from_millis(200))
+            .await
+            .expect("writer installed");
+        assert!(!outcome.is_flushed(), "10×300ms cannot drain in 200ms");
+        // Generous ceiling (no timing fragility): well under the 3s a full
+        // drain would need, proving the deadline was honored.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(1500),
+            "bounded epilogue must not block exit: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Task 12 fix: an armed one-shot ephemeral writer (telemetry Off +
+    /// `/trace next`) is retained by the runtime and drained by the same
+    /// shutdown epilogue as the session writer, so the armed record cannot
+    /// be lost to an exit racing the background worker.
+    #[tokio::test]
+    async fn one_shot_ephemeral_writer_is_retained_and_drained_at_shutdown() {
+        let rt = Runtime::new_headless();
+        assert!(!rt.trace_context().enabled(), "telemetry off");
+        rt.trace_arm_next(false);
+        let armed = rt.effective_trace_context();
+        assert!(armed.enabled(), "armed ephemeral context traces");
+        // No session writer, but the epilogue still finds (and drains) the
+        // retained one-shot writer.
+        let budget = crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT;
+        let outcome = rt
+            .shutdown_observability_async(budget)
+            .await
+            .expect("retained one-shot writer must be drained by the epilogue");
+        assert!(outcome.is_flushed());
+        // Consumed: a second epilogue call finds nothing.
+        assert!(rt.shutdown_observability_async(budget).await.is_none());
+    }
+
+    /// Task 12 operational expiry: stale content-capture bundles are
+    /// physically removed at Runtime startup and by BOTH shutdown
+    /// epilogues (sync and async), not only on trace interactions.
+    /// Combined into one serialized test: all three paths resolve the
+    /// capture dir through `SYNAPS_BASE_DIR`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn startup_and_shutdown_paths_sweep_expired_captures() {
+        struct BaseDirGuard(Option<String>);
+        impl Drop for BaseDirGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(old) => std::env::set_var("SYNAPS_BASE_DIR", old),
+                    None => std::env::remove_var("SYNAPS_BASE_DIR"),
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = BaseDirGuard(std::env::var("SYNAPS_BASE_DIR").ok());
+        std::env::set_var("SYNAPS_BASE_DIR", tmp.path());
+
+        let cap_dir = trace::default_capture_dir();
+        assert!(
+            cap_dir.starts_with(tmp.path()),
+            "capture dir must be private to the test"
+        );
+        let stale_id = trace::TraceId::new("req-stale").unwrap();
+        let plant_stale = || {
+            agent_core::core::private_fs::ensure_private_dir(&cap_dir).unwrap();
+            let stale = trace::controls::ContentCaptureBundle {
+                schema: trace::CONTENT_CAPTURE_SCHEMA.to_string(),
+                request_id: stale_id.clone(),
+                created_unix_ms: 1_000,
+                expires_unix_ms: 2_000, // long past
+                redacted: true,
+                over_budget: false,
+                body: Some(serde_json::json!({"old": true})),
+            };
+            let path = trace::controls::capture_path(&cap_dir, &stale_id);
+            std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            path
+        };
+
+        // 1) Runtime startup sweeps.
+        let stale_path = plant_stale();
+        let rt = Runtime::new().await.expect("runtime constructs");
+        assert!(
+            !stale_path.exists(),
+            "Runtime startup must physically remove expired capture bundles"
+        );
+
+        // 2) Sync shutdown epilogue sweeps (telemetry off → None outcome).
+        let stale_path = plant_stale();
+        let _ = rt.shutdown_observability(std::time::Duration::ZERO);
+        assert!(
+            !stale_path.exists(),
+            "sync shutdown epilogue must remove expired capture bundles"
+        );
+
+        // 3) Async shutdown epilogue sweeps.
+        let stale_path = plant_stale();
+        let _ = rt
+            .shutdown_observability_async(std::time::Duration::from_millis(100))
+            .await;
+        assert!(
+            !stale_path.exists(),
+            "async shutdown epilogue must remove expired capture bundles"
+        );
+        drop(guard);
+    }
+
+    /// fix1 I2b: the capture root binds at CONSTRUCTION. Ambient
+    /// SYNAPS_BASE_DIR churn after construction must not redirect the
+    /// sweep — each runtime keeps sweeping its own root (concurrent
+    /// roots), so a parallel test flipping env can never race the epilogue.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn capture_root_binds_at_construction_and_survives_env_churn() {
+        let base_a = tempfile::tempdir().unwrap();
+        let base_b = tempfile::tempdir().unwrap();
+        let old = std::env::var("SYNAPS_BASE_DIR").ok();
+
+        std::env::set_var("SYNAPS_BASE_DIR", base_a.path());
+        let rt_a = Runtime::new().await.expect("runtime A");
+        std::env::set_var("SYNAPS_BASE_DIR", base_b.path());
+        let rt_b = Runtime::new().await.expect("runtime B");
+
+        let cap_a = base_a.path().join("trace").join("capture");
+        let cap_b = base_b.path().join("trace").join("capture");
+        let plant = |dir: &std::path::Path, name: &str| {
+            agent_core::core::private_fs::ensure_private_dir(dir).unwrap();
+            let id = trace::TraceId::new(name).unwrap();
+            let stale = trace::controls::ContentCaptureBundle {
+                schema: trace::CONTENT_CAPTURE_SCHEMA.to_string(),
+                request_id: id.clone(),
+                created_unix_ms: 1_000,
+                expires_unix_ms: 2_000,
+                redacted: true,
+                over_budget: false,
+                body: Some(serde_json::json!({"old": true})),
+            };
+            let path = trace::controls::capture_path(dir, &id);
+            std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            path
+        };
+
+        // Point ambient env somewhere else entirely — the bound roots must win.
+        let decoy = tempfile::tempdir().unwrap();
+        std::env::set_var("SYNAPS_BASE_DIR", decoy.path());
+
+        let stale_a = plant(&cap_a, "req-stale-a");
+        let stale_b = plant(&cap_b, "req-stale-b");
+        let _ = rt_a.shutdown_observability(std::time::Duration::ZERO);
+        assert!(
+            !stale_a.exists(),
+            "runtime A must sweep the root bound at ITS construction"
+        );
+        assert!(
+            stale_b.exists(),
+            "runtime A must never sweep another runtime's root"
+        );
+        let _ = rt_b
+            .shutdown_observability_async(std::time::Duration::from_millis(100))
+            .await;
+        assert!(
+            !stale_b.exists(),
+            "runtime B must sweep the root bound at ITS construction"
+        );
+
+        match old {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+    }
 
     #[test]
     fn reload_rejects_policy_change_without_partial_apply() {
@@ -1901,7 +3906,35 @@ mod tests {
     }
 
     #[test]
-    fn configured_favorite_models_seed_session_worker_choices() {
+    fn worker_install_does_not_replay_process_global_favorite_grants() {
+        let foreground =
+            crate::orchestration::canonical_foreground_identity("anthropic/claude-fable-5")
+                .unwrap();
+        let session = Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 4, 8).unwrap(),
+        );
+        let favorite = "openai-codex/gpt-5.6-sol";
+        assert!(
+            session.preflight(favorite).is_err(),
+            "precondition: the parent session did not grant this identity"
+        );
+
+        let mut worker = Runtime::new_headless();
+        worker.apply_config(&crate::config::SynapsConfig {
+            favorite_models: vec![favorite.to_owned()],
+            ..Default::default()
+        });
+        worker.install_worker_orchestration(Arc::clone(&session));
+
+        assert!(
+            session.preflight(favorite).is_err(),
+            "constructing a child must not mint/replay a favorite-model grant"
+        );
+        assert!(!session.effective_choices().contains(&favorite.to_owned()));
+    }
+
+    #[test]
+    fn host_install_may_apply_explicit_operator_favorites() {
         let mut runtime = Runtime::new_headless();
         let config = crate::config::SynapsConfig {
             favorite_models: vec![
@@ -2243,7 +4276,7 @@ mod tests {
         assert!(truncated.starts_with(&"x".repeat(30000)));
 
         // Should contain truncation notice with total char count
-        assert!(truncated.contains("[truncated — 30001 total chars, showing first 30000]"));
+        assert!(truncated.contains("[truncated — 30001 total bytes, showing first 30000]"));
 
         // Should be longer than max (due to notice)
         assert!(truncated.len() > 30000);
@@ -2252,14 +4285,34 @@ mod tests {
         let very_long = "a".repeat(50000);
         let truncated_very_long = HelperMethods::truncate_tool_result(&very_long, default_max);
         assert!(
-            truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]")
+            truncated_very_long.contains("[truncated — 50000 total bytes, showing first 30000]")
         );
         assert!(truncated_very_long.starts_with(&"a".repeat(30000)));
 
         // Test with custom limit
         let custom_truncated = HelperMethods::truncate_tool_result(&very_long, 100);
         assert!(custom_truncated.starts_with(&"a".repeat(100)));
-        assert!(custom_truncated.contains("[truncated — 50000 total chars, showing first 100]"));
+        assert!(custom_truncated.contains("[truncated — 50000 total bytes, showing first 100]"));
+    }
+
+    /// T2 red→green: `truncate_tool_result` must enforce a BYTE budget on
+    /// multibyte input (legacy code used `chars().take(n)` — a char budget —
+    /// so 100 two-byte chars under a 50-byte budget kept 100 bytes).
+    #[test]
+    fn truncate_tool_result_enforces_byte_budget() {
+        let multibyte = "é".repeat(100); // 200 bytes, 100 chars
+        let out = HelperMethods::truncate_tool_result(&multibyte, 50);
+        let body = out.split("\n\n[truncated").next().unwrap();
+        assert!(
+            body.len() <= 50,
+            "retained body must fit the byte budget (got {} bytes)",
+            body.len()
+        );
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+        assert!(
+            out.contains("total bytes"),
+            "marker must report byte counts, got: {out}"
+        );
     }
 
     #[test]
@@ -2837,5 +4890,322 @@ mod http_client_timeout_tests {
             start.elapsed()
         );
         assert!(err.is_timeout(), "must be a timeout: {err:?}");
+    }
+}
+
+/// Task A6: memory-context provider validation + revocation wiring.
+#[cfg(test)]
+mod memory_context_provider_tests {
+    use super::{memory_context, Runtime};
+    use std::sync::Arc;
+
+    // ── task A6: memory-context provider validation + revocation wiring ──
+
+    /// Build a headless Runtime with the extension runtime installed (the
+    /// exact `install_extension_runtime` wiring point the engine uses at
+    /// boot) and one deferred context-provider-only extension loaded per
+    /// `(plugin, provider-id)` pair. Nothing spawns: context-provider
+    /// manifests classify as deferred and stay dormant.
+    async fn memory_runtime_with_providers(
+        plugins: &[(&str, &str)],
+    ) -> (
+        Runtime,
+        std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
+    ) {
+        let mut manager = crate::extensions::manager::ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ));
+        manager.set_progressive_deferral(true);
+        for (plugin, provider) in plugins {
+            let manifest: crate::extensions::manifest::ExtensionManifest =
+                serde_json::from_value(serde_json::json!({
+                    "runtime": "process",
+                    "command": "/bin/false",
+                    "permissions": ["context_providers.register"],
+                    "deferred": {
+                        "context_providers": [{
+                            "id": provider,
+                            "capability": "project-memory",
+                            "description": "test context provider",
+                            "schema_version": 1
+                        }]
+                    }
+                }))
+                .expect("manifest parses");
+            manager
+                .load(plugin, &manifest)
+                .await
+                .expect("deferred context-provider load succeeds without spawning");
+        }
+        let extension_runtime = manager.extension_runtime();
+        let mut runtime = Runtime::new_headless();
+        runtime.install_extension_runtime(std::sync::Arc::clone(&extension_runtime));
+        (runtime, extension_runtime)
+    }
+
+    fn assert_memory_off_no_lease(runtime: &Runtime) {
+        let status = runtime.memory_context_status();
+        assert_eq!(
+            status.durable,
+            memory_context::DurableStatus::Off,
+            "state must stay Off"
+        );
+        assert_eq!(
+            status.one_shot,
+            memory_context::OneShotStatus::Idle,
+            "no one-shot lease may exist"
+        );
+        assert!(
+            runtime.memory_bound_providers_for_test().is_empty(),
+            "no provider may be bound"
+        );
+    }
+
+    /// Task A6: enabling against a catalog that does not contain the
+    /// requested provider fails closed — typed error, nothing granted,
+    /// `SessionMemoryState` unchanged (Off/no-lease) — both for an
+    /// explicitly requested nonexistent id and for an id-less request
+    /// against an empty catalog.
+    #[tokio::test]
+    async fn memory_enable_unregistered_provider_fails_closed_grants_nothing() {
+        // Explicit nonexistent id against a catalog with one real provider.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        for requested in ["no-such-provider", "bad:id"] {
+            let err = runtime
+                .memory_context_enable_resolved(
+                    memory_context::MemoryContextMode::CaptureAndRecall,
+                    memory_context::mint_explicit_command_proof(),
+                    Some(requested),
+                )
+                .expect_err("unregistered provider must fail closed");
+            assert_eq!(
+                err,
+                memory_context::MemoryContextError::ProviderNotRegistered
+            );
+            assert_memory_off_no_lease(&runtime);
+        }
+
+        // Id-less request against an EMPTY catalog (extension subsystem
+        // installed, no context-provider extension loaded).
+        let (runtime, _ext) = memory_runtime_with_providers(&[]).await;
+        let err = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("empty catalog must fail closed");
+        assert_eq!(
+            err,
+            memory_context::MemoryContextError::ProviderNotRegistered
+        );
+        assert_memory_off_no_lease(&runtime);
+        // One-shot grants run the same validation.
+        let err = runtime
+            .memory_context_recall_once(memory_context::mint_explicit_command_proof())
+            .expect_err("one-shot grant must validate the provider too");
+        assert_eq!(
+            err,
+            memory_context::MemoryContextError::ProviderNotRegistered
+        );
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// Task A6: with exactly one matching declared provider the grant
+    /// succeeds and records THAT provider's exact composed runtime
+    /// address — for the default id-less request and the explicit exact id.
+    #[tokio::test]
+    async fn memory_enable_exactly_one_declared_provider_records_exact_identity() {
+        const ADDRESS: &str = "extension:axel-memory-manager:project-memory";
+        // Default (id-less) request.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        let status = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("unique declared provider must resolve");
+        assert!(matches!(
+            status.durable,
+            memory_context::DurableStatus::Active { .. }
+        ));
+        let bound = runtime.memory_bound_providers_for_test();
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].as_str(), ADDRESS, "exact runtime address recorded");
+
+        // Explicit exact id resolves to the same identity.
+        let (runtime, _ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable_resolved(
+                memory_context::MemoryContextMode::RecallEachPrompt,
+                memory_context::mint_explicit_command_proof(),
+                Some("project-memory"),
+            )
+            .expect("explicit exact id must resolve");
+        assert_eq!(
+            runtime.memory_bound_providers_for_test()[0].as_str(),
+            ADDRESS
+        );
+    }
+
+    /// Task A6: two installed extensions declaring overlapping context
+    /// providers make both the id-less request AND a request for the
+    /// overlapping id ambiguous — fail closed, nothing granted.
+    #[tokio::test]
+    async fn memory_enable_ambiguous_overlapping_declarations_fails_closed() {
+        let (runtime, _ext) = memory_runtime_with_providers(&[
+            ("mem-a", "project-memory"),
+            ("mem-b", "project-memory"),
+        ])
+        .await;
+        let err = runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("overlapping declarations must fail closed");
+        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
+        assert_memory_off_no_lease(&runtime);
+
+        // The overlapping exact id cannot disambiguate two owners either.
+        let err = runtime
+            .memory_context_enable_resolved(
+                memory_context::MemoryContextMode::CaptureOnly,
+                memory_context::mint_explicit_command_proof(),
+                Some("project-memory"),
+            )
+            .expect_err("same id declared by two plugins is ambiguous");
+        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// Task A6 revocation wiring: disable revokes the granted lease from
+    /// `SessionMemoryState` AND defensively calls
+    /// `ExtensionRuntimeManager::revoke_plugin_lease` for the bound
+    /// plugin/session pair — an idempotent no-op (no panic) when nothing
+    /// was ever spawned.
+    #[tokio::test]
+    async fn memory_disable_revokes_runtime_lease_without_spawn_no_panic() {
+        let (runtime, ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "granting a memory lease spawns nothing"
+        );
+
+        let status = runtime.memory_context_disable();
+        assert_eq!(status.durable, memory_context::DurableStatus::Off);
+        assert_memory_off_no_lease(&runtime);
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "revocation of a never-spawned lease is a no-op"
+        );
+
+        // Idempotent: disabling again is safe and stays Off.
+        let status = runtime.memory_context_disable();
+        assert_eq!(status.durable, memory_context::DurableStatus::Off);
+        assert_eq!(ext.lease_count(), 0);
+    }
+
+    /// Task B5 (spec §15): enable and disable emit metadata-only
+    /// `memory_context.enabled` / `memory_context.disabled` events — mode +
+    /// identities with the host-derived project DIGEST, never the raw
+    /// project path; a failed enable emits nothing.
+    #[test]
+    fn memory_context_enable_disable_emit_metadata_only_events() {
+        memory_context::drain_captured_memory_events_for_test();
+
+        let runtime = Runtime::new_headless();
+        // A rejected enable (Off is not a session-lease mode) emits nothing.
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::Off,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect_err("Off is not an enable mode");
+        assert!(
+            memory_context::drain_captured_memory_events_for_test().is_empty(),
+            "failed enable must emit no event"
+        );
+
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        runtime.memory_context_disable();
+
+        let events = memory_context::drain_captured_memory_events_for_test();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.event, event.outcome))
+                .collect::<Vec<_>>(),
+            vec![
+                ("memory_context.enabled", "enabled"),
+                ("memory_context.disabled", "disabled"),
+            ],
+        );
+        assert_eq!(events[0].mode, Some("capture_and_recall"));
+        assert_eq!(events[1].mode, Some("off"));
+
+        // §15: the project identity in every event is the digest form,
+        // never the raw working-directory path.
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .into_owned();
+        for event in &events {
+            let json = serde_json::to_string(event).expect("event serializes");
+            assert!(
+                json.contains("\"project_digest\":\"p") || json.contains("project-cwd-"),
+                "digest identity expected; got: {json}"
+            );
+            assert!(
+                !json.contains(&cwd),
+                "raw project path leaked into event JSON: {json}"
+            );
+        }
+    }
+
+    /// Task A6 session-end plumbing: dropping the LAST runtime owner runs
+    /// the shared `ExtensionSessionEndGuard` (terminate_session — the SAME
+    /// reap mechanism deferred tools/handlers use), and a fresh
+    /// construction against the same extension runtime starts Off with no
+    /// lease of any kind.
+    #[tokio::test]
+    async fn memory_session_end_guard_drop_fresh_construction_is_off_no_lease() {
+        let (runtime, ext) =
+            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .expect("enable succeeds");
+        // True session end: the last owner drop fires the guard.
+        drop(runtime);
+        assert_eq!(
+            ext.lease_count(),
+            0,
+            "session end must leave no runtime lease (never-spawned reap is a no-op)"
+        );
+
+        // A fresh construction (what any new session does) is Off/no-lease.
+        let mut fresh = Runtime::new_headless();
+        fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
+        assert_memory_off_no_lease(&fresh);
+        assert_eq!(ext.lease_count(), 0);
     }
 }

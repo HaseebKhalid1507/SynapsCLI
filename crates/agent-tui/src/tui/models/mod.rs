@@ -2187,7 +2187,9 @@ mod tests {
         );
 
         assert!(
-            !state.provider_catalog_overrides.contains_key("openai-codex"),
+            !state
+                .provider_catalog_overrides
+                .contains_key("openai-codex"),
             "live openai-codex rows must never populate main-section overrides: {:?}",
             state.provider_catalog_overrides
         );

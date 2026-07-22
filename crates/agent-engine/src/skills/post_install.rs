@@ -1015,6 +1015,7 @@ mod tests {
             commands: vec![],
             extension: Some(ExtensionManifest {
                 theme_tokens: Default::default(),
+                deferred: None,
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: "bin/ext".to_string(),
@@ -1331,6 +1332,7 @@ mod tests {
             commands: vec![],
             extension: Some(ExtensionManifest {
                 theme_tokens: Default::default(),
+                deferred: None,
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: command.to_string(),
@@ -1496,6 +1498,7 @@ mod tests {
             commands: vec![],
             extension: Some(ExtensionManifest {
                 theme_tokens: Default::default(),
+                deferred: None,
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: command.to_string(),

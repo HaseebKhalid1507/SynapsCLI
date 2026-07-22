@@ -11,17 +11,31 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
-/// Truncate to at most `max` bytes without slicing mid-UTF-8-codepoint.
-/// Used for forensic logging of unknown event lines.
-fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+/// Trace the outgoing Anthropic request. Metadata only — raw payload content
+/// (message text, system prompt, tool schemas/arguments) must NEVER reach any
+/// log sink at any level. Guarded by `outgoing_request_trace_is_metadata_only`.
+fn trace_outgoing_request(model: &str, body_bytes: &[u8], message_count: usize, tool_count: usize) {
+    // Per-process monotonic sequence: correlates this trace line with any
+    // later log lines for the same request without embedding content.
+    static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let correlation_id = REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Count prompt-cache markers by scanning the serialized bytes — reports
+    // marker placement (a count) without deserializing or echoing content.
+    const NEEDLE: &[u8] = b"\"cache_control\"";
+    let cache_marker_count = body_bytes
+        .windows(NEEDLE.len())
+        .filter(|w| *w == NEEDLE)
+        .count();
+    tracing::trace!(
+        provider = "anthropic",
+        model = %model,
+        payload_bytes = body_bytes.len(),
+        message_count,
+        tool_count,
+        cache_marker_count,
+        correlation_id,
+        "Outgoing API request (metadata only)"
+    );
 }
 
 /// Parse accumulated tool input JSON. On failure, returns a JSON object with
@@ -93,6 +107,15 @@ struct ParseState {
     /// declined the request. Used by `classify_stream_outcome` to gate the
     /// refusal-retry path independently of the telemetry flag.
     stop_reason_is_refusal: bool,
+    // ── Trace captures (Task 8) — unconditional, metadata-only ──
+    /// Offset of the first parsed model event from `ctx.request_start`
+    /// (post-headers), in ms. Feeds the trace `first_model_event` bucket.
+    first_event_elapsed_ms: Option<u64>,
+    /// Normalized stop reason for the trace record (raw wire string is
+    /// mapped immediately, never retained).
+    trace_stop_reason: Option<crate::runtime::trace::StopReason>,
+    /// Provider-reported usage for the trace record; `None` until observed.
+    trace_usage: Option<crate::runtime::trace::UsageMeta>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -105,7 +128,9 @@ struct StreamError {
     /// Anthropic wire error type, retained separately from display text so
     /// retry policy never depends on parsing a human-facing message.
     error_type: Option<String>,
-    /// Human-facing, actionable message (already names the error type + body).
+    /// Human-facing, actionable message. Built from vetted static text only —
+    /// the provider's error message is untrusted (it can echo the request)
+    /// and is never copied into this field.
     message: String,
     /// True for transient classes that a backoff retry can clear.
     retryable: bool,
@@ -163,6 +188,9 @@ impl ParseState {
             stream_error: None,
             stop_reason_seen: false,
             stop_reason_is_refusal: false,
+            first_event_elapsed_ms: None,
+            trace_stop_reason: None,
+            trace_usage: None,
         }
     }
 
@@ -203,6 +231,7 @@ impl ParseState {
 /// not in `ParseState`: read/write separation is the point.
 struct EventCtx<'t> {
     tx: &'t mpsc::UnboundedSender<StreamEvent>,
+    suppress_stream_deltas: bool,
     telemetry_level: TelemetryLevel,
     request_start: std::time::Instant,
     /// Requested cache TTL — used by the silent-downgrade detector.
@@ -219,6 +248,9 @@ struct EventCtx<'t> {
     /// tools): no 1h marker exists anywhere in the payload, so a 1h bucket of
     /// zero proves nothing — the detector must stay disarmed.
     request_has_1h_marker: bool,
+    /// Optional Task 23 turn-budget usage counters, recorded at the single
+    /// authoritative Usage emission (and its residual twin) only.
+    usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -242,10 +274,14 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
 fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
-    // ═══ TELEMETRY: capture TTFT on first event ═══
-    if !state.first_event_seen && ctx.telemetry_level.enabled() {
-        state.telem_ttft = Some(ctx.request_start.elapsed().as_millis() as u64);
+    // First-event capture: the trace timing bucket is unconditional
+    // (Task 8); the telemetry TTFT mirror stays gated as before.
+    if !state.first_event_seen {
         state.first_event_seen = true;
+        state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+        if ctx.telemetry_level.enabled() {
+            state.telem_ttft = state.first_event_elapsed_ms;
+        }
     }
 
     match event {
@@ -281,26 +317,32 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
         AnthropicEvent::ContentBlockDelta { delta } => match delta {
             Delta::TextDelta { text } => {
                 state.current_text.push_str(&text);
-                let _ = ctx
-                    .tx
-                    .send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx
+                        .tx
+                        .send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
+                }
             }
             Delta::ThinkingDelta { thinking } => {
                 // Anthropic sends thinking text in delta.thinking
                 state.current_thinking.push_str(&thinking);
-                let _ = ctx
-                    .tx
-                    .send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx
+                        .tx
+                        .send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+                }
             }
             Delta::SignatureDelta { signature } => {
                 state.current_thinking_signature = signature.into_owned();
             }
             Delta::InputJsonDelta { partial_json } => {
                 state.current_tool_input_json.push_str(&partial_json);
-                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
-                    tool_id: state.current_tool_id.clone(),
-                    delta: partial_json.into_owned(),
-                }));
+                if !ctx.suppress_stream_deltas {
+                    let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                        tool_id: state.current_tool_id.clone(),
+                        delta: partial_json.into_owned(),
+                    }));
+                }
             }
             // Unknown delta subtype: no state change, mirrors the old `_ => {}`.
             Delta::Unknown => {}
@@ -361,6 +403,11 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 if sr.as_ref() == "refusal" {
                     state.stop_reason_is_refusal = true;
                 }
+                // Trace capture: map to the normalized enum immediately —
+                // the raw wire string is never retained (Task 8).
+                state.trace_stop_reason = Some(
+                    crate::runtime::trace::anthropic::stop_reason_from_wire(sr.as_ref()),
+                );
                 if ctx.telemetry_level.enabled() {
                     state.telem_stop_reason = Some(sr.into_owned());
                 }
@@ -477,6 +524,16 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     // downstream consumer is an accumulator, so a second
                     // emission double-bills input/cache.
                     state.usage_emitted = true;
+                    state.trace_usage = Some(crate::runtime::trace::UsageMeta {
+                        provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
+                        input_tokens: Some(input_t),
+                        output_tokens: Some(output_t),
+                        cache_read_tokens: Some(cache_read),
+                        cache_write_tokens: Some(cache_create),
+                    });
+                    if let Some(counters) = &ctx.usage_counters {
+                        counters.record(input_t, output_t, cache_read, cache_create);
+                    }
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -534,7 +591,7 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             // a visible, accurate error — never the silent "stopping" swallow
             // (task #130). First error wins — later frames don't clobber it.
             if state.stream_error.is_none() {
-                let (kind, body) = match &error {
+                let (kind, _body) = match &error {
                     Some(e) => (
                         e.error_type.as_deref().unwrap_or("error"),
                         e.message.as_deref(),
@@ -542,16 +599,21 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     None => ("error", None),
                 };
                 let retryable = StreamError::is_retryable_type(kind);
-                let message = match body {
-                    Some(m) => format!("API stream error ({kind}): {m}"),
-                    None => format!("API stream error ({kind})"),
-                };
-                // Gap-1 forensics: the raw frame is the ground truth for the
-                // next occurrence — log it once, verbatim (bounded).
+                // SECURITY (spec §5.1): the frame — error type AND message —
+                // is untrusted; a hostile provider can echo the entire request
+                // through it. Surface only a vetted static class label; never
+                // the message or the raw frame (bounded truncation is not
+                // redaction).
+                let vetted =
+                    crate::core::error::sanitize_error_type(kind).unwrap_or("unrecognized_error");
+                let message = format!(
+                    "API stream error ({vetted}). Provider error details withheld — they can echo request content."
+                );
                 tracing::warn!(
                     retryable,
-                    raw = %truncate_at_char_boundary(raw, 400),
-                    "SSE error event: {message}"
+                    error_type = vetted,
+                    frame_bytes = raw.len(),
+                    "SSE error event (payload withheld — untrusted)"
                 );
                 state.stream_error = Some(StreamError {
                     error_type: Some(kind.to_string()),
@@ -561,12 +623,12 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::Unknown => {
-            // #[serde(other)] discarded the tag — the raw line is the only
-            // forensics. Covers `ping` and future event types (`error` is now
-            // a real arm above).
+            // #[serde(other)] discarded the tag. The raw line is untrusted
+            // provider output — log only its size, never its content
+            // (spec §5.1: no response-derived text in logs at any level).
             tracing::trace!(
-                "Unknown SSE event type: {}",
-                truncate_at_char_boundary(raw, 200)
+                payload_bytes = raw.len(),
+                "Unknown SSE event type (payload withheld — untrusted)"
             );
         }
     }
@@ -599,6 +661,16 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
         state.telem_usage.compute_hit_pct();
     }
     state.usage_emitted = true;
+    state.trace_usage = Some(crate::runtime::trace::UsageMeta {
+        provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
+        input_tokens: Some(input_t),
+        output_tokens: Some(output_t),
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: Some(cache_create),
+    });
+    if let Some(counters) = &ctx.usage_counters {
+        counters.record(input_t, output_t, cache_read, cache_create);
+    }
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
         output_tokens: output_t,
@@ -710,6 +782,129 @@ pub struct ApiOptions {
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     /// Foreground/worker/internal request role.
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    /// Trace emission seam (Task 8). Default is a disabled context (no-op
+    /// sink, zero request-path work); tests install a collecting sink and
+    /// production installs the Task 11 writer-backed sink via the Runtime.
+    pub trace: crate::runtime::trace::TraceContext,
+    /// The correlated IDs reserved for this provider request. Set before the
+    /// transport starts and consumed by both RequestTracer and the stream's
+    /// tool lifecycle recorder.
+    pub request_correlation: Option<crate::runtime::trace::RequestCorrelation>,
+    /// Internal sync routes can suppress high-volume display-only deltas at
+    /// the producer boundary; final text/tool results are still returned in
+    /// the normal response value.
+    #[doc(hidden)]
+    pub suppress_stream_deltas: bool,
+    /// Bounded background writer for legacy telemetry records (Task 11).
+    /// `None` (default) drops records; production sets the Runtime's shared
+    /// session writer whenever the telemetry level is Basic/Full. Enqueue
+    /// only — never synchronous file I/O on the request path.
+    pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
+    /// Runtime-scoped tool-session identity (Task 16). Scopes the execution
+    /// gate for extension-provider interior tool loops reached through
+    /// `try_route`. Stream turns (and `run_single`) thread the Runtime's
+    /// host session; `None` (internal helpers, tests) makes the extension
+    /// route fail closed to a locally minted identity with the identical
+    /// default-core policy — never to ungated execution.
+    pub tool_session_id: Option<crate::tools::activation::SessionId>,
+    /// The RETAINED per-stream session tool set handle (Task 17). Stream
+    /// turns thread the same shared set the execution gate authorizes
+    /// against, so extension-provider interior tool loops observe the
+    /// identical set/generation — including exact activations. `None`
+    /// (internal helpers, non-stream paths, tests) makes the extension
+    /// route fall back to a locally minted default-core set; a STALE
+    /// retained set is denied there, never silently replaced.
+    pub session_tool_set: Option<crate::tools::activation::SharedSessionToolSet>,
+    /// Optional provider-neutral Task 18 schema projection for this request.
+    /// `None` preserves the legacy registry-cached Arc and therefore the
+    /// flag-off request bytes exactly. Stream rounds set `Some` only when the
+    /// progressive-disclosure flag is enabled.
+    pub request_tools_schema: Option<std::sync::Arc<Vec<Value>>>,
+    /// Optional shared turn-budget usage counters (Task 23). Updated at the
+    /// single authoritative Usage emission per request; the stream loop
+    /// reads them for the optional token/cost budget dimensions. `None`
+    /// (default, non-stream callers) records nothing.
+    pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+}
+
+/// Validate a provider-assigned request ID from response headers into a
+/// bounded [`trace::TraceId`]. Invalid or hostile values are omitted —
+/// never copied raw into a trace record.
+pub(super) fn provider_request_id_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<crate::runtime::trace::TraceId> {
+    crate::runtime::telemetry::request_id_from_headers(headers)
+        .and_then(|s| crate::runtime::trace::TraceId::new(s).ok())
+}
+
+/// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
+/// is disabled or any structural identity is unrepresentable — tracing can
+/// never fail the request. `body_bytes` MUST be the exact buffer handed to
+/// reqwest: it is the sole source of the wire length + digest.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn begin_anthropic_tracer(
+    options: &ApiOptions,
+    url: &str,
+    bare_model: &str,
+    body_bytes: &[u8],
+    messages: &[crate::SharedMessage],
+    system_prompt: Option<&str>,
+    tools_schema: &[Value],
+    has_tool_marker: bool,
+    has_system_marker: bool,
+    translation: &crate::runtime::transport::report::TranslationReport,
+) -> Option<crate::runtime::trace::RequestTracer> {
+    use crate::runtime::trace as tr;
+    if !options.trace.enabled() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let host = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let endpoint = tr::EndpointMeta::new(host, parsed.path()).ok()?;
+    let model =
+        agent_core::prompt::QualifiedModelId::parse(format!("anthropic/{bare_model}")).ok()?;
+    // Lazy, spawn_blocking-backed key load; `None` degrades the record to
+    // digest-free sections and is counted, never surfaced as an error.
+    let key = options.trace.digest_key().await;
+    let prefix_ttl = match options.cache_ttl {
+        crate::core::config::CacheTtl::FiveMinutes => Some(tr::CacheTtlClass::FiveMinutes),
+        crate::core::config::CacheTtl::OneHour | crate::core::config::CacheTtl::Hybrid => {
+            Some(tr::CacheTtlClass::OneHour)
+        }
+    };
+    let structure = tr::anthropic::anthropic_request_structure(
+        key.as_deref(),
+        body_bytes,
+        messages,
+        system_prompt,
+        tools_schema,
+        prefix_ttl,
+        has_tool_marker,
+        has_system_marker,
+        translation.clone().into_losses(),
+        Some(options.trace.cache_snapshots()),
+    );
+    let tracer = tr::RequestTracer::begin(
+        &options.trace,
+        options.request_correlation.clone(),
+        model,
+        tr::TransportKind::AnthropicMessages,
+        endpoint,
+        structure,
+    );
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context that does not carry the arm. Body bytes only — headers
+    // and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        options
+            .trace
+            .capture_request_content(tracer.request_id(), body_bytes);
+    }
+    tracer
 }
 
 pub(super) struct ApiMethods;
@@ -770,97 +965,42 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
+        // One provider-neutral schema source for every transport. The opt-in
+        // progressive path supplies a per-round session projection; flag-off
+        // keeps cloning the registry's existing cached Arc byte-for-byte.
+        let tools_schema = options
+            .request_tools_schema
+            .clone()
+            .unwrap_or_else(|| tools.tools_schema());
         // Cloud models always dispatch through the typed credential broker.
+        // Text-only pre-flight, invocation, cancellation, and Task 10B trace
+        // wiring live in `runtime::cloud_invoke` (extracted for testability).
         let (cloud_model, cloud_context) = crate::auth::cloud::split_model_route(model);
         if let Some((provider_key, _)) = cloud_model.split_once('/') {
             if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
-                use futures::StreamExt;
-                let broker = crate::auth::broker_from_source(
-                    &options.credential_source,
-                    &options.token_cache,
-                    client.clone(),
-                );
-                let mut normalized = Vec::new();
-                if let Some(system) = system_prompt.as_ref().filter(|s| !s.is_empty()) {
-                    normalized.push(crate::auth::cloud::BrokerMessage {
-                        role: crate::auth::cloud::MessageRole::System,
-                        content: system.clone(),
-                    });
-                }
-                for message in messages {
-                    let role = match message["role"].as_str().unwrap_or("user") {
-                        "assistant" => crate::auth::cloud::MessageRole::Assistant,
-                        "system" => crate::auth::cloud::MessageRole::System,
-                        "tool" => crate::auth::cloud::MessageRole::Tool,
-                        _ => crate::auth::cloud::MessageRole::User,
-                    };
-                    let content = message["content"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| message["content"].to_string());
-                    normalized.push(crate::auth::cloud::BrokerMessage { role, content });
-                }
-                let request = crate::auth::cloud::InvokeRequest {
-                    messages: normalized,
-                    tools: Vec::new(),
-                    stream: true,
-                    options: Default::default(),
-                };
-                let context_ref = cloud_context.unwrap_or(provider.as_str());
-                let mut stream = broker
-                    .cloud_invoke(provider, context_ref, cloud_model, request)
-                    .await
-                    .map_err(|e| RuntimeError::Config(e.to_string()))?;
-                let mut text = String::new();
-                while let Some(event) = tokio::select! { _ = cancel.cancelled() => return Err(RuntimeError::Config("cloud invocation cancelled".into())), event = stream.next() => event }
-                {
-                    match event.map_err(|e| RuntimeError::Config(e.to_string()))? {
-                        crate::auth::broker::CloudEvent::TextDelta { delta } => {
-                            text.push_str(&delta);
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::Text(delta),
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::ToolArguments { id, name, delta } => {
-                            if let Some(name) = name {
-                                let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                    crate::runtime::types::LlmEvent::ToolUseStart {
-                                        tool_name: name,
-                                        tool_id: id.clone(),
-                                    },
-                                ));
-                            }
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::ToolUseDelta {
-                                    tool_id: id,
-                                    delta,
-                                },
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::Usage {
-                            input_tokens,
-                            output_tokens,
-                        } => {
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Session(
-                                crate::runtime::types::SessionEvent::Usage {
-                                    input_tokens,
-                                    output_tokens,
-                                    cache_read_input_tokens: 0,
-                                    cache_creation_input_tokens: 0,
-                                    cache_creation_5m: None,
-                                    cache_creation_1h: None,
-                                    model: Some(model.into()),
-                                },
-                            ));
-                        }
-                        crate::auth::broker::CloudEvent::Done => break,
-                    }
-                }
-                return Ok(serde_json::json!({"content":[{"type":"text","text":text}]}));
+                return crate::runtime::cloud_invoke::cloud_invoke_stream(
+                    provider,
+                    model,
+                    cloud_model,
+                    cloud_context,
+                    !tools_schema.is_empty(),
+                    || {
+                        crate::auth::broker_from_source(
+                            &options.credential_source,
+                            &options.token_cache,
+                            client.clone(),
+                        )
+                    },
+                    system_prompt,
+                    messages,
+                    &tx,
+                    cancel,
+                    &options.trace,
+                )
+                .await;
             }
         }
         // Route to OpenAI-compat provider if the model id resolves to one.
-        let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
             model,
             client,
@@ -877,6 +1017,10 @@ impl ApiMethods {
             &options.token_cache,
             max_retries,
             options.codex_request_role,
+            options.tool_session_id.as_ref(),
+            options.session_tool_set.as_ref(),
+            &options.trace,
+            options.suppress_stream_deltas,
         )
         .await
         {
@@ -939,8 +1083,11 @@ impl ApiMethods {
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
         // and the tool schemas instead of the old `json!` assembly that deep-
         // rebuilt the entire history into a `Value` tree (copy C8). Byte-
-        // identical output is enforced by `runtime::body_golden`.
-        let body = super::request::RequestBody::new(
+        // identical output is enforced by `runtime::body_golden`. Task 9: the
+        // transport adapter wraps that same serializer and adds the
+        // provider-neutral `TranslationReport` (no Value round-trip, no
+        // second history copy).
+        let parts = crate::runtime::transport::anthropic::build_anthropic_request(
             model,
             &cleaned_messages,
             &tools_schema,
@@ -952,6 +1099,8 @@ impl ApiMethods {
             options.cache_ttl,
             true,
         );
+        let body = parts.body;
+        let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
         // silent-downgrade detector. Mirrors cache_control_value(): OneHour
@@ -969,11 +1118,6 @@ impl ApiMethods {
             crate::core::config::CacheTtl::Hybrid => has_tool_marker || has_system_marker,
         };
 
-        tracing::trace!(
-            "Outgoing API Request Payload:\n{}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        );
-
         // Serialize the body once up-front; each retry attempt reuses the same
         // bytes via a cheap `Bytes::clone()` (refcount bump, no copy). Previously
         // we called `req.json(&body).send()` per attempt, which re-ran
@@ -984,6 +1128,13 @@ impl ApiMethods {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
             .into();
+
+        trace_outgoing_request(
+            model,
+            &body_bytes,
+            cleaned_messages.len(),
+            tools_schema.len(),
+        );
 
         // ═══ UNIFIED RETRY (task #130) ════════════════════════════════════════
         // ONE generic budget governs transient failures whether they surface as
@@ -1000,6 +1151,35 @@ impl ApiMethods {
         // separate Claude-compatible persistent budget (10 retries), because
         // these 200/SSE overload responses carry no retry headers.
         const MAX_429_RETRIES: u32 = 8;
+        // Endpoint resolved once — identical across retry attempts.
+        let anthropic_base = options
+            .anthropic_base_url
+            .clone()
+            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
+        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+
+        // ═══ TRACE (Task 8): one record per actual attempt ════════════════════
+        // Emission rule documented in `trace::emit`. Tracing is metadata-only
+        // and can never fail or delay the request.
+        let mut tracer = begin_anthropic_tracer(
+            options,
+            &anthropic_url,
+            model,
+            &body_bytes,
+            &cleaned_messages,
+            system_prompt.as_deref(),
+            &tools_schema,
+            has_tool_marker,
+            has_system_marker,
+            &translation_report,
+        )
+        .await;
+        // Placeholder value: every send re-starts the clock immediately
+        // before handing bytes to reqwest (per-attempt timing).
+        #[allow(unused_assignments)]
+        let mut clock = crate::runtime::trace::AttemptClock::start();
+
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
@@ -1023,13 +1203,6 @@ impl ApiMethods {
                     }
 
                     // Rebuild request (consumed on send)
-                    let anthropic_base = options
-                        .anthropic_base_url
-                        .clone()
-                        .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
-                        .unwrap_or_else(|| "https://api.anthropic.com".into());
-                    let anthropic_url =
-                        format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
                     let mut req = client
                         .post(&anthropic_url)
                         .header(auth_header_name.clone(), auth_header_value.clone())
@@ -1045,10 +1218,12 @@ impl ApiMethods {
                         req = req.header("anthropic-beta", beta);
                     }
 
+                    clock = crate::runtime::trace::AttemptClock::start();
                     match req.body(body_bytes.clone()).send().await {
                         Ok(resp) => {
                             let status = resp.status();
                             if status.is_success() {
+                                clock.mark_headers();
                                 response = Some(resp);
                                 break;
                             }
@@ -1062,6 +1237,18 @@ impl ApiMethods {
                                 && !auth_retried
                             {
                                 auth_retried = true;
+                                clock.mark_headers();
+                                if let Some(t) = tracer.as_mut() {
+                                    let rid = provider_request_id_from_headers(resp.headers());
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Auth,
+                                        Duration::ZERO,
+                                        Some(401),
+                                        rid,
+                                        "http_401",
+                                    );
+                                }
                                 let _ = resp.text().await; // drain body
                                 options.token_cache.invalidate("anthropic");
                                 {
@@ -1095,6 +1282,8 @@ impl ApiMethods {
                                 None
                             };
 
+                            clock.mark_headers();
+                            let trace_rid = provider_request_id_from_headers(resp.headers());
                             let error_text = resp.text().await.unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
@@ -1105,6 +1294,18 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                if let Some(t) = tracer.take() {
+                                    let terminal =
+                                        t.failed_terminal(&format!("http_{}", status.as_u16()));
+                                    t.finish(
+                                        clock,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        None,
+                                        None,
+                                        terminal,
+                                    );
+                                }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::ApiStatus(
                                     crate::core::error::humanize_api_error_with_reset(
@@ -1117,7 +1318,11 @@ impl ApiMethods {
 
                             last_status = Some(status.as_u16());
                             last_reset_hint = reset_hint.clone();
-                            last_err = format!("{}: {}", status, error_text);
+                            // SECURITY (spec §5.1): `error_text` is untrusted and can
+                            // echo the entire request. Retain only the status for
+                            // retry state — never the body (it reaches logs and the
+                            // exhausted-fallback error text below).
+                            last_err = format!("HTTP {}", status.as_u16());
 
                             if !is_429 {
                                 non_429_attempts += 1;
@@ -1150,6 +1355,19 @@ impl ApiMethods {
                             );
                             let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
 
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::anthropic::retry_class_for_status(
+                                        status.as_u16(),
+                                    ),
+                                    delay,
+                                    Some(status.as_u16()),
+                                    trace_rid,
+                                    &format!("http_{}", status.as_u16()),
+                                );
+                            }
+
                             tokio::time::sleep(delay).await;
 
                             if cancel.is_cancelled() {
@@ -1159,6 +1377,10 @@ impl ApiMethods {
                         Err(e) => {
                             non_429_attempts += 1;
                             if non_429_attempts > max_retries {
+                                if let Some(t) = tracer.take() {
+                                    let terminal = t.failed_terminal("network");
+                                    t.finish(clock, None, None, None, None, terminal);
+                                }
                                 return Err(RuntimeError::ApiStatus(
                                     crate::core::error::humanize_network_error(&e),
                                 ));
@@ -1180,6 +1402,16 @@ impl ApiMethods {
                                 "⏳ API error, retrying ({}/{})…",
                                 non_429_attempts, max_retries
                             ))));
+                            if let Some(t) = tracer.as_mut() {
+                                t.attempt_failed(
+                                    clock,
+                                    crate::runtime::trace::RetryClass::Network,
+                                    delay,
+                                    None,
+                                    None,
+                                    "network",
+                                );
+                            }
                             tokio::time::sleep(delay).await;
                             if cancel.is_cancelled() {
                                 return Err(RuntimeError::Canceled);
@@ -1205,6 +1437,12 @@ impl ApiMethods {
 
             // ═══ TELEMETRY: capture headers before consuming the response body ═══
             let request_start = std::time::Instant::now();
+            // Trace: validated provider request ID (invalid values omitted).
+            let trace_rid_stream = if tracer.is_some() {
+                provider_request_id_from_headers(response.headers())
+            } else {
+                None
+            };
             let telem_request_id = if telemetry_level.enabled() {
                 telemetry::request_id_from_headers(response.headers())
             } else {
@@ -1227,12 +1465,14 @@ impl ApiMethods {
             let mut state = ParseState::new();
             let ctx = EventCtx {
                 tx: &tx,
+                suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
                 request_start,
                 cache_ttl: options.cache_ttl,
                 ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
+                usage_counters: options.usage_counters.clone(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -1250,7 +1490,10 @@ impl ApiMethods {
                 // the turn. Bill any start-captured usage first: the API already
                 // processed the input even if the stream died on us.
                 let chunk = match chunk {
-                    Ok(c) => c,
+                    Ok(c) => {
+                        clock.mark_first_byte();
+                        c
+                    }
                     Err(e) => {
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
@@ -1289,6 +1532,24 @@ impl ApiMethods {
             let has_stop_reason = state.stop_reason_seen;
             let stop_reason_is_refusal = state.stop_reason_is_refusal;
             let cancelled = cancel.is_cancelled();
+
+            // ═══ TRACE: finish this attempt's monotonic clock + captures ═══
+            clock.mark_stream_end();
+            if let Some(offset_ms) = state.first_event_elapsed_ms {
+                clock.set_first_model_event_after_headers(offset_ms);
+            }
+            let trace_stop_reason = state.trace_stop_reason;
+            let trace_usage = state.trace_usage;
+            // Structural failure code for trace terminals: a vetted static
+            // error-class label or a fixed literal — never raw provider text.
+            let stream_error_code: &str = match stream_error.as_ref() {
+                Some(e) => e
+                    .error_type
+                    .as_deref()
+                    .and_then(crate::core::error::sanitize_error_type)
+                    .unwrap_or("stream_error"),
+                None => "empty_response",
+            };
 
             // ═══ TELEMETRY: write the record ═══
             if telemetry_level.enabled() {
@@ -1332,7 +1593,12 @@ impl ApiMethods {
                         breakpoints,
                     },
                 };
-                telemetry::write_record(&record);
+                // Non-blocking enqueue onto the session's bounded writer
+                // (Task 11): overflow or a broken log path is counted by
+                // the writer and can never delay or fail the request.
+                if let Some(writer) = options.telemetry.as_ref() {
+                    writer.enqueue_telemetry(record);
+                }
             }
 
             match classify_stream_outcome(
@@ -1342,8 +1608,38 @@ impl ApiMethods {
                 stop_reason_is_refusal,
                 cancelled,
             ) {
-                StreamOutcome::Done(v) => return Ok(v),
-                StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
+                StreamOutcome::Done(v) => {
+                    if let Some(t) = tracer.take() {
+                        let terminal = if cancelled {
+                            agent_core::TurnOutcome::Canceled
+                        } else {
+                            agent_core::TurnOutcome::Completed
+                        };
+                        t.finish(
+                            clock,
+                            Some(200),
+                            trace_rid_stream,
+                            trace_stop_reason,
+                            trace_usage,
+                            terminal,
+                        );
+                    }
+                    return Ok(v);
+                }
+                StreamOutcome::Fail(msg) => {
+                    if let Some(t) = tracer.take() {
+                        let terminal = t.failed_terminal(stream_error_code);
+                        t.finish(
+                            clock,
+                            Some(200),
+                            trace_rid_stream,
+                            trace_stop_reason,
+                            trace_usage,
+                            terminal,
+                        );
+                    }
+                    return Err(RuntimeError::ApiStatus(msg));
+                }
                 StreamOutcome::Retry(stream_error) => {
                     let msg = stream_error.message;
                     // Anthropic OAuth overloads need the same persistent retry
@@ -1365,6 +1661,17 @@ impl ApiMethods {
                     if retries_used >= retry_budget || cancel.is_cancelled() {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
+                        if let Some(t) = tracer.take() {
+                            let terminal = t.failed_terminal(stream_error_code);
+                            t.finish(
+                                clock,
+                                Some(200),
+                                trace_rid_stream,
+                                trace_stop_reason,
+                                trace_usage,
+                                terminal,
+                            );
+                        }
                         return Err(RuntimeError::ApiStatus(msg));
                     }
                     let retry_index = retries_used.saturating_add(1);
@@ -1390,6 +1697,18 @@ impl ApiMethods {
                         "⏳ API stream error — retrying ({}/{})…",
                         retry_index, retry_budget
                     ))));
+                    if let Some(t) = tracer.as_mut() {
+                        t.attempt_failed(
+                            clock,
+                            crate::runtime::trace::anthropic::retry_class_for_stream_error(
+                                stream_error.error_type.as_deref(),
+                            ),
+                            delay,
+                            Some(200),
+                            trace_rid_stream,
+                            stream_error_code,
+                        );
+                    }
                     tokio::time::sleep(delay).await;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
@@ -1402,6 +1721,17 @@ impl ApiMethods {
                     // Check budget before sleeping so an immediate exhaustion is
                     // surfaced without a pointless delay.
                     if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                        if let Some(t) = tracer.take() {
+                            let terminal = t.failed_terminal("refusal");
+                            t.finish(
+                                clock,
+                                Some(200),
+                                trace_rid_stream,
+                                trace_stop_reason,
+                                trace_usage,
+                                terminal,
+                            );
+                        }
                         let msg = format!(
                             "⚠ model refused the request ({} attempt{})",
                             refusal_attempts + 1,
@@ -1428,6 +1758,16 @@ impl ApiMethods {
                         "⏳ model refusal — retrying ({}/{})…",
                         refusal_attempts, refusal_retries
                     ))));
+                    if let Some(t) = tracer.as_mut() {
+                        t.attempt_failed(
+                            clock,
+                            crate::runtime::trace::RetryClass::Other,
+                            delay,
+                            Some(200),
+                            trace_rid_stream,
+                            "refusal",
+                        );
+                    }
                     tokio::time::sleep(delay).await;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
@@ -1458,13 +1798,30 @@ mod tests {
     fn make_ctx(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
+            usage_counters: None,
         }
+    }
+
+    #[test]
+    fn suppressed_sync_context_accumulates_text_without_emitting_deltas() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ParseState::new();
+        let mut ctx = make_ctx(&tx);
+        ctx.suppress_stream_deltas = true;
+        process_data_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"large-final-text"}}"#,
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.current_text, "large-final-text");
+        assert!(rx.try_recv().is_err());
     }
 
     /// Telemetry-OFF ctx — the DEFAULT runtime config. Used to prove parse-time
@@ -1472,12 +1829,14 @@ mod tests {
     fn make_ctx_telemetry_off(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Off,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
+            usage_counters: None,
         }
     }
 
@@ -1491,6 +1850,7 @@ mod tests {
     ) -> EventCtx<'a> {
         EventCtx {
             tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: ttl,
@@ -1499,6 +1859,7 @@ mod tests {
             // Default armed: most detector tests model a request that DID
             // carry a 1h marker. The no-marker test overrides this.
             request_has_1h_marker: true,
+            usage_counters: None,
         }
     }
 
@@ -2225,8 +2586,9 @@ mod tests {
         // overloaded, context overflow) MUST be captured — not silently
         // dropped as an Unknown event. This is the root of task #130: a
         // dropped error event left the stream empty and the turn ended
-        // silently. The captured message must name the error type so the
-        // surfaced error is actionable.
+        // silently. The captured message must name the (vetted) error type so
+        // the surfaced error is actionable — but never the provider's raw
+        // message, which is untrusted (spec §5.1).
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
@@ -2245,8 +2607,8 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("Overloaded"),
-            "must carry the error message: {}",
+            !err.message.contains("Overloaded"),
+            "must NOT carry the raw provider message (untrusted): {}",
             err.message
         );
         assert!(
@@ -2265,6 +2627,81 @@ mod tests {
         assert!(
             state.stream_error.is_some(),
             "error event with no payload must still set a stream error"
+        );
+    }
+
+    /// Phase 1 holdout regression — RED at HEAD: the SSE `error` event arm
+    /// logged the raw frame (bounded 400 bytes) at WARN and copied the
+    /// provider message verbatim into `stream_error.message` (→ retry
+    /// warnings and the terminal error). GREEN: neither the captured message
+    /// nor any log line carries the hostile body; the vetted error type
+    /// survives for retry policy.
+    #[test]
+    fn hostile_sse_error_event_never_leaks_request_content() {
+        const HOSTILE_SENTINEL: &str = "HOLDOUT-SENTINEL-http500-77aa";
+
+        /// `std::io::Write` sink appending to a shared buffer.
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Cap {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || Cap(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        let hostile = format!(
+            r#"data: {{"type":"error","error":{{"type":"overloaded_error","message":"ECHOED:{HOSTILE_SENTINEL} {{\"system\":[...],\"tools\":[{{\"input_schema\":{{}}}}]}}"}}}}"#
+        );
+        feed(&[hostile.as_str()], &mut state, &ctx);
+
+        let err = state
+            .stream_error
+            .take()
+            .expect("error event must be captured");
+        for (text, ctx_name) in [(err.message.as_str(), "stream_error message")] {
+            assert!(
+                !text.contains(HOSTILE_SENTINEL),
+                "{ctx_name}: sentinel leaked: {text}"
+            );
+            assert!(
+                !text.contains("ECHOED") && !text.contains("input_schema"),
+                "{ctx_name}: echoed request content leaked: {text}"
+            );
+        }
+        assert_eq!(
+            err.error_type.as_deref(),
+            Some("overloaded_error"),
+            "vetted type must survive for retry policy"
+        );
+        assert!(err.retryable, "overloaded_error stays retryable");
+
+        // Hostile unknown SSE events must not leak via the forensics trace.
+        let unknown = format!(r#"data: {{"type":"fnord","echo":"{HOSTILE_SENTINEL}"}}"#);
+        feed(&[unknown.as_str()], &mut state, &ctx);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!logs.is_empty(), "expected SSE error warn to be logged");
+        assert!(
+            !logs.contains(HOSTILE_SENTINEL),
+            "log sink leaked the sentinel: {logs}"
+        );
+        assert!(
+            !logs.contains("ECHOED") && !logs.contains("input_schema"),
+            "log sink leaked echoed request content: {logs}"
         );
     }
 
@@ -2765,12 +3202,14 @@ mod tests {
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = EventCtx {
             tx: &tx,
+            suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::Hybrid,
             ttl_downgrade_notified: notified.clone(),
             saw_1h_honored: honored.clone(),
             request_has_1h_marker: false,
+            usage_counters: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -3178,6 +3617,298 @@ mod on401_tests {
             1,
             "Local source must never retry on 401, got {} calls",
             counter.load(Ordering::SeqCst)
+        );
+    }
+
+    // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────
+    // A request body containing a unique sentinel must never surface in
+    // tracing output at ANY level (TRACE included); only metadata fields
+    // (provider, model, byte length, counts, correlation id) may appear.
+
+    /// `std::io::Write` sink that appends to a shared buffer, for capturing
+    /// formatted tracing output in-process.
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn outgoing_request_trace_is_metadata_only() {
+        let sentinel = "SENTINEL_5f2a9c_do_not_log";
+        let body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": sentinel,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "system": sentinel,
+            "tools": [],
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::trace_outgoing_request("claude-test", &body_bytes, 1, 0);
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!output.is_empty(), "expected a trace line to be emitted");
+        assert!(
+            !output.contains(sentinel),
+            "raw payload content leaked into trace output: {output}"
+        );
+        for field in [
+            "provider",
+            "model",
+            "payload_bytes",
+            "message_count",
+            "tool_count",
+            "cache_marker_count",
+            "correlation_id",
+        ] {
+            assert!(
+                output.contains(field),
+                "metadata field `{field}` missing from trace output: {output}"
+            );
+        }
+    }
+
+    // ─── Phase 1 holdout regression: hostile provider echoes the request ─────
+    // A hostile loopback provider returns HTTP 500 whose `error.message` is
+    // "ECHOED:" + the full request body (user message, system prompts, tool
+    // schemas). spec §5.1 / Task 1: no raw-content sentinel may appear in
+    // logs at any level, in retry notices, or in the surfaced error.
+
+    const HOSTILE_SENTINEL: &str = "HOLDOUT-SENTINEL-http500-77aa";
+
+    /// Stub provider that echoes the entire request body inside a 500 JSON
+    /// error envelope — the exact hostile shape from the preserved probe.
+    async fn spawn_echoing_500_provider() -> String {
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move |body: String| async move {
+                let envelope = serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "api_error",
+                               "message": format!("ECHOED:{body}") }
+                });
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    envelope.to_string(),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn assert_no_hostile_leak(text: &str, ctx: &str) {
+        assert!(
+            !text.contains(HOSTILE_SENTINEL),
+            "{ctx}: sentinel leaked: {text}"
+        );
+        assert!(
+            !text.contains("ECHOED:"),
+            "{ctx}: echoed request body leaked: {text}"
+        );
+        assert!(
+            !text.contains("input_schema"),
+            "{ctx}: tool schema leaked: {text}"
+        );
+    }
+
+    /// RED at HEAD: the retry `tracing::warn!` prints `last_err` (status +
+    /// raw body) and the exhausted path humanizes the raw body into the
+    /// user-visible error — both carried the sentinel. GREEN: neither logs
+    /// (any level), notices, nor the typed error contain any body-derived
+    /// text.
+    #[tokio::test]
+    async fn hostile_500_retry_and_exhaustion_never_leak_request_content() {
+        let anthropic_url = spawn_echoing_500_provider().await;
+
+        // Capture ALL tracing output (TRACE included) on this thread.
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let options = make_options(anthropic_url, CredentialSource::Local, TokenCache::new());
+        let auth = auth_with_token("sk-local-key");
+        let client = Client::new();
+        let tools = ToolRegistry::new();
+        let messages = vec![std::sync::Arc::new(json!({
+            "role": "user",
+            "content": format!("{HOSTILE_SENTINEL} tell me things"),
+        }))];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        // max_retries=1 → exercises BOTH the retry-warning path (attempt 1)
+        // and the retries-exhausted error path (attempt 2).
+        let result = ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "claude-haiku-4-5",
+            &tools,
+            &Some(format!("system secret {HOSTILE_SENTINEL}")),
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &messages,
+            tx,
+            1, // max_retries
+            0, // refusal_retries
+            &options,
+            TelemetryLevel::Off,
+        )
+        .await;
+
+        // 1) Surfaced typed error must not carry any body-derived text.
+        let err = result.expect_err("hostile 500 must fail").to_string();
+        assert_no_hostile_leak(&err, "typed error");
+        assert!(
+            err.contains("500") || err.contains("server error"),
+            "error must stay actionable (status class): {err}"
+        );
+
+        // 2) User-visible notices (retry banners) must not leak.
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+                assert_no_hostile_leak(&n, "notice");
+            }
+        }
+
+        // 3) Log sink at every level must not leak.
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!logs.is_empty(), "expected retry warnings to be logged");
+        assert_no_hostile_leak(&logs, "tracing output");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 5 — honest cloud tool capability (spec §5.5).
+//
+// Cloud broker routes are text-only until full tool translation exists. A
+// mode that requires tools must fail with a typed unsupported-capability
+// error BEFORE any credential lookup or network access. The counting stub
+// broker below receives every credential/catalog/invoke request a Remote
+// source could make; the pre-flight is proven by the counter staying at 0.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod cloud_capability_tests {
+    use axum::{http::StatusCode, Router};
+    use reqwest::Client;
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::{mpsc, RwLock};
+
+    use super::{ApiMethods, ApiOptions};
+    use crate::auth::{CredentialSource, TokenCache};
+    use crate::runtime::telemetry::TelemetryLevel;
+    use crate::runtime::types::AuthState;
+    use crate::{StreamEvent, ToolRegistry};
+
+    /// Stub broker that counts EVERY inbound request (any method, any path):
+    /// token vend, cloud catalog, and cloud invoke all land here for a Remote
+    /// credential source, so `hits == 0` proves zero credential use and zero
+    /// network activity.
+    async fn spawn_counting_stub() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let app = Router::new().fallback(move || {
+            let hits = Arc::clone(&hits_clone);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    async fn drive_cloud(tools: ToolRegistry) -> (crate::error::Result<serde_json::Value>, usize) {
+        let (endpoint, hits) = spawn_counting_stub().await;
+        let options = ApiOptions {
+            credential_source: CredentialSource::Remote {
+                endpoint,
+                machine_token: "machine-tok".into(),
+            },
+            token_cache: TokenCache::new(),
+            ..Default::default()
+        };
+        let auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "unused".into(),
+            auth_type: "api_key".into(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+        }));
+        let client = Client::new();
+        let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "aws-bedrock/anthropic.claude-3-haiku#synaps-context=ctx-test",
+            &tools,
+            &None,
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &messages,
+            tx,
+            0,
+            0,
+            &options,
+            TelemetryLevel::Off,
+        )
+        .await;
+        (result, hits.load(Ordering::SeqCst))
+    }
+
+    /// RED at HEAD: no pre-flight exists, so the request reaches the stub
+    /// broker (hits > 0) and fails with a transport-ish error instead of the
+    /// typed unsupported-capability error. GREEN once the pre-flight fires
+    /// before `broker_from_source`.
+    #[tokio::test]
+    async fn tool_requiring_cloud_route_fails_before_credentials_or_network() {
+        // Default chat registry: tools are required.
+        let (result, hits) = drive_cloud(ToolRegistry::new()).await;
+        let msg = result
+            .expect_err("tool-requiring cloud route must fail")
+            .to_string();
+        assert!(
+            msg.contains("text-only") && msg.contains("tools"),
+            "expected typed unsupported-capability error, got: {msg}"
+        );
+        assert_eq!(
+            hits, 0,
+            "cloud pre-flight must reject tools before any credential or network use"
         );
     }
 }

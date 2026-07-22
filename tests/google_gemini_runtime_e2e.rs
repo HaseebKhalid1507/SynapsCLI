@@ -164,7 +164,7 @@ async fn broker_streams_gemini_generate_content_end_to_end() {
                 tool_signatures.push(c.thought_signature.clone());
             }
             GeminiStreamEvent::Finish { .. } => finishes += 1,
-            GeminiStreamEvent::Ignored => {}
+            GeminiStreamEvent::Usage(_) | GeminiStreamEvent::Ignored => {}
         }
     }
     assert_eq!(text, "Hello world");
@@ -266,6 +266,7 @@ async fn proxy_denies_non_allowlisted_cloudcode_pa_paths() {
             path: bad.into(),
             body: Some(serde_json::json!({})),
             stream: false,
+            body_bytes: None,
         };
         assert!(
             req.validate().is_err(),
@@ -284,6 +285,7 @@ async fn oversized_request_body_is_denied_before_egress() {
         path: "/v1internal:streamGenerateContent".into(),
         body: Some(big),
         stream: true,
+        body_bytes: None,
     };
     assert!(req.validate().is_err());
 }

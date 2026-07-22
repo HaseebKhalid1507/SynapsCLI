@@ -35,6 +35,9 @@ axum               = { version = "0.7", features = ["ws"] }
 url                = "2"
 urlencoding        = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"

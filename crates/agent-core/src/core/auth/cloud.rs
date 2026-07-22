@@ -23,6 +23,15 @@ impl CloudProviderId {
             Self::GoogleVertex => "google-vertex",
         }
     }
+    /// Whether this cloud route supports tool use. Cloud broker routes are
+    /// text-only until full tool translation exists (spec §5.5); the value is
+    /// sourced from the provider descriptor so listing and enforcement agree.
+    pub fn supports_tools(self) -> bool {
+        CLOUD_PROVIDER_DESCRIPTORS
+            .iter()
+            .find(|d| d.id == self)
+            .is_some_and(|d| d.supports_tools)
+    }
 }
 impl fmt::Display for CloudProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -276,6 +285,9 @@ pub struct CloudProviderDescriptor {
     pub typed_broker_only: bool,
     /// Production login needs a Synaps-owned/configured public OAuth app.
     pub registration_required: bool,
+    /// Tool-use capability. `false` = text-only route: tool-requiring modes
+    /// fail pre-flight, before any credential lookup or network access.
+    pub supports_tools: bool,
 }
 
 pub const CLOUD_PROVIDER_DESCRIPTORS: [CloudProviderDescriptor; 3] = [
@@ -284,18 +296,21 @@ pub const CLOUD_PROVIDER_DESCRIPTORS: [CloudProviderDescriptor; 3] = [
         display_name: "Azure OpenAI",
         typed_broker_only: true,
         registration_required: true,
+        supports_tools: false,
     },
     CloudProviderDescriptor {
         id: CloudProviderId::AwsBedrock,
         display_name: "AWS Bedrock",
         typed_broker_only: true,
         registration_required: false,
+        supports_tools: false,
     },
     CloudProviderDescriptor {
         id: CloudProviderId::GoogleVertex,
         display_name: "Google Vertex",
         typed_broker_only: true,
         registration_required: true,
+        supports_tools: false,
     },
 ];
 
@@ -323,5 +338,19 @@ mod descriptor_tests {
                 .collect::<Vec<_>>(),
             vec![CloudProviderId::AzureOpenAi, CloudProviderId::GoogleVertex]
         );
+    }
+
+    /// Spec §5.5: until full tool translation exists, every cloud route must
+    /// advertise itself as text-only (no tool support).
+    #[test]
+    fn cloud_routes_advertise_text_only() {
+        for descriptor in cloud_provider_descriptors() {
+            assert!(
+                !descriptor.supports_tools,
+                "{} must advertise text-only until tool translation lands",
+                descriptor.id
+            );
+            assert!(!descriptor.id.supports_tools());
+        }
     }
 }

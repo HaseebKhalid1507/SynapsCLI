@@ -1,29 +1,29 @@
+mod baccarat_ui;
 mod blackjack_ui;
 mod boot;
+mod craps_ui;
 mod hub;
 mod hud;
-mod roulette_ui;
-mod slots_ui;
-mod war_ui;
-mod baccarat_ui;
-mod video_poker_ui;
 mod keno_ui;
+mod roulette_ui;
 mod sicbo_ui;
-mod craps_ui;
+mod slots_ui;
 pub mod theme;
 pub mod transition;
+mod video_poker_ui;
+mod war_ui;
 
-use ratatui::Frame;
-use ratatui::style::Color;
 use crate::app::App;
+use ratatui::style::Color;
+use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App) {
     use crate::app::Screen;
-    use ratatui::layout::{Layout, Constraint};
+    use ratatui::layout::{Constraint, Layout};
 
     let [main_area, hud_area] = Layout::vertical([
-        Constraint::Min(1),     // main area
-        Constraint::Length(3),  // HUD
+        Constraint::Min(1),    // main area
+        Constraint::Length(3), // HUD
     ])
     .areas(f.area());
 
@@ -66,7 +66,11 @@ fn draw_crt_overlay(f: &mut Frame, app: &App) {
         for x in area.left()..area.right() {
             let cell = &mut buf[(x, y)];
             if let Color::Rgb(r, g, b) = cell.bg {
-                cell.set_bg(Color::Rgb(r.saturating_sub(3), g.saturating_sub(3), b.saturating_sub(3)));
+                cell.set_bg(Color::Rgb(
+                    r.saturating_sub(3),
+                    g.saturating_sub(3),
+                    b.saturating_sub(3),
+                ));
             }
         }
     }
@@ -92,10 +96,15 @@ fn draw_game_over(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let noise_chars = ['░', '▒', '▓', '█', '·', ':', ' ', ' '];
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            let seed = (app.frame as usize).wrapping_mul(x as usize + 1).wrapping_add(y as usize * 37);
+            let seed = (app.frame as usize)
+                .wrapping_mul(x as usize + 1)
+                .wrapping_add(y as usize * 37);
             let nch = noise_chars[seed % noise_chars.len()];
             let intensity = ((seed * 13) % 30) as u8;
-            buf[(x, y)].set_char(nch).set_fg(Color::Rgb(intensity, intensity / 2, intensity / 3)).set_bg(Color::Rgb(5, 0, 0));
+            buf[(x, y)]
+                .set_char(nch)
+                .set_fg(Color::Rgb(intensity, intensity / 2, intensity / 3))
+                .set_bg(Color::Rgb(5, 0, 0));
         }
     }
 
@@ -107,9 +116,14 @@ fn draw_game_over(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let blink = (app.frame / 20) % 2 == 0;
         let mut cx = area.left() + mx as u16;
         for ch in msg.chars() {
-            if cx >= area.right() { break; }
+            if cx >= area.right() {
+                break;
+            }
             let color = if blink { theme::RED } else { theme::RED_DIM };
-            buf[(cx, ay)].set_char(ch).set_fg(color).set_bg(Color::Rgb(30, 0, 0));
+            buf[(cx, ay)]
+                .set_char(ch)
+                .set_fg(color)
+                .set_bg(Color::Rgb(30, 0, 0));
             cx += 1;
         }
     }
@@ -121,7 +135,9 @@ fn draw_game_over(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if ay2 < area.bottom() {
         let mut cx = area.left() + sx as u16;
         for ch in sub.chars() {
-            if cx >= area.right() { break; }
+            if cx >= area.right() {
+                break;
+            }
             buf[(cx, ay2)].set_char(ch).set_fg(theme::GRAY);
             cx += 1;
         }

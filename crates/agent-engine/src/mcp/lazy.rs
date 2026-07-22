@@ -32,6 +32,10 @@ impl McpConnectTool {
 
 #[async_trait::async_trait]
 impl Tool for McpConnectTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "connect_mcp_server"
     }

@@ -30,6 +30,9 @@ pub fn extension_env_var(extension_id: &str, key: &str) -> String {
 /// Where a resolved config value originated from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSource {
+    /// Resolved from trusted host context recorded by the extension
+    /// manager (e.g. `project_root`). Never user/env/model supplied.
+    HostContext(&'static str),
     /// Resolved from the `SYNAPS_EXTENSION_<ID>_<KEY>` env override.
     EnvOverride(String),
     /// Resolved from the manifest-declared `secret_env` variable.
@@ -67,7 +70,13 @@ pub fn classify_config_entry(
     let env_var = extension_env_var(extension_id, &entry.key);
     let legacy_config_key = format!("extension.{}.{}", extension_id, entry.key);
 
-    let source = if env_lookup(&env_var).is_some() {
+    let source = if let Some(host_key) = entry.host_context {
+        match host_key {
+            crate::extensions::manifest::HostContextKey::ProjectRoot => {
+                ConfigSource::HostContext("project_root")
+            }
+        }
+    } else if env_lookup(&env_var).is_some() {
         ConfigSource::EnvOverride(env_var)
     } else if let Some(secret_env) = entry.secret_env.as_ref() {
         if env_lookup(secret_env).is_some() {
@@ -172,6 +181,7 @@ mod tests {
             required: false,
             default: None,
             secret_env: None,
+            host_context: None,
         }
     }
 

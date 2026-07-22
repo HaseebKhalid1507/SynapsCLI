@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,54 @@ pub struct MemoryRecord {
     /// Optional structured metadata. Validated as JSON on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
+    /// Stable record id (`mem-<uuid>`), assigned by [`store_record_in`].
+    /// Absent on pre-T32 legacy lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Canonical project-scope key. Absent on legacy lines — project-less
+    /// records never match a project scope (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Who/what produced this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MemoryProvenance>,
+    /// Sensitivity class (spec §9.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<MemorySensitivity>,
+    /// Retention class (consumed by the unified retention sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<MemoryRetention>,
+}
+
+/// Provenance of a memory record (spec §9.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryProvenance {
+    /// Producer: "user", "model", "tool:<name>", "extension:<id>", …
+    pub source: String,
+    /// Session the record was produced in, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// Sensitivity class of a memory record (spec §9.5). Enforcement at the
+/// model-visibility boundary lives in the memory tools: `Secret` bodies are
+/// never returned to model context.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySensitivity {
+    Normal,
+    Sensitive,
+    Secret,
+}
+
+/// Retention class of a memory record (consumed by spec §9.7 retention).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetention {
+    /// Kept until explicitly forgotten or swept by disk budget.
+    Standard,
+    /// Expires after the given number of days.
+    MaxAgeDays(u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,9 +92,17 @@ pub const MAX_CONTENT_BYTES: usize = 16 * 1024;
 #[derive(Debug)]
 pub enum MemoryError {
     InvalidNamespace(String),
-    ContentTooLarge { len: usize, max: usize },
+    ContentTooLarge {
+        len: usize,
+        max: usize,
+    },
     Io(String),
     Serde(String),
+    /// The record id does not exist IN THIS PROJECT SCOPE (also returned
+    /// for other projects' ids — fail closed without existence disclosure).
+    NotFound(String),
+    /// The project root could not be canonicalized.
+    InvalidProjectRoot(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -58,6 +114,10 @@ impl std::fmt::Display for MemoryError {
             }
             MemoryError::Io(s) => write!(f, "memory io error: {s}"),
             MemoryError::Serde(s) => write!(f, "memory serde error: {s}"),
+            MemoryError::NotFound(id) => {
+                write!(f, "memory record not found in this project scope: {id}")
+            }
+            MemoryError::InvalidProjectRoot(s) => write!(f, "invalid project root: {s}"),
         }
     }
 }
@@ -102,7 +162,8 @@ pub fn memory_dir() -> PathBuf {
     crate::config::base_dir().join("memory")
 }
 
-pub(crate) fn memory_dir_in(base: &Path) -> PathBuf {
+/// Memory directory under an explicit base (test/tool seam).
+pub fn memory_dir_in(base: &Path) -> PathBuf {
     base.join("memory")
 }
 
@@ -115,7 +176,7 @@ pub fn append(record: &MemoryRecord) -> Result<(), MemoryError> {
     append_to(&crate::config::base_dir(), record)
 }
 
-pub(crate) fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> {
+pub fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> {
     validate_namespace(&record.namespace)?;
     if record.content.len() > MAX_CONTENT_BYTES {
         return Err(MemoryError::ContentTooLarge {
@@ -124,12 +185,36 @@ pub(crate) fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), Memory
         });
     }
     let dir = memory_dir_in(base);
-    fs::create_dir_all(&dir)?;
+    crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, &record.namespace);
-    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
-    let mut line = serde_json::to_string(record)?;
-    line.push('\n');
-    f.write_all(line.as_bytes())?;
+    let line = serde_json::to_string(record)?;
+    append_jsonl_line(&path, &line)
+}
+
+/// Append one JSONL line with torn-tail healing: if a previous writer
+/// crashed mid-line (file does not end in a newline), a leading newline
+/// isolates the torn fragment on its own line — lenient readers skip the
+/// fragment and every subsequent record stays parseable.
+fn append_jsonl_line(path: &Path, line: &str) -> Result<(), MemoryError> {
+    let needs_heal = match fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = fs::File::open(path)?;
+            f.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            f.read_exact(&mut last)?;
+            last[0] != b'\n'
+        }
+        _ => false,
+    };
+    let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
+    let mut out = String::with_capacity(line.len() + 2);
+    if needs_heal {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    f.write_all(out.as_bytes())?;
     Ok(())
 }
 
@@ -138,7 +223,7 @@ pub fn query(namespace: &str, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, Memo
     query_in(&crate::config::base_dir(), namespace, q)
 }
 
-pub(crate) fn query_in(
+pub fn query_in(
     base: &Path,
     namespace: &str,
     q: &MemoryQuery,
@@ -229,7 +314,345 @@ pub fn new_record(
         content: content.into(),
         tags,
         meta,
+        id: None,
+        project: None,
+        provenance: None,
+        sensitivity: None,
+        retention: None,
     }
+}
+
+// ─── Task 32: project-scoped progressive memory (spec §9.5) ─────────────────
+
+/// Host-resolved project identity: the canonical workspace root, digested
+/// into a stable scope key. The HOST constructs this from trusted execution
+/// context — it is never accepted solely from model-authored arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectScope {
+    key: String,
+    root: PathBuf,
+}
+
+impl ProjectScope {
+    /// Resolve a scope from a workspace root. The path is canonicalized so
+    /// every spelling of the same directory yields one project identity.
+    pub fn for_root(root: &Path) -> Result<Self, MemoryError> {
+        let canonical = root
+            .canonicalize()
+            .map_err(|e| MemoryError::InvalidProjectRoot(format!("{}: {e}", root.display())))?;
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_os_str().as_encoded_bytes());
+        let digest = hasher.finalize();
+        let mut key = String::with_capacity(17);
+        key.push('p');
+        for byte in digest.iter().take(8) {
+            use std::fmt::Write;
+            let _ = write!(key, "{byte:02x}");
+        }
+        Ok(Self {
+            key,
+            root: canonical,
+        })
+    }
+
+    /// Stable scope key (`p<16 hex>`).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Discover the stable project root for a starting directory (CP-13
+    /// fix1 I2): the `SYNAPS_PROJECT_ROOT` env override wins; otherwise a
+    /// bounded upward walk finds the nearest directory containing a `.git`
+    /// entry (DIRECTORY or FILE — worktree-safe, no process spawning, no
+    /// gitdir parsing) or a `.synaps-project` marker; with no marker the
+    /// start directory itself is the root.
+    pub fn discover(start: &Path) -> Result<Self, MemoryError> {
+        let override_root = std::env::var_os("SYNAPS_PROJECT_ROOT").map(std::path::PathBuf::from);
+        Self::discover_with_override(start, override_root.as_deref())
+    }
+
+    /// [`Self::discover`] with an explicit override (env-free seam).
+    pub fn discover_with_override(
+        start: &Path,
+        override_root: Option<&Path>,
+    ) -> Result<Self, MemoryError> {
+        if let Some(root) = override_root {
+            return Self::for_root(root);
+        }
+        const MARKERS: [&str; 2] = [".git", ".synaps-project"];
+        const MAX_ASCENT: usize = 64;
+        let canonical_start = start
+            .canonicalize()
+            .map_err(|e| MemoryError::InvalidProjectRoot(format!("{}: {e}", start.display())))?;
+        let mut dir = canonical_start.as_path();
+        for _ in 0..MAX_ASCENT {
+            if MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).symlink_metadata().is_ok())
+            {
+                return Self::for_root(dir);
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent,
+                None => break,
+            }
+        }
+        Self::for_root(&canonical_start)
+    }
+
+    /// The canonical workspace root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The JSONL namespace holding this project's records.
+    pub fn namespace(&self) -> String {
+        format!("project-{}", self.key)
+    }
+}
+
+/// Input for [`store_record_in`] — explicit provenance, sensitivity, and
+/// retention (spec §9.5: nothing is stored with implicit metadata).
+#[derive(Debug, Clone)]
+pub struct NewMemoryRecord {
+    pub content: String,
+    pub tags: Vec<String>,
+    pub provenance: MemoryProvenance,
+    pub sensitivity: MemorySensitivity,
+    pub retention: MemoryRetention,
+}
+
+/// Bounded search result: descriptor + snippet, NEVER the full body (full
+/// content requires an exact [`fetch_exact_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDescriptor {
+    pub id: String,
+    pub project: String,
+    pub timestamp_ms: u64,
+    pub tags: Vec<String>,
+    /// UTF-8-boundary-bounded head of the content.
+    pub snippet: String,
+    /// Whether the snippet was cut.
+    pub truncated: bool,
+    /// Full content length in bytes (size disclosure only).
+    pub content_bytes: usize,
+    pub sensitivity: MemorySensitivity,
+    pub retention: MemoryRetention,
+}
+
+/// Hard cap on search results per call.
+pub const MAX_SEARCH_LIMIT: usize = 25;
+/// Default search result count.
+pub const DEFAULT_SEARCH_LIMIT: usize = 8;
+/// Hard cap on snippet bytes per descriptor.
+pub const MAX_SNIPPET_BYTES: usize = 400;
+/// Default snippet bytes per descriptor.
+pub const DEFAULT_SNIPPET_BYTES: usize = 160;
+
+/// Project-scoped search query. Limits clamp to the hard caps.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectMemoryQuery {
+    pub content_contains: Option<String>,
+    pub tag_prefix: Option<String>,
+    pub since_ms: Option<u64>,
+    pub until_ms: Option<u64>,
+    pub limit: Option<usize>,
+    pub snippet_bytes: Option<usize>,
+}
+
+/// One parsed line of a project namespace file: a record or a tombstone.
+/// Tombstones are append-only (`{"tombstone":"<id>","timestamp_ms":…}`);
+/// physical deletion belongs to the retention sweep. Legacy readers skip
+/// tombstone lines as malformed records — forward compatible.
+#[derive(Debug, Serialize, Deserialize)]
+struct TombstoneLine {
+    tombstone: String,
+    timestamp_ms: u64,
+}
+
+/// Store one record in a project scope: assigns a stable `mem-<uuid>` id,
+/// binds the scope key, and appends to the project namespace.
+pub fn store_record_in(
+    base: &Path,
+    scope: &ProjectScope,
+    new: NewMemoryRecord,
+) -> Result<MemoryRecord, MemoryError> {
+    let record = MemoryRecord {
+        namespace: scope.namespace(),
+        timestamp_ms: now_ms(),
+        content: new.content,
+        tags: new.tags,
+        meta: None,
+        id: Some(format!("mem-{}", uuid::Uuid::new_v4().simple())),
+        project: Some(scope.key().to_string()),
+        provenance: Some(new.provenance),
+        sensitivity: Some(new.sensitivity),
+        retention: Some(new.retention),
+    };
+    append_to(base, &record)?;
+    Ok(record)
+}
+
+/// Load the LIVE (non-tombstoned, scope-matching) records of a project.
+/// Records whose inner `project` key does not match the scope are excluded
+/// — fail closed even if a foreign file was copied into the namespace.
+fn load_live_project_records(
+    base: &Path,
+    scope: &ProjectScope,
+) -> Result<Vec<MemoryRecord>, MemoryError> {
+    let path = namespace_path(&memory_dir_in(base), &scope.namespace());
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let f = fs::File::open(&path)?;
+    let reader = BufReader::new(f);
+    let mut live: Vec<MemoryRecord> = Vec::new();
+    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(tomb) = serde_json::from_str::<TombstoneLine>(&line) {
+            tombstoned.insert(tomb.tombstone);
+            continue;
+        }
+        let rec: MemoryRecord = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Fail closed: only records carrying THIS scope's key participate.
+        if rec.project.as_deref() != Some(scope.key()) || rec.id.is_none() {
+            continue;
+        }
+        live.push(rec);
+    }
+    live.retain(|r| {
+        r.id.as_ref()
+            .map(|id| !tombstoned.contains(id))
+            .unwrap_or(false)
+    });
+    Ok(live)
+}
+
+/// Project-scoped bounded search: descriptors + snippets, most recent
+/// first, hard-capped result count and snippet bytes.
+pub fn search_project_in(
+    base: &Path,
+    scope: &ProjectScope,
+    q: &ProjectMemoryQuery,
+) -> Result<Vec<MemoryDescriptor>, MemoryError> {
+    let needle = q.content_contains.as_ref().map(|s| s.to_lowercase());
+    let snippet_bytes = q
+        .snippet_bytes
+        .unwrap_or(DEFAULT_SNIPPET_BYTES)
+        .min(MAX_SNIPPET_BYTES);
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .min(MAX_SEARCH_LIMIT);
+
+    let mut records = load_live_project_records(base, scope)?;
+    records.retain(|rec| {
+        let secret = rec.sensitivity == Some(MemorySensitivity::Secret);
+        if let Some(since) = q.since_ms {
+            if rec.timestamp_ms < since {
+                return false;
+            }
+        }
+        if let Some(until) = q.until_ms {
+            if rec.timestamp_ms > until {
+                return false;
+            }
+        }
+        if let Some(needle) = &needle {
+            // Secret bodies never participate in content matching — a
+            // substring probe must not confirm secret content.
+            if secret || !rec.content.to_lowercase().contains(needle) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &q.tag_prefix {
+            if !rec.tags.iter().any(|t| t.starts_with(prefix)) {
+                return false;
+            }
+        }
+        true
+    });
+    records.sort_by_key(|r| std::cmp::Reverse(r.timestamp_ms));
+    records.truncate(limit);
+
+    Ok(records
+        .into_iter()
+        .map(|rec| {
+            let sensitivity = rec.sensitivity.unwrap_or(MemorySensitivity::Normal);
+            // Secret descriptors carry NO body-derived snippet text (spec
+            // §9.5: secret bodies are visible locally only).
+            let (snippet, truncated) = if sensitivity == MemorySensitivity::Secret {
+                (String::new(), false)
+            } else {
+                let bounded = crate::text::BoundedText::new(&rec.content, snippet_bytes);
+                (bounded.text, bounded.truncated)
+            };
+            MemoryDescriptor {
+                id: rec.id.clone().unwrap_or_default(),
+                project: scope.key().to_string(),
+                timestamp_ms: rec.timestamp_ms,
+                tags: rec.tags,
+                snippet,
+                truncated,
+                content_bytes: rec.content.len(),
+                sensitivity,
+                retention: rec.retention.unwrap_or(MemoryRetention::Standard),
+            }
+        })
+        .collect())
+}
+
+/// Fetch exact record ids within a project scope. EVERY id must resolve in
+/// this scope or the whole call fails closed with [`MemoryError::NotFound`]
+/// — other projects' ids are indistinguishable from unknown ids.
+pub fn fetch_exact_in(
+    base: &Path,
+    scope: &ProjectScope,
+    ids: &[&str],
+) -> Result<Vec<MemoryRecord>, MemoryError> {
+    let live = load_live_project_records(base, scope)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for wanted in ids {
+        match live.iter().find(|r| r.id.as_deref() == Some(*wanted)) {
+            Some(rec) => out.push(rec.clone()),
+            None => return Err(MemoryError::NotFound((*wanted).to_string())),
+        }
+    }
+    Ok(out)
+}
+
+/// Tombstone one record in a project scope (append-only forget). Fails
+/// closed with [`MemoryError::NotFound`] for unknown, already-tombstoned,
+/// or other-project ids.
+pub fn forget_in(base: &Path, scope: &ProjectScope, id: &str) -> Result<(), MemoryError> {
+    let live = load_live_project_records(base, scope)?;
+    if !live.iter().any(|r| r.id.as_deref() == Some(id)) {
+        return Err(MemoryError::NotFound(id.to_string()));
+    }
+    let dir = memory_dir_in(base);
+    crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
+    let path = namespace_path(&dir, &scope.namespace());
+    let line = serde_json::to_string(&TombstoneLine {
+        tombstone: id.to_string(),
+        timestamp_ms: now_ms(),
+    })?;
+    append_jsonl_line(&path, &line)
+}
+
+/// Path of a project namespace's JSONL store file (index-module seam).
+pub(crate) fn namespace_file(base: &Path, namespace: &str) -> PathBuf {
+    namespace_path(&memory_dir_in(base), namespace)
 }
 
 #[cfg(test)]
@@ -244,6 +667,11 @@ mod tests {
             content: content.to_string(),
             tags: tags.into_iter().map(String::from).collect(),
             meta: None,
+            id: None,
+            project: None,
+            provenance: None,
+            sensitivity: None,
+            retention: None,
         }
     }
 
@@ -419,5 +847,69 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let got = query_in(tmp.path(), "nope", &MemoryQuery::default()).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Private-mode tests (spec §5.4). Umask isolation: see
+    /// `private_fs::test_support::UmaskGuard` — `#[serial(umask)]` serializes
+    /// every umask-mutating test in the crate, and the guard restores the old
+    /// mask on drop (panic-safe).
+    #[cfg(unix)]
+    mod private_modes {
+        use super::*;
+        use crate::core::private_fs::test_support::UmaskGuard;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn append_creates_0600_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = TempDir::new().unwrap();
+            append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+            let dir = memory_dir_in(tmp.path());
+            assert_eq!(mode_of(&dir), 0o700, "memory dir must be 0700");
+            assert_eq!(
+                mode_of(&dir.join("ns.jsonl")),
+                0o600,
+                "memory file must be 0600"
+            );
+        }
+
+        #[test]
+        fn append_refuses_symlink_target() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("ns.jsonl")).unwrap();
+            let res = append_to(tmp.path(), &rec("ns", 1, "secret", vec![]));
+            assert!(res.is_err(), "append through a symlink must fail");
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "",
+                "no bytes may be written through the planted symlink"
+            );
+        }
+
+        #[test]
+        fn append_repairs_preexisting_broad_mode() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("ns.jsonl");
+            fs::write(&file, "").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
+            append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+            assert_eq!(
+                mode_of(&file),
+                0o600,
+                "broad pre-existing mode must be repaired"
+            );
+        }
     }
 }

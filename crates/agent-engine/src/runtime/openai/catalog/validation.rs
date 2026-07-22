@@ -147,14 +147,14 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
                 .then(|| super::anthropic_mode_capabilities(model))
                 .flatten()
                 .map(|caps| {
-                caps.narrow_with_live_effort(capability_cache::get(model).and_then(|entry| {
-                    match entry.reasoning {
-                        ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
-                        ReasoningSupport::None => Some(false),
-                        _ => None,
-                    }
-                }))
-            });
+                    caps.narrow_with_live_effort(capability_cache::get(model).and_then(|entry| {
+                        match entry.reasoning {
+                            ReasoningSupport::AnthropicAdaptive { adaptive } => Some(adaptive),
+                            ReasoningSupport::None => Some(false),
+                            _ => None,
+                        }
+                    }))
+                });
             let supported = match level {
                 ReasoningLevel::Max => capabilities.is_some_and(|caps| caps.max_supported),
                 ReasoningLevel::UltraCode => {

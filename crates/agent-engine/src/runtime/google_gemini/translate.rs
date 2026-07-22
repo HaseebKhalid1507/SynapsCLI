@@ -237,9 +237,24 @@ pub enum GeminiStreamEvent {
     Finish {
         reason: Option<String>,
     },
+    /// Provider-reported token accounting (`usageMetadata`). Counts the
+    /// upstream did not report stay `None` — never fabricated zeros.
+    Usage(GeminiUsage),
     /// The upstream chunk was well-formed JSON but did not carry text/tool/
     /// finish info. Callers usually drop these.
     Ignored,
+}
+
+/// Provider-reported usage decoded from a stream chunk's `usageMetadata`.
+/// Every field is optional: absent upstream counts stay absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct GeminiUsage {
+    #[serde(default, rename = "promptTokenCount")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, rename = "candidatesTokenCount")]
+    pub candidates_tokens: Option<u64>,
+    #[serde(default, rename = "cachedContentTokenCount")]
+    pub cached_tokens: Option<u64>,
 }
 
 /// A single `data: ...` payload as decoded from the Code Assist SSE stream.
@@ -255,6 +270,8 @@ struct CaResponseEnvelope {
 struct VertexResponse {
     #[serde(default)]
     candidates: Vec<VertexCandidate>,
+    #[serde(default, rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,6 +347,16 @@ pub fn from_stream_line(line: &str) -> Result<Vec<GeminiStreamEvent>, String> {
             out.push(GeminiStreamEvent::Finish {
                 reason: Some(reason),
             });
+        }
+    }
+    if let Some(usage) = response.usage_metadata {
+        // Only surface usage the provider actually reported — an
+        // all-`None` struct would invite zero-filling downstream.
+        if usage.prompt_tokens.is_some()
+            || usage.candidates_tokens.is_some()
+            || usage.cached_tokens.is_some()
+        {
+            out.push(GeminiStreamEvent::Usage(usage));
         }
     }
     if out.is_empty() {
@@ -517,6 +544,35 @@ mod tests {
     #[test]
     fn sse_empty_response_envelope_is_ignored() {
         let events = from_stream_line("data: {}").unwrap();
+        assert_eq!(events, vec![GeminiStreamEvent::Ignored]);
+    }
+
+    #[test]
+    fn sse_decodes_reported_usage_metadata_without_zero_filling() {
+        let line = r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5}}}"#;
+        let events = from_stream_line(line).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                GeminiStreamEvent::TextDelta("hi".into()),
+                GeminiStreamEvent::Finish {
+                    reason: Some("STOP".into())
+                },
+                GeminiStreamEvent::Usage(GeminiUsage {
+                    prompt_tokens: Some(12),
+                    candidates_tokens: Some(5),
+                    cached_tokens: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_empty_usage_metadata_is_not_surfaced() {
+        // usageMetadata with no reported counts must not produce a Usage
+        // event — nothing observed means nothing recorded.
+        let line = r#"data: {"response":{"usageMetadata":{}}}"#;
+        let events = from_stream_line(line).unwrap();
         assert_eq!(events, vec![GeminiStreamEvent::Ignored]);
     }
 }

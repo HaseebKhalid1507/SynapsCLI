@@ -1052,8 +1052,13 @@ mod tests {
                 session_manager: None,
                 subagent_registry: None,
                 event_queue: None,
+                delegation_parent: None,
                 secret_prompt: None,
                 orchestration: None,
+                tool_activation: None,
+                mcp_leases: None,
+                extension_leases: None,
+                memory_context: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,

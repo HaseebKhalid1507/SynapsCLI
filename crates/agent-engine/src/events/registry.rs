@@ -340,7 +340,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    // Keyed to the same lock as every HOME/SYNAPS_BASE_DIR mutator: unkeyed
+    // `#[serial]` and `#[serial(synaps_base_dir)]` do NOT exclude each other,
+    // so this base-dir *reader* raced mutator tests that point
+    // SYNAPS_BASE_DIR at a tempdir under /tmp.
+    #[serial(synaps_base_dir)]
     fn socket_path_format() {
         let path = socket_path_for_session("20240101-120000-ab12");
         // Sockets now live in the registry dir, not /tmp
@@ -363,7 +367,10 @@ mod tests {
         let path_a = socket_path_in_dir(std::path::Path::new("/tmp/a"), &long_session);
         let path_b = socket_path_in_dir(std::path::Path::new("/tmp/b"), &long_session);
         assert!(path_a.len() < 108, "Unix socket path too long: {path_a}");
-        assert_ne!(path_a, path_b, "per-user runtime roots must isolate same session ids");
+        assert_ne!(
+            path_a, path_b,
+            "per-user runtime roots must isolate same session ids"
+        );
 
         // Bind under SHORT, /tmp-rooted dirs. The whole point is short socket
         // paths; some platforms' tempdir() (e.g. macOS /var/folders/...) is long

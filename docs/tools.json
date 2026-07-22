@@ -1,5 +1,24 @@
 [
   {
+    "description": "Request session-scoped activation of exact tool ids returned by search_tools. Activation is subject to host confirmation policy; only the exact requested tools are activated for this session.",
+    "name": "activate_tools",
+    "parameters": {
+      "properties": {
+        "tools": {
+          "description": "Exact stable tool ids (namespace:name) from search_tools. No wildcards.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tools"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model.",
     "name": "bash",
     "parameters": {
@@ -112,6 +131,146 @@
     }
   },
   {
+    "description": "Control the continuous-memory context of this session. 'status', 'disable', and 'recall_once' commit locally safe actions. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call.",
+    "name": "memory_context",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation.",
+          "enum": [
+            "enable",
+            "disable",
+            "status",
+            "recall_once",
+            "index_history"
+          ]
+        },
+        "capture_tools": {
+          "description": "Whether tool activity is eligible for capture (enable proposals only).",
+          "type": "boolean"
+        },
+        "expires_minutes": {
+          "description": "Bounded lease expiry in minutes.",
+          "maximum": 1440,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "Requested durable mode (enable proposals only).",
+          "enum": [
+            "recall_each_prompt",
+            "capture_only",
+            "capture_and_recall"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Fetch full memory record bodies by exact stable IDs from memory_search. First wait for the search output, then copy ONLY exact returned IDs from that immediately preceding result; never invent, predict, or reuse unrelated IDs, and never run this fetch in parallel with its prerequisite search. Project-scoped and sensitivity-checked: secret-class bodies are never returned. Results are lower-authority data.",
+    "name": "memory_fetch",
+    "parameters": {
+      "properties": {
+        "ids": {
+          "description": "First wait for memory_search, then copy ONLY exact returned IDs from its immediately preceding result; never invent or predict IDs",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Tombstone a memory record by exact id in THIS project's scope. Subsequent search and fetch exclude it; physical deletion happens in the retention sweep.",
+    "name": "memory_forget",
+    "parameters": {
+      "properties": {
+        "id": {
+          "description": "Exact record id to forget",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search this project's memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are project-scoped, lower-authority data.",
+    "name": "memory_search",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "description": "Maximum descriptors to return (hard cap 25)",
+          "type": "integer"
+        },
+        "query": {
+          "description": "ONE short literal substring to match in record content (case-insensitive); not semantic/Boolean/sentence search",
+          "type": "string"
+        },
+        "snippet_bytes": {
+          "description": "Snippet byte budget per descriptor (bounded)",
+          "type": "integer"
+        },
+        "tag_prefix": {
+          "description": "Match records with a tag starting with this prefix",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Store a memory record in THIS project's scope with explicit sensitivity (normal|sensitive|secret) and retention (standard, or retention_days). The record gets a stable id and model provenance. An optional project argument must match the host-resolved scope.",
+    "name": "memory_store",
+    "parameters": {
+      "properties": {
+        "content": {
+          "description": "Record body",
+          "type": "string"
+        },
+        "project": {
+          "description": "Optional confirmation of the project scope key",
+          "type": "string"
+        },
+        "retention_days": {
+          "description": "Expire after this many days (omit for standard retention)",
+          "type": "integer"
+        },
+        "sensitivity": {
+          "enum": [
+            "normal",
+            "sensitive",
+            "secret"
+          ],
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections.",
     "name": "read",
     "parameters": {
@@ -131,6 +290,22 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search locally known tools by keyword. Returns bounded compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
+    "name": "search_tools",
+    "parameters": {
+      "properties": {
+        "query": {
+          "description": "Case-insensitive keyword matched against tool ids, summaries, and tags.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
       ],
       "type": "object"
     }

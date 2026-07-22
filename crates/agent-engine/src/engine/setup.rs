@@ -185,8 +185,21 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let tools_shared = runtime.tools_shared();
     let (registry, keybind_registry) = crate::skills::register(&tools_shared, &config).await;
 
-    // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
-    let mcp_server_count = crate::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
+    // Set up MCP loading (if configured in ~/.synaps-cli/mcp.json). Flag-off
+    // keeps the legacy connect gateway; progressive disclosure switches to
+    // exact descriptor-backed dormant tools (Task 19) with no gateway.
+    let mcp_server_count =
+        crate::mcp::setup_lazy_mcp(&runtime.tools_shared(), config.progressive_tool_disclosure)
+            .await;
+    if config.progressive_tool_disclosure {
+        // Exact MCP mode: one shared lease manager for the runtime. Streams
+        // mint session capabilities/guards from it; children die with the
+        // session (RAII) or on runtime drop.
+        runtime.install_mcp_runtime(std::sync::Arc::new(crate::mcp::McpRuntimeManager::new(
+            crate::mcp::lease::config_source_from_disk(),
+            crate::mcp::lease::DEFAULT_IDLE_MAX,
+        )));
+    }
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
@@ -240,11 +253,27 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         )));
     }
 
+    // Task 23: the engine's interactive session runs under the FOREGROUND
+    // turn budget with typed per-role config overrides applied.
+    runtime.set_turn_budget(crate::runtime::budget::TurnBudget::from_config(
+        crate::runtime::budget::TurnRole::Foreground,
+        &config.turn_budgets,
+    ));
+
     // Extension manager
-    let ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
+    let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
         Arc::clone(runtime.hook_bus()),
         runtime.tools_shared(),
     );
+    // Task 20: progressive disclosure defers tool-only extension spawns
+    // (dormant descriptors only); flag-off keeps the legacy eager loads.
+    ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
+    if config.progressive_tool_disclosure {
+        // ONE shared extension runtime lease manager: the manager uses it
+        // for unload revocation; the runtime mints per-session capabilities
+        // and the durable session-end scope from the SAME instance.
+        runtime.install_extension_runtime(ext_mgr.extension_runtime());
+    }
     let ext_manager = Arc::new(RwLock::new(ext_mgr));
     crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 

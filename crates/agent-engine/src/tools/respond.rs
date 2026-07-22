@@ -7,6 +7,10 @@ pub struct RespondTool;
 
 #[async_trait::async_trait]
 impl Tool for RespondTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "respond"
     }

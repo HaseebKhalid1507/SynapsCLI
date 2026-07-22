@@ -28,6 +28,16 @@ impl ToolNameMap {
             .unwrap_or(name)
     }
 
+    /// Original names that were rewritten for the OpenAI wire, in
+    /// deterministic (sorted) order. Feeds the metadata-only translation
+    /// report — a rename is a semantic rewrite and must never be silently
+    /// claimed lossless (spec §6.3).
+    pub fn renamed_originals(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.original_to_oai.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
     fn insert(&mut self, original: &str, oai: &str) {
         if original != oai {
             self.original_to_oai

@@ -95,6 +95,48 @@ pub(super) fn emergency_teardown_terminal() {
     execute!(stdout, cursor::Show).ok();
 }
 
+/// Bounded observability flush for TUI teardown (Task 11): stop intake on
+/// the session's telemetry/trace writer and drain it under the default
+/// shutdown budget.
+///
+/// Semantics: telemetry `off` → no writer → `None`, a true no-op.
+/// "Flushed" means every queued record was appended into OS file buffers
+/// (no fsync — best-effort diagnostic logs). A timeout logs a
+/// metadata-only warning (counter stats, never record content) and
+/// teardown continues — trace loss must never abort or fail an exit.
+pub(super) async fn flush_observability(runtime: &synaps_cli::Runtime) {
+    flush_observability_within(
+        runtime,
+        synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    )
+    .await;
+}
+
+/// Emergency-exit epilogue (session save timed out): short (1 s) bounded
+/// observability flush, then terminal restore and `process::exit(1)`. The
+/// exit reason is the save timeout — never trace loss; the flush is
+/// best-effort and cannot extend the exit beyond its own bound.
+pub(super) async fn emergency_flush_and_exit(runtime: &synaps_cli::Runtime) -> ! {
+    flush_observability_within(runtime, std::time::Duration::from_secs(1)).await;
+    emergency_teardown_terminal();
+    std::process::exit(1);
+}
+
+async fn flush_observability_within(runtime: &synaps_cli::Runtime, budget: std::time::Duration) {
+    match runtime.shutdown_observability_async(budget).await {
+        None => {} // telemetry off — nothing to flush
+        Some(outcome) if outcome.is_flushed() => {
+            tracing::debug!("observability flush completed");
+        }
+        Some(outcome) => {
+            tracing::warn!(
+                stats = ?outcome.stats(),
+                "observability flush timed out — detached worker keeps draining"
+            );
+        }
+    }
+}
+
 // `teardown_terminal` was removed in the #116 render-thread work — the render
 // thread now owns the Terminal and performs its own teardown (see render_thread.rs).
 

@@ -45,9 +45,8 @@ pub use anthropic::{
     anthropic_mode_capabilities, anthropic_models_url, anthropic_static_capability,
     merge_catalog_pages, parse_anthropic_catalog_models, parse_anthropic_catalog_page,
     plan_anthropic_execution, plan_standard_anthropic_transport, AnthropicCatalogPage,
-    AnthropicExecutionMode, AnthropicExecutionPlan,
-    AnthropicPlanError, AnthropicPlanErrorCode, AnthropicPlanPrerequisites, AnthropicWireEffort,
-    AnthropicWorkflowPlan,
+    AnthropicExecutionMode, AnthropicExecutionPlan, AnthropicPlanError, AnthropicPlanErrorCode,
+    AnthropicPlanPrerequisites, AnthropicWireEffort, AnthropicWorkflowPlan,
 };
 pub use codex::{
     codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
@@ -540,13 +539,10 @@ impl ModelCatalogProvider for CodexCatalogProvider {
                     capability_cache::replace_provider(self.provider_key(), &models);
                     Ok(models)
                 }
-                Err(err) => {
-                    if is_missing_credential_catalog_error(&err) {
-                        Ok(codex_static_catalog_models())
-                    } else {
-                        Err(err)
-                    }
-                }
+                // Typed decision (fix1 I2a): only a no-live-session outcome
+                // falls back to static seeds; operational failures surface.
+                Err(CatalogBrokerError::NotAuthenticated(_)) => Ok(codex_static_catalog_models()),
+                Err(CatalogBrokerError::Failed(err)) => Err(err),
             }
         })
     }
@@ -576,25 +572,15 @@ impl ModelCatalogProvider for GitHubCopilotCatalogProvider {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
         // Prefer broker-proxied live discovery (session token never enters this
         // module as a caller-supplied secret). Fall back to curated static seeds
-        // only when the account is not configured for proxy discovery.
+        // exactly when the TYPED broker outcome says there is no live session
+        // (fix1 I2a) — deterministic for every ambient credential state.
         Box::pin(async move {
             match broker_catalog_models_body("github-copilot").await {
                 Ok(body) => {
                     parse_copilot_catalog_models(&body).map_err(|e| format!("parse failed: {e}"))
                 }
-                Err(err) => {
-                    // Offline / not-logged-in / transport: surface static fallback
-                    // only for explicit not-configured cases; other errors fail closed.
-                    let lower = err.to_lowercase();
-                    if lower.contains("not configured")
-                        || lower.contains("unknown provider")
-                        || lower.contains("not logged")
-                    {
-                        Ok(copilot_static_catalog_models())
-                    } else {
-                        Err(err)
-                    }
-                }
+                Err(CatalogBrokerError::NotAuthenticated(_)) => Ok(copilot_static_catalog_models()),
+                Err(CatalogBrokerError::Failed(err)) => Err(err),
             }
         })
     }
@@ -650,14 +636,63 @@ async fn fetch_generic_catalog_provider_models(
 }
 
 /// GET `/models` through the credential broker (the key never enters this
-/// module). Returns the body on 2xx, an HTTP-status error otherwise.
-async fn broker_catalog_models_body(provider_key: &str) -> Result<String, String> {
+/// module). Returns the body on 2xx, a typed failure otherwise.
+async fn broker_catalog_models_body(provider_key: &str) -> Result<String, CatalogBrokerError> {
     broker_proxy_catalog_body(provider_key, "/models").await
+}
+
+/// Typed broker catalog failure (fix1 I2a): the static-fallback decision is
+/// made on TYPED broker variants, never by probing Display strings after
+/// the fact — so the outcome is deterministic for every credential state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogBrokerError {
+    /// No usable live session for the provider (not configured, unknown to
+    /// the registries, registration required, or a stored-credential miss).
+    /// Providers with curated seeds fall back to them.
+    NotAuthenticated(String),
+    /// A real operational failure (transport, denial, HTTP status,
+    /// account-shape credential errors): fail closed.
+    Failed(String),
+}
+
+impl CatalogBrokerError {
+    fn message(&self) -> &str {
+        match self {
+            Self::NotAuthenticated(msg) | Self::Failed(msg) => msg,
+        }
+    }
+}
+
+impl From<CatalogBrokerError> for String {
+    fn from(err: CatalogBrokerError) -> Self {
+        err.message().to_string()
+    }
+}
+
+/// Classify a typed [`BrokerError`] for catalog fetching. The one string
+/// dependency left is the stable token-store load-miss prefix inside
+/// `BrokerError::Credential` ("No credentials for …"), pinned by a unit
+/// test — account-shape credential errors stay hard failures.
+fn classify_catalog_broker_error(err: agent_core::auth::BrokerError) -> CatalogBrokerError {
+    use agent_core::auth::BrokerError as B;
+    let msg = format!("request failed: {err}");
+    match &err {
+        B::NotConfigured(_) | B::UnknownProvider(_) | B::RegistrationRequired { .. } => {
+            CatalogBrokerError::NotAuthenticated(msg)
+        }
+        B::Credential(detail) if detail.starts_with("No credentials for ") => {
+            CatalogBrokerError::NotAuthenticated(msg)
+        }
+        _ => CatalogBrokerError::Failed(msg),
+    }
 }
 
 /// GET an allowlisted catalog path through the credential broker.
 /// The credential never enters this module — only the provider key + path.
-async fn broker_proxy_catalog_body(provider_key: &str, path: &str) -> Result<String, String> {
+async fn broker_proxy_catalog_body(
+    provider_key: &str,
+    path: &str,
+) -> Result<String, CatalogBrokerError> {
     let resp = crate::auth::broker::global_broker()
         .proxy(crate::auth::ProxyRequest {
             provider: provider_key.to_string(),
@@ -665,11 +700,15 @@ async fn broker_proxy_catalog_body(provider_key: &str, path: &str) -> Result<Str
             path: path.to_string(),
             body: None,
             stream: false,
+            body_bytes: None,
         })
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(classify_catalog_broker_error)?;
     if !(200..300).contains(&resp.status) {
-        return Err(format!("model list failed: HTTP {}", resp.status));
+        return Err(CatalogBrokerError::Failed(format!(
+            "model list failed: HTTP {}",
+            resp.status
+        )));
     }
     Ok(resp.body)
 }
@@ -811,6 +850,69 @@ mod tests {
             assert!(ids.contains(required), "missing {required}");
         }
         assert!(!ids.contains("text-embedding-3-small"));
+    }
+
+    /// fix1 I2a: with NO credentials anywhere (fresh empty base dir), the
+    /// documented contract — "otherwise the curated static fallback is
+    /// returned" — must hold DETERMINISTICALLY. The broker's typed
+    /// credential-miss must map to the static seeds, never to an error.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn copilot_catalog_without_credentials_is_deterministic_static_fallback() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
+            .await
+            .expect("credential-less fetch must fall back to static seeds");
+        assert_eq!(models, copilot_static_catalog_models());
+        assert!(models
+            .iter()
+            .all(|m| m.runtime_id().starts_with("github-copilot/")));
+    }
+
+    /// fix1 I2a: the fetch outcome must not depend on ambient
+    /// SYNAPS_BASE_DIR churn. A current-thread churn task flips the base
+    /// dir between two credential-less roots at every await point while
+    /// fetches run — every fetch must return the same static catalog.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn copilot_catalog_is_deterministic_under_concurrent_base_dir_churn() {
+        let base_a = tempfile::TempDir::new().unwrap();
+        let base_b = tempfile::TempDir::new().unwrap();
+        let old = std::env::var("SYNAPS_BASE_DIR").ok();
+        std::env::set_var("SYNAPS_BASE_DIR", base_a.path());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let churn = {
+                    let a = base_a.path().to_path_buf();
+                    let b = base_b.path().to_path_buf();
+                    // Same-thread churn task: env flips interleave at await
+                    // points only (no cross-thread set_var races).
+                    tokio::task::spawn_local(async move {
+                        loop {
+                            std::env::set_var("SYNAPS_BASE_DIR", &a);
+                            tokio::task::yield_now().await;
+                            std::env::set_var("SYNAPS_BASE_DIR", &b);
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                };
+                for _ in 0..20 {
+                    let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
+                        .await
+                        .expect("fetch must be deterministic under base-dir churn");
+                    assert_eq!(models, copilot_static_catalog_models());
+                    tokio::task::yield_now().await;
+                }
+                churn.abort();
+            })
+            .await;
+
+        match old {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
     }
 
     #[test]
@@ -1235,6 +1337,58 @@ mod tests {
             assert!(is_missing_credential_catalog_error(
                 "request failed: credential error: No credentials for openai-codex at /home/user/.synaps/auth.json. Run `synaps login`."
             ));
+        }
+
+        /// fix1 I2a: the TYPED classifier is the authoritative fallback
+        /// decision. No-live-session broker variants map to
+        /// NotAuthenticated; everything operational maps to Failed.
+        #[test]
+        fn typed_classifier_maps_auth_misses_to_fallback_and_operations_to_failed() {
+            use crate::auth::BrokerError as B;
+            let auth_misses = [
+                B::NotConfigured("github-copilot".into()),
+                B::UnknownProvider("github-copilot".into()),
+                B::RegistrationRequired {
+                    provider: "github-copilot".into(),
+                    remediation: "run synaps login".into(),
+                },
+                // Pinned token-store load-miss prefix (the one string
+                // dependency, asserted here so token.rs drift breaks THIS
+                // test instead of production determinism).
+                B::Credential(
+                    "No credentials for github-copilot at /tmp/x/auth.json. Run `synaps login`."
+                        .into(),
+                ),
+            ];
+            for err in auth_misses {
+                assert!(
+                    matches!(
+                        classify_catalog_broker_error(err.clone()),
+                        CatalogBrokerError::NotAuthenticated(_)
+                    ),
+                    "must classify as no-live-session: {err}"
+                );
+            }
+
+            let operational = [
+                B::Transport("connection reset".into()),
+                B::Denied("proxy path not allowlisted".into()),
+                B::Unauthorized,
+                B::Credential("github-copilot credential is missing chatgpt account id".into()),
+                B::UnsupportedCapability {
+                    provider: "github-copilot".into(),
+                    capability: "tools".into(),
+                },
+            ];
+            for err in operational {
+                assert!(
+                    matches!(
+                        classify_catalog_broker_error(err.clone()),
+                        CatalogBrokerError::Failed(_)
+                    ),
+                    "must classify as operational failure: {err}"
+                );
+            }
         }
 
         #[test]

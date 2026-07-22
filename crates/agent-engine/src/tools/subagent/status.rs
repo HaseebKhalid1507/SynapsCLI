@@ -4,15 +4,21 @@
 //! elapsed wall-clock seconds, and tool-use count. Non-blocking — always returns
 //! immediately regardless of the subagent's progress.
 
-use serde_json::{json, Value};
-use crate::{Result, RuntimeError};
 use super::super::{Tool, ToolContext};
+use crate::{Result, RuntimeError};
+use serde_json::{json, Value};
 
 pub struct SubagentStatusTool;
 
 #[async_trait::async_trait]
 impl Tool for SubagentStatusTool {
-    fn name(&self) -> &str { "subagent_status" }
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn name(&self) -> &str {
+        "subagent_status"
+    }
 
     fn description(&self) -> &str {
         "Poll the current state of a reactive subagent. Returns status \
@@ -36,23 +42,22 @@ impl Tool for SubagentStatusTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let handle_id = params["handle_id"].as_str()
+        let handle_id = params["handle_id"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
         // ── Registry lookup ────────────────────────────────────────────────────
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
+        let registry = ctx.capabilities.subagent_registry.as_ref().ok_or_else(|| {
+            RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
+        })?;
 
         let reg = registry.lock().unwrap();
 
-        let handle = reg.get(&handle_id)
-            .ok_or_else(|| RuntimeError::Tool(
-                format!("No subagent found with handle_id '{}'", handle_id)
-            ))?;
+        let handle = reg.get(&handle_id).ok_or_else(|| {
+            RuntimeError::Tool(format!("No subagent found with handle_id '{}'", handle_id))
+        })?;
 
         // ── Build response ─────────────────────────────────────────────────────
         // Clone all needed data under the lock, then drop lock before char traversal

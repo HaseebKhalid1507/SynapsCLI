@@ -13,6 +13,7 @@ mod start;
 
 pub use config::ShellConfig;
 pub use end::ShellEndTool;
+pub use pty::{pty_output_snapshot, PtyOutputSnapshot};
 pub use send::ShellSendTool;
 pub use session::{start_reaper, SendResult, SessionManager, SessionOpts};
 pub use start::ShellStartTool;

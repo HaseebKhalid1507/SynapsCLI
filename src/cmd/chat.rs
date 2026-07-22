@@ -12,16 +12,21 @@
 //! Exactly ONE waiter on notified() exists while idle at the prompt.
 //! Piped stdin, EOF, and CRLF behaviour are preserved.
 
-use synaps_cli::engine::setup::{self, EngineOpts};
-use synaps_cli::engine::commands::{self, CommandResult};
-use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::engine::session::ConversationState;
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, claim_auto_turn, WakeAction, AUTO_TURN_CAP};
-use synaps_cli::{CancellationToken, flush_stdout};
-use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::json;
 use std::io::{self, Write};
+use synaps_cli::engine::commands::{self, CommandResult};
+use synaps_cli::engine::reactor::{
+    claim_auto_turn, drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP,
+};
+use synaps_cli::engine::session::ConversationState;
+use synaps_cli::engine::setup::{self, EngineOpts};
+use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::runtime::compaction::{
+    apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
+    CompactionTransition,
+};
+use synaps_cli::{flush_stdout, CancellationToken};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 /// What was read while waiting at the prompt.
@@ -51,7 +56,8 @@ pub async fn run(
         prompt_manifest: None,
         profile,
         no_extensions,
-    }).await?;
+    })
+    .await?;
 
     let mut runtime = boot.runtime;
     let mut conv = if boot.continued {
@@ -88,9 +94,10 @@ pub async fn run(
         boot.ext_manager.write().await.discover_and_load().await;
     }
 
-    eprintln!("synaps {} | {} | session {}", 
+    eprintln!(
+        "synaps {} | {} | session {}",
         env!("CARGO_PKG_VERSION"),
-        runtime.model(), 
+        runtime.model(),
         &conv.session.id[..8]
     );
     if boot.continued {
@@ -104,8 +111,10 @@ pub async fn run(
     // ── Main loop ──
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut subagents: Vec<SubagentTracker> = Vec::new();
-    let compact_threshold: usize = 80_000;
-    let mut last_compacted_tokens: usize = 0;
+    // Typed spec §5.2 terminal failure of the last turn. In headless (piped)
+    // mode an unrecovered failure aborts the read loop and the process exits
+    // nonzero — after the session (with valid partial history) is saved.
+    let mut fatal_failure: Option<synaps_cli::TurnError> = None;
 
     // C4a: consecutive auto-turn counter; reset to 0 on real user input.
     // Initial value doesn't matter — always reset before first turn.
@@ -214,17 +223,51 @@ pub async fn run(
                                 conv.session.thinking_level = spec.config_value();
                                 eprintln!("thinking → {}", spec.level());
                             }
-                            CommandResult::Compact { custom_instructions } => {
+                            CommandResult::Compact {
+                                custom_instructions,
+                            } => {
                                 eprintln!("compacting...");
-                                if let Ok(summary) = compact_conversation(
-                                    &conv.api_messages, &runtime, custom_instructions.as_deref()
-                                ).await {
-                                    conv.api_messages = vec![std::sync::Arc::new(json!({
-                                        "role": "user",
-                                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                                    }))];
-                                    last_compacted_tokens = conv.estimate_tokens();
-                                    eprintln!("compacted → ~{} tokens", last_compacted_tokens);
+                                // Spec §9.4: surface provider/model and the
+                                // approximate disclosure BEFORE dispatch.
+                                eprintln!(
+                                    "{}",
+                                    preview_compaction_disclosure(&runtime, &conv.api_messages)
+                                        .render_line()
+                                );
+                                match compact_conversation(
+                                    &conv.api_messages,
+                                    &runtime,
+                                    custom_instructions.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => match apply_compaction(
+                                        &runtime,
+                                        &conv.session,
+                                        &conv.api_messages,
+                                        &outcome,
+                                        CompactionTransition {
+                                            policy: CompactionPolicy::InPlace,
+                                            pending_events: Vec::new(),
+                                            queued_message: None,
+                                            hook_source: "manual".to_string(),
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(applied) => {
+                                            conv.session = applied.session;
+                                            conv.api_messages = applied.api_messages;
+                                            let after =
+                                                runtime.assess_context(&conv.api_messages).await;
+                                            eprintln!(
+                                                "compacted → ~{} tokens",
+                                                after.used_tokens()
+                                            );
+                                        }
+                                        Err(e) => eprintln!("compaction failed: {}", e),
+                                    },
+                                    Err(e) => eprintln!("compaction failed: {}", e),
                                 }
                             }
                             CommandResult::Error(e) => eprintln!("error: {}", e),
@@ -240,25 +283,42 @@ pub async fn run(
                             conv.clear(&runtime).await;
                             eprintln!("session cleared → {}", &conv.session.id[..8]);
                         }
-                        "sessions" => {
-                            match synaps_cli::list_recent_sessions(20) {
-                                Ok(sessions) => {
-                                    for s in sessions.iter().take(20) {
-                                        let marker = if s.id == conv.session.id { "→ " } else { "  " };
-                                        eprintln!("{}{} {} ({}, ${:.4})", 
-                                            marker, &s.id[..8], s.title, s.model, s.session_cost);
-                                    }
+                        "sessions" => match synaps_cli::list_recent_sessions(20) {
+                            Ok(sessions) => {
+                                for s in sessions.iter().take(20) {
+                                    let marker = if s.id == conv.session.id {
+                                        "→ "
+                                    } else {
+                                        "  "
+                                    };
+                                    eprintln!(
+                                        "{}{} {} ({}, ${:.4})",
+                                        marker,
+                                        &s.id[..8],
+                                        s.title,
+                                        s.model,
+                                        s.session_cost
+                                    );
                                 }
-                                Err(e) => eprintln!("error: {}", e),
                             }
-                        }
+                            Err(e) => eprintln!("error: {}", e),
+                        },
                         "status" => {
                             eprintln!("session: {}", &conv.session.id[..8]);
                             eprintln!("model: {}", runtime.model());
-                            eprintln!("tokens: {}↑ {}↓", conv.total_input_tokens, conv.total_output_tokens);
+                            eprintln!(
+                                "tokens: {}↑ {}↓",
+                                conv.total_input_tokens, conv.total_output_tokens
+                            );
                             eprintln!("cost: ${:.4}", conv.session_cost);
                             eprintln!("messages: {}", conv.api_messages.len());
-                            eprintln!("est. tokens: ~{}", conv.estimate_tokens());
+                            let assessment = runtime.assess_context(&conv.api_messages).await;
+                            eprintln!(
+                                "context: ~{} of {} budget tokens ({} window)",
+                                assessment.used_tokens(),
+                                assessment.budget_tokens(),
+                                assessment.provider_window
+                            );
                         }
                         "help" => {
                             eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
@@ -276,8 +336,9 @@ pub async fn run(
                 } else {
                     trimmed.to_string()
                 };
-                conv.api_messages
-                    .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
+                conv.api_messages.push(std::sync::Arc::new(
+                    json!({"role": "user", "content": message}),
+                ));
             }
         }
 
@@ -286,9 +347,11 @@ pub async fn run(
             let cancel = CancellationToken::new();
             // Vec<SharedMessage> clone = pointer bumps only.
             let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
-            let mut stream = runtime.run_stream_with_messages(
-                msgs_in, cancel, None, None, false
-            ).await;
+            // Failure repair may only remove messages appended by this turn.
+            let turn_baseline = msgs_in.len();
+            let mut stream = runtime
+                .run_stream_with_messages(msgs_in, cancel, None, None, false)
+                .await;
 
             let mut in_thinking = false;
 
@@ -302,6 +365,7 @@ pub async fn run(
                     &mut subagents,
                     &mut conv.queued_message,
                     &mut conv.pending_events,
+                    turn_baseline,
                 );
 
                 match engine_event {
@@ -322,11 +386,16 @@ pub async fn run(
                         flush_stdout();
                     }
                     EngineStreamEvent::ToolStart { tool_name, .. } => {
-                        if in_thinking { eprintln!("\x1b[0m"); in_thinking = false; }
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                            in_thinking = false;
+                        }
                         eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
                         io::stderr().flush().ok();
                     }
-                    EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
+                    EngineStreamEvent::ToolFinalized {
+                        tool_name, input, ..
+                    } => {
                         let input_preview = serde_json::to_string(&input).unwrap_or_default();
                         let preview: String = input_preview.chars().take(60).collect();
                         eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
@@ -338,12 +407,32 @@ pub async fn run(
                     EngineStreamEvent::SubagentStart { name, task, .. } => {
                         eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
                     }
-                    EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
+                    EngineStreamEvent::SubagentDone {
+                        status,
+                        duration_secs,
+                        ..
+                    } => {
                         eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
                     }
-                    EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
+                    EngineStreamEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read,
+                        cache_creation,
+                        cache_creation_5m,
+                        cache_creation_1h,
+                        model,
+                    } => {
                         let model_name = model.as_deref().unwrap_or(runtime.model());
-                        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
+                        conv.add_usage(
+                            input_tokens,
+                            output_tokens,
+                            cache_read,
+                            cache_creation,
+                            cache_creation_5m,
+                            cache_creation_1h,
+                            model_name,
+                        );
                     }
                     EngineStreamEvent::SteeringDelivered { message } => {
                         eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
@@ -359,43 +448,82 @@ pub async fn run(
                 }
 
                 match completion {
-                    StreamCompletion::Done | StreamCompletion::Error(_) => {
-                        if in_thinking { eprintln!("\x1b[0m"); }
+                    StreamCompletion::Done => {
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                        }
                         println!();
                         break StreamCompletion::Done;
                     }
+                    StreamCompletion::Error(err) => {
+                        // Typed spec §5.2 outcome — do NOT collapse into Done.
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                        }
+                        println!();
+                        break StreamCompletion::Error(err);
+                    }
                     StreamCompletion::AutoSendQueued(queued) => {
-                        if in_thinking { eprintln!("\x1b[0m"); }
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                        }
                         conv.api_messages.push(std::sync::Arc::new(
-                            json!({"role": "user", "content": queued})
+                            json!({"role": "user", "content": queued}),
                         ));
                         break StreamCompletion::AutoSendQueued(String::new());
                     }
                     StreamCompletion::AutoTriggerEvents => {
-                        if in_thinking { eprintln!("\x1b[0m"); }
+                        if in_thinking {
+                            eprintln!("\x1b[0m");
+                        }
                         break StreamCompletion::AutoTriggerEvents;
                     }
                     StreamCompletion::Continue => {}
                 }
             };
 
-            // Post-turn: save + auto-compact.
+            // Post-turn: save + auto-compact. The trigger decision is the
+            // engine's request-aware budget (T29, spec §9.1) — no local
+            // token math.
             conv.save().await;
-            let est = conv.estimate_tokens();
-            let threshold = if last_compacted_tokens > 0 {
-                last_compacted_tokens + compact_threshold
-            } else {
-                compact_threshold
-            };
-            if est > threshold && conv.api_messages.len() >= 4 {
-                eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
-                if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
-                    conv.api_messages = vec![std::sync::Arc::new(json!({
-                        "role": "user",
-                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                    }))];
-                    last_compacted_tokens = conv.estimate_tokens();
-                    eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
+            let assessment = runtime.assess_context(&conv.api_messages).await;
+            if assessment.should_compact() {
+                eprintln!(
+                    "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
+                    assessment.used_tokens()
+                );
+                // Spec §9.4: pre-dispatch disclosure (provider/model/bytes).
+                eprintln!(
+                    "\x1b[2m[{}]\x1b[0m",
+                    preview_compaction_disclosure(&runtime, &conv.api_messages).render_line()
+                );
+                match compact_conversation(&conv.api_messages, &runtime, None).await {
+                    Ok(outcome) => match apply_compaction(
+                        &runtime,
+                        &conv.session,
+                        &conv.api_messages,
+                        &outcome,
+                        CompactionTransition {
+                            policy: CompactionPolicy::InPlace,
+                            pending_events: Vec::new(),
+                            queued_message: None,
+                            hook_source: "auto".to_string(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(applied) => {
+                            conv.session = applied.session;
+                            conv.api_messages = applied.api_messages;
+                            let after = runtime.assess_context(&conv.api_messages).await;
+                            eprintln!(
+                                "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
+                                after.used_tokens()
+                            );
+                        }
+                        Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
+                    },
+                    Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
                 }
             }
 
@@ -446,25 +574,77 @@ pub async fn run(
                         }
                     }
                 }
+                StreamCompletion::Error(err) => {
+                    // Unrecovered turn failure. History was already repaired
+                    // (turn-appended invalid messages only) and saved above.
+                    eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
+                    fatal_failure = Some(err);
+                    break 'turn_loop;
+                }
                 _ => {
-                    // Done or Error — exit turn loop normally.
+                    // Done — exit turn loop normally.
                     break 'turn_loop;
                 }
             }
         } // end 'turn_loop
+
+        // Headless (piped) mode: an unrecovered failure must terminate with a
+        // nonzero exit instead of silently waiting for more input. In
+        // interactive (TTY) mode the user keeps their session and can retry.
+        if fatal_failure.is_some() {
+            if !is_tty {
+                break;
+            }
+            fatal_failure = None;
+        }
     }
 
     // ── Shutdown ──
     conv.save().await;
 
     // Fire on_session_end hook
-    let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
-        &conv.session.id,
-        None,
-    );
+    let hook_event =
+        synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&conv.session.id, None);
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
     boot.background.shutdown();
-    eprintln!("session saved: {} (${:.4})", &conv.session.id[..8], conv.session_cost);
+
+    // Bounded observability flush (Task 11): stop intake on the session's
+    // telemetry/trace writer and drain it before the process exits. Runs
+    // after session save + hooks, and BEFORE the success/failure branch
+    // below so the fatal-failure return path flushes too. Telemetry `off`
+    // → no writer → `None`, a true no-op. "Flushed" means appended into OS
+    // file buffers (no fsync — best-effort diagnostic logs). A timeout
+    // logs metadata-only stats and continues; trace loss never changes the
+    // exit outcome.
+    if let Some(outcome) = runtime
+        .shutdown_observability_async(
+            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+        )
+        .await
+    {
+        if !outcome.is_flushed() {
+            tracing::warn!(
+                stats = ?outcome.stats(),
+                "observability flush timed out — detached worker keeps draining"
+            );
+        }
+    }
+
+    eprintln!(
+        "session saved: {} (${:.4})",
+        &conv.session.id[..8],
+        conv.session_cost
+    );
+
+    // Criterion: headless `synaps chat` exits nonzero on an unrecovered
+    // provider/tool failure — after the partial history was saved above.
+    if let Some(err) = fatal_failure {
+        return Err(synaps_cli::RuntimeError::Session(format!(
+            "turn failed: {} [{}]",
+            err.message,
+            err.category_label()
+        )));
+    }
     Ok(())
 }

@@ -1,0 +1,23 @@
+{
+  "description": "Plain text conversation with a primary system segment. Fully representable on Anthropic wire: expected report is empty.",
+  "request": {
+    "system": [
+      { "kind": "primary", "text": "You are a terse assistant." }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [{ "type": "text", "text": "What's the capital of France?" }]
+      },
+      {
+        "role": "assistant",
+        "blocks": [{ "type": "text", "text": "Paris." }]
+      },
+      {
+        "role": "user",
+        "blocks": [{ "type": "text", "text": "And of Japan?" }]
+      }
+    ]
+  },
+  "expected_anthropic": { "entries": [] }
+}

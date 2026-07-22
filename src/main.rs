@@ -203,6 +203,17 @@ enum Command {
         #[command(subcommand)]
         action: cmd::tools::ToolsAction,
     },
+    /// Request-trace export utilities (metadata-only by default).
+    Trace {
+        #[command(subcommand)]
+        action: cmd::trace::TraceAction,
+    },
+    /// Unified retention: inspect/sweep/export/forget across sessions,
+    /// memory, indexes, traces, and logs (chain-integrity-safe).
+    Retention {
+        #[command(subcommand)]
+        action: cmd::retention::RetentionAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -324,6 +335,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
+        }
+        Some(Command::Trace { action }) => {
+            cmd::trace::run(action)?;
+        }
+        Some(Command::Retention { action }) => {
+            cmd::retention::run(action)?;
         }
         Some(Command::Rpc {
             continue_id,

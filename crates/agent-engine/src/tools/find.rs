@@ -8,6 +8,14 @@ pub struct FindTool;
 
 #[async_trait::async_trait]
 impl Tool for FindTool {
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "find"
     }

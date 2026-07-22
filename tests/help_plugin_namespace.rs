@@ -1,8 +1,13 @@
-use synaps_cli::help::{builtin_entries, render_help, HelpEntry, HelpFindState, HelpRegistry, HelpTopicKind};
+use synaps_cli::help::{
+    builtin_entries, render_help, HelpEntry, HelpFindState, HelpRegistry, HelpTopicKind,
+};
 
 fn plugin_entry(command: &str, title: &str) -> HelpEntry {
     HelpEntry {
-        id: command.trim_start_matches('/').replace([' ', ':'], "-").to_string(),
+        id: command
+            .trim_start_matches('/')
+            .replace([' ', ':'], "-")
+            .to_string(),
         command: command.to_string(),
         title: title.to_string(),
         summary: format!("Help for {title}."),
@@ -30,7 +35,10 @@ fn plugin_can_add_namespaced_help_topic_under_help() {
     let registry = HelpRegistry::new(builtin_entries(), vec![entry]);
 
     let rendered = render_help(&registry, Some("acme")).expect("plugin help topic should render");
-    assert!(rendered.starts_with("Acme Help"), "plugin /help namespace entry should render:\n{rendered}");
+    assert!(
+        rendered.starts_with("Acme Help"),
+        "plugin /help namespace entry should render:\n{rendered}"
+    );
     assert!(rendered.contains("Plugin-provided help detail."));
 }
 
@@ -50,7 +58,10 @@ fn plugin_help_topic_appears_in_find_menu() {
         .map(|entry| entry.command.as_str())
         .collect::<Vec<_>>();
 
-    assert!(commands.contains(&"/help acme"), "plugin help topic should be searchable in /help find; got {commands:?}");
+    assert!(
+        commands.contains(&"/help acme"),
+        "plugin help topic should be searchable in /help find; got {commands:?}"
+    );
 }
 
 #[test]
@@ -66,7 +77,10 @@ fn plugin_command_help_entry_appears_in_find_menu() {
         .map(|entry| entry.command.as_str())
         .collect::<Vec<_>>();
 
-    assert!(commands.contains(&"/acme:sync"), "plugin command help should be searchable in /help find; got {commands:?}");
+    assert!(
+        commands.contains(&"/acme:sync"),
+        "plugin command help should be searchable in /help find; got {commands:?}"
+    );
 }
 
 #[test]
@@ -80,7 +94,14 @@ fn plugin_cannot_hijack_builtin_help_topics_but_can_add_new_help_topics() {
 
     let registry = HelpRegistry::new(builtin_entries(), vec![hijack, allowed]);
 
-    let settings = render_help(&registry, Some("settings")).expect("builtin settings should render");
-    assert!(!settings.starts_with("Hijacked Settings"), "protected builtin help topic was hijacked:\n{settings}");
-    assert!(registry.entry_by_command("/help acme").is_some(), "non-conflicting plugin help topic should load");
+    let settings =
+        render_help(&registry, Some("settings")).expect("builtin settings should render");
+    assert!(
+        !settings.starts_with("Hijacked Settings"),
+        "protected builtin help topic was hijacked:\n{settings}"
+    );
+    assert!(
+        registry.entry_by_command("/help acme").is_some(),
+        "non-conflicting plugin help topic should load"
+    );
 }

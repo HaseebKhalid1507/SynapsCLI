@@ -145,6 +145,7 @@ mod tests {
     fn summary_lists_permissions_hooks_and_required_config() {
         let summary = summarize_plugin_permissions(&plugin(Some(ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -167,6 +168,7 @@ mod tests {
                 required: true,
                 default: None,
                 secret_env: Some("API_KEY".to_string()),
+                host_context: None,
             }],
         })));
 

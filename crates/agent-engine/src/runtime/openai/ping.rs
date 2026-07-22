@@ -72,6 +72,7 @@ pub async fn ping_model(cfg: &ProviderConfig, provider_key: &str) -> PingResult 
         path: "/chat/completions".to_string(),
         body: Some(body),
         stream: false,
+        body_bytes: None,
     });
 
     let status = match tokio::time::timeout(TIMEOUT, fut).await {

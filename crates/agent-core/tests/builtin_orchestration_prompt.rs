@@ -13,18 +13,22 @@ fn ctx(model: &str) -> SelectionContext {
 }
 
 #[test]
-fn codex_models_compose_base_plus_supervision_doctrine() {
+fn codex_models_compose_base_plus_both_codex_doctrines() {
     for model in [
         "openai-codex/gpt-5.6-sol",
         "openai-codex/gpt-5.5",
         "openai-codex/gpt-5.4-mini",
     ] {
         let composed = compose_orchestration_prompt(Some("BASE."), &ctx(model))
-            .unwrap_or_else(|| panic!("{model}: doctrine must compose"));
+            .unwrap_or_else(|| panic!("{model}: doctrines must compose"));
         assert!(composed.starts_with("BASE."), "{model}: base must lead");
         assert!(
             composed.contains("## Subagent supervision"),
-            "{model}: doctrine heading missing"
+            "{model}: supervision doctrine heading missing"
+        );
+        assert!(
+            composed.contains("## Project memory workflow"),
+            "{model}: project-memory doctrine heading missing"
         );
         assert!(composed.contains("subagent_status"), "{model}");
         assert!(composed.contains("subagent_collect"), "{model}");
@@ -48,6 +52,20 @@ fn codex_models_compose_base_plus_supervision_doctrine() {
         assert!(
             composed.contains("sleep 240"),
             "{model}: 4-minute cadence missing"
+        );
+        assert!(
+            composed.contains("ONE short literal case-insensitive substring"),
+            "{model}: memory_search literal-query semantics missing"
+        );
+        assert!(
+            composed.contains("Wait for memory_search")
+                && composed.contains("ONLY exact IDs from the immediately preceding result"),
+            "{model}: sequential exact-id fetch rule missing"
+        );
+        assert!(
+            composed.contains("project memory records")
+                && composed.contains("lower-authority historical data"),
+            "{model}: lower-authority historical wording missing"
         );
     }
 }
@@ -101,7 +119,11 @@ fn no_base_composes_doctrine_alone_for_codex_and_none_otherwise() {
 #[test]
 fn builtin_adapters_are_builtin_provider_selected_guidance() {
     let adapters = builtin_orchestration_adapters();
-    assert_eq!(adapters.len(), 2, "exactly the two known builtin adapters");
+    assert_eq!(
+        adapters.len(),
+        3,
+        "exactly the three known builtin adapters"
+    );
 
     for module in &adapters {
         assert!(matches!(module.source, PromptModuleSource::Builtin));
@@ -112,13 +134,18 @@ fn builtin_adapters_are_builtin_provider_selected_guidance() {
         assert!(!module.content().is_empty());
     }
 
-    let codex = adapters
+    let codex_supervision = adapters
         .iter()
         .find(|module| module.id.as_str() == "builtin.codex.subagent-supervision")
-        .expect("Codex builtin must exist");
+        .expect("Codex supervision builtin must exist");
+    let codex_memory = adapters
+        .iter()
+        .find(|module| module.id.as_str() == "builtin.codex.project-memory")
+        .expect("Codex project-memory builtin must exist");
+    let combined_codex_bytes = codex_supervision.content().len() + codex_memory.content().len();
     assert!(
-        codex.content().len() <= 2048,
-        "doctrine must stay bounded; every codex request carries it"
+        combined_codex_bytes <= 4096,
+        "combined Codex doctrine must stay bounded; every Codex request carries it"
     );
 
     let anthropic = adapters
@@ -130,8 +157,9 @@ fn builtin_adapters_are_builtin_provider_selected_guidance() {
         AdapterRegistry::new(adapters.clone()).expect("known builtins must form a registry");
     let codex_context = ctx("openai-codex/gpt-5.5");
     let selected = registry.select(&codex_context).unwrap();
-    assert_eq!(selected.len(), 1, "Codex selector must not overlap");
-    assert_eq!(selected[0].id, codex.id);
+    assert_eq!(selected.len(), 2, "both Codex doctrines must compose");
+    assert_eq!(selected[0].id, codex_supervision.id);
+    assert_eq!(selected[1].id, codex_memory.id);
 
     let anthropic_context =
         ctx("anthropic/claude-fable-5").with_workflow_mode(Some(WorkflowMode::UltraCode));

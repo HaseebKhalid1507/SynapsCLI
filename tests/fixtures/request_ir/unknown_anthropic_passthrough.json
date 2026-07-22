@@ -1,0 +1,20 @@
+{
+  "description": "Unknown opaque block tagged with the anthropic provider: retained verbatim on the Anthropic wire (pass-through), so the expected report is empty.",
+  "request": {
+    "system": [],
+    "messages": [
+      {
+        "role": "assistant",
+        "blocks": [
+          { "type": "text", "text": "Here you go." },
+          {
+            "type": "unknown",
+            "provider": "anthropic",
+            "payload": { "type": "future_block", "data": "opaque-provider-bytes" }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_anthropic": { "entries": [] }
+}

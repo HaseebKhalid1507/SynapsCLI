@@ -38,8 +38,15 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
         return RuntimeError::Canceled;
     }
 
-    // Upstream returned an HTTP error status — an API failure, not config.
-    if msg.starts_with("codex request failed:") || msg.starts_with("openai request failed:") {
+    // Upstream returned an HTTP error status or the Responses API reported a
+    // terminal stream failure — API failures, not configuration errors.
+    if msg.starts_with("codex request failed:")
+        || msg.starts_with("openai request failed:")
+        || msg.starts_with("Codex response failed in stream.")
+        || msg.starts_with("Codex response was incomplete.")
+        || msg.starts_with("Codex completed without text or tool output.")
+        || msg.starts_with("Codex response stream ended without a terminal event.")
+    {
         tracing::warn!(error = %msg, "provider API error");
         return RuntimeError::ApiStatus(msg);
     }
@@ -52,9 +59,7 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
 ///
 /// `send().await?` boxes the `reqwest::Error` directly, but helpers may wrap
 /// it another level deep — check the whole chain, not just the top.
-fn find_reqwest_error<'a>(
-    e: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a reqwest::Error> {
+fn find_reqwest_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a reqwest::Error> {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = current {
         if let Some(re) = err.downcast_ref::<reqwest::Error>() {
@@ -63,6 +68,28 @@ fn find_reqwest_error<'a>(
         current = err.source();
     }
     None
+}
+
+/// Strip the provider response-body snippet from a broker proxy error.
+///
+/// `LocalBroker::proxy_stream` flattens an upstream HTTP failure into
+/// `… provider request failed: {status}: {body snippet}`. The snippet is
+/// provider-controlled and may echo the full request (spec §5.1) — a byte
+/// bound is not redaction. Keep everything up to and including the status
+/// (canonical reason phrase, no `:`), drop the snippet. Messages without the
+/// marker pass through unchanged: every other `BrokerError` variant carries
+/// broker-authored, secret-free text, and transport-level reqwest errors are
+/// not response bodies.
+pub(crate) fn redact_provider_proxy_error(msg: &str) -> String {
+    const MARKER: &str = "provider request failed: ";
+    let Some(start) = msg.find(MARKER) else {
+        return msg.to_string();
+    };
+    let status_start = start + MARKER.len();
+    match msg[status_start..].find(':') {
+        Some(idx) => msg[..status_start + idx].to_string(),
+        None => msg.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -94,7 +121,10 @@ mod tests {
             !display.starts_with("Config error"),
             "transient network failure must not be presented as a config problem: {display}"
         );
-        assert!(display.contains("127.0.0.1"), "must name the host: {display}");
+        assert!(
+            display.contains("127.0.0.1"),
+            "must name the host: {display}"
+        );
     }
 
     #[tokio::test]
@@ -130,6 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn responses_terminal_errors_are_api_status_not_config() {
+        for msg in [
+            "Codex response failed in stream. Provider error details withheld because they can echo request content.",
+            "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
+            "Codex completed without text or tool output. Retry the request.",
+            "Codex response stream ended without a terminal event. Retry the request.",
+        ] {
+            let err = provider_error_to_runtime(msg.into());
+            assert!(
+                matches!(err, RuntimeError::ApiStatus(_)),
+                "Responses terminal must classify as ApiStatus: {err:?}"
+            );
+            assert!(!err.to_string().starts_with("Config error"));
+        }
+    }
+
+    #[test]
     fn cancellation_is_canceled() {
         let e: BoxedProviderError = "operation canceled".into();
         assert!(matches!(
@@ -144,6 +191,29 @@ mod tests {
     }
 
     #[test]
+    fn redact_provider_proxy_error_drops_body_snippet_keeps_status() {
+        let msg = "gemini stream error: broker transport error: provider request failed: \
+                   429 Too Many Requests: {\"error\":{\"message\":\"ECHOED:secret\"}}";
+        let redacted = redact_provider_proxy_error(msg);
+        assert_eq!(
+            redacted,
+            "gemini stream error: broker transport error: provider request failed: \
+             429 Too Many Requests"
+        );
+    }
+
+    #[test]
+    fn redact_provider_proxy_error_passes_through_non_proxy_messages() {
+        for msg in [
+            "broker transport error: connection reset",
+            "no credential configured for 'groq'. Run `synaps login` to add one.",
+            "request canceled",
+        ] {
+            assert_eq!(redact_provider_proxy_error(msg), msg);
+        }
+    }
+
+    #[test]
     fn genuine_config_problems_stay_config_with_original_prefix() {
         let e: BoxedProviderError =
             "No API key for 'groq'. Set provider.groq in ~/.synaps-cli/config or the corresponding env var."
@@ -154,7 +224,9 @@ mod tests {
             "missing key IS a config problem, got: {runtime_err:?}"
         );
         assert!(
-            runtime_err.to_string().starts_with("Config error: openai provider: "),
+            runtime_err
+                .to_string()
+                .starts_with("Config error: openai provider: "),
             "must keep the historical prefix for genuine config errors: {runtime_err}"
         );
     }

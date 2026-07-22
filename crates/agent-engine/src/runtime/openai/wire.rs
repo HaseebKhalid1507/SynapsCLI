@@ -108,6 +108,10 @@ pub struct StreamDecoder {
     pub calls: HashMap<u32, ToolCallAccumulator>,
     pub truncated: bool,
     pub completed: bool,
+    /// First `finish_reason` string observed on the wire (set-once). Raw
+    /// provider value — read it only through a normalizing mapper (trace
+    /// records store the normalized enum, never this string).
+    pub finish_reason: Option<String>,
     role_emitted: bool,
     done_emitted: bool,
 }
@@ -124,6 +128,7 @@ impl StreamDecoder {
             calls: HashMap::new(),
             truncated: false,
             completed: false,
+            finish_reason: None,
             role_emitted: false,
             done_emitted: false,
         }
@@ -144,8 +149,12 @@ impl StreamDecoder {
         }
         match serde_json::from_str::<RawChunk>(payload) {
             Ok(chunk) => self.push_chunk(chunk, sink),
+            // Privacy (spec §5.1): `payload` is provider-controlled and may
+            // echo the request — never include its bytes in a warning that
+            // feeds the log sink. serde's error carries position info only.
             Err(e) => sink.extend(Some(OaiEvent::Warning(format!(
-                "sse parse error: {e}; payload={payload:?}"
+                "sse parse error: {e} (payload {} bytes, not logged)",
+                payload.len()
             )))),
         }
     }
@@ -180,6 +189,9 @@ impl StreamDecoder {
                 }
             }
             if let Some(reason) = choice.finish_reason {
+                if self.finish_reason.is_none() {
+                    self.finish_reason = Some(reason.clone());
+                }
                 match reason.as_str() {
                     "tool_calls" => self.flush_complete(sink),
                     "length" => {
@@ -189,9 +201,11 @@ impl StreamDecoder {
                         }
                     }
                     "stop" | "content_filter" => {}
-                    other => sink.extend(Some(OaiEvent::Warning(format!(
-                        "unknown finish_reason: {other}"
-                    )))),
+                    // Privacy (spec §5.1): the value is provider-controlled;
+                    // keep it out of warnings that feed the log sink.
+                    _ => sink.extend(Some(OaiEvent::Warning(
+                        "unknown finish_reason (value not logged)".to_string(),
+                    ))),
                 }
             }
         }
@@ -281,5 +295,51 @@ impl StreamDecoder {
             calls,
             truncated: self.truncated,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Phase 1 privacy (spec §5.1): SSE payloads are provider-controlled and
+    //! may echo the request. Decoder warnings feed `tracing::warn!` (see
+    //! `translate::oai_event_to_stream_event`), so no provider-controlled
+    //! bytes may ride along in a warning message.
+
+    use super::*;
+
+    #[test]
+    fn parse_error_warning_never_contains_payload_bytes() {
+        const SENTINEL: &str = "PH1-WIRE-SENTINEL-4c1a-RAW";
+        let mut decoder = StreamDecoder::new();
+        let mut sink: Vec<OaiEvent> = Vec::new();
+        decoder.push_line(&format!("data: {{\"broken\": \"{SENTINEL}"), &mut sink);
+        let [OaiEvent::Warning(w)] = sink.as_slice() else {
+            panic!("malformed payload must produce exactly one warning, got {sink:?}");
+        };
+        assert!(w.contains("sse parse error"), "{w}");
+        assert!(
+            !w.contains(SENTINEL),
+            "provider payload bytes leaked into a warning destined for logs: {w}"
+        );
+    }
+
+    #[test]
+    fn unknown_finish_reason_warning_never_contains_provider_value() {
+        const SENTINEL: &str = "PH1-FINISH-SENTINEL-7e2b-RAW";
+        let mut decoder = StreamDecoder::new();
+        let mut sink: Vec<OaiEvent> = Vec::new();
+        decoder.push_line(
+            &format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{SENTINEL}\"}}]}}"),
+            &mut sink,
+        );
+        let warning = sink.iter().find_map(|e| match e {
+            OaiEvent::Warning(w) => Some(w.clone()),
+            _ => None,
+        });
+        let w = warning.expect("unknown finish_reason must still warn");
+        assert!(
+            !w.contains(SENTINEL),
+            "provider-controlled finish_reason leaked into a warning destined for logs: {w}"
+        );
     }
 }

@@ -560,5 +560,57 @@
     "keywords": ["quit", "exit"],
     "lines": ["/quit or /exit leaves SynapsCLI."],
     "related": ["/help"]
+  },
+  {
+    "id": "context-command",
+    "command": "/context",
+    "title": "Context report",
+    "summary": "Show system/tool/history sizes and cache prefix changes (metadata only).",
+    "category": "Diagnostics",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": [
+      "context",
+      "cache",
+      "prefix",
+      "tokens",
+      "diagnostics"
+    ],
+    "lines": [
+      "/context reports system-prompt, tool, and history counts/bytes, which cache component changed on the last traced request, and trace writer counters. It never shows content."
+    ],
+    "related": [
+      "/trace",
+      "/status"
+    ]
+  },
+  {
+    "id": "trace-command",
+    "command": "/trace",
+    "title": "Trace controls",
+    "summary": "Arm one-request tracing (/trace next) and show trace status.",
+    "category": "Diagnostics",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": [
+      "trace",
+      "observability",
+      "telemetry",
+      "export",
+      "capture"
+    ],
+    "lines": [
+      "/trace next traces exactly the next request (even with telemetry off), then auto-disables.",
+      "/trace next content additionally captures a redacted copy of the next request body for `synaps trace export --include-content`.",
+      "/trace status reports mode, persistence path, and counters."
+    ],
+    "related": [
+      "/context",
+      "/status"
+    ]
   }
 ]

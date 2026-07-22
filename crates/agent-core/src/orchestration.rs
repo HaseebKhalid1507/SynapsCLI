@@ -1,3 +1,5 @@
+pub mod capability;
+
 use crate::prompt::QualifiedModelId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

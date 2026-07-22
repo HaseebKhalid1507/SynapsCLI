@@ -6,10 +6,38 @@
 use super::translate;
 use super::types::{ChatMessage, OaiEvent, ProviderConfig, StreamOptions, ToolCall};
 use super::wire::StreamDecoder;
+use crate::runtime::trace::openai as tr;
 use crate::runtime::types::StreamEvent;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+
+/// Trace capture for one batch of decoded Chat Completions events: marks the
+/// first parsed model event and records provider-reported usage. Metadata
+/// only — token counts, no content.
+fn capture_oai_trace_signals(
+    events: &[OaiEvent],
+    attempt: &mut tr::StreamAttempt,
+    usage: &mut Option<crate::runtime::trace::UsageMeta>,
+) {
+    for ev in events {
+        if !matches!(ev, OaiEvent::Warning(_)) {
+            attempt.mark_first_model_event();
+        }
+        if let OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } = ev
+        {
+            *usage = Some(tr::provider_usage(
+                u64::from(*prompt_tokens),
+                u64::from(*completion_tokens),
+                u64::from(*cached_tokens),
+            ));
+        }
+    }
+}
 
 /// Persistent retry posture for the Codex transport, mirroring the Anthropic
 /// OAuth overload budget (`OAUTH_OVERLOAD_RETRIES` in `runtime/api.rs`).
@@ -53,35 +81,69 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
 /// and 408 / 429 / 5xx responses. Deterministic client errors (other 4xx)
 /// and localhost connection refusals (Ollama/LM Studio not running — a
 /// setup problem, not a blip) fail fast. Backoff sleeps are cancel-aware.
+///
+/// Trace (Task 10A): one record per actual HTTP send — every retried
+/// failure is recorded via `attempt_failed` (status + retry class, never
+/// provider text) and the per-attempt clock restarts right before each
+/// re-send. Terminal failures emit their final record here; on success the
+/// caller finishes the attempt after consuming the stream.
 async fn send_with_retries(
     label: &str,
     url: &str,
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
+    trace_attempt: &mut tr::StreamAttempt,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempt: u32 = 0;
     loop {
         match build().send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) if resp.status().is_success() => {
+                trace_attempt.mark_headers();
+                return Ok(resp);
+            }
             Ok(resp) => {
+                // A complete HTTP response was observed even when its status
+                // is non-success. Preserve that timing for retried and
+                // terminal failure records just as the success branch does.
+                trace_attempt.mark_headers();
                 let status = resp.status();
+                // Provider-assigned request id from validated headers only.
+                let trace_rid = tr::provider_request_id_from_headers(resp.headers());
                 let retryable =
                     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
-                let text = resp.text().await.unwrap_or_default();
+                // Privacy (spec §5.1): the response body is provider-controlled
+                // and may echo the full request (prompts, system text, tool
+                // schemas, credentials). Drop it unread — it must never be
+                // stored, surfaced, or logged at any level. `status` Display
+                // uses the canonical reason phrase, never server bytes.
+                drop(resp);
+                let code = format!("http_{}", status.as_u16());
                 if !retryable || attempt >= max_retries {
-                    return Err(format!("{label} request failed: {status}: {text}").into());
+                    trace_attempt.finish_failed(&code, Some(status.as_u16()), trace_rid);
+                    return Err(format!("{label} request failed: {status}").into());
                 }
                 attempt += 1;
                 let delay = retry_delay(attempt);
+                trace_attempt.attempt_failed(
+                    tr::retry_class_for_status(status.as_u16()),
+                    delay,
+                    Some(status.as_u16()),
+                    trace_rid,
+                    &code,
+                );
                 tracing::warn!(
-                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}: {}",
-                    crate::truncate_str(&text, 200)
+                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                    _ = cancel.cancelled() => {
+                        trace_attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
                 }
+                // Retry clocks reset per attempt, right before the re-send.
+                trace_attempt.restart_clock();
             }
             Err(e) => {
                 let localhost_refusal = e.is_connect() && url.contains("localhost");
@@ -91,18 +153,35 @@ async fn send_with_retries(
                         "{label} request failed (no retry): {}",
                         crate::core::error::error_chain_string(&e)
                     );
+                    trace_attempt.finish_failed("transport_error", None, None);
                     return Err(e.into());
                 }
                 attempt += 1;
                 let delay = retry_delay(attempt);
+                trace_attempt.attempt_failed(
+                    if e.is_timeout() {
+                        crate::runtime::trace::RetryClass::Timeout
+                    } else {
+                        crate::runtime::trace::RetryClass::Other
+                    },
+                    delay,
+                    None,
+                    None,
+                    "transport_error",
+                );
                 tracing::warn!(
                     "{label} transport retry {attempt}/{max_retries} after {delay:?}: {}",
                     crate::core::error::error_chain_string(&e)
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.cancelled() => return Err("request canceled".into()),
+                    _ = cancel.cancelled() => {
+                        trace_attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
                 }
+                // Retry clocks reset per attempt, right before the re-send.
+                trace_attempt.restart_clock();
             }
         }
     }
@@ -125,6 +204,9 @@ pub(crate) async fn call_oai_stream_inner(
     max_tokens: Option<u32>,
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+    suppress_stream_deltas: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -172,32 +254,99 @@ pub(crate) async fn call_oai_stream_inner(
 
     tracing::debug!(provider=%cfg.provider, model=%cfg.model, "openai stream request via broker proxy");
 
+    // Serialize ONCE via the sanctioned constructor: the returned bytes are
+    // both digested for the trace and the very buffer stored on the request
+    // (`body_bytes`), which `LocalBroker` sends verbatim — the digest is
+    // never computed over a re-serialization, and `body`/`body_bytes`
+    // cannot diverge.
+    let (proxy_request, body_bytes) = crate::auth::ProxyRequest::post_json_exact(
+        cfg.provider.clone(),
+        "/chat/completions",
+        body,
+        true,
+    )?;
+    // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
+    // A remote broker re-serializes the JSON out of process: honest kind
+    // `CloudProxy`, no wire-byte claim. Rule documented in `trace::emit`.
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        if exact_wire_bytes {
+            crate::runtime::trace::TransportKind::OpenAiChatCompletions
+        } else {
+            crate::runtime::trace::TransportKind::CloudProxy
+        },
+        &format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
+        exact_wire_bytes.then_some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&name_map),
+    )
+    .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
+    let mut attempt = tr::StreamAttempt::new(tracer);
+
     // The broker owns the API key and executes/signs the request; this path
     // never resolves or attaches a credential.
-    let mut stream = broker
-        .proxy_stream(crate::auth::ProxyRequest {
-            provider: cfg.provider.clone(),
-            method: crate::auth::ProxyMethod::Post,
-            path: "/chat/completions".to_string(),
-            body: Some(body),
-            stream: true,
-        })
+    let stream = broker
+        .proxy_stream(proxy_request)
         .await
-        .map_err(|e| format!("openai request failed: {e}"))?;
+        // Privacy (spec §5.1): a broker proxy error may carry an upstream
+        // response-body snippet; redact it to status-only before surfacing.
+        .map_err(|e| {
+            format!(
+                "openai request failed: {}",
+                super::net::redact_provider_proxy_error(&e.to_string())
+            )
+        });
+    let mut stream = match stream {
+        Ok(stream) => {
+            attempt.mark_headers();
+            stream
+        }
+        Err(msg) => {
+            // Status parsed from the redacted static-prefix message only;
+            // codes are `http_<status>` or the static `broker_error`.
+            let status = tr::broker_error_status(&msg);
+            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+            attempt.finish_failed(&code, status, None);
+            return Err(msg.into());
+        }
+    };
 
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
     let mut tool_use_blocks: Vec<Value> = Vec::new();
     let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
     let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
+    let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
 
     while let Some(chunk) = tokio::select! {
         chunk = stream.next() => chunk,
         _ = cancel.cancelled() => {
+            attempt.finish_canceled(None, trace_usage);
             return Err("request canceled".into());
         }
     } {
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(chunk) => {
+                attempt.mark_first_byte();
+                chunk
+            }
+            Err(e) => {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(e.into());
+            }
+        };
         buf.extend_from_slice(&chunk);
 
         // Scan for newline-delimited SSE lines (SIMD-accelerated via memchr)
@@ -207,12 +356,14 @@ pub(crate) async fn call_oai_stream_inner(
 
             sink.clear();
             decoder.push_line(line, &mut sink);
+            capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
             handle_events(
                 &sink,
                 tx,
                 &mut accumulated_text,
                 &mut tool_use_blocks,
                 &name_map,
+                suppress_stream_deltas,
             );
         }
     }
@@ -222,23 +373,36 @@ pub(crate) async fn call_oai_stream_inner(
         let line = std::str::from_utf8(&buf).unwrap_or("");
         sink.clear();
         decoder.push_line(line, &mut sink);
+        capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
         handle_events(
             &sink,
             tx,
             &mut accumulated_text,
             &mut tool_use_blocks,
             &name_map,
+            suppress_stream_deltas,
         );
     }
     sink.clear();
     decoder.finish(&mut sink);
+    capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
     handle_events(
         &sink,
         tx,
         &mut accumulated_text,
         &mut tool_use_blocks,
         &name_map,
+        suppress_stream_deltas,
     );
+
+    // Normalized stop reason: only when a finish_reason was actually
+    // observed on the wire — never inferred.
+    let stop_reason = decoder
+        .finish_reason
+        .as_deref()
+        .map(tr::stop_reason_from_finish_reason);
+    // Broker paths never observe the upstream HTTP status: honest `None`.
+    attempt.finish_success(None, None, stop_reason, trace_usage);
 
     // Build Anthropic-shaped final response
     let mut content: Vec<Value> = Vec::new();
@@ -268,6 +432,7 @@ pub(crate) async fn call_codex_stream_inner(
     codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Build the exact provider-qualified plan before any credential or network
     // access. Logical Ultra is lowered here, never in the generic level enum.
@@ -374,63 +539,145 @@ pub(crate) async fn call_codex_stream_inner(
     );
     tracing::debug!(url=%url, model=%cfg.model, "codex stream request");
 
-    let resp = send_with_retries(
-        "codex",
+    // Serialize ONCE. These exact bytes are digested for the trace AND are
+    // the request body of every attempt — retries resend the identical
+    // buffer, so one wire digest is honest for all attempt records.
+    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+    // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        crate::runtime::trace::TransportKind::OpenAiResponses,
         &url,
-        || {
-            client
-                .post(&url)
-                .bearer_auth(&access)
-                .header("chatgpt-account-id", account_id.as_str())
-                .header("originator", "synaps")
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&body)
-        },
-        cancel,
-        max_retries,
+        Some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&name_map),
     )
-    .await?;
+    .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
+    let mut attempt = tr::StreamAttempt::new(tracer);
+    let mut stream_retry = 0u32;
 
-    let mut accumulated_text = String::new();
-    let mut parser = CodexSseDecoder::default();
-    let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
-    let mut stream = resp.bytes_stream();
+    loop {
+        let resp = send_with_retries(
+            "codex",
+            &url,
+            || {
+                client
+                    .post(&url)
+                    .bearer_auth(&access)
+                    .header("chatgpt-account-id", account_id.as_str())
+                    .header("originator", "synaps")
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .body(body_bytes.clone())
+            },
+            cancel,
+            max_retries.saturating_sub(stream_retry),
+            &mut attempt,
+        )
+        .await?;
+        // Direct HTTP: upstream status and provider request id are observed.
+        let http_status = Some(resp.status().as_u16());
+        let trace_rid = tr::provider_request_id_from_headers(resp.headers());
 
-    while let Some(chunk) = tokio::select! {
-        chunk = stream.next() => chunk,
-        _ = cancel.cancelled() => {
-            return Err("request canceled".into());
+        let mut accumulated_text = String::new();
+        let mut parser = CodexSseDecoder::default();
+        let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
+        let mut stream = resp.bytes_stream();
+
+        while let Some(chunk) = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = cancel.cancelled() => {
+                attempt.finish_canceled(http_status, parser.trace_usage());
+                return Err("request canceled".into());
+            }
+        } {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    attempt.mark_first_byte();
+                    chunk
+                }
+                Err(e) => {
+                    attempt.finish_failed("stream_error", http_status, trace_rid.clone());
+                    return Err(e.into());
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(nl) = memchr::memchr(b'\n', &buf) {
+                let line_bytes = buf.split_to(nl + 1);
+                let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+                parser.push_line(line, tx, &mut accumulated_text);
+            }
+            if parser.saw_model_event {
+                attempt.mark_first_model_event();
+            }
         }
-    } {
-        let chunk = chunk?;
-        buf.extend_from_slice(&chunk);
-        while let Some(nl) = memchr::memchr(b'\n', &buf) {
-            let line_bytes = buf.split_to(nl + 1);
-            let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+        if !buf.is_empty() {
+            let line = std::str::from_utf8(&buf).unwrap_or("");
             parser.push_line(line, tx, &mut accumulated_text);
         }
-    }
-    if !buf.is_empty() {
-        let line = std::str::from_utf8(&buf).unwrap_or("");
-        parser.push_line(line, tx, &mut accumulated_text);
-    }
-    parser.finish();
+        parser.finish();
+        // Trailing-buffer flush and finish() can surface the first (or only)
+        // model event — e.g. a payload dispatched by the tail line. Mark it so
+        // first_model_event_ms is honest even for tail-only streams.
+        if parser.saw_model_event {
+            attempt.mark_first_model_event();
+        }
+        if let Err(failure) = parser.terminal_result() {
+            if failure.code == "responses_empty" && stream_retry < max_retries {
+                stream_retry += 1;
+                let delay = retry_delay(stream_retry);
+                attempt.attempt_failed(
+                    crate::runtime::trace::RetryClass::Other,
+                    delay,
+                    http_status,
+                    trace_rid,
+                    failure.code,
+                );
+                tracing::warn!(
+                    "codex stream retry {stream_retry}/{max_retries} after {delay:?}: completed without usable output"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => {
+                        attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
+                }
+                attempt.restart_clock();
+                continue;
+            }
+            attempt.finish_failed(failure.code, http_status, trace_rid);
+            return Err(failure.message.into());
+        }
+        attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
 
-    let mut content: Vec<Value> = Vec::new();
-    if !accumulated_text.is_empty() {
-        content.push(json!({"type": "text", "text": accumulated_text}));
-    }
-    content.extend(translate::tool_calls_to_content_blocks(
-        &parser.completed_tools,
-        &name_map,
-    ));
+        let mut content: Vec<Value> = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(json!({"type": "text", "text": accumulated_text}));
+        }
+        content.extend(translate::tool_calls_to_content_blocks(
+            &parser.completed_tools,
+            &name_map,
+        ));
 
-    Ok(json!({
-        "role": "assistant",
-        "content": content,
-    }))
+        return Ok(json!({
+            "role": "assistant",
+            "content": content,
+        }));
+    }
 }
 
 /// Stable prompt-cache routing key for this conversation.
@@ -625,11 +872,29 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
     out
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResponsesStreamFailure {
+    code: &'static str,
+    message: &'static str,
+}
+
 #[derive(Default)]
 struct CodexSseDecoder {
     buffer: String,
     active_tools: Vec<CodexToolAccumulator>,
     completed_tools: Vec<ToolCall>,
+    /// Trace (Task 10A): set once the decoder parses any model event —
+    /// feeds the first-model-event timing bucket.
+    saw_model_event: bool,
+    /// A terminal Responses event was observed. Failure/incomplete events
+    /// take precedence over completion and are surfaced after the stream is
+    /// drained; provider-controlled text is never retained.
+    terminal_success: bool,
+    terminal_failure: Option<ResponsesStreamFailure>,
+    emitted_output: bool,
+    /// Trace (Task 10A): provider-reported usage from `response.completed`
+    /// (input including cached, output, cached slice). `None` until observed.
+    observed_usage: Option<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -657,6 +922,53 @@ fn parse_tool_arguments(raw: &str) -> Value {
     }
 }
 
+/// Reduce a provider-supplied error identifier (`error.type`, `error.code`,
+/// `incomplete_details.reason`) to a token safe for local logs. Lowercase
+/// snake-case identifiers (`server_error`, `rate_limit_exceeded`,
+/// `context_length_exceeded`, `max_output_tokens`) pass through verbatim —
+/// that shape cannot carry prose or credential material. Anything with
+/// uppercase, whitespace, or symbols outside the identifier charset — or
+/// longer than 64 bytes — is replaced so free-text (which can echo request
+/// content) and secret-shaped tokens can never leak into the log stream.
+fn sanitize_error_identifier(raw: Option<&str>) -> &str {
+    match raw {
+        None => "absent",
+        Some(s) => {
+            let identifier_shaped = !s.is_empty()
+                && s.len() <= 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.');
+            if identifier_shaped
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                // Lowercase snake_case enum value: safe to record verbatim.
+                s
+            } else if identifier_shaped {
+                // Mixed-case / dashed identifiers can be secret-shaped
+                // (API keys, tokens): report shape only.
+                "unlisted_identifier"
+            } else {
+                "unsafe_or_freeform"
+            }
+        }
+    }
+}
+
+/// Map a Codex terminal failure to a user-facing message. Only reacts to the
+/// already-sanitized enum identifiers (`error.type` / `error.code`) — never to
+/// provider free-text — so no request content can leak. Known, user-actionable
+/// conditions get a specific remedy; everything else keeps the neutral,
+/// details-withheld default.
+fn user_message_for_terminal_failure(error_kind: &str, error_code: &str) -> &'static str {
+    // Context-window overflow is deterministic and user-fixable: the turn
+    // cannot succeed until the conversation is smaller.
+    if error_code == "context_length_exceeded" || error_kind == "context_length_exceeded" {
+        return "Codex rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.";
+    }
+    "Codex response failed in stream. Provider error details withheld because they can echo request content."
+}
+
 impl CodexSseDecoder {
     fn push_line(
         &mut self,
@@ -676,6 +988,7 @@ impl CodexSseDecoder {
             return;
         };
         if data == "[DONE]" {
+            self.terminal_success = true;
             self.finish();
             return;
         }
@@ -689,15 +1002,36 @@ impl CodexSseDecoder {
         text_acc: &mut String,
     ) {
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            tracing::debug!(
+                payload_bytes = payload.len(),
+                "discarding malformed Responses SSE payload"
+            );
             return;
         };
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.output_item.added"
+                | "response.function_call_arguments.delta"
+                | "response.output_item.done"
+                | "response.completed"
+                | "response.done"
+                | "response.failed"
+                | "response.incomplete"
+                | "error"
+        ) {
+            self.saw_model_event = true;
+        }
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.emitted_output = true;
+                    }
                     text_acc.push_str(delta);
                     let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
                         delta.to_string(),
@@ -745,9 +1079,83 @@ impl CodexSseDecoder {
             }
             "response.completed" | "response.done" => {
                 self.push_usage(&event, tx);
+                self.terminal_success = true;
                 self.finish();
             }
-            _ => {}
+            "response.failed" | "error" => {
+                self.push_usage(&event, tx);
+                // Local-only diagnostics: log the provider's enum-like error
+                // identifiers (`type` / `code`) after sanitizing them down to a
+                // short identifier charset. The free-text `message` field is
+                // never logged or surfaced — it can echo request content.
+                let error_obj = event
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .or_else(|| event.get("error"));
+                let error_kind = sanitize_error_identifier(
+                    error_obj
+                        .and_then(|e| e.get("type"))
+                        .and_then(Value::as_str),
+                );
+                let error_code = sanitize_error_identifier(
+                    error_obj
+                        .and_then(|e| e.get("code"))
+                        .and_then(Value::as_str),
+                );
+                tracing::warn!(
+                    event_type,
+                    error_kind,
+                    error_code,
+                    "codex stream terminal failure (provider message withheld)"
+                );
+                self.terminal_failure = Some(ResponsesStreamFailure {
+                    code: "responses_failed",
+                    message: user_message_for_terminal_failure(error_kind, error_code),
+                });
+                self.finish();
+            }
+            "response.incomplete" => {
+                self.push_usage(&event, tx);
+                let reason = sanitize_error_identifier(
+                    event
+                        .get("response")
+                        .and_then(|r| r.get("incomplete_details"))
+                        .and_then(|d| d.get("reason"))
+                        .and_then(Value::as_str),
+                );
+                tracing::warn!(reason, "codex stream terminal incomplete");
+                self.terminal_failure = Some(ResponsesStreamFailure {
+                    code: "responses_incomplete",
+                    message: "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
+                });
+                self.finish();
+            }
+            _ => {
+                if !event_type.is_empty() {
+                    tracing::debug!(event_type, "ignoring unknown Responses SSE event");
+                }
+            }
+        }
+    }
+
+    fn terminal_result(&self) -> Result<(), ResponsesStreamFailure> {
+        if let Some(failure) = self.terminal_failure {
+            return Err(failure);
+        }
+        if self.terminal_success {
+            if self.emitted_output || !self.completed_tools.is_empty() {
+                Ok(())
+            } else {
+                Err(ResponsesStreamFailure {
+                    code: "responses_empty",
+                    message: "Codex completed without text or tool output. Retry the request.",
+                })
+            }
+        } else {
+            Err(ResponsesStreamFailure {
+                code: "responses_missing_terminal",
+                message: "Codex response stream ended without a terminal event. Retry the request.",
+            })
         }
     }
 
@@ -837,6 +1245,7 @@ impl CodexSseDecoder {
             if self.completed_tools.iter().any(|done| done.id == call.id) {
                 return;
             }
+            self.emitted_output = true;
             // Emit the finalized `ToolUse` event so the chat UI can collapse
             // the streaming `ToolUseStart` (animated) into a stable
             // `ToolUse` block. Without this the bash-trace animation
@@ -858,7 +1267,7 @@ impl CodexSseDecoder {
         }
     }
 
-    fn push_usage(&self, event: &Value, tx: &mpsc::UnboundedSender<StreamEvent>) {
+    fn push_usage(&mut self, event: &Value, tx: &mpsc::UnboundedSender<StreamEvent>) {
         let usage = event
             .get("response")
             .and_then(|r| r.get("usage"))
@@ -883,6 +1292,11 @@ impl CodexSseDecoder {
             .unwrap_or(0)
             .min(input);
         if input > 0 || output > 0 {
+            // Trace capture (metadata only): the provider-reported totals as
+            // sent — input including the cached slice.
+            if self.observed_usage.is_none() {
+                self.observed_usage = Some((input, output, cached));
+            }
             let _ = tx.send(StreamEvent::Session(
                 crate::runtime::types::SessionEvent::Usage {
                     input_tokens: input - cached,
@@ -897,12 +1311,19 @@ impl CodexSseDecoder {
         }
     }
 
+    /// Provider-reported usage for the trace record; `None` until observed.
+    fn trace_usage(&self) -> Option<crate::runtime::trace::UsageMeta> {
+        self.observed_usage
+            .map(|(input, output, cached)| tr::provider_usage(input, output, cached))
+    }
+
     fn finish(&mut self) {
         for tool in self.active_tools.drain(..) {
             if !tool.id.is_empty()
                 && !tool.name.is_empty()
                 && !self.completed_tools.iter().any(|done| done.id == tool.id)
             {
+                self.emitted_output = true;
                 self.completed_tools.push(ToolCall {
                     id: tool.id,
                     kind: "function".to_string(),
@@ -922,6 +1343,7 @@ fn handle_events(
     text_acc: &mut String,
     tool_blocks: &mut Vec<Value>,
     name_map: &translate::ToolNameMap,
+    suppress_stream_deltas: bool,
 ) {
     for ev in events {
         if let OaiEvent::TextDelta(t) = ev {
@@ -930,8 +1352,10 @@ fn handle_events(
         if let OaiEvent::ToolCallsComplete { calls, .. } = ev {
             tool_blocks.extend(translate::tool_calls_to_content_blocks(calls, name_map));
         }
-        if let Some(se) = translate::oai_event_to_llm(ev) {
-            let _ = tx.send(se);
+        if !suppress_stream_deltas {
+            if let Some(se) = translate::oai_event_to_llm(ev) {
+                let _ = tx.send(se);
+            }
         }
     }
 }
@@ -1326,14 +1750,144 @@ mod codex_decoder_tests {
     #[test]
     fn response_completed_with_zero_usage_emits_nothing() {
         let lines = [
+            r#"data: {"type":"response.output_text.delta","delta":"ok"}"#,
+            "",
             r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":0,"output_tokens":0}}}"#,
             "",
         ];
-        let (_decoder, _text, events) = drive(&lines);
+        let (decoder, _text, events) = drive(&lines);
         let any_usage = events
             .iter()
             .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })));
         assert!(!any_usage, "zero-token usage should be suppressed");
+        assert_eq!(decoder.terminal_result(), Ok(()));
+    }
+
+    #[test]
+    fn response_failed_is_a_terminal_failure_without_retaining_provider_text() {
+        let lines = [
+            r#"data: {"type":"response.failed","response":{"error":{"type":"server_error","message":"ECHOED:secret prompt"}}}"#,
+            "",
+        ];
+        let (decoder, text, events) = drive(&lines);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_failed");
+        assert_eq!(
+            failure.message,
+            "Codex response failed in stream. Provider error details withheld because they can echo request content."
+        );
+        assert!(!failure.message.contains("ECHOED"));
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn top_level_error_event_is_a_terminal_failure() {
+        let lines = [
+            r#"data: {"type":"error","error":{"type":"server_error","message":"private"}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_failed"
+        );
+    }
+
+    #[test]
+    fn response_incomplete_is_not_misreported_as_empty_success() {
+        let lines = [
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_incomplete");
+        assert!(failure.message.contains("incomplete"));
+        assert!(!failure.message.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn completed_without_text_or_tools_fails_at_transport_boundary() {
+        let lines = [
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":0}}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_empty"
+        );
+    }
+
+    #[test]
+    fn eof_without_terminal_event_fails_closed() {
+        let lines = [
+            r#"data: {"type":"response.created","response":{"id":"resp_123"}}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert_eq!(
+            decoder.terminal_result().expect_err("must fail").code,
+            "responses_missing_terminal"
+        );
+    }
+
+    /// The local-log sanitizer must pass lowercase snake-case identifiers
+    /// verbatim, collapse secret-shaped identifiers to a shape marker, and
+    /// never emit free-form provider text.
+    #[test]
+    fn error_identifier_sanitizer_never_passes_freeform_text() {
+        assert_eq!(sanitize_error_identifier(None), "absent");
+        assert_eq!(
+            sanitize_error_identifier(Some("rate_limit_exceeded")),
+            "rate_limit_exceeded"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("context_length_exceeded")),
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("some_new_code2")),
+            "some_new_code2"
+        );
+        // Mixed-case / dashed tokens can be secret-shaped (API keys).
+        assert_eq!(
+            sanitize_error_identifier(Some("sk-Abc123XYZ")),
+            "unlisted_identifier"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("Server.Error")),
+            "unlisted_identifier"
+        );
+        assert_eq!(
+            sanitize_error_identifier(Some("ECHOED: user secret prompt")),
+            "unsafe_or_freeform"
+        );
+        assert_eq!(sanitize_error_identifier(Some("")), "unsafe_or_freeform");
+        let long = "a".repeat(65);
+        assert_eq!(sanitize_error_identifier(Some(&long)), "unsafe_or_freeform");
+    }
+
+    /// Context-window overflow maps to a specific, actionable message; every
+    /// other terminal failure keeps the neutral details-withheld default. The
+    /// mapping only ever reads sanitized enum identifiers, never free-text.
+    #[test]
+    fn terminal_failure_user_message_is_specific_only_for_known_codes() {
+        assert!(user_message_for_terminal_failure(
+            "invalid_request_error",
+            "context_length_exceeded"
+        )
+        .contains("/compact"));
+        // Code carried on `type` rather than `code` still maps.
+        assert!(
+            user_message_for_terminal_failure("context_length_exceeded", "absent")
+                .contains("context window")
+        );
+        // Unknown/other codes keep the neutral default (no remedy claim).
+        let default = user_message_for_terminal_failure("server_error", "unlisted_identifier");
+        assert!(default.starts_with("Codex response failed in stream."));
+        assert!(!default.contains("/compact"));
     }
 
     #[test]
@@ -1461,10 +2015,23 @@ mod broker_stream_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let result =
-            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
-                .await
-                .expect("stream must complete");
+        let result = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            false,
+        )
+        .await
+        .expect("stream must complete");
 
         // Final Anthropic-shaped value carries the accumulated text.
         assert_eq!(result["content"][0]["text"], "Hello");
@@ -1486,6 +2053,43 @@ mod broker_stream_tests {
     /// Broker errors surface as typed failures without opening a stream and
     /// without any credential material in the message.
     #[tokio::test]
+    async fn suppressed_sync_route_does_not_enqueue_display_deltas() {
+        let (upstream, _seen_auth) = spawn_fake_openai_sse().await;
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            upstream,
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            true,
+        )
+        .await
+        .expect("stream must complete");
+        assert_eq!(result["content"][0]["text"], "Hello");
+        assert!(
+            rx.try_recv().is_err(),
+            "sync route must suppress display deltas at production"
+        );
+    }
+
+    #[tokio::test]
     async fn oai_stream_broker_error_fails_closed() {
         // Unconfigured static provider → NotConfigured, no upstream contact.
         let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::new(reqwest::Client::new()));
@@ -1496,13 +2100,97 @@ mod broker_stream_tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let err =
-            call_oai_stream_inner(&cfg, &broker, &[], &None, &[], &tx, None, None, 0, &cancel)
-                .await
-                .unwrap_err()
-                .to_string();
+        let err = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown provider"), "got: {err}");
         assert!(!err.to_lowercase().contains("bearer"));
+    }
+
+    /// Phase 1 privacy (spec §5.1): a hostile upstream answers the streaming
+    /// open with HTTP 500 whose body echoes the full request. The broker's
+    /// transport error carries a body snippet; the runtime must not surface
+    /// or log it — status + provider label only.
+    #[tokio::test]
+    async fn oai_stream_upstream_error_body_never_surfaces() {
+        use axum::response::IntoResponse;
+        const SENTINEL: &str = "PH1-OAI-BROKER-SENTINEL-91d2-RAW";
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |body: String| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    format!("{{\"error\":{{\"message\":\"ECHOED:{body}\"}}}}"),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            format!("http://{addr}"),
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let tools = vec![serde_json::json!({
+            "name": "ph1_secret_tool_zz",
+            "description": "internal tool schema",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(
+            serde_json::json!({"role": "user", "content": SENTINEL}),
+        )];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let err = call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &tools,
+            &Some(format!("system secret {SENTINEL}")),
+            &msgs,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            false,
+        )
+        .await
+        .expect_err("500 must fail")
+        .to_string();
+
+        assert!(err.contains("500"), "status must survive: {err}");
+        for banned in ["ECHOED", SENTINEL, "ph1_secret_tool_zz", "system secret"] {
+            assert!(
+                !err.contains(banned),
+                "provider body content `{banned}` leaked into the surfaced error: {err}"
+            );
+        }
     }
 }
 
@@ -1517,6 +2205,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
     max_tokens: Option<u32>,
     reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, names) = translate::tools_to_oai(tools_schema);
     let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
@@ -1541,30 +2231,104 @@ pub(crate) async fn call_xai_responses_stream_inner(
         max_tokens,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let mut stream = broker
-        .proxy_stream(crate::auth::ProxyRequest {
-            provider: "xai-auth".into(),
-            method: crate::auth::ProxyMethod::Post,
-            path: "/responses".into(),
-            body: Some(body),
-            stream: true,
-        })
-        .await?;
+    // Serialize ONCE via the sanctioned constructor: the digested bytes are
+    // the very bytes the broker sends upstream (`body_bytes` handoff,
+    // LocalBroker verbatim) — `body`/`body_bytes` cannot diverge. On a
+    // remote broker the daemon re-serializes out of process → honest
+    // `CloudProxy` kind and no wire-byte claim.
+    let (proxy_request, body_bytes) =
+        crate::auth::ProxyRequest::post_json_exact("xai-auth", "/responses", body, true)?;
+    let tracer = tr::begin_openai_tracer(
+        trace,
+        &cfg.provider,
+        &cfg.model,
+        if exact_wire_bytes {
+            crate::runtime::trace::TransportKind::OpenAiResponses
+        } else {
+            crate::runtime::trace::TransportKind::CloudProxy
+        },
+        &format!("{}/responses", cfg.base_url.trim_end_matches('/')),
+        exact_wire_bytes.then_some(body_bytes.as_ref()),
+        messages,
+        system_prompt.as_deref(),
+        tools_schema,
+        tr::renamed_tool_losses(&names),
+    )
+    .await;
+    // One-shot explicit content capture (`/trace next content`): a no-op in
+    // every context without the arm. `body_bytes` is the serialized request
+    // body this process built pre-send (exact wire bytes on the local
+    // broker; the same body a remote broker re-serializes) — body only,
+    // headers and credentials structurally never reach this seam.
+    if let Some(tracer) = &tracer {
+        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+    }
+    let mut attempt = tr::StreamAttempt::new(tracer);
+    let stream = broker
+        .proxy_stream(proxy_request)
+        .await
+        // Privacy (spec §5.1): a broker proxy error may carry an upstream
+        // response-body snippet; redact it to status-only before surfacing.
+        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+    let mut stream = match stream {
+        Ok(stream) => {
+            attempt.mark_headers();
+            stream
+        }
+        Err(msg) => {
+            let status = tr::broker_error_status(&msg);
+            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+            attempt.finish_failed(&code, status, None);
+            return Err(msg.into());
+        }
+    };
     let mut text = String::new();
     let mut parser = CodexSseDecoder::default();
     let mut buf = bytes::BytesMut::new();
-    while let Some(chunk) = tokio::select! { c=stream.next()=>c, _=cancel.cancelled()=>return Err("request canceled".into()) }
-    {
-        buf.extend_from_slice(&chunk?);
+    while let Some(chunk) = tokio::select! {
+        c = stream.next() => c,
+        _ = cancel.cancelled() => {
+            attempt.finish_canceled(None, parser.trace_usage());
+            return Err("request canceled".into());
+        }
+    } {
+        let chunk = match chunk {
+            Ok(chunk) => {
+                attempt.mark_first_byte();
+                chunk
+            }
+            Err(e) => {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(e.into());
+            }
+        };
+        buf.extend_from_slice(&chunk);
         while let Some(n) = memchr::memchr(b'\n', &buf) {
             let line = buf.split_to(n + 1);
             parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
+        }
+        if parser.saw_model_event {
+            attempt.mark_first_model_event();
         }
     }
     if !buf.is_empty() {
         parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
     }
     parser.finish();
+    // Trailing-buffer flush and finish() can surface the first (or only)
+    // model event; mark it so first_model_event_ms is honest for tail-only
+    // streams (mirrors the Codex direct path above).
+    if parser.saw_model_event {
+        attempt.mark_first_model_event();
+    }
+    // Broker paths never observe the upstream HTTP status; the Responses
+    // stream does not yet expose a normalized stop reason — both stay
+    // honest `None` rather than guessed values.
+    if let Err(failure) = parser.terminal_result() {
+        attempt.finish_failed(failure.code, None, None);
+        return Err(failure.message.into());
+    }
+    attempt.finish_success(None, None, None, parser.trace_usage());
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(json!({"type":"text","text":text}));
@@ -2297,6 +3061,64 @@ mod send_retry_tests {
         (format!("http://{addr}"), counter)
     }
 
+    async fn spawn_codex_sse(body: &'static str) -> String {
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post(move || async move {
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_empty_then_success_codex() -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<bytes::Bytes>>>,
+    ) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post({
+                let counter = Arc::clone(&counter);
+                let bodies = Arc::clone(&bodies);
+                move |body: bytes::Bytes| {
+                    let counter = Arc::clone(&counter);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        bodies.lock().unwrap().push(body);
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        let response = if n == 0 {
+                            concat!(
+                                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        } else {
+                            CODEX_SSE_SUCCESS
+                        };
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            response,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter, bodies)
+    }
+
     async fn run_codex(
         base_url: &str,
         max_retries: u32,
@@ -2325,6 +3147,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             max_retries,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
     }
@@ -2356,6 +3179,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             0,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
         .expect_err("foreground Ultra without delegation tools must fail closed");
@@ -2395,6 +3219,7 @@ mod send_retry_tests {
             crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             &tokio_util::sync::CancellationToken::new(),
             0,
+            &crate::runtime::trace::TraceContext::disabled(),
         )
         .await
         .expect_err("the Codex seam must validate provider-qualified identity");
@@ -2405,6 +3230,87 @@ mod send_retry_tests {
             0,
             "provider identity denial must precede broker credential access"
         );
+    }
+
+    /// A stream whose terminal event is `response.failed` must surface a
+    /// typed API failure at the transport boundary — never `Ok` with empty
+    /// content (the "model returned an empty response" misdiagnosis,
+    /// incident: sessions 20260720-022603-6c2a / turn-2629074-0). The
+    /// provider-controlled error body must not leak into the message.
+    #[tokio::test]
+    async fn codex_response_failed_event_is_a_terminal_error_not_empty_success() {
+        let base_url = spawn_codex_sse(concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"ECHOED:secret prompt\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("response.failed must fail the request");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Codex response failed in stream."),
+            "static failure message expected: {msg}"
+        );
+        assert!(
+            !msg.contains("ECHOED") && !msg.contains("secret prompt"),
+            "provider error body must never surface: {msg}"
+        );
+    }
+
+    /// `response.incomplete` is a terminal non-success: surfacing it as an
+    /// empty `Ok` poisoned the turn with the generic empty-response error.
+    #[tokio::test]
+    async fn codex_response_incomplete_event_is_a_terminal_error() {
+        let base_url = spawn_codex_sse(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("response.incomplete must fail the request");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response was incomplete."),
+            "got: {err}"
+        );
+    }
+
+    /// EOF without any terminal Responses event (mid-stream connection drop
+    /// after HTTP 200) must fail closed instead of returning empty content.
+    #[tokio::test]
+    async fn codex_eof_without_terminal_event_fails_closed() {
+        let base_url = spawn_codex_sse(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        )
+        .await;
+        let err = run_codex(&base_url, 0)
+            .await
+            .expect_err("EOF without terminal event must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response stream ended without a terminal event."),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_completed_without_output_retries_identical_bytes_then_succeeds() {
+        let (base_url, counter, bodies) = spawn_empty_then_success_codex().await;
+        let result = run_codex(&base_url, 1)
+            .await
+            .expect("one empty-success stream with retries available must not abort the turn");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "expected one retry");
+        let received = bodies.lock().unwrap();
+        assert_eq!(received.len(), 2, "both attempts must reach the endpoint");
+        assert_eq!(
+            received[0], received[1],
+            "the logical request must resend byte-identical content"
+        );
+        assert_eq!(result["content"][0]["text"], "hello");
     }
 
     #[tokio::test]
@@ -2420,6 +3326,55 @@ mod send_retry_tests {
         );
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn codex_response_failed_surfaces_typed_provider_error_not_empty_response() {
+        const BODY: &str = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"ECHOED:private prompt\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = spawn_codex_sse(BODY).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.starts_with("Codex response failed in stream."), "{msg}");
+        assert!(!msg.contains("empty response"), "{msg}");
+        assert!(!msg.contains("ECHOED"), "provider text leaked: {msg}");
+        assert!(
+            !msg.contains("private prompt"),
+            "provider text leaked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_response_incomplete_surfaces_typed_provider_error_not_empty_response() {
+        const BODY: &str = concat!(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = spawn_codex_sse(BODY).await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.starts_with("Codex response was incomplete."), "{msg}");
+        assert!(!msg.contains("empty response"), "{msg}");
+        assert!(
+            !msg.contains("max_output_tokens"),
+            "provider text leaked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_clean_eof_without_terminal_fails_closed() {
+        let base_url = spawn_codex_sse(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+        )
+        .await;
+        let err = run_codex(&base_url, 0).await.expect_err("must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Codex response stream ended without a terminal event."),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -2495,5 +3450,167 @@ mod send_retry_tests {
         assert_eq!(retry_delay(4).as_secs(), 8);
         assert_eq!(retry_delay(7).as_secs(), 64);
         assert_eq!(retry_delay(10).as_secs(), 64);
+    }
+
+    // ─── Phase 1 privacy: hostile provider echoes the request ───────────────
+    // spec §5.1: provider error bodies are untrusted and may echo the full
+    // request (prompts, system text, tool schemas, credentials). Neither the
+    // surfaced error nor ANY log line may contain response-body content —
+    // status + provider label only.
+
+    /// Unique raw-content sentinel placed in the outgoing request body.
+    const ECHO_SENTINEL: &str = "PH1-OAI-SENTINEL-2b8c4d-RAW-CONTENT";
+
+    /// `std::io::Write` sink capturing formatted tracing output in-process.
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_subscriber(
+        buf: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber + Send + Sync {
+        let sink = buf.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// Hostile loopback provider: every request is answered with `status` and
+    /// a JSON error envelope whose `message` is `"ECHOED:" + the full request
+    /// body` — the preserved holdout probe shape, aimed at the OpenAI routes.
+    async fn spawn_hostile_echo_provider(status: StatusCode) -> String {
+        let app = Router::new().fallback(move |body: String| async move {
+            let envelope = serde_json::json!({
+                "error": { "message": format!("ECHOED:{body}") }
+            });
+            (
+                status,
+                [("content-type", "application/json")],
+                envelope.to_string(),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Request body shaped like a real provider request: prompt sentinel plus
+    /// a distinctive tool schema. If the provider echo survives anywhere,
+    /// these markers betray it.
+    fn sentinel_request_body() -> Value {
+        json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": format!("system secret {ECHO_SENTINEL}")},
+                {"role": "user", "content": ECHO_SENTINEL},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ph1_secret_tool_zz",
+                    "description": "internal tool schema",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+        })
+    }
+
+    /// Markers that must never surface in errors or logs.
+    const BANNED_MARKERS: &[&str] = &[
+        "ECHOED",
+        ECHO_SENTINEL,
+        "ph1_secret_tool_zz",
+        "\"messages\"",
+        "system secret",
+    ];
+
+    fn assert_no_banned(haystack: &str, context: &str) {
+        for banned in BANNED_MARKERS {
+            assert!(
+                !haystack.contains(banned),
+                "provider body content `{banned}` leaked into {context}: {haystack}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_with_retries_non_retryable_error_never_surfaces_provider_body() {
+        let url = spawn_hostile_echo_provider(StatusCode::BAD_REQUEST).await;
+        let client = reqwest::Client::new();
+        let body = sentinel_request_body();
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+
+        let err = send_with_retries(
+            "codex",
+            &url,
+            || client.post(&url).json(&body),
+            &tokio_util::sync::CancellationToken::new(),
+            3,
+            &mut tr::StreamAttempt::new(None),
+        )
+        .await
+        .expect_err("400 must fail fast");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 400"),
+            "status + label must survive for classification/usability: {msg}"
+        );
+        assert_no_banned(&msg, "the surfaced error");
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_no_banned(&logs, "tracing output");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_retries_retry_logs_never_contain_provider_body() {
+        let url = spawn_hostile_echo_provider(StatusCode::SERVICE_UNAVAILABLE).await;
+        let client = reqwest::Client::new();
+        let body = sentinel_request_body();
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+
+        let err = send_with_retries(
+            "codex",
+            &url,
+            || client.post(&url).json(&body),
+            &tokio_util::sync::CancellationToken::new(),
+            1,
+            &mut tr::StreamAttempt::new(None),
+        )
+        .await
+        .expect_err("persistent 503 must exhaust the budget");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("codex request failed: 503"),
+            "status + label must survive after exhaustion: {msg}"
+        );
+        assert_no_banned(&msg, "the surfaced error");
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("retry 1/1"),
+            "retry accounting must stay observable: {logs}"
+        );
+        assert!(
+            logs.contains("503"),
+            "retry log must keep the status for diagnosis: {logs}"
+        );
+        assert_no_banned(&logs, "retry tracing output");
     }
 }

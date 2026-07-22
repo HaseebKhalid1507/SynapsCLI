@@ -1,9 +1,9 @@
-use ratatui::prelude::*;
-use ratatui::buffer::Buffer;
 use crate::app::App;
-use crate::games::video_poker::*;
 use crate::games::blackjack::Card;
+use crate::games::video_poker::*;
 use crate::ui::theme;
+use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 
 // ── Card Rendering ──────────────────────────────────────────────────
 
@@ -17,7 +17,11 @@ fn draw_card(buf: &mut Buffer, area: Rect, x: usize, y: usize, card: &Card) {
 
     let rank = card.rank.label();
     let suit = card.suit.symbol();
-    let suit_color = if card.suit.is_red() { theme::CARD_RED } else { theme::CARD_BLACK };
+    let suit_color = if card.suit.is_red() {
+        theme::CARD_RED
+    } else {
+        theme::CARD_BLACK
+    };
 
     let r_pad = if rank.len() == 1 { " " } else { "" };
     let lines = [
@@ -30,11 +34,16 @@ fn draw_card(buf: &mut Buffer, area: Rect, x: usize, y: usize, card: &Card) {
 
     for (dy, line) in lines.iter().enumerate() {
         let cy = ay + dy as u16;
-        if cy >= area.bottom() { continue; }
+        if cy >= area.bottom() {
+            continue;
+        }
         let mut cx = ax;
         for ch in line.chars() {
-            if cx >= area.right() { break; }
-            let fg = if ch == '┌' || ch == '┐' || ch == '└' || ch == '┘' || ch == '─' || ch == '│' {
+            if cx >= area.right() {
+                break;
+            }
+            let fg = if ch == '┌' || ch == '┐' || ch == '└' || ch == '┘' || ch == '─' || ch == '│'
+            {
                 theme::AMBER_DIM
             } else if ch == '♠' || ch == '♥' || ch == '♦' || ch == '♣' {
                 suit_color
@@ -66,10 +75,14 @@ pub fn draw_video_poker(f: &mut Frame, app: &App, game: &VideoPokerGame, area: R
     let machine_bot = h.saturating_sub(2);
     for y in machine_top..machine_bot {
         let ay = area.top() + y as u16;
-        if ay >= area.bottom() { continue; }
+        if ay >= area.bottom() {
+            continue;
+        }
         for x in 2..(w.saturating_sub(2)) {
             let ax = area.left() + x as u16;
-            if ax >= area.right() { continue; }
+            if ax >= area.right() {
+                continue;
+            }
             buf[(ax, ay)].set_bg(Color::Rgb(8, 8, 15));
         }
     }
@@ -80,8 +93,12 @@ pub fn draw_video_poker(f: &mut Frame, app: &App, game: &VideoPokerGame, area: R
         let at = area.top() + machine_top as u16;
         let ab = area.top() + machine_bot as u16;
         if ax < area.right() {
-            if at < area.bottom() { buf[(ax, at)].set_char('━').set_fg(theme::CYAN_DIM); }
-            if ab < area.bottom() { buf[(ax, ab)].set_char('━').set_fg(theme::CYAN_DIM); }
+            if at < area.bottom() {
+                buf[(ax, at)].set_char('━').set_fg(theme::CYAN_DIM);
+            }
+            if ab < area.bottom() {
+                buf[(ax, ab)].set_char('━').set_fg(theme::CYAN_DIM);
+            }
         }
     }
 
@@ -99,12 +116,40 @@ pub fn draw_video_poker(f: &mut Frame, app: &App, game: &VideoPokerGame, area: R
     draw_paytable(buf, area, game, w, h);
 }
 
-fn draw_betting(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, app: &App, w: usize, h: usize) {
+fn draw_betting(
+    buf: &mut Buffer,
+    area: Rect,
+    game: &VideoPokerGame,
+    app: &App,
+    w: usize,
+    h: usize,
+) {
     let cy = h / 2 - 2;
 
-    draw_str(buf, area, (w - 22) / 2, cy, "┏━━━━━━━━━━━━━━━━━━━━┓", theme::CYAN);
-    draw_str(buf, area, (w - 22) / 2, cy + 1, "┃   VIDEO POKER BET   ┃", theme::CYAN);
-    draw_str(buf, area, (w - 22) / 2, cy + 2, "┗━━━━━━━━━━━━━━━━━━━━┛", theme::CYAN);
+    draw_str(
+        buf,
+        area,
+        (w - 22) / 2,
+        cy,
+        "┏━━━━━━━━━━━━━━━━━━━━┓",
+        theme::CYAN,
+    );
+    draw_str(
+        buf,
+        area,
+        (w - 22) / 2,
+        cy + 1,
+        "┃   VIDEO POKER BET   ┃",
+        theme::CYAN,
+    );
+    draw_str(
+        buf,
+        area,
+        (w - 22) / 2,
+        cy + 2,
+        "┗━━━━━━━━━━━━━━━━━━━━┛",
+        theme::CYAN,
+    );
 
     let bet_display = if game.bet_input.is_empty() {
         "_ ".to_string()
@@ -113,10 +158,24 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, app: &App, 
     };
 
     let bet_line = format!("◈ {} CREDITS", bet_display);
-    draw_str(buf, area, (w - bet_line.len()) / 2, cy + 4, &bet_line, theme::GREEN);
+    draw_str(
+        buf,
+        area,
+        (w - bet_line.len()) / 2,
+        cy + 4,
+        &bet_line,
+        theme::GREEN,
+    );
 
     let balance = format!("Credits: {}", app.tokens);
-    draw_str(buf, area, (w - balance.len()) / 2, cy + 6, &balance, theme::GRAY);
+    draw_str(
+        buf,
+        area,
+        (w - balance.len()) / 2,
+        cy + 6,
+        &balance,
+        theme::GRAY,
+    );
 
     let hint = "[0-9] Enter amount  ·  [ENTER] Deal  ·  [A] All-in  ·  [ESC] Back";
     let hx = (w.saturating_sub(hint.len())) / 2;
@@ -133,7 +192,11 @@ fn draw_cards(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, _app: &App, w
         draw_card(buf, area, x, cards_y, &game.hand[i]);
 
         // HOLD label and selection
-        let hold_color = if game.held[i] { theme::GREEN } else { theme::DARK_GRAY };
+        let hold_color = if game.held[i] {
+            theme::GREEN
+        } else {
+            theme::DARK_GRAY
+        };
         let hold_text = if game.held[i] { "HOLD" } else { "    " };
         draw_str(buf, area, x + 1, cards_y - 1, hold_text, hold_color);
 
@@ -145,12 +208,26 @@ fn draw_cards(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, _app: &App, w
 
     // Bet display
     let bet_str = format!("BET: {} CREDITS", game.bet);
-    draw_str(buf, area, (w - bet_str.len()) / 2, cards_y + CARD_H + 2, &bet_str, theme::AMBER_DIM);
+    draw_str(
+        buf,
+        area,
+        (w - bet_str.len()) / 2,
+        cards_y + CARD_H + 2,
+        &bet_str,
+        theme::AMBER_DIM,
+    );
 
     // Controls
     if game.phase == VideoPokerPhase::Hold {
         let hint = "[←→] Select Card  ·  [SPACE] Toggle Hold  ·  [ENTER] Draw";
-        draw_str(buf, area, (w.saturating_sub(hint.len())) / 2, h - 2, hint, theme::GREEN_DIM);
+        draw_str(
+            buf,
+            area,
+            (w.saturating_sub(hint.len())) / 2,
+            h - 2,
+            hint,
+            theme::GREEN_DIM,
+        );
     }
 }
 
@@ -159,7 +236,7 @@ fn draw_paytable(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, w: usize, 
     let table_y = 4;
 
     draw_str(buf, area, table_x, table_y, "PAYTABLE", theme::AMBER);
-    
+
     let hands = [
         ("Royal Flush", 250),
         ("Straight Flush", 50),
@@ -176,7 +253,11 @@ fn draw_paytable(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, w: usize, 
         let y = table_y + 2 + i;
         let line = format!("{:<12} {:>3}x", hand, mult);
         let color = if let Some(ref result) = game.result {
-            if result.label() == *hand { theme::GREEN } else { theme::GRAY }
+            if result.label() == *hand {
+                theme::GREEN
+            } else {
+                theme::GRAY
+            }
         } else {
             theme::GRAY
         };
@@ -184,20 +265,57 @@ fn draw_paytable(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, w: usize, 
     }
 }
 
-fn draw_result(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, _app: &App, w: usize, h: usize) {
+fn draw_result(
+    buf: &mut Buffer,
+    area: Rect,
+    game: &VideoPokerGame,
+    _app: &App,
+    w: usize,
+    h: usize,
+) {
     if let Some(ref result) = game.result {
         let label = result.label();
-        let color = if game.last_payout > 0 { theme::GREEN } else { theme::RED };
+        let color = if game.last_payout > 0 {
+            theme::GREEN
+        } else {
+            theme::RED
+        };
 
         // Result banner
         let banner_w = label.len() + 6;
         let bx = (w.saturating_sub(banner_w)) / 2;
         let by = h / 2 + 10;
 
-        draw_str(buf, area, bx, by, &format!("┏{}┓", "━".repeat(banner_w - 2)), color);
+        draw_str(
+            buf,
+            area,
+            bx,
+            by,
+            &format!("┏{}┓", "━".repeat(banner_w - 2)),
+            color,
+        );
         let pad = (banner_w - 2 - label.len()) / 2;
-        draw_str(buf, area, bx, by + 1, &format!("┃{}{}{}┃", " ".repeat(pad), label, " ".repeat(banner_w - 2 - pad - label.len())), color);
-        draw_str(buf, area, bx, by + 2, &format!("┗{}┛", "━".repeat(banner_w - 2)), color);
+        draw_str(
+            buf,
+            area,
+            bx,
+            by + 1,
+            &format!(
+                "┃{}{}{}┃",
+                " ".repeat(pad),
+                label,
+                " ".repeat(banner_w - 2 - pad - label.len())
+            ),
+            color,
+        );
+        draw_str(
+            buf,
+            area,
+            bx,
+            by + 2,
+            &format!("┗{}┛", "━".repeat(banner_w - 2)),
+            color,
+        );
 
         // Payout
         let payout_str = if game.last_payout > 0 {
@@ -205,10 +323,28 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, _app: &App, 
         } else {
             format!("-{} CREDITS", game.bet)
         };
-        let payout_color = if game.last_payout > 0 { theme::GREEN } else { theme::RED };
-        draw_str(buf, area, (w - payout_str.len()) / 2, by + 4, &payout_str, payout_color);
+        let payout_color = if game.last_payout > 0 {
+            theme::GREEN
+        } else {
+            theme::RED
+        };
+        draw_str(
+            buf,
+            area,
+            (w - payout_str.len()) / 2,
+            by + 4,
+            &payout_str,
+            payout_color,
+        );
 
-        draw_str(buf, area, (w - 28) / 2, h - 2, "[ENTER] New Hand  ·  [ESC] Back", theme::DARK_GRAY);
+        draw_str(
+            buf,
+            area,
+            (w - 28) / 2,
+            h - 2,
+            "[ENTER] New Hand  ·  [ESC] Back",
+            theme::DARK_GRAY,
+        );
     }
 }
 
@@ -217,9 +353,13 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &VideoPokerGame, _app: &App, 
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() { return; }
+    if cy >= area.bottom() {
+        return;
+    }
     for ch in s.chars() {
-        if cx >= area.right() { break; }
+        if cx >= area.right() {
+            break;
+        }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }
