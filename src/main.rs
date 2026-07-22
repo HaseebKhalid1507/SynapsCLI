@@ -21,6 +21,30 @@ use synaps_cli::tui;
 mod cmd;
 mod watcher;
 
+// ── Allocator ────────────────────────────────────────────────────────────────
+// Long-lived sessions serialize the ENTIRE conversation to a JSON body every
+// turn (prompt caching requires sending the full prefix — see
+// runtime/api.rs `serde_json::to_vec(&body)`). That transient buffer scales
+// with history length; on glibc the freed arena pages are never returned to the
+// OS, so RSS ratchets up to ~history size and never shrinks (the classic
+// transient-heavy-long-lived-process hysteresis).
+//
+// jemalloc's background thread purges cold dirty pages back to the OS, which
+// reclaims exactly that dead-but-retained arena — with zero impact on caching
+// or retained history. Gated to non-musl: musl's allocator already returns
+// memory readily, and the Pria agentic-VM runtime is a musl build we don't want
+// to perturb.
+#[cfg(not(target_env = "musl"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Configure jemalloc at load time (no env var needed): run a background thread
+// and purge dirty pages ~1s after they go idle.
+#[cfg(not(target_env = "musl"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 #[derive(Parser)]
 #[command(
     name = "synaps",

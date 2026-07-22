@@ -16,6 +16,8 @@ rust-version = "1.80"
 testing = ["agent-tui/testing", "agent-engine/testing"]
 
 [dependencies]
+# Non-musl only: jemalloc + background purge to stop glibc RSS ratchet on
+# long sessions (see src/main.rs). musl keeps its own allocator.
 agent-core = { path = "crates/agent-core", version = "0.6.1", package = "synaps-core" }
 agent-engine = { path = "crates/agent-engine", version = "0.6.1", package = "synaps-engine" }
 agent-tui = { path = "crates/agent-tui", version = "0.6.1", package = "synaps-tui" }
@@ -113,6 +115,9 @@ assets = [
     ["target/release/synaps", "usr/bin/", "755"],
     ["target/release/hidden", "usr/bin/", "755"],
 ]
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [workspace]
 members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]
