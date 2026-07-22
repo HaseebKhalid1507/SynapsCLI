@@ -38,12 +38,24 @@ mod watcher;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Configure jemalloc at load time (no env var needed): run a background thread
-// and purge dirty pages ~1s after they go idle.
+// Configure jemalloc at load time (no env var needed). Three settings:
+//   - background_thread:true  → background thread purges cold dirty pages to OS
+//   - narenas:4               → cap arenas (default is 4×ncpu = 48 on a 12-core
+//                               box). 26 runtime threads sprawling across 48
+//                               arenas reserve ~70 MB of 4 MB chunks at baseline
+//                               for no benefit; 4 arenas is ample for our
+//                               allocation concurrency and slashes idle RSS.
+//   - dirty_decay_ms:1000     → return idle dirty pages ~1s after they go cold
+//   - muzzy_decay_ms:0        → purge muzzy pages immediately
+//
+// CRITICAL: tikv-jemalloc-sys is built with the `_rjem_` symbol prefix, so
+// jemalloc reads the config from `_rjem_malloc_conf` — NOT `malloc_conf`. An
+// earlier revision exported the unmangled name, which jemalloc silently ignored
+// (verified: opt.dirty_decay_ms sat at the 10000ms default). Keep this mangled.
 #[cfg(not(target_env = "musl"))]
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[derive(Parser)]
 #[command(
