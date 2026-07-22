@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Kimi (Moonshot AI) static-key provider.** New `kimi` provider pinned to
+  `https://api.moonshot.ai/v1` with broker-owned key discovery from
+  `MOONSHOT_API_KEY` / `KIMI_API_KEY`. Catalog covers Kimi K2.7 Code
+  (default), K2.7 Code Highspeed, K3 (1M context), and K2.6 — all
+  OpenAI-compatible with tool calling and reasoning support. Use models as
+  `kimi/<model-id>`.
+
 - **Typed, brokered provider authentication and routing.** `synaps login` now
   discovers typed OAuth, cloud, and static-key targets from provider
   descriptors. New broker-owned flows cover Grok/xAI, GitHub Copilot, Google

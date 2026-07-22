@@ -297,6 +297,19 @@ pub fn providers() -> &'static [ProviderSpec] {
                     ("Qwen/QwQ-32B", "QwQ 32B", "A+"),
                 ],
             },
+            ProviderSpec {
+                key: "kimi",
+                name: "Kimi (Moonshot AI)",
+                base_url: "https://api.moonshot.ai/v1",
+                env_vars: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+                default_model: "kimi-k2.7-code",
+                models: &[
+                    ("kimi-k2.7-code", "Kimi K2.7 Code", "S+"),
+                    ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", "S"),
+                    ("kimi-k3", "Kimi K3", "S+"),
+                    ("kimi-k2.6", "Kimi K2.6", "S"),
+                ],
+            },
         ]
     });
     &PROVIDERS
