@@ -137,6 +137,12 @@ pub const STATIC_PROVIDERS: &[StaticProviderSpec] = &[
         base_url: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
         env_vars: &["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
     },
+    StaticProviderSpec {
+        key: "kimi",
+        name: "Kimi (Moonshot AI)",
+        base_url: "https://api.moonshot.ai/v1",
+        env_vars: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+    },
 ];
 
 /// Proxy endpoint allowlist for OpenAI-compatible providers (and the local

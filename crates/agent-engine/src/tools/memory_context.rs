@@ -241,10 +241,12 @@ impl Tool for MemoryContextTool {
             "additionalProperties": false,
             "properties": {
                 "action": {
+                    "type": "string",
                     "enum": ["enable", "disable", "status", "recall_once", "index_history"],
                     "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation."
                 },
                 "mode": {
+                    "type": "string",
                     "enum": ["recall_each_prompt", "capture_only", "capture_and_recall"],
                     "description": "Requested durable mode (enable proposals only)."
                 },

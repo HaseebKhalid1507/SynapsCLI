@@ -144,7 +144,8 @@
             "status",
             "recall_once",
             "index_history"
-          ]
+          ],
+          "type": "string"
         },
         "capture_tools": {
           "description": "Whether tool activity is eligible for capture (enable proposals only).",
@@ -162,7 +163,8 @@
             "recall_each_prompt",
             "capture_only",
             "capture_and_recall"
-          ]
+          ],
+          "type": "string"
         }
       },
       "required": [
