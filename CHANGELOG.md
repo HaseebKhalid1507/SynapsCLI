@@ -11,7 +11,12 @@ All notable changes to this project will be documented in this file.
   `MOONSHOT_API_KEY` / `KIMI_API_KEY`. Catalog covers Kimi K2.7 Code
   (default), K2.7 Code Highspeed, K3 (1M context), and K2.6 — all
   OpenAI-compatible with tool calling and reasoning support. Use models as
-  `kimi/<model-id>`.
+  `kimi/<model-id>`. `/effort` exposes exact documented reasoning modes per
+  model: K3 supports `low` / `high` / `max` (default `max`) via the
+  top-level `reasoning_effort` field; K2.6/K2.5 support only a thinking
+  on/off toggle (`thinking.type`); the K2.7 Code family always thinks with
+  no effort control. Unsupported levels are rejected at mutation time —
+  never silently swallowed by the API.
 
 - **Typed, brokered provider authentication and routing.** `synaps login` now
   discovers typed OAuth, cloud, and static-key targets from provider

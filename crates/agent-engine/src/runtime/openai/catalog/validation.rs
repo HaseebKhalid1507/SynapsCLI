@@ -11,9 +11,9 @@
 use agent_core::reasoning::ReasoningLevel;
 
 use super::{
-    anthropic_static_capability, capability_cache, codex_static_capability, plan_codex_execution,
-    xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
-    ReasoningSupport, XaiReasoningCapability,
+    anthropic_static_capability, capability_cache, codex_static_capability, kimi_static_capability,
+    plan_codex_execution, xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion,
+    CodexRequestRole, KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
 };
 
 /// Conservative option set for providers without authoritative exact-model
@@ -138,6 +138,43 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
             )),
         };
     }
+    if let Some(model_id) = model.strip_prefix("kimi/") {
+        // Adaptive = provider default (omit the field) — always expressible.
+        if level == ReasoningLevel::Adaptive {
+            return Ok(());
+        }
+        return match kimi_static_capability(model_id) {
+            Some(KimiReasoningCapability::Effort {
+                supported,
+                can_disable,
+                ..
+            }) => match level {
+                ReasoningLevel::Off if can_disable => Ok(()),
+                ReasoningLevel::Off => Err(format!(
+                    "reasoning cannot be disabled on {model}; use adaptive or a supported effort"
+                )),
+                l if supported.contains(&l) => Ok(()),
+                l => Err(unsupported_msg(l, model, supported)),
+            },
+            Some(KimiReasoningCapability::AlwaysThinking) => match level {
+                ReasoningLevel::Off => Err(format!(
+                    "{model} always thinks and the API rejects disabling; use adaptive"
+                )),
+                l => Err(format!(
+                    "{model} has no documented effort control; level '{l}' cannot be sent — use adaptive"
+                )),
+            },
+            Some(KimiReasoningCapability::ToggleableThinking) => match level {
+                ReasoningLevel::Off => Ok(()),
+                l => Err(format!(
+                    "{model} supports only a thinking on/off toggle; level '{l}' cannot be sent — use off or adaptive"
+                )),
+            },
+            None => Err(format!(
+                "no capability metadata for {model}; cannot authorize level '{level}'"
+            )),
+        };
+    }
     if let Some(model_id) = anthropic_model_id(model) {
         if matches!(level, ReasoningLevel::Max | ReasoningLevel::UltraCode) {
             // Max/UltraCode require an exact qualified Anthropic capability row;
@@ -211,6 +248,16 @@ pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
             _ => ReasoningLevel::Adaptive,
         });
     }
+    if let Some(model_id) = model.strip_prefix("kimi/") {
+        return Some(match kimi_static_capability(model_id) {
+            Some(KimiReasoningCapability::Effort {
+                default_level: Some(level),
+                ..
+            }) => level,
+            // Toggle/always-thinking/unknown → provider default via omission.
+            _ => ReasoningLevel::Adaptive,
+        });
+    }
     None
 }
 
@@ -228,6 +275,14 @@ pub fn reasoning_type_for_model(model: &str) -> &'static str {
             Some(XaiReasoningCapability::Effort { .. }) => "effort",
             Some(XaiReasoningCapability::IntrinsicReasoning) => "intrinsic",
             Some(XaiReasoningCapability::NonReasoning) => "none",
+            None => "unknown",
+        };
+    }
+    if let Some(model_id) = model.strip_prefix("kimi/") {
+        return match kimi_static_capability(model_id) {
+            Some(KimiReasoningCapability::Effort { .. }) => "effort",
+            Some(KimiReasoningCapability::AlwaysThinking) => "intrinsic",
+            Some(KimiReasoningCapability::ToggleableThinking) => "toggle (on/off)",
             None => "unknown",
         };
     }
@@ -273,6 +328,27 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
             Some(XaiReasoningCapability::NonReasoning) => owned(&["off", "adaptive"]),
             // Intrinsic reasoning without effort control, or unknown id:
             // only the provider default is expressible.
+            _ => owned(&["adaptive"]),
+        };
+    }
+    if let Some(model_id) = model.strip_prefix("kimi/") {
+        return match kimi_static_capability(model_id) {
+            Some(KimiReasoningCapability::Effort {
+                supported,
+                can_disable,
+                ..
+            }) => {
+                let mut opts = Vec::new();
+                if can_disable {
+                    opts.push("off".to_string());
+                }
+                opts.push("adaptive".to_string());
+                opts.extend(supported.iter().map(|l| l.as_str().to_string()));
+                opts
+            }
+            Some(KimiReasoningCapability::ToggleableThinking) => owned(&["off", "adaptive"]),
+            // Always-thinking without effort control, or unknown id: only
+            // the provider default is expressible.
             _ => owned(&["adaptive"]),
         };
     }
@@ -671,5 +747,111 @@ mod tests {
             assert!(!opts.contains(&"max".to_string()), "{model}");
             assert!(!opts.contains(&"ultra".to_string()), "{model}");
         }
+    }
+
+    #[test]
+    fn kimi_k3_accepts_exact_efforts_and_rejects_off_medium_xhigh_ultra() {
+        let model = "kimi/kimi-k3";
+        for level in [Adaptive, Low, High, Max] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_ok(),
+                "{model} {level}"
+            );
+        }
+        for level in [Off, Medium, XHigh, Ultra, UltraCode] {
+            let err = validate_reasoning_mutation(model, level).unwrap_err();
+            assert!(err.contains("kimi"), "{err}");
+        }
+    }
+
+    #[test]
+    fn kimi_always_thinking_models_accept_only_adaptive() {
+        for model in ["kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed"] {
+            assert!(
+                validate_reasoning_mutation(model, Adaptive).is_ok(),
+                "{model}"
+            );
+            for level in [Off, Low, Medium, High, Max] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_err(),
+                    "{model} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_toggleable_models_accept_off_and_adaptive_only() {
+        for model in ["kimi/kimi-k2.6", "kimi/kimi-k2.5"] {
+            for level in [Off, Adaptive] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_ok(),
+                    "{model} {level}"
+                );
+            }
+            for level in [Low, Medium, High, Max] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_err(),
+                    "{model} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_unknown_ids_fail_closed_except_adaptive() {
+        let model = "kimi/kimi-k9000";
+        assert!(validate_reasoning_mutation(model, Adaptive).is_ok());
+        for level in [Off, Low, Medium, High, Max, Ultra] {
+            assert!(
+                validate_reasoning_mutation(model, level).is_err(),
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_options_are_exact_per_model() {
+        assert_eq!(
+            thinking_options_for_model("kimi/kimi-k3"),
+            vec!["adaptive", "low", "high", "max"]
+        );
+        for model in ["kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed"] {
+            assert_eq!(
+                thinking_options_for_model(model),
+                vec!["adaptive"],
+                "{model}"
+            );
+        }
+        for model in ["kimi/kimi-k2.6", "kimi/kimi-k2.5"] {
+            assert_eq!(
+                thinking_options_for_model(model),
+                vec!["off", "adaptive"],
+                "{model}"
+            );
+        }
+        assert_eq!(
+            thinking_options_for_model("kimi/kimi-k9000"),
+            vec!["adaptive"]
+        );
+    }
+
+    #[test]
+    fn kimi_reasoning_types_and_default_level() {
+        assert_eq!(reasoning_type_for_model("kimi/kimi-k3"), "effort");
+        assert_eq!(reasoning_type_for_model("kimi/kimi-k2.7-code"), "intrinsic");
+        assert_eq!(
+            reasoning_type_for_model("kimi/kimi-k2.6"),
+            "toggle (on/off)"
+        );
+        assert_eq!(reasoning_type_for_model("kimi/kimi-k9000"), "unknown");
+        assert_eq!(
+            default_level_for_model("kimi/kimi-k3"),
+            Some(ReasoningLevel::Max)
+        );
+        assert_eq!(
+            default_level_for_model("kimi/kimi-k2.6"),
+            Some(ReasoningLevel::Adaptive)
+        );
     }
 }

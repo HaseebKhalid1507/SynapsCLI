@@ -158,6 +158,7 @@ async fn drive_chat(
         None,
         None,
         0,
+        agent_core::reasoning::ReasoningLevel::Medium,
         cancel,
         trace,
         exact,

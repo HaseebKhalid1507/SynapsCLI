@@ -203,6 +203,7 @@ pub(crate) async fn call_oai_stream_inner(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
@@ -249,6 +250,7 @@ pub(crate) async fn call_oai_stream_inner(
         super::reasoning::provider_for_key(&cfg.provider),
         &cfg.model,
         thinking_budget,
+        reasoning_level,
     );
     let body = Value::Object(body);
 
@@ -2025,6 +2027,7 @@ mod broker_stream_tests {
             None,
             None,
             0,
+            agent_core::reasoning::ReasoningLevel::Medium,
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
@@ -2075,6 +2078,7 @@ mod broker_stream_tests {
             None,
             None,
             0,
+            agent_core::reasoning::ReasoningLevel::Medium,
             &tokio_util::sync::CancellationToken::new(),
             &crate::runtime::trace::TraceContext::disabled(),
             true,
@@ -2110,6 +2114,7 @@ mod broker_stream_tests {
             None,
             None,
             0,
+            agent_core::reasoning::ReasoningLevel::Medium,
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
@@ -2175,6 +2180,7 @@ mod broker_stream_tests {
             None,
             None,
             0,
+            agent_core::reasoning::ReasoningLevel::Medium,
             &cancel,
             &crate::runtime::trace::TraceContext::disabled(),
             true,

@@ -251,6 +251,7 @@ pub async fn try_route(
                 temperature,
                 max_tokens,
                 thinking_budget,
+                reasoning_level,
                 cancel,
                 trace,
                 exact_wire_bytes,
