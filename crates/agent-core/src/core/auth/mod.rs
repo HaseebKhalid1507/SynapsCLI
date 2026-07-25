@@ -81,7 +81,7 @@ pub(super) const SCOPES: &str = "org:create_api_key user:profile user:inference 
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     #[serde(rename = "type")]
     pub auth_type: String,
@@ -90,6 +90,19 @@ pub struct OAuthCredentials {
     pub expires: u64,
     #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+/// Redacting Debug — never print refresh/access tokens (review finding H1).
+impl std::fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredentials")
+            .field("auth_type", &self.auth_type)
+            .field("refresh", &"[REDACTED]")
+            .field("access", &"[REDACTED]")
+            .field("expires", &self.expires)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

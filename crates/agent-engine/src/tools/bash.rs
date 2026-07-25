@@ -148,9 +148,16 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"]
+        let requested_timeout = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.bash_timeout);
+        // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
+        // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
+        let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
+            requested_timeout.min(ctx.limits.bash_max_timeout)
+        } else {
+            requested_timeout
+        };
         let max_output = ctx.limits.max_tool_buffer;
 
         let script = bash_script_with_secure_sudo(command);
@@ -524,22 +531,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_tool_requested_timeout_is_not_clamped_by_max_timeout() {
+    async fn test_bash_tool_requested_timeout_is_clamped_by_max_timeout() {
         let tool = BashTool;
         let mut ctx = create_tool_context();
         ctx.limits.bash_max_timeout = 1;
 
         let params = json!({
-            "command": "sleep 2; echo done",
-            "timeout": 3
+            "command": "sleep 5; echo done",
+            "timeout": 10
         });
 
         let result = tool.execute(params, ctx).await;
         assert!(
-            result.is_ok(),
-            "requested timeout should not be clamped by bash_max_timeout: {result:?}"
+            result.unwrap_err().to_string().contains("timed out"),
+            "requested timeout MUST be clamped by bash_max_timeout"
         );
-        assert!(result.unwrap().contains("done"));
     }
 
     #[tokio::test]

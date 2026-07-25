@@ -69,7 +69,7 @@ impl std::fmt::Debug for CredentialSource {
 /// Deliberately has **no** refresh-token field: a Remote client must never
 /// receive or hold one. This is the invariant made structural — there is no
 /// place to put a refresh token even if the broker mistakenly sent one.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct BrokerToken {
     pub access_token: String,
     /// Absolute expiry, unix-epoch **milliseconds** (matches
@@ -81,6 +81,17 @@ pub struct BrokerToken {
     /// clock skew on suspend/resume VMs (board C3). Absent → use `expires`.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
+}
+
+/// Redacting Debug — never print access_token (review finding H2).
+impl std::fmt::Debug for BrokerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerToken")
+            .field("access_token", &"[REDACTED]")
+            .field("expires", &self.expires)
+            .field("ttl_ms", &self.ttl_ms)
+            .finish()
+    }
 }
 
 /// Current unix time in milliseconds.

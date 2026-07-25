@@ -25,6 +25,17 @@ impl McpConnection {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
 
+        // H3: clear inherited env to prevent leaking host secrets
+        // (ANTHROPIC_API_KEY, AWS_*, etc.) to third-party MCP servers.
+        // Mirror the ProcessExtension pattern (process.rs env_clear).
+        cmd.env_clear();
+        // Re-inject essential vars for child process operation.
+        for var in ["PATH", "HOME", "LANG", "TERM", "XDG_RUNTIME_DIR", "TMPDIR"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        // Apply user-configured env overrides from mcp.json.
         for (k, v) in &config.env {
             cmd.env(k, v);
         }

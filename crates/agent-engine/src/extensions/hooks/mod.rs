@@ -320,7 +320,9 @@ impl HookBus {
     /// to N×5 s; concurrent emit collapses that to a single 5 s window
     /// regardless of N — critical for teardown budgets.
     pub async fn emit_concurrent(&self, event: &HookEvent) -> HookResult {
-        debug_assert!(
+        // H4: real assert, not debug_assert — this invariant protects against
+        // nondeterministic Block/Modify/Replace results in release builds.
+        assert!(
             !matches!(
                 event.kind,
                 HookKind::BeforeToolCall | HookKind::AfterToolCall | HookKind::BeforeMessage
