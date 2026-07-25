@@ -47,7 +47,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 }
 
-use agent_core::orchestration::CompletionGate;
+use agent_core::orchestration::{CompletionGate, WorkerTerminal};
 use agent_core::prompt::QualifiedModelId;
 use agent_engine::orchestration::OrchestrationRuntime;
 use agent_engine::runtime::subagent::{
@@ -104,6 +104,21 @@ async fn expired_worker_is_bounded_transport_free_collectible_and_reconcilable()
     orchestration
         .authorize(HANDLE_ID, MODEL)
         .expect("authorize worker before registering runtime handle");
+    // Transition through the lifecycle so the orchestration knows the worker
+    // is terminal (not just dispatched). The completion gate only blocks on
+    // Terminal|Collected workers — running/dispatched pass through.
+    orchestration
+        .mark_starting(HANDLE_ID)
+        .expect("mark starting");
+    orchestration
+        .mark_running(HANDLE_ID)
+        .expect("mark running");
+    orchestration
+        .terminal_and_collect(
+            HANDLE_ID,
+            agent_core::orchestration::WorkerTerminal::Completed,
+        )
+        .expect("mark terminal + collected");
 
     let state = Arc::new(RwLock::new(SubagentState::new()));
     {
