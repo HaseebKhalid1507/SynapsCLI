@@ -590,14 +590,18 @@ impl OrchestrationRuntime {
     /// snapshot before locking the subagent registry avoids cross-registry lock order.
     pub fn unreconciled_runtime_handles(&self) -> HashSet<String> {
         let inner = self.inner.lock().unwrap();
-        let workers = match inner.registry.completion_gate() {
-            CompletionGate::Allowed => return HashSet::new(),
-            CompletionGate::Warning { workers } | CompletionGate::Blocked { workers } => workers,
-        };
+        // Use all_unreconciled_ids (includes Running workers) — NOT
+        // completion_gate (which only reports Terminal|Collected). The reaper
+        // must retain handles the orchestration still tracks, even if the
+        // gate lets the foreground turn through.
+        let unreconciled = inner.registry.all_unreconciled_ids();
+        if unreconciled.is_empty() {
+            return HashSet::new();
+        }
         inner
             .handles
             .iter()
-            .filter(|(_, handle)| workers.iter().any(|id| id == handle.id()))
+            .filter(|(_, handle)| unreconciled.iter().any(|id| id == handle.id()))
             .map(|(runtime_id, _)| runtime_id.clone())
             .collect()
     }
@@ -863,14 +867,13 @@ mod tests {
         assert!(rt.authorize("sa_1", "openrouter/worker").is_err());
         assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
         rt.authorize("sa_2", "anthropic/worker").unwrap();
-        assert!(matches!(
-            rt.completion_gate(),
-            CompletionGate::Blocked { .. }
-        ));
+        // Running workers pass through the gate (reactive pattern).
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
         rt.poll("sa_2", "same").unwrap();
         rt.steer("sa_2").unwrap();
         rt.terminal_and_collect("sa_2", WorkerTerminal::Completed)
             .unwrap();
+        // Terminal+Collected: gate blocks until reconciled.
         assert!(matches!(
             rt.completion_gate(),
             CompletionGate::Blocked { .. }
@@ -1029,6 +1032,11 @@ mod tests {
         ));
         rt.authorize("sa_alpha", "anthropic/worker").unwrap();
         rt.authorize("sa_beta", "anthropic/worker").unwrap();
+        // Transition both to Terminal so the gate reports them.
+        rt.terminal_and_collect("sa_alpha", WorkerTerminal::Completed)
+            .unwrap();
+        rt.terminal_and_collect("sa_beta", WorkerTerminal::Completed)
+            .unwrap();
 
         match rt.completion_gate() {
             CompletionGate::Blocked { workers } => {
@@ -1052,8 +1060,6 @@ mod tests {
         }
 
         // After one reconcile, only the remaining runtime handle is reported.
-        rt.terminal_and_collect("sa_alpha", WorkerTerminal::Completed)
-            .unwrap();
         rt.reconcile("sa_alpha").unwrap();
         match rt.completion_gate() {
             CompletionGate::Blocked { workers } => {

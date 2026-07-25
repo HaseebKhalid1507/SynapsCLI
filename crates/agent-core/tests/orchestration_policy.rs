@@ -44,10 +44,8 @@ fn lifecycle_completion_and_overlap_are_enforced() {
         .unwrap();
     r.mark_starting(&h).unwrap();
     r.mark_running(&h).unwrap();
-    assert!(matches!(
-        r.completion_gate(),
-        CompletionGate::Blocked { .. }
-    ));
+    // Running workers pass through the gate (reactive subagent pattern).
+    assert_eq!(r.completion_gate(), CompletionGate::Allowed);
     assert!(matches!(
         r.check_foreground_write("src/lib.rs"),
         ScopeDecision::ReconciliationRequired { .. }
@@ -72,13 +70,19 @@ fn advisory_completion_warns_and_telemetry_is_structured_and_safe() {
         DelegationPolicy::enforced(model("openrouter/kimi"), [model("openrouter/glm")], 1, 2);
     p.mode = EnforcementMode::Advisory;
     let mut r = WorkerRegistry::new(p);
-    let _ = r
+    let h = r
         .authorize_dispatch(
             &model("openrouter/glm"),
             WorkerRole::Reviewer,
             WorkerWritePolicy::ReadOnly,
         )
         .unwrap();
+    // Running workers pass through even in advisory mode.
+    assert_eq!(r.completion_gate(), CompletionGate::Allowed);
+    // Transition to terminal — advisory mode warns (not blocks).
+    r.mark_starting(&h).unwrap();
+    r.mark_running(&h).unwrap();
+    r.mark_terminal(&h, WorkerTerminal::Completed).unwrap();
     assert!(matches!(
         r.completion_gate(),
         CompletionGate::Warning { .. }

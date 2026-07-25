@@ -302,9 +302,16 @@ mod tests {
             Arc::new(OrchestrationRuntime::baseline(foreground, 8, 64).expect("baseline runtime"));
         orch.authorize(handle_id, "anthropic/claude-sonnet-4-6")
             .expect("authorize worker");
+        // authorize() leaves the worker Running. Transition to Terminal+Collected
+        // so the gate blocks (it only catches finished-but-unreconciled workers).
+        orch.terminal_and_collect(
+            handle_id,
+            agent_core::orchestration::WorkerTerminal::Completed,
+        )
+        .expect("mark terminal + collected");
         assert!(
             matches!(orch.completion_gate(), CompletionGate::Blocked { .. }),
-            "authorized worker must block completion until reconciled"
+            "terminal worker must block completion until reconciled"
         );
 
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));

@@ -767,6 +767,16 @@ impl WorkerRegistry {
             CompletionGate::Blocked { workers }
         }
     }
+    /// All non-reconciled worker IDs — including running ones. Used by the
+    /// reaper to decide retention (don't GC a worker the orchestration still
+    /// tracks, even if the completion gate lets the turn through).
+    pub fn all_unreconciled_ids(&self) -> Vec<String> {
+        self.workers
+            .iter()
+            .filter(|(_, w)| w.state != State::Reconciled)
+            .map(|(h, _)| h.0.clone())
+            .collect()
+    }
     pub fn check_foreground_write(&self, path: &str) -> ScopeDecision {
         let workers: Vec<_> = self
             .workers

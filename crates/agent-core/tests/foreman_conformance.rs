@@ -22,16 +22,22 @@ fn sonnet_foreman_cannot_finish_after_delegating_without_reconciliation() {
             WorkerWritePolicy::NonOverlappingPaths(vec!["src/**".into()]),
         )
         .unwrap();
+    // Running workers pass through the gate (reactive subagent pattern).
+    assert_eq!(registry.completion_gate(), CompletionGate::Allowed);
+    registry.mark_starting(&worker).unwrap();
+    registry.mark_running(&worker).unwrap();
+    // Still running — gate allows.
+    assert_eq!(registry.completion_gate(), CompletionGate::Allowed);
+    registry
+        .mark_terminal(&worker, WorkerTerminal::Completed)
+        .unwrap();
+    // Terminal: gate blocks — model must collect.
     assert!(matches!(
         registry.completion_gate(),
         CompletionGate::Blocked { .. }
     ));
-    registry.mark_starting(&worker).unwrap();
-    registry.mark_running(&worker).unwrap();
-    registry
-        .mark_terminal(&worker, WorkerTerminal::Completed)
-        .unwrap();
     registry.collect(&worker).unwrap();
+    // Collected but not reconciled: gate still blocks.
     assert!(matches!(
         registry.completion_gate(),
         CompletionGate::Blocked { .. }
