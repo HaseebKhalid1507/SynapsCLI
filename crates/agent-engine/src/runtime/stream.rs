@@ -210,9 +210,28 @@ impl StreamMethods {
         // every call site; surface the typed outcome and stop cleanly.
         macro_rules! finish_budget_exceeded {
             ($dimension:expr) => {{
+                let dimension: agent_core::BudgetDimension = $dimension;
+                // Observability (metadata only — no request content, per the
+                // Phase 1 privacy rule). Without this the turn dies silently:
+                // `SessionEvent::Error` is rendered by the frontend and
+                // dropped, so an exhausted turn left NO trace in synaps.log.
+                tracing::warn!(
+                    event = "turn_budget_exhausted",
+                    dimension = dimension.as_str(),
+                    elapsed_secs = budget_meter.elapsed().as_secs(),
+                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                    rounds_used = budget_meter.rounds_used(),
+                    max_provider_rounds = budget_meter.budget().max_provider_rounds,
+                    round_renewals_used = budget_meter.round_renewals_used(),
+                    max_round_renewals = budget_meter.budget().max_round_renewals,
+                    tool_calls_used = budget_meter.tool_calls_used(),
+                    max_tool_calls = budget_meter.budget().max_tool_calls,
+                    tool_result_bytes = budget_meter.tool_result_bytes_used(),
+                    "turn ended: budget exhausted"
+                );
                 let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                    agent_core::TurnError::budget($dimension),
+                    agent_core::TurnError::budget(dimension),
                 )));
                 return Ok(());
             }};
@@ -242,6 +261,20 @@ impl StreamMethods {
                     match budget_meter.try_renew_rounds() {
                         Some(remaining) => match budget_meter.begin_round() {
                             Ok(()) => {
+                                // Soft checkpoint: the turn self-healed. Logged
+                                // so renewal frequency is measurable rather
+                                // than inferred from user reports.
+                                tracing::info!(
+                                    event = "turn_budget_round_renewed",
+                                    dimension = agent_core::BudgetDimension::ProviderRounds.as_str(),
+                                    renewals_used = budget_meter.round_renewals_used(),
+                                    renewals_remaining = remaining,
+                                    elapsed_secs = budget_meter.elapsed().as_secs(),
+                                    max_elapsed_secs =
+                                        budget_meter.budget().max_elapsed.as_secs(),
+                                    tool_calls_used = budget_meter.tool_calls_used(),
+                                    "provider-round checkpoint: renewed, continuing automatically"
+                                );
                                 let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                                     format!(
                                         "Reached a provider-round checkpoint — work preserved, continuing automatically ({remaining} extension(s) left)."
@@ -1145,6 +1178,17 @@ impl StreamMethods {
 
                 // Synthetic valid results for over-budget calls (model
                 // order preserved: executed prefix first, suffix here).
+                if !over_budget_tool_uses.is_empty() {
+                    tracing::warn!(
+                        event = "turn_budget_tool_calls_truncated",
+                        dimension = agent_core::BudgetDimension::ToolCalls.as_str(),
+                        not_executed = over_budget_tool_uses.len(),
+                        tool_calls_used = budget_meter.tool_calls_used(),
+                        max_tool_calls = budget_meter.budget().max_tool_calls,
+                        elapsed_secs = budget_meter.elapsed().as_secs(),
+                        "tool calls dropped: turn tool-call budget exhausted"
+                    );
+                }
                 for tool_use in &over_budget_tool_uses {
                     if let Some(tool_id) = tool_use["id"].as_str() {
                         let content = "Tool call not executed: turn tool-call budget exhausted";

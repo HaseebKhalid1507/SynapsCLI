@@ -17,6 +17,18 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets -- -D warnings
 
+  # The suite was previously never run in CI, so a failing test could sit on a
+  # green PR indefinitely — `infinite_tool_loop_stops_at_exact_round_budget`
+  # did exactly that after graceful round-renewal landed. Serial-marked tests
+  # mutate process-global state (HOME, env, audit spool), so this must NOT be
+  # sharded or the `#[serial]` guarantees stop holding.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo test --workspace --locked
+
   feature-gate:
     runs-on: ubuntu-latest
     steps:

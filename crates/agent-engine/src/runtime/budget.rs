@@ -231,6 +231,28 @@ impl TurnBudgetMeter {
         self.round_renewals
     }
 
+    /// Wall-clock consumed by this turn so far. Diagnostics only — the
+    /// enforcement path uses [`Self::wall_clock_exceeded`].
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Provider rounds charged since the last renewal (reset by
+    /// [`Self::try_renew_rounds`]). Diagnostics only.
+    pub fn rounds_used(&self) -> u32 {
+        self.rounds
+    }
+
+    /// Tool calls charged this turn. Diagnostics only.
+    pub fn tool_calls_used(&self) -> u32 {
+        self.tool_calls
+    }
+
+    /// Accumulated tool-result bytes charged this turn. Diagnostics only.
+    pub fn tool_result_bytes_used(&self) -> usize {
+        self.tool_result_bytes
+    }
+
     /// Remaining tool-call allowance (for exact-cap batch splitting).
     pub fn remaining_tool_calls(&self) -> u32 {
         self.budget.max_tool_calls.saturating_sub(self.tool_calls)

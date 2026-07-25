@@ -322,17 +322,26 @@ pub async fn complete_provider_with_tools<F>(
     mut context_factory: F,
     max_tool_output: usize,
     max_iterations: usize,
+    // Out-param: total tool calls the provider requested across every
+    // interior round. An out-param (rather than a return tuple) so the
+    // count is still observable on the error paths below — the audit
+    // record must stay honest when the iteration limit is hit.
+    tools_requested: &mut u32,
 ) -> Result<ProviderCompleteResult, String>
 where
     F: FnMut() -> crate::ToolContext,
 {
     let max_iterations = max_iterations.max(1);
+    *tools_requested = 0;
     for iteration in 0..max_iterations {
         let result = handler.provider_complete(params.clone()).await?;
         let tool_uses = extract_provider_tool_uses(&result.content)?;
         if tool_uses.is_empty() {
             return Ok(result);
         }
+        // Counted before the limit check: the provider DID request these,
+        // even when we refuse to run another round.
+        *tools_requested = tools_requested.saturating_add(tool_uses.len() as u32);
         if iteration + 1 == max_iterations {
             return Err(format!(
                 "extension provider '{}' exceeded provider tool-use iteration limit ({})",

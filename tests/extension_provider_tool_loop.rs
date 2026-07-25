@@ -151,6 +151,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         thinking_budget: 0,
     };
 
+    let mut tools_requested: u32 = 0;
     let result = complete_provider_with_tools(
         handler,
         params,
@@ -160,6 +161,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         test_context,
         1000,
         4,
+        &mut tools_requested,
     )
     .await
     .expect("provider loop succeeds");
@@ -167,6 +169,13 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
     assert_eq!(
         result.content,
         vec![json!({"type": "text", "text": "done"})]
+    );
+    // Honest audit metric: this provider requested exactly one tool before
+    // its final text turn, so the count must be 1 — not the hardcoded 0 the
+    // audit record used to report for every tool-loop turn.
+    assert_eq!(
+        tools_requested, 1,
+        "the tool-use the provider actually requested must be counted"
     );
 }
 
@@ -325,6 +334,7 @@ async fn provider_loop_denies_unverified_tool_before_hooks_and_execution() {
         thinking_budget: 0,
     };
 
+    let mut tools_requested: u32 = 0;
     let result = complete_provider_with_tools(
         handler,
         params,
@@ -334,6 +344,7 @@ async fn provider_loop_denies_unverified_tool_before_hooks_and_execution() {
         test_context,
         1000,
         4,
+        &mut tools_requested,
     )
     .await
     .expect("loop terminates with the final text turn");

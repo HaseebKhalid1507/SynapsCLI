@@ -593,8 +593,57 @@ mod tests {
         assert!(script.ends_with("sudo id"));
     }
 
+    /// Writes an executable stub `sudo` into `dir` that emulates the flags the
+    /// secure wrapper passes (`-S -p PROMPT`): `-k` exits silently like a real
+    /// timestamp reset, anything else writes PROMPT to stderr, consumes one
+    /// stdin line, and fails. Lets the wrapper be tested without the system
+    /// sudo, whose prompting behaviour is host-dependent.
+    #[cfg(unix)]
+    fn write_fake_sudo(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let sudo_path = dir.join("sudo");
+        std::fs::write(
+            &sudo_path,
+            r#"#!/bin/sh
+prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -S) shift ;;
+    -p) prompt="$2"; shift 2 ;;
+    -k) exit 0 ;;
+    *) break ;;
+  esac
+done
+printf '%s' "$prompt" >&2
+read -r _pw
+exit 1
+"#,
+        )
+        .expect("write fake sudo");
+        let mut perms = std::fs::metadata(&sudo_path)
+            .expect("stat fake sudo")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sudo_path, perms).expect("chmod fake sudo");
+    }
+
+    /// The `sudo()` wrapper's prompt is intercepted by the secret-prompt path
+    /// and never reaches the delta stream.
+    ///
+    /// Hermetic by construction: it drives a STUB sudo on PATH, not the host's.
+    /// `command sudo` bypasses the shell function but still honours PATH, so
+    /// the real wrapper path is exercised. PATH is exported inside the script
+    /// rather than through `std::env::set_var` because these tests are not
+    /// `#[serial]` and mutating process-global env would race them.
+    ///
+    /// This previously drove the system sudo and asserted that it prompts —
+    /// false on any host with passwordless sudo, which includes every GitHub
+    /// runner, so it could never pass in CI.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_bash_sudo_function_prompt_is_intercepted_before_streaming() {
+        let fake_bin = tempfile::tempdir().expect("tempdir");
+        write_fake_sudo(fake_bin.path());
         let tool = BashTool;
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
@@ -620,7 +669,10 @@ mod tests {
         ctx.capabilities.secret_prompt = Some(prompt_handle);
         ctx.channels.tx_delta = Some(delta_tx);
         let params = json!({
-            "command": "sudo -k; sudo -v",
+            "command": format!(
+                "export PATH=\"{}:$PATH\"; sudo -k; sudo -v",
+                fake_bin.path().display()
+            ),
             "timeout": 30
         });
 
