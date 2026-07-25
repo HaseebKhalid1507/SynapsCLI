@@ -8,14 +8,14 @@
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
   <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
   <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
-  <img src="https://img.shields.io/badge/binary-15MB-success.svg" alt="15MB binary">
+  <img src="https://img.shields.io/badge/binary-20MB-success.svg" alt="20MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 15MB, 2ms boot.
+  Any model, 20MB, 2ms boot.
 </p>
 
 ---
@@ -111,11 +111,13 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **🧩 Policy-driven orchestration.** Exact model identities, typed roles, write scopes, concurrency limits, and lifecycle gates authorize workers before credentials, network, billing, threads, or worker state.
 - **⚙️ Exact reasoning controls.** `/settings` and `/effort` expose only modes supported by the active provider-qualified model, including distinct Codex `xhigh`/`max`/`ultra` and Claude Fable 5 `max`/`ultracode` semantics.
 - **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **🌐 Native and cloud model transports.** Claude, ChatGPT/Codex, Grok/xAI, GitHub Copilot, Gemini Code Assist, Azure OpenAI, Amazon Bedrock, and Google Vertex AI, plus OpenAI-compatible providers such as Groq, Cerebras, NVIDIA NIM, OpenRouter, or local Ollama. Provider and account support varies; unsupported routes fail closed.
+- **🌐 Native and cloud model transports.** Claude, ChatGPT/Codex, Grok/xAI, GitHub Copilot, Gemini Code Assist, Kimi (Moonshot AI), Azure OpenAI, Amazon Bedrock, and Google Vertex AI, plus OpenAI-compatible providers such as Groq, Cerebras, NVIDIA NIM, OpenRouter, or local Ollama. Provider and account support varies; unsupported routes fail closed.
+- **🧠 Continuous memory.** Project-scoped persistent memory with sensitivity classes. Context, decisions, and entities survive across sessions automatically.
+- **💰 Per-turn budgets.** Tool calls, wall clock, provider rounds, output tokens, result bytes, and cost — all bounded and logged per turn.
 - **📡 Event bus.** Any script, cron, or service can poke a running session and the agent reacts in real time.
-- **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days.
+- **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days. Continuous memory persists across projects.
 - **🤖 Autonomous mode.** `synaps watcher` runs a fleet with heartbeats, crash recovery, cost limits, and session handoff.
-- **⚡ Fast and lean.** ~87K lines of Rust, one 15MB binary, ~2ms cold start, zero runtime deps.
+- **⚡ Fast and lean.** ~210K lines of Rust, one 20MB binary, ~2ms cold start, zero runtime deps.
 - **🎨 18 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 ---
@@ -129,6 +131,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 | `synaps server` | WebSocket API: token auth, origin validation, streaming |
 | `synaps rpc` | Line-JSON IPC for bridges (Slack, Discord) |
 | `synaps watcher` | Supervisor daemon for autonomous agent fleets |
+| `synaps auth-broker` | Credential broker for multi-machine shared auth |
 
 ## Configuration
 
@@ -169,7 +172,7 @@ Protocol spec: [docs/extensions/](docs/extensions/).
 
 ## Contributing
 
-Synaps is young (started April 2026) and moving fast: 1,300+ commits in its first 3 months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+Synaps is young (started April 2026) and moving fast: 1,900+ commits in its first 3 months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
