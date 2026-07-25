@@ -320,19 +320,35 @@ mod tests {
         assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
     }
 
+    /// `e` expands whichever provider is under the cursor.
+    ///
+    /// The expectation is DERIVED from `build_sections`, not hardcoded: that
+    /// function reads real host state (`configured_static_provider_keys()` and
+    /// `logged_in_oauth_providers()`), so which provider sorts first differs
+    /// per machine. Asserting "anthropic" passed only on hosts holding
+    /// Anthropic credentials and failed everywhere else — on a clean CI runner
+    /// the first row is `azure-openai`.
+    ///
+    /// Load semantics stay out of scope here because they are provider-class
+    /// dependent (live-catalog providers go to `Loading`, static-OAuth ones to
+    /// a `Ready` row set without fetching). Those are covered exactly by
+    /// `expanding_anthropic_still_requests_live_catalog` and the static-OAuth
+    /// test above; this one pins the routing.
     #[test]
     fn e_opens_expanded_provider_browser() {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
+        let sections = crate::tui::models::build_sections("claude-opus-4-7", &state);
+        let expected = crate::tui::models::selected_provider(&sections, &state)
+            .expect("a provider row is selected at cursor 0")
+            .provider_key
+            .clone();
+
         let outcome = handle_event(&mut state, key(KeyCode::Char('e')), "claude-opus-4-7");
-        assert_eq!(
-            outcome,
-            InputOutcome::ExpandProvider("anthropic".to_string())
-        );
+        assert_eq!(outcome, InputOutcome::ExpandProvider(expected.clone()));
         let expanded = state.expanded.expect("expanded state");
-        assert_eq!(expanded.provider_key, "anthropic");
+        assert_eq!(expanded.provider_key, expected);
         assert_eq!(expanded.search, "");
-        assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
     }
 
     #[test]
