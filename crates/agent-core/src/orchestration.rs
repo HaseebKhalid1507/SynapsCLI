@@ -749,10 +749,14 @@ impl WorkerRegistry {
         )
     }
     pub fn completion_gate(&self) -> CompletionGate {
+        // Only block on FINISHED-but-unreconciled workers. Running/Starting/
+        // Dispatched workers pass through — that's the reactive pattern
+        // (subagent_start → collect on wake). Blocking on Running makes
+        // subagent_start functionally identical to subagent.
         let workers: Vec<_> = self
             .workers
             .iter()
-            .filter(|(_, w)| w.state != State::Reconciled)
+            .filter(|(_, w)| matches!(w.state, State::Terminal | State::Collected))
             .map(|(h, _)| h.0.clone())
             .collect();
         if workers.is_empty() || self.policy.mode == EnforcementMode::Off {
