@@ -27,12 +27,20 @@ fn scenario_01_settings_then_marketplace_two_deep_unwind() {
     let mut h = TestHarness::boot();
 
     h.open_settings_modal();
-    assert_eq!(h.modal_stack_depth(), 1, "settings should be the only modal");
+    assert_eq!(
+        h.modal_stack_depth(),
+        1,
+        "settings should be the only modal"
+    );
     assert_eq!(h.top_pane_name(), "settings");
 
     // The Plugins modal is the marketplace surface; opening it nests on top.
     h.open_plugins_modal();
-    assert_eq!(h.modal_stack_depth(), 2, "marketplace should nest over settings");
+    assert_eq!(
+        h.modal_stack_depth(),
+        2,
+        "marketplace should nest over settings"
+    );
     assert_eq!(h.top_pane_name(), "plugins", "marketplace must own input");
 
     esc(&mut h);
@@ -61,7 +69,10 @@ fn scenario_02_settings_plugin_editor_nesting() {
     h.open_plugin_editor();
     assert_eq!(h.modal_stack_depth(), 2, "editor nests over settings");
     assert_eq!(h.top_pane_name(), "plugin-editor");
-    assert!(h.plugin_editor_active(), "PluginCustom editor should be live");
+    assert!(
+        h.plugin_editor_active(),
+        "PluginCustom editor should be live"
+    );
 
     esc(&mut h);
     assert!(
@@ -87,7 +98,11 @@ fn scenario_03_tab_focus_traversal_plugins_and_settings() {
     // Plugins ring.
     let mut h = TestHarness::boot();
     h.open_plugins_modal();
-    assert_eq!(h.plugins_focus_side(), Some("left"), "plugins start on left");
+    assert_eq!(
+        h.plugins_focus_side(),
+        Some("left"),
+        "plugins start on left"
+    );
     h.key(KeyCode::Tab, KeyModifiers::empty());
     assert_eq!(h.plugins_focus_side(), Some("right"), "Tab → right pane");
     h.key(KeyCode::Tab, KeyModifiers::empty());
@@ -96,7 +111,11 @@ fn scenario_03_tab_focus_traversal_plugins_and_settings() {
     // Settings ring.
     let mut h = TestHarness::boot();
     h.open_settings_modal();
-    assert_eq!(h.settings_focus_side(), Some("left"), "settings start on left");
+    assert_eq!(
+        h.settings_focus_side(),
+        Some("left"),
+        "settings start on left"
+    );
     h.key(KeyCode::Tab, KeyModifiers::empty());
     assert_eq!(h.settings_focus_side(), Some("right"), "Tab → right pane");
     h.key(KeyCode::Tab, KeyModifiers::empty());

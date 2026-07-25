@@ -1,6 +1,6 @@
 [package]
 name = "synaps-core"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Foundation types, config, session, auth, protocol — leaf crate for agent-runtime"
@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 serde              = { version = "1.0", features = ["derive", "rc"] }
 serde_json         = "1.0"
+serde_yaml         = "0.9"
 tokio              = { version = "1.0", features = ["full"] }
 toml               = "0.8"
 bytes              = "1"
@@ -20,6 +21,8 @@ tracing            = "0.1"
 tracing-appender   = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+async-trait        = "0.1.89"
+futures            = "0.3"
 uuid               = { version = "1.0", features = ["v4"] }
 base64             = "0.22"
 rand               = "0.9"
@@ -31,6 +34,9 @@ fs4                = "0.13"
 axum               = { version = "0.7", features = ["ws"] }
 url                = "2"
 urlencoding        = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serial_test = "3.4.0"

@@ -1,7 +1,7 @@
 pub(crate) mod input;
 pub(crate) use input::{handle_event, InputOutcome};
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DevProviderSelection {
@@ -13,6 +13,7 @@ struct DevProviderSelection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DevProviderAuth {
     OAuth(&'static str),
+    Cloud,
     ApiKey,
     LocalModels,
 }
@@ -20,7 +21,7 @@ enum DevProviderAuth {
 fn dev_model_providers() -> Vec<DevProviderSelection> {
     let mut providers = vec![
         DevProviderSelection {
-            key: "claude",
+            key: "anthropic",
             name: "Anthropic",
             auth_kind: DevProviderAuth::OAuth("anthropic"),
         },
@@ -28,6 +29,36 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             key: "openai-codex",
             name: "OpenAI Codex",
             auth_kind: DevProviderAuth::OAuth("openai-codex"),
+        },
+        DevProviderSelection {
+            key: "xai-auth",
+            name: "xAI (Grok)",
+            auth_kind: DevProviderAuth::OAuth("xai-auth"),
+        },
+        DevProviderSelection {
+            key: "github-copilot",
+            name: "GitHub Copilot",
+            auth_kind: DevProviderAuth::OAuth("github-copilot"),
+        },
+        DevProviderSelection {
+            key: "google-gemini",
+            name: "Google Gemini (Code Assist)",
+            auth_kind: DevProviderAuth::OAuth("google-gemini"),
+        },
+        DevProviderSelection {
+            key: "azure-openai",
+            name: "Azure OpenAI",
+            auth_kind: DevProviderAuth::Cloud,
+        },
+        DevProviderSelection {
+            key: "aws-bedrock",
+            name: "AWS Bedrock",
+            auth_kind: DevProviderAuth::Cloud,
+        },
+        DevProviderSelection {
+            key: "google-vertex",
+            name: "Google Vertex",
+            auth_kind: DevProviderAuth::Cloud,
         },
     ];
 
@@ -38,7 +69,7 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
                 key: spec.key,
                 name: spec.name,
                 auth_kind: DevProviderAuth::ApiKey,
-            })
+            }),
     );
 
     providers.push(DevProviderSelection {
@@ -92,11 +123,26 @@ pub(crate) struct ExpandedModelEntry {
 impl ExpandedModelEntry {
     #[allow(dead_code)]
     pub(crate) fn new(id: String, label: String, is_favorite: bool) -> Self {
-        Self { id, label, is_favorite, metadata: Vec::new() }
+        Self {
+            id,
+            label,
+            is_favorite,
+            metadata: Vec::new(),
+        }
     }
 
-    pub(crate) fn with_metadata(id: String, label: String, is_favorite: bool, metadata: Vec<String>) -> Self {
-        Self { id, label, is_favorite, metadata }
+    pub(crate) fn with_metadata(
+        id: String,
+        label: String,
+        is_favorite: bool,
+        metadata: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            is_favorite,
+            metadata,
+        }
     }
 
     pub(crate) fn metadata_label(&self) -> String {
@@ -114,7 +160,11 @@ pub(crate) struct FuzzyScore {
 pub(crate) fn fuzzy_model_score(query: &str, haystack: &str) -> Option<FuzzyScore> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return Some(FuzzyScore { gaps: 0, first_match: 0, haystack_len: haystack.chars().count() });
+        return Some(FuzzyScore {
+            gaps: 0,
+            first_match: 0,
+            haystack_len: haystack.chars().count(),
+        });
     }
 
     let haystack_lower = haystack.to_lowercase();
@@ -122,15 +172,26 @@ pub(crate) fn fuzzy_model_score(query: &str, haystack: &str) -> Option<FuzzyScor
     let mut positions = Vec::new();
     for ch in query.chars() {
         let tail = &haystack_lower[search_start..];
-        let found = tail.char_indices().find(|(_, candidate)| *candidate == ch)?;
+        let found = tail
+            .char_indices()
+            .find(|(_, candidate)| *candidate == ch)?;
         let pos = search_start + found.0;
         positions.push(pos);
         search_start = pos + found.1.len_utf8();
     }
     let first_match = positions.first().copied().unwrap_or(0);
-    let span = positions.last().copied().unwrap_or(first_match).saturating_sub(first_match) + 1;
+    let span = positions
+        .last()
+        .copied()
+        .unwrap_or(first_match)
+        .saturating_sub(first_match)
+        + 1;
     let gaps = span.saturating_sub(query.chars().count());
-    Some(FuzzyScore { gaps, first_match, haystack_len: haystack_lower.len() })
+    Some(FuzzyScore {
+        gaps,
+        first_match,
+        haystack_len: haystack_lower.len(),
+    })
 }
 
 pub(crate) fn sort_expanded_models(models: &mut [ExpandedModelEntry], query: &str) {
@@ -181,6 +242,9 @@ pub(crate) struct ExpandedModelsState {
     pub load_state: ExpandedLoadState,
 }
 
+/// Live catalog rows for a provider that should replace static main-section seeds.
+pub(crate) type ProviderCatalogOverride = Vec<(String, String)>; // (model_id, label)
+
 #[derive(Clone, Debug)]
 pub(crate) struct ModelsModalState {
     pub cursor: usize,
@@ -189,6 +253,10 @@ pub(crate) struct ModelsModalState {
     pub collapsed: HashSet<String>,
     pub favorites: BTreeSet<String>,
     pub expanded: Option<ExpandedModelsState>,
+    /// Live OpenAI Codex / Anthropic catalog overrides for main modal sections.
+    /// Populated asynchronously when the modal opens; static seeds remain until
+    /// a successful live list arrives (or while offline / loading).
+    pub provider_catalog_overrides: std::collections::BTreeMap<String, ProviderCatalogOverride>,
 }
 
 impl ModelsModalState {
@@ -196,8 +264,13 @@ impl ModelsModalState {
         let favorites: BTreeSet<String> = synaps_cli::config::load_config()
             .favorite_models
             .into_iter()
+            .map(|id| normalize_favorite_id(&id))
             .collect();
-        let view = if favorites.is_empty() { ModelsView::All } else { ModelsView::Favorites };
+        let view = if favorites.is_empty() {
+            ModelsView::All
+        } else {
+            ModelsView::Favorites
+        };
         Self {
             cursor: 0,
             search: String::new(),
@@ -205,6 +278,7 @@ impl ModelsModalState {
             collapsed: HashSet::new(),
             favorites,
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         }
     }
 
@@ -212,6 +286,7 @@ impl ModelsModalState {
         self.favorites = synaps_cli::config::load_config()
             .favorite_models
             .into_iter()
+            .map(|id| normalize_favorite_id(&id))
             .collect();
         if self.favorites.is_empty() && self.view == ModelsView::Favorites {
             self.view = ModelsView::All;
@@ -220,42 +295,255 @@ impl ModelsModalState {
 }
 
 pub(crate) fn normalize_favorite_id(model: &str) -> String {
-    if model.contains('/') {
+    if let Some(id) = model.strip_prefix("claude/") {
+        format!("anthropic/{id}")
+    } else if model.contains('/') {
         model.to_string()
+    } else if model.starts_with("claude-") {
+        format!("anthropic/{model}")
     } else {
-        format!("claude/{model}")
+        model.to_string()
     }
 }
 
+#[cfg(test)]
 pub(crate) fn model_id_for_runtime(favorite_id: &str) -> String {
-    favorite_id
-        .strip_prefix("claude/")
-        .unwrap_or(favorite_id)
-        .to_string()
+    normalize_favorite_id(favorite_id)
+}
+
+fn remove_favorite_compat(id: &str) {
+    let canonical = normalize_favorite_id(id);
+    let _ = synaps_cli::config::remove_favorite_model(&canonical);
+    if let Some(wire_id) = canonical.strip_prefix("anthropic/") {
+        // Old configurations used both bare and claude/-qualified forms.
+        let _ = synaps_cli::config::remove_favorite_model(wire_id);
+        let _ = synaps_cli::config::remove_favorite_model(&format!("claude/{wire_id}"));
+    }
+}
+
+/// Providers whose main-section seeds should be replaced by live catalog rows
+/// when the Models modal opens (logged-in OAuth discovery).
+///
+/// `openai-codex` is intentionally absent: its picker rows are hardcoded to
+/// the seven source-controlled OAuth slugs (`codex_static_catalog_models`)
+/// and must never be replaced by live `/models` results.
+pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
+    &["anthropic"]
+}
+
+/// Providers whose model lists are source-controlled: any live/injected
+/// catalog result is canonicalized to the static entries before it can touch
+/// ANY /models surface (main sections, /settings picker, expanded browser).
+const SOURCE_CONTROLLED_PROVIDER: &str = "openai-codex";
+
+/// The seven static OpenAI Codex OAuth models as expanded-browser entries,
+/// provider-qualified, in catalog order (`codex_static_catalog_models`).
+pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
+    synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
+        .into_iter()
+        .map(|model| {
+            let mut metadata = vec!["static".to_string()];
+            if model.codex_supported_levels().is_some() {
+                metadata.push("thinking".to_string());
+            }
+            ExpandedModelEntry::with_metadata(
+                model.runtime_id(),
+                model.display_label().to_string(),
+                false,
+                metadata,
+            )
+        })
+        .collect()
+}
+
+/// Central invariant: canonicalize a model-list result before it reaches any
+/// state. For `openai-codex` the result is ALWAYS the seven static OAuth
+/// entries — live rows, injected rows, and fetch errors alike are replaced.
+/// All other providers (Anthropic included) pass through unchanged.
+pub(crate) fn canonicalize_model_list_result(
+    provider_key: &str,
+    result: Result<Vec<ExpandedModelEntry>, String>,
+) -> Result<Vec<ExpandedModelEntry>, String> {
+    if provider_key == SOURCE_CONTROLLED_PROVIDER {
+        return Ok(codex_static_expanded_entries());
+    }
+    result
+}
+
+/// Apply a live catalog result to both expanded state and main-section overrides.
+///
+/// On success, main sections for the provider switch from static seeds to the
+/// returned provider-qualified IDs. Errors leave static seeds in place.
+/// Results are canonicalized first (`canonicalize_model_list_result`), so no
+/// live openai-codex row can reach either surface through this choke point.
+pub(crate) fn apply_model_list_result(
+    state: &mut ModelsModalState,
+    provider_key: &str,
+    result: Result<Vec<ExpandedModelEntry>, String>,
+) {
+    let result = canonicalize_model_list_result(provider_key, result);
+    // Always update expanded view when it matches this provider.
+    set_expanded_models(
+        state,
+        provider_key,
+        match &result {
+            Ok(models) => Ok(models.clone()),
+            Err(err) => Err(err.clone()),
+        },
+    );
+
+    if let Ok(models) = result {
+        let override_rows = catalog_override_rows(provider_key, &models);
+        if !override_rows.is_empty() {
+            state
+                .provider_catalog_overrides
+                .insert(provider_key.to_string(), override_rows);
+        }
+    }
+}
+
+/// Convert live catalog entries into main-section override rows.
+///
+/// Strips the provider prefix to store bare model ids for section building,
+/// but keeps labels. Entries already use provider-qualified runtime ids.
+/// Shared by the /models modal and the app-level catalog cache that feeds
+/// the /settings model picker.
+pub(crate) fn catalog_override_rows(
+    provider_key: &str,
+    models: &[ExpandedModelEntry],
+) -> ProviderCatalogOverride {
+    if provider_key == SOURCE_CONTROLLED_PROVIDER {
+        // openai-codex sections/pickers are hardcoded to the seven static
+        // OAuth slugs — override rows must never exist for it.
+        return Vec::new();
+    }
+    let prefix = format!("{provider_key}/");
+    models
+        .iter()
+        .filter_map(|model| {
+            let bare = model
+                .id
+                .strip_prefix(&prefix)
+                .unwrap_or(model.id.as_str())
+                .to_string();
+            if bare.trim().is_empty() {
+                return None;
+            }
+            Some((bare, model.label.clone()))
+        })
+        .collect()
+}
+
+/// Format a ping latency/status cell for model rows (shared with /settings).
+pub(crate) fn fmt_latency(
+    status: synaps_cli::runtime::openai::ping::PingStatus,
+    ms: u64,
+) -> String {
+    use synaps_cli::runtime::openai::ping::PingStatus;
+    match status {
+        PingStatus::Online => {
+            if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{}ms", ms)
+            }
+        }
+        other => other.label().to_string(),
+    }
+}
+
+/// Flatten model sections into parallel (display, value) picker rows.
+///
+/// One header row per provider section (empty value — never selectable),
+/// then one row per model whose value is the EXACT provider-qualified
+/// runtime id of the entry. Ping health renders as a display-only prefix.
+/// This is the single row source for the /settings model picker, so
+/// /settings and /models can never drift apart on available models.
+pub(crate) fn picker_rows_from_sections(
+    sections: &[ModelSection],
+    model_health: &std::collections::HashMap<
+        String,
+        (synaps_cli::runtime::openai::ping::PingStatus, u64),
+    >,
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for section in sections {
+        rows.push((format!("── {} ──", section.provider_name), String::new()));
+        for entry in &section.entries {
+            let health = model_health
+                .get(&entry.id)
+                .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
+                .unwrap_or_default();
+            let tier = if entry.tier.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", entry.tier)
+            };
+            rows.push((
+                format!("  {}{}  — {}{}", health, entry.id, entry.label, tier),
+                entry.id.clone(),
+            ));
+        }
+    }
+    rows
+}
+
+/// Build the /settings model-picker rows from the same data the /models
+/// modal renders: dev provider sections, broker availability/login state,
+/// and any live catalog overrides fetched so far (`app.catalog_overrides`).
+pub(crate) fn settings_model_picker_rows(
+    current_model: &str,
+    catalog_overrides: &std::collections::BTreeMap<String, ProviderCatalogOverride>,
+    model_health: &std::collections::HashMap<
+        String,
+        (synaps_cli::runtime::openai::ping::PingStatus, u64),
+    >,
+) -> Vec<(String, String)> {
+    let mut state = ModelsModalState::new();
+    state.view = ModelsView::All;
+    state.search.clear();
+    state.provider_catalog_overrides = catalog_overrides.clone();
+    picker_rows_from_sections(&build_sections(current_model, &state), model_health)
 }
 
 pub(crate) fn build_sections(current_model: &str, state: &ModelsModalState) -> Vec<ModelSection> {
-    let config = synaps_cli::config::load_config();
+    // Non-secret availability data from the credential broker boundary — this
+    // module never reads provider keys or credential env vars.
+    let availability = ProviderAvailability {
+        configured_static: synaps_cli::auth::broker::configured_static_provider_keys(),
+        local_models: synaps_cli::auth::broker::local_model_ids(),
+    };
     let logged_in_oauth = logged_in_oauth_providers();
-    build_sections_from_parts(current_model, state, &config.provider_keys, &logged_in_oauth)
+    build_sections_from_parts(current_model, state, &availability, &logged_in_oauth)
+}
+
+/// Non-secret provider availability: which static providers have a
+/// broker-held credential, and the configured local model list.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderAvailability {
+    pub configured_static: BTreeSet<String>,
+    pub local_models: Vec<String>,
 }
 
 fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
-    ["anthropic", "openai-codex"]
-        .into_iter()
-        .filter(|storage_key| {
-            synaps_cli::auth::load_provider_auth(storage_key)
-                .ok()
-                .flatten()
-                .is_some_and(|creds| !synaps_cli::auth::is_token_expired(&creds))
-        })
-        .collect()
+    // Non-secret login-status queries via the broker boundary.
+    [
+        synaps_cli::auth::OAuthProviderId::Anthropic,
+        synaps_cli::auth::OAuthProviderId::OpenAiCodex,
+        synaps_cli::auth::OAuthProviderId::Xai,
+        synaps_cli::auth::OAuthProviderId::GitHubCopilot,
+        synaps_cli::auth::OAuthProviderId::GoogleGemini,
+    ]
+    .into_iter()
+    .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
+    .map(|id| id.as_str())
+    .collect()
 }
 
 fn build_sections_from_parts(
     current_model: &str,
     state: &ModelsModalState,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
     logged_in_oauth: &BTreeSet<&'static str>,
 ) -> Vec<ModelSection> {
     let query = state.search.trim().to_lowercase();
@@ -264,37 +552,41 @@ fn build_sections_from_parts(
     let mut sections = Vec::new();
 
     for provider in dev_model_providers() {
-        if !dev_provider_is_logged_in(&provider, provider_keys, logged_in_oauth) {
+        if !dev_provider_is_logged_in(&provider, availability, logged_in_oauth) {
             continue;
         }
 
-        let mut entries: Vec<ModelEntry> = provider_model_selections(&provider, provider_keys)
-            .into_iter()
-            .map(|model| {
-                let (runtime_id, favorite_id) = if provider.key == "claude" {
-                    (model.id.clone(), format!("claude/{}", model.id))
-                } else {
-                    let full_id = format!("{}/{}", provider.key, model.id);
-                    (full_id.clone(), full_id)
-                };
-                ModelEntry {
-                    id: runtime_id.clone(),
-                    display_id: model.id.clone(),
-                    label: model.label.clone(),
-                    tier: model.tier.clone(),
-                    provider_key: provider.key.to_string(),
-                    provider_name: provider.name.to_string(),
-                    configured: true,
-                    is_current: current_model == runtime_id || current_fav == favorite_id,
-                    is_favorite: state.favorites.contains(&favorite_id),
-                    favorite_id,
-                    order: model.order,
-                }
-            })
-            .filter(|m| model_matches(m, &query, favorites_only))
-            .collect();
+        let mut entries: Vec<ModelEntry> =
+            provider_model_selections(&provider, availability, &state.provider_catalog_overrides)
+                .into_iter()
+                .map(|model| {
+                    let (runtime_id, favorite_id) = if provider.key == "claude" {
+                        (model.id.clone(), format!("claude/{}", model.id))
+                    } else {
+                        let full_id = format!("{}/{}", provider.key, model.id);
+                        (full_id.clone(), full_id)
+                    };
+                    ModelEntry {
+                        id: runtime_id.clone(),
+                        display_id: model.id.clone(),
+                        label: model.label.clone(),
+                        tier: model.tier.clone(),
+                        provider_key: provider.key.to_string(),
+                        provider_name: provider.name.to_string(),
+                        configured: true,
+                        is_current: current_model == runtime_id || current_fav == favorite_id,
+                        is_favorite: state
+                            .favorites
+                            .iter()
+                            .any(|id| normalize_favorite_id(id) == favorite_id),
+                        favorite_id,
+                        order: model.order,
+                    }
+                })
+                .filter(|m| model_matches(m, &query, favorites_only))
+                .collect();
         pin_favorites_first(&mut entries);
-        if !entries.is_empty() {
+        if !entries.is_empty() || provider.auth_kind == DevProviderAuth::Cloud {
             sections.push(ModelSection {
                 provider_key: provider.key.to_string(),
                 provider_name: provider.name.to_string(),
@@ -307,40 +599,65 @@ fn build_sections_from_parts(
     if let Some(manager) = synaps_cli::runtime::openai::extension_manager_for_routing() {
         if let Ok(manager) = manager.try_read() {
             for provider in manager.providers() {
-                let mut entries: Vec<ModelEntry> = provider.spec.models.iter().enumerate().map(|(order, model)| {
-                    let runtime_id = synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
-                        &provider.plugin_id,
-                        &provider.provider_id,
-                        &model.id,
-                    );
-                    let mut badges: Vec<&str> = Vec::new();
-                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        badges.push("tool-use");
-                    }
-                    if model.capabilities.get("streaming").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        badges.push("streaming");
-                    }
-                    let base = model.display_name.clone().unwrap_or_else(|| model.id.clone());
-                    let label = if badges.is_empty() {
-                        base
-                    } else {
-                        let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
-                        format!("{} {}", base, suffix)
-                    };
-                    ModelEntry {
-                        id: runtime_id.clone(),
-                        display_id: model.id.clone(),
-                        label,
-                        tier: "extension".to_string(),
-                        provider_key: provider.runtime_id.clone(),
-                        provider_name: provider.spec.display_name.clone(),
-                        configured: true,
-                        is_current: current_model == runtime_id,
-                        is_favorite: state.favorites.contains(&runtime_id),
-                        favorite_id: runtime_id,
-                        order,
-                    }
-                }).filter(|m| model_matches(m, &query, favorites_only)).collect();
+                let mut entries: Vec<ModelEntry> = provider
+                    .spec
+                    .models
+                    .iter()
+                    .enumerate()
+                    .map(|(order, model)| {
+                        let runtime_id =
+                            synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
+                                &provider.plugin_id,
+                                &provider.provider_id,
+                                &model.id,
+                            );
+                        let mut badges: Vec<&str> = Vec::new();
+                        if model
+                            .capabilities
+                            .get("tool_use")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            badges.push("tool-use");
+                        }
+                        if model
+                            .capabilities
+                            .get("streaming")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            badges.push("streaming");
+                        }
+                        let base = model
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| model.id.clone());
+                        let label = if badges.is_empty() {
+                            base
+                        } else {
+                            let suffix = badges
+                                .iter()
+                                .map(|b| format!("[{}]", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            format!("{} {}", base, suffix)
+                        };
+                        ModelEntry {
+                            id: runtime_id.clone(),
+                            display_id: model.id.clone(),
+                            label,
+                            tier: "extension".to_string(),
+                            provider_key: provider.runtime_id.clone(),
+                            provider_name: provider.spec.display_name.clone(),
+                            configured: true,
+                            is_current: current_model == runtime_id,
+                            is_favorite: state.favorites.contains(&runtime_id),
+                            favorite_id: runtime_id,
+                            order,
+                        }
+                    })
+                    .filter(|m| model_matches(m, &query, favorites_only))
+                    .collect();
                 pin_favorites_first(&mut entries);
                 if !entries.is_empty() {
                     sections.push(ModelSection {
@@ -367,10 +684,13 @@ struct ModelSelectionItem {
 
 fn provider_model_selections(
     provider: &DevProviderSelection,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
+    catalog_overrides: &std::collections::BTreeMap<String, ProviderCatalogOverride>,
 ) -> Vec<ModelSelectionItem> {
     if provider.auth_kind == DevProviderAuth::LocalModels {
-        return local_model_ids(provider_keys)
+        return availability
+            .local_models
+            .clone()
             .into_iter()
             .enumerate()
             .map(|(order, id)| ModelSelectionItem {
@@ -380,6 +700,27 @@ fn provider_model_selections(
                 order,
             })
             .collect();
+    }
+
+    // OpenAI Codex OAuth picker rows are HARDCODED to the seven
+    // source-controlled slugs (`codex_static_catalog_models`). Live catalog
+    // overrides — however they got injected — must never replace them. This
+    // single choke point covers both /models and /settings (shared sections).
+    if provider.key != "openai-codex" {
+        if let Some(live) = catalog_overrides.get(provider.key) {
+            if !live.is_empty() {
+                return live
+                    .iter()
+                    .enumerate()
+                    .map(|(order, (id, label))| ModelSelectionItem {
+                        id: id.clone(),
+                        label: label.clone(),
+                        tier: provider_model_tier(provider.key, id).to_string(),
+                        order,
+                    })
+                    .collect();
+            }
+        }
     }
 
     provider_static_model_seeds(provider)
@@ -394,9 +735,18 @@ fn provider_model_selections(
         .collect()
 }
 
+fn provider_model_tier(provider_key: &str, model_id: &str) -> &'static str {
+    match (provider_key, model_id) {
+        ("openai-codex", "gpt-5.6-sol") => "S+",
+        ("openai-codex", "gpt-5.6-terra" | "gpt-5.5") => "A",
+        ("openai-codex", "gpt-5.6-luna") => "B+",
+        _ => "",
+    }
+}
+
 fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, String, String)> {
     match provider.key {
-        "claude" => synaps_cli::models::KNOWN_MODELS
+        "anthropic" => synaps_cli::models::KNOWN_MODELS
             .iter()
             .enumerate()
             .map(|(idx, (id, label))| {
@@ -411,37 +761,55 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
         "openai-codex" => synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
             .into_iter()
             .map(|model| {
+                let tier = provider_model_tier(provider.key, &model.id);
+                (model.id, model.label.unwrap_or_default(), tier.to_string())
+            })
+            .collect(),
+        "xai-auth" => synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
+            .into_iter()
+            .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
+            .collect(),
+        "github-copilot" => synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
+            .into_iter()
+            .map(|model| {
+                // Tiers are UI-only hints. Every id here is fixture-selectable
+                // (see `COPILOT_FALLBACK_MODELS`); disabled/endpointless rows
+                // never reach this list.
                 let tier = match model.id.as_str() {
-                    "gpt-5.5" => "S+",
+                    "gpt-5.3-codex" | "gpt-5.6-luna" | "gpt-5.6-terra" => "S+",
+                    "gpt-5.4" | "gpt-5.4-mini" | "claude-sonnet-4.6" | "claude-sonnet-5"
+                    | "claude-haiku-4.5" => "S",
                     _ => "",
                 };
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
             .collect(),
+        "google-gemini" => {
+            synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
+                .into_iter()
+                .map(|model| {
+                    let tier = match model.id.as_str() {
+                        "gemini-2.5-pro" => "S",
+                        "gemini-2.5-flash" => "A",
+                        _ => "",
+                    };
+                    (model.id, model.label.unwrap_or_default(), tier.to_string())
+                })
+                .collect()
+        }
         key => synaps_cli::runtime::openai::registry::providers()
             .iter()
             .find(|spec| spec.key == key)
             .map(|spec| {
                 spec.models
                     .iter()
-                    .map(|(id, label, tier)| ((*id).to_string(), (*label).to_string(), (*tier).to_string()))
+                    .map(|(id, label, tier)| {
+                        ((*id).to_string(), (*label).to_string(), (*tier).to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default(),
     }
-}
-
-fn local_model_ids(provider_keys: &BTreeMap<String, String>) -> Vec<String> {
-    provider_keys
-        .get("local.models")
-        .map(|value| {
-            value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn local_model_label(id: &str) -> String {
@@ -463,27 +831,15 @@ fn local_model_label(id: &str) -> String {
 
 fn dev_provider_is_logged_in(
     provider: &DevProviderSelection,
-    provider_keys: &BTreeMap<String, String>,
+    availability: &ProviderAvailability,
     logged_in_oauth: &BTreeSet<&'static str>,
 ) -> bool {
     match provider.auth_kind {
-        DevProviderAuth::LocalModels => !local_model_ids(provider_keys).is_empty(),
-        DevProviderAuth::ApiKey => provider_keys
-            .get(provider.key)
-            .is_some_and(|v| !v.is_empty())
-            || registry_env_vars(provider.key)
-                .iter()
-                .any(|var| std::env::var(var).ok().is_some_and(|v| !v.is_empty())),
+        DevProviderAuth::LocalModels => !availability.local_models.is_empty(),
+        DevProviderAuth::Cloud => true,
+        DevProviderAuth::ApiKey => availability.configured_static.contains(provider.key),
         DevProviderAuth::OAuth(storage_key) => logged_in_oauth.contains(storage_key),
     }
-}
-
-fn registry_env_vars(provider_key: &str) -> &'static [&'static str] {
-    synaps_cli::runtime::openai::registry::providers()
-        .iter()
-        .find(|provider| provider.key == provider_key)
-        .map(|provider| provider.env_vars)
-        .unwrap_or(&[])
 }
 
 fn model_matches(model: &ModelEntry, query: &str, favorites_only: bool) -> bool {
@@ -516,14 +872,20 @@ pub(crate) fn visible_rows(sections: &[ModelSection], state: &ModelsModalState) 
         rows.push(VisibleRow::Section { idx: section_idx });
         if !state.collapsed.contains(&section.provider_key) {
             for (idx, _) in section.entries.iter().enumerate() {
-                rows.push(VisibleRow::Model { section: section_idx, idx });
+                rows.push(VisibleRow::Model {
+                    section: section_idx,
+                    idx,
+                });
             }
         }
     }
     rows
 }
 
-pub(crate) fn selected_provider<'a>(sections: &'a [ModelSection], state: &ModelsModalState) -> Option<&'a ModelSection> {
+pub(crate) fn selected_provider<'a>(
+    sections: &'a [ModelSection],
+    state: &ModelsModalState,
+) -> Option<&'a ModelSection> {
     let rows = visible_rows(sections, state);
     match rows.get(state.cursor)? {
         VisibleRow::Section { idx } => sections.get(*idx),
@@ -532,11 +894,17 @@ pub(crate) fn selected_provider<'a>(sections: &'a [ModelSection], state: &Models
 }
 
 pub(crate) fn expanded_visible_models(state: &ModelsModalState) -> Vec<ExpandedModelEntry> {
-    let Some(expanded) = state.expanded.as_ref() else { return Vec::new(); };
-    let ExpandedLoadState::Ready(models) = &expanded.load_state else { return Vec::new(); };
+    let Some(expanded) = state.expanded.as_ref() else {
+        return Vec::new();
+    };
+    let ExpandedLoadState::Ready(models) = &expanded.load_state else {
+        return Vec::new();
+    };
     let mut visible: Vec<_> = models
         .iter()
-        .filter(|model| fuzzy_model_score(&expanded.search, &format!("{} {}", model.id, model.label)).is_some())
+        .filter(|model| {
+            fuzzy_model_score(&expanded.search, &format!("{} {}", model.id, model.label)).is_some()
+        })
         .cloned()
         .collect();
     sort_expanded_models(&mut visible, &expanded.search);
@@ -553,7 +921,9 @@ pub(crate) fn set_expanded_models(
     provider_key: &str,
     result: Result<Vec<ExpandedModelEntry>, String>,
 ) {
-    let Some(expanded) = state.expanded.as_mut() else { return; };
+    let Some(expanded) = state.expanded.as_mut() else {
+        return;
+    };
     if expanded.provider_key != provider_key {
         return;
     }
@@ -569,7 +939,10 @@ pub(crate) fn set_expanded_models(
     };
 }
 
-pub(crate) fn selected_model<'a>(sections: &'a [ModelSection], state: &ModelsModalState) -> Option<&'a ModelEntry> {
+pub(crate) fn selected_model<'a>(
+    sections: &'a [ModelSection],
+    state: &ModelsModalState,
+) -> Option<&'a ModelEntry> {
     let rows = visible_rows(sections, state);
     match rows.get(state.cursor)? {
         VisibleRow::Model { section, idx } => sections.get(*section)?.entries.get(*idx),
@@ -577,10 +950,22 @@ pub(crate) fn selected_model<'a>(sections: &'a [ModelSection], state: &ModelsMod
     }
 }
 
-pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ModelsModalState, current_model: &str) {
+pub(crate) fn render(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &ModelsModalState,
+    current_model: &str,
+) {
     let sections = build_sections(current_model, state);
     frame.render_widget(Clear, area);
-    frame.render_widget(ModelsModalWidget { state, sections, current_model }, area);
+    frame.render_widget(
+        ModelsModalWidget {
+            state,
+            sections,
+            current_model,
+        },
+        area,
+    );
 }
 
 struct ModelsModalWidget<'a> {
@@ -598,7 +983,12 @@ impl Widget for ModelsModalWidget<'_> {
             .title(" Models ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.modal_border(ModalKind::Models)))
-            .padding(Padding { left: 2, right: 2, top: 1, bottom: 1 });
+            .padding(Padding {
+                left: 2,
+                right: 2,
+                top: 1,
+                bottom: 1,
+            });
         if let Some(tc) = theme.modal_title(ModalKind::Models) {
             block = block.title_style(Style::default().fg(tc));
         }
@@ -623,26 +1013,47 @@ impl Widget for ModelsModalWidget<'_> {
         .areas(inner);
 
         Paragraph::new(Line::from(vec![
-            Span::styled("◇ Switch model", Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" · {model_count} available · {favorite_count} ★ favorites"), Style::default().fg(theme.muted)),
+            Span::styled(
+                "◇ Switch model",
+                Style::default()
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {model_count} available · {favorite_count} ★ favorites"),
+                Style::default().fg(theme.muted),
+            ),
         ]))
         .render(title, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("Search: ", Style::default().fg(theme.muted)),
-            Span::styled(if self.state.search.is_empty() { "▎".to_string() } else { format!("{}▎", self.state.search) }, Style::default().fg(theme.header_fg)),
+            Span::styled(
+                if self.state.search.is_empty() {
+                    "▎".to_string()
+                } else {
+                    format!("{}▎", self.state.search)
+                },
+                Style::default().fg(theme.header_fg),
+            ),
         ]))
         .render(search_bar, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("View:   ", Style::default().fg(theme.muted)),
             Span::styled(view, Style::default().fg(theme.help_fg)),
-            Span::styled(format!("   current: {}", self.current_model), Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("   current: {}", self.current_model),
+                Style::default().fg(theme.muted),
+            ),
         ]))
         .render(view_bar, buf);
 
         let list_height = list_area.height as usize;
-        let offset = self.state.cursor.saturating_sub(list_height.saturating_sub(1));
+        let offset = self
+            .state
+            .cursor
+            .saturating_sub(list_height.saturating_sub(1));
         let lines: Vec<Line> = rows
             .iter()
             .enumerate()
@@ -652,16 +1063,28 @@ impl Widget for ModelsModalWidget<'_> {
                 VisibleRow::Section { idx } => {
                     let section = &self.sections[*idx];
                     let selected = row_idx == self.state.cursor;
-                    let glyph = if self.state.collapsed.contains(&section.provider_key) { "▸" } else { "▾" };
+                    let glyph = if self.state.collapsed.contains(&section.provider_key) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
                     let style = if selected {
-                        Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme.header_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme.help_fg)
                     };
                     Line::from(vec![
-                        Span::styled(if selected { "● " } else { "  " }, Style::default().fg(theme.border_active)),
+                        Span::styled(
+                            if selected { "● " } else { "  " },
+                            Style::default().fg(theme.border_active),
+                        ),
                         Span::styled(format!("{glyph} {}", section.provider_name), style),
-                        Span::styled(format!(" ({})", section.entries.len()), Style::default().fg(theme.muted)),
+                        Span::styled(
+                            format!(" ({})", section.entries.len()),
+                            Style::default().fg(theme.muted),
+                        ),
                     ])
                 }
                 VisibleRow::Model { section, idx } => {
@@ -670,19 +1093,34 @@ impl Widget for ModelsModalWidget<'_> {
                     let marker = if selected { "●" } else { "○" };
                     let fav = if entry.is_favorite { "★" } else { " " };
                     let current = if entry.is_current { " default" } else { "" };
-                    let tier = if entry.tier.is_empty() { String::new() } else { format!(" {}", entry.tier) };
+                    let tier = if entry.tier.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", entry.tier)
+                    };
                     let style = if selected {
-                        Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme.header_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else if entry.is_current {
                         Style::default().fg(theme.status_ready)
                     } else {
                         Style::default().fg(theme.input_fg)
                     };
                     Line::from(vec![
-                        Span::styled(format!("  {marker} "), Style::default().fg(theme.border_active)),
+                        Span::styled(
+                            format!("  {marker} "),
+                            Style::default().fg(theme.border_active),
+                        ),
                         Span::styled(format!("{:<38}", entry.id), style),
-                        Span::styled(format!(" — {}", entry.label), Style::default().fg(theme.muted)),
-                        Span::styled(format!(" {fav}"), Style::default().fg(theme.status_streaming)),
+                        Span::styled(
+                            format!(" — {}", entry.label),
+                            Style::default().fg(theme.muted),
+                        ),
+                        Span::styled(
+                            format!(" {fav}"),
+                            Style::default().fg(theme.status_streaming),
+                        ),
                         Span::styled(tier, Style::default().fg(theme.muted)),
                         Span::styled(current, Style::default().fg(theme.status_ready)),
                     ])
@@ -696,16 +1134,21 @@ impl Widget for ModelsModalWidget<'_> {
             "No configured models match the current search."
         };
         let list = if lines.is_empty() {
-            vec![Line::from(Span::styled(empty_line, Style::default().fg(theme.muted)))]
+            vec![Line::from(Span::styled(
+                empty_line,
+                Style::default().fg(theme.muted),
+            ))]
         } else {
             lines
         };
         Paragraph::new(list).render(list_area, buf);
 
-        Paragraph::new("↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close")
-            .style(Style::default().fg(theme.muted))
-            .alignment(Alignment::Center)
-            .render(footer, buf);
+        Paragraph::new(
+            "↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close",
+        )
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center)
+        .render(footer, buf);
 
         if let Some(expanded) = self.state.expanded.as_ref() {
             render_expanded_lightbox(area, buf, self.state, expanded);
@@ -713,7 +1156,12 @@ impl Widget for ModelsModalWidget<'_> {
     }
 }
 
-fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalState, expanded: &ExpandedModelsState) {
+fn render_expanded_lightbox(
+    area: Rect,
+    buf: &mut Buffer,
+    state: &ModelsModalState,
+    expanded: &ExpandedModelsState,
+) {
     let theme = THEME.load();
     let width = area.width.saturating_sub(10).min(110);
     let height = area.height.saturating_sub(6).min(28);
@@ -724,7 +1172,12 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
     }
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     Clear.render(popup, buf);
     let status = match &expanded.load_state {
@@ -736,7 +1189,12 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
         .title(format!(" {} models · {} ", expanded.provider_name, status))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_active))
-        .padding(Padding { left: 2, right: 2, top: 1, bottom: 1 });
+        .padding(Padding {
+            left: 2,
+            right: 2,
+            top: 1,
+            bottom: 1,
+        });
     let inner = block.inner(popup);
     block.render(popup, buf);
 
@@ -749,17 +1207,35 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
 
     Paragraph::new(Line::from(vec![
         Span::styled("Search: ", Style::default().fg(theme.muted)),
-        Span::styled(if expanded.search.is_empty() { "▎".to_string() } else { format!("{}▎", expanded.search) }, Style::default().fg(theme.header_fg)),
+        Span::styled(
+            if expanded.search.is_empty() {
+                "▎".to_string()
+            } else {
+                format!("{}▎", expanded.search)
+            },
+            Style::default().fg(theme.header_fg),
+        ),
     ]))
     .render(search_bar, buf);
 
     let list_height = list.height as usize;
     let visible = expanded_visible_models(state);
-    let offset = expanded.cursor.saturating_sub(list_height.saturating_sub(1));
+    let offset = expanded
+        .cursor
+        .saturating_sub(list_height.saturating_sub(1));
     let lines = match &expanded.load_state {
-        ExpandedLoadState::Loading => vec![Line::from(Span::styled("Loading provider models…", Style::default().fg(theme.muted)))],
-        ExpandedLoadState::Error(err) => vec![Line::from(Span::styled(format!("Failed to load models: {err}"), Style::default().fg(theme.error_color)))],
-        ExpandedLoadState::Ready(_) if visible.is_empty() => vec![Line::from(Span::styled("No models match the current search.", Style::default().fg(theme.muted)))],
+        ExpandedLoadState::Loading => vec![Line::from(Span::styled(
+            "Loading provider models…",
+            Style::default().fg(theme.muted),
+        ))],
+        ExpandedLoadState::Error(err) => vec![Line::from(Span::styled(
+            format!("Failed to load models: {err}"),
+            Style::default().fg(theme.error_color),
+        ))],
+        ExpandedLoadState::Ready(_) if visible.is_empty() => vec![Line::from(Span::styled(
+            "No models match the current search.",
+            Style::default().fg(theme.muted),
+        ))],
         ExpandedLoadState::Ready(_) => visible
             .iter()
             .enumerate()
@@ -770,17 +1246,32 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
                 let marker = if selected { "●" } else { "○" };
                 let fav = if model.is_favorite { "★" } else { " " };
                 let style = if selected {
-                    Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.header_fg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.input_fg)
                 };
                 let meta = model.metadata_label();
-                let meta_text = if meta.is_empty() { String::new() } else { format!(" · {meta}") };
+                let meta_text = if meta.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {meta}")
+                };
                 Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(theme.border_active)),
+                    Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(theme.border_active),
+                    ),
                     Span::styled(format!("{:<48}", model.id), style),
-                    Span::styled(format!(" — {}{}", model.label, meta_text), Style::default().fg(theme.muted)),
-                    Span::styled(format!(" {fav}"), Style::default().fg(theme.status_streaming)),
+                    Span::styled(
+                        format!(" — {}{}", model.label, meta_text),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        format!(" {fav}"),
+                        Style::default().fg(theme.status_streaming),
+                    ),
                 ])
             })
             .collect(),
@@ -797,6 +1288,109 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
 mod tests {
     use super::*;
 
+    // ---- Slice A: shared picker rows for /settings model picker ----------
+
+    /// `picker_rows_from_sections` is the shared display/value row builder
+    /// consumed by the /settings model picker: one header row per provider
+    /// (empty value) followed by exact provider-qualified model values.
+    #[test]
+    fn picker_rows_from_sections_yields_headers_and_exact_ids() {
+        let sections = vec![ModelSection {
+            provider_key: "openai-codex".to_string(),
+            provider_name: "OpenAI Codex".to_string(),
+            configured: true,
+            entries: vec![ModelEntry {
+                id: "openai-codex/gpt-5.6-sol".to_string(),
+                display_id: "gpt-5.6-sol".to_string(),
+                label: "Sol".to_string(),
+                tier: "S+".to_string(),
+                provider_key: "openai-codex".to_string(),
+                provider_name: "OpenAI Codex".to_string(),
+                favorite_id: "openai-codex/gpt-5.6-sol".to_string(),
+                configured: true,
+                is_current: false,
+                is_favorite: false,
+                order: 0,
+            }],
+        }];
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert_eq!(rows[0].0, "── OpenAI Codex ──");
+        assert!(rows[0].1.is_empty(), "header row carries no value");
+        assert!(
+            rows[1].0.contains("gpt-5.6-sol") && rows[1].0.contains("Sol"),
+            "model row display shows id and label: {}",
+            rows[1].0
+        );
+        assert_eq!(rows[1].1, "openai-codex/gpt-5.6-sol");
+    }
+
+    /// Live catalog overrides (the /models live-list behavior) must flow
+    /// through to the shared picker rows so /settings sees the same data.
+    /// Uses Anthropic — the only provider with live picker discovery;
+    /// openai-codex rows are hardcoded (see the static-slug tests below).
+    #[test]
+    fn picker_rows_include_live_catalog_overrides() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::from([(
+                "anthropic".to_string(),
+                vec![("claude-live-1".to_string(), "Live One".to_string())],
+            )]),
+        };
+        let sections = build_sections_from_parts(
+            "m",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["anthropic"]),
+        );
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert!(
+            rows.iter().any(|(_, v)| v == "anthropic/claude-live-1"),
+            "live catalog override rows must appear with exact runtime ids: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, v)| v.starts_with("anthropic/") && v != "anthropic/claude-live-1"),
+            "static seeds are replaced by live overrides: {rows:?}"
+        );
+    }
+
+    /// Ping health results render as a prefix on the display column only —
+    /// the value column stays the bare exact id.
+    #[test]
+    fn picker_rows_health_prefix_never_leaks_into_value() {
+        let sections = vec![ModelSection {
+            provider_key: "groq".to_string(),
+            provider_name: "Groq".to_string(),
+            configured: true,
+            entries: vec![ModelEntry {
+                id: "groq/llama-3.3-70b-versatile".to_string(),
+                display_id: "llama-3.3-70b-versatile".to_string(),
+                label: "Llama".to_string(),
+                tier: "A".to_string(),
+                provider_key: "groq".to_string(),
+                provider_name: "Groq".to_string(),
+                favorite_id: "groq/llama-3.3-70b-versatile".to_string(),
+                configured: true,
+                is_current: false,
+                is_favorite: false,
+                order: 0,
+            }],
+        }];
+        let health = std::collections::HashMap::from([(
+            "groq/llama-3.3-70b-versatile".to_string(),
+            (synaps_cli::runtime::openai::ping::PingStatus::Online, 79u64),
+        )]);
+        let rows = picker_rows_from_sections(&sections, &health);
+        assert!(rows[1].0.contains("79ms"), "display: {}", rows[1].0);
+        assert_eq!(rows[1].1, "groq/llama-3.3-70b-versatile");
+    }
 
     #[test]
     fn expanded_entry_metadata_label_joins_badges() {
@@ -817,10 +1411,79 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_favorites_normalize_to_canonical_provider_identity() {
+        assert_eq!(
+            normalize_favorite_id("claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_favorite_id("claude/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_favorite_id("anthropic/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("anthropic/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("github-copilot/claude-opus-4-7"),
+            "github-copilot/claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn legacy_and_canonical_anthropic_favorites_and_current_model_match() {
+        for favorite in [
+            "claude-opus-4-7",
+            "claude/claude-opus-4-7",
+            "anthropic/claude-opus-4-7",
+        ] {
+            let state = ModelsModalState {
+                cursor: 0,
+                search: String::new(),
+                view: ModelsView::Favorites,
+                collapsed: HashSet::new(),
+                favorites: BTreeSet::from([favorite.to_string()]),
+                expanded: None,
+                provider_catalog_overrides: std::collections::BTreeMap::new(),
+            };
+            for current in ["claude-opus-4-7", "anthropic/claude-opus-4-7"] {
+                let sections = build_sections_from_parts(
+                    current,
+                    &state,
+                    &ProviderAvailability::default(),
+                    &BTreeSet::from(["anthropic"]),
+                );
+                let entry = sections
+                    .iter()
+                    .flat_map(|s| &s.entries)
+                    .find(|m| m.display_id == "claude-opus-4-7")
+                    .expect("legacy favorite remains visible");
+                assert_eq!(entry.id, "anthropic/claude-opus-4-7");
+                assert_eq!(entry.favorite_id, "anthropic/claude-opus-4-7");
+                assert!(entry.is_favorite);
+                assert!(entry.is_current);
+            }
+        }
+    }
+
+    #[test]
     fn claude_favorite_ids_round_trip_to_runtime_ids() {
-        assert_eq!(normalize_favorite_id("claude-opus-4-7"), "claude/claude-opus-4-7");
-        assert_eq!(model_id_for_runtime("claude/claude-opus-4-7"), "claude-opus-4-7");
-        assert_eq!(model_id_for_runtime("groq/llama-3.3-70b-versatile"), "groq/llama-3.3-70b-versatile");
+        assert_eq!(
+            normalize_favorite_id("claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("claude/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("groq/llama-3.3-70b-versatile"),
+            "groq/llama-3.3-70b-versatile"
+        );
     }
 
     #[test]
@@ -832,22 +1495,26 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::from(["claude/claude-opus-4-7".to_string()]),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
         let total: usize = sections.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
-        assert_eq!(sections[0].entries[0].favorite_id, "claude/claude-opus-4-7");
+        assert_eq!(
+            sections[0].entries[0].favorite_id,
+            "anthropic/claude-opus-4-7"
+        );
 
         state.view = ModelsView::All;
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
         assert!(sections.iter().map(|s| s.entries.len()).sum::<usize>() > 1);
@@ -862,14 +1529,15 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "claude-opus-4-7",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
-        assert!(sections.iter().any(|s| s.provider_key == "claude"));
+        assert!(sections.iter().any(|s| s.provider_key == "anthropic"));
         assert!(!sections.iter().any(|s| s.provider_key == "groq"));
         assert!(!sections.iter().any(|s| s.provider_key == "openrouter"));
     }
@@ -883,9 +1551,21 @@ mod tests {
     #[test]
     fn fuzzy_model_matches_rank_contiguous_and_early_matches_first() {
         let mut models = vec![
-            ExpandedModelEntry::new("provider/alpha-qwen-coder".to_string(), "alpha qwen coder".to_string(), false),
-            ExpandedModelEntry::new("provider/qwen3-coder".to_string(), "qwen3 coder".to_string(), false),
-            ExpandedModelEntry::new("provider/my-q-w-e-n".to_string(), "my q w e n".to_string(), false),
+            ExpandedModelEntry::new(
+                "provider/alpha-qwen-coder".to_string(),
+                "alpha qwen coder".to_string(),
+                false,
+            ),
+            ExpandedModelEntry::new(
+                "provider/qwen3-coder".to_string(),
+                "qwen3 coder".to_string(),
+                false,
+            ),
+            ExpandedModelEntry::new(
+                "provider/my-q-w-e-n".to_string(),
+                "my q w e n".to_string(),
+                false,
+            ),
         ];
         sort_expanded_models(&mut models, "qwen");
         assert_eq!(models[0].id, "provider/qwen3-coder");
@@ -901,11 +1581,12 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
         let sections = build_sections_from_parts(
             "openai-codex/gpt-5.5",
             &state,
-            &BTreeMap::new(),
+            &ProviderAvailability::default(),
             &BTreeSet::from(["openai-codex"]),
         );
 
@@ -921,20 +1602,35 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
-        let provider_keys = BTreeMap::from([
-            ("local.models".to_string(), "qwen3-coder:latest, devstral:latest".to_string()),
-        ]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::new(),
+            local_models: vec![
+                "qwen3-coder:latest".to_string(),
+                "devstral:latest".to_string(),
+            ],
+        };
         let sections = build_sections_from_parts(
             "local/qwen3-coder:latest",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::new(),
         );
 
-        let local = sections.iter().find(|s| s.provider_key == "local").expect("local section");
-        let ids: Vec<_> = local.entries.iter().map(|entry| entry.id.as_str()).collect();
-        assert_eq!(ids, vec!["local/qwen3-coder:latest", "local/devstral:latest"]);
+        let local = sections
+            .iter()
+            .find(|s| s.provider_key == "local")
+            .expect("local section");
+        let ids: Vec<_> = local
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["local/qwen3-coder:latest", "local/devstral:latest"]
+        );
     }
 
     #[test]
@@ -946,16 +1642,20 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
-        let provider_keys = BTreeMap::from([("openrouter".to_string(), "sk-test".to_string())]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::from(["openrouter".to_string()]),
+            local_models: Vec::new(),
+        };
         let sections = build_sections_from_parts(
             "openai-codex/gpt-5.5",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::from(["anthropic", "openai-codex"]),
         );
 
-        assert!(sections.iter().any(|s| s.provider_key == "claude"));
+        assert!(sections.iter().any(|s| s.provider_key == "anthropic"));
         assert!(sections.iter().any(|s| s.provider_key == "openai-codex"));
         assert!(sections.iter().any(|s| s.provider_key == "openrouter"));
         assert!(!sections.iter().any(|s| s.provider_key == "groq"));
@@ -969,6 +1669,207 @@ mod tests {
     }
 
     #[test]
+    fn openai_codex_static_models_have_exact_tier_labels() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        let seeds = provider_static_model_seeds(&provider);
+        let tier = |id: &str| {
+            seeds
+                .iter()
+                .find(|(model_id, _, _)| model_id == id)
+                .map(|(_, _, tier)| tier.as_str())
+        };
+
+        assert_eq!(tier("gpt-5.6-sol"), Some("S+"));
+        assert_eq!(tier("gpt-5.6-terra"), Some("A"));
+        assert_eq!(tier("gpt-5.6-luna"), Some("B+"));
+        assert_eq!(tier("gpt-5.5"), Some("A"));
+    }
+
+    #[test]
+    fn openai_codex_tier_labels_stay_exact_even_when_override_is_injected() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        // An injected override is ignored — selections come from static seeds.
+        let live = vec![("gpt-live-1".to_string(), "Live One".to_string())];
+        let overrides = std::collections::BTreeMap::from([("openai-codex".to_string(), live)]);
+        let selections =
+            provider_model_selections(&provider, &ProviderAvailability::default(), &overrides);
+        assert!(
+            !selections.iter().any(|model| model.id == "gpt-live-1"),
+            "injected override rows must not appear"
+        );
+        let tier = |id: &str| {
+            selections
+                .iter()
+                .find(|model| model.id == id)
+                .map(|model| model.tier.as_str())
+        };
+
+        assert_eq!(tier("gpt-5.6-sol"), Some("S+"));
+        assert_eq!(tier("gpt-5.6-terra"), Some("A"));
+        assert_eq!(tier("gpt-5.6-luna"), Some("B+"));
+        assert_eq!(tier("gpt-5.5"), Some("A"));
+    }
+
+    #[test]
+    fn logged_in_xai_provider_shows_authoritative_static_catalog_immediately() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        let sections = build_sections_from_parts(
+            "xai-auth/grok-4.3",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["xai-auth"]),
+        );
+
+        let xai = sections
+            .iter()
+            .find(|section| section.provider_key == "xai-auth")
+            .expect("logged-in xAI section");
+        let ids: Vec<_> = xai
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
+        let catalog_ids: Vec<_> = synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(ids, catalog_ids);
+        assert!(xai
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("xai-auth/")));
+    }
+
+    #[test]
+    fn logged_in_github_copilot_provider_shows_curated_static_catalog_immediately() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        let sections = build_sections_from_parts(
+            "github-copilot/gpt-5.3-codex",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["github-copilot"]),
+        );
+
+        let copilot = sections
+            .iter()
+            .find(|section| section.provider_key == "github-copilot")
+            .expect("logged-in GitHub Copilot section");
+        let ids: Vec<_> = copilot
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
+        let catalog_ids: Vec<_> =
+            synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
+                .into_iter()
+                .map(|model| model.id)
+                .collect();
+        assert_eq!(ids, catalog_ids);
+        assert!(ids.contains(&"claude-fable-5"));
+        assert!(ids.contains(&"claude-opus-4.8"));
+        assert!(copilot
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("github-copilot/")));
+        // No guessed sol / auto ids.
+        assert!(!ids.contains(&"gpt-5.6-sol"));
+        assert!(!ids.contains(&"auto"));
+    }
+
+    #[test]
+    fn google_gemini_section_lists_conservative_catalog_when_logged_in() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        let sections = build_sections_from_parts(
+            "google-gemini/gemini-2.5-pro",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["google-gemini"]),
+        );
+        let gemini = sections
+            .iter()
+            .find(|section| section.provider_key == "google-gemini")
+            .expect("logged-in Google Gemini section");
+        let ids: Vec<_> = gemini
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-3.1-pro-preview",
+                "gemini-3-pro-preview",
+                "gemini-3.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+            ]
+        );
+        assert!(gemini
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("google-gemini/")));
+        // Routing aliases and non-chat models never leak into the TUI.
+        for banned in ["auto-gemini-2.5", "auto-gemini-3", "text-embedding-004"] {
+            assert!(!ids.contains(&banned));
+        }
+    }
+
+    #[test]
+    fn google_gemini_section_hidden_when_not_logged_in() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        // No login for google-gemini in the logged_in set.
+        let sections = build_sections_from_parts(
+            "claude/sonnet-4.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["claude"]),
+        );
+        assert!(sections
+            .iter()
+            .all(|section| section.provider_key != "google-gemini"));
+    }
+
+    #[test]
     fn configured_registry_provider_uses_all_registry_static_seeds() {
         let state = ModelsModalState {
             cursor: 0,
@@ -977,15 +1878,22 @@ mod tests {
             collapsed: HashSet::new(),
             favorites: BTreeSet::new(),
             expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
         };
-        let provider_keys = BTreeMap::from([("nvidia".to_string(), "sk-test".to_string())]);
+        let availability = ProviderAvailability {
+            configured_static: BTreeSet::from(["nvidia".to_string()]),
+            local_models: Vec::new(),
+        };
         let sections = build_sections_from_parts(
             "nvidia/meta/llama-3.3-70b-instruct",
             &state,
-            &provider_keys,
+            &availability,
             &BTreeSet::new(),
         );
-        let nvidia = sections.iter().find(|s| s.provider_key == "nvidia").expect("nvidia section");
+        let nvidia = sections
+            .iter()
+            .find(|s| s.provider_key == "nvidia")
+            .expect("nvidia section");
         let registry_count = synaps_cli::runtime::openai::registry::providers()
             .iter()
             .find(|provider| provider.key == "nvidia")
@@ -993,6 +1901,356 @@ mod tests {
             .models
             .len();
         assert_eq!(nvidia.entries.len(), registry_count);
-        assert!(nvidia.entries.iter().any(|entry| entry.id == "nvidia/stepfun-ai/step-3.5-flash"));
+        assert!(nvidia
+            .entries
+            .iter()
+            .any(|entry| entry.id == "nvidia/stepfun-ai/step-3.5-flash"));
+    }
+    #[test]
+    fn live_catalog_override_replaces_stale_seeds_in_main_sections_with_provider_qualified_ids() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        // A live openai-codex list may still be applied to state (expanded
+        // view / capability metadata), but it must never replace the
+        // hardcoded picker rows.
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Ok(vec![
+                ExpandedModelEntry::new(
+                    "openai-codex/gpt-5.3-codex".into(),
+                    "GPT-5.3 Codex".into(),
+                    false,
+                ),
+                ExpandedModelEntry::new("openai-codex/o3".into(), "o3".into(), false),
+            ]),
+        );
+        apply_model_list_result(
+            &mut state,
+            "anthropic",
+            Ok(vec![ExpandedModelEntry::new(
+                "anthropic/claude-sonnet-4-7".into(),
+                "Sonnet 4.7".into(),
+                false,
+            )]),
+        );
+
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["anthropic", "openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        let codex_ids: Vec<_> = codex.entries.iter().map(|e| e.id.as_str()).collect();
+        // Hardcoded OAuth slugs win over the live list.
+        assert_eq!(
+            codex_ids,
+            vec![
+                "openai-codex/gpt-5.6-sol",
+                "openai-codex/gpt-5.6-terra",
+                "openai-codex/gpt-5.6-luna",
+                "openai-codex/gpt-5.5",
+                "openai-codex/gpt-5.4",
+                "openai-codex/gpt-5.4-mini",
+                "openai-codex/gpt-5.3-codex-spark",
+            ]
+        );
+        assert!(!codex_ids.iter().any(|id| *id == "openai-codex/o3"));
+
+        let anthropic = sections
+            .iter()
+            .find(|s| s.provider_key == "anthropic")
+            .expect("anthropic section");
+        let anthropic_ids: Vec<_> = anthropic.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(anthropic_ids, vec!["anthropic/claude-sonnet-4-7"]);
+        // Exact provider-qualified IDs only.
+        assert!(anthropic
+            .entries
+            .iter()
+            .all(|e| e.id.starts_with("anthropic/") && e.favorite_id.starts_with("anthropic/")));
+    }
+
+    #[test]
+    fn failed_live_catalog_keeps_static_main_section_seeds() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Err("model list failed: HTTP 500".into()),
+        );
+        assert!(state.provider_catalog_overrides.is_empty());
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        assert!(codex.entries.iter().any(|e| e.id == "openai-codex/gpt-5.5"));
+    }
+
+    #[test]
+    fn apply_model_list_result_also_updates_matching_expanded_state() {
+        let mut state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: Some(ExpandedModelsState {
+                provider_key: "anthropic".into(),
+                provider_name: "Anthropic".into(),
+                cursor: 0,
+                search: String::new(),
+                load_state: ExpandedLoadState::Loading,
+            }),
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        };
+        apply_model_list_result(
+            &mut state,
+            "anthropic",
+            Ok(vec![ExpandedModelEntry::new(
+                "anthropic/claude-haiku-4-5".into(),
+                "Haiku".into(),
+                false,
+            )]),
+        );
+        let expanded = state.expanded.as_ref().expect("expanded");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0].id, "anthropic/claude-haiku-4-5");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(state.provider_catalog_overrides.contains_key("anthropic"));
+    }
+
+    /// (a) Auto refresh must exclude openai-codex (its picker rows are
+    /// hardcoded OAuth slugs) while retaining live Anthropic discovery.
+    #[test]
+    fn auto_refresh_excludes_openai_codex_but_retains_anthropic() {
+        let providers = auto_refresh_catalog_providers();
+        assert!(
+            providers.contains(&"anthropic"),
+            "anthropic live discovery must be preserved: {providers:?}"
+        );
+        assert!(
+            !providers.contains(&"openai-codex"),
+            "openai-codex picker rows are hardcoded — no auto catalog refresh: {providers:?}"
+        );
+    }
+
+    /// (b) Even if an openai-codex catalog override is injected (e.g. stale
+    /// cache or live /models fetch), it must NOT replace the static picker
+    /// rows — in the /models sections nor in the shared /settings picker rows.
+    #[test]
+    fn injected_openai_codex_override_cannot_replace_static_picker_rows() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+            provider_catalog_overrides: std::collections::BTreeMap::from([(
+                "openai-codex".to_string(),
+                vec![("gpt-live-1".to_string(), "Live One".to_string())],
+            )]),
+        };
+        let sections = build_sections_from_parts(
+            "openai-codex/gpt-5.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["openai-codex"]),
+        );
+        let codex = sections
+            .iter()
+            .find(|s| s.provider_key == "openai-codex")
+            .expect("codex section");
+        assert!(
+            !codex.entries.iter().any(|e| e.id.contains("gpt-live-1")),
+            "injected override must not surface in /models sections"
+        );
+        // /settings shares the same sections → same guarantee via picker rows.
+        let rows = picker_rows_from_sections(&sections, &Default::default());
+        assert!(
+            !rows.iter().any(|(_, v)| v == "openai-codex/gpt-live-1"),
+            "injected override must not surface in /settings picker rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, v)| v == "openai-codex/gpt-5.6-sol"),
+            "static OAuth slugs must remain: {rows:?}"
+        );
+    }
+
+    /// (c) The openai-codex picker rows are exactly the seven source-controlled
+    /// OAuth slugs, in catalog order — regardless of any injected override.
+    #[test]
+    fn openai_codex_picker_rows_are_exactly_the_seven_static_oauth_slugs() {
+        let provider = dev_model_providers()
+            .into_iter()
+            .find(|provider| provider.key == "openai-codex")
+            .expect("OpenAI Codex provider");
+        let overrides = std::collections::BTreeMap::from([(
+            "openai-codex".to_string(),
+            vec![("gpt-live-1".to_string(), "Live One".to_string())],
+        )]);
+        let selections =
+            provider_model_selections(&provider, &ProviderAvailability::default(), &overrides);
+        let ids: Vec<_> = selections.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ],
+            "openai-codex picker rows must be exactly the seven hardcoded OAuth slugs, in order"
+        );
+    }
+
+    fn codex_static_qualified_ids() -> Vec<&'static str> {
+        vec![
+            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-terra",
+            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.4",
+            "openai-codex/gpt-5.4-mini",
+            "openai-codex/gpt-5.3-codex-spark",
+        ]
+    }
+
+    fn expanded_codex_state(load_state: ExpandedLoadState) -> ModelsModalState {
+        ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: Some(ExpandedModelsState {
+                provider_key: "openai-codex".into(),
+                provider_name: "OpenAI Codex".into(),
+                cursor: 0,
+                search: String::new(),
+                load_state,
+            }),
+            provider_catalog_overrides: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// (d) Central invariant: a live/injected openai-codex list result must
+    /// not affect main-section overrides NOR the expanded 'e' browser rows.
+    /// Expanded OpenAI rows are exactly the seven static OAuth models, in
+    /// catalog order — dynamic IDs never appear anywhere in /models.
+    #[test]
+    fn injected_openai_codex_result_cannot_affect_overrides_or_expanded_rows() {
+        let mut state = expanded_codex_state(ExpandedLoadState::Loading);
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Ok(vec![
+                ExpandedModelEntry::new("openai-codex/o3".into(), "o3".into(), false),
+                ExpandedModelEntry::new(
+                    "openai-codex/gpt-6-alpha".into(),
+                    "GPT-6 Alpha".into(),
+                    false,
+                ),
+            ]),
+        );
+
+        assert!(
+            !state
+                .provider_catalog_overrides
+                .contains_key("openai-codex"),
+            "live openai-codex rows must never populate main-section overrides: {:?}",
+            state.provider_catalog_overrides
+        );
+        let expanded = state.expanded.as_ref().expect("expanded state");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    codex_static_qualified_ids(),
+                    "expanded OpenAI Codex rows must be exactly the seven static OAuth slugs"
+                );
+            }
+            other => panic!("expected static Ready rows, got {other:?}"),
+        }
+    }
+
+    /// (e) A failed live fetch for openai-codex also resolves to the static
+    /// seven — the expanded browser is source-controlled, never an error/
+    /// loading surface for this provider.
+    #[test]
+    fn openai_codex_expanded_error_result_falls_back_to_static_rows() {
+        let mut state = expanded_codex_state(ExpandedLoadState::Loading);
+        apply_model_list_result(
+            &mut state,
+            "openai-codex",
+            Err("model list failed: HTTP 500".into()),
+        );
+        let expanded = state.expanded.as_ref().expect("expanded state");
+        match &expanded.load_state {
+            ExpandedLoadState::Ready(models) => {
+                let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, codex_static_qualified_ids());
+            }
+            other => panic!("expected static Ready rows, got {other:?}"),
+        }
+    }
+
+    /// (f) The shared override-row builder (also feeds the app-level catalog
+    /// cache behind /settings) must never emit live openai-codex rows, while
+    /// Anthropic stays dynamic.
+    #[test]
+    fn catalog_override_rows_never_emit_live_openai_codex_rows() {
+        let live = vec![ExpandedModelEntry::new(
+            "openai-codex/o3".into(),
+            "o3".into(),
+            false,
+        )];
+        assert!(
+            catalog_override_rows("openai-codex", &live).is_empty(),
+            "openai-codex override rows must be empty (static slugs are hardcoded)"
+        );
+        let anthropic = vec![ExpandedModelEntry::new(
+            "anthropic/claude-sonnet-4-7".into(),
+            "Sonnet 4.7".into(),
+            false,
+        )];
+        assert_eq!(
+            catalog_override_rows("anthropic", &anthropic),
+            vec![("claude-sonnet-4-7".to_string(), "Sonnet 4.7".to_string())],
+            "anthropic dynamic override rows must keep working"
+        );
     }
 }

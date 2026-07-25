@@ -8,27 +8,27 @@
 //! (disable-list filtering), `registry` (command registry with collision
 //! handling), `tool` (the `load_skill` tool implementation).
 
-pub mod manifest;
-pub mod loader;
+pub mod commands;
 pub mod config;
-pub mod registry;
-pub mod tool;
-pub mod state;
-pub mod marketplace;
-pub mod plugin_index;
-pub mod update_diff;
 pub mod install;
 pub mod keybinds;
-pub mod commands;
-pub mod trust;
+pub mod loader;
+pub mod manifest;
+pub mod marketplace;
+pub mod plugin_index;
 pub mod post_install;
+pub mod registry;
+pub mod state;
+pub mod tool;
+pub mod trust;
+pub mod update_diff;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::extensions::manifest::ExtensionManifest;
 use crate::skills::registry::CommandRegistry;
 use crate::skills::tool::LoadSkillTool;
-use crate::extensions::manifest::ExtensionManifest;
 
 /// A plugin discovered during skill loading.
 #[derive(Debug, Clone)]
@@ -42,23 +42,194 @@ pub struct Plugin {
     pub manifest: Option<manifest::PluginManifest>,
 }
 
-/// A skill discovered during loading.
-#[derive(Debug, Clone)]
+/// A skill discovered during loading. Boot discovery holds ONLY bounded
+/// metadata — the body stays on disk behind an immutable fingerprint and
+/// is read, verified, substituted, and returned exclusively by
+/// [`LoadedSkill::load_body`] at exact selection time.
+#[derive(Clone)]
 pub struct LoadedSkill {
     pub name: String,
     pub description: String,
-    pub body: String,           // post-{baseDir} substitution
+    /// Body source — NEVER the body itself at boot. Private: all access
+    /// flows through [`Self::load_body`].
+    pub(crate) source: SkillSource,
     pub plugin: Option<String>, // None for loose skills
     pub base_dir: PathBuf,      // absolute
     pub source_path: PathBuf,   // absolute path to SKILL.md
 }
 
+/// Redacted Debug (Task 21 security review): bounded identity only — no
+/// source paths, no base dir, no body, no fingerprint material — so a
+/// stray debug/log rendering of boot metadata can never leak filesystem
+/// layout or content.
+impl std::fmt::Debug for LoadedSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSkill")
+            .field("name", &agent_core::BoundedText::new(&self.name, 128).text)
+            .field(
+                "plugin",
+                &self
+                    .plugin
+                    .as_deref()
+                    .map(|p| agent_core::BoundedText::new(p, 128).text),
+            )
+            .field("description_len", &self.description.len())
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a skill body comes from. Debug is redacted: no body content, no
+/// fingerprint material.
+#[derive(Clone)]
+pub(crate) enum SkillSource {
+    /// Body held in memory (test constructors; no verification needed).
+    Inline(String),
+    /// Lazy on-disk body: re-read + fingerprint-verified at selection.
+    Lazy {
+        fingerprint: loader::SkillFingerprint,
+        /// Plugin root for ${CLAUDE_PLUGIN_ROOT} substitution.
+        plugin_root: Option<PathBuf>,
+    },
+}
+
+impl std::fmt::Debug for SkillSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(_) => f.debug_struct("Inline").finish_non_exhaustive(),
+            Self::Lazy { .. } => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl LoadedSkill {
+    /// Test/compat constructor with an in-memory body.
+    pub fn new_inline(
+        name: &str,
+        description: &str,
+        body: &str,
+        plugin: Option<&str>,
+        base_dir: PathBuf,
+        source_path: PathBuf,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: SkillSource::Inline(body.to_string()),
+            plugin: plugin.map(str::to_string),
+            base_dir,
+            source_path,
+        }
+    }
+}
+
+// ── Stable skill identities (Task 17, spec §7.2/§7.6 boundary) ──────────────
+
+/// Byte budget for one encoded skill-id segment.
+const SKILL_ID_SEGMENT_MAX_BYTES: usize = 64;
+/// Reserved marker for hex-encoded non-canonical segments.
+const SKILL_ID_ENCODED_PREFIX: &str = "enc-";
+/// Reserved marker for digest-compressed oversized segments.
+const SKILL_ID_DIGEST_PREFIX: &str = "sha-";
+/// Hex characters kept from the SHA-256 of an oversized segment (160 bits).
+const SKILL_ID_DIGEST_HEX_LEN: usize = 40;
+
+fn skill_segment_is_canonical(segment: &str) -> bool {
+    if segment.is_empty() || segment.len() > SKILL_ID_SEGMENT_MAX_BYTES {
+        return false;
+    }
+    let mut chars = segment.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Deterministic, injective, bounded encoding of one raw identity segment
+/// (mirrors the `ToolId` segment strategy): canonical lowercase segments
+/// pass through verbatim; anything else becomes `enc-<hex>`; oversized
+/// encodings compress to `sha-<truncated sha256>`. Two distinct raw
+/// spellings can never collapse into one encoded segment.
+fn encode_skill_segment(raw: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    if skill_segment_is_canonical(raw)
+        && !raw.starts_with(SKILL_ID_ENCODED_PREFIX)
+        && !raw.starts_with(SKILL_ID_DIGEST_PREFIX)
+    {
+        return raw.to_string();
+    }
+    let mut hex = String::with_capacity(raw.len() * 2);
+    for byte in raw.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let encoded = format!("{SKILL_ID_ENCODED_PREFIX}{hex}");
+    if encoded.len() <= SKILL_ID_SEGMENT_MAX_BYTES {
+        return encoded;
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut digest_hex = String::with_capacity(SKILL_ID_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SKILL_ID_DIGEST_HEX_LEN / 2) {
+        use std::fmt::Write as _;
+        let _ = write!(digest_hex, "{byte:02x}");
+    }
+    format!("{SKILL_ID_DIGEST_PREFIX}{digest_hex}")
+}
+
+/// Stable model-facing identity of one skill (Task 17): deterministic and
+/// alias-safe per exact (plugin, name) pair, bounded, and free of source
+/// paths. Plugin skills use the `skill.<plugin>:<name>` namespace; loose
+/// skills use `skill:<name>` — the namespaces cannot collide, so a loose
+/// skill spelling a qualified name can never impersonate a plugin skill.
+pub fn stable_skill_id(skill: &LoadedSkill) -> String {
+    match &skill.plugin {
+        Some(plugin) => format!(
+            "skill.{}:{}",
+            encode_skill_segment(plugin),
+            encode_skill_segment(&skill.name)
+        ),
+        None => format!("skill:{}", encode_skill_segment(&skill.name)),
+    }
+}
+
+/// True when a `load_skill` input is spelled in the stable skill-id
+/// namespace (and should therefore resolve by exact id, not legacy names).
+pub(crate) fn looks_like_stable_skill_id(raw: &str) -> bool {
+    raw.strip_prefix("skill")
+        .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('.'))
+}
+
 /// Built-in command names. Keep in sync with the match in
 /// `src/chatui/commands.rs::handle_command`.
 pub const BUILTIN_COMMANDS: &[&str] = &[
-    "clear", "compact", "chain", "model", "models", "system", "thinking", "sessions",
-    "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
-    "settings", "plugins", "extensions", "status", "stats", "ping", "keybinds",
+    "clear",
+    "compact",
+    "chain",
+    "model",
+    "models",
+    "system",
+    "thinking",
+    "effort",
+    "sessions",
+    "resume",
+    "saveas",
+    "theme",
+    "gamba",
+    "help",
+    "quit",
+    "exit",
+    "settings",
+    "plugins",
+    "extensions",
+    "status",
+    "stats",
+    "context",
+    "trace",
+    "memory",
+    "ping",
+    "keybinds",
     "sidecar",
 ];
 
@@ -68,15 +239,17 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
-) -> (Arc<CommandRegistry>, Arc<std::sync::RwLock<keybinds::KeybindRegistry>>) {
+) -> (
+    Arc<CommandRegistry>,
+    Arc<std::sync::RwLock<keybinds::KeybindRegistry>>,
+) {
     // The fs-walk (read_dir + read_to_string + canonicalize across multiple roots)
     // is fully synchronous std::fs; do it on a blocking pool so we don't park a
     // tokio worker during boot. Behavior is identical — same inputs, same output.
-    let (mut plugins, mut skills) = tokio::task::spawn_blocking(|| {
-        loader::load_all(&loader::default_roots())
-    })
-    .await
-    .expect("skills::loader::load_all panicked");
+    let (mut plugins, mut skills) =
+        tokio::task::spawn_blocking(|| loader::load_all(&loader::default_roots()))
+            .await
+            .expect("skills::loader::load_all panicked");
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
 
     // Filter disabled plugins from commands, keybinds, and help too — not just skills
@@ -123,9 +296,19 @@ pub async fn register(
     overrides.insert(sidecar_key, "/sidecar toggle".to_string());
     kb_registry.register_user(&overrides);
 
-    let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
+    let registry = Arc::new(CommandRegistry::new_with_plugins(
+        BUILTIN_COMMANDS,
+        skills,
+        plugins,
+    ));
     let tool = LoadSkillTool::new(registry.clone());
-    tools.write().await.register(Arc::new(tool));
+    {
+        let mut tools = tools.write().await;
+        tools.register(Arc::new(tool));
+        // Task 17: bounded skill discovery beside load_skill (stable IDs +
+        // compact descriptions only; no bodies, no source paths).
+        tools.register(Arc::new(tool::SearchSkillsTool::new(registry.clone())));
+    }
     (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
 }
 

@@ -56,18 +56,22 @@ impl ProviderRegistry {
         if self.providers.contains_key(&runtime_id) {
             return Err(format!("provider '{}' is already registered", runtime_id));
         }
-        self.providers.insert(runtime_id.clone(), RegisteredProvider {
-            plugin_id: plugin_id.to_string(),
-            provider_id: spec.id.clone(),
-            runtime_id: runtime_id.clone(),
-            spec,
-            handler,
-        });
+        self.providers.insert(
+            runtime_id.clone(),
+            RegisteredProvider {
+                plugin_id: plugin_id.to_string(),
+                provider_id: spec.id.clone(),
+                runtime_id: runtime_id.clone(),
+                spec,
+                handler,
+            },
+        );
         Ok(runtime_id)
     }
 
     pub fn unregister_plugin(&mut self, plugin_id: &str) {
-        self.providers.retain(|_, provider| provider.plugin_id != plugin_id);
+        self.providers
+            .retain(|_, provider| provider.plugin_id != plugin_id);
     }
 
     pub fn get(&self, runtime_id: &str) -> Option<&RegisteredProvider> {
@@ -93,7 +97,11 @@ impl ProviderRegistry {
         let plugin_id = parts.next()?;
         let provider_id = parts.next()?;
         let model_id = parts.next()?;
-        if parts.next().is_some() || plugin_id.is_empty() || provider_id.is_empty() || model_id.is_empty() {
+        if parts.next().is_some()
+            || plugin_id.is_empty()
+            || provider_id.is_empty()
+            || model_id.is_empty()
+        {
             return None;
         }
         Some((plugin_id, provider_id, model_id))
@@ -114,10 +122,22 @@ impl ProviderRegistry {
                     .models
                     .iter()
                     .map(|model| RegisteredProviderModelSummary {
-                        runtime_id: Self::model_runtime_id(&provider.plugin_id, &provider.provider_id, &model.id),
+                        runtime_id: Self::model_runtime_id(
+                            &provider.plugin_id,
+                            &provider.provider_id,
+                            &model.id,
+                        ),
                         display_name: model.display_name.clone(),
-                        tool_use: model.capabilities.get("tool_use").and_then(|v| v.as_bool()).unwrap_or(false),
-                        streaming: model.capabilities.get("streaming").and_then(|v| v.as_bool()).unwrap_or(false),
+                        tool_use: model
+                            .capabilities
+                            .get("tool_use")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        streaming: model
+                            .capabilities
+                            .get("streaming")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         context_window: model.context_window,
                     })
                     .collect(),
@@ -143,35 +163,42 @@ mod tests {
     #[test]
     fn summaries_include_model_tool_use_capability_and_context_metadata() {
         let mut spec = spec("local");
-        spec.models = vec![crate::extensions::runtime::process::RegisteredProviderModelSpec {
-            id: "model-a".to_string(),
-            display_name: Some("Model A".to_string()),
-            capabilities: serde_json::json!({"tool_use": true, "streaming": true}),
-            context_window: Some(8192),
-        }];
+        spec.models = vec![
+            crate::extensions::runtime::process::RegisteredProviderModelSpec {
+                id: "model-a".to_string(),
+                display_name: Some("Model A".to_string()),
+                capabilities: serde_json::json!({"tool_use": true, "streaming": true}),
+                context_window: Some(8192),
+            },
+        ];
         let mut registry = ProviderRegistry::new();
         registry.register("plugin", spec).unwrap();
 
         let summaries = registry.summaries();
 
-        assert_eq!(summaries[0].models, vec![RegisteredProviderModelSummary {
-            runtime_id: "plugin:local:model-a".to_string(),
-            display_name: Some("Model A".to_string()),
-            tool_use: true,
-            streaming: true,
-            context_window: Some(8192),
-        }]);
+        assert_eq!(
+            summaries[0].models,
+            vec![RegisteredProviderModelSummary {
+                runtime_id: "plugin:local:model-a".to_string(),
+                display_name: Some("Model A".to_string()),
+                tool_use: true,
+                streaming: true,
+                context_window: Some(8192),
+            }]
+        );
     }
 
     #[test]
     fn summaries_default_streaming_to_false_when_capability_absent() {
         let mut spec = spec("local");
-        spec.models = vec![crate::extensions::runtime::process::RegisteredProviderModelSpec {
-            id: "model-b".to_string(),
-            display_name: None,
-            capabilities: serde_json::json!({}),
-            context_window: None,
-        }];
+        spec.models = vec![
+            crate::extensions::runtime::process::RegisteredProviderModelSpec {
+                id: "model-b".to_string(),
+                display_name: None,
+                capabilities: serde_json::json!({}),
+                context_window: None,
+            },
+        ];
         let mut registry = ProviderRegistry::new();
         registry.register("plugin", spec).unwrap();
 
@@ -216,7 +243,10 @@ mod tests {
             ProviderRegistry::parse_model_id("plugin:local:model-a"),
             Some(("plugin", "local", "model-a"))
         );
-        assert_eq!(ProviderRegistry::model_runtime_id("plugin", "local", "model-a"), "plugin:local:model-a");
+        assert_eq!(
+            ProviderRegistry::model_runtime_id("plugin", "local", "model-a"),
+            "plugin:local:model-a"
+        );
         assert!(ProviderRegistry::parse_model_id("plugin:local").is_none());
         assert!(ProviderRegistry::parse_model_id("plugin:local:model:extra").is_none());
     }

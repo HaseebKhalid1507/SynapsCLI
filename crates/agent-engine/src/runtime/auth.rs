@@ -1,9 +1,12 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use super::types::AuthState;
+use crate::auth::{
+    broker_from_source, is_expired_with_margin, CredentialSource, OAuthProviderId, TokenCache,
+    DEFAULT_MARGIN_MS,
+};
 use crate::{Result, RuntimeError};
 use reqwest::Client;
-use crate::auth::{BrokerClient, CredentialSource, TokenCache, resolve_remote, is_expired_with_margin, DEFAULT_MARGIN_MS};
-use super::types::{AuthState, PiAuth};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub(super) struct AuthMethods;
 
@@ -13,11 +16,8 @@ pub(super) struct AuthMethods;
 /// Anthropic token first is wasteful and would FAIL on a codex-only Remote
 /// broker. (#158 C4/#7)
 pub(super) fn model_is_anthropic(model: &str) -> bool {
-    let keys = crate::core::config::get_provider_keys();
-    matches!(
-        crate::runtime::openai::resolve_route(model, &keys),
-        crate::runtime::openai::Provider::Anthropic
-    )
+    crate::runtime::openai::resolve_route(model)
+        .is_some_and(|route| route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages)
 }
 
 impl AuthMethods {
@@ -33,148 +33,66 @@ impl AuthMethods {
         s.token_expires = None;
     }
 
-    /// Check if the OAuth token is expired and refresh it if needed.
+    /// Check if the Anthropic access token is expired and re-vend it through
+    /// the credential broker if needed.
     ///
-    /// Two credential sources:
-    /// - `Remote` (#157): fetch a short-lived access token from the broker.
-    ///   Independent of the local auth.json. NEVER holds a refresh token,
-    ///   NEVER writes auth.json, NEVER refreshes client-side.
-    /// - `Local` (default): the original Pi-style file-locked refresh below.
-    ///
-    /// Local path detail (unchanged):
-    /// - Acquires exclusive lock on auth.json
-    /// - Re-reads inside the lock (another instance may have refreshed)
-    /// - Refreshes via API only if still expired
-    /// - Writes back atomically and releases lock
-    ///
-    /// Multiple SynapsCLI instances (or Avante/Jade) can safely call this
-    /// simultaneously — they'll serialize on the lock and only one will
-    /// actually hit the token endpoint.
+    /// One path for both sources: `broker_from_source` yields the in-process
+    /// `LocalBroker` (single-flight refresh + atomic auth.json persistence
+    /// behind the boundary) or the authenticated `RemoteBroker`. In BOTH cases
+    /// this layer receives an access token + expiry only and never holds a
+    /// refresh token — there is no direct-read fallback.
     pub(super) async fn refresh_if_needed(
         auth: Arc<RwLock<AuthState>>,
         client: &Client,
         source: &CredentialSource,
         cache: &TokenCache,
     ) -> Result<()> {
-        // ── Remote credential source: resolve via the broker. ──
-        if let CredentialSource::Remote { endpoint, machine_token } = source {
-            // Fast path: in-memory broker token still outside the refetch margin?
-            // Must use the SAME predicate as the cache (is_expired_with_margin +
-            // DEFAULT_MARGIN_MS) so the fast-path and TokenCache agree on freshness
-            // — otherwise the fast-path serves a token the cache would refetch,
-            // and a >margin tool step can expire it mid-flight (board finding #1).
-            {
-                let auth_guard = auth.read().await;
-                if let Some(exp) = auth_guard.token_expires {
-                    if !auth_guard.auth_token.is_empty()
-                        && !is_expired_with_margin(exp, DEFAULT_MARGIN_MS)
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-            // Reuse the runtime's shared reqwest::Client (shared connection
-            // pool) instead of building a fresh one per refresh. (#158 A5)
-            let broker = BrokerClient::with_client(endpoint.clone(), machine_token.clone(), client.clone());
-            let tok = resolve_remote(&broker, cache, "anthropic", DEFAULT_MARGIN_MS)
-                .await
-                .map_err(|e| RuntimeError::Auth(format!(
-                    "Broker token fetch failed: {}. Check auth.remote_endpoint, the machine token, and broker reachability.", e
-                )))?;
-            let mut auth_guard = auth.write().await;
-            auth_guard.auth_token = tok.access_token;
-            auth_guard.auth_type = "oauth".to_string();
-            auth_guard.refresh_token = None; // invariant: clients never hold a refresh token
-            auth_guard.token_expires = Some(tok.expires);
-            return Ok(());
-        }
-
-        // ── Local credential source (default — unchanged behavior). ──
-        // Fast path: read lock to check expiry without blocking writers
+        // Fast path: in-memory token still fresh?
         {
             let auth_guard = auth.read().await;
-            if auth_guard.auth_type != "oauth" {
+            // A non-OAuth local auth mode (e.g. a stubbed api_key harness)
+            // never contacts the broker. Remote sources always resolve via
+            // the broker regardless of the seeded auth_type.
+            if !source.is_remote() && auth_guard.auth_type != "oauth" {
                 return Ok(());
             }
-
-            let in_memory_expired = match auth_guard.token_expires {
-                Some(exp) => {
-                    let now = crate::epoch_millis();
-                    now >= exp
+            if let Some(exp) = auth_guard.token_expires {
+                let still_fresh = if source.is_remote() {
+                    // Must use the SAME predicate as the remote cache
+                    // (is_expired_with_margin + DEFAULT_MARGIN_MS) so the
+                    // fast-path and TokenCache agree on freshness (board #1).
+                    !auth_guard.auth_token.is_empty()
+                        && !is_expired_with_margin(exp, DEFAULT_MARGIN_MS)
+                } else {
+                    !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp
+                };
+                if still_fresh {
+                    return Ok(());
                 }
-                None => false,
-            };
-
-            if !in_memory_expired {
-                return Ok(());
             }
         }
         // Read lock dropped here
 
-        tracing::info!("Token needs refresh, checking...");
-
-        // Slow path: delegate to auth.rs which handles locking, re-read,
-        // conditional refresh, and persistence.
-        tracing::info!("Refreshing auth token");
-        let creds = crate::auth::ensure_fresh_token(client)
+        tracing::info!("Refreshing auth token via credential broker");
+        let broker = broker_from_source(source, cache, client.clone());
+        let tok = broker
+            .access_token(OAuthProviderId::Anthropic)
             .await
             .map_err(|e| RuntimeError::Auth(format!(
-                "Token refresh failed: {}. Run `synaps login` to re-authenticate.", e
+                "Token refresh failed: {}. Run `synaps login` to re-authenticate, or check auth.remote_endpoint / broker reachability.", e
             )))?;
 
-        // Update shared auth state so all clones (including spawned stream tasks)
-        // immediately see the fresh token.
+        // Update shared auth state so all clones (including spawned stream
+        // tasks) immediately see the fresh token. Never a refresh token.
         {
             let mut auth_guard = auth.write().await;
-            auth_guard.auth_token = creds.access;
-            auth_guard.refresh_token = Some(creds.refresh);
-            auth_guard.token_expires = Some(creds.expires);
+            auth_guard.auth_token = tok.token;
+            auth_guard.auth_type = "oauth".to_string();
+            auth_guard.refresh_token = None;
+            auth_guard.token_expires = Some(tok.expires);
         }
 
         Ok(())
-    }
-    
-    pub(super) fn get_auth_token() -> Result<(String, String, Option<String>, Option<u64>)> {
-        // Try auth.json via the auth module
-        if let Ok(Some(auth_file)) = crate::auth::load_auth() {
-            let creds = &auth_file.anthropic;
-            if creds.auth_type == "oauth" && !creds.access.is_empty() {
-                return Ok((
-                    creds.access.clone(),
-                    "oauth".to_string(),
-                    Some(creds.refresh.clone()),
-                    Some(creds.expires),
-                ));
-            }
-        }
-
-        // Legacy: try the old PiAuth struct format (in case auth.json has optional fields)
-        let auth_path = crate::config::resolve_read_path("auth.json");
-
-        if auth_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&auth_path) {
-                if let Ok(auth) = serde_json::from_str::<PiAuth>(&content) {
-                    let creds = &auth.anthropic;
-                    if let (true, Some(access)) = (creds.auth_type == "oauth", creds.access.as_ref()) {
-                        return Ok((
-                            access.clone(),
-                            "oauth".to_string(),
-                            creds.refresh.clone(),
-                            creds.expires,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Fall back to env var
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            return Ok((api_key, "api_key".to_string(), None, None));
-        }
-        
-        // No Anthropic credentials — allow startup anyway for non-Anthropic providers.
-        // Auth will fail lazily on the first actual Anthropic API call.
-        Ok(("".to_string(), "none".to_string(), None, None))
     }
 }
 #[cfg(test)]
@@ -206,7 +124,10 @@ mod tests {
     #[tokio::test]
     async fn remote_source_fetches_and_populates_auth_state() {
         let url = spawn_broker(r#"{"access_token":"sk-broker-xyz","expires":9999999999999}"#).await;
-        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let source = CredentialSource::Remote {
+            endpoint: url,
+            machine_token: "m".into(),
+        };
         let cache = TokenCache::new();
         let auth = empty_auth();
         AuthMethods::refresh_if_needed(Arc::clone(&auth), &Client::new(), &source, &cache)
@@ -215,14 +136,20 @@ mod tests {
         let g = auth.read().await;
         assert_eq!(g.auth_token, "sk-broker-xyz");
         assert_eq!(g.auth_type, "oauth");
-        assert_eq!(g.refresh_token, None, "Remote must clear any refresh token (invariant)");
+        assert_eq!(
+            g.refresh_token, None,
+            "Remote must clear any refresh token (invariant)"
+        );
         assert_eq!(g.token_expires, Some(9_999_999_999_999));
     }
 
     #[tokio::test]
     async fn remote_source_fast_path_when_token_still_fresh() {
         let url = spawn_broker(r#"{"access_token":"sk-1","expires":9999999999999}"#).await;
-        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let source = CredentialSource::Remote {
+            endpoint: url,
+            machine_token: "m".into(),
+        };
         let cache = TokenCache::new();
         let auth = empty_auth();
         // First call fetches + sets a far-future expiry.
@@ -241,7 +168,10 @@ mod tests {
         // AuthState holds a token that is valid but within the 5-min refetch
         // margin. The fast path must NOT serve it — it must refetch (board #1).
         let url = spawn_broker(r#"{"access_token":"sk-FRESH","expires":9999999999999}"#).await;
-        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let source = CredentialSource::Remote {
+            endpoint: url,
+            machine_token: "m".into(),
+        };
         let cache = TokenCache::new();
         let near = crate::epoch_millis() + 2 * 60 * 1000; // 2 min — inside the 5-min margin
         let auth = Arc::new(RwLock::new(AuthState {
@@ -290,8 +220,17 @@ mod tests {
         };
         AuthMethods::scrub_for_remote(&mut s);
         assert!(s.auth_token.is_empty(), "access token must be cleared");
-        assert_eq!(s.refresh_token, None, "refresh token must be dropped (invariant 1)");
-        assert_eq!(s.token_expires, None, "expiry must be cleared to force a broker fetch");
-        assert_eq!(s.auth_type, "oauth", "auth_type stays oauth so Local early-return is skipped");
+        assert_eq!(
+            s.refresh_token, None,
+            "refresh token must be dropped (invariant 1)"
+        );
+        assert_eq!(
+            s.token_expires, None,
+            "expiry must be cleared to force a broker fetch"
+        );
+        assert_eq!(
+            s.auth_type, "oauth",
+            "auth_type stays oauth so Local early-return is skipped"
+        );
     }
 }

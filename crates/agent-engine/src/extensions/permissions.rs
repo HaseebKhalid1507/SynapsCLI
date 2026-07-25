@@ -29,6 +29,12 @@ pub enum Permission {
     ToolsRegister,
     /// Can register new providers.
     ProvidersRegister,
+    /// Can declare dormant memory/context contribution providers
+    /// (continuous-memory spec §7.1). Distinct from `ProvidersRegister`
+    /// (model/LLM providers): this gates only passive context-provider
+    /// capability metadata; activation additionally requires an exact
+    /// memory-context lease (task A6).
+    ContextProvidersRegister,
     /// Can read from the local memory store via `memory.query`.
     MemoryRead,
     /// Can append to the local memory store via `memory.append`.
@@ -54,6 +60,7 @@ impl Permission {
             Self::SessionLifecycle => "session.lifecycle",
             Self::ToolsRegister => "tools.register",
             Self::ProvidersRegister => "providers.register",
+            Self::ContextProvidersRegister => "context_providers.register",
             Self::MemoryRead => "memory.read",
             Self::MemoryWrite => "memory.write",
             Self::ConfigWrite => "config.write",
@@ -73,6 +80,7 @@ impl Permission {
             "session.lifecycle" => Some(Self::SessionLifecycle),
             "tools.register" => Some(Self::ToolsRegister),
             "providers.register" => Some(Self::ProvidersRegister),
+            "context_providers.register" => Some(Self::ContextProvidersRegister),
             "memory.read" => Some(Self::MemoryRead),
             "memory.write" => Some(Self::MemoryWrite),
             "config.write" => Some(Self::ConfigWrite),
@@ -84,10 +92,7 @@ impl Permission {
     }
     /// Whether this permission is reserved for a future implementation.
     pub fn is_reserved(&self) -> bool {
-        matches!(
-            self,
-            Self::ToolsOverride
-        )
+        matches!(self, Self::ToolsOverride)
     }
 }
 
@@ -162,9 +167,18 @@ mod tests {
 
     #[test]
     fn parse_valid_permissions() {
-        assert_eq!(Permission::parse("tools.intercept"), Some(Permission::ToolsIntercept));
-        assert_eq!(Permission::parse("privacy.llm_content"), Some(Permission::LlmContent));
-        assert_eq!(Permission::parse("session.lifecycle"), Some(Permission::SessionLifecycle));
+        assert_eq!(
+            Permission::parse("tools.intercept"),
+            Some(Permission::ToolsIntercept)
+        );
+        assert_eq!(
+            Permission::parse("privacy.llm_content"),
+            Some(Permission::LlmContent)
+        );
+        assert_eq!(
+            Permission::parse("session.lifecycle"),
+            Some(Permission::SessionLifecycle)
+        );
     }
 
     #[test]
@@ -215,8 +229,14 @@ mod tests {
 
     #[test]
     fn memory_permissions_parse_and_are_not_reserved() {
-        assert_eq!(Permission::parse("memory.read"), Some(Permission::MemoryRead));
-        assert_eq!(Permission::parse("memory.write"), Some(Permission::MemoryWrite));
+        assert_eq!(
+            Permission::parse("memory.read"),
+            Some(Permission::MemoryRead)
+        );
+        assert_eq!(
+            Permission::parse("memory.write"),
+            Some(Permission::MemoryWrite)
+        );
         assert!(!Permission::MemoryRead.is_reserved());
         assert!(!Permission::MemoryWrite.is_reserved());
         let perms = PermissionSet::try_from_strings(&[
@@ -230,8 +250,14 @@ mod tests {
 
     #[test]
     fn audio_permissions_parse_and_are_not_reserved() {
-        assert_eq!(Permission::parse("audio.input"), Some(Permission::AudioInput));
-        assert_eq!(Permission::parse("audio.output"), Some(Permission::AudioOutput));
+        assert_eq!(
+            Permission::parse("audio.input"),
+            Some(Permission::AudioInput)
+        );
+        assert_eq!(
+            Permission::parse("audio.output"),
+            Some(Permission::AudioOutput)
+        );
         assert!(!Permission::AudioInput.is_reserved());
         assert!(!Permission::AudioOutput.is_reserved());
         let perms = PermissionSet::try_from_strings(&[
@@ -244,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn context_providers_register_parses_and_is_not_reserved() {
+        assert_eq!(
+            Permission::parse("context_providers.register"),
+            Some(Permission::ContextProvidersRegister)
+        );
+        assert!(!Permission::ContextProvidersRegister.is_reserved());
+        let perms =
+            PermissionSet::try_from_strings(&["context_providers.register".to_string()]).unwrap();
+        assert!(perms.has(Permission::ContextProvidersRegister));
+        // Distinct from the model/LLM provider permission.
+        assert!(!perms.has(Permission::ProvidersRegister));
+    }
+
+    #[test]
     fn round_trip_as_str() {
         for perm in [
             Permission::ToolsIntercept,
@@ -252,6 +292,7 @@ mod tests {
             Permission::SessionLifecycle,
             Permission::ToolsRegister,
             Permission::ProvidersRegister,
+            Permission::ContextProvidersRegister,
             Permission::MemoryRead,
             Permission::MemoryWrite,
             Permission::AudioInput,

@@ -815,6 +815,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1309,6 +1310,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -3002,6 +3012,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serial2"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3231,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "synaps"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3268,6 +3291,7 @@ dependencies = [
  "synaps-tui",
  "tempfile",
  "thiserror 1.0.69",
+ "tikv-jemallocator",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3284,18 +3308,22 @@ dependencies = [
 
 [[package]]
 name = "synaps-core"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "bytes",
  "chrono",
  "dirs",
  "fs4",
+ "futures",
+ "libc",
  "rand 0.9.4",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "sha2",
  "tempfile",
@@ -3312,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-engine"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3326,6 +3354,7 @@ dependencies = [
  "fs4",
  "futures",
  "globset",
+ "hmac",
  "libc",
  "memchr",
  "notify",
@@ -3339,6 +3368,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "synaps-core",
+ "synaps-engine",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3359,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-tui"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3370,7 +3400,6 @@ dependencies = [
  "futures",
  "parking_lot",
  "ratatui",
- "reqwest",
  "serde",
  "serde_json",
  "serial_test",
@@ -3594,6 +3623,26 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
@@ -4022,6 +4071,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

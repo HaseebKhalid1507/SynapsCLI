@@ -1,12 +1,34 @@
-use serde_json::{json, Value};
+use super::{expand_path, Tool, ToolContext};
 use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, expand_path};
+use serde_json::{json, Value};
 
 pub struct WriteTool;
 
 #[async_trait::async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &str { "write" }
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::IdempotentWrite
+    }
+
+    fn concurrency_key(
+        &self,
+        validated_input: &serde_json::Value,
+    ) -> Option<super::ConcurrencyKey> {
+        Some(
+            match super::util::canonical_path_key(validated_input["path"].as_str()?) {
+                Some(key) => super::ConcurrencyKey::Key(key),
+                None => super::ConcurrencyKey::Serialize,
+            },
+        )
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn name(&self) -> &str {
+        "write"
+    }
 
     fn description(&self) -> &str {
         "Create or overwrite a file with the given content. Creates parent directories if needed. Use this for creating new files or completely rewriting existing ones."
@@ -29,49 +51,70 @@ impl Tool for WriteTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let raw_path = params["path"].as_str()
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let raw_path = params["path"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
-        let content = params["content"].as_str()
+        let content = params["content"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing content parameter".to_string()))?;
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            if matches!(
+                orchestration.check_foreground_write(raw_path),
+                agent_core::orchestration::ScopeDecision::ReconciliationRequired { .. }
+            ) {
+                return Err(RuntimeError::Tool(
+                    "foreground write overlaps an active worker scope".into(),
+                ));
+            }
+        }
 
         let path = expand_path(raw_path);
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await
-                    .map_err(|e| RuntimeError::Tool(format!("Failed to create directories: {}", e)))?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    RuntimeError::Tool(format!("Failed to create directories: {}", e))
+                })?;
             }
         }
 
         // Preserve permissions if overwriting an existing file
-        let original_perms = tokio::fs::metadata(&path).await
+        let original_perms = tokio::fs::metadata(&path)
+            .await
             .map(|m| m.permissions())
             .ok();
 
         let tmp_path = path.with_extension("agent-tmp");
-        tokio::fs::write(&tmp_path, content).await
+        tokio::fs::write(&tmp_path, content)
+            .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
 
         if let Some(perms) = original_perms {
             let _ = tokio::fs::set_permissions(&tmp_path, perms).await;
         }
 
-        tokio::fs::rename(&tmp_path, &path).await
-            .map_err(|e| {
-                let tmp = tmp_path.clone();
-                tokio::spawn(async move { let _ = tokio::fs::remove_file(tmp).await; });
-                RuntimeError::Tool(format!("Failed to finalize write: {}", e))
-            })?;
+        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+            let tmp = tmp_path.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(tmp).await;
+            });
+            RuntimeError::Tool(format!("Failed to finalize write: {}", e))
+        })?;
 
         let line_count = content.lines().count();
-        Ok(format!("Wrote {} lines ({} bytes) to {}", line_count, content.len(), path.display()))
+        Ok(format!(
+            "Wrote {} lines ({} bytes) to {}",
+            line_count,
+            content.len(),
+            path.display()
+        ))
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::create_tool_context;
+    use super::*;
     use crate::tools::Tool;
     use serde_json::json;
 

@@ -53,7 +53,9 @@ impl PluginPermissionSummary {
 }
 
 pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary {
-    let has_setup_script = plugin.manifest.as_ref()
+    let has_setup_script = plugin
+        .manifest
+        .as_ref()
         .and_then(|m| m.provides.as_ref())
         .and_then(|p| p.sidecar.as_ref())
         .and_then(|s| s.setup.as_ref())
@@ -101,14 +103,20 @@ pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary 
         permissions,
         hooks,
         config_keys,
-        command: Some(format!("{} {}", extension.command, extension.args.join(" ")).trim().to_string()),
+        command: Some(
+            format!("{} {}", extension.command, extension.args.join(" "))
+                .trim()
+                .to_string(),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::manifest::{ExtensionConfigEntry, ExtensionManifest, ExtensionRuntime, HookSubscription};
+    use crate::extensions::manifest::{
+        ExtensionConfigEntry, ExtensionManifest, ExtensionRuntime, HookSubscription,
+    };
     use std::path::PathBuf;
 
     fn plugin(extension: Option<ExtensionManifest>) -> Plugin {
@@ -127,20 +135,27 @@ mod tests {
     fn summary_is_empty_without_extension() {
         let summary = summarize_plugin_permissions(&plugin(None));
         assert!(summary.is_empty());
-        assert_eq!(summary.lines(), vec!["no executable extension or extension permissions declared"]);
+        assert_eq!(
+            summary.lines(),
+            vec!["no executable extension or extension permissions declared"]
+        );
     }
 
     #[test]
     fn summary_lists_permissions_hooks_and_required_config() {
         let summary = summarize_plugin_permissions(&plugin(Some(ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
             args: vec!["ext.py".to_string()],
-            permissions: vec!["tools.intercept".to_string(), "privacy.llm_content".to_string()],
+            permissions: vec![
+                "tools.intercept".to_string(),
+                "privacy.llm_content".to_string(),
+            ],
             hooks: vec![HookSubscription {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
@@ -153,13 +168,20 @@ mod tests {
                 required: true,
                 default: None,
                 secret_env: Some("API_KEY".to_string()),
+                host_context: None,
             }],
         })));
 
         assert!(summary.has_executable_extension);
-        assert_eq!(summary.permissions, vec!["privacy.llm_content", "tools.intercept"]);
+        assert_eq!(
+            summary.permissions,
+            vec!["privacy.llm_content", "tools.intercept"]
+        );
         assert_eq!(summary.hooks, vec!["before_tool_call(bash)"]);
         assert_eq!(summary.config_keys, vec!["api_key [required]"]);
-        assert!(summary.lines().iter().any(|line| line.contains("permissions: privacy.llm_content, tools.intercept")));
+        assert!(summary
+            .lines()
+            .iter()
+            .any(|line| line.contains("permissions: privacy.llm_content, tools.intercept")));
     }
 }

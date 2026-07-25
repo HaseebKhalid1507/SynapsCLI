@@ -44,9 +44,8 @@ pub fn load_trust_state() -> Result<ProviderTrustState, String> {
 pub(crate) fn load_trust_state_from(base: &Path) -> Result<ProviderTrustState, String> {
     let path = trust_file_path_for(base);
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).map_err(|e| {
-            format!("failed to parse trust.json at {}: {}", path.display(), e)
-        }),
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|e| format!("failed to parse trust.json at {}: {}", path.display(), e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProviderTrustState::default()),
         Err(e) => Err(format!(
             "failed to read trust.json at {}: {}",
@@ -64,24 +63,21 @@ pub fn save_trust_state(state: &ProviderTrustState) -> Result<(), String> {
 /// Persist state under an explicit base dir.
 pub(crate) fn save_trust_state_to(base: &Path, state: &ProviderTrustState) -> Result<(), String> {
     let path = trust_file_path_for(base);
-    let parent = path.parent().ok_or_else(|| {
-        format!("trust.json path has no parent: {}", path.display())
-    })?;
-    std::fs::create_dir_all(parent).map_err(|e| {
-        format!("failed to create dir {}: {}", parent.display(), e)
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("trust.json path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
     let serialized = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize trust state: {}", e))?;
 
     // Atomic write: write to a unique temp file in the same directory then rename.
     // Using tempfile::NamedTempFile avoids trampling when concurrent writers hit
     // the same target path.
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
-        format!("failed to create temp file in {}: {}", parent.display(), e)
-    })?;
-    std::fs::write(tmp.path(), serialized.as_bytes()).map_err(|e| {
-        format!("failed to write {}: {}", tmp.path().display(), e)
-    })?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("failed to create temp file in {}: {}", parent.display(), e))?;
+    std::fs::write(tmp.path(), serialized.as_bytes())
+        .map_err(|e| format!("failed to write {}: {}", tmp.path().display(), e))?;
     // fsync before rename so data is durable on power loss
     std::fs::File::open(tmp.path())
         .and_then(|f| f.sync_all())
@@ -107,11 +103,7 @@ pub fn is_provider_enabled(state: &ProviderTrustState, runtime_id: &str) -> bool
 }
 
 /// Record a disabled decision. Replaces any existing entry for the runtime_id.
-pub fn disable_provider(
-    state: &mut ProviderTrustState,
-    runtime_id: &str,
-    reason: Option<String>,
-) {
+pub fn disable_provider(state: &mut ProviderTrustState, runtime_id: &str, reason: Option<String>) {
     state.disabled.insert(
         runtime_id.to_string(),
         ProviderTrustEntry {
@@ -194,7 +186,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ this is not json").unwrap();
         let err = load_trust_state_from(dir.path()).unwrap_err();
-        assert!(err.contains("trust.json"), "error should mention trust.json: {}", err);
+        assert!(
+            err.contains("trust.json"),
+            "error should mention trust.json: {}",
+            err
+        );
     }
 
     #[test]

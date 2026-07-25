@@ -1,0 +1,1 @@
+{"max_tokens":64000,"messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":[{"cache_control":{"type":"ephemeral"},"text":"And of Japan?","type":"text"}],"role":"user"}],"model":"claude-sonnet-4-5-20250929","stream":true,"tools":[]}

@@ -34,6 +34,25 @@ const BUILTIN_THEMES: &[&str] = &[
     "lavender",
 ];
 
+/// Compute the thinking level options for `model_runtime_id`.
+///
+/// Delegates to the shared engine derivation
+/// (`catalog::validation::thinking_options_for_model`): exact capability
+/// cache (live catalog) first, then exact static descriptor tables, for
+/// `openai-codex/<id>`, `anthropic/<id>` (and bare `claude-*`), and
+/// `xai-auth/<id>`. Providers without authoritative metadata keep the
+/// conservative set and NEVER gain max/ultra. No substring inference.
+pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
+    agent_engine::runtime::openai::catalog::validation::thinking_options_for_model(model)
+}
+
+/// Human-readable reasoning type for `model_runtime_id` — shared engine
+/// derivation (`catalog::validation::reasoning_type_for_model`), same exact
+/// capability sources as `thinking_options_for_model`.
+pub(crate) fn reasoning_type_for_model(model: &str) -> &'static str {
+    agent_engine::runtime::openai::catalog::validation::reasoning_type_for_model(model)
+}
+
 pub(crate) fn theme_options() -> Vec<String> {
     let mut opts: Vec<String> = BUILTIN_THEMES.iter().map(|s| s.to_string()).collect();
     if let Some(home) = std::env::var_os("HOME") {
@@ -76,7 +95,12 @@ pub(crate) struct RuntimeSnapshot {
     pub theme_name: String,
     pub plugins: Vec<PluginRow>,
     pub disabled_plugins: Vec<String>,
-    pub provider_keys: std::collections::BTreeMap<String, String>,
+    /// Non-secret static-key status per provider (masked preview / from-env /
+    /// not set), sourced from the credential broker. Raw key values never
+    /// enter the TUI.
+    pub provider_key_status: std::collections::BTreeMap<String, synaps_cli::auth::StaticKeyStatus>,
+    /// Explicitly configured local endpoint URL (non-secret), if any.
+    pub local_url_explicit: Option<String>,
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
     pub model_health:
@@ -89,6 +113,17 @@ pub(crate) struct RuntimeSnapshot {
     /// to hide the legacy global `Sidecar` page when a plugin has staked a
     /// claim with a `settings_category`.
     pub lifecycle_claims: Vec<synaps_cli::skills::registry::LifecycleClaim>,
+    /// Dynamic thinking level options for the active model.
+    /// For Codex models: the exact ordered supported levels from the catalog.
+    /// For all other models: the conservative legacy set.
+    pub thinking_options: Vec<String>,
+    /// App-level live catalog overrides (provider → (bare id, label) rows),
+    /// fetched by the same auto-refresh path the /models modal uses. Feeds
+    /// the shared model picker so /settings shows live catalogs too.
+    pub catalog_overrides:
+        std::collections::BTreeMap<String, crate::tui::models::ProviderCatalogOverride>,
+    /// Derived reasoning type for the active model (display-only row).
+    pub reasoning_type: String,
 }
 
 impl RuntimeSnapshot {
@@ -151,10 +186,14 @@ impl RuntimeSnapshot {
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
             plugins,
             disabled_plugins: config.disabled_plugins.clone(),
-            provider_keys: config.provider_keys.clone(),
+            provider_key_status: synaps_cli::auth::broker::static_key_status_map(),
+            local_url_explicit: synaps_cli::auth::broker::local_endpoint_config(),
             model_health,
             plugin_categories: registry.plugin_settings_categories(),
             lifecycle_claims: registry.lifecycle_claims(),
+            thinking_options: thinking_options_for_model(runtime.model()),
+            catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: reasoning_type_for_model(runtime.model()).to_string(),
         }
     }
 }
@@ -176,6 +215,9 @@ pub(super) enum ActiveEditor {
     Picker {
         setting_key: &'static str,
         options: Vec<String>,
+        /// Parallel exact-value column: `values[i]` is applied verbatim when
+        /// row `i` is selected. Empty string = non-selectable (header) row.
+        values: Vec<String>,
         cursor: usize,
     },
     CustomModel {
@@ -351,10 +393,20 @@ mod wireup_tests {
             theme_name: "t".into(),
             plugins: Vec::new(),
             disabled_plugins: Vec::new(),
-            provider_keys: std::collections::BTreeMap::new(),
+            provider_key_status: std::collections::BTreeMap::new(),
+            local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
             lifecycle_claims: claims,
+            thinking_options: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "adaptive".into(),
+            ],
+            catalog_overrides: std::collections::BTreeMap::new(),
+            reasoning_type: "budget (legacy)".into(),
         }
     }
 
@@ -430,8 +482,7 @@ mod wireup_tests {
         // proves the visible-list mapping didn't regress in-range lookups.
         for (idx, &cat) in visible.iter().enumerate() {
             state.category_idx = idx;
-            let expected = if cat == schema::Category::Plugins
-                || cat == schema::Category::Providers
+            let expected = if cat == schema::Category::Plugins || cat == schema::Category::Providers
             {
                 0
             } else {
@@ -446,5 +497,244 @@ mod wireup_tests {
                 "built-in category at idx {idx} mapped to the wrong settings"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod thinking_options_tests {
+    use super::thinking_options_for_model;
+
+    // ---- Slice B: reasoning type + effort recompute on model change ------
+
+    /// Settings derivations key on the runtime's EXACT active model: after a
+    /// model change through the checked dispatch path, both the reasoning
+    /// type and the effort option set recompute for the new model. (The
+    /// snapshot is rebuilt from the runtime on every key event, so these
+    /// derivations ARE the recompute path.)
+    #[test]
+    fn reasoning_type_and_effort_options_recompute_on_model_change() {
+        let mut rt = synaps_cli::Runtime::new_headless();
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
+
+        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.5", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(super::reasoning_type_for_model(rt.model()), "effort");
+        assert_eq!(
+            thinking_options_for_model(rt.model()),
+            vec!["adaptive", "low", "medium", "high"]
+        );
+
+        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.3", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(super::reasoning_type_for_model(rt.model()), "intrinsic");
+        assert_eq!(thinking_options_for_model(rt.model()), vec!["adaptive"]);
+
+        super::defs::apply_setting_dispatch("model", "openai-codex/gpt-5.6-sol", &mut rt, &mut app)
+            .unwrap();
+        assert_eq!(
+            super::reasoning_type_for_model(rt.model()),
+            "effort (named)"
+        );
+        assert!(thinking_options_for_model(rt.model()).contains(&"ultra".to_string()));
+    }
+
+    /// The snapshot built from a runtime must carry the derived reasoning
+    /// type for the active model (shown by the display-only settings row).
+    #[test]
+    fn snapshot_carries_reasoning_type_for_active_model() {
+        let mut rt = synaps_cli::Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.3".to_string());
+        let registry = synaps_cli::skills::registry::CommandRegistry::new(&[], Vec::new());
+        let snap = super::RuntimeSnapshot::from_runtime(&rt, &registry);
+        assert_eq!(snap.reasoning_type, "intrinsic");
+        assert_eq!(snap.thinking_options, vec!["adaptive"]);
+    }
+
+    #[test]
+    fn sol_includes_off_adaptive_and_ultra_max() {
+        let opts = thinking_options_for_model("openai-codex/gpt-5.6-sol");
+        assert_eq!(opts[0], "off", "off must be first");
+        assert_eq!(opts[1], "adaptive", "adaptive must be second");
+        assert!(
+            opts.contains(&"ultra".to_string()),
+            "sol must include ultra"
+        );
+        assert!(opts.contains(&"max".to_string()), "sol must include max");
+    }
+
+    #[test]
+    fn luna_includes_off_adaptive_and_max_not_ultra() {
+        let opts = thinking_options_for_model("openai-codex/gpt-5.6-luna");
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
+        assert!(opts.contains(&"max".to_string()));
+        assert!(
+            !opts.contains(&"ultra".to_string()),
+            "luna must not include ultra"
+        );
+    }
+
+    #[test]
+    fn gpt55_includes_off_adaptive_and_xhigh_not_max_ultra() {
+        for model in [
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.4",
+            "openai-codex/gpt-5.4-mini",
+            "openai-codex/gpt-5.3-codex-spark",
+        ] {
+            let opts = thinking_options_for_model(model);
+            assert_eq!(opts[0], "off", "{model}: off must be first");
+            assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
+            assert!(
+                !opts.contains(&"max".to_string()),
+                "{model} must not include max"
+            );
+            assert!(
+                !opts.contains(&"ultra".to_string()),
+                "{model} must not include ultra"
+            );
+            assert!(
+                opts.contains(&"xhigh".to_string()),
+                "{model} must include xhigh"
+            );
+        }
+    }
+
+    #[test]
+    fn non_codex_provider_includes_off_adaptive_not_max_ultra() {
+        // Unknown xAI ids now fail closed (see
+        // xai_options_derive_from_exact_static_capabilities); providers
+        // without exact metadata keep the conservative set.
+        for model in ["claude-opus-4-7", "groq/llama-3.3-70b"] {
+            let opts = thinking_options_for_model(model);
+            assert_eq!(opts[0], "off", "{model}: off must be first");
+            assert_eq!(opts[1], "adaptive", "{model}: adaptive must be second");
+            assert!(
+                !opts.contains(&"max".to_string()),
+                "{model} must not gain max"
+            );
+            assert!(
+                !opts.contains(&"ultra".to_string()),
+                "{model} must not gain ultra"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codex_model_falls_back_to_conservative_with_off_adaptive() {
+        let opts = thinking_options_for_model("openai-codex/gpt-future-unknown");
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
+        assert!(!opts.contains(&"max".to_string()));
+        assert!(!opts.contains(&"ultra".to_string()));
+    }
+
+    // ── Dynamic options for anthropic/<id> and xai-auth/<id> (spec:
+    //     anthropic-xai-reasoning-modes) ──
+
+    #[test]
+    fn xai_options_derive_from_exact_static_capabilities() {
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.5"),
+            vec!["adaptive", "low", "medium", "high"],
+            "grok-4.5: documented low/medium/high, cannot be disabled → no off, no xhigh"
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-multi-agent-0309"),
+            vec!["adaptive", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.3"),
+            vec!["adaptive"],
+            "no documented effort control → provider default only"
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.20-0309-non-reasoning"),
+            vec!["off", "adaptive"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-unknown-id"),
+            vec!["adaptive"],
+            "unknown exact xAI id must fail closed"
+        );
+    }
+
+    #[test]
+    fn anthropic_options_derive_from_capabilities_and_never_gain_max_ultra() {
+        for model in ["anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6"] {
+            let opts = thinking_options_for_model(model);
+            assert_eq!(
+                opts,
+                vec!["off", "adaptive", "low", "medium", "high", "xhigh"],
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_live_no_thinking_narrows_options() {
+        use agent_engine::runtime::openai::catalog::{
+            capability_cache, CatalogProviderKind, CatalogSource, ReasoningSupport,
+        };
+        let unique_id = "claude-test-tui-nothink";
+        let mut live = agent_engine::runtime::openai::catalog::CatalogModel::new(
+            "anthropic",
+            "Anthropic",
+            unique_id,
+        )
+        .unwrap();
+        live.provider_kind = CatalogProviderKind::Anthropic;
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::None;
+        capability_cache::insert(live);
+        assert_eq!(
+            thinking_options_for_model(&format!("anthropic/{unique_id}")),
+            vec!["off", "adaptive"],
+            "explicit no-thinking evidence must narrow the options"
+        );
+    }
+
+    /// Gap 2: cache-narrower override — live entry with only Low+Medium must
+    /// suppress Ultra in the TUI options even when static sol has Ultra.
+    #[test]
+    fn cache_narrower_than_static_suppresses_ultra_in_tui_options() {
+        use agent_core::reasoning::ReasoningLevel;
+        use agent_engine::runtime::openai::catalog::{
+            capability_cache, CatalogProviderKind, CatalogSource, ReasoningSupport,
+        };
+
+        // Unique slug to avoid polluting other tests via the shared cache.
+        let unique_id = "gpt-5.6-sol-tui-cache-test";
+        let qualified = format!("openai-codex/{unique_id}");
+
+        // Insert a live cache entry that supports only Low+Medium.
+        let mut live = agent_engine::runtime::openai::catalog::CatalogModel::new(
+            "openai-codex",
+            "OpenAI Codex",
+            unique_id,
+        )
+        .unwrap();
+        live.provider_kind = CatalogProviderKind::OpenAiCodex;
+        live.source = CatalogSource::Live;
+        live.reasoning = ReasoningSupport::CodexNamed {
+            supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
+            default_level: Some(ReasoningLevel::Low),
+            multi_agent_version: None,
+        };
+        capability_cache::insert(live);
+
+        let opts = thinking_options_for_model(&qualified);
+        assert_eq!(opts[0], "off");
+        assert_eq!(opts[1], "adaptive");
+        assert!(
+            !opts.contains(&"ultra".to_string()),
+            "cache narrower: ultra must be suppressed"
+        );
+        assert!(
+            !opts.contains(&"max".to_string()),
+            "cache narrower: max must be suppressed"
+        );
+        assert!(opts.contains(&"low".to_string()));
+        assert!(opts.contains(&"medium".to_string()));
     }
 }

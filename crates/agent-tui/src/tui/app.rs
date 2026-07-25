@@ -1,5 +1,5 @@
-use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
+use synaps_cli::Session;
 
 // Type re-export shims from slice (a). Kept this release — deleting is churn
 // for no gain. One-release grace per design §5(f).
@@ -8,9 +8,14 @@ pub(crate) use super::transcript::{ChatMessage, TranscriptStore, THINKING_PLACEH
 // Test-only re-exports: production code reaches the cache via store methods;
 // only ported cache tests name these types directly.
 #[allow(unused_imports)]
-pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
-#[allow(unused_imports)]
 pub(crate) use super::transcript::TimestampedMsg;
+#[allow(unused_imports)]
+pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
+
+/// CP-11 fix-3 sibling audit: bounded capacity for the extension widget
+/// event lane. Producers are extension-controlled notification watchers;
+/// see the `App::widget_rx` field docs for the drop-on-overflow policy.
+pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Central TUI state.
 ///
@@ -30,6 +35,9 @@ pub(crate) struct App {
     pub(crate) cursor_pos: usize,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
+    /// `api_messages.len()` at active-turn start. Failure repair may only
+    /// remove messages appended at or after this index (spec §5.2).
+    pub(crate) turn_baseline: usize,
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) input_stash: String,
@@ -95,6 +103,8 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// Active /effort lightbox state (Some while /effort is open).
+    pub(crate) effort: Option<super::effort::EffortModalState>,
     /// P7 modal-routing stack (finished, P7.8). The single source of input
     /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
     /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
@@ -109,7 +119,14 @@ pub(crate) struct App {
     /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
     pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
-    pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
+    pub(crate) compact_task: Option<
+        tokio::task::JoinHandle<
+            Result<
+                synaps_cli::runtime::compaction::CompactionOutcome,
+                synaps_cli::error::RuntimeError,
+            >,
+        >,
+    >,
     /// Events buffered during streaming — injected into api_messages after stream completes
     pub(crate) pending_events: Vec<String>,
     /// Consecutive auto-triggered model turns since the last real user send.
@@ -117,16 +134,36 @@ pub(crate) struct App {
     /// When this reaches AUTO_TURN_CAP the reactor parks and shows a system message.
     pub(crate) consecutive_auto_turns: u32,
     /// Cached model ping results: "provider/model" -> (status, latency_ms).
-    pub(crate) model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    pub(crate) model_health:
+        std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// App-level live catalog overrides (provider → (bare id, label) rows).
+    /// Updated whenever a live model-list result arrives, so both the /models
+    /// modal and the /settings model picker share one catalog cache.
+    pub(crate) catalog_overrides:
+        std::collections::BTreeMap<String, super::models::ProviderCatalogOverride>,
     /// Print ping results to chat as they arrive (set by /ping command).
     pub(crate) ping_print: bool,
     pub(crate) ping_pending: usize,
     /// Channel for receiving async ping results.
-    pub(crate) ping_tx: tokio::sync::mpsc::UnboundedSender<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
-    pub(crate) ping_rx: tokio::sync::mpsc::UnboundedReceiver<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    pub(crate) ping_tx: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        synaps_cli::runtime::openai::ping::PingStatus,
+        u64,
+    )>,
+    pub(crate) ping_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        String,
+        synaps_cli::runtime::openai::ping::PingStatus,
+        u64,
+    )>,
     /// Channel for receiving expanded model-list API results.
-    pub(crate) model_list_tx: tokio::sync::mpsc::UnboundedSender<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
-    pub(crate) model_list_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
+    pub(crate) model_list_tx: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        Result<Vec<super::models::ExpandedModelEntry>, String>,
+    )>,
+    pub(crate) model_list_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        String,
+        Result<Vec<super::models::ExpandedModelEntry>, String>,
+    )>,
     /// Suppress paste events arriving shortly after a right-click copy/paste.
     /// Terminals that auto-paste on right-click generate a spurious Event::Paste
     /// immediately after MouseDown(Right). We suppress only within a short TTL
@@ -143,21 +180,34 @@ pub(crate) struct App {
     /// Overlay toast provider used by core and extension-adjacent features.
     pub(crate) toasts: super::toast::ToastProvider,
     /// Channel for async extension loader progress events.
-    pub(crate) extension_loader_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
-    pub(crate) extension_loader_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_rx:
+        tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_tx:
+        tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
     pub(crate) extension_loader_running: bool,
     /// Channel for receiving widget events from background extension notification watchers.
-    pub(crate) widget_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
-    pub(crate) widget_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
+    ///
+    /// CP-11 fix-3 sibling audit: BOUNDED ([`WIDGET_EVENT_QUEUE_CAPACITY`]).
+    /// Producers are extension-controlled (`widget.*` notification
+    /// frames), and this loop's consumer arm stalls during inline awaits
+    /// — e.g. the up-to-120 s `command.invoke` window — so an unbounded
+    /// channel here let a hostile extension park aggregate widget bytes
+    /// in host memory. Watchers `try_send` and DROP-newest on overflow
+    /// with a warn: widget upserts are idempotent last-writer-wins UI
+    /// state, so the next event after the consumer resumes restores it.
+    pub(crate) widget_rx:
+        tokio::sync::mpsc::Receiver<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
+    pub(crate) widget_tx:
+        tokio::sync::mpsc::Sender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
-    pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    pub(crate) keybinds:
+        Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 
 #[derive(Clone)]
 pub(crate) struct SubagentState {
@@ -184,14 +234,17 @@ impl App {
     pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
-        let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
-        let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (extension_loader_tx_init, extension_loader_rx_init) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (widget_tx_init, widget_rx_init) =
+            tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             input: String::new(),
             cursor_pos: 0,
             api_messages: Vec::new(),
             streaming: false,
+            turn_baseline: 0,
             input_history: Vec::new(),
             history_index: None,
             input_stash: String::new(),
@@ -230,6 +283,7 @@ impl App {
             plugins: None,
             models: None,
             help_find: None,
+            effort: None,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
             // P7.8: folded off the `run()` local; production wires the mpsc
@@ -239,6 +293,7 @@ impl App {
             pending_events: Vec::new(),
             consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
+            catalog_overrides: std::collections::BTreeMap::new(),
             ping_print: false,
             ping_pending: 0,
             ping_tx: ping_tx_init,
@@ -247,7 +302,9 @@ impl App {
             model_list_rx: model_list_rx_init,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
-            active_tasks: std::sync::Arc::new(synaps_cli::extensions::active_tasks::ActiveTasks::new()),
+            active_tasks: std::sync::Arc::new(
+                synaps_cli::extensions::active_tasks::ActiveTasks::new(),
+            ),
             toasts: super::toast::ToastProvider::new(clock.clone()),
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
@@ -269,7 +326,9 @@ impl App {
         let before_paste = self.input_before_paste.as_deref().unwrap_or("");
         let before_chars = before_paste.chars().count();
         let total_chars = input.chars().count();
-        let paste_chars = self.pasted_char_count.min(total_chars.saturating_sub(before_chars));
+        let paste_chars = self
+            .pasted_char_count
+            .min(total_chars.saturating_sub(before_chars));
         let after_chars = total_chars.saturating_sub(before_chars + paste_chars);
 
         let paste_byte_start = input
@@ -313,7 +372,8 @@ impl App {
     /// Restore SynapsCLI's TUI after casino (or failed spawn).
     /// Convert char-based cursor_pos to byte offset in self.input.
     pub(crate) fn cursor_byte_pos(&self) -> usize {
-        self.input.char_indices()
+        self.input
+            .char_indices()
             .nth(self.cursor_pos)
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
@@ -362,8 +422,12 @@ impl App {
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
         // Accumulate per-TTL-bucket write totals for /stats and footer display.
-        if let Some(c5) = cache_creation_5m { self.total_cache_write_5m += c5; }
-        if let Some(c1) = cache_creation_1h { self.total_cache_write_1h += c1; }
+        if let Some(c5) = cache_creation_5m {
+            self.total_cache_write_5m += c5;
+        }
+        if let Some(c1) = cache_creation_1h {
+            self.total_cache_write_1h += c1;
+        }
         // Per-turn context occupancy (bar numerator): what the API actually
         // ingested this request. Output tokens are generated, not ingested,
         // so they don't count toward current-window use. Reassigned, not accumulated.
@@ -378,8 +442,13 @@ impl App {
         // Delegate cost calculation to the single source of truth in `pricing`.
         // Split-aware: 1h cache writes bill at 2.0x when the TTL split arrived.
         self.session_cost += calculate_cost_optional_split(
-            model, input_tokens, output_tokens, cache_read,
-            cache_creation, cache_creation_5m, cache_creation_1h,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
         );
     }
 
@@ -416,7 +485,6 @@ impl App {
         self.transcript.invalidate_last();
         self.needs_redraw = true;
     }
-
 
     /// Request a redraw without invalidating the line cache (e.g. for
     /// panel-only changes like spinner/timer updates, scroll, cursor blink).
@@ -477,8 +545,14 @@ impl App {
     }
 
     /// Delegates to [`TranscriptStore::on_tool_use_finalized`].
-    pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
-        self.transcript.on_tool_use_finalized(tool_id, tool_name, input_str);
+    pub(crate) fn on_tool_use_finalized(
+        &mut self,
+        tool_id: String,
+        tool_name: String,
+        input_str: String,
+    ) {
+        self.transcript
+            .on_tool_use_finalized(tool_id, tool_name, input_str);
         self.needs_redraw = true;
     }
 
@@ -504,26 +578,25 @@ impl App {
         for tmsg in self.transcript.messages().iter().rev() {
             match &tmsg.msg {
                 ChatMessage::User(_) => break, // stop at the last user message
-                ChatMessage::Thinking(t)
-                    if !t.is_empty() => {
-                        // Truncate thinking to avoid bloating context
-                        let preview: String = t.chars().take(500).collect();
-                        parts.push(format!("[thinking]: {}", preview));
-                    }
-                ChatMessage::Text(t)
-                    if !t.is_empty() => {
-                        parts.push(format!("[response]: {}", t));
-                    }
-                ChatMessage::ToolUse { tool_name, input, .. } => {
+                ChatMessage::Thinking(t) if !t.is_empty() => {
+                    // Truncate thinking to avoid bloating context
+                    let preview: String = t.chars().take(500).collect();
+                    parts.push(format!("[thinking]: {}", preview));
+                }
+                ChatMessage::Text(t) if !t.is_empty() => {
+                    parts.push(format!("[response]: {}", t));
+                }
+                ChatMessage::ToolUse {
+                    tool_name, input, ..
+                } => {
                     // Truncate input to keep context lean
                     let input_preview: String = input.chars().take(200).collect();
                     parts.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                 }
-                ChatMessage::ToolResult { content, .. }
-                    if !content.is_empty() => {
-                        let preview: String = content.chars().take(300).collect();
-                        parts.push(format!("[tool_result]: {}", preview));
-                    }
+                ChatMessage::ToolResult { content, .. } if !content.is_empty() => {
+                    let preview: String = content.chars().take(300).collect();
+                    parts.push(format!("[tool_result]: {}", preview));
+                }
                 _ => {}
             }
         }
@@ -541,7 +614,9 @@ impl App {
     }
 
     pub(crate) fn history_up(&mut self) {
-        if self.input_history.is_empty() { return; }
+        if self.input_history.is_empty() {
+            return;
+        }
         match self.history_index {
             None => {
                 self.input_stash = self.input.clone();
@@ -590,25 +665,25 @@ impl App {
 
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {
         let descriptions: &[(&str, &str)] = &[
-            ("default",        "cool teal on dark blue-gray"),
-            ("night-city",     "premium neon-noir — cyberpunk/blade runner"),
-            ("neon-rain",      "cyberpunk hot pink + cyan"),
-            ("amber",          "warm CRT retro terminal"),
-            ("phosphor",       "green monochrome CRT"),
+            ("default", "cool teal on dark blue-gray"),
+            ("night-city", "premium neon-noir — cyberpunk/blade runner"),
+            ("neon-rain", "cyberpunk hot pink + cyan"),
+            ("amber", "warm CRT retro terminal"),
+            ("phosphor", "green monochrome CRT"),
             ("solarized-dark", "Ethan Schoonover's classic"),
-            ("blood",          "dark red, Doom/horror"),
-            ("ocean",          "deep sea bioluminescence"),
-            ("rose-pine",      "elegant muted purples/pinks"),
-            ("nord",           "arctic frost blues"),
-            ("dracula",        "purple/pink/cyan vibrant"),
-            ("monokai",        "classic orange/pink/green"),
-            ("gruvbox",        "warm earthy tones"),
-            ("catppuccin",     "soft pastels, cozy dark"),
-            ("tokyo-night",    "dark blue-purple, soft accents"),
-            ("sunset",         "warm oranges/pinks dusk"),
-            ("ice",            "frozen arctic pale blues"),
-            ("forest",         "deep greens and browns"),
-            ("lavender",       "rich purple/violet"),
+            ("blood", "dark red, Doom/horror"),
+            ("ocean", "deep sea bioluminescence"),
+            ("rose-pine", "elegant muted purples/pinks"),
+            ("nord", "arctic frost blues"),
+            ("dracula", "purple/pink/cyan vibrant"),
+            ("monokai", "classic orange/pink/green"),
+            ("gruvbox", "warm earthy tones"),
+            ("catppuccin", "soft pastels, cozy dark"),
+            ("tokyo-night", "dark blue-purple, soft accents"),
+            ("sunset", "warm oranges/pinks dusk"),
+            ("ice", "frozen arctic pale blues"),
+            ("forest", "deep greens and browns"),
+            ("lavender", "rich purple/violet"),
         ];
 
         if arg.is_empty() {
@@ -629,37 +704,37 @@ impl App {
                 }
             }
             self.push_msg(ChatMessage::System(String::new()));
-            self.push_msg(ChatMessage::System("Usage: /theme <name> to set. Restart to apply.".to_string()));
+            self.push_msg(ChatMessage::System(
+                "Usage: /theme <name> to set. Restart to apply.".to_string(),
+            ));
         } else {
             let name = arg.trim();
             let is_valid = descriptions.iter().any(|(n, _)| *n == name)
-                || synaps_cli::config::base_dir().join("themes").join(name).exists();
+                || synaps_cli::config::base_dir()
+                    .join("themes")
+                    .join(name)
+                    .exists();
 
             if is_valid {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
-                        let new_theme = super::theme::load_theme_by_name(name)
-                            .unwrap_or_default();
+                        let new_theme = super::theme::load_theme_by_name(name).unwrap_or_default();
                         super::theme::set_theme(new_theme);
-                        self.push_msg(ChatMessage::System(
-                            format!("Theme applied: {}", name)
-                        ));
+                        self.push_msg(ChatMessage::System(format!("Theme applied: {}", name)));
                         self.invalidate();
                     }
                     Err(e) => {
-                        self.push_msg(ChatMessage::Error(
-                            format!("failed to write config: {}", e)
-                        ));
+                        self.push_msg(ChatMessage::Error(format!("failed to write config: {}", e)));
                     }
                 }
             } else {
-                self.push_msg(ChatMessage::Error(
-                    format!("unknown theme: '{}'. Use /theme to list available themes.", name)
-                ));
+                self.push_msg(ChatMessage::Error(format!(
+                    "unknown theme: '{}'. Use /theme to list available themes.",
+                    name
+                )));
             }
         }
     }
-
 }
 
 /// Test-only render delegates. Production rendering goes through
@@ -676,7 +751,8 @@ impl App {
     }
 
     pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> MsgSlot {
-        self.transcript.render_message_lines(idx, width, &self.render_ctx())
+        self.transcript
+            .render_message_lines(idx, width, &self.render_ctx())
     }
 
     pub(crate) fn render_lines(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
@@ -700,24 +776,37 @@ mod tests {
 
         // Case 1: text follows empty thinking.
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-        assert!(app.transcript.uses_spinner(), "placeholder should animate while present");
+        assert!(
+            app.transcript.uses_spinner(),
+            "placeholder should animate while present"
+        );
         app.append_or_update_text("here is the answer");
         assert!(
-            !matches!(app.transcript.messages().last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            !matches!(
+                app.transcript.messages().last().map(|m| &m.msg),
+                Some(ChatMessage::Thinking(_))
+            ),
             "empty thinking must be gone once text arrives"
         );
-        assert!(!app.transcript.uses_spinner(), "spinner must stop after agent moves on");
+        assert!(
+            !app.transcript.uses_spinner(),
+            "spinner must stop after agent moves on"
+        );
 
         // Case 2: a tool follows empty thinking.
         let mut app = test_app();
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
         app.on_tool_use_start("t1".to_string(), "bash".to_string());
         let thinking_count = app
-            .transcript.messages()
+            .transcript
+            .messages()
             .iter()
             .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
             .count();
-        assert_eq!(thinking_count, 0, "empty thinking must be gone once a tool runs");
+        assert_eq!(
+            thinking_count, 0,
+            "empty thinking must be gone once a tool runs"
+        );
 
         // Case 3: real thinking content is preserved.
         let mut app = test_app();
@@ -726,7 +815,10 @@ mod tests {
         app.append_or_update_thinking("actually reasoning");
         app.append_or_update_text("done");
         assert!(
-            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            app.transcript
+                .messages()
+                .iter()
+                .any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
             "non-empty thinking must survive and not keep the … prefix"
         );
     }
@@ -743,7 +835,8 @@ mod tests {
             app.on_tool_result(id.to_string(), format!("out-{id}"));
         }
         let seq: Vec<(String, bool)> = app
-            .transcript.messages()
+            .transcript
+            .messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
@@ -752,12 +845,19 @@ mod tests {
             })
             .collect();
         let expected = vec![
-            ("t1".to_string(), false), ("t1".to_string(), true),
-            ("t2".to_string(), false), ("t2".to_string(), true),
-            ("t3".to_string(), false), ("t3".to_string(), true),
-            ("t4".to_string(), false), ("t4".to_string(), true),
+            ("t1".to_string(), false),
+            ("t1".to_string(), true),
+            ("t2".to_string(), false),
+            ("t2".to_string(), true),
+            ("t3".to_string(), false),
+            ("t3".to_string(), true),
+            ("t4".to_string(), false),
+            ("t4".to_string(), true),
         ];
-        assert_eq!(seq, expected, "parallel tool calls must render as input→output pairs");
+        assert_eq!(
+            seq, expected,
+            "parallel tool calls must render as input→output pairs"
+        );
     }
 
     #[test]
@@ -770,9 +870,17 @@ mod tests {
         for l in &lines {
             let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert!(
-                !s.chars().any(|c| matches!(c,
-                    '\u{256D}' | '\u{256E}' | '\u{2570}' | '\u{256F}' | '\u{2502}'
-                    | '\u{2591}' | '\u{2592}' | '\u{2593}')),
+                !s.chars().any(|c| matches!(
+                    c,
+                    '\u{256D}'
+                        | '\u{256E}'
+                        | '\u{2570}'
+                        | '\u{256F}'
+                        | '\u{2502}'
+                        | '\u{2591}'
+                        | '\u{2592}'
+                        | '\u{2593}'
+                )),
                 "no borders or shade glyphs: {s:?}"
             );
         }
@@ -788,7 +896,10 @@ mod tests {
         // The inset left margin stays transparent.
         if let Some(first) = panel_line.spans.first() {
             if !first.content.is_empty() && first.content.chars().all(|c| c == ' ') {
-                assert!(first.style.bg.is_none(), "left margin must stay transparent");
+                assert!(
+                    first.style.bg.is_none(),
+                    "left margin must stay transparent"
+                );
             }
         }
     }
@@ -817,11 +928,19 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
-        app.transcript.test_insert_tool_start_time("call_2".to_string(), app.clock.now());
+        app.transcript
+            .test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript
+            .test_insert_tool_start_time("call_2".to_string(), app.clock.now());
 
-        assert!(!app.transcript.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
-        assert!(app.transcript.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
+        assert!(
+            !app.transcript.is_active_tool_result(1),
+            "completed historical result (call_1, not in tool_start_times) must render done"
+        );
+        assert!(
+            app.transcript.is_active_tool_result(3),
+            "latest in-flight result (call_2, in tool_start_times) must be active"
+        );
 
         // Bonus: with BOTH in-flight (parallel), BOTH must be active
         let mut app2 = test_app();
@@ -845,11 +964,20 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.transcript.test_set_tool_start_time(Some(app2.clock.now()));
-        app2.transcript.test_insert_tool_start_time("p1".to_string(), app2.clock.now());
-        app2.transcript.test_insert_tool_start_time("p2".to_string(), app2.clock.now());
-        assert!(app2.transcript.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
-        assert!(app2.transcript.is_active_tool_result(3), "parallel in-flight p2 last must be active");
+        app2.transcript
+            .test_set_tool_start_time(Some(app2.clock.now()));
+        app2.transcript
+            .test_insert_tool_start_time("p1".to_string(), app2.clock.now());
+        app2.transcript
+            .test_insert_tool_start_time("p2".to_string(), app2.clock.now());
+        assert!(
+            app2.transcript.is_active_tool_result(1),
+            "parallel in-flight p1 mid-vec must be active"
+        );
+        assert!(
+            app2.transcript.is_active_tool_result(3),
+            "parallel in-flight p2 last must be active"
+        );
     }
 
     #[test]
@@ -865,7 +993,8 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript
+            .test_set_tool_start_time(Some(app.clock.now()));
 
         assert!(!app.transcript.is_active_tool_result(1));
     }
@@ -876,8 +1005,11 @@ mod tests {
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
         {
             let w = 80;
-            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
+                .map(|i| app.render_message_lines(i, w))
+                .collect();
+            app.transcript
+                .test_set_cache_clean(LineCache::new(w, per_msg));
         }
         app.subagents.push(SubagentState {
             id: 1,
@@ -892,9 +1024,18 @@ mod tests {
 
         let invalidate_messages = app.advance_animations();
 
-        assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
-        assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
-        assert!(app.transcript.line_cache().is_some(), "message cache should remain valid for panel-only animation");
+        assert!(
+            !invalidate_messages,
+            "subagent panel spinner redraw must not rebuild message cache"
+        );
+        assert!(
+            !app.needs_clear_for_animation_redraw(),
+            "subagent-only animation must not force terminal.clear flicker"
+        );
+        assert!(
+            app.transcript.line_cache().is_some(),
+            "message cache should remain valid for panel-only animation"
+        );
     }
 
     #[test]
@@ -910,19 +1051,30 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
-        app.transcript.test_insert_tool_start_time("call_1".to_string(), app.clock.now());
+        app.transcript
+            .test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript
+            .test_insert_tool_start_time("call_1".to_string(), app.clock.now());
         {
             let w = 80;
-            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
+                .map(|i| app.render_message_lines(i, w))
+                .collect();
+            app.transcript
+                .test_set_cache_clean(LineCache::new(w, per_msg));
         }
         app.spinner_frame = 2;
 
         let invalidate_messages = app.advance_animations();
 
-        assert!(invalidate_messages, "active message-area bash animation must rebuild message cache");
-        assert!(!app.needs_clear_for_animation_redraw(), "streaming animation must not force whole-terminal clear flicker");
+        assert!(
+            invalidate_messages,
+            "active message-area bash animation must rebuild message cache"
+        );
+        assert!(
+            !app.needs_clear_for_animation_redraw(),
+            "streaming animation must not force whole-terminal clear flicker"
+        );
     }
 
     #[test]
@@ -938,28 +1090,48 @@ mod tests {
 
         // Build full cache first (Clean = old Some + dirty_from None)
         {
-            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
+                .map(|i| app.render_message_lines(i, w))
+                .collect();
+            app.transcript
+                .test_set_cache_clean(LineCache::new(w, per_msg));
         }
         let last = app.transcript.message_count() - 1;
 
         // Snapshot per_msg[0..last]
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| {
+                slot.lines()
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect()
+            })
             .collect();
 
         // Advance spinner (spinner_frame % 3 == 0 triggers uses_spinner)
         app.spinner_frame = 2; // next wrapping_add gives 3, which % 3 == 0
         let needs_redraw = app.advance_animations();
-        assert!(needs_redraw, "spinner must signal redraw while THINKING_PLACEHOLDER present");
+        assert!(
+            needs_redraw,
+            "spinner must signal redraw while THINKING_PLACEHOLDER present"
+        );
 
         // The animation tick itself doesn't call invalidate — the caller in mod.rs does.
         // We simulate that caller calling invalidate_last() (the new behaviour for slice 4).
         // But first assert dirty_from is still None (advance_animations doesn't set it).
         // Then we call invalidate_last() as the updated caller will.
         app.invalidate_last();
-        assert_eq!(app.transcript.cache_dirty_from(), Some(last), "dirty watermark must point to tail message only");
+        assert_eq!(
+            app.transcript.cache_dirty_from(),
+            Some(last),
+            "dirty watermark must point to tail message only"
+        );
 
         // Simulate draw.rs incremental rebuild
         {
@@ -981,9 +1153,22 @@ mod tests {
         // per_msg[0..last] must be unchanged
         let after: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| {
+                slot.lines()
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect()
+            })
             .collect();
-        assert_eq!(snapshot, after, "earlier per_msg slots must not change on spinner tick");
+        assert_eq!(
+            snapshot, after,
+            "earlier per_msg slots must not change on spinner tick"
+        );
     }
 
     #[test]
@@ -996,15 +1181,27 @@ mod tests {
         let lines = app.render_lines(80);
         let header_idx = lines
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("Extensions (1):")))
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("Extensions (1):"))
+            })
             .expect("header system message should render");
         let child_idx = lines
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("capture — ok")))
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("capture — ok"))
+            })
             .expect("child system message should render");
         let grandchild_idx = lines
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("tools: speak")))
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("tools: speak"))
+            })
             .expect("grandchild system message should render");
 
         // Related system messages should not have extra blank-line separators between them
@@ -1012,7 +1209,9 @@ mod tests {
         let has_separator = |slice: &[ratatui::text::Line]| {
             // Two consecutive blank lines indicate a separator was inserted
             slice.windows(2).any(|w| {
-                let blank = |l: &ratatui::text::Line| l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty());
+                let blank = |l: &ratatui::text::Line| {
+                    l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty())
+                };
                 blank(&w[0]) && blank(&w[1])
             })
         };
@@ -1033,14 +1232,21 @@ mod tests {
             .expect("first system message should render");
         let second_idx = lines
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("second"))
+            })
             .expect("second system message should render");
 
         let between = &lines[first_idx + 1..second_idx];
         let is_blank = |line: &ratatui::text::Line| {
             line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
         };
-        assert!(between.iter().any(is_blank), "expected blank line between consecutive system messages");
+        assert!(
+            between.iter().any(is_blank),
+            "expected blank line between consecutive system messages"
+        );
     }
 
     #[test]
@@ -1058,27 +1264,33 @@ mod tests {
 
     fn last_tool_use(app: &App, tool_id: &str) -> Option<(String, String)> {
         app.transcript.messages().iter().find_map(|m| match &m.msg {
-            ChatMessage::ToolUse { tool_id: tid, tool_name, input } if tid == tool_id => {
-                Some((tool_name.clone(), input.clone()))
-            }
+            ChatMessage::ToolUse {
+                tool_id: tid,
+                tool_name,
+                input,
+            } if tid == tool_id => Some((tool_name.clone(), input.clone())),
             _ => None,
         })
     }
 
     fn tool_use_start_partial(app: &App, tool_id: &str) -> Option<String> {
         app.transcript.messages().iter().find_map(|m| match &m.msg {
-            ChatMessage::ToolUseStart { tool_id: tid, partial_input, .. } if tid == tool_id => {
-                Some(partial_input.clone())
-            }
+            ChatMessage::ToolUseStart {
+                tool_id: tid,
+                partial_input,
+                ..
+            } if tid == tool_id => Some(partial_input.clone()),
             _ => None,
         })
     }
 
     fn tool_result_content(app: &App, tool_id: &str) -> Option<String> {
         app.transcript.messages().iter().find_map(|m| match &m.msg {
-            ChatMessage::ToolResult { tool_id: tid, content, .. } if tid == tool_id => {
-                Some(content.clone())
-            }
+            ChatMessage::ToolResult {
+                tool_id: tid,
+                content,
+                ..
+            } if tid == tool_id => Some(content.clone()),
             _ => None,
         })
     }
@@ -1133,7 +1345,8 @@ mod tests {
 
         // Both are now ToolUse, no lingering ToolUseStart.
         let lingering_starts = app
-            .transcript.messages()
+            .transcript
+            .messages()
             .iter()
             .filter(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
             .count();
@@ -1152,7 +1365,8 @@ mod tests {
 
         // On-screen order matches call order (call_a appears before call_b).
         let positions: Vec<&str> = app
-            .transcript.messages()
+            .transcript
+            .messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some(tool_id.as_str()),
@@ -1171,16 +1385,8 @@ mod tests {
         let mut app = test_app();
         app.on_tool_use_start("call_a".to_string(), "bash".to_string());
         app.on_tool_use_start("call_b".to_string(), "bash".to_string());
-        app.on_tool_use_finalized(
-            "call_a".to_string(),
-            "bash".to_string(),
-            "{}".to_string(),
-        );
-        app.on_tool_use_finalized(
-            "call_b".to_string(),
-            "bash".to_string(),
-            "{}".to_string(),
-        );
+        app.on_tool_use_finalized("call_a".to_string(), "bash".to_string(), "{}".to_string());
+        app.on_tool_use_finalized("call_b".to_string(), "bash".to_string(), "{}".to_string());
 
         app.on_tool_result("call_a".to_string(), "first output".to_string());
         app.on_tool_result("call_b".to_string(), "second output".to_string());
@@ -1201,16 +1407,8 @@ mod tests {
         let mut app = test_app();
         app.on_tool_use_start("call_a".to_string(), "bash".to_string());
         app.on_tool_use_start("call_b".to_string(), "bash".to_string());
-        app.on_tool_use_finalized(
-            "call_a".to_string(),
-            "bash".to_string(),
-            "{}".to_string(),
-        );
-        app.on_tool_use_finalized(
-            "call_b".to_string(),
-            "bash".to_string(),
-            "{}".to_string(),
-        );
+        app.on_tool_use_finalized("call_a".to_string(), "bash".to_string(), "{}".to_string());
+        app.on_tool_use_finalized("call_b".to_string(), "bash".to_string(), "{}".to_string());
 
         // Interleaved deltas — must accumulate into the right block.
         app.on_tool_result_delta("call_a".to_string(), "alpha-".to_string());
@@ -1245,15 +1443,29 @@ mod tests {
         app.on_tool_result("call_b".to_string(), "b".to_string());
 
         let a_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
-            ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_a" => *elapsed_ms,
+            ChatMessage::ToolResult {
+                tool_id,
+                elapsed_ms,
+                ..
+            } if tool_id == "call_a" => *elapsed_ms,
             _ => None,
         });
         let b_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
-            ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_b" => *elapsed_ms,
+            ChatMessage::ToolResult {
+                tool_id,
+                elapsed_ms,
+                ..
+            } if tool_id == "call_b" => *elapsed_ms,
             _ => None,
         });
-        assert!(a_elapsed.is_some(), "call_a must record elapsed_ms from its own start_time");
-        assert!(b_elapsed.is_some(), "call_b must record elapsed_ms from its own start_time");
+        assert!(
+            a_elapsed.is_some(),
+            "call_a must record elapsed_ms from its own start_time"
+        );
+        assert!(
+            b_elapsed.is_some(),
+            "call_b must record elapsed_ms from its own start_time"
+        );
     }
 
     // ── FIX 9 regression tests ───────────────────────────────────────────────
@@ -1271,7 +1483,10 @@ mod tests {
         app.append_or_update_text("answer");
         // The Thinking block must survive with "…" content, not be dropped
         assert!(
-            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
+            app.transcript
+                .messages()
+                .iter()
+                .any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
             "real ellipsis thinking content must survive — sentinel and real output are distinct"
         );
     }
@@ -1286,10 +1501,15 @@ mod tests {
         app.push_msg(ChatMessage::System("retrying…".to_string()));
         // Now trigger the drop (e.g. text arrives / turn ends)
         app.drop_empty_thinking();
-        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
-            &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
-        ));
-        assert!(!has_placeholder, "placeholder stranded under a System message must be removed by drop_empty_thinking");
+        let has_placeholder = app.transcript.messages().iter().any(|m| {
+            matches!(
+                &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
+            )
+        });
+        assert!(
+            !has_placeholder,
+            "placeholder stranded under a System message must be removed by drop_empty_thinking"
+        );
     }
 
     /// Test C: aborting a stream must not leave a frozen placeholder spinner.
@@ -1300,10 +1520,15 @@ mod tests {
         // Simulate what the abort handler does: drop + push error
         app.drop_empty_thinking();
         app.push_msg(ChatMessage::Error("aborted".to_string()));
-        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
-            &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
-        ));
-        assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
+        let has_placeholder = app.transcript.messages().iter().any(|m| {
+            matches!(
+                &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
+            )
+        });
+        assert!(
+            !has_placeholder,
+            "abort must remove thinking placeholder so spinner doesn't freeze"
+        );
     }
 
     #[test]
@@ -1326,15 +1551,30 @@ mod tests {
         let w = 80;
         let flat = app.render_lines(w);
         let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.message_count())
-            .flat_map(|i| app.render_message_lines(i, w).lines.expect("freshly rendered slot has lines"))
+            .flat_map(|i| {
+                app.render_message_lines(i, w)
+                    .lines
+                    .expect("freshly rendered slot has lines")
+            })
             .collect();
 
         // Compare by rendered string content (Line doesn't impl PartialEq for spans reliably)
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
         };
-        assert_eq!(to_str(&flat), to_str(&concat),
-            "render_lines must equal concat of render_message_lines for each index");
+        assert_eq!(
+            to_str(&flat),
+            to_str(&concat),
+            "render_lines must equal concat of render_message_lines for each index"
+        );
     }
 
     #[test]
@@ -1369,21 +1609,41 @@ mod tests {
         let cache = LineCache::new(w, per_msg);
 
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
         };
         // Height oracle: cum_heights ≡ prefix sums of the reference render.
-        assert_eq!(cache.total_height(), expected_flat.len(),
-            "total_height must equal the reference render's line count");
+        assert_eq!(
+            cache.total_height(),
+            expected_flat.len(),
+            "total_height must equal the reference render's line count"
+        );
         let mut acc = 0usize;
         for (i, slot) in cache.per_msg.iter().enumerate() {
-            assert_eq!(cache.cum_heights[i], acc, "cum_heights[{i}] must be the prefix sum");
+            assert_eq!(
+                cache.cum_heights[i], acc,
+                "cum_heights[{i}] must be the prefix sum"
+            );
             acc += slot.height();
         }
         // Content oracle: per_msg concatenation ≡ the reference render.
-        let concat: Vec<ratatui::text::Line<'static>> =
-            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-        assert_eq!(to_str(&expected_flat), to_str(&concat),
-            "per_msg concatenation must equal render_lines output");
+        let concat: Vec<ratatui::text::Line<'static>> = cache
+            .per_msg
+            .iter()
+            .flat_map(|e| e.lines().iter().cloned())
+            .collect();
+        assert_eq!(
+            to_str(&expected_flat),
+            to_str(&concat),
+            "per_msg concatenation must equal render_lines output"
+        );
         assert!(cache.width == w);
     }
 
@@ -1443,11 +1703,25 @@ mod tests {
         // Snapshot per_msg[0..last] content strings (before update)
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| {
+                slot.lines()
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect()
+            })
             .collect();
 
         // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
-        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.test_last_msg_mut() {
+        if let Some(crate::tui::app::TimestampedMsg {
+            msg: ChatMessage::Text(ref mut t),
+            ..
+        }) = app.transcript.test_last_msg_mut()
+        {
             t.push_str(" — more content appended");
         }
         app.transcript.invalidate_from(last); // invalidate_last equivalent (direct store call)
@@ -1460,29 +1734,68 @@ mod tests {
         // per_msg[0..last] must be unchanged (content-equal to snapshot)
         let after: Vec<Vec<String>> = cache.per_msg[..last]
             .iter()
-            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| {
+                slot.lines()
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect()
+            })
             .collect();
-        assert_eq!(snapshot, after, "per_msg[0..last] must not change on tail-only invalidation");
+        assert_eq!(
+            snapshot, after,
+            "per_msg[0..last] must not change on tail-only invalidation"
+        );
 
         // per_msg[last] must have changed (the text grew)
-        let last_strs: Vec<String> = cache.per_msg[last].lines().iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        let last_strs: Vec<String> = cache.per_msg[last]
+            .lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
-        let contains_new = last_strs.iter().any(|s| s.contains("more content appended"));
+        let contains_new = last_strs
+            .iter()
+            .any(|s| s.contains("more content appended"));
         assert!(contains_new, "per_msg[last] must reflect the updated text");
 
         // Concatenated slots + cum_heights must equal the reference render
         // (the surviving §4 oracle — flat is gone).
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
         };
-        let concat: Vec<ratatui::text::Line<'static>> =
-            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-        assert_eq!(to_str(&expected_flat), to_str(&concat),
-            "per_msg concatenation must equal full render_lines after incremental rebuild");
-        assert_eq!(cache.total_height(), expected_flat.len(),
-            "cum_heights total must track the reference render after incremental rebuild");
+        let concat: Vec<ratatui::text::Line<'static>> = cache
+            .per_msg
+            .iter()
+            .flat_map(|e| e.lines().iter().cloned())
+            .collect();
+        assert_eq!(
+            to_str(&expected_flat),
+            to_str(&concat),
+            "per_msg concatenation must equal full render_lines after incremental rebuild"
+        );
+        assert_eq!(
+            cache.total_height(),
+            expected_flat.len(),
+            "cum_heights total must track the reference render after incremental rebuild"
+        );
     }
 
     #[test]
@@ -1500,31 +1813,55 @@ mod tests {
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
-        app.transcript.test_insert_at(at, crate::tui::app::TimestampedMsg {
-            msg: ChatMessage::ToolResult {
-                tool_id: "t1".to_string(),
-                content: "file.txt".to_string(),
-                elapsed_ms: Some(5),
+        app.transcript.test_insert_at(
+            at,
+            crate::tui::app::TimestampedMsg {
+                msg: ChatMessage::ToolResult {
+                    tool_id: "t1".to_string(),
+                    content: "file.txt".to_string(),
+                    elapsed_ms: Some(5),
+                },
+                time: "00:00".to_string(),
             },
-            time: "00:00".to_string(),
-        });
+        );
         app.transcript.invalidate_from(at);
 
         // Rebuild: since per_msg.len() (2) != messages.len() (3), should do full-from-k rebuild
         rebuild_incremental(&mut app, w);
 
         let cache = app.transcript.line_cache().unwrap();
-        assert_eq!(cache.per_msg.len(), app.transcript.message_count(), "per_msg must track messages after insert");
+        assert_eq!(
+            cache.per_msg.len(),
+            app.transcript.message_count(),
+            "per_msg must track messages after insert"
+        );
 
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
         };
-        let concat: Vec<ratatui::text::Line<'static>> =
-            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-        assert_eq!(to_str(&expected_flat), to_str(&concat),
-            "per_msg concatenation must equal render_lines after insert + incremental rebuild");
-        assert_eq!(cache.total_height(), expected_flat.len(),
-            "cum_heights total must track the reference render after insert + incremental rebuild");
+        let concat: Vec<ratatui::text::Line<'static>> = cache
+            .per_msg
+            .iter()
+            .flat_map(|e| e.lines().iter().cloned())
+            .collect();
+        assert_eq!(
+            to_str(&expected_flat),
+            to_str(&concat),
+            "per_msg concatenation must equal render_lines after insert + incremental rebuild"
+        );
+        assert_eq!(
+            cache.total_height(),
+            expected_flat.len(),
+            "cum_heights total must track the reference render after insert + incremental rebuild"
+        );
     }
 }

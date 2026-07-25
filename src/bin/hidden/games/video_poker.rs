@@ -1,4 +1,4 @@
-use crate::games::blackjack::{Card, Rank, Suit, Deck};
+use crate::games::blackjack::{Card, Deck, Rank, Suit};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VideoPokerPhase {
@@ -81,33 +81,56 @@ pub fn evaluate_hand(cards: &[Card; 5]) -> PokerHand {
     let is_straight = {
         let mut s = true;
         for i in 1..5 {
-            if ranks[i] != ranks[i - 1] + 1 { s = false; break; }
+            if ranks[i] != ranks[i - 1] + 1 {
+                s = false;
+                break;
+            }
         }
         // Ace-low straight: A,2,3,4,5
-        if !s && ranks == [2, 3, 4, 5, 14] { s = true; }
+        if !s && ranks == [2, 3, 4, 5, 14] {
+            s = true;
+        }
         s
     };
 
     // Count occurrences
     let mut counts = [0u8; 15];
-    for &r in &ranks { counts[r as usize] += 1; }
+    for &r in &ranks {
+        counts[r as usize] += 1;
+    }
     let mut groups: Vec<u8> = counts.iter().filter(|&&c| c > 0).cloned().collect();
     groups.sort_unstable_by(|a, b| b.cmp(a));
 
     if is_flush && is_straight {
-        if ranks[0] == 10 { return PokerHand::RoyalFlush; }
+        if ranks[0] == 10 {
+            return PokerHand::RoyalFlush;
+        }
         return PokerHand::StraightFlush;
     }
-    if groups[0] == 4 { return PokerHand::FourOfAKind; }
-    if groups[0] == 3 && groups[1] == 2 { return PokerHand::FullHouse; }
-    if is_flush { return PokerHand::Flush; }
-    if is_straight { return PokerHand::Straight; }
-    if groups[0] == 3 { return PokerHand::ThreeOfAKind; }
-    if groups[0] == 2 && groups[1] == 2 { return PokerHand::TwoPair; }
+    if groups[0] == 4 {
+        return PokerHand::FourOfAKind;
+    }
+    if groups[0] == 3 && groups[1] == 2 {
+        return PokerHand::FullHouse;
+    }
+    if is_flush {
+        return PokerHand::Flush;
+    }
+    if is_straight {
+        return PokerHand::Straight;
+    }
+    if groups[0] == 3 {
+        return PokerHand::ThreeOfAKind;
+    }
+    if groups[0] == 2 && groups[1] == 2 {
+        return PokerHand::TwoPair;
+    }
     if groups[0] == 2 {
         // Check if pair is jacks or better
         for r in [11, 12, 13, 14] {
-            if counts[r] == 2 { return PokerHand::JacksOrBetter; }
+            if counts[r] == 2 {
+                return PokerHand::JacksOrBetter;
+            }
         }
     }
     PokerHand::Nothing
@@ -156,7 +179,9 @@ impl VideoPokerGame {
     }
 
     pub fn toggle_hold(&mut self, idx: usize) {
-        if idx < 5 { self.held[idx] = !self.held[idx]; }
+        if idx < 5 {
+            self.held[idx] = !self.held[idx];
+        }
     }
 
     pub fn draw_cards(&mut self) {
@@ -195,8 +220,10 @@ mod tests {
     #[test]
     fn royal_flush() {
         let hand = [
-            Card::new(Rank::Ten, Suit::Spades), Card::new(Rank::Jack, Suit::Spades),
-            Card::new(Rank::Queen, Suit::Spades), Card::new(Rank::King, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Spades),
+            Card::new(Rank::Jack, Suit::Spades),
+            Card::new(Rank::Queen, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
             Card::new(Rank::Ace, Suit::Spades),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::RoyalFlush);
@@ -205,8 +232,10 @@ mod tests {
     #[test]
     fn straight_flush() {
         let hand = [
-            Card::new(Rank::Five, Suit::Hearts), Card::new(Rank::Six, Suit::Hearts),
-            Card::new(Rank::Seven, Suit::Hearts), Card::new(Rank::Eight, Suit::Hearts),
+            Card::new(Rank::Five, Suit::Hearts),
+            Card::new(Rank::Six, Suit::Hearts),
+            Card::new(Rank::Seven, Suit::Hearts),
+            Card::new(Rank::Eight, Suit::Hearts),
             Card::new(Rank::Nine, Suit::Hearts),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::StraightFlush);
@@ -215,8 +244,10 @@ mod tests {
     #[test]
     fn four_of_a_kind() {
         let hand = [
-            Card::new(Rank::Seven, Suit::Spades), Card::new(Rank::Seven, Suit::Hearts),
-            Card::new(Rank::Seven, Suit::Diamonds), Card::new(Rank::Seven, Suit::Clubs),
+            Card::new(Rank::Seven, Suit::Spades),
+            Card::new(Rank::Seven, Suit::Hearts),
+            Card::new(Rank::Seven, Suit::Diamonds),
+            Card::new(Rank::Seven, Suit::Clubs),
             Card::new(Rank::Ace, Suit::Spades),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::FourOfAKind);
@@ -225,8 +256,10 @@ mod tests {
     #[test]
     fn full_house() {
         let hand = [
-            Card::new(Rank::King, Suit::Spades), Card::new(Rank::King, Suit::Hearts),
-            Card::new(Rank::King, Suit::Diamonds), Card::new(Rank::Three, Suit::Clubs),
+            Card::new(Rank::King, Suit::Spades),
+            Card::new(Rank::King, Suit::Hearts),
+            Card::new(Rank::King, Suit::Diamonds),
+            Card::new(Rank::Three, Suit::Clubs),
             Card::new(Rank::Three, Suit::Spades),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::FullHouse);
@@ -235,8 +268,10 @@ mod tests {
     #[test]
     fn flush() {
         let hand = [
-            Card::new(Rank::Two, Suit::Clubs), Card::new(Rank::Five, Suit::Clubs),
-            Card::new(Rank::Eight, Suit::Clubs), Card::new(Rank::Jack, Suit::Clubs),
+            Card::new(Rank::Two, Suit::Clubs),
+            Card::new(Rank::Five, Suit::Clubs),
+            Card::new(Rank::Eight, Suit::Clubs),
+            Card::new(Rank::Jack, Suit::Clubs),
             Card::new(Rank::Ace, Suit::Clubs),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::Flush);
@@ -245,8 +280,10 @@ mod tests {
     #[test]
     fn jacks_or_better() {
         let hand = [
-            Card::new(Rank::Jack, Suit::Spades), Card::new(Rank::Jack, Suit::Hearts),
-            Card::new(Rank::Three, Suit::Diamonds), Card::new(Rank::Seven, Suit::Clubs),
+            Card::new(Rank::Jack, Suit::Spades),
+            Card::new(Rank::Jack, Suit::Hearts),
+            Card::new(Rank::Three, Suit::Diamonds),
+            Card::new(Rank::Seven, Suit::Clubs),
             Card::new(Rank::Nine, Suit::Spades),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::JacksOrBetter);
@@ -255,8 +292,10 @@ mod tests {
     #[test]
     fn pair_of_tens_is_nothing() {
         let hand = [
-            Card::new(Rank::Ten, Suit::Spades), Card::new(Rank::Ten, Suit::Hearts),
-            Card::new(Rank::Three, Suit::Diamonds), Card::new(Rank::Seven, Suit::Clubs),
+            Card::new(Rank::Ten, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Hearts),
+            Card::new(Rank::Three, Suit::Diamonds),
+            Card::new(Rank::Seven, Suit::Clubs),
             Card::new(Rank::Nine, Suit::Spades),
         ];
         assert_eq!(evaluate_hand(&hand), PokerHand::Nothing);

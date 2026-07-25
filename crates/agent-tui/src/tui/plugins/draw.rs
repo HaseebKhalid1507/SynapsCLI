@@ -1,12 +1,12 @@
-use ratatui::Frame;
+use super::super::theme::{ModalKind, THEME};
+use super::progress::{ClonePhase, InstallProgressHandle};
+use super::state::{Focus, LeftRow, RightMode, RightRow};
+use super::PluginsModalState;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
-use super::PluginsModalState;
-use super::progress::{ClonePhase, InstallProgressHandle};
-use super::state::{Focus, LeftRow, RightMode, RightRow};
-use super::super::theme::{ModalKind, THEME};
+use ratatui::Frame;
 
 const OVERLAY_MAX_WIDTH: u16 = 70;
 const OVERLAY_HEIGHT: u16 = 7;
@@ -50,10 +50,17 @@ fn estimate_summary_rows(summary: &[String], inner_width: u16) -> u16 {
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
-    let h = (area.height.saturating_mul(7) / 10).max(20).min(area.height);
+    let h = (area.height.saturating_mul(7) / 10)
+        .max(20)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     // P19.1: `plugins.border` override (else `border_active` base token);
@@ -71,10 +78,10 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let [content, footer_bar] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-        .areas(inner);
-    let [sidebar, main] = Layout::horizontal([Constraint::Length(20), Constraint::Min(1)])
-        .areas(content);
+    let [content, footer_bar] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [sidebar, main] =
+        Layout::horizontal([Constraint::Length(20), Constraint::Min(1)]).areas(content);
 
     render_left(frame, sidebar, state);
     render_right(frame, main, state);
@@ -104,7 +111,10 @@ fn render_left(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
                 }
             }
             LeftRow::Marketplace(name) => {
-                let count = state.file.marketplaces.iter()
+                let count = state
+                    .file
+                    .marketplaces
+                    .iter()
                     .find(|m| &m.name == name)
                     .map(|m| m.cached_plugins.len())
                     .unwrap_or(0);
@@ -116,7 +126,10 @@ fn render_left(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
             }
             LeftRow::AddMarketplace => "+ Add Marketplace…".to_string(),
         };
-        lines.push(Line::from(vec![Span::styled(format!("{}{}", marker, label), style)]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("{}{}", marker, label),
+            style,
+        )]));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -131,20 +144,43 @@ fn render_right(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         RightMode::AddMarketplaceEditor { buffer, error } => {
             render_add_editor(frame, area, buffer, error.as_deref())
         }
-        RightMode::TrustPrompt { plugin_name, host, summary, .. } => {
-            render_trust_prompt(frame, area, plugin_name, host, summary)
-        }
-        RightMode::Confirm { prompt, summary, .. } => render_confirm(frame, area, prompt, summary),
-        RightMode::PendingInstallConfirm { plugin_name, summary, .. } => {
-            render_confirm(frame, area, &format!("Install executable plugin '{}' ?", plugin_name).replace("' ?", "'?"), summary)
-        }
-        RightMode::PendingUpdateConfirm { plugin_name, summary, .. } => {
-            render_confirm(frame, area, &format!("Update plugin '{}' ?", plugin_name).replace("' ?", "'?"), summary)
-        }
+        RightMode::TrustPrompt {
+            plugin_name,
+            host,
+            summary,
+            ..
+        } => render_trust_prompt(frame, area, plugin_name, host, summary),
+        RightMode::Confirm {
+            prompt, summary, ..
+        } => render_confirm(frame, area, prompt, summary),
+        RightMode::PendingInstallConfirm {
+            plugin_name,
+            summary,
+            ..
+        } => render_confirm(
+            frame,
+            area,
+            &format!("Install executable plugin '{}' ?", plugin_name).replace("' ?", "'?"),
+            summary,
+        ),
+        RightMode::PendingUpdateConfirm {
+            plugin_name,
+            summary,
+            ..
+        } => render_confirm(
+            frame,
+            area,
+            &format!("Update plugin '{}' ?", plugin_name).replace("' ?", "'?"),
+            summary,
+        ),
     }
 }
 
-fn installed_row_up_to_date(latest_commit: Option<&String>, installed_commit: &str, checksum_value: Option<&String>) -> bool {
+fn installed_row_up_to_date(
+    latest_commit: Option<&String>,
+    installed_commit: &str,
+    checksum_value: Option<&String>,
+) -> bool {
     match (latest_commit, checksum_value) {
         (Some(latest), _) if latest == installed_commit => true,
         (None, Some(_)) => true,
@@ -223,8 +259,7 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
     let rows = state.right_rows();
     let Some(row) = rows.get(row_idx) else {
         frame.render_widget(
-            Paragraph::new("(no selection)")
-                .style(Style::default().fg(THEME.load().help_fg)),
+            Paragraph::new("(no selection)").style(Style::default().fg(THEME.load().help_fg)),
             inner,
         );
         return;
@@ -246,7 +281,9 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
             lines.push(Line::from(vec![
                 Span::styled("marketplace: ", label_style),
                 Span::styled(
-                    ip.marketplace.clone().unwrap_or_else(|| "(direct)".to_string()),
+                    ip.marketplace
+                        .clone()
+                        .unwrap_or_else(|| "(direct)".to_string()),
                     value_style,
                 ),
             ]));
@@ -282,7 +319,13 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 lines.push(Line::from(vec![
                     Span::styled("checksum:    ", label_style),
                     Span::styled(
-                        format!("{}:{}", ip.checksum_algorithm.clone().unwrap_or_else(|| "sha256".to_string()), value),
+                        format!(
+                            "{}:{}",
+                            ip.checksum_algorithm
+                                .clone()
+                                .unwrap_or_else(|| "sha256".to_string()),
+                            value
+                        ),
                         value_style,
                     ),
                 ]));
@@ -307,7 +350,10 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
             lines.push(Line::from(vec![
                 Span::styled("description: ", label_style),
                 Span::styled(
-                    plugin.description.clone().unwrap_or_else(|| "no description".to_string()),
+                    plugin
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "no description".to_string()),
                     value_style,
                 ),
             ]));
@@ -325,15 +371,27 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("checksum:    ", label_style),
-                    Span::styled(format!("{}:{}", index.checksum_algorithm, index.checksum_value), value_style),
+                    Span::styled(
+                        format!("{}:{}", index.checksum_algorithm, index.checksum_value),
+                        value_style,
+                    ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("compatible:  ", label_style),
-                    Span::styled(format!(
-                        "Synaps {}, extension protocol {}",
-                        index.compatibility_synaps.clone().unwrap_or_else(|| "unspecified".to_string()),
-                        index.compatibility_extension_protocol.clone().unwrap_or_else(|| "unspecified".to_string())
-                    ), value_style),
+                    Span::styled(
+                        format!(
+                            "Synaps {}, extension protocol {}",
+                            index
+                                .compatibility_synaps
+                                .clone()
+                                .unwrap_or_else(|| "unspecified".to_string()),
+                            index
+                                .compatibility_extension_protocol
+                                .clone()
+                                .unwrap_or_else(|| "unspecified".to_string())
+                        ),
+                        value_style,
+                    ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("executable:  ", label_style),
@@ -341,26 +399,62 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("permissions: ", label_style),
-                    Span::styled(if index.permissions.is_empty() { "none".to_string() } else { index.permissions.join(", ") }, value_style),
+                    Span::styled(
+                        if index.permissions.is_empty() {
+                            "none".to_string()
+                        } else {
+                            index.permissions.join(", ")
+                        },
+                        value_style,
+                    ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("hooks:       ", label_style),
-                    Span::styled(if index.hooks.is_empty() { "none".to_string() } else { index.hooks.join(", ") }, value_style),
+                    Span::styled(
+                        if index.hooks.is_empty() {
+                            "none".to_string()
+                        } else {
+                            index.hooks.join(", ")
+                        },
+                        value_style,
+                    ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("commands:    ", label_style),
-                    Span::styled(if index.commands.is_empty() { "none".to_string() } else { index.commands.join(", ") }, value_style),
+                    Span::styled(
+                        if index.commands.is_empty() {
+                            "none".to_string()
+                        } else {
+                            index.commands.join(", ")
+                        },
+                        value_style,
+                    ),
                 ]));
                 if !index.providers.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled("providers:   ", label_style),
-                        Span::styled(index.providers.iter().map(|p| format!("{} ({})", p.id, p.models.join(", "))).collect::<Vec<_>>().join("; "), value_style),
+                        Span::styled(
+                            index
+                                .providers
+                                .iter()
+                                .map(|p| format!("{} ({})", p.id, p.models.join(", ")))
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                            value_style,
+                        ),
                     ]));
                 }
-                if index.permissions.iter().any(|permission| permission == "providers.register") {
+                if index
+                    .permissions
+                    .iter()
+                    .any(|permission| permission == "providers.register")
+                {
                     lines.push(Line::from(vec![
                         Span::styled("provider UX: ", label_style),
-                        Span::styled("high impact — selected provider models receive conversation content", Style::default().fg(THEME.load().error_color)),
+                        Span::styled(
+                            "high impact — selected provider models receive conversation content",
+                            Style::default().fg(THEME.load().error_color),
+                        ),
                     ]));
                 }
                 if let Some(publisher) = &index.trust_publisher {
@@ -377,7 +471,10 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 }
                 lines.push(Line::from(vec![
                     Span::styled("install:     ", label_style),
-                    Span::styled("fetched manifest is re-inspected before final install", value_style),
+                    Span::styled(
+                        "fetched manifest is re-inspected before final install",
+                        value_style,
+                    ),
                 ]));
             }
         }
@@ -390,7 +487,12 @@ fn centered_overlay_with_height(frame: &mut Frame, area: Rect, title: &str, heig
     let h = height;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h.min(area.height) };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h.min(area.height),
+    };
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .title(title.to_string())
@@ -429,7 +531,13 @@ fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &str, summary: &[String]) {
+fn render_trust_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    plugin_name: &str,
+    host: &str,
+    summary: &[String],
+) {
     let inner_w = overlay_inner_width(area);
     let prompt = format!("Trust source {} and install {}?", host, plugin_name);
     let prompt_rows = estimate_wrapped_rows(&prompt, inner_w);
@@ -517,7 +625,11 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
         snap;
 
     let elapsed = started_at.elapsed();
-    let elapsed_str = format!("{:>2}.{:02}s", elapsed.as_secs(), elapsed.subsec_millis() / 10);
+    let elapsed_str = format!(
+        "{:>2}.{:02}s",
+        elapsed.as_secs(),
+        elapsed.subsec_millis() / 10
+    );
 
     // Layout: title + blank + gauge (1 row) + status line + (optional error line)
     // Content rows fixed at 5 + optional error line; +2 borders.
@@ -626,7 +738,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
 
     if let Some(err) = &state.row_error {
         let spans = vec![
-            Span::styled(format!("! {}  ", err), Style::default().fg(THEME.load().error_color)),
+            Span::styled(
+                format!("! {}  ", err),
+                Style::default().fg(THEME.load().error_color),
+            ),
             Span::styled(hint.to_string(), Style::default().fg(THEME.load().help_fg)),
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -652,8 +767,7 @@ fn inset_rect(area: Rect, dx: u16, dy: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_summary_rows, estimate_wrapped_rows, installed_row_up_to_date,
-        OVERLAY_HEIGHT,
+        estimate_summary_rows, estimate_wrapped_rows, installed_row_up_to_date, OVERLAY_HEIGHT,
     };
 
     #[test]

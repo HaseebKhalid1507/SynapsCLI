@@ -1,0 +1,25 @@
+{
+  "description": "Reasoning blocks: signed thinking plus an opaque redacted-reasoning block. Fully representable on Anthropic wire: expected report is empty.",
+  "request": {
+    "system": [],
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [{ "type": "text", "text": "Think about it." }]
+      },
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "type": "reasoning",
+            "text": "Need the weather tool.",
+            "signature": "sig-abc123"
+          },
+          { "type": "reasoning", "redacted": true },
+          { "type": "text", "text": "Done thinking." }
+        ]
+      }
+    ]
+  },
+  "expected_anthropic": { "entries": [] }
+}

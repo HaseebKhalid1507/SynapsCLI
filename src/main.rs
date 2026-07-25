@@ -12,14 +12,50 @@
     clippy::await_holding_lock,
     clippy::useless_format,
     clippy::cmp_owned,
-    clippy::items_after_test_module,
+    clippy::items_after_test_module
 )]
 
 use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
-mod watcher;
 mod cmd;
+mod watcher;
+
+// ── Allocator ────────────────────────────────────────────────────────────────
+// Long-lived sessions serialize the ENTIRE conversation to a JSON body every
+// turn (prompt caching requires sending the full prefix — see
+// runtime/api.rs `serde_json::to_vec(&body)`). That transient buffer scales
+// with history length; on glibc the freed arena pages are never returned to the
+// OS, so RSS ratchets up to ~history size and never shrinks (the classic
+// transient-heavy-long-lived-process hysteresis).
+//
+// jemalloc's background thread purges cold dirty pages back to the OS, which
+// reclaims exactly that dead-but-retained arena — with zero impact on caching
+// or retained history. Gated to non-musl: musl's allocator already returns
+// memory readily, and the Pria agentic-VM runtime is a musl build we don't want
+// to perturb.
+#[cfg(not(target_env = "musl"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Configure jemalloc at load time (no env var needed). Three settings:
+//   - background_thread:true  → background thread purges cold dirty pages to OS
+//   - narenas:4               → cap arenas (default is 4×ncpu = 48 on a 12-core
+//                               box). 26 runtime threads sprawling across 48
+//                               arenas reserve ~70 MB of 4 MB chunks at baseline
+//                               for no benefit; 4 arenas is ample for our
+//                               allocation concurrency and slashes idle RSS.
+//   - dirty_decay_ms:1000     → return idle dirty pages ~1s after they go cold
+//   - muzzy_decay_ms:0        → purge muzzy pages immediately
+//
+// CRITICAL: tikv-jemalloc-sys is built with the `_rjem_` symbol prefix, so
+// jemalloc reads the config from `_rjem_malloc_conf` — NOT `malloc_conf`. An
+// earlier revision exported the unmangled name, which jemalloc silently ignored
+// (verified: opt.dirty_decay_ms sat at the 10000ms default). Keep this mangled.
+#[cfg(not(target_env = "musl"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +76,10 @@ struct Cli {
     /// System prompt: a string or path to a file (TUI only).
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
+
+    /// Typed modular prompt manifest (validated offline before session start).
+    #[arg(long = "prompt-manifest", value_name = "PATH")]
+    prompt_manifest: Option<std::path::PathBuf>,
 
     /// Disable all extensions for this session.
     #[arg(long)]
@@ -189,10 +229,26 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Offline modular prompt validation and inspection.
+    Prompt {
+        #[command(subcommand)]
+        action: cmd::prompt::PromptAction,
+    },
     /// Tool-surface utilities (schema export, etc.)
     Tools {
         #[command(subcommand)]
         action: cmd::tools::ToolsAction,
+    },
+    /// Request-trace export utilities (metadata-only by default).
+    Trace {
+        #[command(subcommand)]
+        action: cmd::trace::TraceAction,
+    },
+    /// Unified retention: inspect/sweep/export/forget across sessions,
+    /// memory, indexes, traces, and logs (chain-integrity-safe).
+    Retention {
+        #[command(subcommand)]
+        action: cmd::retention::RetentionAction,
     },
 }
 
@@ -209,37 +265,100 @@ enum AuthAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Prompt { .. })) {
+        if let Some(Command::Prompt { action }) = cli.command {
+            return cmd::prompt::run(action);
+        }
+        unreachable!();
+    }
     if let Some(ref prof) = cli.profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
     match cli.command {
         None => {
-            tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            tui::run(
+                cli.continue_session,
+                cli.system,
+                cli.prompt_manifest,
+                cli.profile,
+                cli.no_extensions,
+            )
+            .await?;
         }
-        Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
+        Some(Command::Chat {
+            continue_session,
+            system,
+            agent,
+            profile,
+            no_extensions,
+        }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
-        Some(Command::Server { port, host, system, continue_session, token, auto_approve_confirms, allowed_origins }) => {
-            cmd::server::run(port, host, system, continue_session, cli.profile, token, auto_approve_confirms, allowed_origins).await?;
+        Some(Command::Server {
+            port,
+            host,
+            system,
+            continue_session,
+            token,
+            auto_approve_confirms,
+            allowed_origins,
+        }) => {
+            cmd::server::run(
+                port,
+                host,
+                system,
+                continue_session,
+                cli.profile,
+                token,
+                auto_approve_confirms,
+                allowed_origins,
+            )
+            .await?;
         }
-        Some(Command::Agent { config, trigger_context }) => {
+        Some(Command::Agent {
+            config,
+            trigger_context,
+        }) => {
             cmd::agent::run(config, trigger_context).await;
         }
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
         Some(Command::Login { provider }) => {
-            cmd::login::run(cli.profile, provider).await;
+            cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
         Some(Command::Auth { action }) => match action {
-            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider).await,
+            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider)
+                .await
+                .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status) => {
-            cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            cmd::status::run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http }) => {
-            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http).await?;
+        Some(Command::AuthBroker {
+            bind,
+            machine_token,
+            machine_token_file,
+            insecure_no_auth,
+            tls_cert,
+            tls_key,
+            insecure_http,
+        }) => {
+            cmd::auth_broker::run(
+                bind,
+                machine_token,
+                machine_token_file,
+                insecure_no_auth,
+                tls_cert,
+                tls_key,
+                insecure_http,
+            )
+            .await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
@@ -247,14 +366,45 @@ async fn main() -> anyhow::Result<()> {
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
+        Some(Command::Prompt { .. }) => {
+            unreachable!("prompt dispatched before profile initialization")
+        }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
         }
-        Some(Command::Rpc { continue_id, system, model, profile }) => {
+        Some(Command::Trace { action }) => {
+            cmd::trace::run(action)?;
+        }
+        Some(Command::Retention { action }) => {
+            cmd::retention::run(action)?;
+        }
+        Some(Command::Rpc {
+            continue_id,
+            system,
+            model,
+            profile,
+        }) => {
             cmd::rpc::run(continue_id, system, model, profile).await?;
         }
-        Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
-            cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
+        Some(Command::Send {
+            message,
+            source,
+            severity,
+            channel,
+            content_type,
+            session,
+            broadcast,
+        }) => {
+            cmd::send::run(
+                message,
+                source,
+                severity,
+                channel,
+                content_type,
+                session,
+                broadcast,
+            )
+            .await?;
         }
     }
     Ok(())

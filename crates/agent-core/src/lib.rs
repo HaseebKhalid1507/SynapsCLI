@@ -8,19 +8,28 @@ pub mod pricing;
 // Re-export stream event types at crate root so engine/tui can import them
 // cleanly as `agent_core::{StreamEvent, LlmEvent, ...}` without digging
 // into the internal module path.
-pub use core::stream_types::{AgentEvent, LlmEvent, SessionEvent, SharedMessage, StreamEvent};
+pub use core::stream_types::{
+    next_turn_correlation_id, AgentEvent, BudgetDimension, LlmEvent, SessionEvent, SharedMessage,
+    StreamEvent, TurnError, TurnOutcome,
+};
 
 // Replicate the root lib.rs aliases so internal `crate::config`,
 // `crate::models`, `crate::session`, etc. resolve INSIDE agent-core.
-pub use core::config;
-pub use core::session;
 pub use core::auth;
-pub use core::logging;
-pub use core::protocol;
-pub use core::error;
-pub use core::watcher_types;
-pub use core::models;
 pub use core::chain;
+pub use core::compaction;
+pub use core::config;
+pub use core::disclosure;
+pub use core::error;
+pub use core::logging;
+pub use core::models;
+pub use core::private_fs;
+pub use core::protocol;
+pub use core::reasoning;
+pub use core::retention;
+pub use core::session;
+pub use core::session_journal;
+pub use core::watcher_types;
 
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]
@@ -47,3 +56,9 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+
+pub mod orchestration;
+pub mod prompt;
+pub mod text;
+
+pub use text::BoundedText;

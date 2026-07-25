@@ -22,30 +22,65 @@ pub enum RuntimeError {
 
 /// Translate an Anthropic API error response into a human-actionable message.
 ///
-/// Parses the error body (`{"error": {"type": ..., "message": ...}}`) and maps
-/// well-known statuses to guidance. Falls back to a trimmed version of the raw
-/// body for unknown cases.
+/// SECURITY (spec §5.1): the response `body` — including any nested
+/// `error.message` / `error.type` — is UNTRUSTED. A hostile or misconfigured
+/// provider can echo the entire request (prompts, system text, tool schemas,
+/// credentials) inside it, so no body-derived text is ever reproduced in the
+/// returned message. The body is used only for *classification* (matching
+/// against fixed, vetted patterns); output is built exclusively from static
+/// guidance plus the numeric status.
 pub fn humanize_api_error(status: u16, body: &str) -> String {
     humanize_api_error_with_reset(status, body, None)
+}
+
+/// Anthropic wire error types we recognise. Matching one lets the message
+/// name the class via OUR static string — never the provider's bytes.
+const VETTED_ERROR_TYPES: &[&str] = &[
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "request_too_large",
+    "rate_limit_error",
+    "api_error",
+    "overloaded_error",
+    "billing_error",
+    "timeout_error",
+];
+
+/// Extract `error.type` from an Anthropic error envelope and map it onto a
+/// vetted static label. Returns `None` for anything unrecognised — the
+/// untrusted value itself is never surfaced.
+fn vetted_error_type(body: &str) -> Option<&'static str> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let ty = v.get("error")?.get("type")?.as_str()?;
+    VETTED_ERROR_TYPES.iter().find(|t| **t == ty).copied()
+}
+
+/// Classification-only peek at the untrusted error body: true when it
+/// contains the given fixed pattern. The body text itself is never emitted.
+fn body_mentions(body: &str, pattern: &str) -> bool {
+    body.contains(pattern)
+}
+
+/// Map an untrusted provider error-type string onto a vetted static label.
+///
+/// Used by streaming/sync callers that already parsed the envelope: the
+/// returned `&'static str` is OUR constant, safe to log/display; the input
+/// itself must never be reproduced.
+pub fn sanitize_error_type(ty: &str) -> Option<&'static str> {
+    VETTED_ERROR_TYPES.iter().find(|t| **t == ty).copied()
 }
 
 /// Like [`humanize_api_error`] but surfaces a known rate-limit reset time in
 /// the 429 message so the failure is honest rather than cryptic.
 /// `reset_hint` is a human-readable duration string, e.g. `"47s"`.
 pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option<&str>) -> String {
-    // Pull the server's message out of the JSON envelope if present.
-    let api_msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .map(String::from)
-        });
-    let detail = api_msg.unwrap_or_else(|| {
-        let trimmed = body.trim();
-        if trimmed.len() > 200 { format!("{}…", crate::truncate_str(trimmed, 200)) } else { trimmed.to_string() }
-    });
+    // Vetted static class label, e.g. " [api_error]" — safe because it is
+    // one of OUR constants, selected (not copied) via the untrusted body.
+    let kind = vetted_error_type(body)
+        .map(|t| format!(" [{t}]"))
+        .unwrap_or_default();
 
     match status {
         529 => "Anthropic is overloaded right now. Retries exhausted — wait a minute and try again.".to_string(),
@@ -53,23 +88,24 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
             if let Some(reset) = reset_hint {
                 format!(
                     "Rate limit exhausted — retries used up while waiting for reset (next window in {}). \
-                     Try again shortly, or switch models with /model. ({})",
-                    reset, detail
+                     Try again shortly, or switch models with /model.",
+                    reset
                 )
             } else {
-                format!("Rate limited by Anthropic ({}). Wait for the limit to reset, or switch models with /model.", detail)
+                format!("Rate limited by Anthropic (HTTP 429{kind}). Wait for the limit to reset, or switch models with /model.")
             }
         }
-        401 => "Authentication rejected. Run `synaps login` to re-authenticate, or check ANTHROPIC_API_KEY.".to_string(),
-        403 => format!("Access denied ({}). Your account may not have access to this model.", detail),
-        404 => format!("Model or endpoint not found ({}). Check the model name with /model.", detail),
+        401 => "Authentication rejected. Run `synaps login` to re-authenticate.".to_string(),
+        403 => format!("Access denied (HTTP 403{kind}). Your account may not have access to this model."),
+        404 => format!("Model or endpoint not found (HTTP 404{kind}). Check the model name with /model."),
         413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),
-        400 if detail.contains("extended-cache-ttl") =>
-            format!("Bad request ({}) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.", detail),
-        400 if detail.contains("prompt is too long") || detail.contains("max_tokens") || detail.contains("context") =>
-            format!("Context window exceeded ({}). Run /compact to shrink the conversation.", detail),
-        500 | 502 | 503 => format!("Anthropic server error ({} {}). Retries exhausted — usually transient, try again shortly.", status, detail),
-        _ => format!("API error {} — {}", status, detail),
+        400 if body_mentions(body, "extended-cache-ttl") =>
+            "Bad request (HTTP 400) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.".to_string(),
+        400 if body_mentions(body, "prompt is too long") || body_mentions(body, "max_tokens") || body_mentions(body, "context") =>
+            "Context window exceeded (HTTP 400). Run /compact to shrink the conversation.".to_string(),
+        400 => format!("Bad request (HTTP 400{kind}). Provider error details withheld — they can echo request content."),
+        500 | 502 | 503 => format!("Anthropic server error (HTTP {status}{kind}). Retries exhausted — usually transient, try again shortly."),
+        _ => format!("API error (HTTP {status}{kind}). Provider error details withheld — they can echo request content."),
     }
 }
 
@@ -86,6 +122,56 @@ pub fn humanize_network_error(e: &reqwest::Error) -> String {
     }
 }
 
+/// Render an error's full cause chain (`Display` of every level, `: `-joined).
+///
+/// `format!("{e}")` on a `reqwest::Error` prints only the top level — e.g.
+/// `error sending request for url (…)` — and silently drops the source that
+/// says *why* (`operation timed out`, `dns error`, `connection refused`, …).
+/// That cost a real postmortem hours; always surface the chain.
+pub fn error_chain_string(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let cause_str = cause.to_string();
+        // Some wrappers already embed their source's Display; skip duplicates.
+        if !msg.contains(&cause_str) {
+            msg.push_str(": ");
+            msg.push_str(&cause_str);
+        }
+        source = cause.source();
+    }
+    msg
+}
+
+/// Host-aware variant of [`humanize_network_error`] for non-Anthropic
+/// providers (OpenAI Codex, Groq, local OpenAI-compat endpoints, …).
+///
+/// Unlike the Anthropic-specific helper this derives the host from the
+/// failing request's URL and preserves the underlying cause chain, so
+/// `chatgpt.com` failures are never misattributed and the *reason*
+/// (timeout vs connect vs mid-stream drop) survives into the UI.
+pub fn humanize_provider_network_error(e: &reqwest::Error) -> String {
+    let host = e
+        .url()
+        .and_then(|u| u.host_str())
+        .map(String::from)
+        .unwrap_or_else(|| "the provider endpoint".to_string());
+    let chain = error_chain_string(e);
+    if e.is_timeout() {
+        format!(
+            "Request to {host} timed out — usually transient; check your connection and try again. [{chain}]"
+        )
+    } else if e.is_connect() {
+        format!(
+            "Could not reach {host} (connection failed). Check your network, DNS, or proxy settings. [{chain}]"
+        )
+    } else if e.is_body() || e.is_decode() {
+        format!("Connection to {host} lost mid-response — usually transient; try again. [{chain}]")
+    } else {
+        format!("Network error talking to {host}: {chain}")
+    }
+}
+
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[cfg(test)]
@@ -94,7 +180,10 @@ mod tests {
 
     #[test]
     fn test_humanize_529_overloaded() {
-        let msg = humanize_api_error(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+        let msg = humanize_api_error(
+            529,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
         assert!(msg.contains("overloaded"), "got: {msg}");
         assert!(!msg.contains('{'), "raw JSON leaked: {msg}");
     }
@@ -107,20 +196,29 @@ mod tests {
 
     #[test]
     fn test_humanize_400_context_suggests_compact() {
-        let msg = humanize_api_error(400, r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#);
+        let msg = humanize_api_error(
+            400,
+            r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#,
+        );
         assert!(msg.contains("/compact"), "got: {msg}");
     }
 
     #[test]
     fn test_humanize_400_cache_ttl_names_config_key() {
-        let msg = humanize_api_error(400, r#"{"error":{"message":"The extended-cache-ttl-2025-04-11 beta is not enabled for this account"}}"#);
+        let msg = humanize_api_error(
+            400,
+            r#"{"error":{"message":"The extended-cache-ttl-2025-04-11 beta is not enabled for this account"}}"#,
+        );
         assert!(msg.contains("cache_ttl = 5m"), "got: {msg}");
     }
 
     #[test]
-    fn test_humanize_unknown_status_includes_detail() {
+    fn test_humanize_unknown_status_names_status_but_withholds_detail() {
+        // Provider `error.message` is untrusted (can echo the request) —
+        // only the status and vetted guidance may appear.
         let msg = humanize_api_error(418, r#"{"error":{"message":"teapot"}}"#);
-        assert!(msg.contains("418") && msg.contains("teapot"), "got: {msg}");
+        assert!(msg.contains("418"), "got: {msg}");
+        assert!(!msg.contains("teapot"), "untrusted detail leaked: {msg}");
     }
 
     #[test]
@@ -151,6 +249,179 @@ mod tests {
         assert!(!msg.contains('\u{FFFD}'), "replacement char leaked: {msg}");
     }
 
+    // ── error_chain_string: full cause chain, not just the top Display ──────
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    #[derive(Debug)]
+    struct Inner;
+
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error sending request for url (https://example.com/x)")
+        }
+    }
+    impl std::fmt::Display for Inner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "operation timed out")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    impl std::error::Error for Inner {}
+
+    #[test]
+    fn error_chain_string_joins_all_sources() {
+        let msg = error_chain_string(&Outer(Inner));
+        assert!(
+            msg.contains("error sending request") && msg.contains("operation timed out"),
+            "chain must include top-level AND source: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_chain_string_single_level_has_no_separator_suffix() {
+        let msg = error_chain_string(&Inner);
+        assert_eq!(msg, "operation timed out");
+    }
+
+    // ── humanize_provider_network_error: host-aware transport messaging ─────
+
+    /// Listener that accepts connections but never responds → client-side
+    /// timeout while awaiting response headers (the incident failure mode).
+    #[tokio::test]
+    async fn humanize_provider_timeout_names_host_and_says_transient() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Keep the listener alive but never accept/respond.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .post(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("must time out");
+        drop(listener);
+        assert!(err.is_timeout(), "precondition: {err:?}");
+        let msg = humanize_provider_network_error(&err);
+        assert!(msg.contains("127.0.0.1"), "must name the host: {msg}");
+        assert!(msg.contains("timed out"), "must say timed out: {msg}");
+        assert!(msg.contains("transient"), "must flag transience: {msg}");
+        assert!(
+            !msg.contains("api.anthropic.com"),
+            "must not claim the Anthropic host: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn humanize_provider_connect_error_names_host() {
+        // Bind then drop → guaranteed-refused port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let err = client
+            .post(format!("http://{addr}/codex/responses"))
+            .send()
+            .await
+            .expect_err("must fail to connect");
+        assert!(err.is_connect(), "precondition: {err:?}");
+        let msg = humanize_provider_network_error(&err);
+        assert!(msg.contains("127.0.0.1"), "must name the host: {msg}");
+        assert!(
+            msg.contains("Could not reach"),
+            "must describe connection failure: {msg}"
+        );
+    }
+
+    // ── Phase 1 holdout regression: hostile provider echoes the request ─────
+    //
+    // A hostile/misconfigured provider can put the ENTIRE request body
+    // (user messages, system prompts, tool schemas, credentials) into
+    // `error.message`. spec §5.1 / Task 1: no raw-content sentinel may
+    // appear in logs or user-visible errors at any level. The humanizer
+    // must therefore never echo any body-derived text.
+
+    const HOSTILE_SENTINEL: &str = "HOLDOUT-SENTINEL-http500-77aa";
+
+    /// Anthropic-shaped error envelope whose message echoes a request body.
+    fn hostile_json_body() -> String {
+        format!(
+            r#"{{"type":"error","error":{{"type":"api_error","message":"ECHOED:{{\"messages\":[{{\"role\":\"user\",\"content\":\"{} tell me things\"}}],\"system\":[{{\"text\":\"You are a secret system prompt\"}}],\"tools\":[{{\"name\":\"bash\",\"input_schema\":{{\"properties\":{{}}}}}}]}}"}}}}"#,
+            HOSTILE_SENTINEL
+        )
+    }
+
+    /// Request-shaped markers that must never surface in a humanized error.
+    fn assert_no_request_content(msg: &str, ctx: &str) {
+        assert!(
+            !msg.contains(HOSTILE_SENTINEL),
+            "{ctx}: sentinel leaked: {msg}"
+        );
+        assert!(!msg.contains("ECHOED"), "{ctx}: echoed body leaked: {msg}");
+        assert!(
+            !msg.contains("input_schema") && !msg.contains("secret system prompt"),
+            "{ctx}: request-shaped content leaked: {msg}"
+        );
+    }
+
+    #[test]
+    fn hostile_error_message_never_leaks_for_any_status() {
+        let body = hostile_json_body();
+        for status in [400u16, 403, 404, 429, 500, 418] {
+            let msg = humanize_api_error(status, &body);
+            assert_no_request_content(&msg, &format!("status {status}"));
+            // Still actionable: names the status class.
+            assert!(
+                msg.contains(&status.to_string())
+                    || msg.contains("Rate limited")
+                    || msg.contains("Access denied")
+                    || msg.contains("not found"),
+                "status {status}: message not actionable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_429_with_reset_hint_keeps_timing_but_not_body() {
+        let msg = humanize_api_error_with_reset(429, &hostile_json_body(), Some("47s"));
+        assert_no_request_content(&msg, "429+reset");
+        assert!(msg.contains("47s"), "reset timing must survive: {msg}");
+    }
+
+    #[test]
+    fn hostile_non_json_body_never_leaks() {
+        // Non-JSON hostile content (e.g. text/plain echo of the request).
+        let body = format!(
+            "raw echo: {} {{\"messages\":[...],\"system\":[...]}} {}",
+            HOSTILE_SENTINEL,
+            "x".repeat(300)
+        );
+        for status in [400u16, 403, 404, 429, 500, 418] {
+            let msg = humanize_api_error(status, &body);
+            assert_no_request_content(&msg, &format!("non-json status {status}"));
+        }
+    }
+
+    #[test]
+    fn hostile_error_type_field_is_not_echoed_verbatim() {
+        // `error.type` is attacker-controlled too — only vetted static
+        // labels may be reproduced.
+        let body = format!(
+            r#"{{"error":{{"type":"{} injected-type","message":"m"}}}}"#,
+            HOSTILE_SENTINEL
+        );
+        for status in [400u16, 403, 404, 429, 500, 418] {
+            let msg = humanize_api_error(status, &body);
+            assert_no_request_content(&msg, &format!("type-field status {status}"));
+        }
+    }
+
     #[test]
     fn test_runtime_error_display() {
         assert_eq!(
@@ -173,15 +444,9 @@ mod tests {
             "Session error: not found"
         );
 
-        assert_eq!(
-            format!("{}", RuntimeError::Timeout),
-            "Request timed out"
-        );
+        assert_eq!(format!("{}", RuntimeError::Timeout), "Request timed out");
 
-        assert_eq!(
-            format!("{}", RuntimeError::Canceled),
-            "Operation canceled"
-        );
+        assert_eq!(format!("{}", RuntimeError::Canceled), "Operation canceled");
     }
 
     #[test]
@@ -206,14 +471,8 @@ mod tests {
             "Session error: not found"
         );
 
-        assert_eq!(
-            RuntimeError::Timeout.to_string(),
-            "Request timed out"
-        );
+        assert_eq!(RuntimeError::Timeout.to_string(), "Request timed out");
 
-        assert_eq!(
-            RuntimeError::Canceled.to_string(),
-            "Operation canceled"
-        );
+        assert_eq!(RuntimeError::Canceled.to_string(), "Operation canceled");
     }
 }

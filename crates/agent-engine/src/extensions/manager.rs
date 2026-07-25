@@ -4,14 +4,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::capability::{
+    ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry,
+};
 use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
-use super::info::PluginInfo;
+use super::context_provider::{
+    dormant_context_provider_descriptors, resolve_context_provider, ContextProviderId,
+    RegisteredContextProviderDescriptor, SharedContextProviderCatalog,
+};
 use super::hooks::HookBus;
+use super::info::PluginInfo;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
-use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
-use super::capability::{ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry};
+use super::runtime::{ExtensionHandler, ExtensionHealth};
 use serde_json::{Map, Value};
 
 fn project_plugins_disabled() -> bool {
@@ -23,6 +29,35 @@ fn project_plugins_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a `plugins/` directory entry name denotes an INERT copy of a
+/// plugin — a backup, disabled, or temporary directory — rather than an
+/// installed plugin. Inert directories are excluded from discovery so a
+/// stale copy can never register tools or execute alongside the real one
+/// (user incident: `axel-memory-manager.backup.<TS>` dirs were discovered
+/// as live plugins and their binaries spawned next to the real v0.3).
+///
+/// Name-based and conservative: only well-known suffix conventions (plus
+/// the timestamped `.backup.<...>` infix) are excluded, so legitimate
+/// dotted/hyphenated plugin names (`com.example.notes`, `backup-manager`)
+/// stay discoverable. Exact plugin IDs of surviving plugins are untouched.
+fn is_inert_plugin_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // Timestamped backups: `<plugin>.backup.20260720101416`.
+    if lower.contains(".backup.") {
+        return true;
+    }
+    const INERT_SUFFIXES: &[&str] = &[
+        ".backup",
+        ".update-backup", // written by the plugin updater
+        ".bak",
+        ".disabled",
+        ".old",
+        ".orig",
+        ".tmp",
+        ".temp",
+    ];
+    INERT_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
 
 fn installed_plugin_setup_failure_in(
     state: &crate::skills::state::PluginsState,
@@ -143,6 +178,63 @@ pub struct ExtensionManager {
     /// `ext.<plugin-id>.<token>` without re-reading manifests. Extensions
     /// that declare none simply have no entry.
     manifest_theme_tokens: HashMap<String, std::collections::BTreeMap<String, String>>,
+    /// Task 20: when true (progressive disclosure), tool-only manifests
+    /// with validated passive declarations are NOT spawned at load — their
+    /// dormant deferred tools are cataloged instead and the launch record
+    /// is retained for exact-activation lease acquisition.
+    progressive_deferral: bool,
+    /// Launch records for deferred tool-only extensions (manifest + cwd +
+    /// resolved config), keyed by plugin id, behind a SHARED handle: the
+    /// [`crate::extensions::lease::ExtensionRuntimeManager`] reads the
+    /// CURRENT record at every lease acquisition (sync lock, map ops only,
+    /// never held across I/O). Consumed by the lease lifecycle only.
+    deferred_tool_only: SharedDeferredRecords,
+    /// Lazily-created shared extension runtime lease manager (Task 20
+    /// Commit B). One instance shared by this manager (unload revocation)
+    /// and the `Runtime` (per-session capabilities + session-end scope).
+    extension_runtime: std::sync::OnceLock<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
+    /// Task A6: DORMANT context-provider descriptors declared by loaded
+    /// extensions (`deferred.context_providers`, task A3) — the OWNED
+    /// catalog behind [`Self::context_providers`]/[`Self::context_provider`],
+    /// mirroring how `providers` backs the model-provider catalog reads.
+    /// Pure metadata: cataloging a descriptor spawns nothing (discovery/
+    /// status spawn zero processes); the only activation path is a future
+    /// exact memory-context lease routed through the lease manager.
+    context_providers: Vec<RegisteredContextProviderDescriptor>,
+    /// Published snapshot of `context_providers`, shared with the lease
+    /// manager exactly like `deferred_tool_only`: every catalog mutation
+    /// republishes via [`Self::publish_context_providers`], and the
+    /// `Runtime` memory-context enable path reads the CURRENT snapshot
+    /// through `ExtensionRuntimeManager::resolve_context_provider` (sync
+    /// lock, slice ops only, never held across I/O, never spawning).
+    context_provider_catalog: SharedContextProviderCatalog,
+    /// HOST-OWNED trusted project root, recorded ONCE per manager on first
+    /// use (canonical `ProjectScope::discover` walk from the host's own
+    /// working directory). Injected into resolved config for manifest
+    /// entries declaring `host_context: "project_root"`; never sourced
+    /// from env overrides, user config, or model input, and never
+    /// forwarded as an environment variable.
+    host_project_root: std::sync::OnceLock<Option<String>>,
+}
+
+/// Shared handle to the retained deferred launch records. Crate-private:
+/// records hold RESOLVED (potentially secret) config.
+pub(crate) type SharedDeferredRecords =
+    Arc<std::sync::Mutex<HashMap<String, DeferredExtensionRecord>>>;
+
+/// Retained launch expectation for a spawn-deferred tool-only extension.
+///
+/// INTERNAL AND OPAQUE (review fix A3): `config` holds RESOLVED values —
+/// including `secret_env` material — so this record is crate-private,
+/// exposes no public accessor, and deliberately implements neither
+/// `Debug` nor `Serialize`. Public diagnostics may reveal only booleans/
+/// counts (see [`ExtensionManager::is_deferred_tool_only`]); runtime
+/// acquisition stays inside the manager/lease lifecycle API.
+#[derive(Clone)]
+pub(crate) struct DeferredExtensionRecord {
+    pub(crate) manifest: ExtensionManifest,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) config: Value,
 }
 
 impl ExtensionManager {
@@ -157,6 +249,12 @@ impl ExtensionManager {
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
+            progressive_deferral: false,
+            deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            extension_runtime: std::sync::OnceLock::new(),
+            context_providers: Vec::new(),
+            context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
+            host_project_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -174,15 +272,17 @@ impl ExtensionManager {
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
             manifest_theme_tokens: HashMap::new(),
+            progressive_deferral: false,
+            deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            extension_runtime: std::sync::OnceLock::new(),
+            context_providers: Vec::new(),
+            context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
+            host_project_root: std::sync::OnceLock::new(),
         }
     }
 
     /// Load and start an extension from its manifest.
-    pub async fn load(
-        &mut self,
-        id: &str,
-        manifest: &ExtensionManifest,
-    ) -> Result<(), String> {
+    pub async fn load(&mut self, id: &str, manifest: &ExtensionManifest) -> Result<(), String> {
         self.load_with_cwd(id, manifest, None).await
     }
 
@@ -193,8 +293,179 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        let config = Self::resolve_config(id, &manifest.config)?;
-        self.load_with_cwd_and_config(id, manifest, cwd, config).await
+        let config = Self::resolve_config(id, &manifest.config, self.host_project_root())?;
+        self.load_with_cwd_and_config(id, manifest, cwd, config)
+            .await
+    }
+
+    /// Enable Task 20 progressive spawn deferral (set at engine boot from
+    /// the progressive-disclosure flag; default false keeps every legacy
+    /// eager path byte-for-byte).
+    pub fn set_progressive_deferral(&mut self, enabled: bool) {
+        self.progressive_deferral = enabled;
+    }
+
+    /// The HOST-OWNED trusted project root, discovered ONCE per manager
+    /// from the host's own working directory via the canonical
+    /// `agent_core` project-scope walk (nearest `.git`/`.synaps-project`
+    /// marker, canonicalized). Recorded here so every extension load in
+    /// this manager's lifetime sees one stable value. `None` when the
+    /// working directory is unavailable or cannot be canonicalized.
+    pub fn host_project_root(&self) -> Option<&str> {
+        self.host_project_root
+            .get_or_init(|| {
+                let cwd = std::env::current_dir().ok()?;
+                agent_core::memory::store::ProjectScope::discover(&cwd)
+                    .ok()
+                    .map(|scope| scope.root().display().to_string())
+            })
+            .as_deref()
+    }
+
+    /// Whether one plugin id is currently deferred (any Task 20 class:
+    /// tool-only, provider, hook/lifecycle, UI/sidecar, mixed — zero
+    /// spawn). Boolean-only diagnostic: the underlying launch record
+    /// (which holds resolved — potentially secret — config) is never
+    /// exposed.
+    pub fn is_deferred(&self, id: &str) -> bool {
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+
+    /// Compatibility alias for [`Self::is_deferred`] (Commit B name).
+    pub fn is_deferred_tool_only(&self, id: &str) -> bool {
+        self.is_deferred(id)
+    }
+
+    /// Number of retained deferred tool-only launch records (count-only
+    /// diagnostic; never the records).
+    pub fn deferred_tool_only_count(&self) -> usize {
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn deferred_records(&self) -> &SharedDeferredRecords {
+        &self.deferred_tool_only
+    }
+
+    /// Republish the owned context-provider catalog into the shared
+    /// snapshot the lease manager reads (task A6). Called after EVERY
+    /// catalog mutation so `resolve_context_provider` always observes the
+    /// current loaded set — a removed extension's providers can never be
+    /// resolved from a stale snapshot.
+    fn publish_context_providers(&self) {
+        let mut published = self
+            .context_provider_catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *published = self.context_providers.clone();
+    }
+
+    /// Catalog one loaded extension's DORMANT context-provider
+    /// declarations (task A6) via the task-A3 validated builder. Pure
+    /// metadata registration — spawns nothing; invalid or ungated
+    /// declaration sets yield no descriptors (fail closed inside
+    /// [`dormant_context_provider_descriptors`]).
+    fn catalog_context_providers(&mut self, id: &str, manifest: &ExtensionManifest) {
+        let descriptors = dormant_context_provider_descriptors(id, manifest);
+        if descriptors.is_empty() {
+            return;
+        }
+        self.context_providers.extend(descriptors);
+        self.publish_context_providers();
+    }
+
+    /// Drop every cataloged context-provider descriptor owned by one
+    /// extension (unload/teardown path, task A6) and republish.
+    fn uncatalog_context_providers(&mut self, id: &str) {
+        let before = self.context_providers.len();
+        self.context_providers
+            .retain(|descriptor| descriptor.extension_id() != id);
+        if self.context_providers.len() != before {
+            self.publish_context_providers();
+        }
+    }
+
+    /// The SHARED extension runtime lease manager (Task 20 Commit B),
+    /// created on first use against this manager's retained launch
+    /// records. The engine installs the same instance on the `Runtime`
+    /// (session capabilities + durable session-end scope); this manager
+    /// uses it for unload/reload lease revocation. Runtime acquisition —
+    /// spawn, re-validation, exact declaration matching — happens ONLY
+    /// inside that manager's lease lifecycle.
+    pub fn extension_runtime(&self) -> Arc<crate::extensions::lease::ExtensionRuntimeManager> {
+        self.extension_runtime_with_idle(crate::extensions::lease::DEFAULT_IDLE_MAX)
+    }
+
+    /// As [`Self::extension_runtime`], but the FIRST caller fixes the idle
+    /// reap bound (tests use short bounds; production uses the default).
+    pub fn extension_runtime_with_idle(
+        &self,
+        idle_max: std::time::Duration,
+    ) -> Arc<crate::extensions::lease::ExtensionRuntimeManager> {
+        Arc::clone(self.extension_runtime.get_or_init(|| {
+            Arc::new(crate::extensions::lease::ExtensionRuntimeManager::new(
+                Arc::clone(&self.deferred_tool_only),
+                Arc::clone(&self.context_provider_catalog),
+                idle_max,
+            ))
+        }))
+    }
+
+    /// Test-only internal introspection: clone one retained launch record
+    /// (the lease manager reads the shared records handle directly).
+    #[cfg(test)]
+    pub(crate) fn deferred_launch_record(&self, id: &str) -> Option<DeferredExtensionRecord> {
+        self.deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    /// Test seam: tamper the retained manifest permissions of one deferred
+    /// record IN PLACE (simulates internal-state drift the public API can
+    /// never produce, to prove acquisition re-validation fails closed).
+    /// Reveals nothing.
+    #[doc(hidden)]
+    pub fn tamper_deferred_manifest_permissions_for_tests(
+        &self,
+        id: &str,
+        permissions: Vec<String>,
+    ) -> bool {
+        let mut map = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get_mut(id) {
+            Some(record) => {
+                record.manifest.permissions = permissions;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test seam: tamper the retained RESOLVED config of one deferred
+    /// record in place (simulates launch-record/config drift under a live
+    /// lease). Reveals nothing.
+    #[doc(hidden)]
+    pub fn tamper_deferred_config_for_tests(&self, id: &str, config: Value) -> bool {
+        let mut map = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get_mut(id) {
+            Some(record) => {
+                record.config = config;
+                true
+            }
+            None => false,
+        }
     }
 
     async fn load_with_cwd_and_config(
@@ -204,8 +475,8 @@ impl ExtensionManager {
         cwd: Option<std::path::PathBuf>,
         config: Value,
     ) -> Result<(), String> {
-        // Don't load duplicates
-        if self.extensions.contains_key(id) {
+        // Don't load duplicates (live OR deferred).
+        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
             return Err(format!("Extension '{}' is already loaded", id));
         }
 
@@ -216,8 +487,173 @@ impl ExtensionManager {
         let permissions = validated.permissions;
         let subscriptions = validated.subscriptions;
 
+        // Task 20: under progressive disclosure, EVERY manifest with a
+        // validated `deferred` block defers its spawn entirely (spec §7.5):
+        //  - tool-only: dormant descriptor tools cataloged; exact
+        //    activation acquires the lease;
+        //  - provider: declared provider METADATA registered with a lazy
+        //    handler; first selected complete/stream acquires;
+        //  - hook/lifecycle: permission-validated subscriptions registered
+        //    with a lazy handler; the first AUTHORIZED matching event
+        //    acquires;
+        //  - UI/sidecar: record retained only; explicit user APIs acquire;
+        //  - mixed: all of the above against ONE shared per-plugin lease
+        //    (earliest legitimate capability starts it; tool SEARCH alone
+        //    never does).
+        // Legacy manifests (no `deferred` block) and flag-off stay on the
+        // documented eager path byte-for-byte.
+        let class = crate::extensions::lifecycle::classify(manifest);
+        if self.progressive_deferral
+            && class != crate::extensions::lifecycle::ExtensionClass::LegacyEager
+        {
+            let declared_tool_names: Vec<String> = manifest
+                .deferred
+                .as_ref()
+                .map(|d| d.tools.iter().map(|t| format!("{id}:{}", t.name)).collect())
+                .unwrap_or_default();
+            let dormant = crate::extensions::lifecycle::dormant_extension_tools(id, manifest);
+            let tool_count = dormant.len();
+            if !dormant.is_empty() {
+                let Some(tools) = &self.tools else {
+                    return Err(format!(
+                        "Extension '{}' declares deferred tools but no tool registry is available",
+                        id
+                    ));
+                };
+                tools
+                    .write()
+                    .await
+                    .try_register_batch(dormant)
+                    .map_err(|e| {
+                        format!("Extension '{}' deferred tool catalog rejected: {}", id, e)
+                    })?;
+            }
+            // Retain the launch record BEFORE registering lazy capability
+            // surfaces so a capability firing immediately can acquire.
+            self.deferred_tool_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    id.to_string(),
+                    DeferredExtensionRecord {
+                        manifest: manifest.clone(),
+                        cwd,
+                        config: config.clone(),
+                    },
+                );
+            // Bounded unwind shared by the failure paths below: remove the
+            // record, the dormant batch, and any provider metadata.
+            macro_rules! unwind_deferred {
+                () => {{
+                    self.deferred_tool_only
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(id);
+                    self.providers.unregister_plugin(id);
+                    if let Some(tools) = &self.tools {
+                        let _ = tools.write().await.try_disable(&declared_tool_names);
+                    }
+                    self.hook_bus.unsubscribe_all(id).await;
+                }};
+            }
+            let lazy: Option<Arc<dyn ExtensionHandler>> = {
+                // Created only when a lazy capability surface exists, so a
+                // tool-only load never pre-initializes the runtime manager
+                // (its idle policy stays first-caller-configurable).
+                let needs_lazy = manifest
+                    .deferred
+                    .as_ref()
+                    .map(|d| !d.providers.is_empty())
+                    .unwrap_or(false)
+                    || !manifest.hooks.is_empty();
+                needs_lazy.then(|| {
+                    Arc::new(crate::extensions::lease::LazyExtensionHandler::new(
+                        id,
+                        self.extension_runtime(),
+                    )) as Arc<dyn ExtensionHandler>
+                })
+            };
+            // Declared provider METADATA (validated shape) registered with
+            // the lazy handler; routing re-validates the live runtime's
+            // declarations against the manifest before any call.
+            let declared_providers: Vec<_> = manifest
+                .deferred
+                .as_ref()
+                .map(|d| d.providers.clone())
+                .unwrap_or_default();
+            let mut registered_provider_ids = Vec::new();
+            for declared in &declared_providers {
+                let spec = declared.to_registered_spec();
+                if let Err(error) = Self::validate_provider_config_requirements(id, &spec, &config)
+                {
+                    unwind_deferred!();
+                    return Err(error);
+                }
+                let handler = lazy.clone().expect("providers imply a lazy handler");
+                match self
+                    .providers
+                    .register_with_handler(id, spec, Some(handler))
+                {
+                    Ok(runtime_id) => registered_provider_ids.push(runtime_id),
+                    Err(error) => {
+                        unwind_deferred!();
+                        return Err(error);
+                    }
+                }
+            }
+            // Tool-use audit parity with the eager path.
+            for runtime_id in &registered_provider_ids {
+                if let Some(provider) = self.providers.get(runtime_id) {
+                    let tool_use = provider.spec.models.iter().any(|m| {
+                        m.capabilities
+                            .get("tool_use")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    });
+                    if tool_use {
+                        tracing::warn!(
+                            "Provider '{}' is tool-use capable: it can request Synaps tools through provider mediation. Use `/extensions trust disable {}` to block routing.",
+                            runtime_id,
+                            runtime_id,
+                        );
+                    }
+                }
+            }
+            // Permission-validated hook subscriptions with the lazy
+            // handler: the first AUTHORIZED matching event acquires.
+            for (kind, tool_filter, matcher) in subscriptions {
+                let handler = lazy.clone().expect("subscriptions imply a lazy handler");
+                if let Err(error) = self
+                    .hook_bus
+                    .subscribe(kind, handler, tool_filter, matcher, permissions.clone())
+                    .await
+                {
+                    unwind_deferred!();
+                    return Err(error);
+                }
+            }
+            self.manifest_configs
+                .insert(id.to_string(), manifest.config.clone());
+            if !manifest.theme_tokens.is_empty() {
+                self.manifest_theme_tokens
+                    .insert(id.to_string(), manifest.theme_tokens.clone());
+            }
+            // Task A6: catalog DORMANT context-provider declarations LAST —
+            // every fallible registration step above has succeeded, so the
+            // unwind path never needs to reason about a half-published
+            // catalog. Metadata only; nothing spawns.
+            self.catalog_context_providers(id, manifest);
+            tracing::info!(extension = %id, class = ?class, tools = tool_count,
+                providers = registered_provider_ids.len(), hooks = manifest.hooks.len(),
+                context_providers = self.context_providers.iter().filter(|d| d.extension_id() == id).count(),
+                "Extension deferred: passive surfaces registered, no process started");
+            return Ok(());
+        }
+
         // Spawn the extension process only after the manifest is known-good.
-        let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
+        let process =
+            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone())
+                .await?;
         // Publish permissions to the inbound-request dispatcher so memory.*
         // calls during initialize can be authorized correctly.
         process.set_permissions(permissions.clone()).await;
@@ -235,14 +671,18 @@ impl ExtensionManager {
             || !registered_providers.is_empty()
             || !capability_declarations.is_empty();
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
-        if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
+        if !registered_tools.is_empty()
+            && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister)
+        {
             handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered tools but lacks permission 'tools.register'",
                 id
             ));
         }
-        if !registered_providers.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ProvidersRegister) {
+        if !registered_providers.is_empty()
+            && !permissions.has(crate::extensions::permissions::Permission::ProvidersRegister)
+        {
             handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered providers but lacks permission 'providers.register'",
@@ -250,7 +690,9 @@ impl ExtensionManager {
             ));
         }
         for decl in &capability_declarations {
-            if let Err(err) = crate::extensions::runtime::process::validate_capability(decl, &permissions) {
+            if let Err(err) =
+                crate::extensions::runtime::process::validate_capability(decl, &permissions)
+            {
                 handler.shutdown().await;
                 return Err(format!(
                     "Extension '{}' capability '{}' invalid: {}",
@@ -261,12 +703,17 @@ impl ExtensionManager {
         if !registered_providers.is_empty() {
             let mut registered_ids = Vec::new();
             for provider in registered_providers {
-                if let Err(error) = Self::validate_provider_config_requirements(id, &provider, &config) {
+                if let Err(error) =
+                    Self::validate_provider_config_requirements(id, &provider, &config)
+                {
                     self.providers.unregister_plugin(id);
                     handler.shutdown().await;
                     return Err(error);
                 }
-                match self.providers.register_with_handler(id, provider, Some(handler.clone())) {
+                match self
+                    .providers
+                    .register_with_handler(id, provider, Some(handler.clone()))
+                {
                     Ok(runtime_id) => registered_ids.push(runtime_id),
                     Err(error) => {
                         self.providers.unregister_plugin(id);
@@ -305,7 +752,19 @@ impl ExtensionManager {
             };
             let mut registry = tools.write().await;
             for spec in registered_tools {
-                registry.register(Arc::new(crate::tools::ExtensionTool::new(id, spec, handler.clone())));
+                let tool_name = spec.name.clone();
+                if let Err(e) = registry.try_register(Arc::new(crate::tools::ExtensionTool::new(
+                    id,
+                    spec,
+                    handler.clone(),
+                ))) {
+                    tracing::warn!(
+                        extension = %id,
+                        tool = %tool_name,
+                        error = %e,
+                        "Refusing to expose extension tool the capability catalog could not record"
+                    );
+                }
             }
         }
 
@@ -341,7 +800,13 @@ impl ExtensionManager {
         // Register hook subscriptions
         for (kind, tool_filter, matcher) in subscriptions {
             self.hook_bus
-                .subscribe(kind, handler.clone(), tool_filter, matcher, permissions.clone())
+                .subscribe(
+                    kind,
+                    handler.clone(),
+                    tool_filter,
+                    matcher,
+                    permissions.clone(),
+                )
                 .await?;
         }
 
@@ -359,6 +824,12 @@ impl ExtensionManager {
         if let Some(info) = info {
             self.plugin_info.insert(id.to_string(), info);
         }
+        // Task A6: catalog validated DORMANT `deferred.context_providers`
+        // declarations for eagerly-loaded extensions too, so the context-
+        // provider catalog reflects EVERY loaded extension regardless of
+        // lifecycle class. Metadata only — the process above was spawned by
+        // the legacy eager path, never by this catalog write.
+        self.catalog_context_providers(id, manifest);
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
     }
@@ -372,7 +843,8 @@ impl ExtensionManager {
             .config_schema
             .as_ref()
             .and_then(|schema| schema.get("required"))
-            .and_then(Value::as_array) else {
+            .and_then(Value::as_array)
+        else {
             return Ok(());
         };
         for key in required {
@@ -396,7 +868,11 @@ impl ExtensionManager {
         Ok(())
     }
 
-    fn resolve_config(id: &str, entries: &[ExtensionConfigEntry]) -> Result<Value, String> {
+    fn resolve_config(
+        id: &str,
+        entries: &[ExtensionConfigEntry],
+        host_project_root: Option<&str>,
+    ) -> Result<Value, String> {
         let mut out = Map::new();
         for entry in entries {
             let key = entry.key.trim();
@@ -409,8 +885,40 @@ impl ExtensionManager {
                     id, key,
                 ));
             }
+            // RESERVED host-context entries: the value comes EXCLUSIVELY
+            // from trusted host state recorded once by this manager. Env
+            // overrides, secret_env, plugin config, and legacy config keys
+            // are all deliberately skipped — user or model input can never
+            // supply or widen a host-context value.
+            if let Some(host_key) = entry.host_context {
+                if entry.secret_env.is_some() {
+                    return Err(format!(
+                        "Extension '{}' config key '{}' declares both host_context and secret_env; host-context values never carry secrets",
+                        id, key,
+                    ));
+                }
+                match host_key {
+                    crate::extensions::manifest::HostContextKey::ProjectRoot => {
+                        if let Some(root) = host_project_root {
+                            out.insert(key.to_string(), Value::String(root.to_string()));
+                        } else if let Some(default) = &entry.default {
+                            out.insert(key.to_string(), default.clone());
+                        } else if entry.required {
+                            return Err(format!(
+                                "Extension '{}' requires host context 'project_root' but the host could not resolve a trusted project root",
+                                id,
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
             let config_key = format!("extension.{}.{}", id, key);
-            if let Ok(value) = std::env::var(format!("SYNAPS_EXTENSION_{}_{}", id.replace('-', "_").to_ascii_uppercase(), key.replace('-', "_").to_ascii_uppercase())) {
+            if let Ok(value) = std::env::var(format!(
+                "SYNAPS_EXTENSION_{}_{}",
+                id.replace('-', "_").to_ascii_uppercase(),
+                key.replace('-', "_").to_ascii_uppercase()
+            )) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
@@ -434,11 +942,17 @@ impl ExtensionManager {
             }
             if entry.required {
                 let hint = if let Some(secret_env) = &entry.secret_env {
-                    format!("set environment variable '{}' or config key '{}'", secret_env, config_key)
+                    format!(
+                        "set environment variable '{}' or config key '{}'",
+                        secret_env, config_key
+                    )
                 } else {
                     format!("set config key '{}'", config_key)
                 };
-                return Err(format!("Extension '{}' missing required config '{}': {}", id, key, hint));
+                return Err(format!(
+                    "Extension '{}' missing required config '{}': {}",
+                    id, key, hint
+                ));
             }
         }
         Ok(Value::Object(out))
@@ -457,11 +971,68 @@ impl ExtensionManager {
     }
 
     /// Unload an extension — unsubscribe hooks and shut down the process.
+    ///
+    /// A DEFERRED tool-only extension (Task 20) has no live handler:
+    /// unloading it removes the retained launch record, deregisters its
+    /// dormant catalog batch (advancing the catalog generation so stale
+    /// grants cannot survive), and terminates every session's runtime
+    /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        let deferred = self
+            .deferred_tool_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        if let Some(record) = deferred {
+            // Record removed FIRST: any concurrent lease acquisition now
+            // fails closed (NotDeferred) regardless of the steps below.
+            // Context providers go with it (task A6): once unloading has
+            // begun, a memory-context enable can no longer resolve this
+            // extension's declared providers.
+            self.uncatalog_context_providers(id);
+            if let Some(runtime) = self.extension_runtime.get() {
+                let revoked = runtime.revoke_plugin_all_sessions(id);
+                if revoked > 0 {
+                    tracing::info!(extension = %id, leases = revoked,
+                        "Terminated live runtime leases of unloaded deferred extension");
+                }
+            }
+            self.hook_bus.unsubscribe_all(id).await;
+            self.providers.unregister_plugin(id);
+            if let Some(tools) = &self.tools {
+                let names: Vec<String> = record
+                    .manifest
+                    .deferred
+                    .as_ref()
+                    .map(|d| {
+                        d.tools
+                            .iter()
+                            .map(|t| format!("{}:{}", id, t.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Err(error) = tools.write().await.try_disable(&names) {
+                    // Fail-closed either way: with the record gone, dormant
+                    // descriptors can never execute; surface the partial
+                    // cleanup instead of hiding it.
+                    return Err(format!(
+                        "Extension '{}' unloaded (record removed, leases revoked) but its dormant catalog batch could not be deregistered: {}",
+                        id, error
+                    ));
+                }
+            }
+            self.manifest_configs.remove(id);
+            self.manifest_theme_tokens.remove(id);
+            tracing::info!(extension = %id, "Deferred extension unloaded");
+            return Ok(());
+        }
         let handler = self
             .extensions
             .remove(id)
             .ok_or_else(|| format!("Extension '{}' not found", id))?;
+        // Task A6: cataloged context providers of a live extension are
+        // removed with it.
+        self.uncatalog_context_providers(id);
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
@@ -484,7 +1055,7 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        if self.extensions.contains_key(id) {
+        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
             self.unload(id).await?;
         }
         self.load_with_cwd(id, manifest, cwd).await
@@ -496,6 +1067,21 @@ impl ExtensionManager {
         for id in ids {
             let _ = self.unload(&id).await;
         }
+        // Deferred extensions (Task 20): unload each retained record so
+        // dormant catalog batches and any live runtime leases go with it.
+        let deferred_ids: Vec<String> = {
+            let map = self
+                .deferred_tool_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.keys().cloned().collect()
+        };
+        for id in deferred_ids {
+            let _ = self.unload(&id).await;
+        }
+        if let Some(runtime) = self.extension_runtime.get() {
+            runtime.terminate_all();
+        }
     }
 
     /// Start shutting down all extensions in the background.
@@ -503,7 +1089,9 @@ impl ExtensionManager {
     /// This is intended for process exit: the UI should not hang waiting for
     /// extension child processes to acknowledge shutdown. Dropping the join handle
     /// lets Tokio abort remaining work when the runtime exits.
-    pub fn shutdown_all_detached(manager: Arc<tokio::sync::RwLock<Self>>) -> tokio::task::JoinHandle<()> {
+    pub fn shutdown_all_detached(
+        manager: Arc<tokio::sync::RwLock<Self>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             manager.write().await.shutdown_all().await;
         })
@@ -562,6 +1150,31 @@ impl ExtensionManager {
         self.providers.get(runtime_id)
     }
 
+    /// Return DORMANT context-provider descriptors declared by loaded
+    /// extensions, sorted by runtime address (task A6; mirrors
+    /// [`Self::providers`] for the UNRELATED model-provider catalog).
+    /// Pure catalog read — discovery/status spawn zero processes, and
+    /// holding a descriptor grants nothing.
+    pub fn context_providers(&self) -> Vec<&RegisteredContextProviderDescriptor> {
+        let mut out: Vec<&RegisteredContextProviderDescriptor> =
+            self.context_providers.iter().collect();
+        out.sort_by_key(|descriptor| descriptor.runtime_address());
+        out
+    }
+
+    /// Exact context-provider lookup by declared id (task A6; mirrors
+    /// [`Self::provider`]). `Some` iff EXACTLY ONE loaded extension
+    /// declares `provider_id` — zero matches and overlapping declarations
+    /// (the same id declared by multiple installed extensions) both
+    /// resolve to `None`, fail closed, no partial matches. Pure catalog
+    /// read — never spawns.
+    pub fn context_provider(
+        &self,
+        provider_id: &ContextProviderId,
+    ) -> Option<&RegisteredContextProviderDescriptor> {
+        resolve_context_provider(&self.context_providers, Some(provider_id)).ok()
+    }
+
     /// Return optional cached plugin info reported by `info.get`.
     pub fn plugin_info(&self, id: &str) -> Option<&PluginInfo> {
         self.plugin_info.get(id)
@@ -585,35 +1198,93 @@ impl ExtensionManager {
     /// plugins that don't host a sidecar (or pre-Phase-7 plugins that
     /// haven't implemented the RPC yet) return `Err`. Callers are
     /// expected to treat that as "no overrides; use manifest defaults".
+    /// Handler for explicit USER-triggered plugin APIs (sidecar spawn,
+    /// interactive commands, settings editors). Live extensions use their
+    /// running handler; a DEFERRED extension (Task 20) gets a lazy handler
+    /// whose first use acquires the shared per-plugin runtime lease — a
+    /// user action is a legitimate activation trigger. Discovery/search/
+    /// diagnostics never call this.
+    fn user_action_handler(
+        &self,
+        id: &str,
+    ) -> Result<Arc<dyn super::runtime::ExtensionHandler>, String> {
+        if let Some(handler) = self.extensions.get(id) {
+            return Ok(handler.clone());
+        }
+        if self.is_deferred(id) {
+            return Ok(Arc::new(
+                crate::extensions::lease::LazyExtensionHandler::new(id, self.extension_runtime()),
+            ));
+        }
+        Err(format!("unknown extension '{}'", id))
+    }
+
     pub async fn sidecar_spawn_args(
         &self,
         id: &str,
     ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.sidecar_spawn_args().await
     }
 
     /// Invoke an interactive plugin command on extension `id`. Streams
     /// `command.output` (matching `request_id`) and `task.*` notifications
     /// to `sink`. Returns the final JSON-RPC response value.
+    ///
+    /// CP-11 fix-3: `sink` is the bounded, metered producer half of
+    /// [`crate::extensions::invoke_output::invoke_event_channel`]; the
+    /// caller MUST drive the matching collector concurrently with this
+    /// call (an awaited bounded send with no consumer would stall the
+    /// invocation loop until the 120 s timeout). Prefer
+    /// [`Self::invoke_command_collected`], which wires that correctly.
     pub async fn invoke_command(
         &self,
         id: &str,
         command: &str,
         args: Vec<String>,
         request_id: &str,
-        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+        sink: crate::extensions::invoke_output::InvokeEventSink,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
-        handler.invoke_command(command, args, request_id, sink).await
+        let handler = self.user_action_handler(id)?;
+        handler
+            .invoke_command(command, args, request_id, sink)
+            .await
+    }
+
+    /// Invoke an interactive plugin command and collect its budgeted
+    /// output. This is THE production entry point for user-facing
+    /// surfaces: it joins the invocation with an eagerly concurrent
+    /// collector so hostile `command.output` floods are paced and capped
+    /// at production time (never parked unbounded), then returns the
+    /// final response alongside the retained events and exact
+    /// produced/consumed/retained/truncated/dropped accounting.
+    ///
+    /// Dropping the returned future cancels the invocation, drops the
+    /// sink, and releases the collector plus any blocked producers — no
+    /// detached tasks are spawned.
+    pub async fn invoke_command_collected(
+        &self,
+        id: &str,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+    ) -> (
+        Result<serde_json::Value, String>,
+        crate::extensions::invoke_output::InvokeOutputReport,
+    ) {
+        let (sink, collector) = crate::extensions::invoke_output::invoke_event_channel(
+            crate::extensions::invoke_output::InvokeOutputBudget::default(),
+        );
+        let handler = match self.user_action_handler(id) {
+            Ok(handler) => handler,
+            Err(error) => {
+                drop(sink);
+                return (Err(error), collector.collect().await);
+            }
+        };
+        let invoke = handler.invoke_command(command, args, request_id, sink);
+        let (result, report) = tokio::join!(invoke, collector.collect());
+        (result, report)
     }
 
     pub async fn settings_editor_open(
@@ -622,11 +1293,7 @@ impl ExtensionManager {
         category: &str,
         field: &str,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_open(category, field).await
     }
 
@@ -637,11 +1304,7 @@ impl ExtensionManager {
         field: &str,
         key: &str,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_key(category, field, key).await
     }
 
@@ -652,11 +1315,7 @@ impl ExtensionManager {
         field: &str,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let handler = self
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("unknown extension '{}'", id))?
-            .clone();
+        let handler = self.user_action_handler(id)?;
         handler.settings_editor_commit(category, field, value).await
     }
 
@@ -792,7 +1451,8 @@ impl ExtensionManager {
             Err(e) => {
                 tracing::warn!("trust.json corrupt or unreadable, failing closed (all providers disabled): {e}");
                 // Return all providers as disabled
-                return self.providers
+                return self
+                    .providers
                     .list()
                     .into_iter()
                     .map(|p| (p.runtime_id.clone(), false))
@@ -803,8 +1463,7 @@ impl ExtensionManager {
             .list()
             .into_iter()
             .map(|p| {
-                let enabled =
-                    crate::extensions::trust::is_provider_enabled(&trust, &p.runtime_id);
+                let enabled = crate::extensions::trust::is_provider_enabled(&trust, &p.runtime_id);
                 (p.runtime_id.clone(), enabled)
             })
             .collect()
@@ -838,7 +1497,8 @@ impl ExtensionManager {
         provider_required.sort_by(|a, b| a.0.cmp(&b.0));
 
         let env_lookup = |name: &str| std::env::var(name).ok();
-        let plugin_config_lookup = |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
+        let plugin_config_lookup =
+            |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
         let legacy_config_lookup = |key: &str| crate::config::read_config_value(key);
 
         Some(diagnose_extension_config(
@@ -870,6 +1530,19 @@ impl ExtensionManager {
         self.tools.clone()
     }
 
+    /// Test-only: register a provider spec + in-process handler directly,
+    /// without spawning an extension process. Used by trace wiring tests.
+    #[cfg(test)]
+    pub(crate) fn register_provider_handler_for_tests(
+        &mut self,
+        plugin_id: &str,
+        spec: crate::extensions::runtime::process::RegisteredProviderSpec,
+        handler: Arc<dyn ExtensionHandler>,
+    ) -> Result<String, String> {
+        self.providers
+            .register_with_handler(plugin_id, spec, Some(handler))
+    }
+
     /// Discover and load all extensions from the user and project plugin directories.
     ///
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and
@@ -883,7 +1556,10 @@ impl ExtensionManager {
     /// Discover and load all extensions, invoking `progress` after each load
     /// attempt. Used by the async UI loader to update startup toasts without
     /// blocking first paint.
-    pub async fn discover_and_load_with_progress<F>(&mut self, mut progress: F) -> (Vec<String>, Vec<ExtensionLoadFailure>)
+    pub async fn discover_and_load_with_progress<F>(
+        &mut self,
+        mut progress: F,
+    ) -> (Vec<String>, Vec<ExtensionLoadFailure>)
     where
         F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
     {
@@ -921,6 +1597,14 @@ impl ExtensionManager {
 
             for entry in entries.flatten() {
                 let plugin_name = entry.file_name().to_string_lossy().to_string();
+                if is_inert_plugin_dir_name(&plugin_name) {
+                    tracing::debug!(
+                        plugin = %plugin_name,
+                        path = %entry.path().display(),
+                        "Skipping backup/disabled/temp plugin directory"
+                    );
+                    continue;
+                }
                 plugin_dirs.insert(plugin_name, entry.path());
             }
         }
@@ -1009,36 +1693,51 @@ impl ExtensionManager {
             #[allow(clippy::if_same_then_else)]
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
-            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR) && !ext_manifest.command.contains('/') {
+            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
+                && !ext_manifest.command.contains('/')
+            {
                 ext_manifest.command.clone()
             } else {
-                plugin_dir.join(&ext_manifest.command)
-                    .to_string_lossy().to_string()
+                plugin_dir
+                    .join(&ext_manifest.command)
+                    .to_string_lossy()
+                    .to_string()
             };
 
-            let args: Vec<String> = ext_manifest.args.iter().map(|arg| {
-                let arg_path = plugin_dir.join(arg);
-                if arg_path.exists() {
-                    if let (Ok(canonical), Ok(plugin_canonical)) = (
-                        arg_path.canonicalize(),
-                        plugin_dir.canonicalize(),
-                    ) {
-                        if canonical.starts_with(&plugin_canonical) {
-                            return canonical.to_string_lossy().to_string();
+            let args: Vec<String> = ext_manifest
+                .args
+                .iter()
+                .map(|arg| {
+                    let arg_path = plugin_dir.join(arg);
+                    if arg_path.exists() {
+                        if let (Ok(canonical), Ok(plugin_canonical)) =
+                            (arg_path.canonicalize(), plugin_dir.canonicalize())
+                        {
+                            if canonical.starts_with(&plugin_canonical) {
+                                return canonical.to_string_lossy().to_string();
+                            }
                         }
                     }
-                }
-                arg.clone()
-            }).collect();
+                    arg.clone()
+                })
+                .collect();
 
             let resolved = ExtensionManifest {
                 theme_tokens: Default::default(),
+                // Deferred declarations flow through from the installed
+                // manifest (legacy `tools`/`activation` aliases are folded
+                // into `deferred` at deserialization) so installed plugins
+                // keep their zero-spawn deferred lifecycle instead of
+                // silently loading eager.
                 command,
                 args,
                 ..ext_manifest
             };
 
-            match self.load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone())).await {
+            match self
+                .load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone()))
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(plugin = %plugin_name, path = %plugin_dir.display(), "Extension loaded from plugins/");
                     loaded.push(plugin_name.clone());
@@ -1053,14 +1752,13 @@ impl ExtensionManager {
                     let setup_script = json
                         .pointer("/extension/setup")
                         .and_then(|v| v.as_str())
-                        .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
+                        .or_else(|| {
+                            json.pointer("/provides/sidecar/setup")
+                                .and_then(|v| v.as_str())
+                        });
                     let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
-                    let failure = ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        e,
-                        hint,
-                    );
+                    let failure =
+                        ExtensionLoadFailure::new(plugin_name, Some(manifest_path), e, hint);
                     failed.push(failure.clone());
                     progress(crate::extensions::loader::ExtensionLoaderEvent::Failed {
                         failure,
@@ -1076,8 +1774,197 @@ impl ExtensionManager {
 }
 
 #[cfg(test)]
+mod invoke_command_collected_tests {
+    //! CP-11 fix-3: prove the manager's collected entry point pairs the
+    //! bounded sink with an eagerly concurrent collector — an in-process
+    //! handler that floods far past the channel capacity AND the retained
+    //! budget must neither deadlock nor grow retention, and accounting
+    //! must be exact.
+    use super::*;
+    use crate::extensions::commands::CommandOutputEvent;
+    use crate::extensions::invoke_output::INVOKE_RETAINED_BYTE_BUDGET;
+    use crate::extensions::runtime::InvokeCommandEvent;
+
+    struct FloodingHandler;
+
+    #[async_trait::async_trait]
+    impl super::ExtensionHandler for FloodingHandler {
+        fn id(&self) -> &str {
+            "flooding-fake"
+        }
+        async fn handle(
+            &self,
+            _event: &crate::extensions::hooks::events::HookEvent,
+        ) -> crate::extensions::hooks::events::HookResult {
+            Default::default()
+        }
+        async fn shutdown(&self) {}
+
+        async fn invoke_command(
+            &self,
+            _command: &str,
+            _args: Vec<String>,
+            _request_id: &str,
+            sink: crate::extensions::invoke_output::InvokeEventSink,
+        ) -> Result<Value, String> {
+            // 2048 x 4 KiB = 8 MiB >> 256 KiB budget, and 2048 events
+            // >> channel capacity 8: every awaited send past capacity
+            // requires the concurrent collector to make progress.
+            for _ in 0..2048 {
+                let event = InvokeCommandEvent::Output(CommandOutputEvent::Text {
+                    content: "f".repeat(4096),
+                });
+                if sink.send(event).await.is_err() {
+                    return Err("collector vanished".to_string());
+                }
+            }
+            let _ = sink
+                .send(InvokeCommandEvent::Output(CommandOutputEvent::Done))
+                .await;
+            Ok(serde_json::json!({"status": "flooded"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn collected_invoke_bounds_in_process_flood_without_deadlock() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus);
+        mgr.extensions
+            .insert("flooding-fake".to_string(), Arc::new(FloodingHandler));
+
+        let (result, report) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mgr.invoke_command_collected("flooding-fake", "any", vec![], "req-1"),
+        )
+        .await
+        .expect("bounded sink + concurrent collector must not deadlock");
+
+        assert_eq!(result.expect("invoke ok")["status"], "flooded");
+        let c = &report.counters;
+        assert_eq!(c.produced_events, 2049);
+        assert_eq!(c.produced_payload_bytes, 2048 * 4096);
+        assert_eq!(c.consumed_events, c.produced_events);
+        assert_eq!(c.consumed_payload_bytes, c.produced_payload_bytes);
+        assert_eq!(c.retained_payload_bytes, INVOKE_RETAINED_BYTE_BUDGET as u64);
+        assert!(c.saw_done);
+        assert_eq!(
+            c.consumed_payload_bytes,
+            c.retained_payload_bytes + c.truncated_payload_bytes + c.dropped_payload_bytes,
+        );
+        assert_eq!(c.consumed_events, c.retained_events + c.dropped_events);
+    }
+
+    #[tokio::test]
+    async fn collected_invoke_reports_unknown_extension_with_empty_report() {
+        let bus = Arc::new(HookBus::new());
+        let mgr = ExtensionManager::new(bus);
+        let (result, report) = mgr
+            .invoke_command_collected("nope", "any", vec![], "req-1")
+            .await;
+        assert!(result
+            .expect_err("unknown id")
+            .contains("unknown extension"));
+        assert!(report.events.is_empty());
+        assert_eq!(report.counters.produced_events, 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task A6: context-provider manifest for one plugin (no tools, no
+    /// hooks — classifies as `ContextProvider` and defers without spawn).
+    fn context_provider_manifest(provider_id: &str) -> ExtensionManifest {
+        serde_json::from_value(serde_json::json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["context_providers.register"],
+            "deferred": {
+                "context_providers": [{
+                    "id": provider_id,
+                    "capability": "project-memory",
+                    "description": "test context provider",
+                    "schema_version": 1
+                }]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Task A6: the context-provider catalog mirrors the model-provider
+    /// catalog shape — populated at load, exact fail-closed lookup, kept
+    /// current across unload, shared with the lease manager — and every
+    /// read is pure metadata: zero processes are ever started.
+    #[tokio::test]
+    async fn context_provider_catalog_lists_resolves_and_unloads_exactly() {
+        let mut mgr = ExtensionManager::new(Arc::new(HookBus::new()));
+        mgr.set_progressive_deferral(true);
+        mgr.load("mem-a", &context_provider_manifest("alpha"))
+            .await
+            .unwrap();
+        mgr.load("mem-b", &context_provider_manifest("beta"))
+            .await
+            .unwrap();
+
+        // Catalog reads: sorted by runtime address, exact ids only.
+        let listed: Vec<String> = mgr
+            .context_providers()
+            .iter()
+            .map(|d| d.runtime_address())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "extension:mem-a:alpha".to_string(),
+                "extension:mem-b:beta".to_string(),
+            ]
+        );
+        let alpha = super::super::context_provider::ContextProviderId::parse("alpha").unwrap();
+        assert_eq!(
+            mgr.context_provider(&alpha).map(|d| d.extension_id()),
+            Some("mem-a")
+        );
+        let unknown = super::super::context_provider::ContextProviderId::parse("nope").unwrap();
+        assert!(mgr.context_provider(&unknown).is_none(), "fail closed");
+
+        // The shared lease-manager handle observes the same catalog.
+        let runtime = mgr.extension_runtime();
+        assert_eq!(
+            runtime
+                .resolve_context_provider(Some(&alpha))
+                .map(|d| d.runtime_address()),
+            Ok("extension:mem-a:alpha".to_string())
+        );
+
+        // An overlapping declaration makes the id ambiguous — fail closed
+        // on BOTH read surfaces, never an arbitrary pick.
+        mgr.load("mem-c", &context_provider_manifest("alpha"))
+            .await
+            .unwrap();
+        assert!(mgr.context_provider(&alpha).is_none(), "ambiguous → None");
+        assert_eq!(
+            runtime.resolve_context_provider(Some(&alpha)),
+            Err(super::super::context_provider::ContextProviderLookupError::Ambiguous)
+        );
+
+        // Unload removes exactly the owner's descriptors and republishes.
+        mgr.unload("mem-c").await.unwrap();
+        assert_eq!(
+            mgr.context_provider(&alpha).map(|d| d.extension_id()),
+            Some("mem-a")
+        );
+        mgr.unload("mem-a").await.unwrap();
+        assert_eq!(
+            runtime.resolve_context_provider(Some(&alpha)),
+            Err(super::super::context_provider::ContextProviderLookupError::NotRegistered)
+        );
+        assert_eq!(mgr.context_providers().len(), 1, "mem-b remains");
+
+        // Pure catalog discipline: nothing above started a process.
+        assert_eq!(mgr.count(), 0, "no live extension handlers");
+        assert_eq!(runtime.lease_count(), 0, "no runtime leases");
+    }
 
     #[tokio::test]
     async fn capability_snapshots_empty_when_no_extensions() {
@@ -1086,12 +1973,73 @@ mod tests {
         assert!(mgr.capability_snapshots().await.is_empty());
     }
 
+    /// Review fix A3: the retained deferred launch record resolves
+    /// `secret_env` config values, so NOTHING public/debug/diagnostic may
+    /// ever reveal them — only booleans/counts. The record type itself is
+    /// crate-private, field-private, and implements neither `Debug` nor
+    /// `Serialize` (compiler-enforced); this test additionally proves the
+    /// live diagnostic surfaces never carry the resolved secret.
+    #[tokio::test]
+    async fn deferred_launch_record_never_leaks_secret_config_through_diagnostics() {
+        const SECRET: &str = "task20-A3-sentinel-5f2c9d";
+        const VAR: &str = "SYNAPS_TEST_T20_A3_SECRET";
+        std::env::set_var(VAR, SECRET);
+
+        let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["tools.register"],
+            "config": [{
+                "key": "api_key",
+                "type": "string",
+                "required": true,
+                "secret_env": VAR
+            }],
+            "deferred": {
+                "tools": [{
+                    "name": "search",
+                    "description": "deferred search",
+                    "input_schema": {"type": "object"}
+                }]
+            }
+        }))
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(crate::ToolRegistry::new()));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry);
+        mgr.set_progressive_deferral(true);
+        mgr.load("secretive", &manifest).await.unwrap();
+
+        // Boolean/count-only public surface for the deferral state.
+        assert!(mgr.is_deferred_tool_only("secretive"));
+        assert_eq!(mgr.deferred_tool_only_count(), 1);
+        // The internal record DID resolve the secret (lease path needs it).
+        let record = mgr.deferred_launch_record("secretive").expect("retained");
+        assert_eq!(record.config["api_key"], serde_json::json!(SECRET));
+
+        // Every public/debug/diagnostic surface stays free of the value.
+        let mut rendered = String::new();
+        rendered.push_str(&format!("{:?}", mgr.statuses().await));
+        rendered.push_str(&format!("{:?}", mgr.config_diagnostics("secretive")));
+        rendered.push_str(&format!("{:?}", mgr.all_config_diagnostics()));
+        rendered.push_str(&format!("{:?}", mgr.capability_snapshots().await));
+        rendered.push_str(&format!("{:?}", mgr.plugin_infos()));
+        rendered.push_str(&format!("{:?}", mgr.list()));
+        assert!(
+            !rendered.contains(SECRET),
+            "resolved secret config leaked through a public diagnostic surface"
+        );
+
+        std::env::remove_var(VAR);
+    }
+
     #[tokio::test]
     async fn capability_snapshot_lists_hooks_for_loaded_extension() {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1133,6 +2081,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1217,12 +2166,17 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
-            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-test.log".to_string()],
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-reload-test.log".to_string(),
+            ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
@@ -1248,12 +2202,17 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus.clone());
         let good = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
-            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-failure-test.log".to_string()],
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-reload-failure-test.log".to_string(),
+            ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
@@ -1264,6 +2223,7 @@ mod tests {
         };
         let bad = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             command: "/definitely/not/a/real/extension-binary".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
@@ -1271,7 +2231,10 @@ mod tests {
         };
 
         mgr.load("reload-failure-test", &good).await.unwrap();
-        let err = mgr.reload("reload-failure-test", &bad, None).await.unwrap_err();
+        let err = mgr
+            .reload("reload-failure-test", &bad, None)
+            .await
+            .unwrap_err();
 
         assert!(err.contains("Failed to spawn extension"), "{err}");
         assert_eq!(mgr.count(), 0);
@@ -1307,8 +2270,12 @@ mod tests {
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::extensions::config_store::write_plugin_config("sample-sidecar", "backend", "cpu")
-                .unwrap();
+            crate::extensions::config_store::write_plugin_config(
+                "sample-sidecar",
+                "backend",
+                "cpu",
+            )
+            .unwrap();
             crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
@@ -1320,11 +2287,16 @@ mod tests {
                     required: true,
                     default: None,
                     secret_env: None,
+                    host_context: None,
                 }],
+                None,
             )
             .unwrap();
 
-            assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+            assert_eq!(
+                resolved["backend"],
+                serde_json::Value::String("cpu".to_string())
+            );
         });
     }
 
@@ -1344,11 +2316,16 @@ mod tests {
                     required: true,
                     default: None,
                     secret_env: None,
+                    host_context: None,
                 }],
+                None,
             )
             .unwrap();
 
-            assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
+            assert_eq!(
+                resolved["backend"],
+                serde_json::Value::String("auto".to_string())
+            );
         });
     }
 
@@ -1366,6 +2343,7 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus);
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1389,6 +2367,7 @@ mod tests {
                 required: false,
                 default: Some(serde_json::Value::String("us-east-1".to_string())),
                 secret_env: None,
+                host_context: None,
             }],
         };
 
@@ -1422,7 +2401,9 @@ mod tests {
 
     #[tokio::test]
     async fn provider_tool_use_runtime_ids_lists_only_tool_use_capable() {
-        use crate::extensions::runtime::process::{RegisteredProviderModelSpec, RegisteredProviderSpec};
+        use crate::extensions::runtime::process::{
+            RegisteredProviderModelSpec, RegisteredProviderSpec,
+        };
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus);
         // Tool-use capable provider.
@@ -1521,5 +2502,147 @@ mod tests {
             Some("setup.sh"),
         );
         assert!(hint.contains("Extension binary missing"), "got {hint}");
+    }
+
+    // ── bugfix: installed-plugin backup discovery ───────────────────────────
+
+    /// Minimal deferred tool-only plugin.json (Axel-shaped: `memory_fetch`
+    /// takes a single `{id}`), written under `<dir>/.synaps-plugin/`.
+    fn write_installed_plugin(plugins_root: &std::path::Path, dir_name: &str) {
+        let plugin_dir = plugins_root.join(dir_name).join(".synaps-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let manifest = serde_json::json!({
+            "extension": {
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": ["tools.register"],
+                "deferred": {
+                    "tools": [{
+                        "name": "memory_fetch",
+                        "description": "Fetch one memory by exact ID.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}},
+                            "required": ["id"]
+                        }
+                    }]
+                }
+            }
+        });
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Regression (user incident, session 20260720-141844-fb5a): `plugins/`
+    /// held the installed `axel-memory-manager` AND timestamped copies
+    /// (`axel-memory-manager.backup.<TS>`). Discovery treated every
+    /// directory with a valid manifest as a live plugin, so the backups
+    /// were loaded and their binaries executed alongside the real one.
+    /// Backup/disabled/temp directory names must never be discovered: only
+    /// active plugins load, backup tools are never cataloged, and (since a
+    /// backup that is never loaded owns no lease) a backup process can
+    /// never be spawned.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn discover_and_load_skips_backup_and_disabled_plugin_directories() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _no_project_plugins =
+            crate::test_env::EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
+        let plugins_root = base.path().join("plugins");
+
+        write_installed_plugin(&plugins_root, "axel-memory-manager");
+        // The two timestamped backups from the incident, the updater's own
+        // `.update-backup` convention, and common manual conventions.
+        for inert in [
+            "axel-memory-manager.backup.20260719210053",
+            "axel-memory-manager.backup.20260720101416",
+            "axel-memory-manager.update-backup",
+            "axel-memory-manager.backup",
+            "axel-memory-manager.bak",
+            "axel-memory-manager.disabled",
+            "axel-memory-manager.old",
+            "axel-memory-manager.orig",
+            "axel-memory-manager.tmp",
+        ] {
+            write_installed_plugin(&plugins_root, inert);
+        }
+        // Dotted names that are NOT backups stay discoverable.
+        write_installed_plugin(&plugins_root, "com.example.notes");
+
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::ToolRegistry::without_subagent(),
+        ));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry.clone());
+        mgr.set_progressive_deferral(true);
+
+        let (mut loaded, failed) = mgr.discover_and_load().await;
+        loaded.sort();
+
+        assert!(failed.is_empty(), "no failures expected: {failed:?}");
+        assert_eq!(
+            loaded,
+            vec![
+                "axel-memory-manager".to_string(),
+                "com.example.notes".to_string()
+            ],
+            "backup/disabled/temp plugin directories must not be discovered"
+        );
+
+        let reg = registry.read().await;
+        assert!(reg.get("axel-memory-manager:memory_fetch").is_some());
+        assert!(reg.get("com.example.notes:memory_fetch").is_some());
+        assert!(
+            reg.get("axel-memory-manager.backup.20260719210053:memory_fetch")
+                .is_none(),
+            "backup plugin tools must never be cataloged"
+        );
+        assert!(reg
+            .get("axel-memory-manager.backup.20260720101416:memory_fetch")
+            .is_none());
+        drop(reg);
+
+        // Deferred lifecycle + no backup load ⇒ zero live extension
+        // processes were started by discovery.
+        assert_eq!(mgr.count(), 0, "discovery must spawn nothing");
+    }
+
+    /// The exclusion helper is name-based and conservative: it must catch
+    /// known backup/disabled/temp conventions without swallowing
+    /// legitimate dotted or hyphenated plugin names.
+    #[test]
+    fn inert_plugin_dir_name_filter_is_exact() {
+        for inert in [
+            "axel-memory-manager.backup.20260720101416",
+            "axel-memory-manager.BACKUP.1",
+            "axel-memory-manager.backup",
+            "axel-memory-manager.update-backup",
+            "axel-memory-manager.bak",
+            "axel-memory-manager.disabled",
+            "axel-memory-manager.old",
+            "axel-memory-manager.orig",
+            "axel-memory-manager.tmp",
+            "axel-memory-manager.temp",
+        ] {
+            assert!(
+                is_inert_plugin_dir_name(inert),
+                "{inert} should be excluded from discovery"
+            );
+        }
+        for live in [
+            "axel-memory-manager",
+            "com.example.notes",
+            "backup-manager",
+            "old-school-tools",
+            "tmpfs-inspector",
+            "my.backups.viewer",
+        ] {
+            assert!(
+                !is_inert_plugin_dir_name(live),
+                "{live} is a legitimate plugin name and must stay discoverable"
+            );
+        }
     }
 }

@@ -1,12 +1,15 @@
 //! Provider-aware thinking/reasoning request helpers.
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiReasoningProvider {
     OpenRouter,
     Groq,
     NvidiaNim,
+    /// Kimi (Moonshot AI): level-driven exact capability wiring
+    /// (`catalog::kimi`), not budget-driven inference.
+    Kimi,
     Generic,
 }
 
@@ -29,7 +32,16 @@ pub fn apply_openai_reasoning_params(
     provider: OpenAiReasoningProvider,
     model: &str,
     thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
 ) {
+    // Kimi is level-driven, not budget-driven: `Off` must still serialize
+    // (`thinking:{"type":"disabled"}` on toggleable models) and `Max` has no
+    // numeric budget, so the budget==0 guard below must not apply here.
+    // Exact per-model wiring lives in `catalog::kimi`.
+    if provider == OpenAiReasoningProvider::Kimi {
+        crate::runtime::openai::catalog::apply_kimi_reasoning_params(body, model, reasoning_level);
+        return;
+    }
     // Don't inject reasoning params when thinking is disabled.
     // Without this guard, non-reasoning models (e.g. llama-3.3) get
     // unsupported fields that cause request failures.
@@ -48,9 +60,13 @@ pub fn apply_openai_reasoning_params(
                 == crate::runtime::openai::catalog::ReasoningSupport::GroqReasoning
             {
                 body.insert("reasoning_format".to_string(), json!("parsed"));
-                body.insert("reasoning_effort".to_string(), json!(openai_effort_for_level(level)));
+                body.insert(
+                    "reasoning_effort".to_string(),
+                    json!(openai_effort_for_level(level)),
+                );
             }
         }
+        OpenAiReasoningProvider::Kimi => unreachable!("handled above"),
         OpenAiReasoningProvider::NvidiaNim | OpenAiReasoningProvider::Generic => {}
     }
 }
@@ -60,6 +76,7 @@ pub fn provider_for_key(provider_key: &str) -> OpenAiReasoningProvider {
         "openrouter" => OpenAiReasoningProvider::OpenRouter,
         "groq" => OpenAiReasoningProvider::Groq,
         "nvidia" => OpenAiReasoningProvider::NvidiaNim,
+        "kimi" => OpenAiReasoningProvider::Kimi,
         _ => OpenAiReasoningProvider::Generic,
     }
 }
@@ -71,7 +88,13 @@ mod tests {
     #[test]
     fn openrouter_adds_reasoning_and_include_reasoning() {
         let mut body = Map::new();
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::OpenRouter, "deepseek/deepseek-r1", 4096);
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::OpenRouter,
+            "deepseek/deepseek-r1",
+            4096,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["include_reasoning"], true);
     }
@@ -79,31 +102,116 @@ mod tests {
     #[test]
     fn groq_adds_reasoning_only_for_reasoning_families() {
         let mut body = Map::new();
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::Groq, "openai/gpt-oss-120b", 16_384);
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Groq,
+            "openai/gpt-oss-120b",
+            16_384,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
         assert_eq!(body["reasoning_format"], "parsed");
         assert_eq!(body["reasoning_effort"], "high");
 
         let mut plain = Map::new();
-        apply_openai_reasoning_params(&mut plain, OpenAiReasoningProvider::Groq, "llama-3.3-70b-versatile", 16_384);
+        apply_openai_reasoning_params(
+            &mut plain,
+            OpenAiReasoningProvider::Groq,
+            "llama-3.3-70b-versatile",
+            16_384,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
         assert!(plain.is_empty());
     }
 
     #[test]
     fn nvidia_and_generic_do_not_emit_unsupported_extra_fields() {
         let mut body = Map::new();
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::NvidiaNim, "moonshotai/kimi-k2-thinking", 4096);
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::NvidiaNim,
+            "moonshotai/kimi-k2-thinking",
+            4096,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
         assert!(body.is_empty());
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::Generic, "some/model", 4096);
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Generic,
+            "some/model",
+            4096,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
         assert!(body.is_empty());
     }
 
     #[test]
     fn zero_budget_skips_all_reasoning_params() {
         let mut body = Map::new();
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::OpenRouter, "deepseek/deepseek-r1", 0);
-        assert!(body.is_empty(), "OpenRouter should not inject reasoning when budget is 0");
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::OpenRouter,
+            "deepseek/deepseek-r1",
+            0,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
+        assert!(
+            body.is_empty(),
+            "OpenRouter should not inject reasoning when budget is 0"
+        );
 
-        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::Groq, "openai/gpt-oss-120b", 0);
-        assert!(body.is_empty(), "Groq should not inject reasoning when budget is 0");
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Groq,
+            "openai/gpt-oss-120b",
+            0,
+            agent_core::reasoning::ReasoningLevel::Medium,
+        );
+        assert!(
+            body.is_empty(),
+            "Groq should not inject reasoning when budget is 0"
+        );
+    }
+
+    #[test]
+    fn kimi_key_maps_to_kimi_provider() {
+        assert_eq!(provider_for_key("kimi"), OpenAiReasoningProvider::Kimi);
+    }
+
+    #[test]
+    fn kimi_is_level_driven_not_budget_driven() {
+        use agent_core::reasoning::ReasoningLevel;
+        // Max has no numeric budget; the level must still reach the wire.
+        let mut body = Map::new();
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Kimi,
+            "kimi-k3",
+            0,
+            ReasoningLevel::Max,
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // Off carries budget 0 but must still serialize the disable toggle
+        // on toggleable models — the zero-budget guard must not swallow it.
+        let mut body = Map::new();
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Kimi,
+            "kimi-k2.6",
+            0,
+            ReasoningLevel::Off,
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        // Adaptive omits every reasoning field (provider default).
+        let mut body = Map::new();
+        apply_openai_reasoning_params(
+            &mut body,
+            OpenAiReasoningProvider::Kimi,
+            "kimi-k3",
+            0,
+            ReasoningLevel::Adaptive,
+        );
+        assert!(body.is_empty());
     }
 }

@@ -3,6 +3,40 @@ use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
+const BASH_INTERMEDIARY_CHANNEL_CAPACITY: usize = 64;
+static BASH_INTERMEDIARY_PRODUCED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_ACCEPTED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_CONSUMED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static BASH_INTERMEDIARY_DROPPED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct BashIntermediarySnapshot {
+    pub produced_bytes: u64,
+    pub accepted_bytes: u64,
+    pub consumed_bytes: u64,
+    pub dropped_bytes: u64,
+    pub retained_bytes: u64,
+}
+
+pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
+    use std::sync::atomic::Ordering;
+    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(Ordering::Relaxed);
+    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(Ordering::Relaxed);
+    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(Ordering::Relaxed);
+    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(Ordering::Relaxed);
+    BashIntermediarySnapshot {
+        produced_bytes: produced,
+        accepted_bytes: accepted,
+        consumed_bytes: consumed,
+        dropped_bytes: dropped,
+        retained_bytes: produced.saturating_sub(consumed).saturating_sub(dropped),
+    }
+}
+
 pub struct BashTool;
 
 const READ_CHUNK_SIZE: usize = 1024;
@@ -74,6 +108,16 @@ pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
 
 #[async_trait::async_trait]
 impl Tool for BashTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    /// Explicitly NonIdempotent (Task 24): arbitrary shell side effects —
+    /// serialized execution, no concurrency key.
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::NonIdempotent
+    }
+
     fn name(&self) -> &str {
         "bash"
     }
@@ -104,9 +148,16 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"]
+        let requested_timeout = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.bash_timeout);
+        // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
+        // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
+        let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
+            requested_timeout.min(ctx.limits.bash_max_timeout)
+        } else {
+            requested_timeout
+        };
         let max_output = ctx.limits.max_tool_buffer;
 
         let script = bash_script_with_secure_sudo(command);
@@ -147,7 +198,8 @@ impl Tool for BashTool {
             .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stdin".to_string()))?;
 
-        let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+        let (tx_inter, mut rx_inter) =
+            tokio::sync::mpsc::channel::<(bool, String)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
 
         let tx_o = tx_inter.clone();
         tokio::spawn(async move {
@@ -160,7 +212,18 @@ impl Tool for BashTool {
                     Ok(n) => {
                         let msg = sanitize_output(&buf[..n]);
                         if !msg.is_empty() {
-                            let _ = tx_o.send((false, msg));
+                            use std::sync::atomic::Ordering;
+                            BASH_INTERMEDIARY_PRODUCED_BYTES
+                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
+                            let len = msg.len();
+                            if tx_o.send((false, msg)).await.is_ok() {
+                                BASH_INTERMEDIARY_ACCEPTED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                            } else {
+                                BASH_INTERMEDIARY_DROPPED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
                     Err(_) => break,
@@ -179,7 +242,18 @@ impl Tool for BashTool {
                     Ok(n) => {
                         let msg = sanitize_output(&buf[..n]);
                         if !msg.is_empty() {
-                            let _ = tx_e.send((true, msg));
+                            use std::sync::atomic::Ordering;
+                            BASH_INTERMEDIARY_PRODUCED_BYTES
+                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
+                            let len = msg.len();
+                            if tx_e.send((true, msg)).await.is_ok() {
+                                BASH_INTERMEDIARY_ACCEPTED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                            } else {
+                                BASH_INTERMEDIARY_DROPPED_BYTES
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
                     Err(_) => break,
@@ -200,6 +274,8 @@ impl Tool for BashTool {
             let mut redactions: Vec<String> = Vec::new();
 
             while let Some((is_stderr, mut msg)) = rx_inter.recv().await {
+                BASH_INTERMEDIARY_CONSUMED_BYTES
+                    .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 if is_stderr {
                     stderr_tail.push_str(&msg);
                     if stderr_tail.len() > 512 {
@@ -277,11 +353,7 @@ impl Tool for BashTool {
                         let delta = if msg.len() <= remaining {
                             msg.clone()
                         } else {
-                            let mut end = remaining;
-                            while end > 0 && !msg.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            msg[..end].to_string()
+                            crate::truncate_str(&msg, remaining).to_string()
                         };
                         streamed_bytes += delta.len();
                         if !delta.is_empty() {
@@ -338,6 +410,58 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bash_intermediary_handoff_conserves_bytes_under_large_output() {
+        let before = bash_intermediary_snapshot();
+        let tool = BashTool;
+        let mut ctx = create_tool_context();
+        ctx.limits.max_tool_buffer = 64 * 1024;
+        let result = tool
+            .execute(
+                json!({
+                    "command": "python3 -c \"import sys; sys.stdout.write('x' * 1048576)\"",
+                    "timeout": 30
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("output truncated"));
+
+        // The counters are PROCESS-GLOBAL: sibling tests running bash
+        // concurrently (--test-threads > 1) contribute mid-flight bytes to
+        // any instantaneous snapshot. Conservation is therefore asserted at
+        // quiescence: every completed relay balances produced == consumed +
+        // dropped and returns retained to baseline, so the delta window
+        // rebalances once in-flight relays finish. A REAL leak never
+        // rebalances — the bounded poll keeps the oracle strict while
+        // removing scheduling sensitivity (observed flake under the full
+        // workspace run at 8 threads).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut produced, mut consumed, mut accepted, mut dropped);
+        loop {
+            let after = bash_intermediary_snapshot();
+            produced = after.produced_bytes - before.produced_bytes;
+            consumed = after.consumed_bytes - before.consumed_bytes;
+            accepted = after.accepted_bytes - before.accepted_bytes;
+            dropped = after.dropped_bytes - before.dropped_bytes;
+            let balanced =
+                produced == consumed + dropped && after.retained_bytes == before.retained_bytes;
+            if balanced || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    produced,
+                    consumed + dropped,
+                    "handoff bytes must be conserved at quiescence"
+                );
+                assert_eq!(after.retained_bytes, before.retained_bytes);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(accepted >= consumed);
+        assert!(produced >= 64 * 1024);
+    }
 
     #[test]
     fn detects_sudo_password_prompt_without_newline() {
@@ -407,22 +531,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_tool_requested_timeout_is_not_clamped_by_max_timeout() {
+    async fn test_bash_tool_requested_timeout_is_clamped_by_max_timeout() {
         let tool = BashTool;
         let mut ctx = create_tool_context();
         ctx.limits.bash_max_timeout = 1;
 
         let params = json!({
-            "command": "sleep 2; echo done",
-            "timeout": 3
+            "command": "sleep 5; echo done",
+            "timeout": 10
         });
 
         let result = tool.execute(params, ctx).await;
         assert!(
-            result.is_ok(),
-            "requested timeout should not be clamped by bash_max_timeout: {result:?}"
+            result.unwrap_err().to_string().contains("timed out"),
+            "requested timeout MUST be clamped by bash_max_timeout"
         );
-        assert!(result.unwrap().contains("done"));
     }
 
     #[tokio::test]
@@ -430,7 +553,8 @@ mod tests {
         let tool = BashTool;
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
 
         let responder = tokio::spawn(async move {
             let req = prompt_rx
@@ -456,7 +580,7 @@ mod tests {
         let result = tool.execute(params, ctx).await.unwrap();
         responder.await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 
@@ -475,12 +599,62 @@ mod tests {
         assert!(script.ends_with("sudo id"));
     }
 
+    /// Writes an executable stub `sudo` into `dir` that emulates the flags the
+    /// secure wrapper passes (`-S -p PROMPT`): `-k` exits silently like a real
+    /// timestamp reset, anything else writes PROMPT to stderr, consumes one
+    /// stdin line, and fails. Lets the wrapper be tested without the system
+    /// sudo, whose prompting behaviour is host-dependent.
+    #[cfg(unix)]
+    fn write_fake_sudo(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let sudo_path = dir.join("sudo");
+        std::fs::write(
+            &sudo_path,
+            r#"#!/bin/sh
+prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -S) shift ;;
+    -p) prompt="$2"; shift 2 ;;
+    -k) exit 0 ;;
+    *) break ;;
+  esac
+done
+printf '%s' "$prompt" >&2
+read -r _pw
+exit 1
+"#,
+        )
+        .expect("write fake sudo");
+        let mut perms = std::fs::metadata(&sudo_path)
+            .expect("stat fake sudo")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sudo_path, perms).expect("chmod fake sudo");
+    }
+
+    /// The `sudo()` wrapper's prompt is intercepted by the secret-prompt path
+    /// and never reaches the delta stream.
+    ///
+    /// Hermetic by construction: it drives a STUB sudo on PATH, not the host's.
+    /// `command sudo` bypasses the shell function but still honours PATH, so
+    /// the real wrapper path is exercised. PATH is exported inside the script
+    /// rather than through `std::env::set_var` because these tests are not
+    /// `#[serial]` and mutating process-global env would race them.
+    ///
+    /// This previously drove the system sudo and asserted that it prompts —
+    /// false on any host with passwordless sudo, which includes every GitHub
+    /// runner, so it could never pass in CI.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_bash_sudo_function_prompt_is_intercepted_before_streaming() {
+        let fake_bin = tempfile::tempdir().expect("tempdir");
+        write_fake_sudo(fake_bin.path());
         let tool = BashTool;
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
 
         let responder = tokio::spawn(async move {
             let req = prompt_rx
@@ -501,14 +675,17 @@ mod tests {
         ctx.capabilities.secret_prompt = Some(prompt_handle);
         ctx.channels.tx_delta = Some(delta_tx);
         let params = json!({
-            "command": "sudo -k; sudo -v",
+            "command": format!(
+                "export PATH=\"{}:$PATH\"; sudo -k; sudo -v",
+                fake_bin.path().display()
+            ),
             "timeout": 30
         });
 
         let _ = tool.execute(params, ctx).await;
         responder.await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 
@@ -521,7 +698,8 @@ mod tests {
     #[tokio::test]
     async fn test_bash_control_char_output_is_sanitized_and_bounded_in_deltas() {
         let tool = BashTool;
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
         let mut ctx = create_tool_context();
         ctx.channels.tx_delta = Some(delta_tx);
         ctx.limits.max_tool_buffer = 256;
@@ -533,7 +711,7 @@ mod tests {
 
         let result = tool.execute(params, ctx).await.unwrap();
         let mut streamed = String::new();
-        while let Ok(delta) = delta_rx.try_recv() {
+        while let Some(delta) = delta_rx.try_drain() {
             streamed.push_str(&delta);
         }
 

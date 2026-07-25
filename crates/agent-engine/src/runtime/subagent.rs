@@ -1,7 +1,7 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
-use serde_json::Value;
 
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
@@ -18,9 +18,62 @@ pub struct SubagentResult {
     pub cache_creation_5m: Option<u64>,
     pub cache_creation_1h: Option<u64>,
     pub tool_count: u32,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AuthorizationDiagnostic {
+    pub selection_source: String,
+    pub policy_digest: String,
+    pub catalog_snapshot_id: String,
+    pub catalog_digest: String,
+    pub correlation_id: String,
+    pub network_attempted: bool,
+    pub cross_provider_grant_id: Option<String>,
 }
 
 // ── SubagentStatus ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCategory {
+    Completed,
+    Route,
+    Credential,
+    Runtime,
+    ProviderClient,
+    Transport,
+    StartupFailed,
+    ExecutionFailed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TerminalDiagnostic {
+    pub category: TerminalCategory,
+    pub code: String,
+    pub stage: String,
+    pub correlation_id: String,
+    pub network_attempted: bool,
+    pub safe_message: String,
+}
+
+pub fn safe_failure_message(category: &TerminalCategory) -> &'static str {
+    match category {
+        TerminalCategory::Route => "worker route could not be resolved",
+        TerminalCategory::Credential => "worker credentials are unavailable",
+        TerminalCategory::Runtime | TerminalCategory::StartupFailed => {
+            "worker runtime could not be started"
+        }
+        TerminalCategory::ProviderClient => "provider client could not be initialized",
+        TerminalCategory::Transport => "provider transport failed",
+        TerminalCategory::TimedOut => "worker timed out",
+        TerminalCategory::Cancelled => "worker was cancelled",
+        TerminalCategory::ExecutionFailed => "worker execution failed",
+        TerminalCategory::Completed => "worker completed",
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubagentStatus {
@@ -47,6 +100,7 @@ pub struct SubagentState {
     /// Set by cancel() before the shutdown signal is sent.
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
+    pub terminal: Option<TerminalDiagnostic>,
 }
 
 impl SubagentState {
@@ -58,12 +112,22 @@ impl SubagentState {
             conversation_state: Vec::new(),
             finished_at: None,
             cancel_requested: false,
+            terminal: None,
         }
+    }
+
+    /// Persist only typed, allowlisted failure data. Raw provider errors never enter state.
+    pub fn safe_fail(&mut self, mut diagnostic: TerminalDiagnostic) {
+        diagnostic.safe_message = safe_failure_message(&diagnostic.category).into();
+        self.status = SubagentStatus::Failed(diagnostic.safe_message.clone());
+        self.terminal = Some(diagnostic);
     }
 }
 
 impl Default for SubagentState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── SubagentDisplayRow ────────────────────────────────────────────────────────────
@@ -93,6 +157,7 @@ pub struct SubagentHandle {
     pub system_prompt: String,
     pub started_at: std::time::Instant,
     pub timeout_secs: u64,
+    pub authorization: Option<AuthorizationDiagnostic>,
 
     // Shared state updated by the subagent thread — one lock for everything.
     state: Arc<RwLock<SubagentState>>,
@@ -147,6 +212,7 @@ impl SubagentHandle {
             system_prompt,
             started_at: std::time::Instant::now(),
             timeout_secs,
+            authorization: None,
             state,
             steer_tx,
             shutdown_tx,
@@ -156,29 +222,129 @@ impl SubagentHandle {
         }
     }
 
+    pub fn with_authorization(
+        mut self,
+        decision: &crate::orchestration::AuthorizedWorkerModel,
+    ) -> Self {
+        self.authorization = Some(AuthorizationDiagnostic {
+            selection_source: decision.selection_source.as_str().into(),
+            policy_digest: decision.policy_digest.clone(),
+            catalog_snapshot_id: decision.catalog_snapshot_id.clone(),
+            catalog_digest: decision.catalog_digest.clone(),
+            correlation_id: decision.correlation_id.clone(),
+            network_attempted: decision.network_attempted,
+            cross_provider_grant_id: decision.cross_provider_grant_id.clone(),
+        });
+        self
+    }
+
+    pub fn set_terminal_diagnostic(&self, diagnostic: TerminalDiagnostic) {
+        let mut state = self.state.write().unwrap();
+        state.safe_fail(diagnostic);
+    }
+
     /// Current status snapshot.
     pub fn status(&self) -> SubagentStatus {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).status.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .status
+            .clone()
     }
 
     /// Partial output accumulated so far.
     pub fn partial_output(&self) -> String {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).partial_text.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .partial_text
+            .clone()
     }
 
     /// Snapshot of the tool log.
     pub fn tool_log(&self) -> Vec<String> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).tool_log.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .tool_log
+            .clone()
+    }
+
+    pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
+        if let Some(diagnostic) = self.state.read().unwrap().terminal.clone() {
+            return Some(diagnostic);
+        }
+        match self.status() {
+            SubagentStatus::Running => None,
+            SubagentStatus::Completed => Some(TerminalDiagnostic {
+                category: TerminalCategory::Completed,
+                code: "completed".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::Completed).into(),
+            }),
+            SubagentStatus::TimedOut => Some(TerminalDiagnostic {
+                category: TerminalCategory::TimedOut,
+                code: "worker_timeout".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::TimedOut).into(),
+            }),
+            SubagentStatus::Cancelled => Some(TerminalDiagnostic {
+                category: TerminalCategory::Cancelled,
+                code: "worker_cancelled".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::Cancelled).into(),
+            }),
+            SubagentStatus::Failed(_) => Some(TerminalDiagnostic {
+                category: TerminalCategory::ExecutionFailed,
+                code: "inference_failed".into(),
+                stage: "inference".into(),
+                correlation_id: self.id.clone(),
+                network_attempted: true,
+                safe_message: safe_failure_message(&TerminalCategory::ExecutionFailed).into(),
+            }),
+        }
     }
 
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).conversation_state.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .conversation_state
+            .clone()
     }
 
     /// Seconds since this handle was created.
     pub fn elapsed_secs(&self) -> f64 {
         self.started_at.elapsed().as_secs_f64()
+    }
+
+    /// Release execution-only resources after a worker has expired while
+    /// retaining bounded terminal identity/output for collection and reconciliation.
+    fn make_tombstone(&mut self) {
+        debug_assert!(self.is_finished());
+        self.steer_tx.take();
+        self.shutdown_tx.take();
+        self.result_rx.take();
+        if let Some(thread) = self.thread_handle.take() {
+            let _ = thread.join();
+        }
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        if state.partial_text.len() > TOMBSTONE_OUTPUT_MAX_BYTES {
+            let mut start = state.partial_text.len() - TOMBSTONE_OUTPUT_MAX_BYTES;
+            while !state.partial_text.is_char_boundary(start) {
+                start += 1;
+            }
+            state.partial_text.drain(..start);
+        }
+        state.tool_log.clear();
+        state.conversation_state.clear();
     }
 
     /// Send a steering message into the running subagent.
@@ -200,7 +366,10 @@ impl SubagentHandle {
     pub fn cancel(&mut self) {
         // Flag FIRST so finalize_subagent can read it before the thread exits.
         // Use poison-safe write in case the thread panicked holding the lock.
-        self.state.write().unwrap_or_else(|p| p.into_inner()).cancel_requested = true;
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_requested = true;
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -221,16 +390,31 @@ impl SubagentHandle {
         self.collected
     }
 
+    /// Whether execution transports and resumable context have been discarded.
+    pub fn is_tombstone(&self) -> bool {
+        self.is_finished()
+            && self.steer_tx.is_none()
+            && self.shutdown_tx.is_none()
+            && self.result_rx.is_none()
+            && self.thread_handle.is_none()
+    }
+
     /// Time elapsed since the subagent reached a terminal state.
     /// Returns `None` if still running or if `finished_at` has not been stamped yet.
     pub fn finished_elapsed(&self) -> Option<std::time::Duration> {
-        self.state.read().unwrap_or_else(|p| p.into_inner()).finished_at.map(|t| t.elapsed())
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .finished_at
+            .map(|t| t.elapsed())
     }
 
     /// Consume the handle and wait for the final result.
     pub async fn collect(mut self) -> Result<SubagentResult, String> {
         match self.result_rx.take() {
-            Some(rx) => rx.await.map_err(|_| "subagent result channel dropped".to_string()),
+            Some(rx) => rx
+                .await
+                .map_err(|_| "subagent result channel dropped".to_string()),
             None => Err("no result receiver — already collected or never set".to_string()),
         }
     }
@@ -240,6 +424,8 @@ impl SubagentHandle {
 
 /// Finished-but-uncollected handles are retained this long before GC.
 pub const FINISHED_HANDLE_TTL: std::time::Duration = std::time::Duration::from_secs(900); // 15 min
+/// Maximum terminal text retained by a transport-free tombstone.
+pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
 pub struct SubagentRegistry {
@@ -270,6 +456,16 @@ impl SubagentRegistry {
 
     pub fn remove(&mut self, id: &str) -> Option<SubagentHandle> {
         self.handles.remove(id)
+    }
+
+    /// Drop finished execution transports and resumable context while retaining
+    /// bounded terminal diagnostics and output under normal session retention.
+    pub fn release_finished_resources(&mut self, id: &str) {
+        if let Some(handle) = self.handles.get_mut(id) {
+            if handle.is_finished() {
+                handle.make_tombstone();
+            }
+        }
     }
 
     /// Returns (id, agent_name, status) for every tracked handle.
@@ -315,19 +511,33 @@ impl SubagentRegistry {
     /// Additionally, handles whose OS thread is still running (e.g. still in
     /// the finalizer path) are deferred — joining a live thread blocks the TUI
     /// loop. They will be reaped on the next cleanup pass once the thread exits.
+    /// Orchestration-required expired handles become bounded tombstones instead
+    /// of being removed; a later collect/reconcile makes them normally reapable.
     pub fn cleanup_finished_with_ttl(&mut self, ttl: std::time::Duration) {
-        let reap_ids: Vec<String> = self.handles.iter()
-            .filter(|(_, h)| h.is_finished()
-                // Defer handles whose OS thread is still alive — joining a live
-                // thread would block the TUI event loop. Use map_or (stable 1.80+)
-                // rather than is_none_or (stable 1.82+).
-                && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
-                && (h.is_collected()
-                    || h.finished_elapsed().is_some_and(|d| d >= ttl)))
-            .map(|(id, _)| id.clone())
+        self.cleanup_finished_with_ttl_and_retention(ttl, |_| false);
+    }
+
+    /// Reap normally, except that an expired uncollected handle still required by
+    /// orchestration is downgraded to a bounded, collectible tombstone.
+    pub fn cleanup_finished_with_ttl_and_retention(
+        &mut self,
+        ttl: std::time::Duration,
+        retain_unreconciled: impl Fn(&str) -> bool,
+    ) {
+        let candidates: Vec<(String, bool)> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| {
+                h.is_finished()
+                    && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
+                    && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
+            })
+            .map(|(id, h)| (id.clone(), !h.is_collected() && retain_unreconciled(id)))
             .collect();
-        for id in reap_ids {
-            if let Some(mut handle) = self.handles.remove(&id) {
+        for (id, retain) in candidates {
+            if retain {
+                self.release_finished_resources(&id);
+            } else if let Some(mut handle) = self.handles.remove(&id) {
                 if let Some(th) = handle.thread_handle.take() {
                     let _ = th.join();
                 }
@@ -348,11 +558,28 @@ impl SubagentRegistry {
 ///
 /// Intended to be called from the `tokio::spawn` wrapper in `runtime/mod.rs`
 /// after `run_stream_internal` returns and BEFORE sending `SessionEvent::Done`.
-pub fn reap_finished(registry: &Arc<std::sync::Mutex<SubagentRegistry>>) {
+pub(crate) fn reap_finished_with_ttl(
+    registry: &Arc<std::sync::Mutex<SubagentRegistry>>,
+    orchestration: Option<&crate::orchestration::OrchestrationRuntime>,
+    ttl: std::time::Duration,
+) {
+    let retained = orchestration
+        .map(|runtime| runtime.unreconciled_runtime_handles())
+        .unwrap_or_default();
+    let cleanup = |guard: &mut SubagentRegistry| {
+        guard.cleanup_finished_with_ttl_and_retention(ttl, |id| retained.contains(id));
+    };
     match registry.lock() {
-        Ok(mut guard) => guard.cleanup_finished(),
-        Err(poisoned) => poisoned.into_inner().cleanup_finished(),
+        Ok(mut guard) => cleanup(&mut guard),
+        Err(poisoned) => cleanup(&mut poisoned.into_inner()),
     }
+}
+
+pub fn reap_finished(
+    registry: &Arc<std::sync::Mutex<SubagentRegistry>>,
+    orchestration: Option<&crate::orchestration::OrchestrationRuntime>,
+) {
+    reap_finished_with_ttl(registry, orchestration, FINISHED_HANDLE_TTL);
 }
 
 impl Default for SubagentRegistry {
@@ -381,7 +608,6 @@ impl SubagentStatus {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,7 +626,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (_result_tx, result_rx) = oneshot::channel();
         // Parse numeric id from "sa_N" or use 0 as fallback for tests
-        let numeric_id: u64 = id.strip_prefix("sa_").and_then(|n| n.parse().ok()).unwrap_or(0);
+        let numeric_id: u64 = id
+            .strip_prefix("sa_")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         TestHandle {
             handle: SubagentHandle::new(
                 id.to_string(),
@@ -432,6 +661,23 @@ mod tests {
             s.finished_at = Some(std::time::Instant::now());
         }
         h
+    }
+
+    #[test]
+    fn typed_failure_drops_raw_provider_secret_canary() {
+        let mut state = SubagentState::new();
+        let canary = "Bearer secret-canary-provider-body";
+        state.safe_fail(TerminalDiagnostic {
+            category: TerminalCategory::Credential,
+            code: "credential_unavailable".into(),
+            stage: "credential".into(),
+            correlation_id: "sa_safe".into(),
+            network_attempted: false,
+            safe_message: canary.into(),
+        });
+        let rendered = format!("{:?}{:?}", state.status, state.terminal);
+        assert!(!rendered.contains(canary));
+        assert!(rendered.contains("credential_unavailable"));
     }
 
     #[test]
@@ -474,8 +720,17 @@ mod tests {
         let (_shutdown_tx, _) = oneshot::channel::<()>();
         let (_, result_rx) = oneshot::channel();
         let h = SubagentHandle::new(
-            "sa_1".into(), 1, "test".into(), "task".into(),
-            "model".into(), "prompt".into(), 300, state, None, None, Some(result_rx),
+            "sa_1".into(),
+            1,
+            "test".into(),
+            "task".into(),
+            "model".into(),
+            "prompt".into(),
+            300,
+            state,
+            None,
+            None,
+            Some(result_rx),
         );
         assert!(h.steer("msg").is_err());
     }
@@ -532,8 +787,14 @@ mod tests {
 
         reg.cleanup_finished();
 
-        assert!(reg.get("sa_1").is_none(), "collected finished handle must be reaped");
-        assert!(reg.get("sa_2").is_some(), "running handle must survive cleanup");
+        assert!(
+            reg.get("sa_1").is_none(),
+            "collected finished handle must be reaped"
+        );
+        assert!(
+            reg.get("sa_2").is_some(),
+            "running handle must survive cleanup"
+        );
     }
 
     // U1: finished, not collected, fresh → retained within TTL
@@ -545,7 +806,10 @@ mod tests {
 
         reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
 
-        assert!(reg.get("sa_1").is_some(), "finished-uncollected handle within TTL must be retained");
+        assert!(
+            reg.get("sa_1").is_some(),
+            "finished-uncollected handle within TTL must be retained"
+        );
     }
 
     // U2: finished + mark_collected → removed immediately
@@ -558,19 +822,38 @@ mod tests {
 
         reg.cleanup_finished_with_ttl(std::time::Duration::from_secs(900));
 
-        assert!(reg.get("sa_1").is_none(), "finished+collected handle must be reaped");
+        assert!(
+            reg.get("sa_1").is_none(),
+            "finished+collected handle must be reaped"
+        );
     }
 
-    // U3: finished, not collected, but TTL=ZERO (expired) → removed
+    // U3: finished, not collected, and TTL-expired, but still required by
+    // orchestration → retained as a resource-free tombstone.
     #[test]
-    fn reaper_reaps_abandoned_after_ttl() {
+    fn reaper_tombstones_unreconciled_after_ttl() {
         let mut reg = SubagentRegistry::new();
         let h = make_finished_handle("sa_1"); // not collected
+        h.state.write().unwrap().partial_text = "🦀".repeat(25_000);
         reg.register(h);
+
+        reg.cleanup_finished_with_ttl_and_retention(std::time::Duration::ZERO, |_| true);
+
+        let h = reg
+            .get("sa_1")
+            .expect("gate-relevant handle must remain collectible");
+        assert!(h.is_tombstone(), "expired handle must release transports");
+        assert!(h.partial_output().len() <= TOMBSTONE_OUTPUT_MAX_BYTES);
+    }
+
+    #[test]
+    fn reaper_reaps_abandoned_after_ttl_without_orchestration() {
+        let mut reg = SubagentRegistry::new();
+        reg.register(make_finished_handle("sa_1"));
 
         reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
 
-        assert!(reg.get("sa_1").is_none(), "handle past TTL must be reaped even if uncollected");
+        assert!(reg.get("sa_1").is_none());
     }
 
     // U5-reaper: finished-status handle with a still-sleeping OS thread is deferred;
@@ -610,7 +893,10 @@ mod tests {
 
         // Second cleanup: thread is finished → handle must be reaped
         reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
-        assert!(reg.get("sa_live").is_none(), "handle must be reaped once OS thread exits");
+        assert!(
+            reg.get("sa_live").is_none(),
+            "handle must be reaped once OS thread exits"
+        );
     }
 
     // U4: running handles never touched by any reaper variant
@@ -637,7 +923,10 @@ mod tests {
         assert!(s.tool_log.is_empty());
         assert!(s.conversation_state.is_empty());
         assert!(s.finished_at.is_none());
-        assert!(!s.cancel_requested, "cancel_requested must default to false");
+        assert!(
+            !s.cancel_requested,
+            "cancel_requested must default to false"
+        );
     }
 
     #[test]
@@ -660,7 +949,10 @@ mod tests {
         h.cancel();
         {
             let s = h.state.read().unwrap();
-            assert!(s.cancel_requested, "cancel_requested must be true after cancel()");
+            assert!(
+                s.cancel_requested,
+                "cancel_requested must be true after cancel()"
+            );
         }
         // Second call is a no-op (shutdown_tx already taken)
         h.cancel();
@@ -739,9 +1031,11 @@ mod tests {
             h.mark_collected();
             reg.register(h);
         }
-        super::reap_finished(&registry);
-        assert!(registry.lock().unwrap().get("sa_r1").is_none(),
-            "reap_finished must reap collected+finished handle");
+        super::reap_finished(&registry, None);
+        assert!(
+            registry.lock().unwrap().get("sa_r1").is_none(),
+            "reap_finished must reap collected+finished handle"
+        );
     }
 
     /// R2: reap_finished retains running handles — must not touch live work.
@@ -752,9 +1046,11 @@ mod tests {
             let mut reg = registry.lock().unwrap();
             reg.register(make_handle("sa_running"));
         }
-        super::reap_finished(&registry);
-        assert!(registry.lock().unwrap().get("sa_running").is_some(),
-            "reap_finished must not touch running handles");
+        super::reap_finished(&registry, None);
+        assert!(
+            registry.lock().unwrap().get("sa_running").is_some(),
+            "reap_finished must not touch running handles"
+        );
     }
 
     /// R3: reap_finished recovers from a poisoned lock without panicking.
@@ -776,10 +1072,11 @@ mod tests {
         });
 
         // reap_finished must not panic despite poisoned lock.
-        super::reap_finished(&registry);
+        super::reap_finished(&registry, None);
 
         // The handle must be reaped (cleanup ran despite poison).
-        let result = registry.lock()
+        let result = registry
+            .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get("sa_poison")
             .is_none();
@@ -805,26 +1102,38 @@ mod cancelled_wake_tests {
         {
             let mut s = state.write().unwrap();
             s.status = SubagentStatus::Completed; // thread set Completed before cancel flag noticed
-            s.cancel_requested = true;            // cancel() was called
+            s.cancel_requested = true; // cancel() was called
         }
         let queue = Arc::new(EventQueue::new(100));
 
         finalize_subagent(
             &state,
             Some(&queue),
-            "sa_v3", 42, "test-agent",
+            "sa_v3",
+            42,
+            "test-agent",
             std::time::Instant::now(),
             None,
         );
 
         // Queue must be empty — no wake event for cancelled subagents.
-        assert!(queue.is_empty(), "cancelled subagent must not publish a wake event");
+        assert!(
+            queue.is_empty(),
+            "cancelled subagent must not publish a wake event"
+        );
 
         // Status must have been re-labelled to Cancelled.
         let s = state.read().unwrap();
-        assert_eq!(s.status, SubagentStatus::Cancelled, "status must be Cancelled when cancel_requested");
+        assert_eq!(
+            s.status,
+            SubagentStatus::Cancelled,
+            "status must be Cancelled when cancel_requested"
+        );
 
         // finished_at must be stamped.
-        assert!(s.finished_at.is_some(), "finished_at must be stamped by finalizer");
+        assert!(
+            s.finished_at.is_some(),
+            "finished_at must be stamped by finalizer"
+        );
     }
 }

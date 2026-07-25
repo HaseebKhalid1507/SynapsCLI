@@ -1,0 +1,12 @@
+# Engineering plugin runtime artifacts — auto-generated.
+# Plan documents (*.plan.html) and _assets/ stay tracked.
+# >>> engineering plans (managed — do not edit inside) >>>
+agents.json
+*.events.json
+*.notes.json
+*.oracle.jsonl
+*.tmp-*
+*.lock
+.server.json
+.server.lock
+# <<< engineering plans (managed) <<<

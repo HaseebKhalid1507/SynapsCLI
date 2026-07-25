@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn sanitize_display_string_strips_controls() {
-        assert_eq!(sanitize_display_string("hello\x1B[31mworld"), "hello[31mworld");
+        assert_eq!(
+            sanitize_display_string("hello\x1B[31mworld"),
+            "hello[31mworld"
+        );
         assert_eq!(sanitize_display_string("ok\x07bell"), "okbell");
         // Preserves newlines and tabs
         assert_eq!(sanitize_display_string("a\nb\tc"), "a\nb\tc");

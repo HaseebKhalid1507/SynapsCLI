@@ -232,7 +232,9 @@ impl Theme {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 let line = line.trim();
-                if line.starts_with('#') || line.is_empty() { continue; }
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
                     let value = value.trim().trim_matches('"').trim_matches('\'');
@@ -311,7 +313,7 @@ impl Theme {
             k if k.starts_with("ext.") => {
                 self.ext_overrides.insert(k.to_string(), c);
             }
-            _ => {}, // unknown key, ignore
+            _ => {} // unknown key, ignore
         }
     }
 }
@@ -443,7 +445,9 @@ pub(crate) fn load_theme_from_config() -> Theme {
     if let Ok(content) = std::fs::read_to_string(synaps_cli::config::resolve_read_path("config")) {
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with('#') || line.is_empty() { continue; }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
             if let Some((key, val)) = line.split_once('=') {
                 if key.trim() == "theme" {
                     let name = val.trim();
@@ -572,10 +576,25 @@ mod theme_tests {
         // guarantee, asserted directly against the resolvers.
         // The 18 named palettes plus the built-in `default` (19 total).
         const NAMES: [&str; 19] = [
-            "default", "night-city", "neon-rain", "amber", "phosphor",
-            "solarized-dark", "blood", "ocean", "rose-pine", "nord", "dracula",
-            "monokai", "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
-            "forest", "lavender",
+            "default",
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
         ];
         for name in NAMES {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
@@ -585,9 +604,17 @@ mod theme_tests {
                     t.border_active,
                     "{name}: {kind:?} border must fall back to border_active"
                 );
-                assert_eq!(t.modal_title(kind), None, "{name}: {kind:?} title must be None");
+                assert_eq!(
+                    t.modal_title(kind),
+                    None,
+                    "{name}: {kind:?} title must be None"
+                );
             }
-            assert_eq!(t.sidecar_pill_color(), t.muted, "{name}: pill falls back to muted");
+            assert_eq!(
+                t.sidecar_pill_color(),
+                t.muted,
+                "{name}: pill falls back to muted"
+            );
         }
     }
 
@@ -616,7 +643,10 @@ mod theme_tests {
         t.set("plugins.title", Color::Rgb(4, 5, 6));
         t.set("models.border", Color::Rgb(7, 8, 9));
         t.set("sidecar.pill", Color::Rgb(10, 11, 12));
-        assert_eq!(t.modal_title(ModalKind::Settings), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            t.modal_title(ModalKind::Settings),
+            Some(Color::Rgb(1, 2, 3))
+        );
         assert_eq!(t.modal_title(ModalKind::Plugins), Some(Color::Rgb(4, 5, 6)));
         assert_eq!(t.modal_border(ModalKind::Models), Color::Rgb(7, 8, 9));
         assert_eq!(t.sidecar_pill_color(), Color::Rgb(10, 11, 12));

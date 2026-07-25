@@ -55,7 +55,11 @@ fn print_checkpoint(label: &str, harness: &TestHarness) {
         Some(kb) => println!(
             "CHECKPOINT {label:<25}  RssAnon={:>7} kB ({:>5.1} MB)  \
              renders={:>5}  hl_calls={:>5}  ss_touched={}",
-            kb, kb as f64 / 1024.0, renders, hl, ss
+            kb,
+            kb as f64 / 1024.0,
+            renders,
+            hl,
+            ss
         ),
         None => println!(
             "CHECKPOINT {label:<25}  RssAnon=unavailable(non-Linux)  \
@@ -115,7 +119,7 @@ fn populate(harness: &mut TestHarness, total: usize) {
 fn mem_transcript_four_checkpoint_baseline() {
     const TOTAL: usize = 1_000;
     let viewport_cols: u16 = 122; // outer = inner 120 + 2 border
-    let viewport_rows: u16 = 42;  // outer = inner 40 + 2 border
+    let viewport_rows: u16 = 42; // outer = inner 40 + 2 border
 
     println!("━━━ mem_transcript_four_checkpoint_baseline (T241 §8) ━━━");
     println!("    messages={TOTAL}  viewport=40×120  (every 5th has off-screen code fence)");
@@ -162,16 +166,22 @@ fn mem_transcript_four_checkpoint_baseline() {
 
     // Scroll cycle: up 20, render×5, down 20, render×5
     for _ in 0..5 {
-        harness.key(crossterm::event::KeyCode::PageUp, crossterm::event::KeyModifiers::NONE);
+        harness.key(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        );
         let _ = harness.render();
     }
     for _ in 0..5 {
-        harness.key(crossterm::event::KeyCode::PageDown, crossterm::event::KeyModifiers::NONE);
+        harness.key(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
         let _ = harness.render();
     }
 
     let cp4_renders = harness.render_count();
-    let cp4_hl     = harness.highlight_call_count();
+    let cp4_hl = harness.highlight_call_count();
     print_checkpoint("post-steady-frame", &harness);
 
     println!();

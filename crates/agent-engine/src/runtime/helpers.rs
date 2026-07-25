@@ -1,6 +1,5 @@
 use super::types::{AgentEvent, StreamEvent};
 use crate::core::config::CacheTtl;
-use crate::truncate_str;
 use crate::SharedMessage;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -45,6 +44,39 @@ pub(super) fn cache_control_value(ttl: CacheTtl, site: MarkerSite) -> Value {
 
 pub(crate) struct HelperMethods;
 
+/// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
+/// [`agent_core::TurnError`]. This is the SINGLE derivation point: every
+/// frontend receives the resulting typed outcome (variant + correlation ID)
+/// through `SessionEvent::Error` and must never re-derive it from text.
+pub(crate) fn turn_error_for(
+    err: &crate::RuntimeError,
+    correlation_id: &str,
+) -> agent_core::TurnError {
+    use crate::RuntimeError as E;
+    let provider = |code: &str| agent_core::TurnOutcome::ProviderFailed {
+        code: code.to_string(),
+        correlation_id: correlation_id.to_string(),
+    };
+    let outcome = match err {
+        E::Canceled => agent_core::TurnOutcome::Canceled,
+        E::Api(_) => provider("network_error"),
+        E::ApiStatus(_) => provider("api_status"),
+        E::Auth(_) => provider("auth_error"),
+        E::Config(_) => provider("config_error"),
+        E::Session(_) => provider("session_error"),
+        E::Timeout => provider("timeout"),
+        // Tool-loop failures surfaced as stream errors today carry no tool_id
+        // (they are protocol/orchestration failures, not a specific tool's
+        // result); `TurnOutcome::ToolFailed` is reserved for call-site-typed
+        // failures in later budget/ledger work.
+        E::Tool(_) => provider("tool_error"),
+    };
+    agent_core::TurnError {
+        message: err.to_string(),
+        outcome,
+    }
+}
+
 impl HelperMethods {
     /// Drain all pending steering messages from the channel and inject them
     /// into the conversation as user messages. Returns true if any were injected.
@@ -60,7 +92,9 @@ impl HelperMethods {
 
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
-            tracing::info!("Steering message injected: {}", truncate_str(&msg, 80));
+            // Metadata only — steering messages are user content and must not
+            // reach log sinks (request-lifecycle hardening T1).
+            tracing::info!(len = msg.len(), "Steering message injected");
             let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered {
                 message: msg.clone(),
             }));
@@ -227,10 +261,11 @@ impl HelperMethods {
     /// last block. Shared by both transports so the auth-specific block
     /// layout (and the OAuth identity-first invariant) has exactly one truth.
     ///
-    /// - OAuth: identity block FIRST (never reorder — it heads the cached
-    ///   prefix; changing it invalidates every active session), then the
-    ///   spoof-guard block, then the optional user system prompt. Last block
-    ///   gets the stable-prefix marker.
+    /// - OAuth: Anthropic's fixed Claude Code transport-contract identity block
+    ///   FIRST, then Synaps's configurable product identity, the general
+    ///   assistant guidance, and optional user system prompt. The transport
+    ///   identity is deliberately not configurable. Last block gets the
+    ///   stable-prefix marker.
     /// - API key (or any non-oauth): single user-prompt block with the
     ///   stable-prefix marker; `None` when there is no system prompt.
     pub(super) fn build_system_blocks(
@@ -239,7 +274,12 @@ impl HelperMethods {
         ttl: CacheTtl,
     ) -> Option<Value> {
         if auth_type == "oauth" {
+            // Anthropic OAuth routes on this first system block. It is a wire
+            // protocol contract, not Synaps branding or user-configurable identity.
+            const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
+                "You are Claude Code, Anthropic's official CLI for Claude.";
             let mut system_blocks = vec![
+                json!({"type": "text", "text": CLAUDE_CODE_TRANSPORT_IDENTITY}),
                 json!({"type": "text", "text": crate::core::config::get_identity()}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
@@ -263,16 +303,19 @@ impl HelperMethods {
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
-    pub(crate) fn truncate_tool_result(result: &str, max_chars: usize) -> String {
-        if result.len() <= max_chars {
-            return result.to_string();
+    ///
+    /// `max_bytes` is a BYTE budget enforced at a UTF-8 char boundary via the
+    /// shared [`agent_core::BoundedText`] helper (T2; the legacy code applied
+    /// a char budget, so multibyte output could exceed the byte cap). Marker
+    /// format intentionally changed from "total chars" to "total bytes".
+    pub(crate) fn truncate_tool_result(result: &str, max_bytes: usize) -> String {
+        let bounded = agent_core::BoundedText::new(result, max_bytes);
+        if !bounded.truncated {
+            return bounded.text;
         }
-        let truncated: String = result.chars().take(max_chars).collect();
         format!(
-            "{}\n\n[truncated — {} total chars, showing first {}]",
-            truncated,
-            result.len(),
-            max_chars
+            "{}\n\n[truncated — {} total bytes, showing first {}]",
+            bounded.text, bounded.original_bytes, bounded.retained_bytes
         )
     }
 
@@ -314,11 +357,6 @@ impl HelperMethods {
             setting
         };
 
-        // Best-effort: create parent dir; ignore failure (open will error out)
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
         let total = input_t + cache_read + cache_create;
         let pct = if total > 0 {
             (cache_read as f64 / total as f64 * 100.0) as u32
@@ -326,30 +364,28 @@ impl HelperMethods {
             0
         };
 
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: refuse to open if the target is a symlink. Defensive
-        // against a co-located user planting a symlink at a custom
-        // SYNAPS_USAGE_LOG path (CWE-59). The default path lives under
-        // $HOME/.cache which is typically 0700 so this is belt-and-braces.
-        #[cfg(target_os = "linux")]
-        const O_NOFOLLOW_FLAG: i32 = 0o400000;
-        #[cfg(target_os = "macos")]
-        const O_NOFOLLOW_FLAG: i32 = 0x0100;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const O_NOFOLLOW_FLAG: i32 = 0;
-        let result = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW_FLAG)
-            .open(&path);
-        if let Ok(mut f) = result {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
+        Self::append_usage_line(
+            std::path::Path::new(&path),
+            &format!(
                 "uncached={} cache_read={} cache_write={} output={} hit={}%",
                 input_t, cache_read, cache_create, output_t, pct
-            );
+            ),
+        );
+    }
+
+    /// Append one line to the usage log. Best-effort — errors silently
+    /// dropped so a broken log path never breaks the request pipeline.
+    ///
+    /// Delegates to `private_fs`: parent dir 0700, file created 0600 with
+    /// O_NOFOLLOW (CWE-59 — a co-located user planting a symlink at a custom
+    /// SYNAPS_USAGE_LOG path is refused), broader pre-existing modes repaired.
+    pub(super) fn append_usage_line(path: &std::path::Path, line: &str) {
+        if let Some(parent) = path.parent() {
+            let _ = agent_core::core::private_fs::ensure_private_dir(parent);
+        }
+        if let Ok(mut f) = agent_core::core::private_fs::open_private_append(path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
         }
     }
 }
@@ -427,7 +463,10 @@ mod tests {
         assert!(input[4]["content"].is_string());
         assert!(input[4]["content"].as_str() == Some("five"));
         // ...while the cleaned copy carries the marker.
-        assert_eq!(cleaned[4]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            cleaned[4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     /// Finding-1 freeze (S241 gate review): the OLD Vec-era sanitize used
@@ -442,8 +481,14 @@ mod tests {
         let before = serde_json::to_string(&msgs[0]).unwrap();
         sanitize_vals(&mut msgs);
         let after = serde_json::to_string(&msgs[0]).unwrap();
-        assert_eq!(before, after, "message without content key must pass through byte-identical");
-        assert!(msgs[0].get("content").is_none(), "content key must NOT be inserted");
+        assert_eq!(
+            before, after,
+            "message without content key must pass through byte-identical"
+        );
+        assert!(
+            msgs[0].get("content").is_none(),
+            "content key must NOT be inserted"
+        );
     }
 
     #[test]
@@ -826,18 +871,24 @@ mod tests {
     // ── build_system_blocks (OAuth + API-key sites, both transports) ────────
 
     #[test]
-    fn system_blocks_oauth_identity_first_and_marker_on_last() {
+    fn system_blocks_oauth_transport_identity_first_and_marker_on_last() {
+        const CLAUDE_CODE_IDENTITY: &str =
+            "You are Claude Code, Anthropic's official CLI for Claude.";
         for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
             let prompt = Some("custom prompt".to_string());
             let system = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
             let blocks = system.as_array().unwrap();
-            assert_eq!(blocks.len(), 3);
-            // Identity block is FIRST and unmarked — head of the cached prefix.
-            assert_eq!(blocks[0]["text"], crate::core::config::get_identity());
+            assert_eq!(blocks.len(), 4);
+            // OAuth's protocol identity is fixed and FIRST. Product/user identity
+            // remains additive and therefore cannot replace the transport contract.
+            assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+            assert_eq!(blocks[1]["text"], crate::core::config::get_identity());
+            assert_ne!(blocks[0]["text"], blocks[1]["text"]);
             assert!(blocks[0].get("cache_control").is_none());
             assert!(blocks[1].get("cache_control").is_none());
+            assert!(blocks[2].get("cache_control").is_none());
             // Last block carries the stable-prefix marker.
-            let cc = &blocks[2]["cache_control"];
+            let cc = &blocks[3]["cache_control"];
             assert_eq!(cc["type"], "ephemeral");
             match ttl {
                 CacheTtl::FiveMinutes => assert!(cc.get("ttl").is_none(), "5m: no ttl key"),
@@ -963,5 +1014,52 @@ mod tests {
             serde_json::to_string(&body["tools"][1]["cache_control"]).unwrap(),
             r#"{"type":"ephemeral"}"#,
         );
+    }
+
+    /// Private-mode test for the usage log (spec §5.4). Umask isolation:
+    /// `#[serial(umask)]` serializes umask-mutating tests crate-wide; the
+    /// guard restores the previous process-global mask on drop (panic-safe).
+    #[cfg(unix)]
+    mod usage_private_modes {
+        use super::*;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct UmaskGuard {
+            old: libc::mode_t,
+        }
+        impl UmaskGuard {
+            fn set(mask: libc::mode_t) -> Self {
+                Self {
+                    old: unsafe { libc::umask(mask) },
+                }
+            }
+        }
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.old);
+                }
+            }
+        }
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn usage_line_creates_0600_file_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join("synaps").join("usage.log");
+            HelperMethods::append_usage_line(&path, "uncached=1");
+            assert_eq!(
+                mode_of(path.parent().unwrap()),
+                0o700,
+                "usage dir must be 0700"
+            );
+            assert_eq!(mode_of(&path), 0o600, "usage file must be 0600");
+        }
     }
 }

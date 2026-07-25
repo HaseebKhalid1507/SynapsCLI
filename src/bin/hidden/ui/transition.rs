@@ -1,5 +1,5 @@
-use ratatui::prelude::*;
 use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 use std::time::Instant;
 
 /// A screen transition effect — CRT channel-switch glitch
@@ -24,7 +24,9 @@ impl Transition {
     }
 
     pub fn progress(&self) -> f64 {
-        if !self.active { return 1.0; }
+        if !self.active {
+            return 1.0;
+        }
         let elapsed = self.start.elapsed().as_millis() as f64;
         (elapsed / self.duration_ms as f64).min(1.0)
     }
@@ -60,14 +62,19 @@ pub fn draw_transition(buf: &mut Buffer, area: Rect, progress: f64, frame: u64) 
 
         for y in top..bot {
             let ay = area.top() + y as u16;
-            if ay >= area.bottom() { continue; }
+            if ay >= area.bottom() {
+                continue;
+            }
             for x in 0..w {
                 let ax = area.left() + x as u16;
-                if ax >= area.right() { continue; }
+                if ax >= area.right() {
+                    continue;
+                }
                 let seed = (frame as usize).wrapping_mul(x + 1).wrapping_add(y * 31);
                 let nch = noise_chars[seed % noise_chars.len()];
                 let intensity = ((seed * 7) % 60 + 10) as u8;
-                buf[(ax, ay)].set_char(nch)
+                buf[(ax, ay)]
+                    .set_char(nch)
                     .set_fg(Color::Rgb(intensity, intensity / 2, intensity))
                     .set_bg(Color::Rgb(5, 5, 10));
             }
@@ -75,10 +82,15 @@ pub fn draw_transition(buf: &mut Buffer, area: Rect, progress: f64, frame: u64) 
 
         // Horizontal displacement on nearby lines
         for offset in 0..3 {
-            let lines = [center.saturating_sub(spread + offset), (center + spread + offset).min(h - 1)];
+            let lines = [
+                center.saturating_sub(spread + offset),
+                (center + spread + offset).min(h - 1),
+            ];
             for &y in &lines {
                 let ay = area.top() + y as u16;
-                if ay >= area.bottom() || ay < area.top() { continue; }
+                if ay >= area.bottom() || ay < area.top() {
+                    continue;
+                }
                 let shift = ((frame as usize + offset) * 3) % 8;
                 for x in 0..w.saturating_sub(shift) {
                     let ax_src = area.left() + (x + shift) as u16;
@@ -94,14 +106,19 @@ pub fn draw_transition(buf: &mut Buffer, area: Rect, progress: f64, frame: u64) 
         // Full static
         for y in 0..h {
             let ay = area.top() + y as u16;
-            if ay >= area.bottom() { continue; }
+            if ay >= area.bottom() {
+                continue;
+            }
             for x in 0..w {
                 let ax = area.left() + x as u16;
-                if ax >= area.right() { continue; }
+                if ax >= area.right() {
+                    continue;
+                }
                 let seed = (frame as usize).wrapping_mul(x + 1).wrapping_add(y * 37);
                 let nch = noise_chars[seed % noise_chars.len()];
                 let intensity = ((seed * 13) % 40 + 5) as u8;
-                buf[(ax, ay)].set_char(nch)
+                buf[(ax, ay)]
+                    .set_char(nch)
                     .set_fg(Color::Rgb(intensity, intensity, intensity + 10))
                     .set_bg(Color::Rgb(3, 3, 5));
             }

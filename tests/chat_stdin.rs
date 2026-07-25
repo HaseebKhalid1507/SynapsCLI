@@ -26,8 +26,11 @@ use tokio::process::{Child, ChildStdin, Command};
 
 struct ChatChild {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stderr: BufReader<tokio::process::ChildStderr>,
+    /// Kept open (not read) so the child never sees EPIPE on stdout writes —
+    /// exit codes must reflect turn logic, not broken-pipe panics.
+    _stdout: Option<tokio::process::ChildStdout>,
     _home: TempDir,
 }
 
@@ -78,10 +81,16 @@ impl ChatChild {
         let stdin = child.stdin.take().expect("piped stdin");
         let stderr_raw = child.stderr.take().expect("piped stderr");
         let stderr = BufReader::new(stderr_raw);
-        // stdout is piped but we don't need to read it in these tests
-        drop(child.stdout.take());
+        // stdout is piped and held open; these tests only assert on stderr.
+        let stdout = child.stdout.take();
 
-        Ok(Self { child, stdin, stderr, _home: home })
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stderr,
+            _stdout: stdout,
+            _home: home,
+        })
     }
 
     /// Read lines from stderr until `predicate` is satisfied or timeout.
@@ -97,10 +106,7 @@ impl ChatChild {
                 anyhow::bail!("timeout waiting for expected stderr line");
             }
             let mut line = String::new();
-            let n = tokio::time::timeout(
-                remaining,
-                self.stderr.read_line(&mut line),
-            ).await??;
+            let n = tokio::time::timeout(remaining, self.stderr.read_line(&mut line)).await??;
             if n == 0 {
                 anyhow::bail!("stderr closed before expected line appeared");
             }
@@ -112,9 +118,21 @@ impl ChatChild {
     }
 
     async fn send(&mut self, text: &str) -> anyhow::Result<()> {
-        self.stdin.write_all(text.as_bytes()).await?;
-        self.stdin.flush().await?;
+        let stdin = self.stdin.as_mut().expect("stdin already closed");
+        stdin.write_all(text.as_bytes()).await?;
+        stdin.flush().await?;
         Ok(())
+    }
+
+    /// Close the child's stdin (EOF) so the read loop terminates. Dropping
+    /// the handle is what actually closes the pipe.
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// The child's SYNAPS_BASE_DIR (where sessions/ lives).
+    fn base_dir(&self) -> std::path::PathBuf {
+        self._home.path().join(".synaps-cli")
     }
 
     async fn wait_exit(&mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
@@ -134,7 +152,9 @@ async fn piped_status_then_quit() -> anyhow::Result<()> {
     let mut child = ChatChild::spawn(|_| {}).await?;
 
     // Wait for the banner so the process is ready to accept commands.
-    child.wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15)).await?;
+    child
+        .wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15))
+        .await?;
 
     // Send commands
     child.send("/status\n/quit\n").await?;
@@ -143,13 +163,22 @@ async fn piped_status_then_quit() -> anyhow::Result<()> {
     child
         .wait_stderr_line(|l| l.contains("model:"), Duration::from_secs(5))
         .await
-        .map_err(|_| anyhow::anyhow!("did not see 'model:' in stderr after /status — async stdin may be broken"))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "did not see 'model:' in stderr after /status — async stdin may be broken"
+            )
+        })?;
 
     // Must exit cleanly (code 0 or 1; just not hang)
-    let status = child.wait_exit(Duration::from_secs(5)).await
+    let status = child
+        .wait_exit(Duration::from_secs(5))
+        .await
         .map_err(|_| anyhow::anyhow!("/quit did not produce clean exit — process hung"))?;
     // exit code is 0 (clean) or any non-signal exit
-    assert!(status.code().is_some(), "process was killed by signal rather than exiting");
+    assert!(
+        status.code().is_some(),
+        "process was killed by signal rather than exiting"
+    );
 
     Ok(())
 }
@@ -181,7 +210,9 @@ async fn eof_exits_cleanly() -> anyhow::Result<()> {
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("process hung on EOF stdin — async stdin EOF handling broken"))??;
+    .map_err(|_| {
+        anyhow::anyhow!("process hung on EOF stdin — async stdin EOF handling broken")
+    })??;
 
     assert!(
         output.status.code().is_some(),
@@ -196,7 +227,9 @@ async fn eof_exits_cleanly() -> anyhow::Result<()> {
 #[tokio::test]
 async fn crlf_trimmed_correctly() -> anyhow::Result<()> {
     let mut child = ChatChild::spawn(|_| {}).await?;
-    child.wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15)).await?;
+    child
+        .wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15))
+        .await?;
 
     child.send("/status\r\n/quit\r\n").await?;
 
@@ -205,9 +238,66 @@ async fn crlf_trimmed_correctly() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("CRLF not trimmed — /status not executed"))?;
 
-    let status = child.wait_exit(Duration::from_secs(5)).await
+    let status = child
+        .wait_exit(Duration::from_secs(5))
+        .await
         .map_err(|_| anyhow::anyhow!("process hung after CRLF /quit"))?;
     assert!(status.code().is_some());
+
+    Ok(())
+}
+
+/// T3 criterion 1+2: an unrecovered provider failure in headless mode must
+/// exit NONZERO while still saving the valid partial history (here: the
+/// user's prompt) into the session file.
+///
+/// The failure fixture is credential-free boot: the default model routes to
+/// Anthropic, no auth.json / API key exists, so the pre-stream token refresh
+/// fails locally (no network) and surfaces as a provider failure.
+#[tokio::test]
+async fn provider_failure_exits_nonzero_and_preserves_history() -> anyhow::Result<()> {
+    let mut child = ChatChild::spawn(|_| {}).await?;
+
+    // Wait for the banner so the process is ready.
+    child
+        .wait_stderr_line(|l| l.contains("synaps"), Duration::from_secs(15))
+        .await?;
+
+    // Send a real prompt, then EOF — the turn must fail (no credentials).
+    child.send("hello from the failure fixture\n").await?;
+    child.close_stdin();
+
+    let status = child
+        .wait_exit(Duration::from_secs(30))
+        .await
+        .map_err(|_| anyhow::anyhow!("chat hung after provider failure"))?;
+
+    // Criterion 1: unrecovered provider failure must exit nonzero.
+    assert!(
+        status.code().is_some(),
+        "process was killed by signal rather than exiting"
+    );
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "headless chat must exit nonzero on an unrecovered provider failure"
+    );
+
+    // Criterion 2: valid partial history (the user prompt) survives in the
+    // saved session file.
+    let sessions_dir = child.base_dir().join("sessions");
+    let mut saved = String::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            saved.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+    }
+    assert!(
+        saved.contains("hello from the failure fixture"),
+        "saved session must preserve the user's message after a provider \
+         failure; sessions dir contents: {:?}",
+        saved
+    );
 
     Ok(())
 }
@@ -221,7 +311,7 @@ mod continuation_policy {
     use agent_engine::engine::reactor::{
         drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP,
     };
-    use agent_engine::events::{EventQueue, types::Severity};
+    use agent_engine::events::{types::Severity, EventQueue};
     use std::sync::Arc;
 
     fn user_msg(text: &str) -> agent_engine::SharedMessage {
@@ -233,8 +323,11 @@ mod continuation_policy {
     fn run_turn_under_cap() {
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "completion", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "completion",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("hello")];
         let mut pending: Vec<String> = Vec::new();
 
@@ -248,8 +341,11 @@ mod continuation_policy {
     fn parks_at_cap() {
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "completion", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "completion",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("hello")];
         let mut pending: Vec<String> = Vec::new();
 
@@ -265,8 +361,11 @@ mod continuation_policy {
         // After reset, first auto-turn fires again.
         let q = EventQueue::new(10);
         q.push(agent_engine::events::types::Event::simple(
-            "test", "new-event", Some(Severity::Medium),
-        )).unwrap();
+            "test",
+            "new-event",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
         let mut messages = vec![user_msg("new user message after reset")];
         let mut pending: Vec<String> = Vec::new();
 

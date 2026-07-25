@@ -49,9 +49,7 @@ pub(super) fn setup_terminal(caps: Option<&TermCaps>) -> synaps_cli::Result<Term
         EnableMouseCapture,
         EnableBracketedPaste
     )
-    .map_err(|e| {
-        synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e))
-    })?;
+    .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     // Best-effort: enable the kitty keyboard protocol so modifier-heavy
     // chords (Ctrl+Alt+V, Ctrl+Shift+letter, etc.) report correctly on
     // terminals that support it (kitty, wezterm, foot, iterm2, alacritty).
@@ -97,6 +95,48 @@ pub(super) fn emergency_teardown_terminal() {
     execute!(stdout, cursor::Show).ok();
 }
 
+/// Bounded observability flush for TUI teardown (Task 11): stop intake on
+/// the session's telemetry/trace writer and drain it under the default
+/// shutdown budget.
+///
+/// Semantics: telemetry `off` → no writer → `None`, a true no-op.
+/// "Flushed" means every queued record was appended into OS file buffers
+/// (no fsync — best-effort diagnostic logs). A timeout logs a
+/// metadata-only warning (counter stats, never record content) and
+/// teardown continues — trace loss must never abort or fail an exit.
+pub(super) async fn flush_observability(runtime: &synaps_cli::Runtime) {
+    flush_observability_within(
+        runtime,
+        synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    )
+    .await;
+}
+
+/// Emergency-exit epilogue (session save timed out): short (1 s) bounded
+/// observability flush, then terminal restore and `process::exit(1)`. The
+/// exit reason is the save timeout — never trace loss; the flush is
+/// best-effort and cannot extend the exit beyond its own bound.
+pub(super) async fn emergency_flush_and_exit(runtime: &synaps_cli::Runtime) -> ! {
+    flush_observability_within(runtime, std::time::Duration::from_secs(1)).await;
+    emergency_teardown_terminal();
+    std::process::exit(1);
+}
+
+async fn flush_observability_within(runtime: &synaps_cli::Runtime, budget: std::time::Duration) {
+    match runtime.shutdown_observability_async(budget).await {
+        None => {} // telemetry off — nothing to flush
+        Some(outcome) if outcome.is_flushed() => {
+            tracing::debug!("observability flush completed");
+        }
+        Some(outcome) => {
+            tracing::warn!(
+                stats = ?outcome.stats(),
+                "observability flush timed out — detached worker keeps draining"
+            );
+        }
+    }
+}
+
 // `teardown_terminal` was removed in the #116 render-thread work — the render
 // thread now owns the Terminal and performs its own teardown (see render_thread.rs).
 
@@ -122,18 +162,32 @@ mod kitty_gate_tests {
         // Default caps carry no DA1 fence ⇒ still push (= today).
         let caps = TermCaps::default();
         assert!(!caps.da1_answered);
-        assert!(kitty_push_enabled(Some(&caps)), "no fence ⇒ blind push (= today)");
+        assert!(
+            kitty_push_enabled(Some(&caps)),
+            "no fence ⇒ blind push (= today)"
+        );
     }
 
     #[test]
     fn negotiated_kitty_support_pushes() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: true, ..TermCaps::default() };
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: true,
+            ..TermCaps::default()
+        };
         assert!(kitty_push_enabled(Some(&caps)));
     }
 
     #[test]
     fn negotiated_no_kitty_skips_push() {
-        let caps = TermCaps { da1_answered: true, kitty_keyboard: false, ..TermCaps::default() };
-        assert!(!kitty_push_enabled(Some(&caps)), "kitty negotiated off ⇒ no push");
+        let caps = TermCaps {
+            da1_answered: true,
+            kitty_keyboard: false,
+            ..TermCaps::default()
+        };
+        assert!(
+            !kitty_push_enabled(Some(&caps)),
+            "kitty negotiated off ⇒ no push"
+        );
     }
 }

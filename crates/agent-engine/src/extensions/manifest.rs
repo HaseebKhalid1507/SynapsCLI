@@ -14,7 +14,15 @@ fn default_protocol_version() -> u32 {
 }
 
 /// Extension declaration inside a plugin manifest.
+///
+/// Deserialization goes through [`RawExtensionManifest`] so legacy
+/// manifest aliases (`extension.tools` + `activation: "deferred"`, the
+/// pre-native shape shipped by early deferred plugins such as
+/// axel-memory-manager 0.1) are folded into the native `deferred` block
+/// BEFORE any classification or validation can observe them. Unknown
+/// `activation` values fail closed instead of silently loading eager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawExtensionManifest")]
 pub struct ExtensionManifest {
     /// Extension protocol version. Defaults to v1 for pre-versioned manifests.
     #[serde(default = "default_protocol_version")]
@@ -63,6 +71,102 @@ pub struct ExtensionManifest {
     /// identical to pre-P19.2 manifests.
     #[serde(default)]
     pub theme_tokens: std::collections::BTreeMap<String, String>,
+    /// OPTIONAL (additive, protocol v1-compatible): passive `deferred`
+    /// lifecycle declarations (Task 20, spec 7.5). Absent => legacy eager
+    /// lifecycle, byte-for-byte compatible. Present declarations are
+    /// trusted local manifest expectations validated BEFORE any spawn and
+    /// matched EXACTLY against runtime initialize declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<super::lifecycle::DeferredDeclarations>,
+}
+
+/// Wire-shape shadow of [`ExtensionManifest`] carrying the LEGACY manifest
+/// aliases (`tools` + `activation`) used by pre-native deferred plugins.
+/// [`TryFrom`] folds them into the native `deferred` block with a
+/// fail-closed policy:
+///   * `activation` values other than `"deferred"` are rejected (a typo or
+///     unknown mode must never silently fall back to the eager lifecycle);
+///   * declaring BOTH native `deferred` and a legacy alias is ambiguous
+///     and rejected;
+///   * `activation: "deferred"` without legacy `tools` declarations has no
+///     deferrable surface and is rejected.
+#[derive(Deserialize)]
+struct RawExtensionManifest {
+    #[serde(default = "default_protocol_version")]
+    protocol_version: u32,
+    runtime: ExtensionRuntime,
+    command: String,
+    #[serde(default)]
+    setup: Option<String>,
+    #[serde(default)]
+    prebuilt: std::collections::HashMap<String, PrebuiltAsset>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    hooks: Vec<HookSubscription>,
+    #[serde(default)]
+    config: Vec<ExtensionConfigEntry>,
+    #[serde(default)]
+    theme_tokens: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    deferred: Option<super::lifecycle::DeferredDeclarations>,
+    /// LEGACY ALIAS: passive tool declarations at the extension top level.
+    #[serde(default)]
+    tools: Vec<super::lifecycle::DeclaredExtensionTool>,
+    /// LEGACY ALIAS: `"deferred"` marks the legacy `tools` block deferred.
+    #[serde(default)]
+    activation: Option<String>,
+}
+
+impl TryFrom<RawExtensionManifest> for ExtensionManifest {
+    type Error = String;
+
+    fn try_from(raw: RawExtensionManifest) -> Result<Self, Self::Error> {
+        if let Some(activation) = raw.activation.as_deref() {
+            if activation != "deferred" {
+                return Err(format!(
+                    "unsupported extension activation '{}' (supported: \"deferred\"); refusing to fall back to the eager lifecycle",
+                    activation,
+                ));
+            }
+        }
+        let legacy_alias_used = raw.activation.is_some() || !raw.tools.is_empty();
+        if raw.deferred.is_some() && legacy_alias_used {
+            return Err(
+                "extension declares both a native 'deferred' block and legacy 'tools'/'activation' aliases; use only the native 'deferred' block".to_string(),
+            );
+        }
+        let deferred = if legacy_alias_used {
+            if raw.tools.is_empty() {
+                return Err(
+                    "extension declares activation \"deferred\" without legacy 'tools' declarations; declare tools or use the native 'deferred' block".to_string(),
+                );
+            }
+            Some(super::lifecycle::DeferredDeclarations {
+                tools: raw.tools,
+                providers: Vec::new(),
+                lifecycle: None,
+                context_providers: Vec::new(),
+            })
+        } else {
+            raw.deferred
+        };
+        Ok(Self {
+            protocol_version: raw.protocol_version,
+            runtime: raw.runtime,
+            command: raw.command,
+            setup: raw.setup,
+            prebuilt: raw.prebuilt,
+            args: raw.args,
+            permissions: raw.permissions,
+            hooks: raw.hooks,
+            config: raw.config,
+            theme_tokens: raw.theme_tokens,
+            deferred,
+        })
+    }
 }
 
 /// Per-host-triple prebuilt distribution asset for an extension. Lives
@@ -107,6 +211,23 @@ pub struct ExtensionConfigEntry {
     pub default: Option<Value>,
     #[serde(default)]
     pub secret_env: Option<String>,
+    /// RESERVED host-context source: when present the value is resolved
+    /// EXCLUSIVELY from trusted host state recorded by the
+    /// `ExtensionManager` (never from env overrides, user config, or model
+    /// input) and injected into the resolved config sent at initialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_context: Option<HostContextKey>,
+}
+
+/// Typed host-context sources for [`ExtensionConfigEntry::host_context`].
+/// Each variant is a host-owned trusted value; no secrets, no environment
+/// forwarding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostContextKey {
+    /// Canonical trusted project root, discovered once by the host from
+    /// its own working directory (see `ExtensionManager::host_project_root`).
+    ProjectRoot,
 }
 
 /// A validated extension manifest prepared for loading.
@@ -119,6 +240,14 @@ pub struct ValidatedExtensionManifest {
 impl ExtensionManifest {
     /// Validate manifest fields and derive typed permissions/subscriptions.
     pub fn validate(&self, id: &str) -> Result<ValidatedExtensionManifest, String> {
+        // Review fix A1/A2: full deferred policy — block bounds PLUS
+        // permission coupling (deferred tools => 'tools.register',
+        // deferred providers => 'providers.register') and hook-lifecycle
+        // coupling (lifecycle 'hook' => at least one hook subscription).
+        // Runs before any spawn or catalog registration.
+        super::lifecycle::validate_manifest_deferred(self).map_err(|reason| {
+            format!("Extension '{id}' deferred declarations invalid: {reason}")
+        })?;
         if self.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
             return Err(format!(
                 "Extension '{}' uses unsupported protocol_version {} (supported: {})",
@@ -133,8 +262,15 @@ impl ExtensionManifest {
         let has_capability_permission = self.permissions.iter().any(|permission| {
             matches!(
                 permission.as_str(),
-                "tools.register" | "providers.register" | "memory.read" | "memory.write"
-                    | "config.write" | "config.subscribe" | "audio.input" | "audio.output"
+                "tools.register"
+                    | "providers.register"
+                    | "context_providers.register"
+                    | "memory.read"
+                    | "memory.write"
+                    | "config.write"
+                    | "config.subscribe"
+                    | "audio.input"
+                    | "audio.output"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {
@@ -237,7 +373,10 @@ impl HookMatcher {
     pub const SUPPORTED_KEYS: &'static [&'static str] = &["input_contains", "input_equals"];
 
     pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
-        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
+        let input = event
+            .tool_input
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null);
         if let Some(expected) = &self.input_equals {
             if input != expected {
                 return false;
@@ -317,7 +456,10 @@ mod tests {
         assert_eq!(entry.key, "backend");
         assert_eq!(entry.value_type, Some(ExtensionConfigValueKind::String));
         assert_eq!(entry.description.as_deref(), Some("Backend selector"));
-        assert_eq!(entry.default, Some(serde_json::Value::String("auto".to_string())));
+        assert_eq!(
+            entry.default,
+            Some(serde_json::Value::String("auto".to_string()))
+        );
     }
 
     #[test]
@@ -380,6 +522,7 @@ mod tests {
     fn validate_rejects_unsupported_protocol_version() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 999,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -403,6 +546,7 @@ mod tests {
     fn validate_allows_hookless_provider_registration_extensions() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -421,6 +565,7 @@ mod tests {
     fn validate_rejects_tool_filter_on_non_tool_hook() {
         let manifest = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -446,6 +591,7 @@ mod tests {
     fn serialize_roundtrip() {
         let original = ExtensionManifest {
             theme_tokens: Default::default(),
+            deferred: None,
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),
@@ -506,10 +652,11 @@ mod tests {
             "bash",
             serde_json::json!({"command": "echo safe"}),
         );
-        let equals_but_missing_contains = crate::extensions::hooks::events::HookEvent::before_tool_call(
-            "bash",
-            serde_json::json!({"command": "echo ok"}),
-        );
+        let equals_but_missing_contains =
+            crate::extensions::hooks::events::HookEvent::before_tool_call(
+                "bash",
+                serde_json::json!({"command": "echo ok"}),
+            );
 
         assert!(matcher.matches(&matching));
         assert!(!matcher.matches(&equals_but_missing_contains));
@@ -568,7 +715,10 @@ mod tests {
         // Missing sha256 must error — no silent acceptance of unverified assets.
         let json = r#"{ "url": "https://example.com/x.tar.gz" }"#;
         let res: Result<PrebuiltAsset, _> = serde_json::from_str(json);
-        assert!(res.is_err(), "PrebuiltAsset without sha256 must fail to parse");
+        assert!(
+            res.is_err(),
+            "PrebuiltAsset without sha256 must fail to parse"
+        );
     }
 
     // ── Theme tokens (P19.2, additive-optional per STABILITY.md §1) ─────────
@@ -584,8 +734,14 @@ mod tests {
             "permissions": ["tools.register"]
         }"#;
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
-        assert!(m.theme_tokens.is_empty(), "absent theme_tokens must default to empty");
-        assert!(m.validate("legacy-ext").is_ok(), "legacy manifests must validate unchanged");
+        assert!(
+            m.theme_tokens.is_empty(),
+            "absent theme_tokens must default to empty"
+        );
+        assert!(
+            m.validate("legacy-ext").is_ok(),
+            "legacy manifests must validate unchanged"
+        );
     }
 
     #[test]
@@ -597,7 +753,10 @@ mod tests {
             "theme_tokens": { "accent": "#22d3ee", "warn": "#fa0" }
         }"##;
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(m.theme_tokens.get("accent").map(String::as_str), Some("#22d3ee"));
+        assert_eq!(
+            m.theme_tokens.get("accent").map(String::as_str),
+            Some("#22d3ee")
+        );
         assert_eq!(m.theme_tokens.get("warn").map(String::as_str), Some("#fa0"));
         assert!(m.validate("themed-ext").is_ok());
     }
@@ -615,7 +774,10 @@ mod tests {
             );
             let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
             let err = m.validate("bad-ext").unwrap_err();
-            assert!(err.contains("theme token"), "'{bad}' must be rejected: {err}");
+            assert!(
+                err.contains("theme token"),
+                "'{bad}' must be rejected: {err}"
+            );
         }
     }
 
@@ -632,7 +794,10 @@ mod tests {
             );
             let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
             let err = m.validate("bad-ext").unwrap_err();
-            assert!(err.contains("invalid color"), "'{bad}' must be rejected: {err}");
+            assert!(
+                err.contains("invalid color"),
+                "'{bad}' must be rejected: {err}"
+            );
         }
     }
 

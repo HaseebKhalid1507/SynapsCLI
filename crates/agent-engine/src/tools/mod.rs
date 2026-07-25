@@ -15,12 +15,19 @@ mod extension;
 mod find;
 mod grep;
 mod ls;
+pub mod memory;
+mod memory_context;
 mod read;
 mod secret_prompt;
 mod subagent;
 mod write;
 
+pub mod activation;
 mod agent;
+pub mod catalog;
+pub mod discovery;
+pub mod ledger;
+pub mod output;
 mod registry;
 pub mod respond;
 pub mod send_channel;
@@ -31,15 +38,18 @@ pub mod watcher_exit;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use crate::runtime::subagent::{
-    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState, SubagentStatus,
+    SubagentDisplayRow, SubagentHandle, SubagentRegistry, SubagentResult, SubagentState,
+    SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
-pub use bash::BashTool;
+pub use bash::{bash_intermediary_snapshot, BashIntermediarySnapshot, BashTool};
+pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
 pub use extension::ExtensionTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
+pub use memory_context::MemoryContextTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use respond::RespondTool;
@@ -48,8 +58,8 @@ pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
-    SubagentCollectTool, SubagentResumeTool, SubagentStartTool, SubagentStatusTool,
-    SubagentSteerTool, SubagentTool,
+    SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
+    SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
 pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
@@ -65,8 +75,13 @@ pub use subagent::finalize::{build_completion_event, finalize_subagent};
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 
 /// Streaming channels — carry partial tool output and stream events.
+///
+/// `tx_delta` is the Task 26 bounded delta lane (spec §8.4): a non-blocking
+/// coalesce-then-drop producer handle whose consumer enforces the UI-preview
+/// byte budget. It replaced the previous unbounded `mpsc` sender so a fast
+/// producer with a slow consumer can no longer grow memory without bound.
 pub struct ToolChannels {
-    pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub tx_delta: Option<crate::tools::output::DeltaSender>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
 }
 
@@ -77,7 +92,35 @@ pub struct ToolCapabilities {
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
+    /// Current worker handle when this context belongs to a delegated
+    /// runtime. `None` denotes the foreground root.
+    pub delegation_parent: Option<String>,
     pub secret_prompt: Option<SecretPromptHandle>,
+    /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
+    /// path must authorize before creating channels, threads, or provider runtimes.
+    pub orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
+    /// Discovery/activation capability context (Task 17): passive catalog
+    /// snapshot + retained session-set handle + host-supplied activation
+    /// authority. `None` (default for manual fixtures and non-stream
+    /// contexts) means the discovery/activation builtins fail typed and no
+    /// model-initiated activation is possible.
+    pub tool_activation: Option<crate::tools::discovery::ActivationCapability>,
+    /// Session-scoped exact MCP lease capability (Task 19): exact session
+    /// identity + shared runtime manager. `None` (default for non-stream
+    /// contexts) means deferred MCP tools fail typed and start nothing.
+    pub mcp_leases: Option<crate::mcp::McpLeaseCapability>,
+    /// Session-scoped exact EXTENSION lease capability (Task 20): exact
+    /// session identity + shared extension runtime manager. `None`
+    /// (default for non-stream contexts) means deferred extension tools
+    /// fail typed and start nothing.
+    pub extension_leases: Option<crate::extensions::lease::ExtensionLeaseCapability>,
+    /// Session-scoped continuous-memory context capability (task A4, spec
+    /// §7.2): shared per-session memory state + host-owned grant scope.
+    /// `None` (default for non-stream contexts) means the `memory_context`
+    /// builtin can commit nothing — lease-granting actions fail typed,
+    /// while `status`/`disable` still answer deterministically `Off`
+    /// (memory off requires no infrastructure).
+    pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
 }
 
 /// Configuration limits and timeouts.
@@ -102,6 +145,40 @@ pub struct ToolContext {
     pub limits: ToolLimits,
 }
 
+/// Explicit runtime-origin identity of a registered tool implementation.
+///
+/// This is the metadata boundary the capability catalog trusts for
+/// provenance. The default is conservative: a tool that declares nothing is
+/// [`ToolOrigin::Unknown`] (or [`ToolOrigin::Extension`] when it already
+/// declares an owning extension via [`Tool::extension_id`]) — never builtin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOrigin {
+    /// Compiled into this binary.
+    Builtin,
+    /// Registered by a locally installed extension (`<extension_id>:<tool>`
+    /// runtime names).
+    Extension { extension_id: String },
+    /// Bridged from an MCP server; identifies the server and the tool name
+    /// as the server knows it (not the prefixed runtime name).
+    Mcp {
+        server_id: String,
+        server_tool_name: String,
+    },
+    /// Declared by a plugin definition.
+    Plugin {
+        plugin_id: String,
+        tool_name: String,
+    },
+    /// No declared origin. Cataloged conservatively, never as builtin.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrencyKey {
+    Key(String),
+    Serialize,
+}
+
 /// The core trait for all tools. Implement this to add a new tool.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -119,6 +196,33 @@ pub trait Tool: Send + Sync {
 
     /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
     fn extension_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Runtime-origin identity used for catalog provenance. Conservative by
+    /// default: tools that declare nothing are `Unknown` (fail-closed source
+    /// trust), and tools that declare an owning extension classify as
+    /// extension-provided. Built-in implementations override this explicitly.
+    fn origin(&self) -> ToolOrigin {
+        match self.extension_id() {
+            Some(extension_id) => ToolOrigin::Extension {
+                extension_id: extension_id.to_string(),
+            },
+            None => ToolOrigin::Unknown,
+        }
+    }
+
+    /// Conservative effect class (Task 24, spec §8.2). The default keeps
+    /// unknown/dynamic tools `NonIdempotent` — serialized execution;
+    /// implementations opt IN to weaker classes explicitly.
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::NonIdempotent
+    }
+
+    /// Key resolution derived from validated input. `Serialize` explicitly
+    /// fails closed into the global mutation lane; `None` is the conservative
+    /// default for tools with no key support.
+    fn concurrency_key(&self, _validated_input: &Value) -> Option<ConcurrencyKey> {
         None
     }
 }

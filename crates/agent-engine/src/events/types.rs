@@ -58,6 +58,11 @@ pub struct EventContent {
     pub content_type: String,
     pub severity: Option<Severity>,
     pub data: Option<Value>,
+    /// Disclosure class (spec §9.7). Absent means the baseline
+    /// `model_visible`; every other class is enforced at the agent-facing
+    /// rendering boundary (`format_event_for_agent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<agent_core::disclosure::DisclosureClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +95,7 @@ impl Event {
                 content_type: "message".to_string(),
                 severity,
                 data: None,
+                disclosure: None,
             },
             expects_response: false,
             reply_to: None,
@@ -110,7 +116,12 @@ mod tests {
 
     #[test]
     fn severity_str_roundtrip() {
-        for s in [Severity::Low, Severity::Medium, Severity::High, Severity::Critical] {
+        for s in [
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
             assert_eq!(Severity::from_str(s.as_str()), s);
         }
         assert_eq!(Severity::from_str("garbage"), Severity::Medium);

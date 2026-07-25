@@ -36,6 +36,7 @@ fn manifest_with_perms_and_args(perms: Vec<&str>, extra_args: Vec<&str>) -> Exte
     args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -72,10 +73,7 @@ async fn extension_can_append_and_query_within_its_namespace() {
 
     // Verify the JSONL file exists and contains exactly one record with the
     // expected content.
-    let path = home
-        .path()
-        .join("memory")
-        .join("memory-test-ext.jsonl");
+    let path = home.path().join("memory").join("memory-test-ext.jsonl");
     let body = fs::read_to_string(&path).expect("memory file should exist");
     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1, "expected exactly one record, got {body:?}");

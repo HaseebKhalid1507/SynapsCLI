@@ -11,7 +11,9 @@ fn regex_strip_event_close(s: &str) -> String {
         if i + 7 < chars.len() && lower_chars[i] == '<' && lower_chars[i + 1] == '/' {
             // Scan for "event" after optional whitespace
             let mut j = i + 2;
-            while j < chars.len() && lower_chars[j].is_whitespace() { j += 1; }
+            while j < chars.len() && lower_chars[j].is_whitespace() {
+                j += 1;
+            }
             if j + 5 <= chars.len()
                 && lower_chars[j] == 'e'
                 && lower_chars[j + 1] == 'v'
@@ -20,7 +22,9 @@ fn regex_strip_event_close(s: &str) -> String {
                 && lower_chars[j + 4] == 't'
             {
                 let mut k = j + 5;
-                while k < chars.len() && lower_chars[k].is_whitespace() { k += 1; }
+                while k < chars.len() && lower_chars[k].is_whitespace() {
+                    k += 1;
+                }
                 if k < chars.len() && chars[k] == '>' {
                     i = k + 1; // skip the entire closing tag
                     continue;
@@ -38,6 +42,8 @@ fn regex_strip_event_close(s: &str) -> String {
 /// content inside <event> tags as DATA, not instructions.
 /// Example: `<event id="abc" type="alert" severity="high" source="uptime-kuma" channel="alerts">Jellyfin is DOWN.</event>`
 pub fn format_event_for_agent(event: &Event) -> String {
+    use agent_core::disclosure::{gate_for_model, DisclosureClass, ModelVisibility};
+
     let sev = event
         .content
         .severity
@@ -50,8 +56,24 @@ pub fn format_event_for_agent(event: &Event) -> String {
         None => String::new(),
     };
 
+    // T34 (spec §9.7): this rendering is a MODEL-VISIBILITY boundary. The
+    // event's disclosure class gates content and data through the one core
+    // gate; no consent flow or redactor is configured here, so those
+    // classes fail closed with a typed marker.
+    let class = event
+        .content
+        .disclosure
+        .unwrap_or(DisclosureClass::ModelVisible);
+    let (gated_text, withheld) = match gate_for_model(class, &event.content.text, false, None) {
+        ModelVisibility::Visible(text) => (text, false),
+        ModelVisibility::Withheld(reason) => (
+            format!("[content withheld: {} ({reason})]", class.as_str()),
+            true,
+        ),
+    };
+
     // Sanitize text — strip any closing </event> tags to prevent breakout
-    let safe_text = regex_strip_event_close(&event.content.text);
+    let safe_text = regex_strip_event_close(&gated_text);
     let safe_source = event.source.source_type.replace('"', "'");
     let safe_content_type = event.content.content_type.replace('"', "'");
 
@@ -60,13 +82,15 @@ pub fn format_event_for_agent(event: &Event) -> String {
         event.id, safe_content_type, sev, safe_source, channel_attr, safe_text
     );
 
-    if let Some(data) = &event.content.data {
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        // Cap data size to prevent token abuse
-        let truncated: String = data_str.chars().take(1000).collect();
-        // Strip closing event tags from data (case-insensitive) to prevent breakout
-        let safe_data = regex_strip_event_close(&truncated);
-        out.push_str(&format!("\nData: {}", safe_data));
+    if !withheld {
+        if let Some(data) = &event.content.data {
+            let data_str = serde_json::to_string(data).unwrap_or_default();
+            // Cap data size to prevent token abuse
+            let truncated: String = data_str.chars().take(1000).collect();
+            // Strip closing event tags from data (case-insensitive) to prevent breakout
+            let safe_data = regex_strip_event_close(&truncated);
+            out.push_str(&format!("\nData: {}", safe_data));
+        }
     }
 
     out.push_str("</event>");
@@ -93,7 +117,11 @@ mod tests {
 
     #[test]
     fn format_with_channel() {
-        let mut e = Event::simple("uptime-kuma", "Jellyfin is DOWN. Status 503.", Some(Severity::High));
+        let mut e = Event::simple(
+            "uptime-kuma",
+            "Jellyfin is DOWN. Status 503.",
+            Some(Severity::High),
+        );
         e.content.content_type = "alert".into();
         e.channel = Some(EventChannel {
             id: "1".into(),
@@ -137,8 +165,10 @@ mod tests {
         // The formatted output must end with exactly one </event> — the terminal tag
         // added by format_event_for_agent itself.
         let close_count = s.matches("</event>").count();
-        assert_eq!(close_count, 1,
-            "output must contain exactly one </event> — injected ones must be stripped. Got: {s}");
+        assert_eq!(
+            close_count, 1,
+            "output must contain exactly one </event> — injected ones must be stripped. Got: {s}"
+        );
         assert!(s.ends_with("</event>"));
     }
 
@@ -153,8 +183,66 @@ mod tests {
         e.content.content_type = "subagent_completion".into();
         let s = format_event_for_agent(&e);
         let close_count = s.matches("</event>").count();
-        assert_eq!(close_count, 1,
-            "tab-separated </\\tevent> must be stripped, leaving only the terminal tag: {s}");
+        assert_eq!(
+            close_count, 1,
+            "tab-separated </\\tevent> must be stripped, leaving only the terminal tag: {s}"
+        );
         assert!(s.ends_with("</event>"));
+    }
+}
+
+#[cfg(test)]
+mod disclosure_boundary_tests {
+    use super::*;
+    use crate::events::types::{Event, Severity};
+    use agent_core::disclosure::DisclosureClass;
+
+    const SENTINEL: &str = "EVENT-DISCLOSURE-SENTINEL-2c9d";
+
+    fn event_with_class(class: Option<DisclosureClass>) -> Event {
+        let mut event = Event::simple("kuma", SENTINEL, Some(Severity::High));
+        event.content.data = Some(serde_json::json!({"detail": SENTINEL}));
+        event.content.disclosure = class;
+        event
+    }
+
+    /// T34 (spec §9.7): the agent-facing event rendering IS a
+    /// model-visibility boundary — every disclosure class is enforced there.
+    #[test]
+    fn event_disclosure_classes_gate_model_visible_text() {
+        // Baseline (absent class == model_visible) and never_persist pass
+        // content through.
+        for class in [
+            None,
+            Some(DisclosureClass::ModelVisible),
+            Some(DisclosureClass::NeverPersist),
+        ] {
+            let formatted = format_event_for_agent(&event_with_class(class));
+            assert!(formatted.contains(SENTINEL), "{class:?} must be visible");
+        }
+
+        // Withheld classes: envelope + typed marker, NO content, NO data.
+        for class in [
+            DisclosureClass::LocalOnly,
+            DisclosureClass::PersistNeverTransmit,
+            // No redactor / no consent flow is configured at this boundary,
+            // so these fail CLOSED.
+            DisclosureClass::ModelVisibleAfterRedaction,
+            DisclosureClass::ModelVisibleAfterConsent,
+        ] {
+            let formatted = format_event_for_agent(&event_with_class(Some(class)));
+            assert!(
+                !formatted.contains(SENTINEL),
+                "{class:?} must withhold event content and data: {formatted}"
+            );
+            assert!(
+                formatted.contains("content withheld"),
+                "{class:?} must carry an explicit withheld marker: {formatted}"
+            );
+            assert!(
+                formatted.starts_with("<event") && formatted.ends_with("</event>"),
+                "{class:?} keeps the typed envelope: {formatted}"
+            );
+        }
     }
 }

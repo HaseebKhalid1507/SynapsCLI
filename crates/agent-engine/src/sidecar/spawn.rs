@@ -49,7 +49,10 @@ mod tests {
             "language": "en"
         }"#;
         let parsed: SidecarSpawnArgs = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed.args, vec!["--model-path", "/m.bin", "--language", "en"]);
+        assert_eq!(
+            parsed.args,
+            vec!["--model-path", "/m.bin", "--language", "en"]
+        );
         assert_eq!(parsed.language.as_deref(), Some("en"));
     }
 
@@ -62,8 +65,7 @@ mod tests {
 
     #[test]
     fn deserializes_args_only() {
-        let parsed: SidecarSpawnArgs =
-            serde_json::from_str(r#"{"args":["--mute"]}"#).unwrap();
+        let parsed: SidecarSpawnArgs = serde_json::from_str(r#"{"args":["--mute"]}"#).unwrap();
         assert_eq!(parsed.args, vec!["--mute"]);
         assert_eq!(parsed.language, None);
     }
@@ -86,6 +88,9 @@ mod tests {
             language: None,
         };
         let json = serde_json::to_string(&original).unwrap();
-        assert!(!json.contains("language"), "`language: None` should be omitted, got: {json}");
+        assert!(
+            !json.contains("language"),
+            "`language: None` should be omitted, got: {json}"
+        );
     }
 }

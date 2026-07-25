@@ -1,8 +1,14 @@
-use synaps_cli::help::{builtin_entries, source_display, HelpEntry, HelpExample, HelpFindState, HelpRegistry, HelpTopicKind};
+use synaps_cli::help::{
+    builtin_entries, source_display, HelpEntry, HelpExample, HelpFindState, HelpRegistry,
+    HelpTopicKind,
+};
 
 fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpEntry {
     HelpEntry {
-        id: command.trim_start_matches('/').replace(' ', "-").to_string(),
+        id: command
+            .trim_start_matches('/')
+            .replace(' ', "-")
+            .to_string(),
         command: command.to_string(),
         title: title.to_string(),
         summary: String::new(),
@@ -26,16 +32,14 @@ fn find_state_initial_query_filters_results() {
     let state = HelpFindState::new(registry.entries().to_vec(), "plugin");
 
     assert_eq!(state.filter(), "plugin");
-    assert!(state.filtered_entries().iter().any(|entry| entry.command == "/help plugins"));
+    assert!(state
+        .filtered_entries()
+        .iter()
+        .any(|entry| entry.command == "/help plugins"));
     assert!(state.filtered_entries().iter().all(|entry| {
         let text = format!(
             "{} {} {} {:?} {:?} {:?}",
-            entry.command,
-            entry.title,
-            entry.summary,
-            entry.keywords,
-            entry.aliases,
-            entry.lines
+            entry.command, entry.title, entry.summary, entry.keywords, entry.aliases, entry.lines
         )
         .to_ascii_lowercase();
         text.contains("plugin")
@@ -78,7 +82,10 @@ fn find_state_enter_opens_detail_and_escape_returns_to_list() {
     state.open_selected();
     let detail = state.detail_entry().expect("plugins detail should open");
     assert_eq!(detail.command.as_str(), "/help plugins");
-    assert!(detail.examples.iter().any(|example| example.command == "/plugins"));
+    assert!(detail
+        .examples
+        .iter()
+        .any(|example| example.command == "/plugins"));
     state.close_detail();
     assert!(state.detail_entry().is_none());
 }
@@ -119,7 +126,10 @@ fn find_state_ranks_exact_command_title_then_prefix_then_lower_quality_matches()
     alias.aliases = vec!["/model-alias".to_string()];
     let mut body = test_entry("/alpha", "Alpha", "Advanced", false);
     body.lines = vec!["Only the body mentions model.".to_string()];
-    let registry = HelpRegistry::new(vec![body, alias, prefix, exact_title, exact_command], Vec::new());
+    let registry = HelpRegistry::new(
+        vec![body, alias, prefix, exact_title, exact_command],
+        Vec::new(),
+    );
 
     let state = HelpFindState::new(registry.entries().to_vec(), "model");
     let commands = state
@@ -128,7 +138,10 @@ fn find_state_ranks_exact_command_title_then_prefix_then_lower_quality_matches()
         .map(|entry| entry.command.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(commands[..5], ["/model", "/zzz", "/modelist", "/alias-hit", "/alpha"]);
+    assert_eq!(
+        commands[..5],
+        ["/model", "/zzz", "/modelist", "/alias-hit", "/alpha"]
+    );
 }
 
 #[test]
@@ -151,7 +164,10 @@ fn find_state_empty_query_orders_common_core_category_command() {
         .map(|entry| entry.command.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(commands, ["/model", "/settings", "/alpha", "/beta", "/zeta"]);
+    assert_eq!(
+        commands,
+        ["/model", "/settings", "/alpha", "/beta", "/zeta"]
+    );
 }
 
 #[test]
@@ -191,7 +207,10 @@ fn find_state_plugin_help_detail_preserves_usage_examples_and_source() {
     let mut state = HelpFindState::new(registry.entries().to_vec(), "docs workspace");
 
     assert!(
-        state.filtered_entries().iter().any(|entry| entry.command == "/acme:sync"),
+        state
+            .filtered_entries()
+            .iter()
+            .any(|entry| entry.command == "/acme:sync"),
         "plugin entry should be searchable by example/details"
     );
     while state.selected().map(|entry| entry.command.as_str()) != Some("/acme:sync") {
@@ -201,6 +220,9 @@ fn find_state_plugin_help_detail_preserves_usage_examples_and_source() {
     let detail = state.detail_entry().expect("plugin detail should open");
 
     assert_eq!(detail.usage.as_deref(), Some("/acme:sync [workspace]"));
-    assert!(detail.examples.iter().any(|example| example.command == "/acme:sync docs"));
+    assert!(detail
+        .examples
+        .iter()
+        .any(|example| example.command == "/acme:sync docs"));
     assert_eq!(source_display(detail).as_deref(), Some("plugin acme-tools"));
 }

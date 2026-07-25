@@ -10,18 +10,23 @@ pub mod toast;
 pub mod tui;
 
 // ── agent-core re-exports ──────────────────────────────────────────────────────
+pub use agent_core::{
+    auth, chain, config, error, logging, models, protocol, session, watcher_types,
+};
 pub use agent_core::{core, memory, pricing};
-pub use agent_core::{config, session, auth, logging, protocol, error, watcher_types, models, chain};
-pub use agent_core::{epoch_millis, truncate_str};
+pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 
 // ── agent-engine re-exports ────────────────────────────────────────────────────
-pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help};
+pub use agent_engine::{engine, events, extensions, help, mcp, runtime, sidecar, skills, tools};
 
 // ── item re-exports (tui uses these at crate root) ────────────────────────────
-pub use agent_engine::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, SharedMessage};
+pub use agent_engine::{
+    find_session, find_session_by_name, latest_session, list_recent_sessions, list_sessions,
+    resolve_session, validate_name, Session, SessionInfo,
+};
+pub use agent_engine::{load_config, resolve_system_prompt, SynapsConfig};
+pub use agent_engine::{AgentEvent, LlmEvent, Runtime, SessionEvent, SharedMessage, StreamEvent};
+pub use agent_engine::{Result, RuntimeError};
 pub use agent_engine::{Tool, ToolContext, ToolRegistry};
-pub use agent_engine::{Session, SessionInfo, find_session, latest_session, list_sessions, list_recent_sessions, resolve_session, find_session_by_name, validate_name};
-pub use agent_engine::{RuntimeError, Result};
-pub use agent_engine::{SynapsConfig, load_config, resolve_system_prompt};
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;

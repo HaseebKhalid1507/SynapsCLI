@@ -4,10 +4,9 @@
 
 use std::time::Duration;
 
-
 use super::app::{App, ChatMessage};
-use super::theme;
 use super::settings;
+use super::theme;
 
 /// Decide whether to repaint on this event-loop iteration.
 ///
@@ -40,10 +39,26 @@ pub(super) fn apply_setting(
     runtime: &mut synaps_cli::Runtime,
 ) {
     // Runtime mutation (generated from settings/defs.rs).
-    settings::defs::apply_setting_dispatch(key, value, runtime, app);
+    // On Err: set row_error and do NOT write to config — the value was rejected.
+    if let Err(msg) = settings::defs::apply_setting_dispatch(key, value, runtime, app) {
+        if let Some(st) = app.settings.as_mut() {
+            st.row_error = Some((key.to_string(), msg));
+        }
+        return;
+    }
+
+    // Keep the embedded session in sync with settings changes so resume sees
+    // the exact active provider/model reasoning selection.
+    if key == "thinking" {
+        app.session.thinking_level = value.to_string();
+    } else if key == "model" {
+        app.session.model = runtime.model().to_string();
+    }
 
     // `skills` is internal — not persisted via write_config_value.
-    if key == "skills" { return; }
+    if key == "skills" {
+        return;
+    }
 
     match synaps_cli::config::write_config_value(key, value) {
         Ok(()) => {
@@ -68,27 +83,14 @@ pub(super) fn apply_setting(
 }
 
 pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
-    let auth_path = synaps_cli::config::base_dir().join("auth.json");
-    let content = std::fs::read_to_string(&auth_path)
-        .map_err(|e| format!("Auth read failed: {}", e))?;
-    let auth: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Auth parse failed: {}", e))?;
-    let access = auth["anthropic"]["access"].as_str()
-        .ok_or("No OAuth token")?;
-
-    let client = reqwest::Client::builder()
-        .tls_built_in_webpki_certs(true)
-        .tls_built_in_native_certs(true)
-        .build()
-        .map_err(|e| format!("API client build error: {}", e))?;
-    let resp = client.get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {}", access))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .send().await
-        .map_err(|e| format!("API error: {}", e))?;
-
-    let data: serde_json::Value = resp.json().await
-        .map_err(|e| format!("Parse error: {}", e))?;
+    // Usage is a typed broker operation: the configured broker (local or
+    // remote) pins the destination URL and resolves/attaches the OAuth token
+    // behind the credential boundary. The TUI never reads the credential
+    // store and never sees a token — it receives usage JSON only.
+    let data = synaps_cli::auth::global_broker()
+        .anthropic_usage()
+        .await
+        .map_err(|e| e.to_string())?;
 
     fn format_block(label: &str, data: &serde_json::Value) -> Option<Vec<String>> {
         let util = data["utilization"].as_f64()?;
@@ -97,10 +99,16 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
             let diff = dt.signed_duration_since(chrono::Utc::now());
             let hours = diff.num_hours();
             let mins = diff.num_minutes() % 60;
-            if hours > 24 { format!("{}d {}h", hours / 24, hours % 24) }
-            else if hours > 0 { format!("{}h {}m", hours, mins) }
-            else { format!("{}m", diff.num_minutes()) }
-        } else { "—".to_string() };
+            if hours > 24 {
+                format!("{}d {}h", hours / 24, hours % 24)
+            } else if hours > 0 {
+                format!("{}h {}m", hours, mins)
+            } else {
+                format!("{}m", diff.num_minutes())
+            }
+        } else {
+            "—".to_string()
+        };
 
         let filled = ((util / 100.0) * 20.0) as usize;
         let empty = 20usize.saturating_sub(filled);
@@ -113,11 +121,31 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
     }
 
     let mut lines = vec!["⚡ Account Usage".to_string()];
-    if let Some(rows) = format_block("5-hour window", &data["five_hour"]) { lines.extend(rows); lines.push(String::new()); }
-    if let Some(rows) = format_block("7-day window", &data["seven_day"]) { lines.extend(rows); lines.push(String::new()); }
-    if let Some(rows) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) { lines.extend(rows); }
+    if let Some(rows) = format_block("5-hour window", &data["five_hour"]) {
+        lines.extend(rows);
+        lines.push(String::new());
+    }
+    if let Some(rows) = format_block("7-day window", &data["seven_day"]) {
+        lines.extend(rows);
+        lines.push(String::new());
+    }
+    if let Some(rows) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) {
+        lines.extend(rows);
+    }
 
     Ok(lines)
+}
+
+/// True iff `content` is a canonical agent-event payload — produced in exactly
+/// one place (`format_event_for_agent`): `<event id=… …>…</event>`.
+///
+/// Event payloads travel as `role=user` messages (the API needs a user turn)
+/// and ride the same steering channel as genuine user steering, but they are
+/// presented as Event cards. They must NEVER render as a `ChatMessage::User`
+/// bubble — that made subagent completion wakes appear in the transcript as a
+/// message the user typed and submitted.
+pub(super) fn is_event_payload(content: &str) -> bool {
+    content.starts_with("<event ") && content.ends_with("</event>")
 }
 
 pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
@@ -131,7 +159,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
         }
         // Skip event messages — already displayed as event cards
         if let Some(content) = msg["content"].as_str() {
-            if content.starts_with("<event ") && content.ends_with("</event>") {
+            if is_event_payload(content) {
                 continue;
             }
         }
@@ -157,9 +185,14 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
                             }
                             Some("tool_use") => {
                                 let name = block["name"].as_str().unwrap_or("").to_string();
-                                let input = serde_json::to_string(&block["input"]).unwrap_or_default();
+                                let input =
+                                    serde_json::to_string(&block["input"]).unwrap_or_default();
                                 let tool_id = block["id"].as_str().unwrap_or("").to_string();
-                                app.push_msg(ChatMessage::ToolUse { tool_id, tool_name: name, input });
+                                app.push_msg(ChatMessage::ToolUse {
+                                    tool_id,
+                                    tool_name: name,
+                                    input,
+                                });
                             }
                             _ => {}
                         }
@@ -184,13 +217,31 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 
 #[cfg(test)]
 mod tests {
-    use super::{should_draw, rebuild_display_messages};
     use super::super::app::{App, ChatMessage, LineCache, MsgSlot};
-    use synaps_cli::Session;
+    use super::{is_event_payload, rebuild_display_messages, should_draw};
     use std::time::Duration;
+    use synaps_cli::Session;
 
     fn test_app() -> App {
         App::new(Session::new("test-model", "low", None))
+    }
+
+    /// Canonical event payloads (subagent completion wakes, watcher alerts)
+    /// must be recognized so they render as Event cards, never as user
+    /// bubbles — neither on session resume (rebuild_display_messages) nor
+    /// when steered into a live stream (SteeringDelivered).
+    #[test]
+    fn event_payloads_are_recognized_and_user_text_is_not() {
+        assert!(is_event_payload(
+            "<event id=\"c9ec5a4b\" type=\"subagent_completion\" severity=\"high\" \
+             source=\"subagent\">Subagent 'inline' (sa_1) finished with status \
+             'completed' after 231.1s. Call subagent_collect with handle_id \
+             \"sa_1\" to retrieve the full result.</event>"
+        ));
+        // Genuine user steering — even when it mentions events — stays a user bubble.
+        assert!(!is_event_payload("please re-read the <event ...> above"));
+        assert!(!is_event_payload("regular steering text"));
+        assert!(!is_event_payload(""));
     }
 
     /// Build a populated LineCache for all messages in `app` at `width`, then
@@ -201,7 +252,8 @@ mod tests {
             .map(|i| app.render_message_lines(i, width))
             .collect();
         // Clean — renderer thinks nothing changed
-        app.transcript.test_set_cache_clean(LineCache::new(width, per_msg));
+        app.transcript
+            .test_set_cache_clean(LineCache::new(width, per_msg));
     }
 
     // -------------------------------------------------------------------------
@@ -227,8 +279,14 @@ mod tests {
         prime_clean_cache(&mut app, 80);
 
         // Sanity: cache is primed and marked clean.
-        assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
-        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+        assert!(
+            app.transcript.line_cache().is_some(),
+            "pre-condition: cache must be primed"
+        );
+        assert!(
+            app.transcript.cache_dirty_from().is_none(),
+            "pre-condition: cache must be Clean (no dirty watermark)"
+        );
 
         // Trigger: rebuild with an empty message list — the exact bug trigger.
         // Zero push_msg calls happen → without the fix, no invalidation occurs.
@@ -254,8 +312,14 @@ mod tests {
         app.push_msg(ChatMessage::User("previous content".to_string()));
         prime_clean_cache(&mut app, 80);
 
-        assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
-        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+        assert!(
+            app.transcript.line_cache().is_some(),
+            "pre-condition: cache must be primed"
+        );
+        assert!(
+            app.transcript.cache_dirty_from().is_none(),
+            "pre-condition: cache must be Clean (no dirty watermark)"
+        );
 
         // Every entry is filtered out by rebuild_display_messages.
         let api_messages = vec![
@@ -296,8 +360,20 @@ mod tests {
     #[test]
     fn streaming_text_is_throttled() {
         // Streaming model text, not user-forced: coalesce to the throttle.
-        assert!(!should_draw(true, false, true, Duration::from_millis(16), T)); // too soon → wait
-        assert!(should_draw(true, false, true, Duration::from_millis(100), T)); // throttle elapsed → paint
+        assert!(!should_draw(
+            true,
+            false,
+            true,
+            Duration::from_millis(16),
+            T
+        )); // too soon → wait
+        assert!(should_draw(
+            true,
+            false,
+            true,
+            Duration::from_millis(100),
+            T
+        )); // throttle elapsed → paint
     }
 
     #[test]

@@ -46,9 +46,9 @@
 //! frame using the terminal's actual size anyway).
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::sync::Once;
 use std::time::Instant;
 
@@ -105,16 +105,19 @@ pub(crate) enum RenderCmd {
 /// and the render thread (consumer).
 #[derive(Clone)]
 pub(crate) struct FrameSlot {
-    inner:         Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
+    inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
     render_thread: std::thread::Thread,
 }
 
 impl FrameSlot {
     fn new(
-        inner:         Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
+        inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
         render_thread: std::thread::Thread,
     ) -> Self {
-        FrameSlot { inner, render_thread }
+        FrameSlot {
+            inner,
+            render_thread,
+        }
     }
 
     /// Publish a new frame snapshot.  Replaces any unread frame (latest-wins)
@@ -129,9 +132,9 @@ impl FrameSlot {
 
 /// Handle to the render thread, held by the main task.
 pub(crate) struct RenderHandle {
-    slot:              FrameSlot,
+    slot: FrameSlot,
     pub(crate) cmd_tx: mpsc::Sender<RenderCmd>,
-    join_handle:       Option<std::thread::JoinHandle<()>>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RenderHandle {
@@ -181,7 +184,9 @@ impl RenderHandle {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
         let _ = self.cmd_tx.send(RenderCmd::Pause { ack: ack_tx });
         self.wake();
-        ack_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+        ack_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok()
     }
 
     /// Resume the render thread after the terminal has been restored by the
@@ -242,7 +247,7 @@ impl Drop for RenderHandle {
         // _dead_rx is dropped at end of block, so dead_tx is already the sole
         // sender of a disconnected channel.  Swap it in and drop the real tx.
         let _old_tx = std::mem::replace(&mut self.cmd_tx, dead_tx);
-        drop(_old_tx);  // now render thread's cmd_rx sees Disconnected
+        drop(_old_tx); // now render thread's cmd_rx sees Disconnected
         self.slot.render_thread.unpark();
         drop(self.join_handle.take());
     }
@@ -322,7 +327,14 @@ pub(crate) fn spawn_render_thread(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Safety: we're the only thread touching terminal_opt here.
                 let term = terminal_opt.take().expect("terminal already taken");
-                render_thread_body(term, caps, inner_thread, cmd_rx, boot_done_thread, Arc::clone(&exit_done_thread));
+                render_thread_body(
+                    term,
+                    caps,
+                    inner_thread,
+                    cmd_rx,
+                    boot_done_thread,
+                    Arc::clone(&exit_done_thread),
+                );
                 // render_thread_body returned normally — it already called
                 // do_teardown() before returning.  terminal was consumed.
             }));
@@ -350,7 +362,9 @@ pub(crate) fn spawn_render_thread(
 
     // Block (briefly) until the thread has sent its handle.  This completes
     // before any event-loop iteration on the main side.
-    let render_thread = thread_rx.recv().expect("render thread failed to send its Thread handle");
+    let render_thread = thread_rx
+        .recv()
+        .expect("render thread failed to send its Thread handle");
 
     let slot = FrameSlot::new(inner, render_thread);
     let handle = RenderHandle {
@@ -366,11 +380,11 @@ pub(crate) fn spawn_render_thread(
 
 fn render_thread_body(
     mut terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    caps:         TermCaps,
-    inner:        Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
-    cmd_rx:       mpsc::Receiver<RenderCmd>,
-    boot_done:    Arc<AtomicBool>,
-    exit_done:    Arc<AtomicBool>,
+    caps: TermCaps,
+    inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
+    cmd_rx: mpsc::Receiver<RenderCmd>,
+    boot_done: Arc<AtomicBool>,
+    exit_done: Arc<AtomicBool>,
 ) {
     // P16.3: negotiated terminal capabilities are process-constant (settled at
     // boot before this thread spawned), so we hold them here and hand a
@@ -383,8 +397,8 @@ fn render_thread_body(
     // still advance at the render thread's cadence.
     let mut last_frame = Instant::now();
 
-    let mut boot_fx:      Option<Effect> = None;
-    let mut exit_fx:      Option<Effect> = None;
+    let mut boot_fx: Option<Effect> = None;
+    let mut exit_fx: Option<Effect> = None;
     let mut pending_clear = false;
 
     // When the main thread sends Pause, we enter a "paused" state: we ack
@@ -430,7 +444,7 @@ fn render_thread_body(
                     // Full terminal restoration — must happen before ack.
                     do_teardown(&mut terminal);
                     let _ = ack.send(());
-                    return;   // exit the thread
+                    return; // exit the thread
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -479,7 +493,7 @@ fn render_thread_body(
         // at least once (i.e. the effect has ticked).
         if boot_fx.as_ref().is_some_and(|fx| fx.done()) {
             boot_done.store(true, Ordering::Release);
-            boot_fx = None;  // boot effect is done; release resources
+            boot_fx = None; // boot effect is done; release resources
         }
         if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
             exit_done.store(true, Ordering::Release);

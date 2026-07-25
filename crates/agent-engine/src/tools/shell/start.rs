@@ -8,6 +8,10 @@ pub struct ShellStartTool;
 
 #[async_trait::async_trait]
 impl Tool for ShellStartTool {
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
     fn name(&self) -> &str {
         "shell_start"
     }

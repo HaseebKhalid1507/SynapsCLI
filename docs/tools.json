@@ -1,5 +1,24 @@
 [
   {
+    "description": "Request session-scoped activation of exact tool ids returned by search_tools. Activation is subject to host confirmation policy; only the exact requested tools are activated for this session.",
+    "name": "activate_tools",
+    "parameters": {
+      "properties": {
+        "tools": {
+          "description": "Exact stable tool ids (namespace:name) from search_tools. No wildcards.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tools"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model.",
     "name": "bash",
     "parameters": {
@@ -112,6 +131,148 @@
     }
   },
   {
+    "description": "Control the continuous-memory context of this session. 'status', 'disable', and 'recall_once' commit locally safe actions. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call.",
+    "name": "memory_context",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation.",
+          "enum": [
+            "enable",
+            "disable",
+            "status",
+            "recall_once",
+            "index_history"
+          ],
+          "type": "string"
+        },
+        "capture_tools": {
+          "description": "Whether tool activity is eligible for capture (enable proposals only).",
+          "type": "boolean"
+        },
+        "expires_minutes": {
+          "description": "Bounded lease expiry in minutes.",
+          "maximum": 1440,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "Requested durable mode (enable proposals only).",
+          "enum": [
+            "recall_each_prompt",
+            "capture_only",
+            "capture_and_recall"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Fetch full memory record bodies by exact stable IDs from memory_search. First wait for the search output, then copy ONLY exact returned IDs from that immediately preceding result; never invent, predict, or reuse unrelated IDs, and never run this fetch in parallel with its prerequisite search. Project-scoped and sensitivity-checked: secret-class bodies are never returned. Results are lower-authority data.",
+    "name": "memory_fetch",
+    "parameters": {
+      "properties": {
+        "ids": {
+          "description": "First wait for memory_search, then copy ONLY exact returned IDs from its immediately preceding result; never invent or predict IDs",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Tombstone a memory record by exact id in THIS project's scope. Subsequent search and fetch exclude it; physical deletion happens in the retention sweep.",
+    "name": "memory_forget",
+    "parameters": {
+      "properties": {
+        "id": {
+          "description": "Exact record id to forget",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search this project's memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are project-scoped, lower-authority data.",
+    "name": "memory_search",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "description": "Maximum descriptors to return (hard cap 25)",
+          "type": "integer"
+        },
+        "query": {
+          "description": "ONE short literal substring to match in record content (case-insensitive); not semantic/Boolean/sentence search",
+          "type": "string"
+        },
+        "snippet_bytes": {
+          "description": "Snippet byte budget per descriptor (bounded)",
+          "type": "integer"
+        },
+        "tag_prefix": {
+          "description": "Match records with a tag starting with this prefix",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Store a memory record in THIS project's scope with explicit sensitivity (normal|sensitive|secret) and retention (standard, or retention_days). The record gets a stable id and model provenance. An optional project argument must match the host-resolved scope.",
+    "name": "memory_store",
+    "parameters": {
+      "properties": {
+        "content": {
+          "description": "Record body",
+          "type": "string"
+        },
+        "project": {
+          "description": "Optional confirmation of the project scope key",
+          "type": "string"
+        },
+        "retention_days": {
+          "description": "Expire after this many days (omit for standard retention)",
+          "type": "integer"
+        },
+        "sensitivity": {
+          "enum": [
+            "normal",
+            "sensitive",
+            "secret"
+          ],
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections.",
     "name": "read",
     "parameters": {
@@ -131,6 +292,22 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search locally known tools by keyword. Returns bounded compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
+    "name": "search_tools",
+    "parameters": {
+      "properties": {
+        "query": {
+          "description": "Case-insensitive keyword matched against tool ids, summaries, and tags.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
       ],
       "type": "object"
     }
@@ -227,7 +404,18 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -241,6 +429,50 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -250,18 +482,50 @@
     }
   },
   {
-    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion.",
+    "description": "Retrieve a reactive subagent's result. Non-blocking — returns immediately (status + partial output if still running). Standard flow: poll with subagent_status while the subagent runs; when subagent_status reports a terminal status (completed/failed/timed_out/cancelled), call this ONCE with reconciled=true — that single call both collects the result and attests reconciliation, clearing the completion gate. Calling without reconciled=true is an inspection-only read: it leaves the completion gate blocked and forces a second call. reconciled=true is idempotent and safe on repeats.",
     "name": "subagent_collect",
     "parameters": {
       "properties": {
         "handle_id": {
           "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
           "type": "string"
+        },
+        "reconciled": {
+          "default": false,
+          "description": "Set true on your terminal collect (after subagent_status reports done) to attest the result is reconciled with foreground work and unblock completion — one call collects AND reconciles. Leave false only for a deliberate inspection-only read; a later collect with reconciled=true still reconciles (idempotent).",
+          "type": "boolean"
         }
       },
       "required": [
         "handle_id"
       ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Authorize one exact qualified, locally known model for subagent use in this session. The grant is session-only: it does not change the foreground model or persist favorites. No sudo or interactive confirmation is required.",
+    "name": "subagent_model_authorize",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "description": "Exact runtime-qualified model identity, for example anthropic/claude-sonnet-4-6.",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List this session's exact trusted worker model choices. Omit model on delegation to inherit the foreground identity.",
+    "name": "subagent_models",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
       "type": "object"
     }
   },
@@ -287,7 +551,7 @@
     }
   },
   {
-    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — use subagent_status to poll, subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call repeatedly until done). Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — poll with subagent_status until it reports a terminal status, use subagent_steer to inject guidance mid-run, then call subagent_collect once with reconciled=true to retrieve the result and attest reconciliation in the same call. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
     "name": "subagent_start",
     "parameters": {
       "properties": {
@@ -296,7 +560,19 @@
           "type": "string"
         },
         "model": {
-          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Typed orchestration role.",
+          "enum": [
+            "planner",
+            "implementer",
+            "tester",
+            "reviewer",
+            "researcher",
+            "debugger"
+          ],
           "type": "string"
         },
         "system_prompt": {
@@ -310,6 +586,51 @@
         "timeout": {
           "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
           "type": "integer"
+        },
+        "write_policy": {
+          "description": "Declared write isolation and path scopes.",
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {
+                  "const": "read_only"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "isolated_worktree"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "mode": {
+                  "const": "non_overlapping_paths"
+                },
+                "scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "mode",
+                "scopes"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -319,7 +640,7 @@
     }
   },
   {
-    "description": "Poll the current state of a reactive subagent. Returns status (running/finished/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. Non-blocking — returns immediately.",
+    "description": "Poll the current state of a reactive subagent. Returns status (running/completed/cancelled/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. If the status is 'failed', an 'error' field contains the failure reason. Non-blocking — returns immediately.",
     "name": "subagent_status",
     "parameters": {
       "properties": {

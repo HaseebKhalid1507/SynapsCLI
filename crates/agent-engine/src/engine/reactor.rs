@@ -9,7 +9,7 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::events::{EventQueue, format_event_for_agent};
+use crate::events::{format_event_for_agent, EventQueue};
 use crate::SharedMessage;
 
 // Re-export the shared wire payload so callers can use `engine::reactor::EventPayload`.
@@ -30,6 +30,10 @@ pub enum EventDisposition {
     Buffered,
     /// Injected as a `role=user` message into `messages` (idle turn).
     Injected,
+    /// Surfaced for local display ONLY (CP-13 fix1 I3): `never_persist`
+    /// events must not enter `messages`, `pending_events`, or a live
+    /// steering channel — all three feed session persistence.
+    DisplayOnly,
 }
 
 /// A single event that was drained, together with its formatted payload and
@@ -77,6 +81,19 @@ pub fn drain_event_queue(
     while let Some(event) = queue.pop() {
         let formatted = format_event_for_agent(&event);
 
+        // Persistence gate (spec §9.7): message history, pending buffers,
+        // and steered stream content all end up in saved sessions. Events
+        // whose class refuses persistence never cross this boundary.
+        let class = event.content.disclosure.unwrap_or_default();
+        if !agent_core::disclosure::may_persist(class) {
+            drained.push(DrainedEvent {
+                event,
+                formatted,
+                disposition: EventDisposition::DisplayOnly,
+            });
+            continue;
+        }
+
         let disposition = if busy {
             // Steer into active stream if the channel is live.
             let steered = steer_tx
@@ -97,7 +114,11 @@ pub fn drain_event_queue(
             EventDisposition::Injected
         };
 
-        drained.push(DrainedEvent { event, formatted, disposition });
+        drained.push(DrainedEvent {
+            event,
+            formatted,
+            disposition,
+        });
     }
 
     drained
@@ -121,13 +142,18 @@ pub fn wake_action(
         return WakeAction::Nothing;
     }
 
-    let has_injected = drained.iter().any(|d| d.disposition == EventDisposition::Injected);
+    let has_injected = drained
+        .iter()
+        .any(|d| d.disposition == EventDisposition::Injected);
 
     if has_injected
         && !busy
         && auto_turn_enabled
         && consecutive_auto_turns < AUTO_TURN_CAP
-        && messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
+        && messages
+            .last()
+            .map(|m| m["role"].as_str() == Some("user"))
+            .unwrap_or(false)
     {
         return WakeAction::RunTurn;
     }
@@ -160,6 +186,7 @@ pub fn event_payload_from_drained(drained: &DrainedEvent) -> EventPayload {
         text: ev.content.text.clone(),
         timestamp: ev.timestamp.to_rfc3339(),
         formatted: drained.formatted.clone(),
+        disclosure: ev.content.disclosure.map(|c| c.as_str().to_string()),
     }
 }
 
@@ -235,14 +262,17 @@ pub fn terminal_flush_seam(
     let had_buffered = !to_inject.is_empty();
     for formatted in to_inject {
         api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted})
+            serde_json::json!({"role": "user", "content": formatted}),
         ));
     }
     if allow_chain
         && had_buffered
         && events_auto_turn
         && *consecutive_auto_turns < AUTO_TURN_CAP
-        && api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
+        && api_messages
+            .last()
+            .map(|m| m["role"].as_str() == Some("user"))
+            .unwrap_or(false)
         && claim_auto_turn(consecutive_auto_turns)
     {
         *auto_turn_pending = true;
@@ -296,7 +326,12 @@ mod tests {
     fn make_queue_with(texts: &[(&str, Option<Severity>)]) -> EventQueue {
         let q = EventQueue::new(64);
         for (text, sev) in texts {
-            q.push(crate::events::types::Event::simple("test", text, sev.clone())).unwrap();
+            q.push(crate::events::types::Event::simple(
+                "test",
+                text,
+                sev.clone(),
+            ))
+            .unwrap();
         }
         q
     }
@@ -342,7 +377,9 @@ mod tests {
         let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
 
         assert_eq!(drained.len(), 3);
-        assert!(drained.iter().all(|d| d.disposition == EventDisposition::Injected));
+        assert!(drained
+            .iter()
+            .all(|d| d.disposition == EventDisposition::Injected));
         // Canonical order preserved
         assert!(drained[0].formatted.contains("first"));
         assert!(drained[1].formatted.contains("second"));
@@ -429,8 +466,18 @@ mod tests {
     fn priority_ordering_preserved_critical_first() {
         // Push medium first, then critical — critical should be drained first
         let q = EventQueue::new(10);
-        q.push(crate::events::types::Event::simple("test", "medium", Some(Severity::Medium))).unwrap();
-        q.push(crate::events::types::Event::simple("test", "critical", Some(Severity::Critical))).unwrap();
+        q.push(crate::events::types::Event::simple(
+            "test",
+            "medium",
+            Some(Severity::Medium),
+        ))
+        .unwrap();
+        q.push(crate::events::types::Event::simple(
+            "test",
+            "critical",
+            Some(Severity::Critical),
+        ))
+        .unwrap();
 
         let mut messages: Vec<SharedMessage> = Vec::new();
         let mut pending: Vec<String> = Vec::new();
@@ -592,16 +639,25 @@ mod tests {
     fn claim_auto_turn_first_five_allowed() {
         let mut counter: u32 = 0;
         for _ in 0..AUTO_TURN_CAP {
-            assert!(claim_auto_turn(&mut counter), "turn within cap must be allowed");
+            assert!(
+                claim_auto_turn(&mut counter),
+                "turn within cap must be allowed"
+            );
         }
-        assert_eq!(counter, AUTO_TURN_CAP, "counter must equal cap after 5 claims");
+        assert_eq!(
+            counter, AUTO_TURN_CAP,
+            "counter must equal cap after 5 claims"
+        );
     }
 
     #[test]
     fn claim_auto_turn_sixth_denied() {
         let mut counter: u32 = AUTO_TURN_CAP;
         assert!(!claim_auto_turn(&mut counter), "turn at cap must be denied");
-        assert_eq!(counter, AUTO_TURN_CAP, "counter must remain unchanged when denied");
+        assert_eq!(
+            counter, AUTO_TURN_CAP,
+            "counter must remain unchanged when denied"
+        );
     }
 
     #[test]
@@ -610,7 +666,10 @@ mod tests {
         assert!(!claim_auto_turn(&mut counter));
         assert!(!claim_auto_turn(&mut counter));
         assert!(!claim_auto_turn(&mut counter));
-        assert_eq!(counter, AUTO_TURN_CAP, "counter must not change while denied");
+        assert_eq!(
+            counter, AUTO_TURN_CAP,
+            "counter must not change while denied"
+        );
     }
 
     #[test]
@@ -619,7 +678,10 @@ mod tests {
         assert!(!claim_auto_turn(&mut counter));
         // Simulate user input reset
         counter = 0;
-        assert!(claim_auto_turn(&mut counter), "after reset first turn must be allowed");
+        assert!(
+            claim_auto_turn(&mut counter),
+            "after reset first turn must be allowed"
+        );
         assert_eq!(counter, 1);
     }
 
@@ -634,5 +696,146 @@ mod tests {
         // 6th
         assert!(!claim_auto_turn(&mut c));
         assert_eq!(c, AUTO_TURN_CAP);
+    }
+}
+
+#[cfg(test)]
+mod disclosure_persistence_tests {
+    use super::*;
+    use crate::events::types::{Event, Severity};
+    use agent_core::disclosure::DisclosureClass;
+    use serial_test::serial;
+
+    use crate::test_env::BaseDirGuard;
+
+    const SENTINEL: &str = "PERSIST-BOUNDARY-SENTINEL-5e3b";
+
+    fn classed_event(class: Option<DisclosureClass>) -> Event {
+        let mut ev = Event::simple("kuma", SENTINEL, Some(Severity::High));
+        ev.content.content_type = "message".into();
+        ev.content.disclosure = class;
+        ev
+    }
+
+    fn drain_one(
+        class: Option<DisclosureClass>,
+        busy: bool,
+        steer: bool,
+    ) -> (
+        Vec<crate::SharedMessage>,
+        Vec<String>,
+        Vec<DrainedEvent>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) {
+        let queue = EventQueue::new(16);
+        queue.push(classed_event(class)).unwrap();
+        let mut messages = Vec::new();
+        let mut pending = Vec::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let steer_tx = if steer { Some(&tx) } else { None };
+        let drained = drain_event_queue(&queue, &mut messages, &mut pending, busy, steer_tx);
+        (messages, pending, drained, Some(rx))
+    }
+
+    /// CP-13 fix1 I3: the event→message boundary IS a persistence boundary
+    /// (messages are saved verbatim into session files). never_persist
+    /// events must not cross it in ANY disposition; withheld classes cross
+    /// only as their typed marker.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn all_disclosure_classes_are_honored_through_real_session_persistence() {
+        let _base = BaseDirGuard::new();
+
+        // Visible classes persist their content.
+        for class in [None, Some(DisclosureClass::ModelVisible)] {
+            let (messages, _, drained, _) = drain_one(class, false, false);
+            assert_eq!(drained[0].disposition, EventDisposition::Injected);
+            let mut session = agent_core::session::Session::new("claude-sonnet-4-6", "high", None);
+            session.api_messages = messages;
+            session.save().await.unwrap();
+            let raw = std::fs::read_to_string(
+                agent_core::config::get_active_config_dir()
+                    .join("sessions")
+                    .join(format!("{}.json", session.id)),
+            )
+            .unwrap();
+            assert!(raw.contains(SENTINEL), "{class:?} persists content");
+        }
+
+        // Withheld-from-model classes persist ONLY the typed marker.
+        for class in [
+            DisclosureClass::LocalOnly,
+            DisclosureClass::ModelVisibleAfterRedaction,
+            DisclosureClass::ModelVisibleAfterConsent,
+            DisclosureClass::PersistNeverTransmit,
+        ] {
+            let (messages, _, drained, _) = drain_one(Some(class), false, false);
+            assert_eq!(drained[0].disposition, EventDisposition::Injected);
+            let mut session = agent_core::session::Session::new("claude-sonnet-4-6", "high", None);
+            session.api_messages = messages;
+            session.save().await.unwrap();
+            let raw = std::fs::read_to_string(
+                agent_core::config::get_active_config_dir()
+                    .join("sessions")
+                    .join(format!("{}.json", session.id)),
+            )
+            .unwrap();
+            assert!(
+                !raw.contains(SENTINEL),
+                "{class:?}: withheld content must never persist"
+            );
+            assert!(
+                raw.contains("content withheld"),
+                "{class:?}: marker persists"
+            );
+        }
+
+        // never_persist: nothing enters messages, pending buffers, or the
+        // steering channel — display-only in every mode.
+        let (messages, pending, drained, _) =
+            drain_one(Some(DisclosureClass::NeverPersist), false, false);
+        assert_eq!(
+            drained[0].disposition,
+            EventDisposition::DisplayOnly,
+            "idle: never_persist must not be injected"
+        );
+        assert!(messages.is_empty());
+        assert!(pending.is_empty());
+        assert!(
+            drained[0].formatted.contains(SENTINEL),
+            "never_persist stays locally displayable"
+        );
+
+        let (messages, pending, drained, rx) =
+            drain_one(Some(DisclosureClass::NeverPersist), true, true);
+        assert_eq!(drained[0].disposition, EventDisposition::DisplayOnly);
+        assert!(messages.is_empty() && pending.is_empty());
+        let mut rx = rx.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "never_persist must not be steered into a live stream (streams \
+             persist into history)"
+        );
+    }
+
+    /// Typed disclosure metadata rides the wire payload so RPC/server
+    /// parents can honor persistence policy after handoff.
+    #[test]
+    fn wire_payload_retains_typed_disclosure_metadata() {
+        let queue = EventQueue::new(16);
+        queue
+            .push(classed_event(Some(DisclosureClass::NeverPersist)))
+            .unwrap();
+        let mut messages = Vec::new();
+        let mut pending = Vec::new();
+        let drained = drain_event_queue(&queue, &mut messages, &mut pending, false, None);
+        let payload = event_payload_from_drained(&drained[0]);
+        assert_eq!(payload.disclosure.as_deref(), Some("never_persist"));
+
+        let queue = EventQueue::new(16);
+        queue.push(classed_event(None)).unwrap();
+        let drained = drain_event_queue(&queue, &mut messages, &mut pending, false, None);
+        let payload = event_payload_from_drained(&drained[0]);
+        assert_eq!(payload.disclosure, None, "absent class stays absent");
     }
 }

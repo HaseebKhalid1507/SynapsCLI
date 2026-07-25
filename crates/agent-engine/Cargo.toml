@@ -1,6 +1,6 @@
 [package]
 name = "synaps-engine"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
@@ -11,7 +11,7 @@ name = "agent_engine"
 path = "src/lib.rs"
 
 [dependencies]
-agent-core = { path = "../agent-core", version = "0.6.1", package = "synaps-core" }
+agent-core = { path = "../agent-core", version = "0.7.0", package = "synaps-core" }
 
 # Async runtime + utilities
 tokio              = { version = "1.0", features = ["full"] }
@@ -48,6 +48,7 @@ regex              = "1"
 
 # Crypto / auth
 sha2               = "0.10"
+hmac               = "0.12"
 rand               = "0.9"
 base64             = "0.22"
 
@@ -90,3 +91,8 @@ testing = []
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
+tokio       = { version = "1.0", features = ["full", "test-util"] }
+# Self dev-dependency (same pattern as synaps-tui): turns the `testing`
+# feature on for every test target via feature unification, so integration
+# tests in tests/ see the harness seams without extra cargo flags.
+synaps-engine = { path = ".", features = ["testing"] }

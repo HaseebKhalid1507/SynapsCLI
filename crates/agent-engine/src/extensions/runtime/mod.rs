@@ -5,13 +5,15 @@ pub mod restart;
 
 pub use restart::RestartPolicy;
 
+use self::process::{
+    NotificationFrame, ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent,
+};
+use crate::extensions::commands::CommandOutputEvent;
+use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::info::PluginInfo;
+use crate::extensions::tasks::TaskEvent;
 use async_trait::async_trait;
 use serde_json::Value;
-use crate::extensions::hooks::events::{HookEvent, HookResult};
-use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent, NotificationFrame};
-use crate::extensions::info::PluginInfo;
-use crate::extensions::commands::CommandOutputEvent;
-use crate::extensions::tasks::TaskEvent;
 
 /// Streamed event delivered to a `command.invoke` caller.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,8 +65,14 @@ mod health_tests {
     #[test]
     fn as_str_covers_all_variants() {
         assert_eq!(ExtensionHealth::Loaded.as_str(), "loaded");
-        assert_eq!(ExtensionHealth::FailedValidation.as_str(), "failed_validation");
-        assert_eq!(ExtensionHealth::FailedInitialize.as_str(), "failed_initialize");
+        assert_eq!(
+            ExtensionHealth::FailedValidation.as_str(),
+            "failed_validation"
+        );
+        assert_eq!(
+            ExtensionHealth::FailedInitialize.as_str(),
+            "failed_initialize"
+        );
         assert_eq!(ExtensionHealth::Running.as_str(), "running");
         assert_eq!(ExtensionHealth::Restarting.as_str(), "restarting");
         assert_eq!(ExtensionHealth::Degraded.as_str(), "degraded");
@@ -87,7 +95,10 @@ pub trait ExtensionHandler: Send + Sync {
     }
 
     /// Complete a chat request through an extension-provided model provider.
-    async fn provider_complete(&self, _params: ProviderCompleteParams) -> Result<ProviderCompleteResult, String> {
+    async fn provider_complete(
+        &self,
+        _params: ProviderCompleteParams,
+    ) -> Result<ProviderCompleteResult, String> {
         Err("extension runtime does not support provider.complete".to_string())
     }
 
@@ -101,7 +112,7 @@ pub trait ExtensionHandler: Send + Sync {
     async fn provider_stream(
         &self,
         _params: ProviderCompleteParams,
-        _sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+        _sink: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         Err("provider.stream is not supported by this extension".to_string())
     }
@@ -109,12 +120,25 @@ pub trait ExtensionHandler: Send + Sync {
     /// Invoke a plugin-registered interactive slash command. The handler must
     /// forward `command.output` notifications matching `request_id` and any
     /// `task.*` notifications to `sink`. Returns the final response value.
+    ///
+    /// CP-11 fix-3: the sink is BOUNDED and metered
+    /// ([`crate::extensions::invoke_output::InvokeEventSink`]). It must be
+    /// paired with an EAGERLY CONCURRENT consumer — normally the collector
+    /// half of [`crate::extensions::invoke_output::invoke_event_channel`],
+    /// joined with this call by
+    /// `ExtensionManager::invoke_command_collected` — which enforces
+    /// invocation-local byte/event budgets at production time. A hostile
+    /// `command.output` flood is therefore paced by awaited sends and
+    /// bounded retention instead of parking aggregate bytes in an
+    /// unbounded post-hoc queue (the pre-fix behavior). Handlers must
+    /// treat a closed sink like the old closed-unbounded-sink case: stop
+    /// forwarding, still complete the call.
     async fn invoke_command(
         &self,
         _command: &str,
         _args: Vec<String>,
         _request_id: &str,
-        _sink: tokio::sync::mpsc::UnboundedSender<InvokeCommandEvent>,
+        _sink: crate::extensions::invoke_output::InvokeEventSink,
     ) -> Result<Value, String> {
         Err("extension runtime does not support command.invoke".to_string())
     }
@@ -139,12 +163,22 @@ pub trait ExtensionHandler: Send + Sync {
     }
 
     /// Forward a keypress to the active plugin-owned custom settings editor.
-    async fn settings_editor_key(&self, _category: &str, _field: &str, _key: &str) -> Result<Value, String> {
+    async fn settings_editor_key(
+        &self,
+        _category: &str,
+        _field: &str,
+        _key: &str,
+    ) -> Result<Value, String> {
         Err("extension runtime does not support settings.editor.key".to_string())
     }
 
     /// Ask the plugin to commit a custom editor value selected by the UI.
-    async fn settings_editor_commit(&self, _category: &str, _field: &str, _value: Value) -> Result<Value, String> {
+    async fn settings_editor_commit(
+        &self,
+        _category: &str,
+        _field: &str,
+        _value: Value,
+    ) -> Result<Value, String> {
         Err("extension runtime does not support settings.editor.commit".to_string())
     }
 
@@ -157,8 +191,10 @@ pub trait ExtensionHandler: Send + Sync {
     /// implementation returns a channel whose sender is immediately
     /// dropped, so the receiver yields `None` right away — effectively
     /// a no-op for handler impls that don't support notifications.
-    async fn subscribe_notifications(&self) -> (usize, tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>) {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    async fn subscribe_notifications(
+        &self,
+    ) -> (usize, tokio::sync::mpsc::Receiver<NotificationFrame>) {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         (0, rx)
     }
 

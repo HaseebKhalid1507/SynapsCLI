@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{Result, RuntimeError, ToolContext};
-use crate::extensions::runtime::ExtensionHandler;
 use crate::extensions::runtime::process::RegisteredExtensionToolSpec;
+use crate::extensions::runtime::ExtensionHandler;
+use crate::{Result, RuntimeError, ToolContext};
 
 pub struct ExtensionTool {
     runtime_name: String,
@@ -16,7 +16,11 @@ pub struct ExtensionTool {
 }
 
 impl ExtensionTool {
-    pub fn new(plugin_id: &str, spec: RegisteredExtensionToolSpec, handler: Arc<dyn ExtensionHandler>) -> Self {
+    pub fn new(
+        plugin_id: &str,
+        spec: RegisteredExtensionToolSpec,
+        handler: Arc<dyn ExtensionHandler>,
+    ) -> Self {
         Self {
             runtime_name: format!("{}:{}", plugin_id, spec.name),
             description: spec.description,

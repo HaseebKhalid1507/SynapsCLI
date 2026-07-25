@@ -109,9 +109,9 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
                 .ok_or_else(|| "widget.upsert 'lines' must be an array".to_string())?;
             let mut lines = Vec::with_capacity(lines_arr.len());
             for (i, v) in lines_arr.iter().enumerate() {
-                let s = v.as_str().ok_or_else(|| {
-                    format!("widget.upsert 'lines[{i}]' must be a string")
-                })?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("widget.upsert 'lines[{i}]' must be a string"))?;
                 lines.push(s.to_string());
             }
 
@@ -137,7 +137,11 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
                     let s = v
                         .as_str()
                         .ok_or_else(|| "widget.upsert 'title' must be a string".to_string())?;
-                    if s.is_empty() { None } else { Some(s.to_string()) }
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
                 }
             };
 
@@ -177,10 +181,12 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
                                     format!("widget.upsert 'styled_lines[{i}][{j}].text' must be a string")
                                 })?
                                 .to_string();
-                            let fg = span_obj.get("fg")
+                            let fg = span_obj
+                                .get("fg")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
-                            let bg = span_obj.get("bg")
+                            let bg = span_obj
+                                .get("bg")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
                             spans.push(StyledSpan { text, fg, bg });
@@ -191,7 +197,14 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
                 }
             };
 
-            Ok(WidgetEvent::Upsert { id, lines, styled_lines, position, title, ttl_secs })
+            Ok(WidgetEvent::Upsert {
+                id,
+                lines,
+                styled_lines,
+                position,
+                title,
+                ttl_secs,
+            })
         }
 
         "widget.dismiss" => Ok(WidgetEvent::Dismiss { id }),
@@ -286,11 +299,7 @@ mod tests {
 
     #[test]
     fn upsert_empty_lines_is_valid() {
-        let ev = parse_widget_event(
-            "widget.upsert",
-            &json!({"id": "w", "lines": []}),
-        )
-        .unwrap();
+        let ev = parse_widget_event("widget.upsert", &json!({"id": "w", "lines": []})).unwrap();
         assert!(matches!(ev, WidgetEvent::Upsert { lines, .. } if lines.is_empty()));
     }
 
@@ -323,8 +332,7 @@ mod tests {
 
     #[test]
     fn parses_dismiss() {
-        let ev =
-            parse_widget_event("widget.dismiss", &json!({"id": "hud"})).unwrap();
+        let ev = parse_widget_event("widget.dismiss", &json!({"id": "hud"})).unwrap();
         assert_eq!(ev, WidgetEvent::Dismiss { id: "hud".into() });
     }
 
@@ -338,9 +346,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_id() {
-        assert!(
-            parse_widget_event("widget.upsert", &json!({"id": "", "lines": []})).is_err()
-        );
+        assert!(parse_widget_event("widget.upsert", &json!({"id": "", "lines": []})).is_err());
     }
 
     #[test]
@@ -350,11 +356,8 @@ mod tests {
 
     #[test]
     fn rejects_non_string_line_element() {
-        let err = parse_widget_event(
-            "widget.upsert",
-            &json!({"id": "w", "lines": ["ok", 42]}),
-        )
-        .unwrap_err();
+        let err = parse_widget_event("widget.upsert", &json!({"id": "w", "lines": ["ok", 42]}))
+            .unwrap_err();
         assert!(err.contains("lines[1]"));
     }
 
@@ -376,8 +379,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_method() {
-        let err =
-            parse_widget_event("widget.flash", &json!({"id": "w"})).unwrap_err();
+        let err = parse_widget_event("widget.flash", &json!({"id": "w"})).unwrap_err();
         assert!(err.contains("not a widget method"));
     }
 
@@ -394,15 +396,11 @@ mod tests {
 
     #[test]
     fn event_id_helper() {
-        let upsert = parse_widget_event(
-            "widget.upsert",
-            &json!({"id": "my-widget", "lines": []}),
-        )
-        .unwrap();
+        let upsert =
+            parse_widget_event("widget.upsert", &json!({"id": "my-widget", "lines": []})).unwrap();
         assert_eq!(upsert.id(), "my-widget");
 
-        let dismiss =
-            parse_widget_event("widget.dismiss", &json!({"id": "my-widget"})).unwrap();
+        let dismiss = parse_widget_event("widget.dismiss", &json!({"id": "my-widget"})).unwrap();
         assert_eq!(dismiss.id(), "my-widget");
     }
 }

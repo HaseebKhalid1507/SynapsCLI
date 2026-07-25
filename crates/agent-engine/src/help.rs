@@ -154,13 +154,15 @@ impl HelpFindState {
             return entries.into_iter().map(HelpFindRow::Entry).collect();
         }
 
-        let mut category_names: Vec<&str> = entries.iter().map(|entry| display_category(entry)).collect();
+        let mut category_names: Vec<&str> = entries
+            .iter()
+            .map(|entry| display_category(entry))
+            .collect();
         category_names.sort_by(|a, b| {
             category_sort_key(a)
                 .cmp(&category_sort_key(b))
                 .then_with(|| {
-                    category_best_score(&entries, b)
-                        .cmp(&category_best_score(&entries, a))
+                    category_best_score(&entries, b).cmp(&category_best_score(&entries, a))
                 })
                 .then_with(|| a.cmp(b))
         });
@@ -197,7 +199,9 @@ impl HelpFindState {
     }
 
     pub fn selected(&self) -> Option<&HelpEntry> {
-        self.filtered_rows().get(self.cursor).and_then(HelpFindRow::entry)
+        self.filtered_rows()
+            .get(self.cursor)
+            .and_then(HelpFindRow::entry)
     }
 
     pub fn open_selected(&mut self) {
@@ -205,8 +209,11 @@ impl HelpFindState {
         if let Some(command) = selected_command.as_ref() {
             self.remember_opened(command);
         }
-        self.detail_idx = selected_command
-            .and_then(|command| self.entries.iter().position(|entry| entry.command == command));
+        self.detail_idx = selected_command.and_then(|command| {
+            self.entries
+                .iter()
+                .position(|entry| entry.command == command)
+        });
     }
 
     pub fn close_detail(&mut self) {
@@ -352,17 +359,28 @@ impl HelpRegistry {
     pub fn entry_by_command(&self, command: &str) -> Option<&HelpEntry> {
         let needle = normalize_query_command(command);
         self.entries.iter().find(|entry| {
-            entry.command == needle || entry.aliases.iter().any(|alias| normalize_query_command(alias) == needle)
+            entry.command == needle
+                || entry
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize_query_command(alias) == needle)
         })
     }
 
     pub fn branch(&self, topic: &str) -> Option<&HelpEntry> {
-        let normalized = topic.trim().trim_start_matches("/help").trim().trim_start_matches('/');
+        let normalized = topic
+            .trim()
+            .trim_start_matches("/help")
+            .trim()
+            .trim_start_matches('/');
         self.entries.iter().find(|entry| {
             entry.topic == HelpTopicKind::Branch
                 && (entry.id == normalized
                     || entry.command == format!("/help {}", normalized)
-                    || entry.aliases.iter().any(|alias| alias.trim_start_matches("/help ") == normalized))
+                    || entry
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.trim_start_matches("/help ") == normalized))
         })
     }
 
@@ -391,9 +409,16 @@ impl HelpRegistry {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.command.trim_start_matches('/').to_ascii_lowercase().starts_with(&needle)
+                entry
+                    .command
+                    .trim_start_matches('/')
+                    .to_ascii_lowercase()
+                    .starts_with(&needle)
                     || entry.aliases.iter().any(|alias| {
-                        alias.trim_start_matches('/').to_ascii_lowercase().starts_with(&needle)
+                        alias
+                            .trim_start_matches('/')
+                            .to_ascii_lowercase()
+                            .starts_with(&needle)
                     })
             })
             .count()
@@ -512,7 +537,11 @@ fn render_topics(registry: &HelpRegistry) -> String {
         .iter()
         .filter(|entry| entry.topic == HelpTopicKind::Branch)
         .collect();
-    entries.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.command.cmp(&b.command)));
+    entries.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.command.cmp(&b.command))
+    });
 
     let mut lines = vec![
         "Help topics".to_string(),
@@ -530,7 +559,11 @@ fn render_topics(registry: &HelpRegistry) -> String {
 
 fn render_reference(registry: &HelpRegistry) -> String {
     let mut entries: Vec<&HelpEntry> = registry.entries().iter().collect();
-    entries.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.command.cmp(&b.command)));
+    entries.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.command.cmp(&b.command))
+    });
 
     let mut lines = vec![
         "Help reference".to_string(),
@@ -559,7 +592,11 @@ pub fn source_display(entry: &HelpEntry) -> Option<String> {
 }
 
 fn append_usage_examples_related(lines: &mut Vec<String>, entry: &HelpEntry) {
-    if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
+    if let Some(usage) = entry
+        .usage
+        .as_ref()
+        .filter(|usage| !usage.trim().is_empty())
+    {
         lines.push(String::new());
         lines.push("Usage".to_string());
         lines.push(format!("  {}", usage));
@@ -585,7 +622,11 @@ fn append_usage_examples_related(lines: &mut Vec<String>, entry: &HelpEntry) {
 
 fn normalize_command(entry: &mut HelpEntry) {
     entry.command = normalize_query_command(&entry.command);
-    entry.aliases = entry.aliases.iter().map(|alias| normalize_query_command(alias)).collect();
+    entry.aliases = entry
+        .aliases
+        .iter()
+        .map(|alias| normalize_query_command(alias))
+        .collect();
 }
 
 fn normalize_query_command(command: &str) -> String {
@@ -602,7 +643,10 @@ fn normalize_help_topic(topic: &str) -> String {
     if let Some(rest) = normalized.strip_prefix("/help") {
         normalized = rest.trim();
     }
-    normalized.trim_start_matches('/').trim().to_ascii_lowercase()
+    normalized
+        .trim_start_matches('/')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn render_unknown_topic(registry: &HelpRegistry, topic: &str) -> String {
@@ -695,10 +739,7 @@ fn extension_help_category(source: Option<&str>) -> String {
     let Some(source) = source.map(str::trim).filter(|source| !source.is_empty()) else {
         return "Extensions".to_string();
     };
-    let plugin_name = source
-        .strip_prefix("plugin ")
-        .unwrap_or(source)
-        .trim();
+    let plugin_name = source.strip_prefix("plugin ").unwrap_or(source).trim();
     if plugin_name.is_empty() || plugin_name.eq_ignore_ascii_case("plugin") {
         return "Extensions".to_string();
     }
@@ -714,7 +755,9 @@ fn title_case_word(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {
         None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase(),
+        Some(first) => {
+            first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase()
+        }
     }
 }
 
@@ -755,7 +798,11 @@ fn ranked_entries<'a>(entries: &'a [HelpEntry], query: &str) -> Vec<&'a HelpEntr
     ranked_entries_with_mru(entries, query, &[])
 }
 
-fn ranked_entries_with_mru<'a>(entries: &'a [HelpEntry], query: &str, recently_opened: &[String]) -> Vec<&'a HelpEntry> {
+fn ranked_entries_with_mru<'a>(
+    entries: &'a [HelpEntry],
+    query: &str,
+    recently_opened: &[String],
+) -> Vec<&'a HelpEntry> {
     let needle = query.trim().to_ascii_lowercase();
     let mut scored: Vec<(&HelpEntry, i32)> = entries
         .iter()
@@ -763,7 +810,8 @@ fn ranked_entries_with_mru<'a>(entries: &'a [HelpEntry], query: &str, recently_o
             if needle.is_empty() {
                 Some((entry, empty_query_score(entry)))
             } else {
-                match_score(entry, &needle).map(|score| (entry, score + mru_bonus(entry, recently_opened)))
+                match_score(entry, &needle)
+                    .map(|score| (entry, score + mru_bonus(entry, recently_opened)))
             }
         })
         .collect();
@@ -798,7 +846,9 @@ fn match_score(entry: &HelpEntry, needle: &str) -> Option<i32> {
         return Some(10_000 + common_bonus(entry));
     }
     if command.starts_with(needle)
-        || command.trim_start_matches('/').starts_with(needle.trim_start_matches('/'))
+        || command
+            .trim_start_matches('/')
+            .starts_with(needle.trim_start_matches('/'))
     {
         return Some(8_500 + common_bonus(entry));
     }
@@ -823,7 +873,10 @@ fn match_score(entry: &HelpEntry, needle: &str) -> Option<i32> {
         return Some(4_000 + common_bonus(entry));
     }
     if entry.lines.iter().any(|line| field_matches(line, needle))
-        || entry.usage.as_ref().is_some_and(|usage| field_matches(usage, needle))
+        || entry
+            .usage
+            .as_ref()
+            .is_some_and(|usage| field_matches(usage, needle))
         || entry.examples.iter().any(|example| {
             field_matches(&example.command, needle) || field_matches(&example.description, needle)
         })
@@ -838,7 +891,11 @@ fn field_matches(value: &str, needle: &str) -> bool {
 }
 
 fn common_bonus(entry: &HelpEntry) -> i32 {
-    if entry.common { 100 } else { 0 }
+    if entry.common {
+        100
+    } else {
+        0
+    }
 }
 
 fn mru_bonus(entry: &HelpEntry, recently_opened: &[String]) -> i32 {
@@ -852,7 +909,10 @@ fn mru_bonus(entry: &HelpEntry, recently_opened: &[String]) -> i32 {
 pub fn highlight_segments(text: &str, query: &str) -> Vec<HighlightSegment> {
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
-        return vec![HighlightSegment { text: text.to_string(), matched: false }];
+        return vec![HighlightSegment {
+            text: text.to_string(),
+            matched: false,
+        }];
     }
 
     let lower = text.to_ascii_lowercase();
@@ -862,16 +922,28 @@ pub fn highlight_segments(text: &str, query: &str) -> Vec<HighlightSegment> {
         let match_start = start + relative;
         let match_end = match_start + needle.len();
         if match_start > start {
-            segments.push(HighlightSegment { text: text[start..match_start].to_string(), matched: false });
+            segments.push(HighlightSegment {
+                text: text[start..match_start].to_string(),
+                matched: false,
+            });
         }
-        segments.push(HighlightSegment { text: text[match_start..match_end].to_string(), matched: true });
+        segments.push(HighlightSegment {
+            text: text[match_start..match_end].to_string(),
+            matched: true,
+        });
         start = match_end;
     }
     if start < text.len() {
-        segments.push(HighlightSegment { text: text[start..].to_string(), matched: false });
+        segments.push(HighlightSegment {
+            text: text[start..].to_string(),
+            matched: false,
+        });
     }
     if segments.is_empty() {
-        segments.push(HighlightSegment { text: text.to_string(), matched: false });
+        segments.push(HighlightSegment {
+            text: text.to_string(),
+            matched: false,
+        });
     }
     segments
 }
@@ -912,7 +984,12 @@ pub fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
     }
 }
 
-pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: usize, visible_height: usize) -> usize {
+pub fn visible_help_find_window(
+    row_heights: &[usize],
+    cursor: usize,
+    scroll: usize,
+    visible_height: usize,
+) -> usize {
     if row_heights.is_empty() || visible_height == 0 {
         return 0;
     }
@@ -924,11 +1001,18 @@ pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: us
     start
 }
 
-pub fn wrap_help_find_entry_lines(command: &str, summary: &str, selected: bool, width: usize) -> Vec<(String, String)> {
+pub fn wrap_help_find_entry_lines(
+    command: &str,
+    summary: &str,
+    selected: bool,
+    width: usize,
+) -> Vec<(String, String)> {
     let marker = if selected { "›" } else { " " };
     let first_prefix = format!("{} ", marker);
     let continuation_prefix = "    ";
-    let first_command_width = width.saturating_sub(first_prefix.chars().count()).clamp(8, 22);
+    let first_command_width = width
+        .saturating_sub(first_prefix.chars().count())
+        .clamp(8, 22);
     let command_lines = wrap_help_find_token(command, first_command_width);
     let mut lines = Vec::new();
 
@@ -936,7 +1020,10 @@ pub fn wrap_help_find_entry_lines(command: &str, summary: &str, selected: bool, 
         if idx == 0 {
             lines.push((format!("{}{}", first_prefix, command_part), String::new()));
         } else {
-            lines.push((format!("{}{}", continuation_prefix, command_part), String::new()));
+            lines.push((
+                format!("{}{}", continuation_prefix, command_part),
+                String::new(),
+            ));
         }
     }
 
@@ -996,6 +1083,24 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.command == "/help find"));
     }
 
+    // Slice C: /effort discovery — command registry + searchable help entry.
+    #[test]
+    fn effort_is_a_builtin_command_with_help_entry() {
+        assert!(
+            crate::skills::BUILTIN_COMMANDS.contains(&"effort"),
+            "/effort must be a registered built-in for autocomplete + streaming gating"
+        );
+        let entries = builtin_entries();
+        let effort = entries
+            .iter()
+            .find(|entry| entry.command == "/effort")
+            .expect("/effort must have a builtin help entry");
+        assert!(
+            effort.keywords.iter().any(|k| k.contains("reasoning")),
+            "help entry should be discoverable via reasoning keywords"
+        );
+    }
+
     #[test]
     fn wrap_help_text_wraps_words_to_width_and_preserves_indent() {
         let lines = wrap_help_text("  summary text should wrap neatly", 18);
@@ -1030,10 +1135,22 @@ mod tests {
 
         assert!(lines.len() > 1);
         assert_eq!(lines[0].0, "  /extension-showcase:");
-        assert!(lines[1].0.starts_with("    very-long-demo"), "wrapped command should indent slightly: {:?}", lines);
-        assert_eq!(lines[2].0, "    ", "description should start on its own lightly indented line: {:?}", lines);
+        assert!(
+            lines[1].0.starts_with("    very-long-demo"),
+            "wrapped command should indent slightly: {:?}",
+            lines
+        );
+        assert_eq!(
+            lines[2].0, "    ",
+            "description should start on its own lightly indented line: {:?}",
+            lines
+        );
         assert_eq!(lines[2].1, "description wraps onto a");
-        assert_eq!(lines[3].0, "    ", "wrapped description should keep small indent: {:?}", lines);
+        assert_eq!(
+            lines[3].0, "    ",
+            "wrapped description should keep small indent: {:?}",
+            lines
+        );
         assert_eq!(lines[3].1, "second visual line");
     }
 }

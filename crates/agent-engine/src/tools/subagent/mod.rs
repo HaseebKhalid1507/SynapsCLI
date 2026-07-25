@@ -1,19 +1,23 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
-mod oneshot;
+pub mod authorize_model;
+pub mod collect;
 pub(crate) mod finalize;
+pub mod models;
+mod oneshot;
+pub mod resume;
 pub mod start;
 pub mod status;
 pub mod steer;
-pub mod collect;
-pub mod resume;
 
+pub use authorize_model::SubagentModelAuthorizeTool;
+pub use collect::SubagentCollectTool;
+pub use models::SubagentModelsTool;
 pub use oneshot::SubagentTool;
+pub use resume::SubagentResumeTool;
 pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
-pub use collect::SubagentCollectTool;
-pub use resume::SubagentResumeTool;
 
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
 /// (which has already had `Runtime::new()` called), then **unconditionally
@@ -35,12 +39,21 @@ pub(crate) fn apply_subagent_runtime_policy(
     // resolved config — Remote broker endpoints must be reachable from
     // the subagent thread. (#158 A3)
     runtime.apply_auth_config(config);
+    runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
     // parent session configured. `Runtime::new()` already defaults to
     // `FiveMinutes`, but this explicit call makes the invariant contract-level
     // so a future `apply_config` addition can't silently break it.
     runtime.set_cache_ttl(crate::core::config::CacheTtl::FiveMinutes);
+
+    // Task 23: workers run under the WORKER turn budget (typed config
+    // overrides applied); the single policy point keeps all three spawn
+    // paths identical.
+    runtime.set_turn_budget(crate::runtime::budget::TurnBudget::from_config(
+        crate::runtime::budget::TurnRole::Worker,
+        &config.turn_budgets,
+    ));
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
@@ -84,7 +97,8 @@ mod cache_ttl_policy_tests {
         };
 
         // Create a fresh runtime (as each subagent spawn does).
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Simulate a scenario where apply_config was called with a 1h parent
@@ -118,13 +132,18 @@ mod cache_ttl_policy_tests {
             ..Default::default()
         };
 
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Simulate the parent having configured Hybrid on this runtime.
         runtime.set_cache_ttl(CacheTtl::Hybrid);
 
-        assert_eq!(runtime.cache_ttl(), CacheTtl::Hybrid, "pre-condition: must be Hybrid");
+        assert_eq!(
+            runtime.cache_ttl(),
+            CacheTtl::Hybrid,
+            "pre-condition: must be Hybrid"
+        );
 
         apply_subagent_runtime_policy(&mut runtime, &parent_config);
 
@@ -139,11 +158,16 @@ mod cache_ttl_policy_tests {
     async fn subagent_policy_is_idempotent_when_parent_already_five_minutes() {
         let parent_config = crate::config::SynapsConfig::default(); // FiveMinutes by default
 
-        let mut runtime = crate::Runtime::new().await
+        let mut runtime = crate::Runtime::new()
+            .await
             .expect("Runtime::new() must succeed in test environment");
 
         // Runtime::new() default is already FiveMinutes, but confirm it.
-        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes, "pre-condition: Runtime::new() must default to 5m");
+        assert_eq!(
+            runtime.cache_ttl(),
+            CacheTtl::FiveMinutes,
+            "pre-condition: Runtime::new() must default to 5m"
+        );
 
         apply_subagent_runtime_policy(&mut runtime, &parent_config);
 
@@ -152,5 +176,114 @@ mod cache_ttl_policy_tests {
             CacheTtl::FiveMinutes,
             "subagent spawn must stay 5m when parent is already 5m (idempotent)"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_policy_marks_runtime_as_non_recursive_worker() {
+        let config = crate::config::SynapsConfig::default();
+        let mut runtime = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+
+        apply_subagent_runtime_policy(&mut runtime, &config);
+
+        assert_eq!(
+            runtime.codex_request_role(),
+            crate::runtime::openai::catalog::CodexRequestRole::Worker
+        );
+    }
+
+    /// Task A5 memory-context invariant: subagents never inherit a memory
+    /// lease. Subagent spawn paths build a brand-new `Runtime::new()` (not a
+    /// clone), so as long as every fresh construction starts Off/no-lease —
+    /// and `apply_subagent_runtime_policy` never copies memory-context state
+    /// from a parent — a parent's active `/memory` lease cannot leak into a
+    /// subagent.
+    ///
+    /// Task A6 extension: the parent runtime now has the extension runtime
+    /// installed with exactly ONE declared context provider, so its enable
+    /// goes through the NEW catalog-validation code path (recording the
+    /// exact composed provider address) — and the invariant still holds.
+    #[tokio::test]
+    async fn subagent_memory_context_starts_off_no_lease_despite_active_parent_lease() {
+        use crate::runtime::memory_context::{
+            mint_explicit_command_proof, DurableStatus, MemoryContextMode, OneShotStatus,
+        };
+        use std::sync::Arc;
+
+        // Parent session with an ACTIVE capture-and-recall lease, granted
+        // through task A6 provider validation against a loaded catalog.
+        let mut manager = crate::extensions::manager::ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ));
+        manager.set_progressive_deferral(true);
+        let manifest: crate::extensions::manifest::ExtensionManifest =
+            serde_json::from_value(serde_json::json!({
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": ["context_providers.register"],
+                "deferred": {
+                    "context_providers": [{
+                        "id": "project-memory",
+                        "capability": "project-memory",
+                        "description": "test context provider",
+                        "schema_version": 1
+                    }]
+                }
+            }))
+            .expect("manifest parses");
+        manager
+            .load("axel-memory-manager", &manifest)
+            .await
+            .expect("deferred context-provider load never spawns");
+        let mut parent = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+        parent.install_extension_runtime(manager.extension_runtime());
+        parent
+            .memory_context_enable(
+                MemoryContextMode::CaptureAndRecall,
+                mint_explicit_command_proof(),
+            )
+            .expect("parent enable succeeds");
+        assert!(matches!(
+            parent.memory_context_status().durable,
+            DurableStatus::Active { .. }
+        ));
+        // The A6 validation path bound the exact declared provider address.
+        assert_eq!(
+            parent.memory_bound_providers_for_test()[0].as_str(),
+            "extension:axel-memory-manager:project-memory"
+        );
+
+        // A freshly constructed Runtime::new() — what every subagent spawn
+        // path does — reports Off/no-lease.
+        let mut subagent = crate::Runtime::new()
+            .await
+            .expect("Runtime::new() must succeed in test environment");
+        let fresh = subagent.memory_context_status();
+        assert_eq!(fresh.durable, DurableStatus::Off, "fresh runtime is Off");
+        assert_eq!(
+            fresh.one_shot,
+            OneShotStatus::Idle,
+            "fresh runtime has no one-shot"
+        );
+
+        // ...and STAYS Off/no-lease after the subagent runtime policy runs.
+        let config = crate::config::SynapsConfig::default();
+        apply_subagent_runtime_policy(&mut subagent, &config);
+        let after_policy = subagent.memory_context_status();
+        assert_eq!(
+            after_policy.durable,
+            DurableStatus::Off,
+            "subagent policy must not install or copy any memory lease"
+        );
+        assert_eq!(after_policy.one_shot, OneShotStatus::Idle);
+
+        // The parent's lease is untouched by the subagent construction.
+        assert!(matches!(
+            parent.memory_context_status().durable,
+            DurableStatus::Active { .. }
+        ));
     }
 }

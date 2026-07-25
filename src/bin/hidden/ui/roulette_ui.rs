@@ -1,8 +1,8 @@
-use ratatui::prelude::*;
-use ratatui::buffer::Buffer;
 use crate::app::App;
 use crate::games::roulette::*;
 use crate::ui::theme;
+use ratatui::buffer::Buffer;
+use ratatui::prelude::*;
 
 pub fn draw_roulette(f: &mut Frame, app: &App, game: &RouletteGame, area: Rect) {
     let buf = f.buffer_mut();
@@ -40,7 +40,11 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &RouletteGame, app: &App, w:
         let ratio = format!("{}:1", bet_type.payout_ratio());
 
         let name_color = if selected { theme::WHITE } else { theme::GRAY };
-        let _ratio_color = if selected { theme::GREEN } else { theme::DARK_GRAY };
+        let _ratio_color = if selected {
+            theme::GREEN
+        } else {
+            theme::DARK_GRAY
+        };
 
         // Color indicator for red/black
         let color_indicator = match bet_type {
@@ -54,9 +58,23 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &RouletteGame, app: &App, w:
             _ => theme::BG,
         };
 
-        draw_str(buf, area, 4, y, &format!("{}{:10} {:>5}", prefix, label, ratio), name_color);
+        draw_str(
+            buf,
+            area,
+            4,
+            y,
+            &format!("{}{:10} {:>5}", prefix, label, ratio),
+            name_color,
+        );
         if !color_indicator.is_empty() {
-            draw_str(buf, area, 4 + prefix.len() + label.len(), y, color_indicator, ind_color);
+            draw_str(
+                buf,
+                area,
+                4 + prefix.len() + label.len(),
+                y,
+                color_indicator,
+                ind_color,
+            );
         }
 
         if selected {
@@ -76,22 +94,56 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &RouletteGame, app: &App, w:
     let input_y = options_y + 2;
     draw_str(buf, area, input_x, input_y, "BET AMOUNT:", theme::AMBER);
 
-    let bet_display = if game.bet_input.is_empty() { "_ ".to_string() } else { format!("{}_", game.bet_input) };
-    draw_str(buf, area, input_x, input_y + 2, &format!("◈ {} TOKENS", bet_display), theme::GREEN);
+    let bet_display = if game.bet_input.is_empty() {
+        "_ ".to_string()
+    } else {
+        format!("{}_", game.bet_input)
+    };
+    draw_str(
+        buf,
+        area,
+        input_x,
+        input_y + 2,
+        &format!("◈ {} TOKENS", bet_display),
+        theme::GREEN,
+    );
 
-    draw_str(buf, area, input_x, input_y + 4, &format!("Balance: {}", app.tokens), theme::GRAY);
+    draw_str(
+        buf,
+        area,
+        input_x,
+        input_y + 4,
+        &format!("Balance: {}", app.tokens),
+        theme::GRAY,
+    );
 
     // Active bets
     if !game.bets.is_empty() {
-        draw_str(buf, area, input_x, input_y + 7, "ACTIVE BETS:", theme::AMBER);
+        draw_str(
+            buf,
+            area,
+            input_x,
+            input_y + 7,
+            "ACTIVE BETS:",
+            theme::AMBER,
+        );
         for (i, bet) in game.bets.iter().enumerate() {
             let y = input_y + 8 + i;
-            if y >= h.saturating_sub(3) { break; }
+            if y >= h.saturating_sub(3) {
+                break;
+            }
             let line = format!("  {} — {} tokens", bet.bet_type.label(), bet.amount);
             draw_str(buf, area, input_x, y, &line, theme::CYAN_DIM);
         }
         let total = format!("  TOTAL: {} tokens", game.total_bet);
-        draw_str(buf, area, input_x, input_y + 8 + game.bets.len(), &total, theme::AMBER_DIM);
+        draw_str(
+            buf,
+            area,
+            input_x,
+            input_y + 8 + game.bets.len(),
+            &total,
+            theme::AMBER_DIM,
+        );
     }
 
     // Number grid (bottom)
@@ -99,7 +151,14 @@ fn draw_betting(buf: &mut Buffer, area: Rect, game: &RouletteGame, app: &App, w:
 
     // Controls
     let hint = "↑↓ Select  ·  [0-9] Amount  ·  [ENTER] Place Bet  ·  [SPACE] Spin  ·  [ESC] Back";
-    draw_str(buf, area, (w.saturating_sub(hint.len())) / 2, h - 2, hint, theme::DARK_GRAY);
+    draw_str(
+        buf,
+        area,
+        (w.saturating_sub(hint.len())) / 2,
+        h - 2,
+        hint,
+        theme::DARK_GRAY,
+    );
 }
 
 fn draw_spinning(buf: &mut Buffer, area: Rect, game: &RouletteGame, app: &App, w: usize, h: usize) {
@@ -147,9 +206,23 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &RouletteGame, _app: &App, w:
     // Result display
     let num_str = format!("{:02}", result);
     draw_str(buf, area, (w - 10) / 2, cy, "╔════════╗", color);
-    draw_str(buf, area, (w - 10) / 2, cy + 1, &format!("║   {}   ║", num_str), color);
+    draw_str(
+        buf,
+        area,
+        (w - 10) / 2,
+        cy + 1,
+        &format!("║   {}   ║", num_str),
+        color,
+    );
     draw_str(buf, area, (w - 10) / 2, cy + 2, "╚════════╝", color);
-    draw_str(buf, area, (w - color_name.len()) / 2, cy + 3, color_name, color);
+    draw_str(
+        buf,
+        area,
+        (w - color_name.len()) / 2,
+        cy + 3,
+        color_name,
+        color,
+    );
 
     // Payout
     let payout = game.last_payout;
@@ -160,13 +233,28 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &RouletteGame, _app: &App, w:
     } else {
         "BREAK EVEN".to_string()
     };
-    let payout_color = if payout > 0 { theme::GREEN } else if payout < 0 { theme::RED } else { theme::GRAY };
-    draw_str(buf, area, (w - payout_str.len()) / 2, cy + 5, &payout_str, payout_color);
+    let payout_color = if payout > 0 {
+        theme::GREEN
+    } else if payout < 0 {
+        theme::RED
+    } else {
+        theme::GRAY
+    };
+    draw_str(
+        buf,
+        area,
+        (w - payout_str.len()) / 2,
+        cy + 5,
+        &payout_str,
+        payout_color,
+    );
 
     // Show which bets won/lost
     let by = cy + 7;
     for (i, bet) in game.bets.iter().enumerate() {
-        if by + i >= h.saturating_sub(4) { break; }
+        if by + i >= h.saturating_sub(4) {
+            break;
+        }
         let won = bet.bet_type.wins(result);
         let icon = if won { "✓" } else { "✗" };
         let c = if won { theme::GREEN } else { theme::RED_DIM };
@@ -176,7 +264,14 @@ fn draw_result(buf: &mut Buffer, area: Rect, game: &RouletteGame, _app: &App, w:
 
     draw_number_grid(buf, area, w, h, Some(result));
 
-    draw_str(buf, area, (w - 30) / 2, h - 2, "[ENTER] New Round  ·  [ESC] Back", theme::DARK_GRAY);
+    draw_str(
+        buf,
+        area,
+        (w - 30) / 2,
+        h - 2,
+        "[ENTER] New Round  ·  [ESC] Back",
+        theme::DARK_GRAY,
+    );
 }
 
 fn draw_number_grid(buf: &mut Buffer, area: Rect, w: usize, h: usize, highlight: Option<u8>) {
@@ -185,7 +280,11 @@ fn draw_number_grid(buf: &mut Buffer, area: Rect, w: usize, h: usize, highlight:
     let grid_x = (w.saturating_sub(48)) / 2;
 
     // Zero
-    let zero_color = if highlight == Some(0) { theme::GREEN } else { Color::Rgb(0, 80, 0) };
+    let zero_color = if highlight == Some(0) {
+        theme::GREEN
+    } else {
+        Color::Rgb(0, 80, 0)
+    };
     draw_str(buf, area, grid_x, grid_y, " 0 ", zero_color);
 
     // Numbers 1-36 in 3 rows of 12
@@ -193,23 +292,43 @@ fn draw_number_grid(buf: &mut Buffer, area: Rect, w: usize, h: usize, highlight:
         let y = grid_y + 1 + row;
         for col in 0..12 {
             let num = (col * 3 + (3 - row)) as u8; // standard roulette layout
-            if num > 36 { continue; }
+            if num > 36 {
+                continue;
+            }
             let x = grid_x + 3 + col * 4;
 
             let is_highlighted = highlight == Some(num);
             let base_color = match number_color(num) {
-                RouletteColor::Red => if is_highlighted { theme::RED } else { Color::Rgb(100, 0, 0) },
-                RouletteColor::Black => if is_highlighted { theme::WHITE } else { Color::Rgb(60, 60, 70) },
+                RouletteColor::Red => {
+                    if is_highlighted {
+                        theme::RED
+                    } else {
+                        Color::Rgb(100, 0, 0)
+                    }
+                }
+                RouletteColor::Black => {
+                    if is_highlighted {
+                        theme::WHITE
+                    } else {
+                        Color::Rgb(60, 60, 70)
+                    }
+                }
                 RouletteColor::Green => theme::GREEN,
             };
 
-            let bg = if is_highlighted { Color::Rgb(40, 40, 0) } else { theme::BG };
+            let bg = if is_highlighted {
+                Color::Rgb(40, 40, 0)
+            } else {
+                theme::BG
+            };
             let s = format!("{:>2} ", num);
             let mut cx = area.left() + x as u16;
             let cy = area.top() + y as u16;
             if cy < area.bottom() {
                 for ch in s.chars() {
-                    if cx >= area.right() { break; }
+                    if cx >= area.right() {
+                        break;
+                    }
                     buf[(cx, cy)].set_char(ch).set_fg(base_color).set_bg(bg);
                     cx += 1;
                 }
@@ -221,9 +340,13 @@ fn draw_number_grid(buf: &mut Buffer, area: Rect, w: usize, h: usize, highlight:
 fn draw_str(buf: &mut Buffer, area: Rect, x: usize, y: usize, s: &str, fg: Color) {
     let mut cx = area.left() + x as u16;
     let cy = area.top() + y as u16;
-    if cy >= area.bottom() { return; }
+    if cy >= area.bottom() {
+        return;
+    }
     for ch in s.chars() {
-        if cx >= area.right() { break; }
+        if cx >= area.right() {
+            break;
+        }
         buf[(cx, cy)].set_char(ch).set_fg(fg);
         cx += 1;
     }

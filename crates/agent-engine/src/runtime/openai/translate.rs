@@ -1,6 +1,8 @@
 //! Anthropic ↔ OpenAI translation layer.
 
-use super::types::{ChatMessage, FunctionCall, FunctionDefinition, OaiEvent, ToolCall, ToolDefinition};
+use super::types::{
+    ChatMessage, FunctionCall, FunctionDefinition, OaiEvent, ToolCall, ToolDefinition,
+};
 use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -13,17 +15,35 @@ pub struct ToolNameMap {
 
 impl ToolNameMap {
     pub fn to_oai<'a>(&'a self, name: &'a str) -> &'a str {
-        self.original_to_oai.get(name).map(String::as_str).unwrap_or(name)
+        self.original_to_oai
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     pub fn to_original<'a>(&'a self, name: &'a str) -> &'a str {
-        self.oai_to_original.get(name).map(String::as_str).unwrap_or(name)
+        self.oai_to_original
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
+    /// Original names that were rewritten for the OpenAI wire, in
+    /// deterministic (sorted) order. Feeds the metadata-only translation
+    /// report — a rename is a semantic rewrite and must never be silently
+    /// claimed lossless (spec §6.3).
+    pub fn renamed_originals(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.original_to_oai.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     fn insert(&mut self, original: &str, oai: &str) {
         if original != oai {
-            self.original_to_oai.insert(original.to_string(), oai.to_string());
-            self.oai_to_original.insert(oai.to_string(), original.to_string());
+            self.original_to_oai
+                .insert(original.to_string(), oai.to_string());
+            self.oai_to_original
+                .insert(oai.to_string(), original.to_string());
         }
     }
 }
@@ -50,6 +70,56 @@ fn sanitize_oai_tool_name(name: &str) -> String {
     }
 }
 
+/// OpenAI's function-schema validator rejects any array schema without
+/// `items` ("array schema missing items"), which turns one loosely-specified
+/// MCP/extension tool into a hard 400 on *every* request of the session
+/// (observed live: `ext__lsrf-manager__managerApi_cloudfrontInvalidate`,
+/// session 20260429-235559-094c). Backfill `"items": {}` — the
+/// accept-anything schema — recursively, preserving all author intent.
+fn sanitize_oai_parameters(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    let is_array_type = match obj.get("type") {
+        Some(Value::String(t)) => t == "array",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
+    };
+    if is_array_type && !obj.contains_key("items") {
+        obj.insert("items".into(), json!({}));
+    }
+
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(sub) = obj.get_mut(key) {
+            sanitize_oai_parameters(sub);
+        }
+    }
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(Value::Object(map)) = obj.get_mut(key) {
+            for sub in map.values_mut() {
+                sanitize_oai_parameters(sub);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(Value::Array(list)) = obj.get_mut(key) {
+            for sub in list.iter_mut() {
+                sanitize_oai_parameters(sub);
+            }
+        }
+    }
+}
+
 /// Convert Anthropic tool schema entries to OpenAI ToolDefinitions.
 ///
 /// Anthropic shape: `{"name", "description", "input_schema", optional cache_control}`.
@@ -63,7 +133,11 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
             // Skip empty names and internal-only tools
-            if name.is_empty() || name == "respond" || name == "send_channel" || name == "watcher_exit" {
+            if name.is_empty()
+                || name == "respond"
+                || name == "send_channel"
+                || name == "watcher_exit"
+            {
                 return None;
             }
             let mut oai_name = sanitize_oai_tool_name(&name);
@@ -93,6 +167,10 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
             let parameters = t
                 .get("input_schema")
                 .cloned()
+                .map(|mut schema| {
+                    sanitize_oai_parameters(&mut schema);
+                    schema
+                })
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
             Some(ToolDefinition {
                 kind: "function".to_string(),
@@ -125,7 +203,8 @@ pub fn messages_to_oai(
 
     // Build a map of tool_use_id → tool_name from assistant messages
     // so we can populate the name field on tool result messages.
-    let mut tool_name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_name_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for msg in anthropic_messages {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(Value::Array(blocks)) = msg.get("content") {
@@ -176,15 +255,22 @@ pub fn messages_to_oai(
                                         Some(Value::Array(arr)) => arr
                                             .iter()
                                             .filter_map(|b| {
-                                                b.get("text").and_then(|t| t.as_str()).map(String::from)
+                                                b.get("text")
+                                                    .and_then(|t| t.as_str())
+                                                    .map(String::from)
                                             })
                                             .collect::<Vec<_>>()
                                             .join(""),
                                         Some(other) => other.to_string(),
                                         None => String::new(),
                                     };
-                                    let tool_name = tool_name_map.get(&tool_id).cloned().unwrap_or_default();
-                                    out.push(ChatMessage::tool_result(tool_id, tool_name, result_content));
+                                    let tool_name =
+                                        tool_name_map.get(&tool_id).cloned().unwrap_or_default();
+                                    out.push(ChatMessage::tool_result(
+                                        tool_id,
+                                        tool_name,
+                                        result_content,
+                                    ));
                                 }
                                 _ => {}
                             }
@@ -263,7 +349,12 @@ pub fn messages_to_oai(
     // directly by a 'user' message. Insert an empty assistant message if needed.
     let mut fixed = Vec::with_capacity(out.len());
     for msg in out {
-        if msg.role == "user" && fixed.last().map(|m: &ChatMessage| m.role == "tool").unwrap_or(false) {
+        if msg.role == "user"
+            && fixed
+                .last()
+                .map(|m: &ChatMessage| m.role == "tool")
+                .unwrap_or(false)
+        {
             fixed.push(ChatMessage::assistant(" ".to_string()));
         }
         fixed.push(msg);
@@ -291,11 +382,19 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
                 delta: delta.clone(),
             }))
         }
-        OaiEvent::Usage { prompt_tokens, completion_tokens, cached_tokens } => {
+        OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } => {
+            // prompt_tokens INCLUDES the cached slice (OpenAI semantics);
+            // downstream accounting sums input + cache_read (Anthropic
+            // semantics), so subtract to avoid double-counting the hits.
+            let cached = (*cached_tokens).min(*prompt_tokens) as u64;
             Some(StreamEvent::Session(SessionEvent::Usage {
-                input_tokens: *prompt_tokens as u64,
+                input_tokens: *prompt_tokens as u64 - cached,
                 output_tokens: *completion_tokens as u64,
-                cache_read_input_tokens: *cached_tokens as u64,
+                cache_read_input_tokens: cached,
                 cache_creation_input_tokens: 0,
                 cache_creation_5m: None,
                 cache_creation_1h: None,
@@ -315,7 +414,8 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
     calls
         .iter()
         .map(|c| {
-            let input: Value = serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| json!({}));
+            let input: Value =
+                serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| json!({}));
             json!({
                 "type": "tool_use",
                 "id": c.id,
@@ -324,4 +424,133 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression fixture from session 20260429-235559-094c: the lsrf-manager
+    /// extension exposed `managerApi_cloudfrontInvalidate` whose `paths`
+    /// property was `{"type":"array"}` with no `items`. The Codex Responses
+    /// API rejects every request in such a session:
+    ///   400 "Invalid schema for function 'ext__lsrf-manager__managerApi_cloudfrontInvalidate':
+    ///        In context=('properties', 'paths'), array schema missing items."
+    #[test]
+    fn array_property_missing_items_is_backfilled_for_oai_wire() {
+        let schema = vec![json!({
+            "name": "ext__lsrf-manager__managerApi_cloudfrontInvalidate",
+            "description": "Invalidate CloudFront paths",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array" },
+                    "distribution_id": { "type": "string" }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        let params = &tools[0].function.parameters;
+        assert_eq!(
+            params["properties"]["paths"]["items"],
+            json!({}),
+            "array schema without items must be backfilled: {params}"
+        );
+        // Non-array sibling untouched.
+        assert_eq!(
+            params["properties"]["distribution_id"],
+            json!({"type": "string"})
+        );
+    }
+
+    #[test]
+    fn nested_and_composed_array_schemas_are_sanitized() {
+        let schema = vec![json!({
+            "name": "t",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "matrix": {
+                        "type": "array",
+                        "items": { "type": "array" }
+                    },
+                    "either": {
+                        "anyOf": [
+                            { "type": "array" },
+                            { "type": "string" }
+                        ]
+                    },
+                    "nullable": { "type": ["array", "null"] },
+                    "obj": {
+                        "type": "object",
+                        "additionalProperties": { "type": "array" },
+                        "properties": {
+                            "inner": { "type": "array" }
+                        }
+                    }
+                },
+                "$defs": {
+                    "aliasList": { "type": "array" }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        let p = &tools[0].function.parameters;
+        assert_eq!(p["properties"]["matrix"]["items"]["items"], json!({}));
+        assert_eq!(p["properties"]["either"]["anyOf"][0]["items"], json!({}));
+        assert!(p["properties"]["either"]["anyOf"][1].get("items").is_none());
+        assert_eq!(p["properties"]["nullable"]["items"], json!({}));
+        assert_eq!(
+            p["properties"]["obj"]["additionalProperties"]["items"],
+            json!({})
+        );
+        assert_eq!(
+            p["properties"]["obj"]["properties"]["inner"]["items"],
+            json!({})
+        );
+        assert_eq!(p["$defs"]["aliasList"]["items"], json!({}));
+    }
+
+    #[test]
+    fn array_schema_with_existing_items_is_untouched() {
+        let schema = vec![json!({
+            "name": "t",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "ops": { "type": "array", "items": { "type": "object" } }
+                }
+            }
+        })];
+        let (tools, _map) = tools_to_oai(&schema);
+        assert_eq!(
+            tools[0].function.parameters["properties"]["ops"]["items"],
+            json!({"type": "object"})
+        );
+    }
+
+    /// Regression for session 20260427-235907-2185:
+    ///   400 "Invalid 'tools[18].name': string does not match pattern.
+    ///        Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."
+    /// MCP/extension names carry `.`/`:` separators; the OAI wire name must
+    /// be sanitized and must round-trip back to the original for execution.
+    #[test]
+    fn mcp_tool_names_are_sanitized_for_oai_wire_and_round_trip() {
+        let schema = vec![json!({
+            "name": "ext__lsrf-manager__managerApi.cloudfrontInvalidate",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let (tools, map) = tools_to_oai(&schema);
+        let wire = &tools[0].function.name;
+        assert!(
+            wire.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "wire name must match ^[a-zA-Z0-9_-]+$: {wire}"
+        );
+        assert_eq!(
+            map.to_original(wire),
+            "ext__lsrf-manager__managerApi.cloudfrontInvalidate",
+            "sanitized wire name must map back to the executable tool name"
+        );
+    }
 }

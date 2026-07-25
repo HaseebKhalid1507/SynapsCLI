@@ -1,13 +1,19 @@
 //! RespondTool — reply to an event through its original source channel.
-use serde_json::{json, Value};
-use crate::Result;
 use super::{Tool, ToolContext};
+use crate::Result;
+use serde_json::{json, Value};
 
 pub struct RespondTool;
 
 #[async_trait::async_trait]
 impl Tool for RespondTool {
-    fn name(&self) -> &str { "respond" }
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn name(&self) -> &str {
+        "respond"
+    }
 
     fn description(&self) -> &str {
         "Reply to an event through its original source channel. Sends the response text back via the event's callback URL or logs it if no callback is available."
@@ -25,10 +31,12 @@ impl Tool for RespondTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let event_id = params["event_id"].as_str()
+        let event_id = params["event_id"]
+            .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'event_id' parameter".to_string()))?
             .to_string();
-        let text = params["text"].as_str()
+        let text = params["text"]
+            .as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'text' parameter".to_string()))?
             .to_string();
 
@@ -39,6 +47,7 @@ impl Tool for RespondTool {
             "responded": false,
             "error": "respond tool is not yet implemented — callback dispatch not wired",
             "event_id": event_id,
-        }).to_string())
+        })
+        .to_string())
     }
 }

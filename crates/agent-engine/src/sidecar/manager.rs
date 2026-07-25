@@ -14,9 +14,13 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
+
+/// Maximum bytes per sidecar stdout/stderr line. A hostile or buggy sidecar
+/// sending a single unbounded line could OOM the host without this cap.
+const MAX_SIDECAR_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB, matches MCP
 
 use super::protocol::{InsertTextMode, SidecarCommand, SidecarFrame, SIDECAR_PROTOCOL_VERSION};
 
@@ -39,10 +43,7 @@ pub enum SidecarLifecycleEvent {
         label: Option<String>,
     },
     /// Sidecar wants text applied to the input buffer.
-    InsertText {
-        text: String,
-        mode: InsertTextMode,
-    },
+    InsertText { text: String, mode: InsertTextMode },
     /// Sidecar reported an error message.
     Error(String),
     /// Sidecar process exited (clean or otherwise).
@@ -105,14 +106,8 @@ impl SidecarManager {
             source,
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(SidecarError::PipesUnavailable)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(SidecarError::PipesUnavailable)?;
+        let stdin = child.stdin.take().ok_or(SidecarError::PipesUnavailable)?;
+        let stdout = child.stdout.take().ok_or(SidecarError::PipesUnavailable)?;
         let stderr = child.stderr.take();
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -121,12 +116,29 @@ impl SidecarManager {
         // Reader task: parse line-JSON events and forward as SidecarLifecycleEvent.
         let event_tx = tx.clone();
         let reader_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let mut limited = (&mut reader).take(MAX_SIDECAR_LINE_BYTES + 1);
+                match tokio::io::AsyncBufReadExt::read_line(&mut limited, &mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                if line.len() as u64 > MAX_SIDECAR_LINE_BYTES {
+                    let _ = event_tx
+                        .send(SidecarLifecycleEvent::Error(format!(
+                            "sidecar stdout line exceeded {MAX_SIDECAR_LINE_BYTES} bytes, dropped"
+                        )))
+                        .await;
+                    continue;
+                }
+                let line = line.trim_end();
                 if line.trim().is_empty() {
                     continue;
                 }
-                let event = match serde_json::from_str::<SidecarFrame>(&line) {
+                let event = match serde_json::from_str::<SidecarFrame>(line) {
                     Ok(ev) => ev,
                     Err(err) => {
                         let _ = event_tx
@@ -177,9 +189,21 @@ impl SidecarManager {
         // Stderr task: forward sidecar stderr to tracing for diagnostics.
         let stderr_handle = stderr.map(|stderr| {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "sidecar::manager", "{line}");
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let mut limited = (&mut reader).take(MAX_SIDECAR_LINE_BYTES + 1);
+                    match tokio::io::AsyncBufReadExt::read_line(&mut limited, &mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    if line.len() as u64 > MAX_SIDECAR_LINE_BYTES {
+                        tracing::warn!(target: "sidecar::manager", "stderr line exceeded bound, dropped");
+                        continue;
+                    }
+                    tracing::debug!(target: "sidecar::manager", "{}", line.trim_end());
                 }
             })
         });
@@ -196,12 +220,12 @@ impl SidecarManager {
         // The sidecar must announce its protocol version first so we can
         // reject incompatible versions before committing to the handshake.
         // Timeout: 10s — if the sidecar can't say Hello in 10s, it's broken.
-        let hello_timeout = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            manager.rx.recv(),
-        )
-        .await
-        .map_err(|_| SidecarError::Protocol("sidecar did not send Hello within 10s".to_string()))?;
+        let hello_timeout =
+            tokio::time::timeout(std::time::Duration::from_secs(10), manager.rx.recv())
+                .await
+                .map_err(|_| {
+                    SidecarError::Protocol("sidecar did not send Hello within 10s".to_string())
+                })?;
 
         match hello_timeout {
             Some(SidecarLifecycleEvent::Ready { .. }) => {
@@ -212,11 +236,14 @@ impl SidecarManager {
             }
             Some(other) => {
                 return Err(SidecarError::Protocol(format!(
-                    "expected Hello from sidecar, got: {:?}", other
+                    "expected Hello from sidecar, got: {:?}",
+                    other
                 )));
             }
             None => {
-                return Err(SidecarError::Protocol("sidecar exited before sending Hello".to_string()));
+                return Err(SidecarError::Protocol(
+                    "sidecar exited before sending Hello".to_string(),
+                ));
             }
         }
 
@@ -226,12 +253,20 @@ impl SidecarManager {
 
     /// Send a trigger press command.
     pub async fn press(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::Trigger { name: "press".into(), payload: None }).await
+        self.send(SidecarCommand::Trigger {
+            name: "press".into(),
+            payload: None,
+        })
+        .await
     }
 
     /// Send a trigger release command.
     pub async fn release(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::Trigger { name: "release".into(), payload: None }).await
+        self.send(SidecarCommand::Trigger {
+            name: "release".into(),
+            payload: None,
+        })
+        .await
     }
 
     /// Send a graceful `shutdown` command and reap the child process.
@@ -242,7 +277,18 @@ impl SidecarManager {
             let _ = stdin.shutdown().await;
         }
         if let Some(mut child) = self.child.take() {
-            let _ = child.wait().await;
+            // Grace period: wait up to 2s, then kill. Matches MCP/extension patterns.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(_) => {} // exited gracefully
+                Err(_) => {
+                    let _ = child.kill().await;
+                }
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();

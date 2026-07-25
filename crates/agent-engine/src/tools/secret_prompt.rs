@@ -46,7 +46,9 @@ pub struct SecretPromptQueue {
 }
 
 impl Default for SecretPromptQueue {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SecretPromptQueue {

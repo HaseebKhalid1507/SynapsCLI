@@ -1,12 +1,34 @@
-use serde_json::{json, Value};
+use super::{expand_path, Tool, ToolContext};
 use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, expand_path};
+use serde_json::{json, Value};
 
 pub struct EditTool;
 
 #[async_trait::async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &str { "edit" }
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::IdempotentWrite
+    }
+
+    fn concurrency_key(
+        &self,
+        validated_input: &serde_json::Value,
+    ) -> Option<super::ConcurrencyKey> {
+        Some(
+            match super::util::canonical_path_key(validated_input["path"].as_str()?) {
+                Some(key) => super::ConcurrencyKey::Key(key),
+                None => super::ConcurrencyKey::Serialize,
+            },
+        )
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn name(&self) -> &str {
+        "edit"
+    }
 
     fn description(&self) -> &str {
         "Make a surgical edit to a file by replacing an exact string match. The old_string must appear exactly once in the file. Provide enough surrounding context to make the match unique."
@@ -33,18 +55,32 @@ impl Tool for EditTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let raw_path = params["path"].as_str()
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let raw_path = params["path"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
-        let old_string = params["old_string"].as_str()
+        let old_string = params["old_string"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing old_string parameter".to_string()))?;
-        let new_string = params["new_string"].as_str()
+        let new_string = params["new_string"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing new_string parameter".to_string()))?;
+        if let Some(orchestration) = &ctx.capabilities.orchestration {
+            if matches!(
+                orchestration.check_foreground_write(raw_path),
+                agent_core::orchestration::ScopeDecision::ReconciliationRequired { .. }
+            ) {
+                return Err(RuntimeError::Tool(
+                    "foreground edit overlaps an active worker scope".into(),
+                ));
+            }
+        }
 
         let path = expand_path(raw_path);
 
-        let content = tokio::fs::read_to_string(&path).await
-            .map_err(|e| RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e)))?;
+        let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
+        })?;
 
         let count = content.matches(old_string).count();
 
@@ -65,12 +101,14 @@ impl Tool for EditTool {
         let new_content = content.replacen(old_string, new_string, 1);
 
         // Preserve original file permissions (executable bits, etc.)
-        let original_perms = tokio::fs::metadata(&path).await
+        let original_perms = tokio::fs::metadata(&path)
+            .await
             .map(|m| m.permissions())
             .ok();
 
         let tmp_path = path.with_extension("agent-tmp");
-        tokio::fs::write(&tmp_path, &new_content).await
+        tokio::fs::write(&tmp_path, &new_content)
+            .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
 
         // Restore original permissions on the temp file before rename
@@ -78,25 +116,28 @@ impl Tool for EditTool {
             let _ = tokio::fs::set_permissions(&tmp_path, perms).await;
         }
 
-        tokio::fs::rename(&tmp_path, &path).await
-            .map_err(|e| {
-                let tmp = tmp_path.clone();
-                tokio::spawn(async move { let _ = tokio::fs::remove_file(tmp).await; });
-                RuntimeError::Tool(format!("Failed to finalize edit: {}", e))
-            })?;
+        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+            let tmp = tmp_path.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(tmp).await;
+            });
+            RuntimeError::Tool(format!("Failed to finalize edit: {}", e))
+        })?;
 
         let old_lines: Vec<&str> = old_string.lines().collect();
         let new_lines: Vec<&str> = new_string.lines().collect();
         Ok(format!(
             "Edited {} — replaced {} line(s) with {} line(s)",
-            path.display(), old_lines.len(), new_lines.len()
+            path.display(),
+            old_lines.len(),
+            new_lines.len()
         ))
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::create_tool_context;
+    use super::*;
     use crate::tools::Tool;
     use serde_json::json;
 
@@ -149,7 +190,10 @@ mod tests {
 
         let result = tool.execute(params, ctx).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("old_string not found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("old_string not found"));
 
         // Test old_string found multiple times
         std::fs::write(&test_file, "test\ntest\nother").unwrap();

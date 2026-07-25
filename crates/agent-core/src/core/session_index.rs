@@ -59,7 +59,9 @@ impl SessionIndexRecord {
 }
 
 pub fn index_path() -> PathBuf {
-    crate::core::config::base_dir().join("sessions").join("index.jsonl")
+    crate::core::config::base_dir()
+        .join("sessions")
+        .join("index.jsonl")
 }
 
 pub fn append_record(record: &SessionIndexRecord) -> crate::Result<()> {
@@ -72,31 +74,38 @@ pub fn read_recent(limit: usize) -> crate::Result<Vec<SessionIndexRecord>> {
 
 fn append_record_to_path(path: &std::path::Path, record: &SessionIndexRecord) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| crate::core::error::RuntimeError::Session(format!("create session index directory: {err}")))?;
+        crate::core::private_fs::ensure_private_dir(parent).map_err(|err| {
+            crate::core::error::RuntimeError::Session(format!(
+                "create session index directory: {err}"
+            ))
+        })?;
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("open session index: {err}")))?;
-    let mut line = serde_json::to_string(record)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}")))?;
+    let mut file = crate::core::private_fs::open_private_append(path).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("open session index: {err}"))
+    })?;
+    let mut line = serde_json::to_string(record).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}"))
+    })?;
     line.push('\n');
     use std::io::Write;
-    file.write_all(line.as_bytes())
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("write session index record: {err}")))?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("write session index record: {err}"))
+    })?;
     Ok(())
 }
 
-fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<Vec<SessionIndexRecord>> {
+fn read_recent_from_path(
+    path: &std::path::Path,
+    limit: usize,
+) -> crate::Result<Vec<SessionIndexRecord>> {
     if limit == 0 || !path.exists() {
         return Ok(Vec::new());
     }
 
-    let contents = std::fs::read_to_string(path)
-        .map_err(|err| crate::core::error::RuntimeError::Session(format!("read session index: {err}")))?;
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        crate::core::error::RuntimeError::Session(format!("read session index: {err}"))
+    })?;
     let mut records = Vec::new();
     for line in contents.lines().rev().take(limit) {
         if line.trim().is_empty() {
@@ -117,8 +126,8 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use serde_json::Value;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -186,8 +195,14 @@ mod tests {
         let contents = std::fs::read_to_string(index_path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(serde_json::from_str::<Value>(lines[0]).unwrap()["event"], "start");
-        assert_eq!(serde_json::from_str::<Value>(lines[1]).unwrap()["event"], "end");
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap()["event"],
+            "start"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[1]).unwrap()["event"],
+            "end"
+        );
     }
 
     #[test]
@@ -229,5 +244,53 @@ mod tests {
         append_record(&SessionIndexRecord::start("sess-1")).unwrap();
 
         assert!(read_recent(0).unwrap().is_empty());
+    }
+
+    /// Private-mode tests (spec §5.4). Umask isolation: `#[serial(umask)]`
+    /// serializes umask-mutating tests crate-wide; `UmaskGuard` restores the
+    /// previous mask on drop (panic-safe). These use the path-parametrized
+    /// writer directly, so no env mutation is needed.
+    #[cfg(unix)]
+    mod private_modes {
+        use super::*;
+        use crate::core::private_fs::test_support::UmaskGuard;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        #[serial(umask)]
+        fn append_creates_0600_index_and_0700_dir_under_permissive_umask() {
+            let _umask = UmaskGuard::set(0);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join("sessions").join("index.jsonl");
+            append_record_to_path(&path, &SessionIndexRecord::start("s")).unwrap();
+            assert_eq!(
+                mode_of(path.parent().unwrap()),
+                0o700,
+                "index dir must be 0700"
+            );
+            assert_eq!(mode_of(&path), 0o600, "index file must be 0600");
+        }
+
+        #[test]
+        fn append_refuses_symlink_index() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.jsonl");
+            std::fs::write(&victim, "").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("index.jsonl")).unwrap();
+            let res =
+                append_record_to_path(&dir.join("index.jsonl"), &SessionIndexRecord::start("s"));
+            assert!(res.is_err(), "append through a symlink must fail");
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "",
+                "no bytes may be written through the planted symlink"
+            );
+        }
     }
 }

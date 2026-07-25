@@ -69,7 +69,7 @@ impl std::fmt::Debug for CredentialSource {
 /// Deliberately has **no** refresh-token field: a Remote client must never
 /// receive or hold one. This is the invariant made structural — there is no
 /// place to put a refresh token even if the broker mistakenly sent one.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct BrokerToken {
     pub access_token: String,
     /// Absolute expiry, unix-epoch **milliseconds** (matches
@@ -81,6 +81,17 @@ pub struct BrokerToken {
     /// clock skew on suspend/resume VMs (board C3). Absent → use `expires`.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
+}
+
+/// Redacting Debug — never print access_token (review finding H2).
+impl std::fmt::Debug for BrokerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerToken")
+            .field("access_token", &"[REDACTED]")
+            .field("expires", &self.expires)
+            .field("ttl_ms", &self.ttl_ms)
+            .finish()
+    }
 }
 
 /// Current unix time in milliseconds.
@@ -120,7 +131,9 @@ impl std::fmt::Debug for TokenCache {
             .read()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
-        f.debug_struct("TokenCache").field("providers", &providers).finish()
+        f.debug_struct("TokenCache")
+            .field("providers", &providers)
+            .finish()
     }
 }
 
@@ -212,7 +225,9 @@ pub async fn resolve_remote_token<F: TokenFetcher>(
     provider: &str,
     margin_ms: u64,
 ) -> Result<String, String> {
-    Ok(resolve_remote(fetcher, cache, provider, margin_ms).await?.access_token)
+    Ok(resolve_remote(fetcher, cache, provider, margin_ms)
+        .await?
+        .access_token)
 }
 
 // ── Broker HTTP client ───────────────────────────────────────────────────────
@@ -235,7 +250,11 @@ impl BrokerClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
-        Self { http, endpoint: endpoint.into(), machine_token: machine_token.into() }
+        Self {
+            http,
+            endpoint: endpoint.into(),
+            machine_token: machine_token.into(),
+        }
     }
 
     /// Like `new` but reuses an existing `reqwest::Client` (shared connection
@@ -245,47 +264,41 @@ impl BrokerClient {
         machine_token: impl Into<String>,
         http: reqwest::Client,
     ) -> Self {
-        Self { http, endpoint: endpoint.into(), machine_token: machine_token.into() }
+        Self {
+            http,
+            endpoint: endpoint.into(),
+            machine_token: machine_token.into(),
+        }
     }
 
     /// Build from a `CredentialSource`. `None` for `Local`.
     pub fn from_source(source: &CredentialSource) -> Option<Self> {
         match source {
-            CredentialSource::Remote { endpoint, machine_token } => {
-                Some(Self::new(endpoint.clone(), machine_token.clone()))
-            }
+            CredentialSource::Remote {
+                endpoint,
+                machine_token,
+            } => Some(Self::new(endpoint.clone(), machine_token.clone())),
             CredentialSource::Local => None,
         }
     }
 }
 
-/// Provider-aware token resolution honoring the credential source — the single
-/// entry point both the Anthropic and the OpenAI/codex paths use. (#158 C4)
-///
-/// - `Local`: refresh the provider's own local credential (`ensure_fresh_*`).
-/// - `Remote`: fetch a short-lived access token from the broker, keyed by
-///   provider. Reuses the caller's `http` client (no per-call pool — A5), and
-///   never holds a refresh token / never writes `auth.json` (invariant 1).
+/// Provider-aware token resolution honoring the credential source — kept as a
+/// compatibility adapter for CLI callers (`synaps status`). Delegates to the
+/// typed credential broker: the local in-process broker or the authenticated
+/// remote transport. Vends the access token only.
 pub async fn resolve_access_token(
     provider: &str,
     source: &CredentialSource,
     cache: &TokenCache,
     http: &reqwest::Client,
 ) -> Result<String, String> {
-    match source {
-        CredentialSource::Remote { endpoint, machine_token } => {
-            let broker = BrokerClient::with_client(endpoint.clone(), machine_token.clone(), http.clone());
-            Ok(resolve_remote(&broker, cache, provider, DEFAULT_MARGIN_MS).await?.access_token)
-        }
-        CredentialSource::Local => {
-            let creds = if provider == "anthropic" {
-                super::ensure_fresh_token(http).await?
-            } else {
-                super::ensure_fresh_provider_token(http, provider).await?
-            };
-            Ok(creds.access)
-        }
-    }
+    let provider: super::provider::OAuthProviderId = provider.try_into()?;
+    super::broker::broker_from_source(source, cache, http.clone())
+        .access_token(provider)
+        .await
+        .map(|t| t.token)
+        .map_err(|e| e.to_string())
 }
 
 impl TokenFetcher for BrokerClient {
@@ -332,7 +345,10 @@ mod tests {
 
     #[test]
     fn from_parts_local_when_no_endpoint() {
-        assert_eq!(CredentialSource::from_parts(None, None), CredentialSource::Local);
+        assert_eq!(
+            CredentialSource::from_parts(None, None),
+            CredentialSource::Local
+        );
         assert_eq!(
             CredentialSource::from_parts(Some("   ".into()), Some("m".into())),
             CredentialSource::Local
@@ -341,7 +357,8 @@ mod tests {
 
     #[test]
     fn from_parts_remote_when_endpoint_set() {
-        let s = CredentialSource::from_parts(Some("https://jade.jade:8181".into()), Some("tok".into()));
+        let s =
+            CredentialSource::from_parts(Some("https://jade.jade:8181".into()), Some("tok".into()));
         assert_eq!(
             s,
             CredentialSource::Remote {
@@ -357,7 +374,10 @@ mod tests {
         let s = CredentialSource::from_parts(Some("  https://b/  ".into()), Some("  tok  ".into()));
         assert_eq!(
             s,
-            CredentialSource::Remote { endpoint: "https://b".into(), machine_token: "tok".into() }
+            CredentialSource::Remote {
+                endpoint: "https://b".into(),
+                machine_token: "tok".into()
+            }
         );
     }
 
@@ -366,7 +386,10 @@ mod tests {
         let s = CredentialSource::from_parts(Some("https://b".into()), None);
         assert_eq!(
             s,
-            CredentialSource::Remote { endpoint: "https://b".into(), machine_token: String::new() }
+            CredentialSource::Remote {
+                endpoint: "https://b".into(),
+                machine_token: String::new()
+            }
         );
     }
 
@@ -406,7 +429,11 @@ mod tests {
 
     // ── cache ────────────────────────────────────────────────────────────
     fn tok(expires: u64) -> BrokerToken {
-        BrokerToken { access_token: "sk-live".into(), expires, ttl_ms: None }
+        BrokerToken {
+            access_token: "sk-live".into(),
+            expires,
+            ttl_ms: None,
+        }
     }
 
     #[test]
@@ -456,19 +483,39 @@ mod tests {
     async fn resolve_cache_hit_does_not_fetch() {
         let cache = TokenCache::new();
         cache.put("anthropic", tok(now_millis() + 60 * 60 * 1000));
-        let f = FakeFetcher { token: tok(0), calls: AtomicUsize::new(0) };
-        let t = resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
+        let f = FakeFetcher {
+            token: tok(0),
+            calls: AtomicUsize::new(0),
+        };
+        let t = resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS)
+            .await
+            .unwrap();
         assert_eq!(t, "sk-live");
-        assert_eq!(f.calls.load(Ordering::SeqCst), 0, "must not fetch on a cache hit");
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            0,
+            "must not fetch on a cache hit"
+        );
     }
 
     #[tokio::test]
     async fn resolve_miss_fetches_then_caches() {
         let cache = TokenCache::new();
-        let f = FakeFetcher { token: tok(now_millis() + 60 * 60 * 1000), calls: AtomicUsize::new(0) };
-        resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
-        resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
-        assert_eq!(f.calls.load(Ordering::SeqCst), 1, "second resolve should hit the cache");
+        let f = FakeFetcher {
+            token: tok(now_millis() + 60 * 60 * 1000),
+            calls: AtomicUsize::new(0),
+        };
+        resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS)
+            .await
+            .unwrap();
+        resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            1,
+            "second resolve should hit the cache"
+        );
     }
 
     // ── broker-down degradation ───────────────────────────────────────────
@@ -485,14 +532,18 @@ mod tests {
         // refetch), the broker is down, but it's not HARD-expired, so we serve it.
         let cache = TokenCache::new();
         cache.put("anthropic", tok(now_millis() + 2 * 60 * 1000));
-        let t = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
+        let t = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS)
+            .await
+            .unwrap();
         assert_eq!(t.access_token, "sk-live");
     }
 
     #[tokio::test]
     async fn resolve_errors_when_broker_down_and_no_cache() {
         let cache = TokenCache::new();
-        let err = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap_err();
+        let err = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS)
+            .await
+            .unwrap_err();
         assert!(err.contains("unreachable"), "got: {err}");
     }
 
@@ -500,7 +551,9 @@ mod tests {
     async fn resolve_errors_when_broker_down_and_cache_hard_expired() {
         let cache = TokenCache::new();
         cache.put("anthropic", tok(now_millis().saturating_sub(1000))); // already expired
-        let err = resolve_remote(&FailFetcher, &cache, "anthropic", 0).await.unwrap_err();
+        let err = resolve_remote(&FailFetcher, &cache, "anthropic", 0)
+            .await
+            .unwrap_err();
         assert!(err.contains("unreachable"), "got: {err}");
     }
 
@@ -561,21 +614,33 @@ mod tests {
         let url = spawn_broker(r#"{"access_token":"sk","expires":1,"ttl_ms":3600000}"#, "m").await;
         let c = BrokerClient::new(url, "m");
         let t = c.fetch_token("anthropic").await.unwrap();
-        assert!(t.expires > now_millis(), "expires must come from ttl_ms, got {}", t.expires);
+        assert!(
+            t.expires > now_millis(),
+            "expires must come from ttl_ms, got {}",
+            t.expires
+        );
     }
 
     #[tokio::test]
     async fn fetch_token_rejects_empty_access_token() {
         let url = spawn_broker(r#"{"access_token":"","expires":9999999999999}"#, "m").await;
         let c = BrokerClient::new(url, "m");
-        assert!(c.fetch_token("anthropic").await.unwrap_err().contains("empty"));
+        assert!(c
+            .fetch_token("anthropic")
+            .await
+            .unwrap_err()
+            .contains("empty"));
     }
 
     #[tokio::test]
     async fn fetch_token_rejects_already_expired() {
         let url = spawn_broker(r#"{"access_token":"sk","expires":1}"#, "m").await;
         let c = BrokerClient::new(url, "m");
-        assert!(c.fetch_token("anthropic").await.unwrap_err().contains("expired"));
+        assert!(c
+            .fetch_token("anthropic")
+            .await
+            .unwrap_err()
+            .contains("expired"));
     }
 
     #[tokio::test]
@@ -585,13 +650,20 @@ mod tests {
             "m",
         )
         .await;
-        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let source = CredentialSource::Remote {
+            endpoint: url,
+            machine_token: "m".into(),
+        };
         let cache = TokenCache::new();
         let http = reqwest::Client::new();
-        let t = resolve_access_token("anthropic", &source, &cache, &http).await.unwrap();
+        let t = resolve_access_token("anthropic", &source, &cache, &http)
+            .await
+            .unwrap();
         assert_eq!(t, "sk-broker");
         // second call hits the cache (shared http client reused, no new pool)
-        let t2 = resolve_access_token("anthropic", &source, &cache, &http).await.unwrap();
+        let t2 = resolve_access_token("anthropic", &source, &cache, &http)
+            .await
+            .unwrap();
         assert_eq!(t2, "sk-broker");
     }
 

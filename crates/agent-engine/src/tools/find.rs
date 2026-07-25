@@ -1,14 +1,24 @@
+use super::{expand_path, Tool, ToolContext};
+use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::process::Command;
-use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, expand_path};
 
 pub struct FindTool;
 
 #[async_trait::async_trait]
 impl Tool for FindTool {
-    fn name(&self) -> &str { "find" }
+    fn effect(&self) -> crate::tools::catalog::ToolEffect {
+        crate::tools::catalog::ToolEffect::ReadOnly
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Builtin
+    }
+
+    fn name(&self) -> &str {
+        "find"
+    }
 
     fn description(&self) -> &str {
         "Find files by name using glob patterns. Searches recursively from the given path. Excludes .git directories."
@@ -36,7 +46,8 @@ impl Tool for FindTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let pattern = params["pattern"].as_str()
+        let pattern = params["pattern"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing pattern parameter".to_string()))?;
         let path = expand_path(params["path"].as_str().unwrap_or("."));
         let file_type = params["type"].as_str();
@@ -54,7 +65,8 @@ impl Tool for FindTool {
 
         cmd.arg("-name").arg(pattern);
 
-        let output = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await
+        let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+            .await
             .map_err(|_| RuntimeError::Tool("Find timed out after 10s".to_string()))?
             .map_err(|e| RuntimeError::Tool(format!("Failed to execute find: {}", e)))?;
 
@@ -69,8 +81,8 @@ impl Tool for FindTool {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::create_tool_context;
+    use super::*;
     use crate::tools::Tool;
     use serde_json::json;
 

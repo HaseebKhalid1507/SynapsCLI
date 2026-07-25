@@ -80,15 +80,14 @@ pub async fn emit_heartbeat(
     payload.push(b'\n');
 
     let fut = async move {
-        let stream = UnixStream::connect(uds_path).await.map_err(|e| {
-            match e.kind() {
-                std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::ConnectionRefused => {
+        let stream = UnixStream::connect(uds_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
                     BridgeClientError::Unavailable(e.to_string())
                 }
                 _ => BridgeClientError::Io(e),
-            }
-        })?;
+            })?;
 
         let (read_half, mut write_half) = stream.into_split();
         write_half.write_all(&payload).await?;
@@ -107,9 +106,8 @@ pub async fn emit_heartbeat(
             ));
         }
 
-        let parsed: Value = serde_json::from_str(line.trim_end()).map_err(|e| {
-            BridgeClientError::BadResponse(format!("invalid json: {e}"))
-        })?;
+        let parsed: Value = serde_json::from_str(line.trim_end())
+            .map_err(|e| BridgeClientError::BadResponse(format!("invalid json: {e}")))?;
 
         match parsed.get("ok").and_then(|v| v.as_bool()) {
             Some(true) => Ok(()),
@@ -374,36 +372,30 @@ mod tests {
     async fn mirror_heartbeat_skips_when_disabled() {
         // Point at a non-existent socket; with mirror disabled this must NOT
         // attempt to connect and must return Ok(()).
-        let bogus = std::path::PathBuf::from(
-            "/tmp/synaps-bridge-NEVER-EXISTS-disabled.sock",
-        );
+        let bogus = std::path::PathBuf::from("/tmp/synaps-bridge-NEVER-EXISTS-disabled.sock");
         let cfg = synaps_cli::config::BridgeConfig {
             uds_path: Some(bogus),
             heartbeat_mirror: false,
             heartbeat_timeout_ms: 100,
         };
         let res = mirror_heartbeat(&cfg, "agent-x", true, json!({})).await;
-        assert!(res.is_ok(), "disabled mirror must short-circuit Ok, got {res:?}");
+        assert!(
+            res.is_ok(),
+            "disabled mirror must short-circuit Ok, got {res:?}"
+        );
     }
 
     #[tokio::test]
     async fn mirror_heartbeat_emits_when_enabled() {
         let path = temp_sock("mirror-on");
-        let (task, recorded) =
-            spawn_fake_bridge(path.clone(), r#"{"ok":true}"#);
+        let (task, recorded) = spawn_fake_bridge(path.clone(), r#"{"ok":true}"#);
 
         let cfg = synaps_cli::config::BridgeConfig {
             uds_path: Some(path),
             heartbeat_mirror: true,
             heartbeat_timeout_ms: 1000,
         };
-        let res = mirror_heartbeat(
-            &cfg,
-            "research-bot",
-            true,
-            json!({"session_count": 7}),
-        )
-        .await;
+        let res = mirror_heartbeat(&cfg, "research-bot", true, json!({"session_count": 7})).await;
         assert!(res.is_ok(), "expected Ok, got {res:?}");
 
         let lines = recorded.lock().await.clone();

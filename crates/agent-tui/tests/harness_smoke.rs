@@ -29,7 +29,10 @@ fn harness_boots_and_renders_nonempty_frame() {
     h.type_str("hello harness");
     assert_eq!(h.input_contents(), "hello harness");
     let frame = h.snapshot();
-    assert!(frame.contains("hello harness"), "typed text not rendered:\n{frame}");
+    assert!(
+        frame.contains("hello harness"),
+        "typed text not rendered:\n{frame}"
+    );
 
     // Enter dispatches a Submit action (recorded, not executed — sync-only
     // harness; async execution is the P6 follow-up).

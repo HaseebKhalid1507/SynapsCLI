@@ -95,6 +95,11 @@ pub struct EventPayload {
     pub timestamp: String,
     /// Full `format_event_for_agent` output — XML-wrapped, injection-safe.
     pub formatted: String,
+    /// Typed disclosure class (spec §9.7) as its canonical snake_case name.
+    /// Retained through the wire so RPC/server parents can honor
+    /// persistence policy after handoff. Absent = `model_visible`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<String>,
 }
 
 /// Token-usage summary for a completed agent turn.
@@ -435,12 +440,17 @@ mod tests {
         let json = to_string(&cmd).expect("serialise");
         let val: serde_json::Value = from_str(&json).unwrap();
         assert_eq!(val["type"], "tools_list");
-        assert!(val.get("id").is_none(), "absent id must be omitted (skip_serializing_if)");
+        assert!(
+            val.get("id").is_none(),
+            "absent id must be omitted (skip_serializing_if)"
+        );
     }
 
     #[test]
     fn tools_list_with_id_serialises() {
-        let cmd = RpcCommand::ToolsList { id: Some("req-42".to_string()) };
+        let cmd = RpcCommand::ToolsList {
+            id: Some("req-42".to_string()),
+        };
         let json = to_string(&cmd).expect("serialise");
         let val: serde_json::Value = from_str(&json).unwrap();
         assert_eq!(val["type"], "tools_list");
@@ -493,7 +503,10 @@ mod tests {
         assert_eq!(val["command"], "tools_list");
         // Bridge checks these two fields at the top level (flattened):
         assert_eq!(val["ok"], true, "bridge needs ok=true at top level");
-        assert!(val["tools"].is_array(), "bridge needs tools array at top level");
+        assert!(
+            val["tools"].is_array(),
+            "bridge needs tools array at top level"
+        );
         assert_eq!(val["tools"][0]["name"], "bash");
     }
 }

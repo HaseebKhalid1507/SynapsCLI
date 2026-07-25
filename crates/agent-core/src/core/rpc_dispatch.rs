@@ -6,9 +6,7 @@
 //! See `docs/rpc-protocol.md` and `synaps-bridge.SPEC.md §4` for the wire
 //! protocol specification these functions implement.
 
-use crate::core::rpc_protocol::{
-    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
-};
+use crate::core::rpc_protocol::{AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage};
 use crate::core::stream_types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 // ─── Frame parsing ────────────────────────────────────────────────────────────
@@ -211,7 +209,9 @@ pub fn build_tools_list_body(tools_schema: &[serde_json::Value]) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::rpc_protocol::{AssistantEvent, RpcCommand, RpcEvent, RpcAttachment, TurnUsage};
+    use crate::core::rpc_protocol::{
+        AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
+    };
     use crate::core::stream_types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
     use serde_json::json;
 
@@ -223,7 +223,11 @@ mod tests {
         let result = parse_frame(line, MAX_FRAME_BYTES);
         assert!(result.is_ok(), "should parse valid prompt frame");
         match result.unwrap() {
-            RpcCommand::Prompt { id, message, attachments } => {
+            RpcCommand::Prompt {
+                id,
+                message,
+                attachments,
+            } => {
                 assert_eq!(id, "abc");
                 assert_eq!(message, "hello");
                 assert!(attachments.is_empty());
@@ -256,7 +260,10 @@ mod tests {
     #[test]
     fn parse_frame_valid_abort() {
         let line = r#"{"type":"abort","id":"x"}"#;
-        assert!(matches!(parse_frame(line, MAX_FRAME_BYTES).unwrap(), RpcCommand::Abort { .. }));
+        assert!(matches!(
+            parse_frame(line, MAX_FRAME_BYTES).unwrap(),
+            RpcCommand::Abort { .. }
+        ));
     }
 
     #[test]
@@ -311,7 +318,7 @@ mod tests {
     fn parse_frame_custom_small_limit() {
         // Oversize relative to a custom limit.
         let line = r#"{"type":"shutdown"}"#; // 19 bytes
-        let result = parse_frame(line, 5);   // limit = 5
+        let result = parse_frame(line, 5); // limit = 5
         assert!(result.is_err());
         match result.unwrap_err() {
             RpcEvent::Error { id, .. } => assert!(id.is_none()),
@@ -440,7 +447,11 @@ mod tests {
         });
         let rpc = map_stream_event(&ev).expect("SubagentStart must produce an event");
         match rpc {
-            RpcEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+            RpcEvent::SubagentStart {
+                subagent_id,
+                agent_name,
+                task_preview,
+            } => {
                 assert_eq!(subagent_id, 7);
                 assert_eq!(agent_name, "worker");
                 assert_eq!(task_preview, "do thing");
@@ -458,7 +469,11 @@ mod tests {
         });
         let rpc = map_stream_event(&ev).expect("SubagentUpdate must produce an event");
         match rpc {
-            RpcEvent::SubagentUpdate { subagent_id, agent_name, status } => {
+            RpcEvent::SubagentUpdate {
+                subagent_id,
+                agent_name,
+                status,
+            } => {
                 assert_eq!(subagent_id, 7);
                 assert_eq!(agent_name, "worker");
                 assert_eq!(status, "running");
@@ -509,7 +524,11 @@ mod tests {
         // directly with mutable access to RpcState.
         let events: &[StreamEvent] = &[
             StreamEvent::Session(SessionEvent::Done),
-            StreamEvent::Session(SessionEvent::Error("oops".to_string())),
+            StreamEvent::Session(SessionEvent::Error(crate::TurnError::provider(
+                "oops",
+                "api_status",
+                "turn-test-0",
+            ))),
             StreamEvent::Session(SessionEvent::MessageHistory(vec![])),
             StreamEvent::Session(SessionEvent::Usage {
                 input_tokens: 1,
@@ -626,8 +645,18 @@ mod tests {
     fn accumulate_usage_ignores_error() {
         let mut acc = zero_usage();
         acc.output_tokens = 3;
-        accumulate_usage(&mut acc, &SessionEvent::Error("boom".to_string()));
-        assert_eq!(acc.output_tokens, 3, "Error must not mutate the accumulator");
+        accumulate_usage(
+            &mut acc,
+            &SessionEvent::Error(crate::TurnError::provider(
+                "boom",
+                "api_status",
+                "turn-test-1",
+            )),
+        );
+        assert_eq!(
+            acc.output_tokens, 3,
+            "Error must not mutate the accumulator"
+        );
     }
 
     #[test]
@@ -635,7 +664,10 @@ mod tests {
         let mut acc = zero_usage();
         acc.input_tokens = 7;
         accumulate_usage(&mut acc, &SessionEvent::MessageHistory(vec![]));
-        assert_eq!(acc.input_tokens, 7, "MessageHistory must not mutate the accumulator");
+        assert_eq!(
+            acc.input_tokens, 7,
+            "MessageHistory must not mutate the accumulator"
+        );
     }
 
     // ── build_user_content ───────────────────────────────────────────────────
@@ -660,8 +692,16 @@ mod tests {
     #[test]
     fn build_user_content_multiple_attachments() {
         let attachments = vec![
-            RpcAttachment { path: "/tmp/a.txt".to_string(), name: None, mime: None },
-            RpcAttachment { path: "/tmp/b.pdf".to_string(), name: None, mime: None },
+            RpcAttachment {
+                path: "/tmp/a.txt".to_string(),
+                name: None,
+                mime: None,
+            },
+            RpcAttachment {
+                path: "/tmp/b.pdf".to_string(),
+                name: None,
+                mime: None,
+            },
         ];
         let msg = build_user_content("check these", &attachments);
         assert!(
@@ -680,7 +720,10 @@ mod tests {
         }];
         let original = "multi\nline\nmessage";
         let msg = build_user_content(original, &attachments);
-        assert!(msg.ends_with(original), "original message must appear verbatim at the end");
+        assert!(
+            msg.ends_with(original),
+            "original message must appear verbatim at the end"
+        );
     }
 
     // ── build_user_content: quoting edge cases ───────────────────────────────
@@ -707,8 +750,16 @@ mod tests {
     #[test]
     fn build_user_content_multiple_paths_each_quoted() {
         let attachments = vec![
-            RpcAttachment { path: "/p1".to_string(), name: None, mime: None },
-            RpcAttachment { path: "/p2".to_string(), name: None, mime: None },
+            RpcAttachment {
+                path: "/p1".to_string(),
+                name: None,
+                mime: None,
+            },
+            RpcAttachment {
+                path: "/p2".to_string(),
+                name: None,
+                mime: None,
+            },
         ];
         let msg = build_user_content("x", &attachments);
         assert!(
@@ -773,15 +824,16 @@ mod tests {
     /// Verify the body round-trips through serde and satisfies both conditions.
     #[test]
     fn build_tools_list_body_roundtrip_satisfies_bridge_contract() {
-        let schema = vec![
-            json!({"name": "bash", "description": "desc", "input_schema": {}}),
-        ];
+        let schema = vec![json!({"name": "bash", "description": "desc", "input_schema": {}})];
         let body = super::build_tools_list_body(&schema);
         // Simulate serialise → deserialise (what the parent process and bridge each do).
         let serialised = serde_json::to_string(&body).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&serialised).unwrap();
         assert_eq!(parsed["ok"], true, "bridge check: ok===true");
-        assert!(parsed["tools"].is_array(), "bridge check: Array.isArray(tools)");
+        assert!(
+            parsed["tools"].is_array(),
+            "bridge check: Array.isArray(tools)"
+        );
     }
 
     // ── handle_compact lock-release invariant ────────────────────────────────
@@ -812,7 +864,7 @@ mod tests {
             let snapshot = {
                 let mut g = shared2.lock().await;
                 *g += 1; // mark "lock acquired for snapshot"
-                *g       // return snapshot value
+                *g // return snapshot value
             };
             // Lock is now RELEASED.
 
@@ -827,11 +879,8 @@ mod tests {
         // While the "slow" phase is running, this second task must be able to
         // acquire the lock without blocking for the full 20 ms.
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-        let acquired = tokio::time::timeout(
-            tokio::time::Duration::from_millis(5),
-            shared.lock(),
-        )
-        .await;
+        let acquired =
+            tokio::time::timeout(tokio::time::Duration::from_millis(5), shared.lock()).await;
         assert!(
             acquired.is_ok(),
             "second task must acquire the lock during the slow phase — \

@@ -11,23 +11,64 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-mod pkce;
-mod callback;
-mod token;
-mod storage;
+pub mod aws_bedrock;
+pub mod azure_openai;
+pub mod broker;
 mod browser;
-mod openai_codex;
+mod callback;
+pub mod cloud;
+pub mod cloud_login;
 mod credential_source;
+pub mod github_copilot;
+pub mod google_gemini;
+pub mod google_vertex;
+mod openai_codex;
+mod pkce;
+pub mod provider;
+pub mod providers;
+pub mod static_providers;
+mod storage;
+mod token;
+mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
-pub use pkce::{generate_code_verifier, generate_code_challenge, generate_state, build_auth_url};
-pub use callback::{CallbackServerHandle, start_callback_server};
-pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token, ensure_fresh_provider_token};
-pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
+pub use broker::{
+    broker_from_source, global_broker, preflight_cloud_capability, set_global_broker, AccessToken,
+    BrokerError, CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream,
+    ProxyMethod, ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
+    MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES,
+    PROXY_REQUEST_TIMEOUT,
+};
 pub use browser::open_browser;
-pub use openai_codex::{extract_account_id as extract_codex_account_id, login as login_openai_codex};
-pub use credential_source::{CredentialSource, BrokerToken, BrokerClient, TokenCache, TokenFetcher, resolve_remote, resolve_remote_token, resolve_access_token, is_expired_with_margin, DEFAULT_MARGIN_MS};
+pub use callback::{
+    start_callback_server, start_callback_server_at, CallbackOutcome, CallbackServerHandle,
+};
+pub use cloud::{
+    AuthIdentity, AwsBedrockConfig, AzureOpenAiConfig, BrokerMessage, BrokerOperation, BrokerTool,
+    CloudProviderId, GoogleVertexConfig, InvokeOptions, InvokeRequest, MessageRole, ProviderId,
+};
+pub use credential_source::{
+    is_expired_with_margin, resolve_access_token, resolve_remote, resolve_remote_token,
+    BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
+};
+pub use github_copilot::login as login_github_copilot;
+pub use openai_codex::{
+    extract_account_id as extract_codex_account_id, login as login_openai_codex,
+};
+pub use pkce::{build_auth_url, generate_code_challenge, generate_code_verifier, generate_state};
+pub use provider::{
+    BrokerCredentialStrategy, OAuthProviderDescriptor, OAuthProviderId, OAuthProviderRegistry,
+};
+pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_KEY};
+pub use storage::{
+    auth_file_path, load_auth, load_cloud_state, load_provider_auth, load_static_key, save_auth,
+    save_cloud_state, save_provider_auth, save_static_key,
+};
+pub use token::{
+    ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
+};
+pub use xai::login as login_xai;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
@@ -40,7 +81,7 @@ pub(super) const SCOPES: &str = "org:create_api_key user:profile user:inference 
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     #[serde(rename = "type")]
     pub auth_type: String,
@@ -51,10 +92,27 @@ pub struct OAuthCredentials {
     pub account_id: Option<String>,
 }
 
+/// Redacting Debug — never print refresh/access tokens (review finding H1).
+impl std::fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredentials")
+            .field("auth_type", &self.auth_type)
+            .field("refresh", &"[REDACTED]")
+            .field("access", &"[REDACTED]")
+            .field("expires", &self.expires)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFile {
     pub anthropic: OAuthCredentials,
-    #[serde(rename = "openai-codex", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "openai-codex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub openai_codex: Option<OAuthCredentials>,
 }
 
@@ -66,7 +124,7 @@ pub(crate) struct TokenResponse {
 }
 
 /// Result from the OAuth callback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackResult {
     pub code: String,
     pub state: String,
@@ -102,8 +160,14 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
 
     // Try as full URL (e.g. the redirect from the browser)
     if let Ok(url) = url::Url::parse(trimmed) {
-        let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string());
-        let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        let code = url
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string());
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
         if code.is_some() {
             return (code, state);
         }
@@ -134,7 +198,10 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
 /// here, a bare code paste or a URL without `state` is rejected outright.
 fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
     let (code, state) = parse_manual_input(input);
-    Some(CallbackResult { code: code?, state: state? })
+    Some(CallbackResult {
+        code: code?,
+        state: state?,
+    })
 }
 
 // ── High-level login flow ───────────────────────────────────────────────────
@@ -197,7 +264,9 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     let result = tokio::select! {
         callback = rx => {
             match callback {
-                Ok(result) => result,
+                Ok(CallbackOutcome::Authorized(result)) => result,
+                Ok(CallbackOutcome::Denied { error, description }) => return Err(format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default())),
+                Ok(CallbackOutcome::Invalid) => return Err("Invalid OAuth callback".to_string()),
                 Err(_) => return Err("Callback channel closed".to_string()),
             }
         }
@@ -236,6 +305,23 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 // See also: openai_codex::tests for the parallel codex test suite.
 // These mirror the codex tests — same invariants, same naming pattern.
 
+/// Pinned experimental Copilot models base URL for broker catalog proxy.
+pub(crate) fn github_copilot_models_base_url() -> &'static str {
+    "https://api.githubcopilot.com"
+}
+
+/// Headers for the experimental Copilot models GET (no secrets).
+pub(crate) fn github_copilot_models_request_headers() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("User-Agent", "SynapsCLI/0.6.0"),
+        ("Accept", "application/json"),
+        ("Editor-Version", "vscode/1.107.0"),
+        ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
+        ("Copilot-Integration-Id", "vscode-chat"),
+        ("X-Github-Api-Version", "2025-10-01"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,9 +331,15 @@ mod tests {
     fn test_generate_code_verifier() {
         let verifier = generate_code_verifier();
         assert!(!verifier.is_empty(), "Code verifier should not be empty");
-        assert!(verifier.len() > 20, "Code verifier should be longer than 20 characters");
+        assert!(
+            verifier.len() > 20,
+            "Code verifier should be longer than 20 characters"
+        );
         let verifier2 = generate_code_verifier();
-        assert_ne!(verifier, verifier2, "Two calls should produce different verifiers");
+        assert_ne!(
+            verifier, verifier2,
+            "Two calls should produce different verifiers"
+        );
     }
 
     #[test]
@@ -256,9 +348,15 @@ mod tests {
         let challenge = generate_code_challenge(verifier);
         assert!(!challenge.is_empty(), "Code challenge should not be empty");
         let challenge2 = generate_code_challenge(verifier);
-        assert_eq!(challenge, challenge2, "Same verifier should produce same challenge");
+        assert_eq!(
+            challenge, challenge2,
+            "Same verifier should produce same challenge"
+        );
         let different_challenge = generate_code_challenge("different_verifier_456");
-        assert_ne!(challenge, different_challenge, "Different verifiers should produce different challenges");
+        assert_ne!(
+            challenge, different_challenge,
+            "Different verifiers should produce different challenges"
+        );
     }
 
     #[test]
@@ -311,13 +409,13 @@ mod tests {
     fn test_pkce_challenge_sha256() {
         let verifier = "test_verifier_string";
         let challenge = generate_code_challenge(verifier);
-        
-        use sha2::{Sha256, Digest};
+
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(verifier.as_bytes());
         let hash = hasher.finalize();
         let expected = URL_SAFE_NO_PAD.encode(hash);
-        
+
         assert_eq!(challenge, expected);
     }
 
@@ -345,8 +443,11 @@ mod tests {
 
     #[test]
     fn test_is_token_expired_edge_cases() {
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
         let exactly_now_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
             refresh: "test_refresh".to_string(),
@@ -355,7 +456,7 @@ mod tests {
             account_id: None,
         };
         assert!(is_token_expired(&exactly_now_creds));
-        
+
         let one_ms_future_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
             refresh: "test_refresh".to_string(),
@@ -382,10 +483,11 @@ mod tests {
             expires: 1234567890,
             account_id: None,
         };
-        
+
         let json = serde_json::to_string(&original_creds).expect("Should serialize");
-        let deserialized_creds: OAuthCredentials = serde_json::from_str(&json).expect("Should deserialize");
-        
+        let deserialized_creds: OAuthCredentials =
+            serde_json::from_str(&json).expect("Should deserialize");
+
         assert_eq!(original_creds.auth_type, deserialized_creds.auth_type);
         assert_eq!(original_creds.refresh, deserialized_creds.refresh);
         assert_eq!(original_creds.access, deserialized_creds.access);
@@ -403,10 +505,8 @@ mod tests {
 
     #[test]
     fn anthropic_manual_paste_accepts_full_redirect_url() {
-        let result = manual_paste_to_callback(
-            "http://localhost:53692/callback?code=abc&state=xyz",
-        )
-        .expect("URL with code+state must be accepted");
+        let result = manual_paste_to_callback("http://localhost:53692/callback?code=abc&state=xyz")
+            .expect("URL with code+state must be accepted");
         assert_eq!(result.code, "abc");
         assert_eq!(result.state, "xyz");
     }

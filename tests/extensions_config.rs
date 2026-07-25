@@ -31,6 +31,7 @@ fn manifest_with_perms_and_args(perms: Vec<&str>, extra_args: Vec<&str>) -> Exte
     args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         theme_tokens: Default::default(),
+        deferred: None,
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -61,7 +62,11 @@ async fn extension_can_set_and_read_own_plugin_config_file() {
         .await
         .expect("extension should set/read config during initialize");
 
-    let config_path = home.path().join("plugins").join("config-test-ext").join("config");
+    let config_path = home
+        .path()
+        .join("plugins")
+        .join("config-test-ext")
+        .join("config");
     let body = std::fs::read_to_string(config_path).expect("plugin config file should exist");
     assert!(body.contains("backend = cpu"), "body was: {body:?}");
 

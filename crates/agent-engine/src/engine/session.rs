@@ -3,9 +3,9 @@
 //! Owns the conversation state that both TUI and headless modes need:
 //! messages, token counts, cost, abort context.
 
-use crate::{Session, Runtime};
 use crate::pricing::calculate_cost_optional_split;
 use crate::SharedMessage;
+use crate::{Runtime, Session};
 
 /// Conversation state tracked by the engine.
 pub struct ConversationState {
@@ -115,40 +115,13 @@ impl ConversationState {
         self.total_cache_creation_tokens += cache_creation;
 
         self.session_cost += calculate_cost_optional_split(
-            model, input_tokens, output_tokens, cache_read,
-            cache_creation, cache_creation_5m, cache_creation_1h,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
         );
-    }
-
-    /// Estimate current token count (for compaction decisions).
-    pub fn estimate_tokens(&self) -> usize {
-        let mut total_chars = 0usize;
-        for msg in &self.api_messages {
-            if let Some(s) = msg["content"].as_str() {
-                total_chars += s.len();
-            } else if let Some(arr) = msg["content"].as_array() {
-                for block in arr {
-                    if let Some(s) = block["text"].as_str() {
-                        total_chars += s.len();
-                    }
-                    if let Some(s) = block["thinking"].as_str() {
-                        total_chars += s.len();
-                    }
-                    if let Some(s) = block["content"].as_str() {
-                        total_chars += s.len();
-                    } else if let Some(content_arr) = block["content"].as_array() {
-                        for inner in content_arr {
-                            if let Some(s) = inner["text"].as_str() {
-                                total_chars += s.len();
-                            }
-                        }
-                    }
-                    if let Some(input) = block.get("input") {
-                        total_chars += input.to_string().len();
-                    }
-                }
-            }
-        }
-        total_chars / 4
     }
 }
