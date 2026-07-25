@@ -2,14 +2,14 @@
 
 This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~81K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
 
-- `synaps-core` (`crates/agent-core/`) — config, session, auth, models, memory, pricing, protocol primitives
-- `synaps-engine` (`crates/agent-engine/`) — runtime, tools, MCP, skills, events, extensions, sidecar, watcher
+- `synaps-core` (`crates/agent-core/`) — config, session, auth, credential broker, models, memory, orchestration policy, prompt manifests, pricing, protocol primitives
+- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, sidecar, watcher
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
-Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -39,6 +39,7 @@ cargo clippy --all-targets -- -D warnings  # linting (CI gate)
 - `synaps server` — WebSocket API server
 - `synaps send` — push events into a running session
 - `synaps status` — check account usage
+- `synaps auth-broker` — credential broker daemon for multi-machine shared auth
 
 **Test quirks:**
 - PTY tests (`crates/agent-engine/src/tools/shell/pty.rs`, `crates/agent-engine/src/tools/shell/session.rs`) have historically been flaky under parallel execution due to TTY fd contention. Recent runs pass in parallel consistently — but if you see `shell::` failures, retry with `--test-threads=1` before suspecting your change.
@@ -60,12 +61,14 @@ crates/agent-core/src/    (crate: synaps-core)
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
 │   ├── session.rs        — on-disk session persistence (JSONL), `/saveas` naming, `resolve_session()` (chain → name → partial ID)
 │   ├── chain.rs          — named chain bookmarks (`~/.synaps-cli/chains/<name>.json`), auto-advance on `/compact`
-│   ├── auth/             — OAuth PKCE flow, token storage (fs4-locked, mode 600)
+│   ├── auth/             — typed credential broker: OAuth PKCE, cloud identity (AWS/Azure/GCP), static keys, token storage (fs4-locked, mode 600)
 │   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
 │   ├── logging.rs        — tracing subscriber setup
 │   └── watcher_types.rs  — shared types for watcher IPC
 ├── memory/               — session memory store (mod.rs, store.rs)
+├── orchestration.rs      — worker authorization policy, completion gates, model/role/scope validation
+├── prompt/               — YAML prompt manifests, module composition, path confinement
 └── pricing.rs            — unified pricing table (all providers + models)
 
 crates/agent-engine/src/  (crate: synaps-engine)
@@ -94,13 +97,15 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │       ├── wire.rs       — SSE parser + StreamDecoder (HashMap-based tool call accumulation)
 │       ├── translate.rs  — Anthropic↔OpenAI message/tool/event translation
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
-│       └── ping.rs       — /ping health check (parallel, non-blocking)
+│       ├── ping.rs       — /ping health check (parallel, non-blocking)
+│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, nvidia, openrouter)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
-│   ├── subagent/         — reactive subagent tools (start/status/steer/collect/resume + oneshot)
+│   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
+│   ├── memory/           — memory_store, memory_search, memory_fetch, memory_forget, memory_context tools
 │   ├── agent.rs          — (legacy — prefer the subagent tools)
 │   ├── extension.rs      — extension-provided tool wrapper
 │   ├── respond.rs        — event-bus response tool
@@ -184,6 +189,37 @@ This is the single most important flow to understand.
 
 ## Key Patterns
 
+### Credential Broker & Provider Auth
+
+Typed auth flows live in `crates/agent-core/src/core/auth/`. Three flow families:
+
+- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini. Browser-based device flow with PKCE challenge, refresh token rotation.
+- **Cloud identity** — Azure OpenAI (Azure CLI/managed identity), AWS Bedrock (STS/profile), Google Vertex AI (gcloud ADC). Cloud secrets never leave the broker.
+- **Static keys** — Groq, Cerebras, NVIDIA, OpenRouter, Kimi. Env var or config-file discovery, broker-owned.
+
+The broker boundary ensures long-lived tokens (refresh tokens, cloud credentials) are never handed to model runtimes. Short-lived access tokens are minted per-request. `synaps auth-broker` exposes the broker over a socket for multi-machine setups (shared OAuth across a fleet over WireGuard or TLS).
+
+### Memory System
+
+Project-scoped persistent memory in `crates/agent-core/src/memory/`:
+
+- **Store**: JSONL files at `~/.synaps-cli/memory/<project>/`, one record per line.
+- **Index**: Lexical substring index for fast search without external dependencies.
+- **Sensitivity**: Three classes — `normal` (full access), `sensitive` (redacted in exports/logs), `secret` (never returned via tool calls).
+- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone), `memory_context` (session lifecycle control).
+
+Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
+
+### Reactive Subagent Lifecycle
+
+Implementation split across `crates/agent-engine/src/tools/subagent/` (tools) and `crates/agent-engine/src/orchestration.rs` (lifecycle):
+
+- **Fire-and-forget dispatch**: `subagent_start` returns a handle immediately, worker runs in background.
+- **Polling + steering**: `subagent_status` (non-blocking poll), `subagent_steer` (inject guidance mid-run).
+- **Completion gate**: Only blocks the foreground on `Terminal|Collected` workers (finished but unreconciled). Running workers pass through — this is what enables the reactive pattern where the foreground continues while workers run.
+- **Collection + reconciliation**: `subagent_collect` retrieves results; `reconciled=true` attests the foreground has incorporated the result, clearing the gate.
+- **Tombstones**: Expired uncollected workers become bounded tombstones that release transport/thread/channel resources while retaining a UTF-8-safe output tail and an idempotent collection path. Reconciled tombstones are pruned on the next reaper pass.
+
 ### Adding a New Tool
 
 1. Create `crates/agent-engine/src/tools/my_tool.rs` with a struct implementing the `Tool` trait:
@@ -217,7 +253,7 @@ The old "5-site sync" pain point was solved by the `define_settings!` macro. Now
 ### Adding a New Model
 
 1. `crates/agent-core/src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple (Anthropic models only).
-2. For OpenAI-compatible provider models: add to `crates/agent-engine/src/runtime/openai/registry.rs` in the provider's `models` array as `(model_id, label, tier)`.
+2. For OpenAI-compatible provider models: add to the provider's catalog file in `crates/agent-engine/src/runtime/openai/catalog/` (e.g. `groq.rs`, `kimi.rs`). Each provider has its own catalog with model rows specifying ID, label, tier, and capability flags.
 3. If it supports adaptive thinking: update `model_supports_adaptive_thinking()`.
 4. If it supports 1M context opt-in: update `model_supports_1m()`. If context window differs: `context_window_for_model()`.
 5. Pricing: see `crates/agent-core/src/pricing.rs` for the unified pricing table. `record_cost()` in `crates/agent-tui/src/tui/app.rs` uses it. Default falls back to Sonnet pricing.
