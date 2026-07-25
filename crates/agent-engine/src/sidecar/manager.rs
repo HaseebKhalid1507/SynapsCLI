@@ -14,9 +14,13 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
+
+/// Maximum bytes per sidecar stdout/stderr line. A hostile or buggy sidecar
+/// sending a single unbounded line could OOM the host without this cap.
+const MAX_SIDECAR_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB, matches MCP
 
 use super::protocol::{InsertTextMode, SidecarCommand, SidecarFrame, SIDECAR_PROTOCOL_VERSION};
 
@@ -112,8 +116,25 @@ impl SidecarManager {
         // Reader task: parse line-JSON events and forward as SidecarLifecycleEvent.
         let event_tx = tx.clone();
         let reader_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let mut limited = (&mut reader).take(MAX_SIDECAR_LINE_BYTES + 1);
+                match tokio::io::AsyncBufReadExt::read_line(&mut limited, &mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                if line.len() as u64 > MAX_SIDECAR_LINE_BYTES {
+                    let _ = event_tx
+                        .send(SidecarLifecycleEvent::Error(format!(
+                            "sidecar stdout line exceeded {MAX_SIDECAR_LINE_BYTES} bytes, dropped"
+                        )))
+                        .await;
+                    continue;
+                }
+                let line = line.trim_end();
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -168,9 +189,21 @@ impl SidecarManager {
         // Stderr task: forward sidecar stderr to tracing for diagnostics.
         let stderr_handle = stderr.map(|stderr| {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "sidecar::manager", "{line}");
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let mut limited = (&mut reader).take(MAX_SIDECAR_LINE_BYTES + 1);
+                    match tokio::io::AsyncBufReadExt::read_line(&mut limited, &mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    if line.len() as u64 > MAX_SIDECAR_LINE_BYTES {
+                        tracing::warn!(target: "sidecar::manager", "stderr line exceeded bound, dropped");
+                        continue;
+                    }
+                    tracing::debug!(target: "sidecar::manager", "{}", line.trim_end());
                 }
             })
         });
@@ -244,7 +277,18 @@ impl SidecarManager {
             let _ = stdin.shutdown().await;
         }
         if let Some(mut child) = self.child.take() {
-            let _ = child.wait().await;
+            // Grace period: wait up to 2s, then kill. Matches MCP/extension patterns.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(_) => {} // exited gracefully
+                Err(_) => {
+                    let _ = child.kill().await;
+                }
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();

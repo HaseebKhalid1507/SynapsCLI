@@ -1091,7 +1091,10 @@ pub(crate) async fn handle_input_action(
                             .and_then(|s| s.display_name.as_deref())
                             .unwrap_or("sidecar")
                             .to_string();
-                        let v = app.sidecars.get_mut(&target_pid).unwrap();
+                        let v = match app.sidecars.get_mut(&target_pid) {
+                            Some(v) => v,
+                            None => return ControlFlow::Continue(()),
+                        };
                         if v.armed {
                             v.armed = false;
                             if let Err(err) = v.manager.release().await {
@@ -1200,7 +1203,8 @@ pub(crate) async fn handle_input_action(
                                                 },
                                             }
                     } else if app.sidecars.len() == 1 {
-                        app.sidecars.values().next().unwrap().status_line()
+                        // Safe: len() == 1 guarantees .next() is Some
+                        app.sidecars.values().next().expect("len == 1").status_line()
                     } else if app.sidecars.is_empty() {
                         match synaps_cli::sidecar::discovery::discover() {
                                                 Some(s) => format!(

@@ -43,8 +43,11 @@ pub async fn exchange_code_for_tokens(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        // Truncate error body — server responses may contain sensitive data
+        // (tokens, internal errors). Status code alone is usually sufficient.
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Token exchange failed ({}): {}", status, text));
+        let truncated = if text.len() > 200 { &text[..200] } else { &text };
+        return Err(format!("Token exchange failed ({}): {}", status, truncated));
     }
 
     let token_resp: TokenResponse = resp
@@ -87,7 +90,8 @@ pub async fn refresh_token(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Token refresh failed ({}): {}", status, text));
+        let truncated = if text.len() > 200 { &text[..200] } else { &text };
+        return Err(format!("Token refresh failed ({}): {}", status, truncated));
     }
 
     let token_resp: TokenResponse = resp

@@ -92,7 +92,9 @@ mod tests {
     use agent_core::reasoning::ReasoningLevel;
 
     fn make_model(runtime_id: &str) -> CatalogModel {
-        let (provider, id) = runtime_id.split_once('/').unwrap();
+        let (provider, id) = runtime_id
+            .split_once('/')
+            .expect("test runtime_id must be 'provider/model'");
         let mut m = CatalogModel::new(provider, provider, id).unwrap();
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.source = CatalogSource::Live;
