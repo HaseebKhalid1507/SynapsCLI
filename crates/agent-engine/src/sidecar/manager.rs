@@ -138,7 +138,7 @@ impl SidecarManager {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let event = match serde_json::from_str::<SidecarFrame>(&line) {
+                let event = match serde_json::from_str::<SidecarFrame>(line) {
                     Ok(ev) => ev,
                     Err(err) => {
                         let _ = event_tx
