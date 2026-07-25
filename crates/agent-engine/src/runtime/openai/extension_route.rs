@@ -199,6 +199,14 @@ pub(crate) async fn route_extension_provider(
                 crate::extensions::runtime::process::PROVIDER_EVENT_QUEUE_CAPACITY,
             );
         let tx_clone = tx.clone();
+        // Honest audit metric: `ToolUse` events genuinely arrive here and are
+        // dropped (streaming tool-use is not routed yet). Reporting 0
+        // regardless contradicted `tools_requested`'s documented meaning
+        // ("0 if no tool-use loop ran") and hid the drop from the TUI, which
+        // only renders `tools=N` when N > 0. Count what the provider actually
+        // asked for, even though we discard it.
+        let stream_tool_uses = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stream_tool_uses_fwd = std::sync::Arc::clone(&stream_tool_uses);
         let forwarder = tokio::spawn(async move {
             use crate::extensions::runtime::process::ProviderStreamEvent;
             while let Some(event) = sink_rx.recv().await {
@@ -211,6 +219,7 @@ pub(crate) async fn route_extension_provider(
                     }
                     ProviderStreamEvent::ToolUse { .. } => {
                         first_event.mark();
+                        stream_tool_uses_fwd.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!("provider.stream tool_use event ignored (streaming tool-use not yet wired)");
                     }
                     ProviderStreamEvent::ThinkingDelta { .. }
@@ -230,20 +239,24 @@ pub(crate) async fn route_extension_provider(
             _ = cancel.cancelled() => {
                 forwarder.abort();
                 attempt.finish_canceled();
-                emit_audit(true, "error", Some("canceled"), 0);
+                emit_audit(
+                    true,
+                    "error",
+                    Some("canceled"),
+                    stream_tool_uses.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 return Err("operation canceled".into());
             }
             res = stream_fut => res,
         };
         let _ = forwarder.await;
+        // Forwarder joined: the counter is final.
+        let stream_tool_uses = stream_tool_uses.load(std::sync::atomic::Ordering::Relaxed);
         if cancel.is_cancelled() {
             attempt.finish_canceled();
-            emit_audit(true, "error", Some("canceled"), 0);
+            emit_audit(true, "error", Some("canceled"), stream_tool_uses);
             return Err("operation canceled".into());
         }
-        // TODO(audit): tools_requested is reported as 0 for the streaming
-        // path until ProviderStreamEvent::ToolUse is wired through the
-        // forwarder; tool-use over streaming is not yet routed.
         match result {
             Ok(complete) => {
                 attempt.finish_success(
@@ -253,7 +266,7 @@ pub(crate) async fn route_extension_provider(
                         .map(trace_ext::stop_reason_from_extension),
                     trace_ext::usage_from_extension_value(complete.usage.as_ref()),
                 );
-                emit_audit(true, "ok", None, 0);
+                emit_audit(true, "ok", None, stream_tool_uses);
                 Ok(serde_json::json!({
                     "content": complete.content,
                     "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
@@ -262,7 +275,7 @@ pub(crate) async fn route_extension_provider(
             }
             Err(e) => {
                 attempt.finish_failed(trace_ext::EXTENSION_PROVIDER_ERROR_CODE);
-                emit_audit(true, "error", Some("provider_error"), 0);
+                emit_audit(true, "error", Some("provider_error"), stream_tool_uses);
                 Err(format!("extension provider: {e}").into())
             }
         }
@@ -272,6 +285,9 @@ pub(crate) async fn route_extension_provider(
         // tool-loop helper may perform several interior provider.complete
         // calls, which are deliberately not counted as separate attempts
         // (see `trace::extension` module docs).
+        // Populated by the tool-loop helper; stays 0 on the direct-complete
+        // branch, where no loop runs.
+        let mut tools_requested: u32 = 0;
         let mut attempt = trace_ext::ExtensionAttempt::new(
             trace_ext::begin_extension_tracer(
                 trace,
@@ -347,6 +363,7 @@ pub(crate) async fn route_extension_provider(
                 },
                 30000,
                 8,
+                &mut tools_requested,
             )
             .await
         } else {
@@ -354,13 +371,9 @@ pub(crate) async fn route_extension_provider(
         };
         if cancel.is_cancelled() {
             attempt.finish_canceled();
-            emit_audit(false, "error", Some("canceled"), 0);
+            emit_audit(false, "error", Some("canceled"), tools_requested);
             return Err("operation canceled".into());
         }
-        // TODO(audit): tools_requested is reported as 0 here; the
-        // complete_provider_with_tools helper does not yet expose its
-        // observed tool-use iteration count. Wire that through when the
-        // helper grows a return-tuple or counter argument.
         match result {
             Ok(complete) => {
                 let text = complete
@@ -381,7 +394,7 @@ pub(crate) async fn route_extension_provider(
                         .map(trace_ext::stop_reason_from_extension),
                     trace_ext::usage_from_extension_value(complete.usage.as_ref()),
                 );
-                emit_audit(false, "ok", None, 0);
+                emit_audit(false, "ok", None, tools_requested);
                 Ok(serde_json::json!({
                     "content": complete.content,
                     "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
@@ -390,7 +403,7 @@ pub(crate) async fn route_extension_provider(
             }
             Err(e) => {
                 attempt.finish_failed(trace_ext::EXTENSION_PROVIDER_ERROR_CODE);
-                emit_audit(false, "error", Some("provider_error"), 0);
+                emit_audit(false, "error", Some("provider_error"), tools_requested);
                 Err(format!("extension provider: {e}").into())
             }
         }
