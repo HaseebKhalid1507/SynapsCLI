@@ -84,6 +84,9 @@ synaps login --provider xai-auth
 synaps login --provider github-copilot
 synaps login --provider google-gemini  # requires a Synaps-owned Google Desktop OAuth client registration
 
+# Static API key
+synaps login --provider kimi            # Moonshot AI (MOONSHOT_API_KEY / KIMI_API_KEY)
+
 # Cloud identity; credentials remain broker-owned
 synaps login --provider azure-openai
 synaps login --provider aws-bedrock
