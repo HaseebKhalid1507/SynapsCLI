@@ -186,6 +186,10 @@ async fn infinite_tool_loop_stops_at_exact_round_budget() {
 
     let budget = TurnBudget {
         max_provider_rounds: 3,
+        // Strict fixture: graceful continuation OFF so the round cap is the
+        // exact hard stop this test pins. (Foreground defaults to 8
+        // renewals, which would yield 3 * (1 + 8) = 27 rounds.)
+        max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 8).await;
