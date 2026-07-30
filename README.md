@@ -150,7 +150,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 No YAML. No TOML. No JSON. Just `key = value` in `~/.synaps-cli/config`:
 
 ```ini
-model = anthropic/claude-sonnet-4-6
+model = anthropic/claude-opus-5
 thinking = high
 theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.
