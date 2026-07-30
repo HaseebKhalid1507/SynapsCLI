@@ -132,8 +132,8 @@ impl Default for Theme {
             table_cell_color: Color::Rgb(175, 185, 200),
 
             bg: Color::Rgb(10, 12, 18),
-            // Reset derives a restrained, theme-relative lift from `bg`.
-            message_bg: Color::Reset,
+            // Recessed transcript surface; deliberately distinct from user and tool cards.
+            message_bg: Color::Rgb(6, 8, 13),
             border: Color::Rgb(28, 36, 50),
             border_active: Color::Rgb(50, 180, 210),
             muted: Color::Rgb(50, 58, 72),
@@ -204,19 +204,10 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// Conversation canvas: an explicit theme `message_bg` wins; otherwise
-    /// derive a subtle lift from this theme's own base. This keeps every built-in
-    /// palette coherent instead of using the default theme's fixed dark blue.
+    /// Conversation canvas. Every built-in palette specifies this independently
+    /// so its transcript contrast is intentional rather than a generic RGB rule.
     pub(crate) fn message_background(&self) -> Color {
-        match (self.message_bg, self.bg) {
-            (Color::Reset, Color::Rgb(r, g, b)) => Color::Rgb(
-                r.saturating_add(4),
-                g.saturating_add(6),
-                b.saturating_add(6),
-            ),
-            (Color::Reset, bg) => bg,
-            (color, _) => color,
-        }
+        self.message_bg
     }
 
     /// Dispatcher for builtin themes
