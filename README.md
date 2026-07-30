@@ -29,6 +29,15 @@ Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agen
 
 ---
 
+## Philosophy
+
+- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
+- **Multi-agent is the default.** Single-agent is just n=1.
+- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
+- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
+
+---
+
 ## Install
 
 ```bash
@@ -188,15 +197,10 @@ Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) — que
 
 ---
 
-## Philosophy
-
-- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
-- **Multi-agent is the default.** Single-agent is just n=1.
-- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
-- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
+## Architecture
 
 <details>
-<summary><b>Architecture</b></summary>
+<summary><b>Crate layout</b></summary>
 
 ```
 crates/
