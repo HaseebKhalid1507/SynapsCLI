@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use ratatui::style::Color;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -34,8 +35,10 @@ pub(crate) struct Theme {
     pub(crate) table_header_color: Color,
     pub(crate) table_cell_color: Color,
 
-    // Base
+    // Base. `message_bg` is the conversation canvas between the header and input.
+    // Color::Reset means derive a theme-relative lift from `bg`.
     pub(crate) bg: Color,
+    pub(crate) message_bg: Color,
     pub(crate) border: Color,
     pub(crate) border_active: Color,
     pub(crate) muted: Color,
@@ -129,6 +132,8 @@ impl Default for Theme {
             table_cell_color: Color::Rgb(175, 185, 200),
 
             bg: Color::Rgb(10, 12, 18),
+            // Reset derives a restrained, theme-relative lift from `bg`.
+            message_bg: Color::Reset,
             border: Color::Rgb(28, 36, 50),
             border_active: Color::Rgb(50, 180, 210),
             muted: Color::Rgb(50, 58, 72),
@@ -199,6 +204,21 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Conversation canvas: an explicit theme `message_bg` wins; otherwise
+    /// derive a subtle lift from this theme's own base. This keeps every built-in
+    /// palette coherent instead of using the default theme's fixed dark blue.
+    pub(crate) fn message_background(&self) -> Color {
+        match (self.message_bg, self.bg) {
+            (Color::Reset, Color::Rgb(r, g, b)) => Color::Rgb(
+                r.saturating_add(4),
+                g.saturating_add(6),
+                b.saturating_add(6),
+            ),
+            (Color::Reset, bg) => bg,
+            (color, _) => color,
+        }
+    }
+
     /// Dispatcher for builtin themes
     fn builtin(name: &str) -> Option<Self> {
         match name {
@@ -259,6 +279,7 @@ impl Theme {
             "table_header_color" => self.table_header_color = c,
             "table_cell_color" => self.table_cell_color = c,
             "bg" => self.bg = c,
+            "message_bg" => self.message_bg = c,
             "border" => self.border = c,
             "border_active" => self.border_active = c,
             "muted" => self.muted = c,
@@ -473,6 +494,19 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
         return Some(Theme::load_from(&theme_file));
     }
     Theme::builtin(name)
+}
+
+/// Whether the root TUI paints an opaque canvas. `false` preserves the exact
+/// legacy 0.7.0 layout behavior outside individual widgets.
+pub(crate) static BACKGROUND_OPAQUE: LazyLock<AtomicBool> =
+    LazyLock::new(|| AtomicBool::new(synaps_cli::config::load_config().tui_background_opaque));
+
+pub(crate) fn background_is_opaque() -> bool {
+    BACKGROUND_OPAQUE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_background_opaque(opaque: bool) {
+    BACKGROUND_OPAQUE.store(opaque, Ordering::Relaxed);
 }
 
 pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =

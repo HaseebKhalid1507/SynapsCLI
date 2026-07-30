@@ -14,6 +14,7 @@ use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
 
 use super::text_metrics::{char_width, width as display_width};
+use super::theme::background_is_opaque;
 
 /// The six named panes that make up the outer app layout.
 ///
@@ -810,6 +811,13 @@ pub(crate) fn render_frame_into(
     exit_fx: &mut Option<Effect>,
     elapsed: std::time::Duration,
 ) {
+    if background_is_opaque() {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(THEME.load().bg)),
+            frame.area(),
+        );
+    }
+
     // ── Layout ────────────────────────────────────────────────────────────
     let has_subagents = !model.subagents.is_empty();
     let subagent_height: u16 = if has_subagents {
@@ -985,7 +993,12 @@ pub(crate) fn render_frame_into(
         .padding(Padding::horizontal(1));
     let msg_inner = msg_block.inner(msg_area);
     let messages_widget = Paragraph::new(visible).block(msg_block.clone());
-    frame.render_widget(Clear, msg_area);
+    // The conversation gets its own surface, distinct from the header, input,
+    // and footer chrome. Paint it in both modes so the separation is reliable.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(THEME.load().message_background())),
+        msg_area,
+    );
     if model.secret_prompt.is_some() {
         let blank = Paragraph::new(Vec::<ratatui::text::Line>::new()).block(msg_block);
         frame.render_widget(blank, msg_area);

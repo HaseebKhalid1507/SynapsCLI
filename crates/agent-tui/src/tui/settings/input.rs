@@ -592,6 +592,13 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
     match key {
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
+        "tui_background_opaque" => {
+            if snap.background_opaque {
+                "opaque".to_string()
+            } else {
+                "invisible".to_string()
+            }
+        }
         "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -658,6 +665,7 @@ mod tests {
             subagent_timeout: 0,
             api_retries: 0,
             theme_name: "t".into(),
+            background_opaque: true,
             plugins: vec![
                 super::super::PluginRow {
                     name: "p1".into(),
