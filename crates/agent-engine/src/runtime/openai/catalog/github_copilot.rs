@@ -13,7 +13,7 @@
 //! rows but is not yet routed by this broker, so we fall back to
 //! `/chat/completions` where it is also advertised.
 //!
-//! See `docs/github-copilot-model-catalog-spec.md`.
+//! See `docs/specs/github-copilot-model-catalog-spec.md`.
 
 use super::{
     CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport,

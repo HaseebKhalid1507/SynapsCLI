@@ -1,6 +1,6 @@
 # Dynamic exact-model reasoning modes: native Anthropic and xAI
 
-Builds on `docs/provider-reasoning-modes-spec.md` (Codex slice). The shared
+Builds on `docs/specs/provider-reasoning-modes-spec.md` (Codex slice). The shared
 typed domain remains `agent_core::reasoning::ReasoningLevel`; this spec extends
 exact-model capability validation, dynamic option derivation, and wire
 construction to the native Anthropic (`anthropic/<id>`, legacy bare `claude-*`)

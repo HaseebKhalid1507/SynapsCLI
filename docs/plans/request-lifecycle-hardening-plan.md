@@ -3,7 +3,7 @@
 ## Objective
 
 Implement the five-phase program defined in
-[`docs/request-lifecycle-hardening-spec.md`](./request-lifecycle-hardening-spec.md):
+[`docs/specs/request-lifecycle-hardening-spec.md`](../specs/request-lifecycle-hardening-spec.md):
 (1) immediate correctness and privacy hardening, (2) provider-neutral
 observability, (3) authorization-enforced progressive capability disclosure,
 (4) bounded side-effect-aware agent execution, and (5) consistent context

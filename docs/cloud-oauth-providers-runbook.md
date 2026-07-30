@@ -1,6 +1,6 @@
 # Cloud OAuth Providers — Implementation and Deployment Runbook
 
-This runbook operationalizes [`cloud-oauth-providers-spec.md`](cloud-oauth-providers-spec.md). Execute in order. It is a pre-deployment plan, not evidence that Azure or Vertex registration exists.
+This runbook operationalizes [`cloud-oauth-providers-spec.md`](specs/cloud-oauth-providers-spec.md). Execute in order. It is a pre-deployment plan, not evidence that Azure or Vertex registration exists.
 
 ## 0. Stop/go matrix
 

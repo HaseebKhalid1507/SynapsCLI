@@ -109,4 +109,4 @@ The Judge personally inspected the committed spec, collector accounting and
 reserve invariants, manager/process/TUI production wiring, flood and mutation
 oracles, widget policy, and sibling output channels. It did not modify files or
 rerun Cargo commands. The unrelated unstaged
-`docs/request-lifecycle-hardening-spec.md` edit was excluded from review.
+`docs/specs/request-lifecycle-hardening-spec.md` edit was excluded from review.

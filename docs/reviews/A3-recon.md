@@ -2,7 +2,7 @@
 
 **Branch:** `refactor/a3-crate-split`
 **Target:** `~/Projects/agent-runtime`
-**Plan source:** `docs/REVIEW-S205.md`, recommendation A3
+**Plan source:** `docs/reviews/REVIEW-S205.md`, recommendation A3
 **Status:** Read-only recon. No files modified.
 
 > **TL;DR.** The TUI layer is already cleanly separable — nothing in the library reaches up into `tui/`. The real problem lives one level deeper: there is a **mutual dependency cycle between `runtime/`, `extensions/`, and `tools/`** (with `events/` and `core/` participating on smaller back-edges). The four-crate plan as written (`agent-core` / `agent-providers` / `agent-tui` / `agent-runtime` bin) cannot be implemented as a single Cargo.toml surgery — `agent-providers` would need to import `extensions/`, `tools/`, `events/`, and `skills/`, none of which fit the spec's `agent-providers = "reqwest, SSE, provider/API engine"` description. The split needs an interstitial crate (or careful trait-extraction passes) before any Cargo.toml change. Detailed findings below.

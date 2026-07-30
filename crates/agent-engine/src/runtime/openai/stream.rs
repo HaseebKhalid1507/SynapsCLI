@@ -2349,7 +2349,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
 /// Pure, validated body construction for the xAI Responses API.
 ///
 /// Enforces the exact-model reasoning matrix from
-/// `docs/anthropic-xai-reasoning-modes-spec.md` BEFORE any credential or
+/// `docs/specs/anthropic-xai-reasoning-modes-spec.md` BEFORE any credential or
 /// network access, via the shared per-provider validator:
 /// - `Off` is rejected (never silently omitted) on models whose reasoning
 ///   cannot be disabled; on the non-reasoning model it is trivially omission.

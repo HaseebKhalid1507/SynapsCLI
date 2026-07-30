@@ -3,7 +3,7 @@ title: "A3 Spec — 3-Crate Workspace Split"
 created: "2026-06-13"
 session: S208
 branch: refactor/a3-crate-split
-supersedes: "docs/REVIEW-S205.md A3 (4-crate), docs/A3-recon.md 5-crate option"
+supersedes: "docs/reviews/REVIEW-S205.md A3 (4-crate), docs/reviews/A3-recon.md 5-crate option"
 relates: ["#117", "#116"]
 ---
 

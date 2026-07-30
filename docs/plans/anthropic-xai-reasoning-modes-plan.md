@@ -1,6 +1,6 @@
 # Plan: dynamic exact-model reasoning modes — native Anthropic and xAI
 
-Spec: `docs/anthropic-xai-reasoning-modes-spec.md`. Branch:
+Spec: `docs/specs/anthropic-xai-reasoning-modes-spec.md`. Branch:
 `feat/provider-reasoning-modes` (dedicated worktree).
 
 ## Convergence declaration

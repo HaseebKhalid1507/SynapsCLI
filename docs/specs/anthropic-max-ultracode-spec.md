@@ -48,7 +48,7 @@ Checked-in evidence inspected at this base:
   `claude-fable-5`.
 - `crates/agent-engine/src/runtime/openai/catalog/anthropic.rs:101-114`
   classifies exact static IDs as adaptive named effort or fixed budget.
-- `docs/anthropic-xai-reasoning-modes-spec.md:28-40` records only
+- `docs/specs/anthropic-xai-reasoning-modes-spec.md:28-40` records only
   low/medium/high/xhigh for adaptive Anthropic models and no named effort for
   fixed-budget models.
 

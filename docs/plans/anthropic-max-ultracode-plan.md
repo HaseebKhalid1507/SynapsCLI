@@ -1,6 +1,6 @@
 # Anthropic Max and Ultracode implementation plan
 
-**Specification:** `docs/anthropic-max-ultracode-spec.md`
+**Specification:** `docs/specs/anthropic-max-ultracode-spec.md`
 **Base:** `b1646af`
 **Method:** strict RED → minimal GREEN → refactor; one heavy Cargo command at a
 time with `CARGO_BUILD_JOBS=8`.
