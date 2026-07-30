@@ -159,7 +159,7 @@ Assign people before coding; these are ownership boundaries, not permission to e
 | Harness owner | Local fakes, external-network deny, E2E and adversarial tests | `tests/*cloud*`, `tests/azure_openai_*`, `tests/aws_bedrock_*`, `tests/google_vertex_*`, secret-free fixtures | Interfaces frozen at C1 |
 | Security reviewer | Threat/allowlist/signing review; no builder test authorship before freeze | Review records only; changes returned to owning role | C1–C4 |
 | Release owner | Registrations, sandbox permissions, AWS live evidence, flags/rollback | deployment configuration/evidence in approved operational system; no credentials in repo | C3 |
-| Docs owner | Keep spec/runbook/engplan truthful and synchronized | `docs/cloud-oauth-providers-{spec,runbook}.md`, `.plans/cloud-oauth-providers.plan.html` | All checkpoints |
+| Docs owner | Keep spec/runbook/engplan truthful and synchronized | `docs/cloud-oauth-providers-{spec,runbook}.md` | All checkpoints |
 
 Conflicts are resolved by the listed file owner; cross-cutting interface changes require both owners. No worker edits another owner’s implementation files without handoff. Every checkpoint records commit, commands, result, blockers, owner, and UTC timestamp.
 
