@@ -249,7 +249,8 @@ impl TranscriptStore {
         match &tmsg.msg {
             ChatMessage::User(text) => {
                 let bg = Style::default().bg(THEME.load().user_bg);
-                // Top margin
+                // Top margin — extra <br> for breathing room before the pill
+                lines.push(Line::from(""));
                 lines.push(Line::from(""));
                 // Top padding
                 lines.push(Line::from(Span::styled(
@@ -414,27 +415,11 @@ impl TranscriptStore {
             }
 
             ChatMessage::Text(text) => {
-                // Separator between user block and agent response
-                // After thinking: just a single blank line (no separator)
-                let prev_was_thinking =
-                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
-                if prev_was_thinking {
+                // Turn boundary: two blank lines of breathing room between the
+                // previous block and the agent header. Replaces the old
+                // ──── · ──── divider — the extra <br> carries the beat.
+                if i > 0 {
                     lines.push(Line::from(""));
-                } else if i > 0 {
-                    lines.push(Line::from(""));
-                    let sep_total = width.min(40);
-                    let sep_half = sep_total / 2;
-                    let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
-                    let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
-                    let sep_content_width =
-                        sep_left.chars().count() + 3 + sep_right.chars().count();
-                    let pad_left = width.saturating_sub(sep_content_width) / 2;
-                    lines.push(Line::from(vec![
-                        Span::styled(" ".repeat(pad_left), Style::default()),
-                        Span::styled(sep_left, Style::default().fg(THEME.load().separator)),
-                        Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
-                        Span::styled(sep_right, Style::default().fg(THEME.load().separator)),
-                    ]));
                     lines.push(Line::from(""));
                 }
                 // Header
@@ -481,6 +466,8 @@ impl TranscriptStore {
                         lines.push_meta(line, meta);
                     }
                 }
+                // Bottom margin — <br> after the agent message
+                lines.push(Line::from(""));
             }
 
             ChatMessage::ToolUseStart {
