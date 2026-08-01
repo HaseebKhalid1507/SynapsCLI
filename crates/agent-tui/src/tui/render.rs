@@ -414,11 +414,11 @@ impl TranscriptStore {
             }
 
             ChatMessage::Text(text) => {
-                // Separator between user block and agent response: always a
-                // single blank line, whether or not thinking preceded. The
-                // ──── · ──── divider was removed on user request; the blank
-                // line alone carries the beat.
+                // Turn boundary: two blank lines of breathing room between the
+                // previous block and the agent header. Replaces the old
+                // ──── · ──── divider — the extra <br> carries the beat.
                 if i > 0 {
+                    lines.push(Line::from(""));
                     lines.push(Line::from(""));
                 }
                 // Header
