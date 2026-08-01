@@ -393,6 +393,7 @@ mod tests {
     // an isolated process.
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
+    #[ignore = "reads process-global HIGHLIGHT_CALLS counter; run isolated with --ignored --test-threads=1 (see task #285)"]
     fn estimator_over_1000_fenced_messages_zero_highlight_calls() {
         use super::super::super::highlight;
 
