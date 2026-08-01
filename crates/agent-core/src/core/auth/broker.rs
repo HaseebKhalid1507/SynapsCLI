@@ -282,6 +282,7 @@ impl ProxyRequest {
             && self.provider != "google-gemini"
             && self.provider != "openai-codex"
             && self.provider != "anthropic"
+            && self.provider != "kimi-code"
             && static_provider(&self.provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
@@ -304,6 +305,12 @@ impl ProxyRequest {
                     "/models" | "/chat/completions" | "/responses"
                 )
             || self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
+            // Managed Kimi Code endpoint allowlist: chat inference plus the
+            // read-only catalog/profile/quota surfaces the official CLI uses.
+            || self.provider == "kimi-code"
+                && (self.path == "/chat/completions"
+                    || self.method == ProxyMethod::Get
+                        && matches!(self.path.as_str(), "/models" | "/me" | "/usages"))
             || self.provider == "openai-codex"
                 && self.method == ProxyMethod::Get
                 && is_allowed_openai_codex_path(&self.path)
@@ -1568,6 +1575,12 @@ impl LocalBroker {
             // never leaves the broker; account header is derived broker-side.
             let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
             (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
+        } else if request.provider == "kimi-code" {
+            // Managed Kimi Code OAuth proxy: short-lived (~15 min) access
+            // token resolved broker-side; the rotating refresh token never
+            // leaves the boundary. Base is pinned to the managed endpoint.
+            let token = self.access_token(OAuthProviderId::KimiCode).await?;
+            (token.token, super::kimi_code::API_BASE_URL.to_string())
         } else if request.provider == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
@@ -1585,6 +1598,7 @@ impl LocalBroker {
         let mut builder = if request.provider == "google-gemini"
             || request.provider == "openai-codex"
             || request.provider == "anthropic"
+            || request.provider == "kimi-code"
         {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -1647,6 +1661,15 @@ impl LocalBroker {
                 builder = builder.query(&[("alt", "sse")]);
             }
             builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
+        }
+        if request.provider == "kimi-code" {
+            // Conventional Kimi device-identity surface (mirrors the official
+            // CLI's `X-Msh-*` headers). Values are non-secret; the User-Agent
+            // identifies Synaps honestly.
+            let device_id = super::kimi_code::load_or_create_device_id();
+            for (name, value) in super::kimi_code::identity_request_headers(&device_id) {
+                builder = builder.header(name, value);
+            }
         }
         if let Some(bytes) = &request.body_bytes {
             // Exact-byte handoff (request-trace spec §6.2): send the very
@@ -2600,6 +2623,70 @@ mod tests {
             ..ok
         };
         assert!(matches!(relative.validate(), Err(BrokerError::Denied(_))));
+    }
+
+    /// Managed Kimi Code proxy: chat inference plus the read-only catalog,
+    /// profile, and quota GETs the official CLI uses — nothing else.
+    #[test]
+    fn proxy_allows_only_pinned_kimi_code_paths() {
+        let chat = ProxyRequest {
+            provider: "kimi-code".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: None,
+            stream: true,
+            body_bytes: None,
+        };
+        assert!(chat.validate().is_ok(), "kimi-code chat must be allowed");
+
+        for path in ["/models", "/me", "/usages"] {
+            let get = ProxyRequest {
+                provider: "kimi-code".into(),
+                method: ProxyMethod::Get,
+                path: path.into(),
+                body: None,
+                stream: false,
+                body_bytes: None,
+            };
+            assert!(get.validate().is_ok(), "kimi-code GET {path} must pass");
+            // The same surface must not accept POST (read-only endpoints).
+            let post = ProxyRequest {
+                method: ProxyMethod::Post,
+                ..get
+            };
+            assert!(
+                matches!(post.validate(), Err(BrokerError::Denied(_))),
+                "kimi-code POST {path} must be denied"
+            );
+        }
+
+        // Arbitrary same-host endpoints (feedback/upload/admin) stay denied.
+        for path in ["/feedback", "/search", "/fetch", "/completions"] {
+            let denied = ProxyRequest {
+                provider: "kimi-code".into(),
+                method: ProxyMethod::Post,
+                path: path.into(),
+                body: None,
+                stream: false,
+                body_bytes: None,
+            };
+            assert!(
+                matches!(denied.validate(), Err(BrokerError::Denied(_))),
+                "kimi-code {path} must be denied"
+            );
+        }
+
+        // `kimi` stays the static Moonshot API-key provider key — validating
+        // it as an OAuth proxy id must keep resolving via static_provider.
+        let static_kimi = ProxyRequest {
+            provider: "kimi".into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: None,
+            stream: false,
+            body_bytes: None,
+        };
+        assert!(static_kimi.validate().is_ok());
     }
 
     /// OAuth providers stay fail-closed except reviewed catalog paths.
