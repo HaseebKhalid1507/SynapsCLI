@@ -249,7 +249,8 @@ impl TranscriptStore {
         match &tmsg.msg {
             ChatMessage::User(text) => {
                 let bg = Style::default().bg(THEME.load().user_bg);
-                // Top margin
+                // Top margin — extra <br> for breathing room before the pill
+                lines.push(Line::from(""));
                 lines.push(Line::from(""));
                 // Top padding
                 lines.push(Line::from(Span::styled(
@@ -465,6 +466,8 @@ impl TranscriptStore {
                         lines.push_meta(line, meta);
                     }
                 }
+                // Bottom margin — <br> after the agent message
+                lines.push(Line::from(""));
             }
 
             ChatMessage::ToolUseStart {
