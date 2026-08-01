@@ -775,11 +775,23 @@ pub(crate) fn render_frame(
         // P16.3 gate: the scrub itself is gated on tmux provenance inside
         // `scrub_crossterm_terminal_edges` (short-circuits before any size
         // query when caps affirmatively say no-tmux).
+        //
+        // Fix A (tmux-canvas-edge-scrub): the scrub area is entirely inside
+        // the transcript body (edge_scrub_area skips 2 top rows for the header
+        // + msg top border, and `protected_bottom_rows` for the subagent,
+        // download, input, and footer chrome). So the color that must physically
+        // land at those edge cells is the transcript CANVAS color
+        // (`message_background()`), not the chrome bg (`THEME.bg`). On the
+        // recessed themes (catppuccin, gruvbox, monokai, nord, tokyo-night)
+        // these differ, and without SGR carried on the scrub the physical
+        // blanks inherited whatever style the terminal was last left in and
+        // ratatui's diff skipped the correction (both frames modelled the
+        // edge cell as `message_background`, so no update was emitted).
         super::viewport::scrub_crossterm_terminal_edges(
             terminal,
             caps,
             model.protected_bottom_rows,
-            Style::default().bg(THEME.load().bg),
+            Style::default().bg(THEME.load().message_background()),
         )?;
 
         terminal.draw(|frame| render_frame_into(frame, model, boot_fx, exit_fx, elapsed))?;
