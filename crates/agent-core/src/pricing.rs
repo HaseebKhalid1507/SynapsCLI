@@ -27,6 +27,9 @@
 #[inline]
 fn model_prices(model: &str) -> (f64, f64) {
     match model {
+        // InferX publishes DeepSeek V4 Flash at $0/M input and output.
+        // Keep this exact ID before generic DeepSeek entries are ever added.
+        "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
         m if m.contains("fable") => (10.0, 50.0),
         m if m.contains("opus") => (5.0, 25.0),
         m if m.contains("sonnet") => (3.0, 15.0),
@@ -197,6 +200,12 @@ mod tests {
             let b = calculate_cost_split(m, i, o, r, w, 0);
             assert!((a - b).abs() < 1e-12, "{m}: {a} != {b}");
         }
+    }
+
+    #[test]
+    fn inferx_deepseek_v4_flash_is_free() {
+        let cost = calculate_cost("inferx/deepseek-v4-flash", 1_000_000, 1_000_000, 0, 0);
+        assert_eq!(cost, 0.0);
     }
 
     #[test]

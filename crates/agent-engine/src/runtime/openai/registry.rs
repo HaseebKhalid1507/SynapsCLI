@@ -298,6 +298,14 @@ pub fn providers() -> &'static [ProviderSpec] {
                 ],
             },
             ProviderSpec {
+                key: "inferx",
+                name: "InferX",
+                base_url: "https://model.inferx.net/endpoints/v1",
+                env_vars: &["INFERX_API_KEY"],
+                default_model: "deepseek-v4-flash",
+                models: &[("deepseek-v4-flash", "DeepSeek V4 Flash", "A")],
+            },
+            ProviderSpec {
                 key: "kimi",
                 name: "Kimi (Moonshot AI)",
                 base_url: "https://api.moonshot.ai/v1",
@@ -485,6 +493,36 @@ mod model_list_tests {
             !debug.to_lowercase().contains("api_key"),
             "no key field may exist: {debug}"
         );
+    }
+
+    #[test]
+    fn inferx_catalog_exposes_its_default_model_and_pinned_endpoint() {
+        let spec = providers()
+            .iter()
+            .find(|spec| spec.key == "inferx")
+            .expect("InferX must be registered");
+        assert_eq!(spec.name, "InferX");
+        assert_eq!(spec.base_url, "https://model.inferx.net/endpoints/v1");
+        assert_eq!(spec.env_vars, ["INFERX_API_KEY"]);
+        assert_eq!(spec.default_model, "deepseek-v4-flash");
+        assert_eq!(
+            spec.models,
+            [("deepseek-v4-flash", "DeepSeek V4 Flash", "A")]
+        );
+    }
+
+    #[test]
+    fn inferx_routes_any_published_model_through_its_pinned_endpoint() {
+        let route = crate::runtime::openai::resolve_route("inferx/deepseek-v4-flash")
+            .expect("InferX's registered default must route");
+        assert_eq!(route.provider, "inferx");
+        assert_eq!(route.model, "deepseek-v4-flash");
+        assert_eq!(route.endpoint, "https://model.inferx.net/endpoints/v1");
+
+        let dynamic = crate::runtime::openai::resolve_route("inferx/future-model")
+            .expect("OpenAI-compatible providers accept published model IDs");
+        assert_eq!(dynamic.model, "future-model");
+        assert_eq!(dynamic.endpoint, route.endpoint);
     }
 
     #[test]
