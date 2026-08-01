@@ -76,7 +76,9 @@ pub fn provider_for_key(provider_key: &str) -> OpenAiReasoningProvider {
         "openrouter" => OpenAiReasoningProvider::OpenRouter,
         "groq" => OpenAiReasoningProvider::Groq,
         "nvidia" => OpenAiReasoningProvider::NvidiaNim,
-        "kimi" => OpenAiReasoningProvider::Kimi,
+        // Both Kimi routes share the level-driven exact-id wiring in
+        // `catalog::kimi` (static Moonshot platform + managed Kimi Code).
+        "kimi" | "kimi-code" => OpenAiReasoningProvider::Kimi,
         _ => OpenAiReasoningProvider::Generic,
     }
 }

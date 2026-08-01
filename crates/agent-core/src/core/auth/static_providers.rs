@@ -138,6 +138,12 @@ pub const STATIC_PROVIDERS: &[StaticProviderSpec] = &[
         env_vars: &["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
     },
     StaticProviderSpec {
+        key: "inferx",
+        name: "InferX",
+        base_url: "https://model.inferx.net/endpoints/v1",
+        env_vars: &["INFERX_API_KEY"],
+    },
+    StaticProviderSpec {
         key: "kimi",
         name: "Kimi (Moonshot AI)",
         base_url: "https://api.moonshot.ai/v1",

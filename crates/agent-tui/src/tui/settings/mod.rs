@@ -93,6 +93,7 @@ pub(crate) struct RuntimeSnapshot {
     pub subagent_timeout: u64,
     pub api_retries: u32,
     pub theme_name: String,
+    pub background_opaque: bool,
     pub plugins: Vec<PluginRow>,
     pub disabled_plugins: Vec<String>,
     /// Non-secret static-key status per provider (masked preview / from-env /
@@ -184,6 +185,7 @@ impl RuntimeSnapshot {
             subagent_timeout: runtime.subagent_timeout(),
             api_retries: runtime.api_retries(),
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
+            background_opaque: config.tui_background_opaque,
             plugins,
             disabled_plugins: config.disabled_plugins.clone(),
             provider_key_status: synaps_cli::auth::broker::static_key_status_map(),
@@ -391,6 +393,7 @@ mod wireup_tests {
             subagent_timeout: 0,
             api_retries: 0,
             theme_name: "t".into(),
+            background_opaque: true,
             plugins: Vec::new(),
             disabled_plugins: Vec::new(),
             provider_key_status: std::collections::BTreeMap::new(),

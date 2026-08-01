@@ -11,14 +11,29 @@
 use agent_core::reasoning::ReasoningLevel;
 
 use super::{
-    anthropic_static_capability, capability_cache, codex_static_capability, kimi_static_capability,
-    plan_codex_execution, xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion,
-    CodexRequestRole, KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
+    anthropic_static_capability, capability_cache, codex_static_capability, kimi_code_capability,
+    kimi_static_capability, plan_codex_execution, xai_static_capability, CatalogProviderKind,
+    CodexMultiAgentVersion, CodexRequestRole, KimiReasoningCapability, ReasoningSupport,
+    XaiReasoningCapability,
 };
 
 /// Conservative option set for providers without authoritative exact-model
 /// metadata. Never includes max/ultra.
 const CONSERVATIVE_OPTIONS: &[&str] = &["off", "adaptive", "low", "medium", "high", "xhigh"];
+
+/// Capability lookup shared by both Kimi routes: the static Moonshot-platform
+/// provider (`kimi/`) and the managed Kimi Code OAuth provider (`kimi-code/`).
+/// Outer `None` = not a Kimi route; inner `None` = unknown exact id (fail
+/// closed at the caller).
+fn kimi_route_capability(model: &str) -> Option<Option<KimiReasoningCapability>> {
+    if let Some(model_id) = model.strip_prefix("kimi/") {
+        return Some(kimi_static_capability(model_id));
+    }
+    if let Some(model_id) = model.strip_prefix("kimi-code/") {
+        return Some(kimi_code_capability(model_id));
+    }
+    None
+}
 
 fn anthropic_model_id(model: &str) -> Option<&str> {
     model
@@ -138,12 +153,12 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
             )),
         };
     }
-    if let Some(model_id) = model.strip_prefix("kimi/") {
+    if let Some(capability) = kimi_route_capability(model) {
         // Adaptive = provider default (omit the field) — always expressible.
         if level == ReasoningLevel::Adaptive {
             return Ok(());
         }
-        return match kimi_static_capability(model_id) {
+        return match capability {
             Some(KimiReasoningCapability::Effort {
                 supported,
                 can_disable,
@@ -248,8 +263,8 @@ pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
             _ => ReasoningLevel::Adaptive,
         });
     }
-    if let Some(model_id) = model.strip_prefix("kimi/") {
-        return Some(match kimi_static_capability(model_id) {
+    if let Some(capability) = kimi_route_capability(model) {
+        return Some(match capability {
             Some(KimiReasoningCapability::Effort {
                 default_level: Some(level),
                 ..
@@ -278,8 +293,8 @@ pub fn reasoning_type_for_model(model: &str) -> &'static str {
             None => "unknown",
         };
     }
-    if let Some(model_id) = model.strip_prefix("kimi/") {
-        return match kimi_static_capability(model_id) {
+    if let Some(capability) = kimi_route_capability(model) {
+        return match capability {
             Some(KimiReasoningCapability::Effort { .. }) => "effort",
             Some(KimiReasoningCapability::AlwaysThinking) => "intrinsic",
             Some(KimiReasoningCapability::ToggleableThinking) => "toggle (on/off)",
@@ -331,8 +346,8 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
             _ => owned(&["adaptive"]),
         };
     }
-    if let Some(model_id) = model.strip_prefix("kimi/") {
-        return match kimi_static_capability(model_id) {
+    if let Some(capability) = kimi_route_capability(model) {
+        return match capability {
             Some(KimiReasoningCapability::Effort {
                 supported,
                 can_disable,

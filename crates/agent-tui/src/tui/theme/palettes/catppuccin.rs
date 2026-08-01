@@ -15,6 +15,7 @@ impl Theme {
             table_cell_color: Color::Rgb(166, 173, 200),
 
             bg: Color::Rgb(30, 30, 46),
+            message_bg: Color::Rgb(21, 21, 33),
             border: Color::Rgb(88, 91, 112),
             border_active: Color::Rgb(180, 190, 254),
             muted: Color::Rgb(108, 112, 134),

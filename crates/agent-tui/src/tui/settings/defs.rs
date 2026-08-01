@@ -139,6 +139,17 @@ define_settings! {
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ Ok(()) };
 
+    tui_background_opaque, "Background", Appearance, EditorKind::Cycler(&["opaque", "invisible"]),
+        "Opaque paints Synaps' theme background; invisible uses your terminal background.",
+        |_runtime, _app, value| {
+            match value {
+                "opaque" => super::super::theme::set_background_opaque(true),
+                "invisible" => super::super::theme::set_background_opaque(false),
+                _ => return Err("expected opaque or invisible".to_string()),
+            }
+            Ok(())
+        };
+
     sidecar_toggle_key, "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
         "Keybind that toggles the active sidecar plugin. Takes effect immediately.",

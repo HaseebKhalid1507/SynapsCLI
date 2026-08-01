@@ -769,4 +769,35 @@ mod tests {
         );
         assert!(auth::provider::parse_cli_provider("google").is_err());
     }
+
+    #[test]
+    fn login_providers_include_kimi_code_from_descriptor() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "kimi-code")
+            .expect("descriptor-driven login must surface kimi-code");
+        assert_eq!(found.key(), "kimi-code");
+        assert_eq!(
+            found.target,
+            LoginTarget::OAuth(auth::OAuthProviderId::KimiCode)
+        );
+        assert_eq!(found.name, "Kimi Code");
+        assert!(!found.recommended);
+        // Storage key is canonical.
+        assert_eq!(oauth_storage_key(found), "kimi-code");
+        // The static Moonshot API-key entry stays reachable at "kimi".
+        let moonshot = find_provider(&providers, "kimi")
+            .expect("Moonshot API-key entry must remain reachable");
+        assert_eq!(
+            moonshot.target,
+            LoginTarget::Static(StaticProviderId("kimi"))
+        );
+        // CLI aliases route to kimi-code except the reserved "kimi".
+        assert_eq!(
+            auth::provider::parse_cli_provider("kimicode")
+                .unwrap()
+                .as_str(),
+            "kimi-code"
+        );
+        assert!(auth::provider::parse_cli_provider("kimi").is_err());
+    }
 }
