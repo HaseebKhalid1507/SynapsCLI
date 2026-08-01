@@ -30,7 +30,7 @@ impl Theme {
 
             // Base — deep blue-black haze, not pure black
             bg: Color::Rgb(10, 11, 17),
-            message_bg: Color::Rgb(6, 7, 12),
+            message_bg: Color::Rgb(10, 11, 17),
             border: Color::Rgb(30, 35, 52),
             border_active: CYAN,
             muted: Color::Rgb(74, 82, 104),
