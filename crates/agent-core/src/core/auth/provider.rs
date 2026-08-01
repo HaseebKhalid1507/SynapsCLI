@@ -20,6 +20,7 @@ pub enum OAuthProviderId {
     Xai,
     GitHubCopilot,
     GoogleGemini,
+    KimiCode,
 }
 
 impl OAuthProviderId {
@@ -30,6 +31,7 @@ impl OAuthProviderId {
             Self::Xai => "xai-auth",
             Self::GitHubCopilot => "github-copilot",
             Self::GoogleGemini => "google-gemini",
+            Self::KimiCode => "kimi-code",
         }
     }
 }
@@ -49,6 +51,7 @@ impl FromStr for OAuthProviderId {
             "xai-auth" => Ok(Self::Xai),
             "github-copilot" => Ok(Self::GitHubCopilot),
             "google-gemini" => Ok(Self::GoogleGemini),
+            "kimi-code" => Ok(Self::KimiCode),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
         }
     }
@@ -95,6 +98,7 @@ pub enum ProviderBehavior {
     Xai,
     GitHubCopilot,
     GoogleGemini,
+    KimiCode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,7 +163,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 5] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 6] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -204,6 +208,16 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 5] = [
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::GoogleGemini,
     },
+    OAuthProviderDescriptor {
+        id: OAuthProviderId::KimiCode,
+        display_name: "Kimi Code",
+        description: "Kimi account device OAuth for Kimi Code (experimental)",
+        recommended: false,
+        // Access tokens are ~15-minute JWTs; the rotating refresh token stays
+        // broker-owned and is never vended.
+        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
+        behavior: ProviderBehavior::KimiCode,
+    },
 ];
 
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
@@ -221,6 +235,11 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
         "google-gemini" | "gemini" | "gemini-cli" | "gemini-code-assist" => {
             Ok(OAuthProviderId::GoogleGemini)
         }
+        // CLI aliases only; canonical storage key is "kimi-code".
+        // `kimi` is NOT accepted here: the static provider key "kimi"
+        // (Moonshot platform, API-key) already claims that CLI token and we
+        // must not silently redirect it to the Kimi Code OAuth flow.
+        "kimi-code" | "kimicode" | "kimi-cli" => Ok(OAuthProviderId::KimiCode),
         _ => Err(format!("unknown OAuth provider: {value}")),
     }
 }
@@ -236,6 +255,7 @@ pub async fn login(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
         ProviderBehavior::Xai => super::providers::xai::login().await,
         ProviderBehavior::GitHubCopilot => super::providers::github_copilot::login().await,
         ProviderBehavior::GoogleGemini => super::providers::google_gemini::login().await,
+        ProviderBehavior::KimiCode => super::providers::kimi_code::login().await,
     }
 }
 
@@ -260,6 +280,7 @@ pub async fn refresh(
         ProviderBehavior::GoogleGemini => {
             super::providers::google_gemini::refresh(client, refresh).await
         }
+        ProviderBehavior::KimiCode => super::providers::kimi_code::refresh(client, refresh).await,
     }
 }
 
@@ -389,5 +410,46 @@ mod tests {
         );
         assert_eq!(desc.behavior, ProviderBehavior::GitHubCopilot);
         assert!(!desc.recommended);
+    }
+
+    #[test]
+    fn kimi_code_canonical_id_and_cli_aliases() {
+        assert_eq!(OAuthProviderId::KimiCode.as_str(), "kimi-code");
+        assert_eq!(
+            OAuthProviderId::from_str("kimi-code").unwrap(),
+            OAuthProviderId::KimiCode
+        );
+        // Aliases are CLI-only — canonical FromStr rejects them.
+        assert!(OAuthProviderId::from_str("kimicode").is_err());
+        assert!(OAuthProviderId::from_str("kimi-cli").is_err());
+        assert_eq!(
+            parse_cli_provider("KimiCode").unwrap(),
+            OAuthProviderId::KimiCode
+        );
+        assert_eq!(
+            parse_cli_provider("kimi-cli").unwrap(),
+            OAuthProviderId::KimiCode
+        );
+        assert_eq!(
+            parse_cli_provider("kimi-code").unwrap(),
+            OAuthProviderId::KimiCode
+        );
+        // `kimi` MUST remain reserved for the static Moonshot-platform
+        // API-key provider; treating it as a Kimi Code OAuth alias would
+        // silently redirect existing users' `synaps login --provider kimi`.
+        assert!(
+            parse_cli_provider("kimi").is_err(),
+            "'kimi' must not resolve to kimi-code OAuth"
+        );
+        let registry = registry();
+        let desc = registry.get(OAuthProviderId::KimiCode).expect("descriptor");
+        assert_eq!(desc.id, OAuthProviderId::KimiCode);
+        // Broker keeps the rotating refresh token; only vends access + expiry.
+        assert_eq!(
+            desc.broker_strategy,
+            BrokerCredentialStrategy::OAuthAccessToken
+        );
+        assert_eq!(desc.behavior, ProviderBehavior::KimiCode);
+        assert!(!desc.recommended, "kimi-code is experimental");
     }
 }
