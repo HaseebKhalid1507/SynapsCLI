@@ -22,6 +22,10 @@
 use agent_core::reasoning::ReasoningLevel;
 use serde_json::{json, Map, Value};
 
+use super::{
+    CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport,
+};
+
 /// Documented reasoning capability for an exact Kimi model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KimiReasoningCapability {
@@ -59,6 +63,94 @@ pub fn kimi_static_capability(model_id: &str) -> Option<KimiReasoningCapability>
     }
 }
 
+// ─── Managed Kimi Code (OAuth) catalog ───────────────────────────────────────
+//
+// Exact ids served by the managed endpoint `https://api.kimi.com/coding/v1`
+// (`GET /models`), verified against the official Kimi Code CLI v0.31.1
+// provisioning output. This is a conservative allowlist: unknown ids fail
+// closed at route resolution, mirroring the xai-auth/google-gemini pattern.
+
+/// One managed Kimi Code model row (id as served by `/models`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KimiCodeModelDescriptor {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub context_tokens: Option<u64>,
+}
+
+pub const KIMI_CODE_TEXT_MODELS: &[KimiCodeModelDescriptor] = &[
+    KimiCodeModelDescriptor {
+        id: "k3",
+        label: "Kimi K3",
+        context_tokens: Some(1_048_576),
+    },
+    KimiCodeModelDescriptor {
+        id: "k3-256k",
+        label: "Kimi K3 256k",
+        context_tokens: Some(262_144),
+    },
+    KimiCodeModelDescriptor {
+        id: "kimi-for-coding",
+        label: "Kimi K2.7 Coding",
+        context_tokens: Some(262_144),
+    },
+    KimiCodeModelDescriptor {
+        id: "kimi-for-coding-highspeed",
+        label: "Kimi K2.7 Coding Highspeed",
+        context_tokens: Some(262_144),
+    },
+];
+
+/// Exact-id lookup — never substring-based. Unknown ids return `None` and
+/// fail closed at route resolution.
+pub fn kimi_code_model(id: &str) -> Option<&'static KimiCodeModelDescriptor> {
+    KIMI_CODE_TEXT_MODELS.iter().find(|model| model.id == id)
+}
+
+/// Reasoning capability for an exact managed Kimi Code model id.
+///
+/// Evidence: the managed `/models` payload provisioned by the official CLI —
+/// `k3`/`k3-256k` carry `think_efforts {low, high, max}` with default `high`
+/// and `always_thinking`; the `kimi-for-coding*` pair are `always_thinking`
+/// with no effort control. Reasoning is not disableable on any managed id.
+pub fn kimi_code_capability(model_id: &str) -> Option<KimiReasoningCapability> {
+    use ReasoningLevel::*;
+    match model_id {
+        "k3" | "k3-256k" => Some(KimiReasoningCapability::Effort {
+            supported: &[Low, High, Max],
+            default_level: Some(High),
+            can_disable: false,
+        }),
+        "kimi-for-coding" | "kimi-for-coding-highspeed" => {
+            Some(KimiReasoningCapability::AlwaysThinking)
+        }
+        _ => None,
+    }
+}
+
+/// Static catalog rows for the managed Kimi Code OAuth provider (TUI/model
+/// pickers). All managed ids reason, so `GenericOpenAi` is honest here.
+pub fn kimi_code_static_catalog_models() -> Vec<CatalogModel> {
+    KIMI_CODE_TEXT_MODELS
+        .iter()
+        .map(|descriptor| CatalogModel {
+            provider_key: "kimi-code".into(),
+            provider_name: "Kimi Code".into(),
+            provider_kind: CatalogProviderKind::Generic {
+                key: "kimi-code".into(),
+            },
+            id: descriptor.id.into(),
+            label: Some(descriptor.label.into()),
+            context_tokens: descriptor.context_tokens,
+            max_output_tokens: None,
+            input_modalities: vec![Modality::Text],
+            pricing: PricingSummary::default(),
+            reasoning: ReasoningSupport::GenericOpenAi,
+            source: CatalogSource::StaticFallback,
+        })
+        .collect()
+}
+
 /// Exact wire label for a validated Kimi effort level.
 ///
 /// Only levels present in a capability row's `supported` slice ever reach
@@ -84,7 +176,10 @@ pub fn apply_kimi_reasoning_params(
     model_id: &str,
     level: ReasoningLevel,
 ) {
-    match kimi_static_capability(model_id) {
+    // Static (Moonshot platform) and managed (Kimi Code OAuth) tables are
+    // disjoint id namespaces (`kimi-k3` vs `k3`), so this chain can never
+    // pick the wrong capability row.
+    match kimi_static_capability(model_id).or_else(|| kimi_code_capability(model_id)) {
         Some(KimiReasoningCapability::Effort { supported, .. }) => {
             // Adaptive = provider default via field omission.
             if supported.contains(&level) {
@@ -204,6 +299,90 @@ mod tests {
                 apply_kimi_reasoning_params(&mut body, id, level);
                 assert!(body.is_empty(), "{id} {level:?} must send nothing");
             }
+        }
+    }
+
+    // ─── Managed Kimi Code (OAuth) catalog ───────────────────────────────────
+
+    #[test]
+    fn kimi_code_k3_family_has_effort_low_high_max_default_high_no_disable() {
+        for id in ["k3", "k3-256k"] {
+            let Some(KimiReasoningCapability::Effort {
+                supported,
+                default_level,
+                can_disable,
+            }) = kimi_code_capability(id)
+            else {
+                panic!("{id} must have managed effort capability");
+            };
+            assert_eq!(supported, &[Low, High, Max]);
+            assert_eq!(default_level, Some(High));
+            assert!(!can_disable, "{id} reasoning must not be disableable");
+        }
+    }
+
+    #[test]
+    fn kimi_code_coding_family_is_always_thinking_and_unknown_fails_closed() {
+        for id in ["kimi-for-coding", "kimi-for-coding-highspeed"] {
+            assert_eq!(
+                kimi_code_capability(id),
+                Some(KimiReasoningCapability::AlwaysThinking),
+                "{id}"
+            );
+        }
+        assert_eq!(kimi_code_capability("k3-preview"), None);
+        // Static-platform ids never leak into the managed table.
+        assert_eq!(kimi_code_capability("kimi-k3"), None);
+        assert_eq!(kimi_code_capability(""), None);
+    }
+
+    #[test]
+    fn managed_and_static_id_namespaces_are_disjoint() {
+        for descriptor in KIMI_CODE_TEXT_MODELS {
+            assert!(
+                kimi_static_capability(descriptor.id).is_none(),
+                "{} must not collide with the static Moonshot table",
+                descriptor.id
+            );
+            assert!(kimi_code_model(descriptor.id).is_some());
+        }
+    }
+
+    #[test]
+    fn managed_k3_body_carries_exact_reasoning_effort_via_shared_apply() {
+        for (level, label) in [(Low, "low"), (High, "high"), (Max, "max")] {
+            let mut body = Map::new();
+            apply_kimi_reasoning_params(&mut body, "k3", level);
+            assert_eq!(body.get("reasoning_effort"), Some(&json!(label)));
+            assert!(!body.contains_key("thinking"));
+        }
+        // Adaptive/Off/unknown-levels omit — provider default, never guessed.
+        for level in [Adaptive, Off, Medium, XHigh] {
+            let mut body = Map::new();
+            apply_kimi_reasoning_params(&mut body, "k3-256k", level);
+            assert!(body.is_empty(), "{level:?} must not serialize");
+        }
+    }
+
+    #[test]
+    fn managed_always_thinking_sends_nothing() {
+        for id in ["kimi-for-coding", "kimi-for-coding-highspeed"] {
+            for level in [Off, Adaptive, Low, High, Max] {
+                let mut body = Map::new();
+                apply_kimi_reasoning_params(&mut body, id, level);
+                assert!(body.is_empty(), "{id} {level:?} must send nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_code_catalog_rows_are_managed_and_prefixed_consistently() {
+        let models = kimi_code_static_catalog_models();
+        assert_eq!(models.len(), KIMI_CODE_TEXT_MODELS.len());
+        for model in &models {
+            assert_eq!(model.provider_key, "kimi-code");
+            assert!(model.context_tokens.is_some());
+            assert!(model.label.is_some());
         }
     }
 }

@@ -46,6 +46,11 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             auth_kind: DevProviderAuth::OAuth("google-gemini"),
         },
         DevProviderSelection {
+            key: "kimi-code",
+            name: "Kimi Code",
+            auth_kind: DevProviderAuth::OAuth("kimi-code"),
+        },
+        DevProviderSelection {
             key: "azure-openai",
             name: "Azure OpenAI",
             auth_kind: DevProviderAuth::Cloud,
@@ -533,6 +538,7 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::Xai,
         synaps_cli::auth::OAuthProviderId::GitHubCopilot,
         synaps_cli::auth::OAuthProviderId::GoogleGemini,
+        synaps_cli::auth::OAuthProviderId::KimiCode,
     ]
     .into_iter()
     .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
@@ -797,6 +803,18 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 })
                 .collect()
         }
+        "kimi-code" => synaps_cli::runtime::openai::catalog::kimi_code_static_catalog_models()
+            .into_iter()
+            .map(|model| {
+                // UI-only tier hints for the managed Kimi Code catalog.
+                let tier = match model.id.as_str() {
+                    "k3" | "k3-256k" => "S+",
+                    "kimi-for-coding" => "S",
+                    _ => "",
+                };
+                (model.id, model.label.unwrap_or_default(), tier.to_string())
+            })
+            .collect(),
         key => synaps_cli::runtime::openai::registry::providers()
             .iter()
             .find(|spec| spec.key == key)

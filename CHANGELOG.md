@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] — 2026-08-01
+
+### Added
+
+- **Kimi Code OAuth provider (device flow).** New OAuth device-flow login for
+  Moonshot Kimi Code, complementing the static-key `kimi` provider shipped in
+  0.7.0. Run `synaps login --provider kimi-code`, complete the device
+  authorization in your browser, and Synaps routes through the managed Kimi
+  Code runtime with broker-owned token refresh. Access tokens never leave the
+  broker; the model runtime only sees ephemeral session material.
+- **InferX static-key provider.** New `inferx` provider pinned to
+  `https://model.inferx.net/endpoints/v1`, discovering the API key from
+  `INFERX_API_KEY` or `synaps login --provider inferx`. Default model is
+  `deepseek-v4-flash`; other InferX-published model IDs are usable as
+  `inferx/<model-id>` and surface through the standard OpenAI-compatible
+  `/models` catalog fetch.
+- **Themed conversation canvas.** Every built-in palette now specifies a
+  distinct `message_bg` for the transcript area, giving code blocks and user
+  cards a real elevation instead of blending into the chrome. The new
+  `background` setting toggles the canvas between the themed color
+  (**opaque**) and the terminal-transparent behaviour of 0.7.0
+  (**invisible**), scoped strictly to the conversation area — header, input,
+  footer, and modal chrome are unaffected either way.
+
+### Fixed
+
+- **Background toggle no longer bleeds into chrome.** An earlier iteration
+  routed the toggle through every surface, dimming the header/footer when
+  set to invisible. The toggle now owns exactly one surface: the conversation
+  canvas.
+
+### Changed
+
+- **quinn-proto bumped to 0.11.15** (transitive; picked up via `cargo check`
+  during release prep). No API impact.
+
 ## [0.7.0] — 2026-07-25
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "synaps-engine"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
@@ -11,7 +11,7 @@ name = "agent_engine"
 path = "src/lib.rs"
 
 [dependencies]
-agent-core = { path = "../agent-core", version = "0.7.0", package = "synaps-core" }
+agent-core = { path = "../agent-core", version = "0.7.1", package = "synaps-core" }
 
 # Async runtime + utilities
 tokio              = { version = "1.0", features = ["full"] }

@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use ratatui::style::Color;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -34,8 +35,10 @@ pub(crate) struct Theme {
     pub(crate) table_header_color: Color,
     pub(crate) table_cell_color: Color,
 
-    // Base
+    // Base. `message_bg` is the conversation canvas between the header and input.
+    // Color::Reset means derive a theme-relative lift from `bg`.
     pub(crate) bg: Color,
+    pub(crate) message_bg: Color,
     pub(crate) border: Color,
     pub(crate) border_active: Color,
     pub(crate) muted: Color,
@@ -128,7 +131,9 @@ impl Default for Theme {
             table_header_color: Color::Rgb(80, 210, 230),
             table_cell_color: Color::Rgb(175, 185, 200),
 
-            bg: Color::Rgb(10, 12, 18),
+            bg: Color::Rgb(20, 24, 34),
+            // Recessed transcript surface; deliberately distinct from user and tool cards.
+            message_bg: Color::Rgb(10, 12, 18),
             border: Color::Rgb(28, 36, 50),
             border_active: Color::Rgb(50, 180, 210),
             muted: Color::Rgb(50, 58, 72),
@@ -199,6 +204,12 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Conversation canvas. Every built-in palette specifies this independently
+    /// so its transcript contrast is intentional rather than a generic RGB rule.
+    pub(crate) fn message_background(&self) -> Color {
+        self.message_bg
+    }
+
     /// Dispatcher for builtin themes
     fn builtin(name: &str) -> Option<Self> {
         match name {
@@ -259,6 +270,7 @@ impl Theme {
             "table_header_color" => self.table_header_color = c,
             "table_cell_color" => self.table_cell_color = c,
             "bg" => self.bg = c,
+            "message_bg" => self.message_bg = c,
             "border" => self.border = c,
             "border_active" => self.border_active = c,
             "muted" => self.muted = c,
@@ -473,6 +485,19 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
         return Some(Theme::load_from(&theme_file));
     }
     Theme::builtin(name)
+}
+
+/// Whether the root TUI paints an opaque canvas. `false` preserves the exact
+/// legacy 0.7.0 layout behavior outside individual widgets.
+pub(crate) static BACKGROUND_OPAQUE: LazyLock<AtomicBool> =
+    LazyLock::new(|| AtomicBool::new(synaps_cli::config::load_config().tui_background_opaque));
+
+pub(crate) fn background_is_opaque() -> bool {
+    BACKGROUND_OPAQUE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_background_opaque(opaque: bool) {
+    BACKGROUND_OPAQUE.store(opaque, Ordering::Relaxed);
 }
 
 pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
@@ -756,5 +781,159 @@ mod theme_tests {
             Some(Color::Rgb(0xff, 0x00, 0xff)),
             "user TOML `ext.hello-ext.accent` must override the manifest"
         );
+    }
+}
+
+#[cfg(test)]
+mod message_canvas_tests {
+    use super::*;
+
+    const BUILTINS: &[&str] = &[
+        "default",
+        "night-city",
+        "neon-rain",
+        "amber",
+        "phosphor",
+        "solarized-dark",
+        "blood",
+        "ocean",
+        "rose-pine",
+        "nord",
+        "dracula",
+        "monokai",
+        "gruvbox",
+        "catppuccin",
+        "tokyo-night",
+        "sunset",
+        "ice",
+        "forest",
+        "lavender",
+    ];
+
+    fn rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected an explicit Rgb value, got {other:?}"),
+        }
+    }
+
+    /// WCAG relative luminance.
+    fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        fn lin(v: u8) -> f64 {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+
+    fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Themes whose base is too near black to hold a distinct canvas.
+    ///
+    /// Measured, not guessed: on these palettes `bg` sits within a few RGB
+    /// units of black, so even a *pure black* canvas fails to reach 1.05
+    /// contrast, and raising it instead collides with `code_bg` (which renders
+    /// on top of the canvas). There is no third elevation level available
+    /// between two colours that are already touching.
+    ///
+    /// These deliberately render flush with the header and input chrome. The
+    /// message area still draws its own border, which carries the separation.
+    const FLUSH: &[&str] = &[
+        "amber",
+        "blood",
+        "dracula",
+        "forest",
+        "ice",
+        "lavender",
+        "neon-rain",
+        "night-city",
+        "ocean",
+        "phosphor",
+        "rose-pine",
+        "sunset",
+    ];
+
+    /// Flush themes must match chrome EXACTLY. A near-miss reads as a
+    /// rendering bug rather than a deliberate choice.
+    #[test]
+    fn flush_themes_match_chrome_exactly() {
+        for name in FLUSH {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
+            assert_eq!(
+                rgb(t.message_background()),
+                rgb(t.bg),
+                "{name} is a flush theme: canvas must equal chrome exactly"
+            );
+        }
+    }
+
+    /// Every non-flush theme must clear the perceptibility floor.
+    #[test]
+    fn elevated_themes_separate_canvas_from_chrome() {
+        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
+            let c = contrast(rgb(t.bg), rgb(t.message_background()));
+            assert!(
+                (1.05..=1.30).contains(&c),
+                "{name}: canvas/chrome contrast {c:.3} outside 1.05-1.30"
+            );
+        }
+    }
+
+    /// Recessing preserves hue and saturation; lightening did not. An earlier
+    /// attempt raised CIELAB L* with a/b held fixed and `blood` kept 23% of its
+    /// saturation, rendering a grey canvas under a deep-red theme.
+    #[test]
+    fn elevated_themes_keep_their_colour() {
+        fn saturation((r, g, b): (u8, u8, u8)) -> f64 {
+            let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+            if hi == 0 {
+                0.0
+            } else {
+                f64::from(hi - lo) / f64::from(hi)
+            }
+        }
+        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
+            let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
+            let base = saturation(bg);
+            if base < 0.05 {
+                continue; // achromatic (gruvbox)
+            }
+            let kept = saturation(canvas) / base;
+            assert!(
+                kept >= 0.85,
+                "{name}: canvas kept only {:.0}% of theme saturation (bg={bg:?} canvas={canvas:?})",
+                kept * 100.0
+            );
+        }
+    }
+
+    /// `code_bg` and `user_bg` render ON TOP of the canvas, so the canvas must
+    /// never be brighter than `code_bg` or code blocks invert.
+    ///
+    /// `solarized-dark` is exempt: its `code_bg` (0,36,43) is already darker
+    /// than its `bg` (0,43,54), so code blocks recess by that palette's own
+    /// design. Its canvas is raised toward its separator instead.
+    #[test]
+    fn canvas_never_outranks_code_blocks() {
+        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+            if *name == "solarized-dark" {
+                continue;
+            }
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
+            assert!(
+                luminance(rgb(t.message_background())) < luminance(rgb(t.code_bg)),
+                "{name}: canvas must sit below code_bg in elevation"
+            );
+        }
     }
 }

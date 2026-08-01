@@ -22,6 +22,7 @@ mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
 pub mod google_vertex;
+pub mod kimi_code;
 mod openai_codex;
 mod pkce;
 pub mod provider;
@@ -53,6 +54,7 @@ pub use credential_source::{
     BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
 };
 pub use github_copilot::login as login_github_copilot;
+pub use kimi_code::login as login_kimi_code;
 pub use openai_codex::{
     extract_account_id as extract_codex_account_id, login as login_openai_codex,
 };

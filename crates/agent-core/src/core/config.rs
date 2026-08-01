@@ -490,6 +490,8 @@ pub struct SynapsConfig {
     /// Default: 3. Range 1–20.
     pub scroll_lines: Option<u16>,
     pub theme: Option<String>,
+    /// Whether the TUI paints its own opaque background. `false` preserves the terminal background.
+    pub tui_background_opaque: bool,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -546,6 +548,7 @@ impl Default for SynapsConfig {
             max_fps: 60,
             scroll_lines: None,
             theme: None,
+            tui_background_opaque: true,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -586,6 +589,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "max_fps",
     "scroll_lines",
     "theme",
+    "tui_background_opaque",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -991,6 +995,18 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     .push(format!("scroll_lines = {val} — not a number; ignoring")),
             },
             "theme" => config.theme = Some(val.to_string()),
+            "tui_background_opaque" => match val {
+                "true" | "1" | "on" | "yes" | "opaque" => config.tui_background_opaque = true,
+                "false" | "0" | "off" | "no" | "invisible" => config.tui_background_opaque = false,
+                _ => config.warnings.push(format!(
+                    "tui_background_opaque = {val} — expected opaque or invisible; using {}",
+                    if config.tui_background_opaque {
+                        "opaque"
+                    } else {
+                        "invisible"
+                    }
+                )),
+            },
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
@@ -1204,6 +1220,24 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tui_background_opaque_defaults_and_parses_supported_values() {
+        assert!(super::load_config_from_str("").tui_background_opaque);
+        assert!(
+            super::load_config_from_str("tui_background_opaque = opaque\n").tui_background_opaque
+        );
+        assert!(
+            !super::load_config_from_str("tui_background_opaque = invisible\n")
+                .tui_background_opaque
+        );
+        let invalid = super::load_config_from_str("tui_background_opaque = translucent\n");
+        assert!(invalid.tui_background_opaque);
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|w| w.contains("tui_background_opaque")));
+    }
+
     #[test]
     fn turn_budget_keys_parse_typed_per_role() {
         let config = super::load_config_from_str(

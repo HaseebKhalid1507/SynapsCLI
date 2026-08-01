@@ -54,3 +54,14 @@ pub mod google_gemini {
         super::super::google_gemini::refresh_token(client, refresh).await
     }
 }
+
+pub mod kimi_code {
+    use crate::auth::OAuthCredentials;
+    use reqwest::Client;
+    pub async fn login() -> Result<OAuthCredentials, String> {
+        super::super::kimi_code::login().await
+    }
+    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+        super::super::kimi_code::refresh_token(client, refresh).await
+    }
+}

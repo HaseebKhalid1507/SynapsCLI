@@ -72,7 +72,11 @@ pub use google_gemini::{
     PROVIDER_NAME as GOOGLE_GEMINI_PROVIDER_NAME,
 };
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
-pub use kimi::{apply_kimi_reasoning_params, kimi_static_capability, KimiReasoningCapability};
+pub use kimi::{
+    apply_kimi_reasoning_params, kimi_code_capability, kimi_code_model,
+    kimi_code_static_catalog_models, kimi_static_capability, KimiCodeModelDescriptor,
+    KimiReasoningCapability, KIMI_CODE_TEXT_MODELS,
+};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
 pub use xai::{

@@ -126,6 +126,20 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 wire: WireProtocol::CodexResponses,
             });
         }
+        if prefix == "kimi-code" {
+            // Broker-proxied managed Kimi Code endpoint: the broker owns the
+            // short-lived OAuth access token (and its rotating refresh token)
+            // and pins api.kimi.com/coding/v1. Wire ids are limited to the
+            // conservative managed catalog — unknown ids fail closed.
+            catalog::kimi_code_model(rest)?;
+            return Some(ResolvedRoute {
+                endpoint: crate::auth::kimi_code::API_BASE_URL.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::OpenAiChatCompletions,
+            });
+        }
         if prefix == "local" {
             let c = registry::resolve_provider_model(prefix, rest)?;
             return Some(ResolvedRoute {
@@ -425,6 +439,25 @@ mod tests {
             resolve_route("google-gemini/gemini-pro-latest").is_none(),
             "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
         );
+    }
+
+    #[test]
+    fn kimi_code_routing_is_broker_proxied_and_fail_closed() {
+        for descriptor in catalog::KIMI_CODE_TEXT_MODELS {
+            let route = resolve_route(&format!("kimi-code/{}", descriptor.id)).unwrap();
+            assert_eq!(route.provider, "kimi-code");
+            assert_eq!(route.model, descriptor.id);
+            assert_eq!(route.endpoint, "https://api.kimi.com/coding/v1");
+            // Broker-proxied: the short-lived OAuth bearer never reaches the
+            // runtime; the broker resolves + attaches it per request.
+            assert_eq!(route.auth, AuthPolicy::BrokerProxy);
+            assert_eq!(route.wire, WireProtocol::OpenAiChatCompletions);
+        }
+        // Unknown ids and the static Moonshot-platform ids fail closed on
+        // this route (they belong to the API-key `kimi` provider).
+        assert!(resolve_route("kimi-code/unknown-model").is_none());
+        assert!(resolve_route("kimi-code/kimi-k3").is_none());
+        assert!(resolve_route("kimi-code/kimi-k2.7-code").is_none());
     }
 
     #[test]
