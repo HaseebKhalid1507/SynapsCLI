@@ -993,12 +993,18 @@ pub(crate) fn render_frame_into(
         .padding(Padding::horizontal(1));
     let msg_inner = msg_block.inner(msg_area);
     let messages_widget = Paragraph::new(visible).block(msg_block.clone());
-    // The conversation gets its own surface, distinct from the header, input,
-    // and footer chrome. Paint it in both modes so the separation is reliable.
-    frame.render_widget(
-        Block::default().style(Style::default().bg(THEME.load().message_background())),
-        msg_area,
-    );
+    // The conversation canvas is the ONLY surface the background toggle owns.
+    // Opaque paints the themed canvas; invisible falls back to 0.7.0's exact
+    // behaviour (`Clear`) so the terminal background shows through while the
+    // header, input, and footer chrome stay painted, unchanged from 0.7.0.
+    if background_is_opaque() {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(THEME.load().message_background())),
+            msg_area,
+        );
+    } else {
+        frame.render_widget(Clear, msg_area);
+    }
     if model.secret_prompt.is_some() {
         let blank = Paragraph::new(Vec::<ratatui::text::Line>::new()).block(msg_block);
         frame.render_widget(blank, msg_area);
@@ -1732,5 +1738,83 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
                 .style(Style::default().fg(THEME.load().help_fg))
         };
         frame.render_widget(paragraph, rect);
+    }
+}
+
+#[cfg(test)]
+mod background_toggle_tests {
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque};
+    use ratatui::style::Color;
+    use serial_test::serial;
+
+    /// Background colour of every cell in one row.
+    fn row_bgs(h: &mut TestHarness, y: u16) -> Vec<Option<Color>> {
+        let buf = h.render();
+        let area = *buf.area();
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, y)].style().bg)
+            .collect()
+    }
+
+    /// Regression (S278): `invisible` must change ONLY the conversation
+    /// canvas. An earlier fix routed header/input/footer through the toggle
+    /// too, which made the whole frame lose its chrome. 0.7.0 painted all
+    /// chrome unconditionally and used `Clear` for the message area — that
+    /// is exactly what `invisible` must still look like.
+    #[test]
+    #[serial]
+    fn invisible_leaves_header_and_footer_chrome_identical_to_opaque() {
+        let prior = background_is_opaque();
+        let mut h = TestHarness::boot();
+        let bottom = 23; // 80x24 default geometry
+
+        set_background_opaque(true);
+        let header_opaque = row_bgs(&mut h, 0);
+        let footer_opaque = row_bgs(&mut h, bottom);
+
+        set_background_opaque(false);
+        let header_invisible = row_bgs(&mut h, 0);
+        let footer_invisible = row_bgs(&mut h, bottom);
+
+        assert_eq!(
+            header_opaque, header_invisible,
+            "header chrome must be identical in both modes — invisible owns \
+             only the conversation canvas"
+        );
+        assert_eq!(
+            footer_opaque, footer_invisible,
+            "footer/input chrome must be identical in both modes"
+        );
+
+        set_background_opaque(prior);
+    }
+
+    /// The other half of the contract: the canvas itself really does stop
+    /// painting, otherwise the toggle is a no-op (the original bug).
+    #[test]
+    #[serial]
+    fn invisible_stops_painting_the_conversation_canvas() {
+        let prior = background_is_opaque();
+        let mut h = TestHarness::boot();
+
+        set_background_opaque(true);
+        let opaque: Vec<Vec<Option<Color>>> = (0..24).map(|y| row_bgs(&mut h, y)).collect();
+
+        set_background_opaque(false);
+        let invisible: Vec<Vec<Option<Color>>> = (0..24).map(|y| row_bgs(&mut h, y)).collect();
+
+        let changed: Vec<usize> = (0..24).filter(|&y| opaque[y] != invisible[y]).collect();
+
+        assert!(
+            !changed.is_empty(),
+            "toggling to invisible changed nothing — the canvas is still painted"
+        );
+        assert!(
+            !changed.contains(&0),
+            "row 0 (header) must not change between modes, but did"
+        );
+
+        set_background_opaque(prior);
     }
 }
