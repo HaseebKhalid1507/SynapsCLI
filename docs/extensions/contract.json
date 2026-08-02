@@ -66,7 +66,14 @@
     "privacy.llm_content",
     "session.lifecycle",
     "tools.register",
-    "providers.register"
+    "providers.register",
+    "context_providers.register",
+    "memory.read",
+    "memory.write",
+    "config.write",
+    "config.subscribe",
+    "audio.input",
+    "audio.output"
   ],
   "reserved_permissions": [
     "tools.override"
@@ -81,7 +88,7 @@
     "secret_env_field": "secret_env",
     "host_context_field": "host_context",
     "host_context_keys": {
-      "project_root": "RESERVED host-owned value: the canonical trusted project root the host discovers ONCE from its own working directory (nearest .git/.synaps-project marker, canonicalized). Entries declaring host_context are resolved EXCLUSIVELY from host state — env overrides, secret_env, plugin config, and legacy config keys are all skipped — and the value is injected into the resolved config sent at initialize (retained in deferred launch records). Never forwarded as an environment variable; user or model input can never supply or widen it."
+      "project_root": "RESERVED host-owned value: the canonical trusted project root the host discovers ONCE from its own working directory (nearest .git/.synaps-project marker, canonicalized). Entries declaring host_context are resolved EXCLUSIVELY from host state \u2014 env overrides, secret_env, plugin config, and legacy config keys are all skipped \u2014 and the value is injected into the resolved config sent at initialize (retained in deferred launch records). Never forwarded as an environment variable; user or model input can never supply or widen it."
     },
     "validation": [
       "key must be non-empty and must not contain dots, slashes, or spaces",
@@ -93,7 +100,7 @@
   "theme_tokens": {
     "manifest_key": "extension.theme_tokens",
     "status": "optional",
-    "compatibility": "additive optional field within extension_protocol_version 1 (no version bump; per docs/STABILITY.md §1, extensions and hosts must tolerate its absence — manifests without it behave exactly as before)",
+    "compatibility": "additive optional field within extension_protocol_version 1 (no version bump; per docs/STABILITY.md \u00a71, extensions and hosts must tolerate its absence \u2014 manifests without it behave exactly as before)",
     "shape": "object mapping <token> -> hex color (\"#rgb\" or \"#rrggbb\")",
     "theme_namespace": "ext.<plugin-id>.<token>",
     "override_order": [
@@ -129,10 +136,14 @@
       "methods": {
         "provider.complete": {
           "streaming": false,
-          "timeout_secs": 60
+          "timeout_secs": 30,
+          "note": "Effective timeout is 30s: an outer 60s guard wraps the generic request path, which itself times out non-tool.call methods at 30s."
         },
         "provider.stream": {
-          "status": "reserved"
+          "status": "active",
+          "streaming": true,
+          "timeout_secs": 30,
+          "events": "provider.stream.event notifications, forwarded to the caller's sink until the provider.stream response resolves"
         }
       },
       "spec": "docs/specs/extension-providers.md"
@@ -145,20 +156,20 @@
     "shape": "object { tools?: [{name, description (non-empty), input_schema}], providers?: [RegisteredProviderSpec-compatible {id, display_name, description (non-empty), models: [{id, display_name?, capabilities?, context_window?}], config_schema?}], lifecycle?: \"hook\"|\"user\" }",
     "semantics": [
       "declarations are trusted LOCAL manifest expectations, validated (bounded non-empty names/descriptions, bounded schemas, unique ids, no ':' in tool/provider ids, capability flags boolean) BEFORE any spawn; any violation fails the whole manifest closed",
-      "permission coupling: non-empty deferred.tools REQUIRES the 'tools.register' permission and non-empty deferred.providers REQUIRES 'providers.register'; lifecycle=\"hook\" REQUIRES at least one hook subscription — all enforced during manifest validation, before any spawn or catalog registration",
+      "permission coupling: non-empty deferred.tools REQUIRES the 'tools.register' permission and non-empty deferred.providers REQUIRES 'providers.register'; lifecycle=\"hook\" REQUIRES at least one hook subscription \u2014 all enforced during manifest validation, before any spawn or catalog registration",
       "under progressive tool disclosure, EVERY manifest with a deferred block defers its process: tool-only manifests catalog dormant descriptor tools (searchable, exactly activatable, execution-gated) with zero process/network; provider manifests register declared provider METADATA behind a lazy handler; hook manifests register permission-validated subscriptions behind a lazy handler; lifecycle=\"user\" manifests stay dormant until an explicit user API (sidecar/commands/settings)",
       "the spawn happens only on the class's legitimate trigger: gate-authorized exact tool execution, first SELECTED provider complete/stream, first AUTHORIZED matching hook event, or an explicit user action; discovery, load, search, and diagnostics never spawn",
       "at initialize, the runtime's registered tools must match the declarations EXACTLY (same name set, canonical schema digest, description) and its registered providers must match the declared provider metadata EXACTLY (ids, display names, descriptions, model ids/display/context windows/capability values, config schemas); any mismatch shuts the child down and fails closed before registration, grant, or route",
-      "runtime leases are session-scoped, single-flight per plugin, capacity/idle bounded, and terminated on session end, revocation, unload, or launch-record drift; drift/mismatch classes also revoke exactly the affected session tool grants — transport-transient failures never revoke",
+      "runtime leases are session-scoped, single-flight per plugin, capacity/idle bounded, and terminated on session end, revocation, unload, or launch-record drift; drift/mismatch classes also revoke exactly the affected session tool grants \u2014 transport-transient failures never revoke",
       "lifecycle=\"user\" declares user-triggered-only and CONFLICTS (fails validation) with declared tools/providers; lifecycle=\"hook\" defers start to the first authorized subscribed event",
       "classification: no declarations => legacy_eager; tools => tool_only; providers => provider; hooks/lifecycle=hook => hook_lifecycle; lifecycle=user => ui_sidecar; multiple => mixed",
       "mixed manifests share ONE child process across their capabilities and start on the EARLIEST legitimately required trigger (hook event, then provider selection, then exact tool activation); tool SEARCH alone never starts a process"
     ],
-    "flag_off": "when progressive tool disclosure is off, every manifest — with or without deferred — loads on the legacy eager path unchanged",
+    "flag_off": "when progressive tool disclosure is off, every manifest \u2014 with or without deferred \u2014 loads on the legacy eager path unchanged",
     "legacy_aliases": {
       "shape": "extension-level `tools: [{name, description, input_schema}]` plus optional `activation: \"deferred\"` (pre-native manifests such as axel-memory-manager 0.1)",
       "semantics": [
-        "folded into the native `deferred.tools` block at deserialization, BEFORE any classification or validation — a legacy tool-declaring manifest can never silently load eager",
+        "folded into the native `deferred.tools` block at deserialization, BEFORE any classification or validation \u2014 a legacy tool-declaring manifest can never silently load eager",
         "`activation` values other than \"deferred\" fail the manifest closed (no unknown-activation fallback)",
         "declaring both a native `deferred` block and a legacy alias is ambiguous and fails closed",
         "`activation: \"deferred\"` without legacy tools declarations fails closed"
