@@ -139,7 +139,7 @@ impl Default for Theme {
             muted: Color::Rgb(50, 58, 72),
 
             user_color: Color::Rgb(185, 195, 215),
-            user_bg: Color::Rgb(16, 20, 30),
+            user_bg: Color::Rgb(20, 24, 34),
             claude_label: Color::Rgb(50, 200, 220),
             claude_text: Color::Rgb(192, 198, 210),
             thinking_color: Color::Rgb(45, 55, 75),
