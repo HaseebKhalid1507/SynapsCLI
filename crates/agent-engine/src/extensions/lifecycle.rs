@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use super::manifest::ExtensionManifest;
 use super::runtime::process::RegisteredExtensionToolSpec;
+use super::validation::validate_id_segment;
 use crate::tools::catalog::SchemaDigest;
 use crate::tools::{Tool, ToolContext, ToolOrigin};
 use agent_core::BoundedText;
@@ -224,6 +225,24 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= DECLARED_NAME_MAX_BYTES && !name.chars().any(char::is_control)
 }
 
+/// Manifest-time validation for a name that BECOMES a runtime capability id
+/// (declared tool names, provider ids, model ids).
+///
+/// Deliberately delegates to [`validate_id_segment`] — the exact function the
+/// runtime applies at `initialize` — so the two checks cannot drift. They
+/// previously did: manifest-time `valid_name` allowed 128 bytes and embedded
+/// whitespace, while the runtime caps ids at
+/// [`MAX_ID_LENGTH`][super::validation::MAX_ID_LENGTH] (64) and rejects
+/// whitespace outright. A 65–128 byte or whitespace-bearing name passed
+/// manifest validation and then died at `initialize` with an unrelated error.
+///
+/// No working extension is affected by tightening this: any name that this
+/// now rejects was already guaranteed to fail at `initialize`. The only
+/// change is that the failure is early, local, and says what is wrong.
+fn valid_capability_id(name: &str) -> bool {
+    validate_id_segment(name).is_ok()
+}
+
 /// Bounded validation of a `deferred` block. Static reasons only; any
 /// violation fails the WHOLE manifest closed (validated before any spawn).
 pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static str> {
@@ -242,7 +261,7 @@ pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static
     }
     let mut provider_ids: HashSet<&str> = HashSet::new();
     for provider in &deferred.providers {
-        if !valid_name(&provider.id) || provider.id.contains(':') {
+        if !valid_capability_id(&provider.id) {
             return Err("invalid_declared_provider_id");
         }
         if !provider_ids.insert(provider.id.as_str()) {
@@ -264,7 +283,7 @@ pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static
         }
         let mut model_ids: HashSet<&str> = HashSet::new();
         for model in &provider.models {
-            if !valid_name(&model.id) {
+            if !valid_capability_id(&model.id) {
                 return Err("invalid_declared_provider_model_id");
             }
             if !model_ids.insert(model.id.as_str()) {
@@ -382,7 +401,7 @@ fn validate_tool_shape(
     description: &str,
     input_schema: &Value,
 ) -> Result<(), &'static str> {
-    if !valid_name(name) || name.contains(':') {
+    if !valid_capability_id(name) {
         return Err("invalid_declared_tool_name");
     }
     // Non-empty required: the runtime's initialize validation refuses
@@ -968,6 +987,71 @@ mod tests {
         assert!(
             dormant_context_provider_descriptors("p", &base_manifest(&["tools.register"]))
                 .is_empty()
+        );
+    }
+
+    // ── T291 D4: manifest-time ids must be validated by the SAME function
+    // the runtime uses at initialize, or names pass here and die there.
+
+    /// Every name that manifest validation accepts for a declared tool MUST
+    /// also be accepted by the runtime's `validate_id_segment`, and vice
+    /// versa. This is the anti-drift invariant; the two checks used to
+    /// disagree on length (128 vs 64) and on whitespace.
+    #[test]
+    fn declared_capability_ids_agree_with_runtime_validation() {
+        let cases = [
+            "ok",
+            "with-dash",
+            "with_underscore",
+            "MiXedCase123",
+            "",
+            "has space",
+            "has\ttab",
+            "colon:name",
+            "trailing ",
+            &"a".repeat(super::super::validation::MAX_ID_LENGTH),
+            &"a".repeat(super::super::validation::MAX_ID_LENGTH + 1),
+            &"a".repeat(DECLARED_NAME_MAX_BYTES),
+        ];
+        for name in cases {
+            let manifest_ok = validate_tool_shape(name, "d", &json!({"type": "object"})).is_ok();
+            let runtime_ok = validate_id_segment(name).is_ok();
+            assert_eq!(
+                manifest_ok, runtime_ok,
+                "manifest/runtime disagree on declared tool name {name:?}: \
+                 manifest_ok={manifest_ok} runtime_ok={runtime_ok}"
+            );
+        }
+    }
+
+    /// The exact defect from the S287 audit: a 65-byte name sat in the gap
+    /// between DECLARED_NAME_MAX_BYTES (128) and MAX_ID_LENGTH (64). It
+    /// passed manifest validation and then failed at initialize with an
+    /// unrelated error. It must now fail early, at the manifest.
+    #[test]
+    fn declared_tool_name_over_runtime_bound_fails_at_manifest() {
+        let name = "a".repeat(super::super::validation::MAX_ID_LENGTH + 1);
+        assert_eq!(
+            validate_deferred(&DeferredDeclarations {
+                tools: vec![declared_tool(&name)],
+                ..Default::default()
+            }),
+            Err("invalid_declared_tool_name"),
+        );
+        // ...and it is genuinely inside the old accepted range, i.e. this
+        // test would have failed before the fix.
+        assert!(name.len() <= DECLARED_NAME_MAX_BYTES);
+    }
+
+    /// Whitespace was the second, unfiled half of the same defect.
+    #[test]
+    fn declared_capability_ids_reject_whitespace_at_manifest() {
+        assert_eq!(
+            validate_deferred(&DeferredDeclarations {
+                tools: vec![declared_tool("my tool")],
+                ..Default::default()
+            }),
+            Err("invalid_declared_tool_name"),
         );
     }
 }
