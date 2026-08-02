@@ -779,20 +779,23 @@ pub(crate) fn render_frame(
         // Fix A (tmux-canvas-edge-scrub): the scrub area is entirely inside
         // the transcript body (edge_scrub_area skips 2 top rows for the header
         // + msg top border, and `protected_bottom_rows` for the subagent,
-        // download, input, and footer chrome). So the color that must physically
-        // land at those edge cells is the transcript CANVAS color
-        // (`message_background()`), not the chrome bg (`THEME.bg`). On the
-        // recessed themes (catppuccin, gruvbox, monokai, nord, tokyo-night)
-        // these differ, and without SGR carried on the scrub the physical
-        // blanks inherited whatever style the terminal was last left in and
-        // ratatui's diff skipped the correction (both frames modelled the
-        // edge cell as `message_background`, so no update was emitted).
-        super::viewport::scrub_crossterm_terminal_edges(
-            terminal,
-            caps,
-            model.protected_bottom_rows,
-            Style::default().bg(THEME.load().message_background()),
-        )?;
+        // download, input, and footer chrome). In opaque mode the physical
+        // blanks must land with the transcript CANVAS color
+        // (`message_background()`), rather than inheriting stale SGR state.
+        // In invisible mode no canvas color may be emitted at all: it would
+        // form an opaque strip at the physical first/last terminal columns.
+        // The scrub physically paints its blanks with `message_background()`.
+        // In invisible mode that would reintroduce an opaque strip in the first
+        // and last columns after the canvas was deliberately cleared, so only
+        // run it when the conversation canvas itself is opaque.
+        if background_is_opaque() {
+            super::viewport::scrub_crossterm_terminal_edges(
+                terminal,
+                caps,
+                model.protected_bottom_rows,
+                Style::default().bg(THEME.load().message_background()),
+            )?;
+        }
 
         terminal.draw(|frame| render_frame_into(frame, model, boot_fx, exit_fx, elapsed))?;
         Ok(())
@@ -999,7 +1002,7 @@ pub(crate) fn render_frame_into(
     let visible_is_empty = visible.is_empty();
 
     let msg_block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(Borders::TOP)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(THEME.load().border))
         .padding(Padding::horizontal(1));

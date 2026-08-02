@@ -513,14 +513,15 @@ mod theme_tests {
     use super::*;
 
     #[test]
-    fn tool_styling_defaults_to_reset() {
-        // Neon is NOT in Default — tool_* fields are Reset (derive-from-palette sentinel).
+    fn default_tool_panels_are_explicit() {
+        // The default theme is hand-tuned: argument and result panels must
+        // remain visibly distinct through the SSH → tmux rendering path.
         let t = Theme::default();
         assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_read, Color::Reset);
         assert_eq!(t.tool_generic, Color::Reset);
-        assert_eq!(t.tool_input_bg, Color::Reset);
-        assert_eq!(t.tool_output_bg, Color::Reset);
+        assert_eq!(t.tool_input_bg, Color::Rgb(23, 28, 40));
+        assert_eq!(t.tool_output_bg, Color::Rgb(32, 40, 55));
     }
 
     #[test]
@@ -552,7 +553,8 @@ mod theme_tests {
         // Other palettes should NOT inherit neon — they get Reset via Default.
         let t = Theme::builtin("dracula").expect("dracula exists");
         assert_eq!(t.tool_bash, Color::Reset);
-        assert_eq!(t.tool_input_bg, Color::Reset);
+        assert_eq!(t.tool_input_bg, Color::Rgb(23, 28, 40));
+        assert_eq!(t.tool_output_bg, Color::Rgb(32, 40, 55));
     }
 
     // ---- Per-part chrome overrides (P19.1) --------------------------------
