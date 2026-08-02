@@ -137,3 +137,55 @@ async fn extension_cannot_use_other_namespace() {
 
     manager.shutdown_all().await;
 }
+
+/// T291 defect 3: JSON-RPC 2.0 §4 permits string request ids, and
+/// `docs/extensions/protocol.md` uses them in its own worked examples
+/// (`"evt-001"`). The runtime nonetheless required `id` to parse as u64 and
+/// dropped every other frame at `trace` level, so an extension written
+/// against the documentation blocked forever awaiting a response that was
+/// never going to come — with no error anywhere at default log levels.
+///
+/// This is the end-to-end proof of the fix: the fixture issues its
+/// `memory.append` / `memory.query` requests with string ids and refuses to
+/// complete `initialize` unless both come back correlated to the exact id it
+/// sent. A successful load therefore means string ids round-tripped.
+///
+/// The timeout is load-bearing: before the fix this test does not fail, it
+/// HANGS, which is precisely the reported symptom.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn extension_may_use_string_request_ids() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+
+    std::env::remove_var("MEMORY_FIXTURE_NAMESPACE");
+    std::env::remove_var("MEMORY_FIXTURE_CONTENT");
+    std::env::remove_var("MEMORY_FIXTURE_TAG");
+
+    let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
+    let manifest =
+        manifest_with_perms_and_args(vec!["memory.read", "memory.write"], vec!["--string-ids"]);
+
+    let loaded = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        manager.load("memory-test-ext", &manifest),
+    )
+    .await
+    .expect(
+        "extension load hung: the runtime dropped a string-id request instead \
+         of answering it (regression of #291 defect 3)",
+    );
+
+    loaded.expect("extension using string JSON-RPC ids should load and complete its inbound RPC");
+
+    manager.shutdown_all().await;
+
+    // The RPC really executed — not merely "did not error".
+    let path = home.path().join("memory").join("memory-test-ext.jsonl");
+    let body = fs::read_to_string(&path).expect("memory file should exist");
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected exactly one record, got {body:?}");
+    let rec: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(rec["content"], "hello memory");
+}

@@ -62,6 +62,11 @@ def call_synaps(method, params):
     global _next_outbound_id
     rid = _next_outbound_id
     _next_outbound_id += 1
+    # JSON-RPC 2.0 §4 permits string ids, and protocol.md's own examples use
+    # them. --string-ids proves the runtime honors that: the request must come
+    # back correlated with the exact same string id we sent.
+    if "--string-ids" in sys.argv[1:]:
+        rid = f"evt-{rid}"
     write_message({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
     while True:
         msg = read_message()
