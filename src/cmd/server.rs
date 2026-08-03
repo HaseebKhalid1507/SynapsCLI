@@ -195,10 +195,12 @@ pub async fn run(
     // cmd/chat.rs. Without this, on_session_start fires onto an empty bus
     // and no before_tool_call / before_message / on_session_end hooks ever
     // run in server mode — defeating the purpose of the engine refactor.
+    let session_id_for_hook = boot.session.id.clone();
     let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
     synaps_cli::extensions::loader::spawn_discover_and_load(
         Arc::clone(&boot.ext_manager),
         loader_tx,
+        Some(session_id_for_hook.clone()),
     );
     // Drain loader events in the background — prevents SendError in the loader
     // and lets us log when discovery completes.

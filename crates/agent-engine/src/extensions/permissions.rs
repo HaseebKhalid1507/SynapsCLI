@@ -50,6 +50,34 @@ pub enum Permission {
 }
 
 impl Permission {
+    /// Every permission variant, in declaration order.
+    ///
+    /// Exhaustiveness is enforced by `all_covers_every_variant` below, which
+    /// pattern-matches every variant explicitly: adding one to the enum
+    /// breaks that test's match at compile time, and its length assertion
+    /// then forces this list to be updated too.
+    ///
+    /// This list is what `docs/extensions/contract.json` is drift-checked
+    /// against (see `crates/agent-tui/tests/extensions_contract.rs`). Before
+    /// that check existed the contract had fallen eight permissions behind
+    /// the engine while `STABILITY.md` advertised it as CI-verified.
+    pub const ALL: &'static [Permission] = &[
+        Self::ToolsIntercept,
+        Self::ToolsTransformOutput,
+        Self::ToolsOverride,
+        Self::LlmContent,
+        Self::SessionLifecycle,
+        Self::ToolsRegister,
+        Self::ProvidersRegister,
+        Self::ContextProvidersRegister,
+        Self::MemoryRead,
+        Self::MemoryWrite,
+        Self::ConfigWrite,
+        Self::ConfigSubscribe,
+        Self::AudioInput,
+        Self::AudioOutput,
+    ];
+
     /// Wire-format string for this permission.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -299,6 +327,61 @@ mod tests {
             Permission::AudioOutput,
         ] {
             assert_eq!(Permission::parse(perm.as_str()), Some(perm));
+        }
+    }
+
+    /// `Permission::ALL` must list every variant exactly once.
+    ///
+    /// The match below is deliberately written out variant by variant: adding
+    /// a variant to the enum makes it non-exhaustive and this test stops
+    /// COMPILING, which is the point. The author is then forced to the length
+    /// assertion, which sends them to `ALL`. Without this, `ALL` is just a
+    /// hand-maintained list that silently falls behind -- the exact failure
+    /// mode that let contract.json drift eight permissions out of date.
+    #[test]
+    fn all_covers_every_variant() {
+        for perm in Permission::ALL {
+            match perm {
+                Permission::ToolsIntercept
+                | Permission::ToolsTransformOutput
+                | Permission::ToolsOverride
+                | Permission::LlmContent
+                | Permission::SessionLifecycle
+                | Permission::ToolsRegister
+                | Permission::ProvidersRegister
+                | Permission::ContextProvidersRegister
+                | Permission::MemoryRead
+                | Permission::MemoryWrite
+                | Permission::ConfigWrite
+                | Permission::ConfigSubscribe
+                | Permission::AudioInput
+                | Permission::AudioOutput => {}
+            }
+        }
+        assert_eq!(
+            Permission::ALL.len(),
+            14,
+            "a Permission variant was added or removed -- update Permission::ALL \
+             and docs/extensions/contract.json to match"
+        );
+        let unique: HashSet<Permission> = Permission::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Permission::ALL.len(),
+            "Permission::ALL contains a duplicate"
+        );
+    }
+
+    /// Every listed permission must round-trip through the wire format.
+    #[test]
+    fn all_permissions_round_trip_through_wire_format() {
+        for perm in Permission::ALL {
+            assert_eq!(
+                Permission::parse(perm.as_str()),
+                Some(*perm),
+                "{} does not round-trip",
+                perm.as_str()
+            );
         }
     }
 }

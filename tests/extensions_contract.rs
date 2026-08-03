@@ -9,26 +9,16 @@ use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::manifest::HookMatcher;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 
-const ALL_HOOK_KINDS: [HookKind; 7] = [
-    HookKind::BeforeToolCall,
-    HookKind::AfterToolCall,
-    HookKind::BeforeMessage,
-    HookKind::OnMessageComplete,
-    HookKind::OnCompaction,
-    HookKind::OnSessionStart,
-    HookKind::OnSessionEnd,
-];
-
-const ALL_PERMISSIONS: [Permission; 6] = [
-    Permission::ToolsIntercept,
-    Permission::ToolsTransformOutput,
-    Permission::LlmContent,
-    Permission::SessionLifecycle,
-    Permission::ToolsRegister,
-    Permission::ProvidersRegister,
-];
-
-const RESERVED_PERMISSIONS: [Permission; 1] = [Permission::ToolsOverride];
+// These catalogs are read FROM THE ENGINE, deliberately.
+//
+// They used to be hand-copied literals in this file -- `[Permission; 6]`
+// while the engine already had 14 variants. That made this "drift check"
+// self-referential: it compared contract.json against a stale local copy of
+// the same list, the two drifted in lockstep, and the assertion passed for
+// eight missing permissions with CI green throughout. A contract test that
+// restates the thing it is meant to check is not a check. (#291 defect 2)
+const ALL_HOOK_KINDS: &[HookKind] = HookKind::ALL;
+const ALL_PERMISSIONS: &[Permission] = Permission::ALL;
 
 fn extension_contract() -> Value {
     serde_json::from_str(include_str!("../docs/extensions/contract.json"))
@@ -56,7 +46,7 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
         .and_then(Value::as_array)
         .expect("contract should define reserved_permissions array");
 
-    for hook in ALL_HOOK_KINDS {
+    for &hook in ALL_HOOK_KINDS {
         assert_eq!(HookKind::from_str(hook.as_str()), Some(hook));
         let hook_contract = hooks
             .get(hook.as_str())
@@ -83,21 +73,36 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
             .any(|permission| { permission.as_str() == Some(contract_permission) }));
     }
 
-    let rust_permissions: HashSet<&'static str> =
-        ALL_PERMISSIONS.iter().map(Permission::as_str).collect();
+    // contract.permissions lists GRANTABLE permissions only; reserved ones
+    // live in reserved_permissions and are a hard load failure to declare.
+    let rust_permissions: HashSet<&'static str> = ALL_PERMISSIONS
+        .iter()
+        .filter(|permission| !permission.is_reserved())
+        .map(|permission| permission.as_str())
+        .collect();
     let contract_permissions: HashSet<&str> = permissions
         .iter()
         .map(|permission| permission.as_str().expect("permission should be a string"))
         .collect();
-    assert_eq!(contract_permissions, rust_permissions);
+    let missing: Vec<_> = rust_permissions.difference(&contract_permissions).collect();
+    let invented: Vec<_> = contract_permissions.difference(&rust_permissions).collect();
+    assert!(
+        missing.is_empty(),
+        "contract.json omits permissions the engine grants: {missing:?}"
+    );
+    assert!(
+        invented.is_empty(),
+        "contract.json documents permissions the engine does not have: {invented:?}"
+    );
 
-    for permission in ALL_PERMISSIONS {
+    for &permission in ALL_PERMISSIONS {
         assert_eq!(Permission::parse(permission.as_str()), Some(permission));
     }
 
-    let rust_reserved_permissions: HashSet<&'static str> = RESERVED_PERMISSIONS
+    let rust_reserved_permissions: HashSet<&'static str> = ALL_PERMISSIONS
         .iter()
-        .map(Permission::as_str)
+        .filter(|permission| permission.is_reserved())
+        .map(|permission| permission.as_str())
         .collect();
     let contract_reserved_permissions: HashSet<&str> = reserved_permissions
         .iter()

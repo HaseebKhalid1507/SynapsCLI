@@ -47,6 +47,22 @@ pub enum HookKind {
 }
 
 impl HookKind {
+    /// Every hook kind, in declaration order.
+    ///
+    /// Exhaustiveness is enforced by `all_covers_every_variant` in this
+    /// module's tests. This list is what `docs/extensions/contract.json` is
+    /// drift-checked against (see
+    /// `crates/agent-tui/tests/extensions_contract.rs`).
+    pub const ALL: &'static [HookKind] = &[
+        Self::BeforeToolCall,
+        Self::AfterToolCall,
+        Self::BeforeMessage,
+        Self::OnMessageComplete,
+        Self::OnCompaction,
+        Self::OnSessionStart,
+        Self::OnSessionEnd,
+    ];
+
     /// Canonical string identifier for this kind, suitable for serialization
     /// keys, log output, and manifest declarations.
     pub fn as_str(&self) -> &'static str {
@@ -85,10 +101,12 @@ impl HookKind {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue", "replace"],
             Self::BeforeMessage => &["continue", "inject"],
-            Self::OnMessageComplete
-            | Self::OnCompaction
-            | Self::OnSessionStart
-            | Self::OnSessionEnd => &["continue"],
+            // Session-scoped context. Injected ONCE when the session starts
+            // and carried on the system prompt for the rest of it, rather
+            // than re-appended on every message the way `before_message`
+            // injection is.
+            Self::OnSessionStart => &["continue", "inject"],
+            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -107,6 +125,7 @@ impl HookKind {
                 | (Self::BeforeToolCall, HookResult::Modify { .. })
                 | (Self::AfterToolCall, HookResult::Replace { .. })
                 | (Self::BeforeMessage, HookResult::Inject { .. })
+                | (Self::OnSessionStart, HookResult::Inject { .. })
         )
     }
 
@@ -662,5 +681,95 @@ mod tests {
     fn hook_result_continue_serde() {
         let json = serde_json::to_string(&HookResult::Continue).unwrap();
         assert_eq!(json, r#"{"action":"continue"}"#);
+    }
+
+    /// `HookKind::ALL` must list every variant exactly once. Adding a variant
+    /// makes the match below non-exhaustive => compile error => the author is
+    /// forced to update `ALL` and, via the contract test, contract.json.
+    #[test]
+    fn all_covers_every_variant() {
+        for kind in HookKind::ALL {
+            match kind {
+                HookKind::BeforeToolCall
+                | HookKind::AfterToolCall
+                | HookKind::BeforeMessage
+                | HookKind::OnMessageComplete
+                | HookKind::OnCompaction
+                | HookKind::OnSessionStart
+                | HookKind::OnSessionEnd => {}
+            }
+        }
+        assert_eq!(
+            HookKind::ALL.len(),
+            7,
+            "a HookKind variant was added or removed -- update HookKind::ALL \
+             and docs/extensions/contract.json to match"
+        );
+        let unique: std::collections::HashSet<HookKind> = HookKind::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            HookKind::ALL.len(),
+            "HookKind::ALL has a duplicate"
+        );
+    }
+
+    /// Every hook kind must round-trip through its canonical wire string.
+    #[test]
+    fn all_hook_kinds_round_trip_through_wire_format() {
+        for kind in HookKind::ALL {
+            assert_eq!(
+                HookKind::from_str(kind.as_str()),
+                Some(*kind),
+                "{} does not round-trip",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// `allowed_action_names` is the contract's action list, and
+    /// `allows_result` is what the hook bus actually enforces. They must
+    /// agree, or the documented action set is a lie in one direction or the
+    /// other. (#291: on_session_start advertised only "continue" while Axel
+    /// returned "inject" -- caught here now.)
+    #[test]
+    fn advertised_actions_match_enforced_actions() {
+        let samples: [(&str, HookResult); 6] = [
+            ("continue", HookResult::Continue),
+            ("block", HookResult::Block { reason: "r".into() }),
+            (
+                "confirm",
+                HookResult::Confirm {
+                    message: "m".into(),
+                },
+            ),
+            (
+                "modify",
+                HookResult::Modify {
+                    input: serde_json::json!({}),
+                },
+            ),
+            ("replace", HookResult::Replace { output: "o".into() }),
+            (
+                "inject",
+                HookResult::Inject {
+                    content: "c".into(),
+                },
+            ),
+        ];
+        for kind in HookKind::ALL {
+            for (name, result) in &samples {
+                let advertised = kind.allowed_action_names().contains(name);
+                let enforced = kind.allows_result(result);
+                assert_eq!(
+                    advertised,
+                    enforced,
+                    "hook {} disagrees about action {:?}: advertised={} enforced={}",
+                    kind.as_str(),
+                    name,
+                    advertised,
+                    enforced
+                );
+            }
+        }
     }
 }
