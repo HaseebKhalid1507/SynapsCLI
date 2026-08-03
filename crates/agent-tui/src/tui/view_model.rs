@@ -37,7 +37,11 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) transcript: &'a mut super::transcript::TranscriptStore,
 
     // ── input / edit chrome ──
-    pub(crate) input: &'a String,
+    /// Flat input text, materialized ONCE per frame from the editor
+    /// (`App::input_text`) in [`ViewInputs::from_app`]. Owned because the
+    /// editor stores lines, not a flat string — this is the single per-frame
+    /// flattening point.
+    pub(crate) input: String,
     pub(crate) cursor_pos: usize,
 
     // ── status / spinner / identity ──
@@ -86,11 +90,14 @@ impl<'a> ViewInputs<'a> {
     /// builder consumes is named here; everything it may mutate comes back
     /// as a [`RenderPatch`].
     pub(crate) fn from_app(app: &'a mut App) -> Self {
+        // Flatten editor state before the disjoint field borrows below.
+        let input = app.input_text();
+        let cursor_pos = app.cursor_char_pos();
         Self {
             gamba_active: app.gamba_child.is_some(),
             transcript: &mut app.transcript,
-            input: &app.input,
-            cursor_pos: app.cursor_pos,
+            input,
+            cursor_pos,
             streaming: app.streaming,
             spinner_frame: app.spinner_frame,
             agent_name: &app.agent_name,

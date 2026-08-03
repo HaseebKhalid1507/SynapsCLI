@@ -29,16 +29,11 @@ pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 /// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
-    /// Editing state machine (hybrid plan §3.1, tui-textarea-2). Never
-    /// rendered — snapshot time derives flat `(text, cursor)` via the compat
+    /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
+    /// rendered — snapshot time derives flat `(text, cursor)` via the
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
-    /// soft-wrap render pipeline. `input`/`cursor_pos` below are one-way
-    /// mirrors (editor → mirror via `sync_input_mirror`) until P3 removes them.
+    /// soft-wrap render pipeline.
     pub(crate) editor: tui_textarea::TextArea<'static>,
-    pub(crate) input: String,
-    /// Cursor position as a **char index** (not byte index).
-    /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
-    pub(crate) cursor_pos: usize,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     /// `api_messages.len()` at active-turn start. Failure repair may only
@@ -247,8 +242,6 @@ impl App {
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
-            input: String::new(),
-            cursor_pos: 0,
             api_messages: Vec::new(),
             streaming: false,
             turn_baseline: 0,
@@ -376,15 +369,20 @@ impl App {
         }
     }
 
-    // ── Editor compat accessors (hybrid plan §3.1) ─────────────────────────
-    // The editor owns editing state; everything else keeps reading the flat
-    // `input`/`cursor_pos` mirrors, refreshed by `sync_input_mirror` after
-    // every editor mutation. P3 deletes the mirrors and these become the only
-    // way in/out of the input buffer.
+    // ── Editor accessors (hybrid plan §3.1) ────────────────────────────────
+    // The editor is the sole input-buffer state; these accessors are the only
+    // way in/out. The render path materializes one flat `(text, cursor)` pair
+    // per frame in `ViewInputs::from_app`.
 
     /// Flat input text — editor lines joined by `\n`.
     pub(crate) fn input_text(&self) -> String {
         self.editor.lines().join("\n")
+    }
+
+    /// First line of the buffer, borrowed — for cheap hot-path guards that
+    /// only care about the line a slash command lives on (`/`-detection).
+    pub(crate) fn input_first_line(&self) -> &str {
+        self.editor.lines().first().map_or("", |s| s.as_str())
     }
 
     /// True when the input buffer contains no text at all.
@@ -403,36 +401,16 @@ impl App {
         self.editor = tui_textarea::TextArea::from(s.split('\n'));
         self.editor.move_cursor(tui_textarea::CursorMove::Bottom);
         self.editor.move_cursor(tui_textarea::CursorMove::End);
-        self.sync_input_mirror();
     }
 
     /// Clear the whole buffer (today's Ctrl-U semantics — plan §3.2 note).
     pub(crate) fn clear_input(&mut self) {
         self.editor = tui_textarea::TextArea::default();
-        self.sync_input_mirror();
     }
 
     /// Insert text at the cursor (paste, sidecar transcription, tab-complete).
     pub(crate) fn insert_at_cursor(&mut self, s: &str) {
         self.editor.insert_str(s);
-        self.sync_input_mirror();
-    }
-
-    /// One-way editor → mirror sync. Must run after every editor mutation so
-    /// snapshot/draw (which still read `input`/`cursor_pos`) stay coherent.
-    pub(crate) fn sync_input_mirror(&mut self) {
-        self.input = self.input_text();
-        self.cursor_pos = self.cursor_char_pos();
-    }
-
-    /// Restore SynapsCLI's TUI after casino (or failed spawn).
-    /// Convert char-based cursor_pos to byte offset in self.input.
-    pub(crate) fn cursor_byte_pos(&self) -> usize {
-        self.input
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
     }
 
     /// Calculate the number of visual lines the input needs, given an inner width.
@@ -680,7 +658,7 @@ impl App {
         }
         if let Some(idx) = self.history_index {
             let text = self.input_history[idx].clone();
-            // set_input_text keeps editor + mirrors coherent, cursor at end.
+            // set_input_text rebuilds the editor with the cursor at the end.
             self.set_input_text(&text);
         }
     }
@@ -1981,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn accessors_round_trip_and_mirror_sync() {
+    fn accessors_round_trip() {
         let mut app = test_app();
         assert!(app.input_is_empty());
         assert_eq!(app.cursor_char_pos(), 0);
@@ -1991,18 +1969,17 @@ mod tests {
         assert!(!app.input_is_empty());
         // set_input_text puts the cursor at the very end.
         assert_eq!(app.cursor_char_pos(), 11);
-        // Mirrors track the editor.
-        assert_eq!(app.input, "hello\nworld");
-        assert_eq!(app.cursor_pos, 11);
+        assert_eq!(app.input_first_line(), "hello");
 
         app.insert_at_cursor("!");
         assert_eq!(app.input_text(), "hello\nworld!");
-        assert_eq!(app.cursor_pos, 12);
+        assert_eq!(app.cursor_char_pos(), 12);
 
         app.clear_input();
         assert!(app.input_is_empty());
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor_pos, 0);
+        assert_eq!(app.input_text(), "");
+        assert_eq!(app.cursor_char_pos(), 0);
+        assert_eq!(app.input_first_line(), "");
     }
 
     #[test]

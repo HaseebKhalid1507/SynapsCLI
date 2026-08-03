@@ -280,7 +280,7 @@ fn paste_from_clipboard() -> Option<String> {
 /// submit, tab-completion, transcript scroll, Ctrl-O, Ctrl-U (clear whole
 /// buffer), history-at-edges Up/Down (§3.3) — are matched here with today's
 /// exact semantics. Every other editing key is forwarded to the TextArea
-/// editor, then mirrored via `sync_input_mirror`.
+/// editor, which is the sole input-buffer state.
 fn handle_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
@@ -339,14 +339,12 @@ fn handle_key(
         }
         (KeyCode::Enter, KeyModifiers::SHIFT) if !streaming => {
             app.editor.insert_newline();
-            app.sync_input_mirror();
         }
         // Alt-Enter: same as Shift-Enter. Legacy terminals (and tmux) encode
         // it as ESC+CR, which survives everywhere — Shift-Enter needs the
         // kitty keyboard protocol and often arrives as plain Enter.
         (KeyCode::Enter, KeyModifiers::ALT) if !streaming => {
             app.editor.insert_newline();
-            app.sync_input_mirror();
         }
         (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
@@ -357,7 +355,9 @@ fn handle_key(
         // Enter that matched none of the above (empty buffer) stays a no-op.
         // It must NOT reach the editor, which would insert a newline.
         (KeyCode::Enter, _) => {}
-        (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
+        (KeyCode::Tab, _)
+            if app.input_first_line().starts_with('/') && app.input_first_line().len() > 1 =>
+        {
             if open_help_find_for_ambiguous_slash(app, registry) {
                 return InputAction::HelpFindOutcome;
             }
@@ -381,11 +381,9 @@ fn handle_key(
         // editor's redo via the catch-all.
         (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
             app.editor.undo();
-            app.sync_input_mirror();
         }
         (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
             app.editor.redo();
-            app.sync_input_mirror();
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
@@ -398,11 +396,10 @@ fn handle_key(
         // plain Alt-←/→ unmapped — keep today's semantics via explicit moves.
         (KeyCode::Left, KeyModifiers::ALT) => {
             app.editor.move_cursor(tui_textarea::CursorMove::WordBack);
-            app.sync_input_mirror();
         }
         (KeyCode::Right, KeyModifiers::ALT) => {
-            app.editor.move_cursor(tui_textarea::CursorMove::WordForward);
-            app.sync_input_mirror();
+            app.editor
+                .move_cursor(tui_textarea::CursorMove::WordForward);
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
             app.transcript.scroll_up(1);
@@ -417,20 +414,17 @@ fn handle_key(
         }
         (KeyCode::Up, _) => {
             app.editor.input(key);
-            app.sync_input_mirror();
         }
         (KeyCode::Down, _) if app.editor.cursor().0 + 1 >= app.editor.lines().len() => {
             app.history_down();
         }
         (KeyCode::Down, _) => {
             app.editor.input(key);
-            app.sync_input_mirror();
         }
         // Everything else — chars, Backspace/Delete, ←/→, Home/End,
         // Ctrl-A/E/W/K, Alt-Backspace, undo/redo — is the editor's job.
         _ => {
             app.editor.input(key);
-            app.sync_input_mirror();
         }
     }
     InputAction::None
@@ -851,7 +845,8 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
 }
 
 fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
-    let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
+    let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(app.input_first_line())
+    else {
         return false;
     };
     let help_registry = synaps_cli::help::HelpRegistry::new(
@@ -892,7 +887,7 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
     }
 
     // Fresh tab press — find matches for the current partial.
-    let partial = app.input[1..].to_string();
+    let partial = app.input_first_line()[1..].to_string();
     let matches: Vec<String> = commands
         .iter()
         .filter(|c| c.starts_with(partial.as_str()))
@@ -1078,9 +1073,7 @@ mod tests {
         ));
         press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(app.input_text(), "ab\nc");
-        // Mirrors track the editor for the render pipeline.
-        assert_eq!(app.input, "ab\nc");
-        assert_eq!(app.cursor_pos, 4);
+        assert_eq!(app.cursor_char_pos(), 4);
     }
 
     /// Up inside a multi-line buffer moves the cursor, not history (§3.3).
@@ -1121,22 +1114,20 @@ mod tests {
         app.set_input_text("hello\nworld");
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert!(app.input_is_empty());
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor_pos, 0);
+        assert_eq!(app.cursor_char_pos(), 0);
     }
 
-    /// Backspace / word-delete now route through the editor and keep the
-    /// mirrors in sync.
+    /// Backspace / word-delete route through the editor.
     #[test]
-    fn editing_keys_forward_to_editor_and_sync_mirror() {
+    fn editing_keys_forward_to_editor() {
         let mut app = make_app();
         for c in "hi there".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
         }
         press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
-        assert_eq!(app.input, "hi ther");
+        assert_eq!(app.input_text(), "hi ther");
         press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
-        assert_eq!(app.input, "hi ");
-        assert_eq!(app.cursor_pos, 3);
+        assert_eq!(app.input_text(), "hi ");
+        assert_eq!(app.cursor_char_pos(), 3);
     }
 }
