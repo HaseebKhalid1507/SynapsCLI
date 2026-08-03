@@ -143,6 +143,9 @@ fn handle_event_inner(
             if app.input_before_paste.is_none() {
                 app.input_before_paste = Some(app.input_text());
             }
+            // Terminals (and tmux) convert \n to \r inside bracketed paste —
+            // normalize so multi-line pastes actually become multiple lines.
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
             app.insert_at_cursor(&text);
             app.pasted_char_count += text.chars().count();
             InputAction::None
@@ -360,10 +363,22 @@ fn handle_key(
         (KeyCode::Tab, _) => {}
         // Esc outside streaming: no-op, never forwarded.
         (KeyCode::Esc, _) => {}
-        // Ctrl-U clears the WHOLE buffer (today's semantics), not the lib's
-        // default binding.
+        // Ctrl-U clears the WHOLE buffer (today's semantics). This shadows the
+        // fork's own Ctrl-U binding (undo) — so undo/redo get explicit,
+        // conventional binds below.
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             app.clear_input();
+        }
+        // Undo/redo: the fork's defaults (Ctrl-U undo) are shadowed/unmapped;
+        // bind the conventional keys explicitly. Ctrl-R also reaches the
+        // editor's redo via the catch-all.
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            app.editor.undo();
+            app.sync_input_mirror();
+        }
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            app.editor.redo();
+            app.sync_input_mirror();
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
