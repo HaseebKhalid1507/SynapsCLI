@@ -341,6 +341,13 @@ fn handle_key(
             app.editor.insert_newline();
             app.sync_input_mirror();
         }
+        // Alt-Enter: same as Shift-Enter. Legacy terminals (and tmux) encode
+        // it as ESC+CR, which survives everywhere — Shift-Enter needs the
+        // kitty keyboard protocol and often arrives as plain Enter.
+        (KeyCode::Enter, KeyModifiers::ALT) if !streaming => {
+            app.editor.insert_newline();
+            app.sync_input_mirror();
+        }
         (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
         }
