@@ -435,11 +435,6 @@ impl App {
             .unwrap_or(self.input.len())
     }
 
-    /// Number of chars in self.input (for bounds checking cursor_pos).
-    pub(crate) fn input_char_count(&self) -> usize {
-        self.input.chars().count()
-    }
-
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
     ///
@@ -675,7 +670,7 @@ impl App {
         }
         match self.history_index {
             None => {
-                self.input_stash = self.input.clone();
+                self.input_stash = self.input_text();
                 self.history_index = Some(self.input_history.len() - 1);
             }
             Some(i) if i > 0 => {
@@ -684,8 +679,9 @@ impl App {
             _ => return,
         }
         if let Some(idx) = self.history_index {
-            self.input = self.input_history[idx].clone();
-            self.cursor_pos = self.input.chars().count();
+            let text = self.input_history[idx].clone();
+            // set_input_text keeps editor + mirrors coherent, cursor at end.
+            self.set_input_text(&text);
         }
     }
 
@@ -693,13 +689,13 @@ impl App {
         if let Some(i) = self.history_index {
             if i + 1 < self.input_history.len() {
                 self.history_index = Some(i + 1);
-                self.input = self.input_history[i + 1].clone();
+                let text = self.input_history[i + 1].clone();
+                self.set_input_text(&text);
             } else {
                 self.history_index = None;
-                self.input = self.input_stash.clone();
-                self.input_stash.clear();
+                let stash = std::mem::take(&mut self.input_stash);
+                self.set_input_text(&stash);
             }
-            self.cursor_pos = self.input.chars().count();
         }
     }
 

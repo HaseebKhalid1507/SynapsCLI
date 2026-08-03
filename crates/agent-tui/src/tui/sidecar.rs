@@ -260,9 +260,8 @@ pub(crate) fn insert_text_into_input(app: &mut App, text: &str) {
     } else {
         trimmed.to_string()
     };
-    let byte_pos = app.cursor_byte_pos();
-    app.input.insert_str(byte_pos, &to_insert);
-    app.cursor_pos += to_insert.chars().count();
+    // Route through the editor so it stays coherent with the mirrors (P2).
+    app.insert_at_cursor(&to_insert);
     app.invalidate();
 }
 
@@ -371,8 +370,7 @@ mod tests {
     #[test]
     fn insert_text_appends_with_leading_space() {
         let mut app = fresh_app();
-        app.input = "first".to_string();
-        app.cursor_pos = "first".chars().count();
+        app.set_input_text("first");
         insert_text_into_input(&mut app, "second sentence");
         assert_eq!(app.input, "first second sentence");
         assert_eq!(app.cursor_pos, "first second sentence".chars().count());
@@ -381,8 +379,7 @@ mod tests {
     #[test]
     fn insert_text_no_double_space_when_input_ends_with_space() {
         let mut app = fresh_app();
-        app.input = "first ".to_string();
-        app.cursor_pos = "first ".chars().count();
+        app.set_input_text("first ");
         insert_text_into_input(&mut app, "second");
         assert_eq!(app.input, "first second");
     }
@@ -406,9 +403,10 @@ mod tests {
     #[test]
     fn insert_text_inserts_at_cursor_not_end() {
         let mut app = fresh_app();
-        app.input = "hello world".to_string();
+        app.set_input_text("hello world");
         // Place cursor between "hello" and " world" (after "hello")
-        app.cursor_pos = 5;
+        app.editor.move_cursor(tui_textarea::CursorMove::Jump(0, 5));
+        app.sync_input_mirror();
         insert_text_into_input(&mut app, "beautiful");
         assert_eq!(app.input, "hello beautiful world");
     }

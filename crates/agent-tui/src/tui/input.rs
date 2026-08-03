@@ -111,7 +111,7 @@ fn handle_event_inner(
     scroll_lines: u16,
 ) -> InputAction {
     match event {
-        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
+        Event::Key(key) => handle_key(key, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => handle_mouse(mouse, app, scroll_lines),
         Event::Paste(text) => {
             // Suppress paste events that fire immediately after a right-click copy.
@@ -141,11 +141,9 @@ fn handle_event_inner(
                 text
             };
             if app.input_before_paste.is_none() {
-                app.input_before_paste = Some(app.input.clone());
+                app.input_before_paste = Some(app.input_text());
             }
-            let byte_pos = app.cursor_byte_pos();
-            app.input.insert_str(byte_pos, &text);
-            app.cursor_pos += text.chars().count();
+            app.insert_at_cursor(&text);
             app.pasted_char_count += text.chars().count();
             InputAction::None
         }
@@ -223,11 +221,9 @@ fn handle_mouse(
                 if let Some(text) = paste_from_clipboard() {
                     if !text.is_empty() {
                         if app.input_before_paste.is_none() {
-                            app.input_before_paste = Some(app.input.clone());
+                            app.input_before_paste = Some(app.input_text());
                         }
-                        let byte_pos = app.cursor_byte_pos();
-                        app.input.insert_str(byte_pos, &text);
-                        app.cursor_pos += text.chars().count();
+                        app.insert_at_cursor(&text);
                         app.pasted_char_count += text.chars().count();
                     }
                 }
@@ -275,15 +271,21 @@ fn paste_from_clipboard() -> Option<String> {
     None
 }
 
-/// Handle a key event.
+/// Handle a key event on the base Chat pane.
+///
+/// Interception contract (hybrid plan §3.2): app-level keys — quit, abort,
+/// submit, tab-completion, transcript scroll, Ctrl-O, Ctrl-U (clear whole
+/// buffer), history-at-edges Up/Down (§3.3) — are matched here with today's
+/// exact semantics. Every other editing key is forwarded to the TextArea
+/// editor, then mirrored via `sync_input_mirror`.
 fn handle_key(
-    code: KeyCode,
-    modifiers: KeyModifiers,
+    key: crossterm::event::KeyEvent,
     app: &mut App,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
+    let (code, modifiers) = (key.code, key.modifiers);
     // Clear text selection on any keypress (typing dismisses selection)
     app.transcript.clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
@@ -333,16 +335,18 @@ fn handle_key(
             return InputAction::Abort;
         }
         (KeyCode::Enter, KeyModifiers::SHIFT) if !streaming => {
-            let byte_pos = app.cursor_byte_pos();
-            app.input.insert(byte_pos, '\n');
-            app.cursor_pos += 1;
+            app.editor.insert_newline();
+            app.sync_input_mirror();
         }
-        (KeyCode::Enter, _) if !streaming && !app.input.is_empty() => {
+        (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
         }
-        (KeyCode::Enter, _) if streaming && !app.input.is_empty() => {
+        (KeyCode::Enter, _) if streaming && !app.input_is_empty() => {
             return process_streaming_submit(app);
         }
+        // Enter that matched none of the above (empty buffer) stays a no-op.
+        // It must NOT reach the editor, which would insert a newline.
+        (KeyCode::Enter, _) => {}
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
             if open_help_find_for_ambiguous_slash(app, registry) {
                 return InputAction::HelpFindOutcome;
@@ -351,31 +355,15 @@ fn handle_key(
             // Skip the tab_cycle reset below — we just set it.
             return InputAction::None;
         }
-        // Cursor movement
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-            app.cursor_pos = 0;
-        }
-        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-            app.cursor_pos = app.input.chars().count();
-        }
-        (KeyCode::Char('w'), KeyModifiers::CONTROL) | (KeyCode::Backspace, KeyModifiers::ALT) => {
-            delete_word_backward(app);
-        }
+        // Tab outside slash-completion was a no-op before; the editor would
+        // insert a literal tab char. Keep the no-op.
+        (KeyCode::Tab, _) => {}
+        // Esc outside streaming: no-op, never forwarded.
+        (KeyCode::Esc, _) => {}
+        // Ctrl-U clears the WHOLE buffer (today's semantics), not the lib's
+        // default binding.
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            app.input.clear();
-            app.cursor_pos = 0;
-        }
-        (KeyCode::Home, _) => {
-            app.cursor_pos = 0;
-        }
-        (KeyCode::End, _) => {
-            app.cursor_pos = app.input.chars().count();
-        }
-        (KeyCode::Left, KeyModifiers::ALT) => {
-            jump_word_left(app);
-        }
-        (KeyCode::Right, KeyModifiers::ALT) => {
-            jump_word_right(app);
+            app.clear_input();
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
@@ -384,21 +372,15 @@ fn handle_key(
                 .set_show_full_output(!app.transcript.show_full_output());
             app.request_redraw();
         }
-        (KeyCode::Char(c), _) => {
-            let byte_pos = app.cursor_byte_pos();
-            app.input.insert(byte_pos, c);
-            app.cursor_pos += 1;
+        // Alt-←/→ word jumps: the lib maps Alt-b/f and Ctrl-←/→ but leaves
+        // plain Alt-←/→ unmapped — keep today's semantics via explicit moves.
+        (KeyCode::Left, KeyModifiers::ALT) => {
+            app.editor.move_cursor(tui_textarea::CursorMove::WordBack);
+            app.sync_input_mirror();
         }
-        (KeyCode::Backspace, _) if app.cursor_pos > 0 => {
-            app.cursor_pos -= 1;
-            let byte_pos = app.cursor_byte_pos();
-            app.input.remove(byte_pos);
-        }
-        (KeyCode::Left, _) if app.cursor_pos > 0 => {
-            app.cursor_pos -= 1;
-        }
-        (KeyCode::Right, _) if app.cursor_pos < app.input_char_count() => {
-            app.cursor_pos += 1;
+        (KeyCode::Right, KeyModifiers::ALT) => {
+            app.editor.move_cursor(tui_textarea::CursorMove::WordForward);
+            app.sync_input_mirror();
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
             app.transcript.scroll_up(1);
@@ -406,13 +388,30 @@ fn handle_key(
         (KeyCode::Down, KeyModifiers::SHIFT) => {
             app.transcript.scroll_down(1);
         }
+        // Up/Down: history only at buffer edges (§3.3 DECIDED); inside a
+        // multi-line buffer they move the cursor.
         (KeyCode::Up, _) => {
-            app.history_up();
+            if app.editor.cursor().0 == 0 {
+                app.history_up();
+            } else {
+                app.editor.input(key);
+                app.sync_input_mirror();
+            }
         }
         (KeyCode::Down, _) => {
-            app.history_down();
+            if app.editor.cursor().0 + 1 >= app.editor.lines().len() {
+                app.history_down();
+            } else {
+                app.editor.input(key);
+                app.sync_input_mirror();
+            }
         }
-        _ => {}
+        // Everything else — chars, Backspace/Delete, ←/→, Home/End,
+        // Ctrl-A/E/W/K, Alt-Backspace, undo/redo — is the editor's job.
+        _ => {
+            app.editor.input(key);
+            app.sync_input_mirror();
+        }
     }
     InputAction::None
 }
@@ -422,12 +421,11 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
-    let input = app.input.clone();
+    let input = app.input_text();
     app.input_history.push(input.clone());
     app.history_index = None;
     app.input_stash.clear();
-    app.input.clear();
-    app.cursor_pos = 0;
+    app.clear_input();
     app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
@@ -444,12 +442,11 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
 
 /// User pressed Enter with non-empty input while streaming.
 fn process_streaming_submit(app: &mut App) -> InputAction {
-    let input = app.input.clone();
+    let input = app.input_text();
     app.input_history.push(input.clone());
     app.history_index = None;
     app.input_stash.clear();
-    app.input.clear();
-    app.cursor_pos = 0;
+    app.clear_input();
     app.input_before_paste = None;
     app.pasted_char_count = 0;
 
@@ -869,8 +866,7 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
             return;
         }
         let next = (idx + 1) % matching_cmds.len();
-        app.input = format!("/{}", matching_cmds[next]);
-        app.cursor_pos = app.input.chars().count();
+        app.set_input_text(&format!("/{}", matching_cmds[next]));
         app.tab_cycle = Some((prefix.clone(), next, matching_cmds.clone()));
         return;
     }
@@ -884,8 +880,7 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
         .collect();
 
     if matches.len() == 1 {
-        app.input = format!("/{}", matches[0]);
-        app.cursor_pos = app.input.chars().count();
+        app.set_input_text(&format!("/{}", matches[0]));
         return;
     }
 
@@ -903,12 +898,10 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
 
         if common_len > partial.len() {
             // Extend to common prefix — don't start cycling yet.
-            app.input = format!("/{}", &first[..common_len]);
-            app.cursor_pos = app.input.chars().count();
+            app.set_input_text(&format!("/{}", &first[..common_len]));
         } else {
             // Already at common prefix — start cycle from match[0].
-            app.input = format!("/{}", matches[0]);
-            app.cursor_pos = app.input.chars().count();
+            app.set_input_text(&format!("/{}", matches[0]));
             app.tab_cycle = Some((partial, 0, matches));
         }
         return;
@@ -916,57 +909,8 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
 
     // No prefix matches — try fuzzy matching
     if let Some(fuzzy) = super::commands::fuzzy_match(&partial, &commands) {
-        app.input = format!("/{}", fuzzy);
-        app.cursor_pos = app.input.chars().count();
+        app.set_input_text(&format!("/{}", fuzzy));
     }
-}
-
-/// Delete word backward (Ctrl+W / Alt+Backspace).
-fn delete_word_backward(app: &mut App) {
-    let chars: Vec<char> = app.input.chars().collect();
-    let mut pos = app.cursor_pos;
-    while pos > 0 && chars[pos - 1] == ' ' {
-        pos -= 1;
-    }
-    while pos > 0 && chars[pos - 1] != ' ' {
-        pos -= 1;
-    }
-    let byte_start = app
-        .input
-        .char_indices()
-        .nth(pos)
-        .map(|(i, _)| i)
-        .unwrap_or(app.input.len());
-    let byte_end = app.cursor_byte_pos();
-    app.input.drain(byte_start..byte_end);
-    app.cursor_pos = pos;
-}
-
-/// Jump cursor one word left.
-fn jump_word_left(app: &mut App) {
-    let chars: Vec<char> = app.input.chars().collect();
-    let mut pos = app.cursor_pos;
-    while pos > 0 && chars[pos - 1] == ' ' {
-        pos -= 1;
-    }
-    while pos > 0 && chars[pos - 1] != ' ' {
-        pos -= 1;
-    }
-    app.cursor_pos = pos;
-}
-
-/// Jump cursor one word right.
-fn jump_word_right(app: &mut App) {
-    let chars: Vec<char> = app.input.chars().collect();
-    let len = chars.len();
-    let mut pos = app.cursor_pos;
-    while pos < len && chars[pos] != ' ' {
-        pos += 1;
-    }
-    while pos < len && chars[pos] == ' ' {
-        pos += 1;
-    }
-    app.cursor_pos = pos;
 }
 
 #[cfg(test)]
@@ -1085,5 +1029,94 @@ mod tests {
         };
         let step = cfg.scroll_lines.unwrap_or(3);
         assert_eq!(step, 7);
+    }
+
+    // ── P2: editing keys route through the TextArea editor ────────────────
+
+    /// Drive one keypress through the chat-pane key handler (not streaming).
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) -> InputAction {
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_key(
+            crossterm::event::KeyEvent::new(code, mods),
+            app,
+            false,
+            &registry,
+            &keybinds,
+        )
+    }
+
+    /// Shift-Enter inserts a newline into the buffer instead of submitting.
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let mut app = make_app();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT),
+            InputAction::None
+        ));
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.input_text(), "ab\nc");
+        // Mirrors track the editor for the render pipeline.
+        assert_eq!(app.input, "ab\nc");
+        assert_eq!(app.cursor_pos, 4);
+    }
+
+    /// Up inside a multi-line buffer moves the cursor, not history (§3.3).
+    #[test]
+    fn up_on_multiline_buffer_moves_cursor_not_history() {
+        let mut app = make_app();
+        app.input_history.push("older entry".to_string());
+        app.set_input_text("line1\nline2"); // cursor at end: row 1
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input_text(), "line1\nline2", "buffer must be untouched");
+        assert_eq!(app.history_index, None, "history must not engage");
+        assert_eq!(app.editor.cursor().0, 0, "cursor should move to row 0");
+        // A second Up — now on the first line — engages history.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input_text(), "older entry");
+        assert_eq!(app.history_index, Some(0));
+    }
+
+    /// Up on a single-line buffer recalls history immediately, and Down at
+    /// the last line restores the stashed draft.
+    #[test]
+    fn up_on_single_line_triggers_history() {
+        let mut app = make_app();
+        app.input_history.push("older entry".to_string());
+        app.set_input_text("draft");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input_text(), "older entry");
+        assert_eq!(app.history_index, Some(0));
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.input_text(), "draft", "Down at edge restores stash");
+        assert_eq!(app.history_index, None);
+    }
+
+    /// Ctrl-U clears the WHOLE buffer (our semantics, not the lib default).
+    #[test]
+    fn ctrl_u_clears_whole_buffer() {
+        let mut app = make_app();
+        app.set_input_text("hello\nworld");
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(app.input_is_empty());
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_pos, 0);
+    }
+
+    /// Backspace / word-delete now route through the editor and keep the
+    /// mirrors in sync.
+    #[test]
+    fn editing_keys_forward_to_editor_and_sync_mirror() {
+        let mut app = make_app();
+        for c in "hi there".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.input, "hi ther");
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(app.input, "hi ");
+        assert_eq!(app.cursor_pos, 3);
     }
 }
