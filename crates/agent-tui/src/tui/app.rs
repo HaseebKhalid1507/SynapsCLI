@@ -390,7 +390,7 @@ impl App {
     /// True when the input buffer contains no text at all.
     pub(crate) fn input_is_empty(&self) -> bool {
         let lines = self.editor.lines();
-        lines.len() <= 1 && lines.first().is_none_or(|l| l.is_empty())
+        lines.len() <= 1 && lines.first().map_or(true, |l| l.is_empty())
     }
 
     /// Flat **char** index of the editor cursor within `input_text()`.

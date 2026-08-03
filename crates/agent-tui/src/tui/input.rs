@@ -390,21 +390,19 @@ fn handle_key(
         }
         // Up/Down: history only at buffer edges (§3.3 DECIDED); inside a
         // multi-line buffer they move the cursor.
+        (KeyCode::Up, _) if app.editor.cursor().0 == 0 => {
+            app.history_up();
+        }
         (KeyCode::Up, _) => {
-            if app.editor.cursor().0 == 0 {
-                app.history_up();
-            } else {
-                app.editor.input(key);
-                app.sync_input_mirror();
-            }
+            app.editor.input(key);
+            app.sync_input_mirror();
+        }
+        (KeyCode::Down, _) if app.editor.cursor().0 + 1 >= app.editor.lines().len() => {
+            app.history_down();
         }
         (KeyCode::Down, _) => {
-            if app.editor.cursor().0 + 1 >= app.editor.lines().len() {
-                app.history_down();
-            } else {
-                app.editor.input(key);
-                app.sync_input_mirror();
-            }
+            app.editor.input(key);
+            app.sync_input_mirror();
         }
         // Everything else — chars, Backspace/Delete, ←/→, Home/End,
         // Ctrl-A/E/W/K, Alt-Backspace, undo/redo — is the editor's job.
