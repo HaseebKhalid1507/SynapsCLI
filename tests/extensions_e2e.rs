@@ -748,28 +748,72 @@ async fn declared_secret_env_survives_extension_restart_without_persistence() {
     config::set_base_dir_for_tests(home.path().to_path_buf());
     std::env::set_var("PRIA_AGENT_TOOL_TOKEN", "regression-secret-token");
 
-    let fixture = std::env::current_dir().unwrap()
-        .join("tests/fixtures/config_seen_extension.py").to_string_lossy().to_string();
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/config_seen_extension.py")
+        .to_string_lossy()
+        .to_string();
     let plugin_dir = tempfile::tempdir().unwrap();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
-        theme_tokens: Default::default(), protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
-        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process, command: "python3".to_string(), setup: None,
-        prebuilt: ::std::collections::HashMap::new(), args: vec![fixture, "--exit-on-hook-once".to_string()],
+        theme_tokens: Default::default(),
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
+        args: vec![fixture, "--exit-on-hook-once".to_string()],
         permissions: vec!["tools.intercept".to_string()],
-        hooks: vec![synaps_cli::extensions::manifest::HookSubscription { hook: "before_tool_call".to_string(), tool: Some("bash".to_string()), matcher: None }],
-        config: vec![ExtensionConfigEntry { key: "pria_agent_tool_token".to_string(), value_type: None, description: None, required: true, default: None, secret_env: Some("PRIA_AGENT_TOOL_TOKEN".to_string()), host_context: None }],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+            hook: "before_tool_call".to_string(),
+            tool: Some("bash".to_string()),
+            matcher: None,
+        }],
+        config: vec![ExtensionConfigEntry {
+            key: "pria_agent_tool_token".to_string(),
+            value_type: None,
+            description: None,
+            required: true,
+            default: None,
+            secret_env: Some("PRIA_AGENT_TOOL_TOKEN".to_string()),
+            host_context: None,
+        }],
         deferred: None,
     };
-    manager.load_with_cwd("knowledge", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
-    assert_eq!(manager.hook_bus().emit(&HookEvent::before_tool_call("bash", json!({}))).await, HookResult::Continue);
+    manager
+        .load_with_cwd(
+            "knowledge",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .hook_bus()
+            .emit(&HookEvent::before_tool_call("bash", json!({})))
+            .await,
+        HookResult::Continue
+    );
     manager.shutdown_all().await;
     std::env::remove_var("PRIA_AGENT_TOOL_TOKEN");
 
     let seen = fs::read_to_string(plugin_dir.path().join("config-seen.json")).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&seen).unwrap()["pria_agent_tool_token"], "regression-secret-token");
-    assert!(!home.path().join("config").exists(), "secret must not be persisted");
-    assert!(!std::fs::read_dir(home.path()).unwrap().filter_map(Result::ok).any(|e| e.path().is_file() && fs::read_to_string(e.path()).unwrap_or_default().contains("regression-secret-token")));
+    assert_eq!(
+        serde_json::from_str::<Value>(&seen).unwrap()["pria_agent_tool_token"],
+        "regression-secret-token"
+    );
+    assert!(
+        !home.path().join("config").exists(),
+        "secret must not be persisted"
+    );
+    assert!(!std::fs::read_dir(home.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.path().is_file()
+            && fs::read_to_string(e.path())
+                .unwrap_or_default()
+                .contains("regression-secret-token")));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1517,4 +1561,106 @@ async fn audit_log_records_disabled_route() {
 
     manager.write().await.shutdown_all().await;
     synaps_cli::runtime::openai::clear_extension_manager_for_routing();
+}
+
+/// T291 defect 1 (the live one): an extension subscribed to
+/// `on_session_start` must actually receive the event, and its `inject`
+/// response must survive.
+///
+/// This failed two independent ways before the fix:
+///
+///  1. `engine::setup::boot()` emitted the event while the ExtensionManager
+///     was still empty — every host loads extensions AFTER boot returns — so
+///     no handler ever ran. `cmd/server.rs` even documented the symptom
+///     ("no subscribers until extensions loaded") without it registering as
+///     a bug.
+///  2. `HookKind::allows_result` permitted only `Continue` for this hook, so
+///     even a delivered `inject` was dropped with a warn-level log and the
+///     emit site discarded the return value anyway.
+///
+/// The live `axel` extension returns `inject` from this hook, which is why
+/// its session handoff had never once reached the model.
+#[tokio::test(flavor = "current_thread")]
+async fn on_session_start_injection_reaches_the_session() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+
+    let plugin_dir = home.path().join("plugins/session-start-test");
+    let log_path = plugin_dir.join("session-start.jsonl");
+    fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
+    fs::copy(
+        std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/session_start_inject_extension.py"),
+        plugin_dir.join("extensions/session_start_inject_extension.py"),
+    )
+    .unwrap();
+
+    fs::write(
+        plugin_dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "session-start-test",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/session_start_inject_extension.py"],
+    "permissions": ["session.lifecycle"],
+    "hooks": [{"hook": "on_session_start"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    std::env::set_var("SYNAPS_SESSION_START_LOG", &log_path);
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    assert_eq!(loaded, vec!["session-start-test".to_string()]);
+    assert!(
+        failed.is_empty(),
+        "unexpected discovery failures: {failed:?}"
+    );
+
+    // Nothing is injected until the event is emitted.
+    assert_eq!(
+        hook_bus.session_injection().await,
+        None,
+        "session injection must start empty"
+    );
+
+    let event = HookEvent::on_session_start("sess-291");
+    let result = hook_bus.emit(&event).await;
+
+    // (2) the action survives the hook's result filter
+    let content = match result {
+        HookResult::Inject { content } => content,
+        other => panic!(
+            "on_session_start must accept `inject`; got {other:?} \
+             (regression of #291 defect 1)"
+        ),
+    };
+    assert!(content.contains("HANDOFF-SENTINEL"));
+
+    // (1) the handler genuinely ran, with the right session id
+    let seen = fs::read_to_string(&log_path).expect("hook log must exist — handler never ran");
+    assert!(seen.contains("on_session_start"), "log was {seen:?}");
+    assert!(seen.contains("sess-291"), "log was {seen:?}");
+
+    // The loader stores it for the rest of the session; stream.rs reads it
+    // from here when composing the system prompt.
+    hook_bus.set_session_injection(content).await;
+    let stored = hook_bus
+        .session_injection()
+        .await
+        .expect("session injection must persist for the session");
+    assert!(stored.contains("HANDOFF-SENTINEL"));
+
+    manager.shutdown_all().await;
+    std::env::remove_var("SYNAPS_SESSION_START_LOG");
 }

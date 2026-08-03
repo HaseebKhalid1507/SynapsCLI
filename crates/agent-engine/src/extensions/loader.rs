@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
+use super::hooks::events::{HookEvent, HookResult};
 use super::manager::{ExtensionLoadFailure, ExtensionManager};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,9 +41,22 @@ impl ExtensionLoaderEvent {
     }
 }
 
+/// Discover and load extensions in the background, then fire `on_session_start`.
+///
+/// The hook is emitted HERE, not at engine boot, and that placement is the
+/// whole point. `engine::setup::boot()` used to emit it while constructing an
+/// empty `ExtensionManager` — before any host had called this function — so
+/// the event reached zero subscribers in every host (TUI, server, rpc). No
+/// extension had ever received `on_session_start`. A comment in
+/// `cmd/server.rs` recorded the symptom ("no subscribers until extensions
+/// loaded") without it being recognised as a defect.
+///
+/// `session_id` is the session the hook reports. `None` skips the emit, for
+/// callers that have no session (or extensions disabled).
 pub fn spawn_discover_and_load(
     manager: Arc<RwLock<ExtensionManager>>,
     tx: mpsc::UnboundedSender<ExtensionLoaderEvent>,
+    session_id: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _ = tx.send(ExtensionLoaderEvent::Started);
@@ -53,6 +67,20 @@ pub fn spawn_discover_and_load(
                 let _ = tx.send(event);
             })
             .await;
+
+        // Extensions are now subscribed; the event has somewhere to land.
+        if let Some(session_id) = session_id {
+            let hook_bus = manager.read().await.hook_bus().clone();
+            let event = HookEvent::on_session_start(&session_id);
+            if let HookResult::Inject { content } = hook_bus.emit(&event).await {
+                tracing::debug!(
+                    len = content.len(),
+                    "on_session_start injected session-scoped context"
+                );
+                hook_bus.set_session_injection(content).await;
+            }
+        }
+
         let _ = tx.send(ExtensionLoaderEvent::Finished { loaded, failed });
     })
 }

@@ -915,8 +915,13 @@ pub async fn run(
     //    cannot send a Prompt before extension-backed providers have
     //    registered. Bounded by a 2 s grace period — extension loading is
     //    best-effort, not a hard fail.
+    let session_id_for_hook = session.id.clone();
     let (loader_tx, mut loader_rx) = mpsc::unbounded_channel();
-    synaps_cli::extensions::loader::spawn_discover_and_load(Arc::clone(&ext_manager), loader_tx);
+    synaps_cli::extensions::loader::spawn_discover_and_load(
+        Arc::clone(&ext_manager),
+        loader_tx,
+        Some(session_id_for_hook.clone()),
+    );
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while let Some(ev) = loader_rx.recv().await {
             if matches!(

@@ -49,8 +49,10 @@
       "permission": "session.lifecycle",
       "tool_filter": false,
       "actions": [
-        "continue"
-      ]
+        "continue",
+        "inject"
+      ],
+      "inject_scope": "Session-scoped: injected once when the session starts, after extensions have loaded, and appended to the system prompt for the remainder of the session. Contrast before_message, which is re-evaluated per turn."
     },
     "on_session_end": {
       "permission": "session.lifecycle",

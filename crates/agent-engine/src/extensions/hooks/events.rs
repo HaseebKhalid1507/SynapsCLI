@@ -101,10 +101,12 @@ impl HookKind {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue", "replace"],
             Self::BeforeMessage => &["continue", "inject"],
-            Self::OnMessageComplete
-            | Self::OnCompaction
-            | Self::OnSessionStart
-            | Self::OnSessionEnd => &["continue"],
+            // Session-scoped context. Injected ONCE when the session starts
+            // and carried on the system prompt for the rest of it, rather
+            // than re-appended on every message the way `before_message`
+            // injection is.
+            Self::OnSessionStart => &["continue", "inject"],
+            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -123,6 +125,7 @@ impl HookKind {
                 | (Self::BeforeToolCall, HookResult::Modify { .. })
                 | (Self::AfterToolCall, HookResult::Replace { .. })
                 | (Self::BeforeMessage, HookResult::Inject { .. })
+                | (Self::OnSessionStart, HookResult::Inject { .. })
         )
     }
 

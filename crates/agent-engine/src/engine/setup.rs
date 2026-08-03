@@ -277,7 +277,14 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let ext_manager = Arc::new(RwLock::new(ext_mgr));
     crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 
-    // Session start hook
+    // Session start index record.
+    //
+    // The `on_session_start` HOOK is deliberately NOT emitted here. Extensions
+    // are loaded by the host after boot returns (see
+    // `extensions::loader::spawn_discover_and_load`), so emitting at this
+    // point delivered the event to an empty bus in every host — the hook had
+    // never once reached an extension. It is now emitted by the loader, after
+    // subscribers exist.
     {
         let mut index_record =
             crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
@@ -287,10 +294,6 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         if let Err(err) = crate::core::session_index::append_record(&index_record) {
             tracing::warn!("failed to append session start index record: {}", err);
         }
-
-        let hook_event =
-            crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
-        let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
     if mcp_server_count > 0 {
