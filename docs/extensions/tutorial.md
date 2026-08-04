@@ -429,7 +429,9 @@ registration, and hook dispatch.)
 - Rewrite tool output after execution (compression/redaction) with the
   `after_tool_call` → `replace` action — needs `tools.transform_output` in
   addition to `tools.intercept`. See [`hooks.md`](./hooks.md).
-- Inject context into the model's system prompt with `before_message` → `inject`
+- Inject per-turn context into the model's request (attached to the newest
+  user message as an ephemeral block — not the system prompt) with
+  `before_message` → `inject`
   — needs `privacy.llm_content`. See
   [`examples/extensions/time-ext.py`](../../examples/extensions/time-ext.py) for a
   complete injector.

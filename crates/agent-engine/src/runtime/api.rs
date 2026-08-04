@@ -1558,8 +1558,12 @@ impl ApiMethods {
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
+                        // ANY block, not just the last: the conversational
+                        // marker lands on the last DURABLE block, which sits
+                        // before the ephemeral injected tail when per-turn
+                        // context is attached.
                         if let Some(arr) = m["content"].as_array() {
-                            arr.last().and_then(|b| b.get("cache_control")).is_some()
+                            arr.iter().any(|b| b.get("cache_control").is_some())
                         } else {
                             false
                         }

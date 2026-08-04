@@ -30,7 +30,7 @@ name.
 | `before_message` | `privacy.llm_content` | no | `continue`, `inject` | Inspect the user message and optionally inject context |
 | `on_message_complete` | `privacy.llm_content` | no | `continue` | Observe completed assistant responses |
 | `on_compaction` | `privacy.llm_content` | no | `continue` | Observe completed conversation compaction summaries |
-| `on_session_start` | `session.lifecycle` | no | `continue` | Observe session creation |
+| `on_session_start` | `session.lifecycle` | no | `continue`, `inject` | Observe session creation and optionally inject session-stable context |
 | `on_session_end` | `session.lifecycle` | no | `continue` | Observe session shutdown and transcript |
 
 Unsupported result actions are ignored fail-open and logged as warnings.
@@ -44,7 +44,11 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   It is accepted only on `before_tool_call`. Interactive TUI streams prompt the
   user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `inject` accumulates text from all matching handlers and injects it into the
-  model context. It is accepted only on `before_message`.
+  model context. It is accepted on `before_message` (attached to the newest
+  user message as a trailing ephemeral text block, positioned after the
+  conversational cache marker — never the system prompt) and on
+  `on_session_start` (appended to the system prompt once, session-stable).
+  See `protocol.md` §`inject` for the placement contract.
 - `modify` replaces the tool input before execution. It is accepted only on
   `before_tool_call`; the first modifier stops the handler chain.
 - `replace` substitutes the tool **output** after execution, before it enters
