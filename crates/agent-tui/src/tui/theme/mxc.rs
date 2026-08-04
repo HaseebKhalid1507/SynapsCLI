@@ -957,10 +957,10 @@ mod tests {
 
     // ---- session core (backoff reset, bye split, skew latch) ----
 
-    fn test_channel() -> (
-        tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>,
-        tokio::sync::mpsc::UnboundedReceiver<(Theme, Option<u64>)>,
-    ) {
+    type PaletteTx = tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>;
+    type PaletteRx = tokio::sync::mpsc::UnboundedReceiver<(Theme, Option<u64>)>;
+
+    fn test_channel() -> (PaletteTx, PaletteRx) {
         tokio::sync::mpsc::unbounded_channel()
     }
 
