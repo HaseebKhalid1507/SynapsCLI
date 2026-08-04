@@ -71,7 +71,7 @@ fn effective_in(default_ms: u64, requested: Option<Duration>) -> Duration {
 
 /// Map an MXC wire `fade_ms` onto a requested duration. Present values clamp
 /// to `0..=2000` ms; `Some(0)` is the spec's "snap, no transition intended";
-/// absent (`None`) falls back to the configured default (350 ms).
+/// absent (`None`) falls back to the configured `theme_transition` default.
 pub(crate) fn wire_fade_duration(fade_ms: Option<u64>) -> Option<Duration> {
     fade_ms.map(|ms| Duration::from_millis(ms.min(ThemeTransitionMode::MAX_MS)))
 }
@@ -253,6 +253,8 @@ impl ThemeTransition {
 ///
 /// - Effective duration zero (knob off / fade_ms 0) → clear the slot and
 ///   apply `target` instantly through the normal `set_theme` path.
+/// - `target` already applied (idle) or already the destination of the
+///   in-flight fade → no-op (no identical-theme fades, no clock resets).
 /// - Slot already active → restart FROM the current interpolated frame
 ///   toward `target` (never queue, never jump).
 /// - Slot idle → start from the currently applied global theme.
@@ -280,6 +282,19 @@ fn apply_animated_over(
         *slot = None;
         super::set_theme(target);
         return;
+    }
+    // from == to short-circuit (okarin F2): MXC's snapshot-on-connect
+    // re-sends the current palette on every reconnect — without this check
+    // that was a full ~22-frame fade (with full cache invalidation per
+    // frame) to an IDENTICAL theme. Also covers `/theme <current>` and a
+    // settings preview landing on the active theme. An in-flight fade
+    // already heading exactly at `target` is left alone: restarting it
+    // would reset the clock, and under a spammy publisher the fade would
+    // never land (shady F5).
+    match slot.as_ref() {
+        Some(active) if active.to == target => return,
+        None if *super::THEME.load().as_ref() == target => return,
+        _ => {}
     }
     let from = match slot.take() {
         Some(active) => active.frame(now), // retarget mid-flight
@@ -494,6 +509,43 @@ mod tests {
         // fade_ms: 0 → "snap, no transition intended" — even mid-flight.
         apply_animated_over(&mut slot, theme_b(), Duration::ZERO, at(start, 100));
         assert!(slot.is_none(), "snap must deregister the guard source");
+    }
+
+    #[test]
+    fn retarget_to_same_destination_keeps_the_inflight_fade() {
+        // A reconnect snapshot (or /theme spam) re-requesting the fade's
+        // existing destination must NOT restart the clock — the original
+        // transition keeps its schedule and lands on time.
+        let start = Instant::now();
+        let mut slot = Some(ThemeTransition::new(
+            theme_a(),
+            theme_b(),
+            Duration::from_millis(400),
+            start,
+        ));
+        apply_animated_over(&mut slot, theme_b(), Duration::from_millis(400), at(start, 200));
+        let tr = slot.as_ref().expect("fade must stay active");
+        assert!(
+            tr.is_complete(at(start, 400)),
+            "clock must not reset — the original 400ms schedule stands"
+        );
+        assert_eq!(tr.frame(at(start, 400)), theme_b());
+    }
+
+    #[test]
+    fn idle_apply_of_the_current_theme_is_a_noop() {
+        // MXC snapshot-on-connect resends the palette already on screen on
+        // every reconnect: with no fade active and the target byte-equal to
+        // the applied theme, no transition may start (okarin F2 — ~22
+        // frames of full invalidation for zero visual change).
+        let current = Theme {
+            bg: Color::Rgb(123, 45, 67),
+            ..Theme::default()
+        };
+        super::super::set_theme(current.clone());
+        let mut slot = None;
+        apply_animated_over(&mut slot, current, Duration::from_millis(350), Instant::now());
+        assert!(slot.is_none(), "identical-theme fade must not arm the tick guard");
     }
 
     // ---- durations (pure helpers; no static knob mutation) ----
