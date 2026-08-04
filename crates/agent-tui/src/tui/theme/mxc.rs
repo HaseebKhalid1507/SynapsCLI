@@ -341,25 +341,23 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<Theme>
             // climbing toward the cap instead of oscillating.
             backoff = BACKOFF_START;
             let mut lines = tokio::io::BufReader::new(stream).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match parse_line(&line) {
-                        MxcLine::Theme(colors) => {
-                            if tx.send(theme_from_mxc(&colors)).is_err() {
-                                return; // receiver dropped — app teardown.
-                            }
+            // EOF and socket errors both end the session → reconnect loop.
+            while let Ok(Some(line)) = lines.next_line().await {
+                match parse_line(&line) {
+                    MxcLine::Theme(colors) => {
+                        if tx.send(theme_from_mxc(&colors)).is_err() {
+                            return; // receiver dropped — app teardown.
                         }
-                        MxcLine::Skip => continue,
-                        MxcLine::Bye => break, // keep last-good, reconnect.
-                        MxcLine::VersionSkew => {
-                            tracing::warn!(
-                                "MXC publisher speaks a newer protocol than v{PROTOCOL_VERSION}; \
-                                 holding last-good palette"
-                            );
-                            break;
-                        }
-                    },
-                    Ok(None) | Err(_) => break, // EOF or socket error — reconnect.
+                    }
+                    MxcLine::Skip => {}
+                    MxcLine::Bye => break, // keep last-good, reconnect.
+                    MxcLine::VersionSkew => {
+                        tracing::warn!(
+                            "MXC publisher speaks a newer protocol than v{PROTOCOL_VERSION}; \
+                             holding last-good palette"
+                        );
+                        break;
+                    }
                 }
             }
         }

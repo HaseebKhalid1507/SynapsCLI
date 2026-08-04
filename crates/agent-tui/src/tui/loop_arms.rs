@@ -820,3 +820,28 @@ pub(crate) async fn handle_animation_tick(
     }
     false
 }
+
+/// Live-MXC (myx theme) boot: start the subscriber iff the configured theme
+/// is "myx". Later /theme switches reconcile via `App::sync_myx_live`.
+pub(crate) fn boot_myx_live(app: &mut App) {
+    if theme::configured_theme_name().as_deref() == Some("myx") {
+        app.sync_myx_live("myx");
+    }
+}
+
+/// Live-MXC arm body: apply a palette on the UI thread through the exact
+/// `set_theme` + `invalidate` path `/theme` uses. The subscriber task only
+/// ever sends; it never touches theme state.
+pub(crate) fn handle_myx_theme_arm(app: &mut App, myx_theme: theme::Theme) {
+    theme::set_theme(myx_theme);
+    app.invalidate();
+}
+
+/// Live-MXC teardown: after this the app is tearing down and no background
+/// task may write into it. `abort()` is safe mid-await — the task holds no
+/// locks and owns no external state; queued palettes die with the receiver.
+pub(crate) fn abort_myx_live(app: &mut App) {
+    if let Some(h) = app.myx_task.take() {
+        h.abort();
+    }
+}

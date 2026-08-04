@@ -112,11 +112,8 @@ pub async fn run(
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.
     let mut event_reader = Some(event_reader);
-    // Live-MXC layer: if the session boots with theme = "myx", start the
-    // subscriber now. Every later /theme switch reconciles via sync_myx_live.
-    if theme::configured_theme_name().as_deref() == Some("myx") {
-        app.sync_myx_live("myx");
-    }
+    // Live-MXC layer (myx theme): boot the subscriber when configured.
+    loop_arms::boot_myx_live(&mut app);
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     loop {
@@ -217,12 +214,9 @@ pub async fn run(
                 loop_arms::handle_widget_arm(&mut app, widget_event);
             }
 
-            // ── Live MXC palettes (myx theme) — applied HERE, on the UI thread,
-            // through the same set_theme + invalidate path /theme uses. The
-            // subscriber task only ever sends; it never touches theme state.
+            // ── Live MXC palettes (myx theme) — UI-thread apply, same path as /theme ──
             Some(myx_theme) = app.myx_theme_rx.recv() => {
-                theme::set_theme(myx_theme);
-                app.invalidate();
+                loop_arms::handle_myx_theme_arm(&mut app, myx_theme);
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -349,13 +343,8 @@ pub async fn run(
         }
     }
 
-    // Stop the live-MXC subscriber (myx theme) FIRST: after this point the
-    // app is tearing down and no background task may write into it. abort()
-    // is safe mid-await (the task holds no locks and owns no external state),
-    // and any palette already queued dies with the receiver.
-    if let Some(h) = app.myx_task.take() {
-        h.abort();
-    }
+    // Stop the live-MXC subscriber FIRST — no background task writes past here.
+    loop_arms::abort_myx_live(&mut app);
 
     // ── PART 2: Bounded teardown — two sequential budgets.
     //
