@@ -21,16 +21,31 @@
 //!
 //! Resilience contract (the subscriber must never hurt synaps):
 //! - Socket absent → static palette stands, quiet retry with capped backoff.
-//! - Disconnect / `bye` / EOF → KEEP the last-good palette, resume retrying.
-//! - Malformed line → skip it, keep reading.
+//! - Disconnect / EOF / `bye reason:"reload"` → KEEP the last-good palette,
+//!   resume retrying (a publisher restart re-snapshots on reconnect).
+//! - `bye reason:"shutdown"` → revert to the static myx default. Spec §3.4
+//!   SHOULD; deliberately split by reason: keep-last-good across a reload
+//!   avoids a revert-then-restore flicker, but after a real shutdown Myx
+//!   may be gone for days and yesterday's album colors must not persist.
+//!   Unknown/absent reasons keep last-good (same posture as plain EOF).
+//! - Malformed JSON line → skip it, keep reading.
+//! - Non-UTF-8 bytes or a line exceeding [`MAX_LINE_BYTES`] → drop the
+//!   CONNECTION (not just the line) and reconnect on backoff; the next
+//!   snapshot-on-connect restores state. The length cap bounds heap growth
+//!   against a wedged or hostile publisher; a spec-valid frame is < ~1 KB.
 //! - Protocol version newer than ours → drop the connection (we cannot trust
-//!   the payload) and retry on backoff; a downgraded Myx heals it.
+//!   the payload) and retry on backoff; a downgraded Myx heals it. The skew
+//!   warning fires once per subscriber generation, not once per reconnect.
+//! - Backoff resets on the first VALID theme line, not on connect success —
+//!   an accept-then-die endpoint must not pin retries at 1/s forever.
+//! - The socket's parent directory must exist and be owned by our uid
+//!   before we connect (squat defense for the world-writable `/tmp`
+//!   fallback; `$XDG_RUNTIME_DIR` passes the same check trivially).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::style::Color;
-use tokio::io::AsyncBufReadExt;
 
 use super::Theme;
 
@@ -76,8 +91,11 @@ pub(crate) enum MxcLine {
         colors: MxcColors,
         fade_ms: Option<u64>,
     },
-    /// Clean publisher goodbye — keep the last-good palette, reconnect later.
-    Bye,
+    /// Clean publisher goodbye. `revert` is the §3.4 ruling: `true` for
+    /// `reason:"shutdown"` (revert to the static myx default — the
+    /// publisher is gone for good), `false` for `"reload"` or any
+    /// unknown/absent reason (keep last-good, same posture as EOF).
+    Bye { revert: bool },
     /// Blank, malformed, unknown tag, or unusable payload — skip, keep reading.
     Skip,
     /// The publisher speaks a newer protocol major than we do. The payload
@@ -96,6 +114,12 @@ const BACKOFF_START: Duration = Duration::from_secs(1);
 /// installed — one failed `connect()` every 30s is free.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// Hard per-line byte budget (joestar #1). A spec-valid `theme` frame is
+/// < ~1 KB; a publisher streaming an unterminated line would otherwise grow
+/// the TUI's heap without bound. Exceeding the cap drops the connection and
+/// reuses the normal backoff/reconnect path.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // Socket path
 // ---------------------------------------------------------------------------
@@ -108,8 +132,42 @@ pub(crate) fn socket_path() -> PathBuf {
 
 /// Pure core of [`socket_path`], testable without touching process env.
 fn socket_path_in(runtime_dir: Option<PathBuf>) -> PathBuf {
-    let dir = runtime_dir.unwrap_or_else(|| PathBuf::from(format!("/tmp/myx-{}", uid())));
+    // XDG basedir spec: a set-but-EMPTY or relative XDG_RUNTIME_DIR must be
+    // treated as unset (joestar #3) — otherwise "" yields the CWD-relative
+    // path `myx/theme.sock` and silently skips the uid-scoped fallback.
+    let dir = runtime_dir
+        .filter(|d| d.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/myx-{}", uid())));
     dir.join("myx").join("theme.sock")
+}
+
+/// Trust classification of the socket's parent directory, checked before
+/// every connect attempt (joestar #2). `/tmp` is world-writable: another
+/// local user can pre-create `/tmp/myx-<uid>/` and squat the socket to feed
+/// us palettes (and oversized lines). Refuse to connect unless the directory
+/// exists and is owned by our uid. `$XDG_RUNTIME_DIR/myx` passes trivially
+/// (the runtime dir is per-user by contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketDirTrust {
+    /// Directory absent: Myx not installed / not yet run. Quiet retry.
+    Missing,
+    /// Exists and owned by us — safe to connect.
+    Trusted,
+    /// Exists but NOT ours (or not a directory): likely a squat. Never
+    /// connect; warn once.
+    Untrusted,
+}
+
+fn socket_dir_trust(sock: &std::path::Path) -> SocketDirTrust {
+    use std::os::unix::fs::MetadataExt;
+    let Some(dir) = sock.parent() else {
+        return SocketDirTrust::Untrusted;
+    };
+    match std::fs::metadata(dir) {
+        Err(_) => SocketDirTrust::Missing,
+        Ok(m) if m.is_dir() && m.uid() == uid() => SocketDirTrust::Trusted,
+        Ok(_) => SocketDirTrust::Untrusted,
+    }
 }
 
 /// Current uid without a libc dependency: owner of `/proc/self`, falling
@@ -168,7 +226,14 @@ pub(crate) fn parse_line(line: &str) -> MxcLine {
         return MxcLine::Skip; // not even JSON — a truncated write, perhaps.
     };
     let tag = v.get("t").and_then(|t| t.as_str());
-    let version = v.get("v").and_then(|n| n.as_u64()).unwrap_or(0);
+    // Version discipline (spec §3.2 marks `v` REQUIRED): absent → treat as
+    // 0 and accept (Postel — a missing field is sloppy, not hostile). But a
+    // PRESENT non-u64 value (float, negative, 1e300, string) is NOT a
+    // version we can compare — that is skew, never "version 0" (joestar #5).
+    let version = match v.get("v") {
+        None => 0,
+        Some(n) => n.as_u64().unwrap_or(u64::MAX),
+    };
     match tag {
         Some("theme") | Some("bye") if version > PROTOCOL_VERSION => MxcLine::VersionSkew,
         Some("theme") => match colors_from_json(v.get("colors")) {
@@ -180,7 +245,12 @@ pub(crate) fn parse_line(line: &str) -> MxcLine {
             },
             None => MxcLine::Skip, // known tag, unusable payload: publisher bug.
         },
-        Some("bye") => MxcLine::Bye,
+        Some("bye") => MxcLine::Bye {
+            // §3.4 ruling (yoru F3): only an explicit "shutdown" reverts to
+            // the static default; "reload" and unknown/absent reasons keep
+            // last-good (identical to a plain EOF).
+            revert: v.get("reason").and_then(|r| r.as_str()) == Some("shutdown"),
+        },
         _ => MxcLine::Skip, // unknown `t` (or none): invented after we shipped.
     }
 }
@@ -319,48 +389,171 @@ pub(crate) fn theme_from_mxc(x: &MxcColors) -> Theme {
 /// Spawned when the "myx" theme becomes active; aborted (via its
 /// `JoinHandle`) when the theme switches away or the app shuts down. All it
 /// ever does outward is `tx.send` — the receiving arm in the main loop is
-/// the only place theme state changes.
+/// the only place theme state changes (and it re-checks that myx is still
+/// active, because queued messages survive an abort).
 ///
 /// Lifecycle:
-/// - connect fails (socket absent / stale) → sleep on capped backoff, retry.
-/// - line parses to `Theme` → map, send. If the receiver is gone the app is
-///   tearing down: exit.
-/// - `Bye` / EOF / read error / version skew → drop the connection, keep the
-///   last-good palette on screen, retry on backoff.
-///
-/// Framing uses a buffered line reader (never chunk-reads), so a message
-/// split across socket writes still parses (spec §5.1).
+/// - socket dir missing → Myx not around: sleep on capped backoff, retry.
+/// - socket dir exists but isn't ours → possible squat: NEVER connect
+///   (warn once).
+/// - connected → [`run_session`] until EOF/bye/skew/error, then back off.
+/// - backoff resets on the first VALID theme line of a session (not on
+///   connect success), so an accept-then-die endpoint climbs to the 30s
+///   cap like any other failure.
 pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>) {
     let path = socket_path();
     let mut backoff = BACKOFF_START;
+    let mut skew_warned = false;
+    let mut squat_warned = false;
     loop {
-        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
-            // Reset only on successful connect, so an absent socket keeps
-            // climbing toward the cap instead of oscillating.
-            backoff = BACKOFF_START;
-            let mut lines = tokio::io::BufReader::new(stream).lines();
-            // EOF and socket errors both end the session → reconnect loop.
-            while let Ok(Some(line)) = lines.next_line().await {
-                match parse_line(&line) {
-                    MxcLine::Theme { colors, fade_ms } => {
-                        if tx.send((theme_from_mxc(&colors), fade_ms)).is_err() {
-                            return; // receiver dropped — app teardown.
-                        }
-                    }
-                    MxcLine::Skip => {}
-                    MxcLine::Bye => break, // keep last-good, reconnect.
-                    MxcLine::VersionSkew => {
-                        tracing::warn!(
-                            "MXC publisher speaks a newer protocol than v{PROTOCOL_VERSION}; \
-                             holding last-good palette"
-                        );
-                        break;
+        match socket_dir_trust(&path) {
+            SocketDirTrust::Missing => {} // Myx not installed / not run yet.
+            SocketDirTrust::Untrusted => {
+                if !squat_warned {
+                    squat_warned = true;
+                    tracing::warn!(
+                        "MXC socket directory {:?} exists but is not owned by this uid; \
+                         refusing to connect (possible squat)",
+                        path.parent()
+                    );
+                }
+            }
+            SocketDirTrust::Trusted => {
+                if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+                    match run_session(stream, &tx, &mut backoff, &mut skew_warned).await {
+                        SessionEnd::Teardown => return,
+                        SessionEnd::Disconnect => {}
                     }
                 }
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_CAP);
+    }
+}
+
+/// Why one connected session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// The channel receiver is gone — the app is tearing down; exit the task.
+    Teardown,
+    /// EOF / bye / skew / oversized or non-UTF-8 line / io error — drop the
+    /// connection and let the reconnect loop take over.
+    Disconnect,
+}
+
+/// One connected session: read capped lines, forward palettes, honor `bye`.
+///
+/// Generic over the reader so tests drive it with in-memory bytes — no
+/// socket, no Myx. Framing uses buffered line reads (never chunk-reads), so
+/// a message split across socket writes still parses (spec §5.1).
+///
+/// Side effects on the shared reconnect state:
+/// - first VALID theme line → `backoff` resets to [`BACKOFF_START`] and the
+///   version-skew warn latch re-arms (a healthy publisher was seen).
+async fn run_session<R>(
+    stream: R,
+    tx: &tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>,
+    backoff: &mut Duration,
+    skew_warned: &mut bool,
+) -> SessionEnd
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut buf = Vec::new();
+    let mut got_valid_line = false;
+    loop {
+        let line = match read_line_capped(&mut reader, &mut buf).await {
+            Ok(Some(line)) => line,
+            // EOF, oversized line, non-UTF-8, or socket error: the module
+            // contract drops the connection for all of these — the next
+            // snapshot-on-connect restores state.
+            Ok(None) | Err(_) => return SessionEnd::Disconnect,
+        };
+        match parse_line(&line) {
+            MxcLine::Theme { colors, fade_ms } => {
+                if !got_valid_line {
+                    got_valid_line = true;
+                    // Reset on the first VALID line, not on connect success:
+                    // an endpoint that accepts and dies must not pin the
+                    // retry rate at 1/s forever (okarin F5).
+                    *backoff = BACKOFF_START;
+                    *skew_warned = false;
+                }
+                if tx.send((theme_from_mxc(&colors), fade_ms)).is_err() {
+                    return SessionEnd::Teardown; // receiver dropped — teardown.
+                }
+            }
+            MxcLine::Skip => {}
+            MxcLine::Bye { revert } => {
+                if revert {
+                    // reason:"shutdown" — Myx is gone, possibly for days;
+                    // yesterday's album colors must not persist. Revert to
+                    // the static myx default through the normal apply path
+                    // (fade per the configured knob).
+                    if tx.send((Theme::myx(), None)).is_err() {
+                        return SessionEnd::Teardown;
+                    }
+                }
+                return SessionEnd::Disconnect; // reload/unknown: keep last-good.
+            }
+            MxcLine::VersionSkew => {
+                if !*skew_warned {
+                    *skew_warned = true;
+                    tracing::warn!(
+                        "MXC publisher speaks a newer protocol than v{PROTOCOL_VERSION}; \
+                         holding last-good palette"
+                    );
+                }
+                return SessionEnd::Disconnect;
+            }
+        }
+    }
+}
+
+/// Read one `\n`-terminated line with a hard [`MAX_LINE_BYTES`] budget.
+///
+/// - `Ok(Some(line))` — a complete line (without the `\n`).
+/// - `Ok(None)` — EOF. A trailing unterminated fragment is discarded: the
+///   connection died mid-write, and the frame is by definition incomplete.
+/// - `Err(_)` — over-budget line or non-UTF-8 bytes (both drop the
+///   connection per the module contract) or an underlying io error.
+///
+/// `tokio`'s own `Lines`/`read_until` accumulate without any maximum, which
+/// is a heap-growth DoS from a wedged or hostile publisher (joestar #1).
+async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(None); // EOF (any partial fragment in `buf` is moot).
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.unwrap_or(chunk.len());
+        if buf.len() + take > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MXC line exceeds the 64 KiB budget",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        match newline {
+            Some(pos) => {
+                reader.consume(pos + 1);
+                return String::from_utf8(std::mem::take(buf)).map(Some).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "MXC line is not valid UTF-8",
+                    )
+                });
+            }
+            None => reader.consume(take),
+        }
     }
 }
 
@@ -474,9 +667,17 @@ mod tests {
     }
 
     #[test]
-    fn bye_frame_parses() {
-        let line = r#"{"t":"bye","v":1,"seq":12,"ts":1785616999000,"reason":"shutdown"}"#;
-        assert_eq!(parse_line(line), MxcLine::Bye);
+    fn bye_reason_splits_revert_from_keep_last_good() {
+        // §3.4 ruling: only an explicit "shutdown" reverts to the static
+        // default; "reload" and unknown/absent reasons keep last-good.
+        let shutdown = r#"{"t":"bye","v":1,"seq":12,"ts":1785616999000,"reason":"shutdown"}"#;
+        assert_eq!(parse_line(shutdown), MxcLine::Bye { revert: true });
+        let reload = r#"{"t":"bye","v":1,"seq":12,"ts":1785616999000,"reason":"reload"}"#;
+        assert_eq!(parse_line(reload), MxcLine::Bye { revert: false });
+        let unknown = r#"{"t":"bye","v":1,"seq":12,"ts":1,"reason":"cosmic_rays"}"#;
+        assert_eq!(parse_line(unknown), MxcLine::Bye { revert: false });
+        let absent = r#"{"t":"bye","v":1,"seq":12,"ts":1}"#;
+        assert_eq!(parse_line(absent), MxcLine::Bye { revert: false });
     }
 
     #[test]
@@ -521,6 +722,24 @@ mod tests {
         assert_eq!(parse_line(line), MxcLine::VersionSkew);
         let bye = r#"{"t":"bye","v":2,"seq":9,"ts":1,"reason":"reload"}"#;
         assert_eq!(parse_line(bye), MxcLine::VersionSkew);
+    }
+
+    #[test]
+    fn non_u64_version_is_skew_not_version_zero() {
+        // joestar #5: a PRESENT `v` that isn't a u64 (float, negative,
+        // overflow, string) is not a version we can compare — treating it
+        // as v0 would accept a payload we cannot trust.
+        for v in ["2.5", "-1", "1e300", "\"1\"", "null", "true"] {
+            let line = theme_line().replace("\"v\":1", &format!("\"v\":{v}"));
+            assert_eq!(
+                parse_line(&line),
+                MxcLine::VersionSkew,
+                "v:{v} must be treated as version skew"
+            );
+        }
+        // Absent `v` stays Postel-lenient: decode as v0, accept the frame.
+        let absent = theme_line().replace("\"v\":1,", "");
+        assert!(matches!(parse_line(&absent), MxcLine::Theme { .. }));
     }
 
     #[test]
@@ -637,5 +856,168 @@ mod tests {
             s.starts_with("/tmp/myx-") && s.ends_with("/myx/theme.sock"),
             "fallback must be uid-scoped under /tmp, got {s}"
         );
+    }
+
+    #[test]
+    fn empty_or_relative_xdg_runtime_dir_is_treated_as_unset() {
+        // XDG basedir spec: non-absolute values must be ignored (joestar #3).
+        for bogus in ["", "relative/dir", "./x"] {
+            let p = socket_path_in(Some(PathBuf::from(bogus)));
+            assert!(
+                p.to_string_lossy().starts_with("/tmp/myx-"),
+                "XDG_RUNTIME_DIR={bogus:?} must fall back to the uid-scoped path, got {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_dir_trust_classifies_missing_and_trusted() {
+        // Missing: parent dir does not exist → quiet retry, no connect.
+        let ghost = PathBuf::from("/nonexistent-mxc-test-dir/myx/theme.sock");
+        assert_eq!(socket_dir_trust(&ghost), SocketDirTrust::Missing);
+
+        // Trusted: a directory we just created is owned by our uid.
+        let dir = std::env::temp_dir().join(format!("mxc-trust-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(
+            socket_dir_trust(&dir.join("theme.sock")),
+            SocketDirTrust::Trusted
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Untrusted: `/` is root-owned (skip when the test itself runs as
+        // root, where every directory is trivially ours).
+        if uid() != 0 {
+            assert_eq!(
+                socket_dir_trust(&PathBuf::from("/theme.sock")),
+                SocketDirTrust::Untrusted
+            );
+        }
+    }
+
+    // ---- capped line reader (heap-growth DoS defense) ----
+
+    #[tokio::test]
+    async fn read_line_capped_reads_normal_lines_and_eof() {
+        let data = b"first\nsecond\ntrailing-fragment";
+        let mut r = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_capped(&mut r, &mut buf).await.unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            read_line_capped(&mut r, &mut buf).await.unwrap().as_deref(),
+            Some("second")
+        );
+        // Unterminated trailing fragment = incomplete frame → EOF, discarded.
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversized_lines() {
+        // One byte over budget, never newline-terminated: must error out
+        // (dropping the connection) instead of buffering without bound.
+        let data = vec![b'x'; MAX_LINE_BYTES + 1];
+        let mut r = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let err = read_line_capped(&mut r, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // And the budget itself never ballooned.
+        assert!(buf.len() <= MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_non_utf8() {
+        // Module contract: non-UTF-8 drops the CONNECTION (doc-aligned,
+        // joestar #4) — surfaced as an io error here.
+        let data = b"\xff\xfe garbage \xff\n";
+        let mut r = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let err = read_line_capped(&mut r, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // ---- session core (backoff reset, bye split, skew latch) ----
+
+    fn test_channel() -> (
+        tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>,
+        tokio::sync::mpsc::UnboundedReceiver<(Theme, Option<u64>)>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
+    #[tokio::test]
+    async fn backoff_resets_on_first_valid_theme_line_not_on_connect() {
+        let (tx, mut rx) = test_channel();
+        let mut backoff = BACKOFF_CAP;
+        let mut skew_warned = true; // healthy line must re-arm the latch too.
+
+        // Session A: connects, delivers garbage only, dies. Backoff must
+        // NOT reset — this is the accept-then-die endpoint (okarin F5).
+        let garbage = b"not json\n";
+        let end = run_session(&garbage[..], &tx, &mut backoff, &mut skew_warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        assert_eq!(backoff, BACKOFF_CAP, "no valid line → no backoff reset");
+        assert!(skew_warned, "no valid line → skew latch stays armed");
+
+        // Session B: a real theme line resets backoff and the skew latch.
+        let data = format!("junk\n{}\n", theme_line());
+        let end = run_session(data.as_bytes(), &tx, &mut backoff, &mut skew_warned).await;
+        assert_eq!(end, SessionEnd::Disconnect); // EOF after the palette.
+        assert_eq!(backoff, BACKOFF_START, "first VALID line resets backoff");
+        assert!(!skew_warned, "healthy publisher re-arms the skew warn");
+        assert!(rx.try_recv().is_ok(), "the palette must have been forwarded");
+    }
+
+    #[tokio::test]
+    async fn bye_shutdown_reverts_to_static_default_reload_keeps_last_good() {
+        let (tx, mut rx) = test_channel();
+        let mut backoff = BACKOFF_START;
+        let mut warned = false;
+
+        // reason:"reload" → nothing sent; last-good stands.
+        let reload = b"{\"t\":\"bye\",\"v\":1,\"seq\":1,\"ts\":1,\"reason\":\"reload\"}\n";
+        let end = run_session(&reload[..], &tx, &mut backoff, &mut warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        assert!(rx.try_recv().is_err(), "reload must keep last-good (no send)");
+
+        // reason:"shutdown" → the static myx default goes down the same
+        // channel (knob-default fade), so yesterday's album colors die.
+        let shutdown = b"{\"t\":\"bye\",\"v\":1,\"seq\":2,\"ts\":1,\"reason\":\"shutdown\"}\n";
+        let end = run_session(&shutdown[..], &tx, &mut backoff, &mut warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        let (palette, fade) = rx.try_recv().expect("shutdown must send the revert");
+        assert_eq!(palette, Theme::myx());
+        assert_eq!(fade, None, "revert fades per the configured knob");
+    }
+
+    #[tokio::test]
+    async fn version_skew_warns_once_per_generation() {
+        let (tx, _rx) = test_channel();
+        let mut backoff = BACKOFF_START;
+        let mut warned = false;
+        let skew = b"{\"t\":\"theme\",\"v\":9,\"seq\":0,\"ts\":1,\"colors\":{}}\n";
+
+        let end = run_session(&skew[..], &tx, &mut backoff, &mut warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        assert!(warned, "first skew arms the once-per-generation latch");
+        // Subsequent skewed sessions see the latch already set (the warn
+        // branch is skipped); only a valid theme line re-arms it.
+        let end = run_session(&skew[..], &tx, &mut backoff, &mut warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        assert!(warned);
+    }
+
+    #[tokio::test]
+    async fn oversized_line_ends_the_session() {
+        let (tx, _rx) = test_channel();
+        let mut backoff = BACKOFF_CAP;
+        let mut warned = false;
+        let mut data = vec![b'{'; MAX_LINE_BYTES + 2];
+        data.push(b'\n');
+        let end = run_session(&data[..], &tx, &mut backoff, &mut warned).await;
+        assert_eq!(end, SessionEnd::Disconnect);
+        assert_eq!(backoff, BACKOFF_CAP, "a hostile line is not a valid line");
     }
 }
