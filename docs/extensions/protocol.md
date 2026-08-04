@@ -476,10 +476,17 @@ live in the system prompt):
 - **`on_session_start`** — content is **appended to the system prompt** once
   and carried unchanged for the whole session. Session-stable, cache-safe.
 - **`before_message`** — content is re-evaluated per turn and **attached to
-  the newest user message** as a trailing text block on the outgoing request.
-  It is ephemeral: applied at request assembly only, never persisted into the
-  stored conversation. (Historical note: this content used to be appended to
-  the system prompt, which invalidated the entire cached message history on
+  the newest user message** as a trailing text block on the outgoing request,
+  positioned **after** the conversational cache breakpoint: the cache marker
+  is stamped on the message's last durable block, so the durable prefix
+  caches normally and the injected block is a small uncached tail. It is
+  ephemeral: applied at request assembly only, never persisted into the
+  stored conversation, and not re-attached on tool_result-only rounds of the
+  same turn (the hook fires only when the newest user message carries text —
+  in practice, round 1 of each turn). If the request does not end with a
+  user message, or the hook returns empty content, the injection is skipped
+  with a warning. (Historical note: this content used to be appended to the
+  system prompt, which invalidated the entire cached message history on
   every turn; and even earlier docs claimed "prepend", which was never true.)
 
 In both placements the content is wrapped in the same guard framing
