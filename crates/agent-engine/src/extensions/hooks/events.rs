@@ -352,8 +352,11 @@ pub enum HookResult {
     Continue,
     /// Prevent the hooked operation. The `reason` is surfaced to the user.
     Block { reason: String },
-    /// Inject context — the extension provides text to prepend to the
-    /// system prompt or conversation. Used by before_message hooks.
+    /// Inject context — the extension provides text for the current request.
+    /// Placement depends on the hook (#297): `on_session_start` content is
+    /// appended to the system prompt (session-stable, cache-safe);
+    /// `before_message` content is attached to the newest user message on the
+    /// outgoing request (per-turn, ephemeral, cache-neutral).
     Inject { content: String },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
