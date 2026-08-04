@@ -560,12 +560,14 @@ where
         match newline {
             Some(pos) => {
                 reader.consume(pos + 1);
-                return String::from_utf8(std::mem::take(buf)).map(Some).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "MXC line is not valid UTF-8",
-                    )
-                });
+                return String::from_utf8(std::mem::take(buf))
+                    .map(Some)
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "MXC line is not valid UTF-8",
+                        )
+                    });
             }
             None => reader.consume(take),
         }
@@ -982,7 +984,10 @@ mod tests {
         assert_eq!(end, SessionEnd::Disconnect); // EOF after the palette.
         assert_eq!(backoff, BACKOFF_START, "first VALID line resets backoff");
         assert!(!skew_warned, "healthy publisher re-arms the skew warn");
-        assert!(rx.try_recv().is_ok(), "the palette must have been forwarded");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the palette must have been forwarded"
+        );
     }
 
     #[tokio::test]
@@ -995,7 +1000,10 @@ mod tests {
         let reload = b"{\"t\":\"bye\",\"v\":1,\"seq\":1,\"ts\":1,\"reason\":\"reload\"}\n";
         let end = run_session(&reload[..], &tx, &mut backoff, &mut warned).await;
         assert_eq!(end, SessionEnd::Disconnect);
-        assert!(rx.try_recv().is_err(), "reload must keep last-good (no send)");
+        assert!(
+            rx.try_recv().is_err(),
+            "reload must keep last-good (no send)"
+        );
 
         // reason:"shutdown" → the static myx default goes down the same
         // channel (knob-default fade), so yesterday's album colors die.

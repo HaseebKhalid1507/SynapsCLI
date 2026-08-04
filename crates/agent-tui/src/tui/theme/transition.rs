@@ -523,7 +523,12 @@ mod tests {
             Duration::from_millis(400),
             start,
         ));
-        apply_animated_over(&mut slot, theme_b(), Duration::from_millis(400), at(start, 200));
+        apply_animated_over(
+            &mut slot,
+            theme_b(),
+            Duration::from_millis(400),
+            at(start, 200),
+        );
         let tr = slot.as_ref().expect("fade must stay active");
         assert!(
             tr.is_complete(at(start, 400)),
@@ -544,8 +549,16 @@ mod tests {
         };
         super::super::set_theme(current.clone());
         let mut slot = None;
-        apply_animated_over(&mut slot, current, Duration::from_millis(350), Instant::now());
-        assert!(slot.is_none(), "identical-theme fade must not arm the tick guard");
+        apply_animated_over(
+            &mut slot,
+            current,
+            Duration::from_millis(350),
+            Instant::now(),
+        );
+        assert!(
+            slot.is_none(),
+            "identical-theme fade must not arm the tick guard"
+        );
     }
 
     // ---- durations (pure helpers; no static knob mutation) ----

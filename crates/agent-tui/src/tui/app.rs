@@ -2160,7 +2160,11 @@ mod tests {
         let live = live_sentinel();
         super::super::loop_arms::handle_myx_theme_arm(&mut app, (live.clone(), None));
 
-        assert_eq!(app.myx_last_live.as_ref(), Some(&live), "must cache as last-good");
+        assert_eq!(
+            app.myx_last_live.as_ref(),
+            Some(&live),
+            "must cache as last-good"
+        );
         assert!(
             app.theme_transition.is_none(),
             "preview shield must skip the apply entirely"
