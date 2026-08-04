@@ -68,8 +68,14 @@ pub(crate) struct MxcColors {
 /// The outcome of parsing one NDJSON line off the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MxcLine {
-    /// A complete `theme` message: apply this palette.
-    Theme(MxcColors),
+    /// A complete `theme` message: apply this palette. `fade_ms` is the
+    /// publisher's advisory cross-fade duration (spec §3.3): `Some(0)` means
+    /// "snap, no transition intended"; `None` (absent) leaves the choice to
+    /// the consumer (we fall back to the default transition duration).
+    Theme {
+        colors: MxcColors,
+        fade_ms: Option<u64>,
+    },
     /// Clean publisher goodbye — keep the last-good palette, reconnect later.
     Bye,
     /// Blank, malformed, unknown tag, or unusable payload — skip, keep reading.
@@ -173,7 +179,12 @@ pub(crate) fn parse_line(line: &str) -> MxcLine {
     match tag {
         Some("theme") | Some("bye") if version > PROTOCOL_VERSION => MxcLine::VersionSkew,
         Some("theme") => match colors_from_json(v.get("colors")) {
-            Some(colors) => MxcLine::Theme(colors),
+            Some(colors) => MxcLine::Theme {
+                colors,
+                // Advisory cross-fade duration; clamped later at the apply
+                // site. A non-integer value is treated as absent, not fatal.
+                fade_ms: v.get("fade_ms").and_then(|n| n.as_u64()),
+            },
             None => MxcLine::Skip, // known tag, unusable payload: publisher bug.
         },
         Some("bye") => MxcLine::Bye,
@@ -336,7 +347,7 @@ pub(crate) fn theme_from_mxc(x: &MxcColors) -> Theme {
 ///
 /// Framing uses a buffered line reader (never chunk-reads), so a message
 /// split across socket writes still parses (spec §5.1).
-pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<Theme>) {
+pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme, Option<u64>)>) {
     let path = socket_path();
     let mut backoff = BACKOFF_START;
     loop {
@@ -348,8 +359,8 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<Theme>
             // EOF and socket errors both end the session → reconnect loop.
             while let Ok(Some(line)) = lines.next_line().await {
                 match parse_line(&line) {
-                    MxcLine::Theme(colors) => {
-                        if tx.send(theme_from_mxc(&colors)).is_err() {
+                    MxcLine::Theme { colors, fade_ms } => {
+                        if tx.send((theme_from_mxc(&colors), fade_ms)).is_err() {
                             return; // receiver dropped — app teardown.
                         }
                     }
@@ -440,13 +451,43 @@ mod tests {
 
     #[test]
     fn valid_theme_frame_parses_with_all_tokens() {
-        let MxcLine::Theme(x) = parse_line(&theme_line()) else {
+        let MxcLine::Theme { colors: x, fade_ms } = parse_line(&theme_line()) else {
             panic!("theme frame must parse");
         };
         assert_eq!(x.primary, (0x64, 0xe0, 0xd0));
         assert_eq!(x.background, (0x08, 0x10, 0x18));
         assert_eq!(x.border_dimmest, (0x10, 0x1c, 0x28));
         assert_eq!(x.text_muted, (0x7a, 0x90, 0xa4));
+        // fade_ms rides along verbatim — clamping happens at the apply site.
+        assert_eq!(fade_ms, Some(600));
+    }
+
+    #[test]
+    fn fade_ms_absent_parses_as_none() {
+        let line = theme_line().replace("\"fade_ms\":600,", "");
+        let MxcLine::Theme { fade_ms, .. } = parse_line(&line) else {
+            panic!("theme frame without fade_ms must still parse");
+        };
+        assert_eq!(fade_ms, None);
+    }
+
+    #[test]
+    fn fade_ms_zero_means_snap_and_garbage_means_absent() {
+        let zero = theme_line().replace("\"fade_ms\":600", "\"fade_ms\":0");
+        assert!(matches!(
+            parse_line(&zero),
+            MxcLine::Theme {
+                fade_ms: Some(0),
+                ..
+            }
+        ));
+        // Non-integer fade_ms: advisory field, so degrade to absent (spec
+        // posture: unknown/unusable metadata never rejects a valid palette).
+        let junk = theme_line().replace("\"fade_ms\":600", "\"fade_ms\":\"fast\"");
+        assert!(matches!(
+            parse_line(&junk),
+            MxcLine::Theme { fade_ms: None, .. }
+        ));
     }
 
     #[test]
@@ -503,7 +544,7 @@ mod tests {
     fn unknown_envelope_fields_are_ignored() {
         let with_extra = "\"fade_ms\":600,\"future_field\":{\"a\":1}";
         let line = theme_line().replace("\"fade_ms\":600", with_extra);
-        assert!(matches!(parse_line(&line), MxcLine::Theme(_)));
+        assert!(matches!(parse_line(&line), MxcLine::Theme { .. }));
     }
 
     #[test]

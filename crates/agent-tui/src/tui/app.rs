@@ -203,13 +203,15 @@ pub(crate) struct App {
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds:
         Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
-    /// Live MXC palettes from the myx subscriber task (theme::mxc). The main
-    /// loop's receiver arm is the ONLY place these are applied (set_theme +
-    /// invalidate — the same path /theme uses); the task never mutates theme
-    /// state. Unbounded is safe: the publisher dedupes and emits a handful of
-    /// events per minute, and each message is small (one Theme value).
-    pub(crate) myx_theme_rx: tokio::sync::mpsc::UnboundedReceiver<super::theme::Theme>,
-    pub(crate) myx_theme_tx: tokio::sync::mpsc::UnboundedSender<super::theme::Theme>,
+    /// Live MXC palettes from the myx subscriber task (theme::mxc), paired
+    /// with the wire's advisory `fade_ms` (None = absent). The main loop's
+    /// receiver arm is the ONLY place these are applied (animated through
+    /// the same set_theme + invalidate path /theme uses); the task never
+    /// mutates theme state. Unbounded is safe: the publisher dedupes and
+    /// emits a handful of events per minute, and each message is small (one
+    /// Theme value).
+    pub(crate) myx_theme_rx: tokio::sync::mpsc::UnboundedReceiver<(super::theme::Theme, Option<u64>)>,
+    pub(crate) myx_theme_tx: tokio::sync::mpsc::UnboundedSender<(super::theme::Theme, Option<u64>)>,
     /// The running MXC subscriber, present only while the "myx" theme is
     /// active. Aborted on theme switch-away (`sync_myx_live`) and at
     /// shutdown, so no task leaks and nothing writes after teardown.
