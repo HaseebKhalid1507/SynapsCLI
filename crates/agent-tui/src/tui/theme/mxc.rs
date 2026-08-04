@@ -499,10 +499,8 @@ mod tests {
 
     #[test]
     fn unknown_envelope_fields_are_ignored() {
-        let line = theme_line().replace(
-            "\"fade_ms\":600",
-            "\"fade_ms\":600,\"future_field\":{\"a\":1}",
-        );
+        let with_extra = "\"fade_ms\":600,\"future_field\":{\"a\":1}";
+        let line = theme_line().replace("\"fade_ms\":600", with_extra);
         assert!(matches!(parse_line(&line), MxcLine::Theme(_)));
     }
 
@@ -511,12 +509,9 @@ mod tests {
         // Every theme message is full state, so a seq-0 snapshot after a
         // reconnect parses identically to any other frame — there is no seq
         // state to confuse. This pins that the parser ignores `seq` entirely.
-        let a = parse_line(&theme_line());
-        let restarted = theme_line().replace("\"seq\":0", "\"seq\":0");
-        let b = parse_line(&restarted);
-        assert_eq!(a, b);
+        let snapshot = parse_line(&theme_line());
         let high_seq = theme_line().replace("\"seq\":0", "\"seq\":98765");
-        assert_eq!(parse_line(&high_seq), a);
+        assert_eq!(parse_line(&high_seq), snapshot, "seq is ignored by design");
     }
 
     // ---- mapping ----

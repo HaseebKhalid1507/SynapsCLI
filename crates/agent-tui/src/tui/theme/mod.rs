@@ -491,6 +491,26 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
     Theme::builtin(name)
 }
 
+/// The `theme = <name>` value from config, if any. Used at boot to decide
+/// whether the live-MXC subscriber should start alongside the "myx" theme.
+/// (A `~/.synaps-cli/theme` override file wins over this for *colors*, same
+/// as `load_theme_from_config` — this only reports the configured name.)
+pub(crate) fn configured_theme_name() -> Option<String> {
+    let content = std::fs::read_to_string(synaps_cli::config::resolve_read_path("config")).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            if key.trim() == "theme" {
+                return Some(val.trim().trim_matches('"').trim_matches('\'').to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Whether the root TUI paints an opaque canvas. `false` preserves the exact
 /// legacy 0.7.0 layout behavior outside individual widgets.
 pub(crate) static BACKGROUND_OPAQUE: LazyLock<AtomicBool> =

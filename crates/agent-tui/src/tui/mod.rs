@@ -112,6 +112,11 @@ pub async fn run(
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.
     let mut event_reader = Some(event_reader);
+    // Live-MXC layer: if the session boots with theme = "myx", start the
+    // subscriber now. Every later /theme switch reconciles via sync_myx_live.
+    if theme::configured_theme_name().as_deref() == Some("myx") {
+        app.sync_myx_live("myx");
+    }
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     loop {
@@ -210,6 +215,14 @@ pub async fn run(
             // ── Widget events from background extension notification watchers ──
             Some(widget_event) = app.widget_rx.recv() => {
                 loop_arms::handle_widget_arm(&mut app, widget_event);
+            }
+
+            // ── Live MXC palettes (myx theme) — applied HERE, on the UI thread,
+            // through the same set_theme + invalidate path /theme uses. The
+            // subscriber task only ever sends; it never touches theme state.
+            Some(myx_theme) = app.myx_theme_rx.recv() => {
+                theme::set_theme(myx_theme);
+                app.invalidate();
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -334,6 +347,14 @@ pub async fn run(
                 ).await;
             }
         }
+    }
+
+    // Stop the live-MXC subscriber (myx theme) FIRST: after this point the
+    // app is tearing down and no background task may write into it. abort()
+    // is safe mid-await (the task holds no locks and owns no external state),
+    // and any palette already queued dies with the receiver.
+    if let Some(h) = app.myx_task.take() {
+        h.abort();
     }
 
     // ── PART 2: Bounded teardown — two sequential budgets.

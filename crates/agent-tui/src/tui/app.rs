@@ -203,6 +203,17 @@ pub(crate) struct App {
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds:
         Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Live MXC palettes from the myx subscriber task (theme::mxc). The main
+    /// loop's receiver arm is the ONLY place these are applied (set_theme +
+    /// invalidate — the same path /theme uses); the task never mutates theme
+    /// state. Unbounded is safe: the publisher dedupes and emits a handful of
+    /// events per minute, and each message is small (one Theme value).
+    pub(crate) myx_theme_rx: tokio::sync::mpsc::UnboundedReceiver<super::theme::Theme>,
+    pub(crate) myx_theme_tx: tokio::sync::mpsc::UnboundedSender<super::theme::Theme>,
+    /// The running MXC subscriber, present only while the "myx" theme is
+    /// active. Aborted on theme switch-away (`sync_myx_live`) and at
+    /// shutdown, so no task leaks and nothing writes after teardown.
+    pub(crate) myx_task: Option<tokio::task::JoinHandle<()>>,
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
@@ -239,6 +250,7 @@ impl App {
             tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
             tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
+        let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
@@ -311,6 +323,9 @@ impl App {
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,
+            myx_theme_rx: myx_theme_rx_init,
+            myx_theme_tx: myx_theme_tx_init,
+            myx_task: None,
             keybinds: None,
             clock,
         }
@@ -765,6 +780,9 @@ impl App {
                     Ok(_) => {
                         let new_theme = super::theme::load_theme_by_name(name).unwrap_or_default();
                         super::theme::set_theme(new_theme);
+                        // Reconcile the live-MXC layer: spawn the subscriber
+                        // when switching TO myx, abort it when switching away.
+                        self.sync_myx_live(name);
                         self.push_msg(ChatMessage::System(format!("Theme applied: {}", name)));
                         self.invalidate();
                     }
@@ -777,6 +795,25 @@ impl App {
                     "unknown theme: '{}'. Use /theme to list available themes.",
                     name
                 )));
+            }
+        }
+    }
+
+    /// Reconcile the background MXC subscriber with the active theme name.
+    ///
+    /// `"myx"` active and no live task → spawn `theme::mxc::run_subscriber`
+    /// with a clone of our sender. Any other theme → abort the task if one is
+    /// running. Idempotent, so callers can invoke it on every theme change
+    /// and at boot. Must run on the main loop's runtime (it spawns).
+    pub(crate) fn sync_myx_live(&mut self, theme_name: &str) {
+        let want = theme_name == "myx";
+        let running = self.myx_task.as_ref().is_some_and(|h| !h.is_finished());
+        if want && !running {
+            let tx = self.myx_theme_tx.clone();
+            self.myx_task = Some(tokio::spawn(super::theme::mxc::run_subscriber(tx)));
+        } else if !want {
+            if let Some(h) = self.myx_task.take() {
+                h.abort();
             }
         }
     }
