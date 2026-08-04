@@ -663,10 +663,9 @@ pub(crate) async fn handle_animation_tick(
     // transition::advance clears app.theme_transition and hands back the
     // byte-exact target — so the tick GUARD's `theme_transition.is_some()`
     // term goes false and this arm stops firing (no permanent-60fps leak).
-    if let Some(frame) = theme::transition::advance(
-        &mut app.theme_transition,
-        std::time::Instant::now(),
-    ) {
+    if let Some(frame) =
+        theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
+    {
         theme::set_theme(frame);
         app.invalidate();
     }

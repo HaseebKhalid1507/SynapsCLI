@@ -226,9 +226,8 @@ impl ThemeTransition {
         if self.duration.is_zero() {
             return 1.0;
         }
-        (now.saturating_duration_since(self.start).as_secs_f32()
-            / self.duration.as_secs_f32())
-        .clamp(0.0, 1.0)
+        (now.saturating_duration_since(self.start).as_secs_f32() / self.duration.as_secs_f32())
+            .clamp(0.0, 1.0)
     }
 
     /// The interpolated frame at `now` (eased).

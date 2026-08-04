@@ -210,7 +210,8 @@ pub(crate) struct App {
     /// mutates theme state. Unbounded is safe: the publisher dedupes and
     /// emits a handful of events per minute, and each message is small (one
     /// Theme value).
-    pub(crate) myx_theme_rx: tokio::sync::mpsc::UnboundedReceiver<(super::theme::Theme, Option<u64>)>,
+    pub(crate) myx_theme_rx:
+        tokio::sync::mpsc::UnboundedReceiver<(super::theme::Theme, Option<u64>)>,
     pub(crate) myx_theme_tx: tokio::sync::mpsc::UnboundedSender<(super::theme::Theme, Option<u64>)>,
     /// The running MXC subscriber, present only while the "myx" theme is
     /// active. Aborted on theme switch-away (`sync_myx_live`) and at

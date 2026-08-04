@@ -1204,7 +1204,11 @@ pub(crate) async fn handle_input_action(
                                             }
                     } else if app.sidecars.len() == 1 {
                         // Safe: len() == 1 guarantees .next() is Some
-                        app.sidecars.values().next().expect("len == 1").status_line()
+                        app.sidecars
+                            .values()
+                            .next()
+                            .expect("len == 1")
+                            .status_line()
                     } else if app.sidecars.is_empty() {
                         match synaps_cli::sidecar::discovery::discover() {
                                                 Some(s) => format!(
