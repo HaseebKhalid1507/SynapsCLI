@@ -57,7 +57,8 @@ mod tests {
     fn static_myx_matches_myx_tokyonight_base() {
         use ratatui::style::Color;
         let t = Theme::myx();
-        assert_eq!(t.bg, Color::Rgb(0x1a, 0x1b, 0x26));
+        assert_eq!(t.bg, Color::Rgb(0x1e, 0x20, 0x30)); // chrome = library panel
+        assert_eq!(t.message_bg, Color::Rgb(0x1a, 0x1b, 0x26)); // canvas = myx background
         assert_eq!(t.claude_label, Color::Rgb(0x82, 0xaa, 0xff));
         assert_eq!(t.error_color, Color::Rgb(0xff, 0x75, 0x7f));
     }

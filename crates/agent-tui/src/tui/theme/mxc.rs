@@ -96,13 +96,6 @@ const BACKOFF_START: Duration = Duration::from_secs(1);
 /// installed — one failed `connect()` every 30s is free.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
-/// Canvas recession factor: `message_bg` is derived by scaling the MXC
-/// `background` toward black. Uniform channel scaling preserves hue and
-/// saturation exactly; 0.605 puts the canvas/chrome contrast of the default
-/// (tokyonight-based) palette at ~1.11, inside the 1.05–1.30 band the
-/// builtin-palette tests enforce.
-const CANVAS_RECESS: f32 = 0.605;
-
 // ---------------------------------------------------------------------------
 // Socket path
 // ---------------------------------------------------------------------------
@@ -225,15 +218,6 @@ fn c(rgb: Rgb8) -> Color {
     Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
-/// Recess a surface toward black for the transcript canvas. Uniform channel
-/// scaling keeps hue/saturation intact (unlike CIELAB lightening, which
-/// greys out saturated bases — see the `elevated_themes_keep_their_colour`
-/// palette test).
-fn recess(rgb: Rgb8) -> Rgb8 {
-    let s = |v: u8| ((v as f32) * CANVAS_RECESS).round() as u8;
-    (s(rgb.0), s(rgb.1), s(rgb.2))
-}
-
 /// Map the 16 MXC tokens onto the synaps [`Theme`].
 ///
 /// This single function is BOTH the live path (every socket message) and the
@@ -244,8 +228,8 @@ fn recess(rgb: Rgb8) -> Rgb8 {
 ///
 /// | MXC token            | synaps `Theme` fields                                              |
 /// |----------------------|--------------------------------------------------------------------|
-/// | `background`         | `bg`, `user_bg`                                                    |
-/// | `background_panel`   | `code_bg`, `tool_input_bg`                                         |
+/// | `background`         | `message_bg` — the transcript canvas IS Myx's background           |
+/// | `background_panel`   | `bg` (chrome: header/footer), `user_bg`, `code_bg`, `tool_input_bg` — chrome and user turns sit on Myx's library-panel surface |
 /// | `background_element` | `tool_output_bg`                                                   |
 /// | `text`               | `input_fg`, `claude_text`, `code_fg`, `table_cell_color`, `event_text` |
 /// | `text_muted`         | `muted`, `thinking_color`, `quote_color`, `help_fg`, `header_fg`, `tool_param`, `subagent_status`, `subagent_time` |
@@ -260,7 +244,6 @@ fn recess(rgb: Rgb8) -> Rgb8 {
 /// | `border_active`      | `border_active`                                                    |
 /// | `border_subtle`      | `table_border_color`                                               |
 /// | `border_dimmest`     | `separator`                                                        |
-/// | *(derived)*          | `message_bg` = [`recess`]`(background)` — MXC has no surface darker than `background`, and the transcript canvas must sit below chrome |
 ///
 /// Tool accent colors stay `Color::Reset` (auto-derived from the palette, as
 /// every non-night-city builtin does), and per-part overrides stay `None`.
@@ -277,15 +260,15 @@ pub(crate) fn theme_from_mxc(x: &MxcColors) -> Theme {
         table_cell_color: c(x.text),
 
         // Base
-        bg: c(x.background),
-        message_bg: c(recess(x.background)),
+        bg: c(x.background_panel),
+        message_bg: c(x.background),
         border: c(x.border),
         border_active: c(x.border_active),
         muted: c(x.text_muted),
 
         // Messages
         user_color: c(x.accent),
-        user_bg: c(x.background),
+        user_bg: c(x.background_panel),
         claude_label: c(x.primary),
         claude_text: c(x.text),
         thinking_color: c(x.text_muted),
@@ -564,10 +547,11 @@ mod tests {
         let t = theme_from_mxc(&sentinels());
         let s = |n: u8| Color::Rgb(n, n, n);
 
-        // background → bg, user_bg
-        assert_eq!(t.bg, s(10));
-        assert_eq!(t.user_bg, s(10));
-        // background_panel → code_bg, tool_input_bg
+        // background → the transcript canvas
+        assert_eq!(t.message_bg, s(10));
+        // background_panel → chrome (header/footer), user turns, code, tool input
+        assert_eq!(t.bg, s(11));
+        assert_eq!(t.user_bg, s(11));
         assert_eq!(t.code_bg, s(11));
         assert_eq!(t.tool_input_bg, s(11));
         // background_element → tool_output_bg
@@ -628,8 +612,6 @@ mod tests {
         assert_eq!(t.border_active, s(14));
         assert_eq!(t.table_border_color, s(15));
         assert_eq!(t.separator, s(16));
-        // derived canvas: recess(background), never a raw token.
-        assert_eq!(t.message_bg, Color::Rgb(6, 6, 6)); // 10 * 0.605 ≈ 6
     }
 
     #[test]
@@ -640,15 +622,6 @@ mod tests {
         assert_eq!(t.settings_border, None);
         assert_eq!(t.sidecar_pill, None);
     }
-
-    #[test]
-    fn recess_preserves_saturation_exactly() {
-        // Uniform scaling: (max-min)/max is invariant up to rounding.
-        let (r, g, b) = recess((0x1a, 0x1b, 0x26));
-        assert_eq!((r, g, b), (16, 16, 23));
-    }
-
-    // ---- socket path ----
 
     #[test]
     fn socket_path_honours_xdg_runtime_dir() {
