@@ -317,6 +317,21 @@ fn c(rgb: Rgb8) -> Color {
 ///
 /// Tool accent colors stay `Color::Reset` (auto-derived from the palette, as
 /// every non-night-city builtin does), and per-part overrides stay `None`.
+///
+/// ## Trust boundary — deliberate deviation from MXC spec §7.2
+///
+/// The spec says the adapter CLAMPS wire colors (AA-contrast fallbacks for
+/// status colors, canvas-invariant enforcement) rather than trusting the
+/// wire. This adapter imports all 16 tokens VERBATIM, on purpose: Myx is a
+/// trusted, same-uid, local publisher whose own derivation pipeline already
+/// orders the surfaces and tunes contrast, and the subscriber refuses to
+/// connect through a socket directory it doesn't own. Consequence to keep
+/// in mind: the repo's palette invariants (canvas/chrome band, saturation
+/// gates) are only ever TESTED against the static [`super::palettes::myx`]
+/// snapshot — live palettes bypass them by design. Clamping is deferred
+/// until a real-world palette proves illegible; if it lands, write its
+/// tests against hostile palettes (all-white, all-grey album art), not the
+/// defaults.
 pub(crate) fn theme_from_mxc(x: &MxcColors) -> Theme {
     Theme {
         // Markdown

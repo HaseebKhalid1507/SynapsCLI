@@ -497,20 +497,12 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
 /// whether the live-MXC subscriber should start alongside the "myx" theme.
 /// (A `~/.synaps-cli/theme` override file wins over this for *colors*, same
 /// as `load_theme_from_config` — this only reports the configured name.)
+///
+/// Routed through the real config loader (shady F6): a second hand-rolled
+/// parser drifted on lines like `theme = "myx" # comment`, silently keeping
+/// the boot subscriber off while the color loader still resolved myx.
 pub(crate) fn configured_theme_name() -> Option<String> {
-    let content = std::fs::read_to_string(synaps_cli::config::resolve_read_path("config")).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if let Some((key, val)) = line.split_once('=') {
-            if key.trim() == "theme" {
-                return Some(val.trim().trim_matches('"').trim_matches('\'').to_string());
-            }
-        }
-    }
-    None
+    synaps_cli::config::load_config().theme
 }
 
 /// Whether the root TUI paints an opaque canvas. `false` preserves the exact
