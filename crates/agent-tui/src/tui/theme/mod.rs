@@ -931,7 +931,14 @@ mod message_canvas_tests {
                 f64::from(hi - lo) / f64::from(hi)
             }
         }
-        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+        // "myx" is exempt: its bg and canvas are BOTH verbatim Myx-designed
+        // surfaces (library panel + background), not a derived recess — this
+        // guard exists for derivation drift, and Myx's own hierarchy sits at
+        // 84% saturation retention by design.
+        for name in BUILTINS
+            .iter()
+            .filter(|n| !FLUSH.contains(n) && **n != "myx")
+        {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
             let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
             let base = saturation(bg);
