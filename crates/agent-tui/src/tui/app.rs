@@ -216,6 +216,11 @@ pub(crate) struct App {
     /// active. Aborted on theme switch-away (`sync_myx_live`) and at
     /// shutdown, so no task leaks and nothing writes after teardown.
     pub(crate) myx_task: Option<tokio::task::JoinHandle<()>>,
+    /// In-flight animated theme cross-fade (theme::transition). `Some` is
+    /// the "animation active" signal the tick GUARD in mod.rs keys on; the
+    /// tick arm advances it and clears it on landing, so idle cost returns
+    /// to zero the moment the fade completes (#131 discipline).
+    pub(crate) theme_transition: Option<super::theme::transition::ThemeTransition>,
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
@@ -328,6 +333,7 @@ impl App {
             myx_theme_rx: myx_theme_rx_init,
             myx_theme_tx: myx_theme_tx_init,
             myx_task: None,
+            theme_transition: None,
             keybinds: None,
             clock,
         }
@@ -781,7 +787,10 @@ impl App {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
                         let new_theme = super::theme::load_theme_by_name(name).unwrap_or_default();
-                        super::theme::set_theme(new_theme);
+                        // Animated cross-fade (350ms default; theme_transition
+                        // knob can retune or disable it). The tick arm applies
+                        // frames through the same set_theme path as before.
+                        self.apply_theme_animated(new_theme, None);
                         // Reconcile the live-MXC layer: spawn the subscriber
                         // when switching TO myx, abort it when switching away.
                         self.sync_myx_live(name);
@@ -799,6 +808,25 @@ impl App {
                 )));
             }
         }
+    }
+
+    /// Start (or retarget) an animated theme change toward `target`.
+    /// `requested` is a per-change advisory duration (MXC wire `fade_ms`,
+    /// clamped upstream); `None` = the configured default. When transitions
+    /// are off (or the duration resolves to zero) this snaps instantly —
+    /// byte-identical to the old `set_theme` behavior.
+    pub(crate) fn apply_theme_animated(
+        &mut self,
+        target: super::theme::Theme,
+        requested: Option<std::time::Duration>,
+    ) {
+        super::theme::transition::apply_animated(
+            &mut self.theme_transition,
+            target,
+            requested,
+            std::time::Instant::now(),
+        );
+        self.invalidate();
     }
 
     /// Reconcile the background MXC subscriber with the active theme name.

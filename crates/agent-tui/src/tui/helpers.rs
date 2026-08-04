@@ -65,7 +65,13 @@ pub(super) fn apply_setting(
             if let Some(st) = app.settings.as_mut() {
                 if key == "theme" {
                     if let Some(t) = theme::load_theme_by_name(value) {
-                        theme::set_theme(t);
+                        // Animated apply; disjoint-field borrow beside `st`.
+                        theme::transition::apply_animated(
+                            &mut app.theme_transition,
+                            t,
+                            None,
+                            std::time::Instant::now(),
+                        );
                     }
                     st.row_error = None;
                 } else {

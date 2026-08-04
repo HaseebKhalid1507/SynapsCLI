@@ -768,12 +768,24 @@ fn route_settings(
                 }
                 super::settings::InputOutcome::PreviewTheme { name } => {
                     if let Some(theme) = super::theme::load_theme_by_name(&name) {
-                        super::theme::set_theme(theme);
+                        // Animated preview; arrow-key browsing retargets the
+                        // in-flight fade from its current frame (no jumps).
+                        super::theme::transition::apply_animated(
+                            &mut app.theme_transition,
+                            theme,
+                            None,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
                 super::settings::InputOutcome::RevertTheme => {
                     let theme = super::theme::load_theme_from_config();
-                    super::theme::set_theme(theme);
+                    super::theme::transition::apply_animated(
+                        &mut app.theme_transition,
+                        theme,
+                        None,
+                        std::time::Instant::now(),
+                    );
                 }
                 super::settings::InputOutcome::OpenPluginsMarketplace => {
                     return InputAction::OpenPluginsMarketplace;

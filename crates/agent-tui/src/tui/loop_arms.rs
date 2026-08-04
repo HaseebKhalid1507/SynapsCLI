@@ -658,6 +658,18 @@ pub(crate) async fn handle_animation_tick(
         app.request_redraw();
     }
     app.secret_prompts.poll_requests(secret_prompt_rx);
+    // Animated theme cross-fade: advance the active transition one frame
+    // through the SAME set_theme path every other apply uses. On landing,
+    // transition::advance clears app.theme_transition and hands back the
+    // byte-exact target — so the tick GUARD's `theme_transition.is_some()`
+    // term goes false and this arm stops firing (no permanent-60fps leak).
+    if let Some(frame) = theme::transition::advance(
+        &mut app.theme_transition,
+        std::time::Instant::now(),
+    ) {
+        theme::set_theme(frame);
+        app.invalidate();
+    }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
     // queue's is_active() so SecretPrompt is pushed/popped (§5).
@@ -830,11 +842,14 @@ pub(crate) fn boot_myx_live(app: &mut App) {
 }
 
 /// Live-MXC arm body: apply a palette on the UI thread through the exact
-/// `set_theme` + `invalidate` path `/theme` uses. The subscriber task only
-/// ever sends; it never touches theme state.
-pub(crate) fn handle_myx_theme_arm(app: &mut App, myx_theme: theme::Theme) {
-    theme::set_theme(myx_theme);
-    app.invalidate();
+/// `set_theme` + `invalidate` path `/theme` uses — animated, honoring the
+/// wire's advisory `fade_ms` (clamped to 0..=2000ms; 0 = intentional snap;
+/// absent = 350ms fallback). The subscriber task only ever sends; it never
+/// touches theme state. Rapid track changes retarget the in-flight fade
+/// from its current frame — never queued, never a jump.
+pub(crate) fn handle_myx_theme_arm(app: &mut App, msg: (theme::Theme, Option<u64>)) {
+    let (palette, fade_ms) = msg;
+    app.apply_theme_animated(palette, theme::transition::wire_fade_duration(fade_ms));
 }
 
 /// Live-MXC teardown: after this the app is tearing down and no background

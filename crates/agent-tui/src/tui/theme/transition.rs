@@ -118,9 +118,9 @@ pub(crate) fn lerp_theme(from: &Theme, to: &Theme, t: f32) -> Theme {
     macro_rules! snap {
         ($f:ident) => {
             if t >= 0.5 {
-                to.$f.clone()
+                to.$f
             } else {
-                from.$f.clone()
+                from.$f
             }
         };
     }
@@ -185,7 +185,11 @@ pub(crate) fn lerp_theme(from: &Theme, to: &Theme, t: f32) -> Theme {
         models_border: snap!(models_border),
         models_title: snap!(models_title),
         sidecar_pill: snap!(sidecar_pill),
-        ext_overrides: snap!(ext_overrides),
+        ext_overrides: if t >= 0.5 {
+            to.ext_overrides.clone()
+        } else {
+            from.ext_overrides.clone()
+        },
     }
 }
 

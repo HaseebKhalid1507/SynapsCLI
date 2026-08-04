@@ -150,6 +150,18 @@ define_settings! {
             Ok(())
         };
 
+    theme_transition, "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
+        "Animated cross-fade on theme changes (on = 350ms). Off = instant snap. Integer ms (0-2000) accepted in the config file.",
+        |_runtime, _app, value| {
+            match synaps_cli::config::ThemeTransitionMode::parse(value) {
+                Some(mode) => {
+                    super::super::theme::transition::set_transition_mode(mode);
+                    Ok(())
+                }
+                None => Err("expected on, off, or milliseconds (0-2000)".to_string()),
+            }
+        };
+
     sidecar_toggle_key, "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
         "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
@@ -171,6 +183,19 @@ define_settings! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_transition_setting_is_appearance_cycler() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "theme_transition")
+            .expect("theme_transition setting should be defined");
+        assert_eq!(def.category, Category::Appearance);
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
+            _ => panic!("theme_transition editor should be a Cycler"),
+        }
+    }
 
     #[test]
     fn sidecar_toggle_key_setting_is_in_sidecar_category() {
