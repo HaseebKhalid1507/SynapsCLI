@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 pub(crate) mod mxc;
 mod palettes;
+pub(crate) mod transition;
 
 /// Identifies a piece of high-value modal chrome for per-part style
 /// resolution. Each variant maps to an optional `<modal>.border` /
@@ -25,6 +26,7 @@ pub(crate) enum ModalKind {
 /// Field names are what the theme file uses as keys. Unknown keys are
 /// ignored; missing keys keep the default. Colors are written as `#rrggbb`
 /// or `#rgb` hex.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Theme {
     // Markdown
     pub(crate) code_fg: Color,
