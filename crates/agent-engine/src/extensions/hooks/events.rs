@@ -356,7 +356,8 @@ pub enum HookResult {
     /// Placement depends on the hook (#297): `on_session_start` content is
     /// appended to the system prompt (session-stable, cache-safe);
     /// `before_message` content is attached to the newest user message on the
-    /// outgoing request (per-turn, ephemeral, cache-neutral).
+    /// outgoing request as an ephemeral trailing block positioned AFTER the
+    /// conversational cache marker (per-turn, uncached tail, cache-neutral).
     Inject { content: String },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
