@@ -246,23 +246,26 @@ pub(crate) fn insert_text_into_input(app: &mut App, text: &str) {
     if trimmed.is_empty() {
         return;
     }
-    let needs_leading_space = !app.input.is_empty()
-        && app.cursor_byte_pos() > 0
-        && !app
-            .input
-            .as_bytes()
-            .get(app.cursor_byte_pos().saturating_sub(1))
-            .copied()
-            .map(|b| (b as char).is_whitespace())
-            .unwrap_or(true);
+    // A leading space is needed only when the char immediately before the
+    // cursor exists and is non-whitespace. col > 0 means there's a char on
+    // this line before the cursor; at col 0 the preceding char (if any) is a
+    // newline — whitespace — so no space is inserted.
+    let needs_leading_space = {
+        let (row, col) = app.editor.cursor();
+        col > 0
+            && app
+                .editor
+                .lines()
+                .get(row)
+                .and_then(|line| line.chars().nth(col - 1))
+                .is_some_and(|c| !c.is_whitespace())
+    };
     let to_insert = if needs_leading_space {
         format!(" {}", trimmed)
     } else {
         trimmed.to_string()
     };
-    let byte_pos = app.cursor_byte_pos();
-    app.input.insert_str(byte_pos, &to_insert);
-    app.cursor_pos += to_insert.chars().count();
+    app.insert_at_cursor(&to_insert);
     app.invalidate();
 }
 
@@ -280,8 +283,8 @@ mod tests {
     fn insert_text_into_empty_input() {
         let mut app = fresh_app();
         insert_text_into_input(&mut app, "hello world");
-        assert_eq!(app.input, "hello world");
-        assert_eq!(app.cursor_pos, "hello world".chars().count());
+        assert_eq!(app.input_text(), "hello world");
+        assert_eq!(app.cursor_char_pos(), "hello world".chars().count());
     }
 
     // ---- build_spawn_args tests ---------------------------------------
@@ -371,27 +374,28 @@ mod tests {
     #[test]
     fn insert_text_appends_with_leading_space() {
         let mut app = fresh_app();
-        app.input = "first".to_string();
-        app.cursor_pos = "first".chars().count();
+        app.set_input_text("first");
         insert_text_into_input(&mut app, "second sentence");
-        assert_eq!(app.input, "first second sentence");
-        assert_eq!(app.cursor_pos, "first second sentence".chars().count());
+        assert_eq!(app.input_text(), "first second sentence");
+        assert_eq!(
+            app.cursor_char_pos(),
+            "first second sentence".chars().count()
+        );
     }
 
     #[test]
     fn insert_text_no_double_space_when_input_ends_with_space() {
         let mut app = fresh_app();
-        app.input = "first ".to_string();
-        app.cursor_pos = "first ".chars().count();
+        app.set_input_text("first ");
         insert_text_into_input(&mut app, "second");
-        assert_eq!(app.input, "first second");
+        assert_eq!(app.input_text(), "first second");
     }
 
     #[test]
     fn insert_text_trims_whitespace_from_payload() {
         let mut app = fresh_app();
         insert_text_into_input(&mut app, "  spaced text  ");
-        assert_eq!(app.input, "spaced text");
+        assert_eq!(app.input_text(), "spaced text");
     }
 
     #[test]
@@ -399,18 +403,18 @@ mod tests {
         let mut app = fresh_app();
         insert_text_into_input(&mut app, "");
         insert_text_into_input(&mut app, "   ");
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor_pos, 0);
+        assert_eq!(app.input_text(), "");
+        assert_eq!(app.cursor_char_pos(), 0);
     }
 
     #[test]
     fn insert_text_inserts_at_cursor_not_end() {
         let mut app = fresh_app();
-        app.input = "hello world".to_string();
+        app.set_input_text("hello world");
         // Place cursor between "hello" and " world" (after "hello")
-        app.cursor_pos = 5;
+        app.editor.move_cursor(tui_textarea::CursorMove::Jump(0, 5));
         insert_text_into_input(&mut app, "beautiful");
-        assert_eq!(app.input, "hello beautiful world");
+        assert_eq!(app.input_text(), "hello beautiful world");
     }
 
     // ---- status_line label tests --------------------------------------

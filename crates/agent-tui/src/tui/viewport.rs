@@ -1,6 +1,10 @@
 use std::io::{self, Write};
 
-use crossterm::{cursor::MoveTo, style::Print, QueueableCommand};
+use crossterm::{
+    cursor::MoveTo,
+    style::{Color as CtColor, Print, ResetColor, SetBackgroundColor},
+    QueueableCommand,
+};
 #[cfg(test)]
 use ratatui::backend::Backend;
 use ratatui::{backend::CrosstermBackend, buffer::Buffer, layout::Rect, style::Style, Terminal};
@@ -75,19 +79,77 @@ where
     terminal.backend_mut().flush()
 }
 
-/// Queue the physical edge-scrub escape sequences (`MoveTo` + `Print(" ")`) for
-/// every edge cell in `area` through the crossterm backend, then flush.
+/// Queue the physical edge-scrub escape sequences (`MoveTo` + optional SGR +
+/// `Print(" ")`) for every edge cell in `area` through the crossterm backend,
+/// then flush.
+///
+/// The `style` argument's background is emitted as `SetBackgroundColor` before
+/// each `Print(" ")`, followed by `ResetColor` after the run. Without this, the
+/// blank space inherits whatever SGR the terminal was last left in — usually a
+/// stale cell style from the previous frame's flush — and if ratatui's diff
+/// then skips the edge cell (because the buffer model says it hasn't changed
+/// frame-to-frame), the physical stale paint survives.
+///
+/// This matters specifically for the transcript canvas: the themed
+/// `message_background()` differs from `THEME.bg` on the recessed palettes
+/// (catppuccin, gruvbox, monokai, nord, tokyo-night), so leaving edge cells at
+/// the last-inherited color paints them the wrong shade.
 ///
 /// Split out from [`scrub_crossterm_terminal_edges`] so the exact bytes can be
 /// captured in a vt100/byte-level test with an explicit `area` — the parent
 /// derives `area` from `terminal.size()`, which opens `/dev/tty` and is
 /// therefore non-deterministic headless.
-fn queue_edge_scrub<W: Write>(backend: &mut CrosstermBackend<W>, area: Rect) -> io::Result<()> {
-    for (x, y) in edge_scrub_positions(area) {
+fn queue_edge_scrub<W: Write>(
+    backend: &mut CrosstermBackend<W>,
+    area: Rect,
+    style: Style,
+) -> io::Result<()> {
+    let positions = edge_scrub_positions(area);
+    if positions.is_empty() {
+        return std::io::Write::flush(backend);
+    }
+
+    let bg = style.bg.and_then(ratatui_bg_to_crossterm);
+    if let Some(bg) = bg {
+        backend.queue(SetBackgroundColor(bg))?;
+    }
+    for (x, y) in positions {
         backend.queue(MoveTo(x, y))?;
         backend.queue(Print(" "))?;
     }
+    if bg.is_some() {
+        backend.queue(ResetColor)?;
+    }
     std::io::Write::flush(backend)
+}
+
+/// Best-effort ratatui-color → crossterm-color mapping for the SGR emitted by
+/// [`queue_edge_scrub`]. Only the bg is needed here; `Color::Reset` and unknown
+/// variants collapse to `None` so the scrub falls back to inherited-SGR (same
+/// as pre-fix behavior, i.e. no worse).
+fn ratatui_bg_to_crossterm(c: ratatui::style::Color) -> Option<CtColor> {
+    use ratatui::style::Color as R;
+    match c {
+        R::Reset => None,
+        R::Black => Some(CtColor::Black),
+        R::Red => Some(CtColor::DarkRed),
+        R::Green => Some(CtColor::DarkGreen),
+        R::Yellow => Some(CtColor::DarkYellow),
+        R::Blue => Some(CtColor::DarkBlue),
+        R::Magenta => Some(CtColor::DarkMagenta),
+        R::Cyan => Some(CtColor::DarkCyan),
+        R::Gray => Some(CtColor::Grey),
+        R::DarkGray => Some(CtColor::DarkGrey),
+        R::LightRed => Some(CtColor::Red),
+        R::LightGreen => Some(CtColor::Green),
+        R::LightYellow => Some(CtColor::Yellow),
+        R::LightBlue => Some(CtColor::Blue),
+        R::LightMagenta => Some(CtColor::Magenta),
+        R::LightCyan => Some(CtColor::Cyan),
+        R::White => Some(CtColor::White),
+        R::Rgb(r, g, b) => Some(CtColor::Rgb { r, g, b }),
+        R::Indexed(i) => Some(CtColor::AnsiValue(i)),
+    }
 }
 
 /// Crossterm-specific physical edge scrub used by the real chat UI terminal.
@@ -136,7 +198,7 @@ where
     // draws the input cursor into the ratatui buffer, so these transient backend
     // cursor moves can never become visible.
 
-    queue_edge_scrub(terminal.backend_mut(), area)?;
+    queue_edge_scrub(terminal.backend_mut(), area, style)?;
 
     scrub_edge_columns_in_buffer(terminal.current_buffer_mut(), area, style);
     Ok(())
@@ -252,7 +314,8 @@ mod scrub_gate_tests {
         let sink = SharedSink::default();
         let mut backend = CrosstermBackend::new(sink.clone());
         // Message-pane area (below the 2-row header): edges get scrubbed.
-        queue_edge_scrub(&mut backend, Rect::new(0, 2, 80, 16)).expect("queue emits");
+        queue_edge_scrub(&mut backend, Rect::new(0, 2, 80, 16), Style::default())
+            .expect("queue emits");
         let bytes = sink.bytes();
         assert!(!bytes.is_empty(), "edge scrub must emit bytes");
         // Contains at least one CSI cursor-position (`ESC [`) escape …
@@ -262,6 +325,68 @@ mod scrub_gate_tests {
         );
         // … and the blanking spaces.
         assert!(bytes.contains(&b' '), "scrub must emit blanking spaces");
+    }
+
+    /// Fix A regression: without a style-bg, the physical blanks inherit
+    /// whatever SGR the terminal was last left in — which for the transcript
+    /// canvas edge cells means the wrong color on recessed themes. With an RGB
+    /// bg style, the emission core MUST prepend `SetBackgroundColor(38;2;r;g;b)`
+    /// and terminate with `ResetColor` (`ESC [0m`), so the blank spaces
+    /// physically land in the requested color even when ratatui's diff later
+    /// skips the edge cell.
+    #[test]
+    fn emission_core_wraps_blanks_in_sgr_when_style_has_bg() {
+        let sink = SharedSink::default();
+        let mut backend = CrosstermBackend::new(sink.clone());
+        // Handpicked triple that will not collide with an ANSI 8-color mapping.
+        let bg_style = Style::default().bg(ratatui::style::Color::Rgb(23, 24, 37));
+        queue_edge_scrub(&mut backend, Rect::new(0, 2, 80, 16), bg_style).expect("queue emits");
+        let bytes = sink.bytes();
+        let s = String::from_utf8_lossy(&bytes);
+
+        // Truecolor SGR: `ESC [ 48 ; 2 ; 23 ; 24 ; 37 m`.
+        assert!(
+            s.contains("\x1b[48;2;23;24;37m"),
+            "must set the truecolor bg BEFORE the blanks so the physical write \
+             lands the correct color; got: {s:?}"
+        );
+        // Terminator to avoid bleeding the bg into whatever renders next.
+        assert!(
+            s.contains("\x1b[0m"),
+            "must reset color after the blanks so subsequent renders aren't \
+             tinted by the scrub; got: {s:?}"
+        );
+        // Ordering: the SetBackgroundColor must appear BEFORE any blank space.
+        let sgr_pos = s.find("\x1b[48;2;23;24;37m").expect("sgr present");
+        let first_space = bytes
+            .iter()
+            .position(|&b| b == b' ')
+            .expect("space present");
+        assert!(
+            sgr_pos < first_space,
+            "SetBackgroundColor must come before the first blank space so the \
+             blank inherits the requested bg, not the terminal's stale SGR"
+        );
+    }
+
+    /// Complement: with `Style::default()` (no bg), the emission core must NOT
+    /// emit any SGR — preserves the pre-fix behavior for callers that don't
+    /// care about color (only about physically clearing residue).
+    #[test]
+    fn emission_core_skips_sgr_when_style_has_no_bg() {
+        let sink = SharedSink::default();
+        let mut backend = CrosstermBackend::new(sink.clone());
+        queue_edge_scrub(&mut backend, Rect::new(0, 2, 80, 16), Style::default())
+            .expect("queue emits");
+        let s = String::from_utf8_lossy(&sink.bytes()).to_string();
+        assert!(
+            !s.contains("\x1b[48;"),
+            "no-bg style must not emit SetBackgroundColor SGR; got: {s:?}"
+        );
+        assert!(
+            !s.contains("\x1b[0m"),
+            "no-bg style must not emit ResetColor SGR; got: {s:?}"
+        );
     }
 
     #[test]

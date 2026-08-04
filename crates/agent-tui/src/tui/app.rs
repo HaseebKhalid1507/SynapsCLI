@@ -29,10 +29,11 @@ pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 /// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
-    pub(crate) input: String,
-    /// Cursor position as a **char index** (not byte index).
-    /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
-    pub(crate) cursor_pos: usize,
+    /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
+    /// rendered — snapshot time derives flat `(text, cursor)` via the
+    /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
+    /// soft-wrap render pipeline.
+    pub(crate) editor: tui_textarea::TextArea<'static>,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     /// `api_messages.len()` at active-turn start. Failure repair may only
@@ -202,6 +203,34 @@ pub(crate) struct App {
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds:
         Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Live MXC palettes from the myx subscriber task (theme::mxc), paired
+    /// with the wire's advisory `fade_ms` (None = absent). The main loop's
+    /// receiver arm is the ONLY place these are applied (animated through
+    /// the same set_theme + invalidate path /theme uses); the task never
+    /// mutates theme state. Unbounded is safe: the publisher dedupes and
+    /// emits a handful of events per minute, and each message is small (one
+    /// Theme value).
+    pub(crate) myx_theme_rx:
+        tokio::sync::mpsc::UnboundedReceiver<(super::theme::Theme, Option<u64>)>,
+    pub(crate) myx_theme_tx: tokio::sync::mpsc::UnboundedSender<(super::theme::Theme, Option<u64>)>,
+    /// The running MXC subscriber, present only while the "myx" theme is
+    /// active. Aborted on theme switch-away (`sync_myx_live`) and at
+    /// shutdown, so no task leaks and nothing writes after teardown.
+    /// `Some` here doubles as the receive-side guard's "the active theme is
+    /// still myx" bit: `sync_myx_live` is the single writer, on this thread,
+    /// on every theme-apply path.
+    pub(crate) myx_task: Option<tokio::task::JoinHandle<()>>,
+    /// Last-good LIVE palette from the MXC subscriber. Re-applying "myx"
+    /// statically (`/theme myx` again, settings Esc-revert, picker browse)
+    /// restores this instead of stranding on the static snapshot until the
+    /// next track change. Cleared on switch-away so a stale album palette
+    /// can never resurrect through it.
+    pub(crate) myx_last_live: Option<super::theme::Theme>,
+    /// In-flight animated theme cross-fade (theme::transition). `Some` is
+    /// the "animation active" signal the tick GUARD in mod.rs keys on; the
+    /// tick arm advances it and clears it on landing, so idle cost returns
+    /// to zero the moment the fade completes (#131 discipline).
+    pub(crate) theme_transition: Option<super::theme::transition::ThemeTransition>,
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
@@ -238,10 +267,10 @@ impl App {
             tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
             tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
+        let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             transcript: TranscriptStore::new(clock.clone()),
-            input: String::new(),
-            cursor_pos: 0,
+            editor: tui_textarea::TextArea::default(),
             api_messages: Vec::new(),
             streaming: false,
             turn_baseline: 0,
@@ -311,6 +340,11 @@ impl App {
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,
+            myx_theme_rx: myx_theme_rx_init,
+            myx_theme_tx: myx_theme_tx_init,
+            myx_task: None,
+            myx_last_live: None,
+            theme_transition: None,
             keybinds: None,
             clock,
         }
@@ -369,19 +403,48 @@ impl App {
         }
     }
 
-    /// Restore SynapsCLI's TUI after casino (or failed spawn).
-    /// Convert char-based cursor_pos to byte offset in self.input.
-    pub(crate) fn cursor_byte_pos(&self) -> usize {
-        self.input
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
+    // ── Editor accessors (hybrid plan §3.1) ────────────────────────────────
+    // The editor is the sole input-buffer state; these accessors are the only
+    // way in/out. The render path materializes one flat `(text, cursor)` pair
+    // per frame in `ViewInputs::from_app`.
+
+    /// Flat input text — editor lines joined by `\n`.
+    pub(crate) fn input_text(&self) -> String {
+        self.editor.lines().join("\n")
     }
 
-    /// Number of chars in self.input (for bounds checking cursor_pos).
-    pub(crate) fn input_char_count(&self) -> usize {
-        self.input.chars().count()
+    /// First line of the buffer, borrowed — for cheap hot-path guards that
+    /// only care about the line a slash command lives on (`/`-detection).
+    pub(crate) fn input_first_line(&self) -> &str {
+        self.editor.lines().first().map_or("", |s| s.as_str())
+    }
+
+    /// True when the input buffer contains no text at all.
+    pub(crate) fn input_is_empty(&self) -> bool {
+        let lines = self.editor.lines();
+        lines.len() <= 1 && lines.first().map_or(true, |l| l.is_empty())
+    }
+
+    /// Flat **char** index of the editor cursor within `input_text()`.
+    pub(crate) fn cursor_char_pos(&self) -> usize {
+        flat_cursor_pos(self.editor.lines(), self.editor.cursor())
+    }
+
+    /// Replace the whole buffer, cursor moved to the end of the text.
+    pub(crate) fn set_input_text(&mut self, s: &str) {
+        self.editor = tui_textarea::TextArea::from(s.split('\n'));
+        self.editor.move_cursor(tui_textarea::CursorMove::Bottom);
+        self.editor.move_cursor(tui_textarea::CursorMove::End);
+    }
+
+    /// Clear the whole buffer (today's Ctrl-U semantics — plan §3.2 note).
+    pub(crate) fn clear_input(&mut self) {
+        self.editor = tui_textarea::TextArea::default();
+    }
+
+    /// Insert text at the cursor (paste, sidecar transcription, tab-complete).
+    pub(crate) fn insert_at_cursor(&mut self, s: &str) {
+        self.editor.insert_str(s);
     }
 
     /// Calculate the number of visual lines the input needs, given an inner width.
@@ -619,7 +682,7 @@ impl App {
         }
         match self.history_index {
             None => {
-                self.input_stash = self.input.clone();
+                self.input_stash = self.input_text();
                 self.history_index = Some(self.input_history.len() - 1);
             }
             Some(i) if i > 0 => {
@@ -628,8 +691,9 @@ impl App {
             _ => return,
         }
         if let Some(idx) = self.history_index {
-            self.input = self.input_history[idx].clone();
-            self.cursor_pos = self.input.chars().count();
+            let text = self.input_history[idx].clone();
+            // set_input_text rebuilds the editor with the cursor at the end.
+            self.set_input_text(&text);
         }
     }
 
@@ -637,13 +701,13 @@ impl App {
         if let Some(i) = self.history_index {
             if i + 1 < self.input_history.len() {
                 self.history_index = Some(i + 1);
-                self.input = self.input_history[i + 1].clone();
+                let text = self.input_history[i + 1].clone();
+                self.set_input_text(&text);
             } else {
                 self.history_index = None;
-                self.input = self.input_stash.clone();
-                self.input_stash.clear();
+                let stash = std::mem::take(&mut self.input_stash);
+                self.set_input_text(&stash);
             }
-            self.cursor_pos = self.input.chars().count();
         }
     }
 
@@ -677,6 +741,7 @@ impl App {
             ("nord", "arctic frost blues"),
             ("dracula", "purple/pink/cyan vibrant"),
             ("monokai", "classic orange/pink/green"),
+            ("myx", "album-reactive colors via Myx (MXC)"),
             ("gruvbox", "warm earthy tones"),
             ("catppuccin", "soft pastels, cozy dark"),
             ("tokyo-night", "dark blue-purple, soft accents"),
@@ -689,6 +754,20 @@ impl App {
         if arg.is_empty() {
             self.push_msg(ChatMessage::System("Available themes:".to_string()));
             for (name, desc) in descriptions {
+                // Soft detection annotation for the live theme: "myx" always
+                // works (static fallback), but say whether Myx is around.
+                if *name == "myx" {
+                    let status = if super::theme::mxc::myx_detected() {
+                        "live"
+                    } else {
+                        "static — myx not detected"
+                    };
+                    self.push_msg(ChatMessage::System(format!(
+                        "  {:<15} — {} [{}]",
+                        name, desc, status
+                    )));
+                    continue;
+                }
                 self.push_msg(ChatMessage::System(format!("  {:<15} — {}", name, desc)));
             }
             let themes_dir = synaps_cli::config::base_dir().join("themes");
@@ -718,8 +797,17 @@ impl App {
             if is_valid {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
-                        let new_theme = super::theme::load_theme_by_name(name).unwrap_or_default();
-                        super::theme::set_theme(new_theme);
+                        // Prefer the cached live palette when re-applying
+                        // "myx" over a healthy subscriber — the static
+                        // snapshot would strand until the next track change.
+                        let new_theme = self.resolve_apply_theme(name).unwrap_or_default();
+                        // Animated cross-fade (350ms default; theme_transition
+                        // knob can retune or disable it). The tick arm applies
+                        // frames through the same set_theme path as before.
+                        self.apply_theme_animated(new_theme, None);
+                        // Reconcile the live-MXC layer: spawn the subscriber
+                        // when switching TO myx, abort it when switching away.
+                        self.sync_myx_live(name);
                         self.push_msg(ChatMessage::System(format!("Theme applied: {}", name)));
                         self.invalidate();
                     }
@@ -734,6 +822,73 @@ impl App {
                 )));
             }
         }
+    }
+
+    /// Start (or retarget) an animated theme change toward `target`.
+    /// `requested` is a per-change advisory duration (MXC wire `fade_ms`,
+    /// clamped upstream); `None` = the configured default. When transitions
+    /// are off (or the duration resolves to zero) this snaps instantly —
+    /// byte-identical to the old `set_theme` behavior.
+    pub(crate) fn apply_theme_animated(
+        &mut self,
+        target: super::theme::Theme,
+        requested: Option<std::time::Duration>,
+    ) {
+        super::theme::transition::apply_animated(
+            &mut self.theme_transition,
+            target,
+            requested,
+            std::time::Instant::now(),
+        );
+        self.invalidate();
+    }
+
+    /// Reconcile the background MXC subscriber with the active theme name.
+    ///
+    /// `"myx"` active and no live task → spawn `theme::mxc::run_subscriber`
+    /// with a clone of our sender. Any other theme → abort the task if one is
+    /// running. Idempotent, so callers can invoke it on every theme change
+    /// and at boot. Must run on the main loop's runtime (it spawns).
+    pub(crate) fn sync_myx_live(&mut self, theme_name: &str) {
+        let want = theme_name == "myx";
+        let running = self.myx_task.as_ref().is_some_and(|h| !h.is_finished());
+        if want && !running {
+            let tx = self.myx_theme_tx.clone();
+            self.myx_task = Some(tokio::spawn(super::theme::mxc::run_subscriber(tx)));
+        } else if !want {
+            if let Some(h) = self.myx_task.take() {
+                h.abort();
+            }
+            // A queued stale palette must not resurrect through the
+            // last-good cache after switch-away (the receive-side guard in
+            // `handle_myx_theme_arm` drops the message itself).
+            self.myx_last_live = None;
+        }
+    }
+
+    /// Resolve the theme to apply for `name`: prefers the cached last-good
+    /// LIVE palette when (re-)applying "myx" over a running subscriber, so
+    /// `/theme myx`, settings picker browse, and Esc-revert land back on the
+    /// palette that is actually current — not the static snapshot.
+    pub(crate) fn resolve_apply_theme(&self, name: &str) -> Option<super::theme::Theme> {
+        if name == "myx" && self.myx_task.is_some() {
+            if let Some(live) = &self.myx_last_live {
+                return Some(live.clone());
+            }
+        }
+        super::theme::load_theme_by_name(name)
+    }
+
+    /// Settings-modal theme commit: the same persisted + animated apply as
+    /// `/theme <name>`, INCLUDING the live-MXC subscriber reconcile. Every
+    /// theme-apply path that changes the persisted theme must call
+    /// `sync_myx_live`, or switching away from myx leaks the subscriber
+    /// (album colors re-stomp the chosen theme on every track change) and
+    /// switching to myx never goes live.
+    pub(crate) fn apply_theme_from_settings(&mut self, name: &str) {
+        let target = self.resolve_apply_theme(name).unwrap_or_default();
+        self.apply_theme_animated(target, None);
+        self.sync_myx_live(name);
     }
 }
 
@@ -758,6 +913,19 @@ impl App {
     pub(crate) fn render_lines(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
         self.transcript.render_lines(width, &self.render_ctx())
     }
+}
+
+/// Map the editor's `(row, col)` char-wise cursor to a flat char index into
+/// `lines.join("\n")` — the only new math in the hybrid design (plan §3.1):
+/// `sum(chars(lines[..row]) + 1) + col`, the `+ 1` counting each `\n`.
+/// `col` is clamped to the row's char count defensively.
+pub(crate) fn flat_cursor_pos(lines: &[String], (row, col): (usize, usize)) -> usize {
+    let mut flat = 0;
+    for line in lines.iter().take(row) {
+        flat += line.chars().count() + 1; // +1 for the joining '\n'
+    }
+    let row_chars = lines.get(row).map_or(0, |l| l.chars().count());
+    flat + col.min(row_chars)
 }
 
 #[cfg(test)]
@@ -1862,6 +2030,194 @@ mod tests {
             cache.total_height(),
             expected_flat.len(),
             "cum_heights total must track the reference render after insert + incremental rebuild"
+        );
+    }
+
+    // ── flat_cursor_pos (hybrid plan §3.1 helper) ──────────────────────────
+
+    fn lines_of(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flat_cursor_empty_buffer() {
+        assert_eq!(flat_cursor_pos(&lines_of(&[""]), (0, 0)), 0);
+        // Truly empty slice must not panic either.
+        assert_eq!(flat_cursor_pos(&[], (0, 0)), 0);
+    }
+
+    #[test]
+    fn flat_cursor_single_line() {
+        let lines = lines_of(&["hello"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 0)), 0);
+        assert_eq!(flat_cursor_pos(&lines, (0, 3)), 3);
+        assert_eq!(flat_cursor_pos(&lines, (0, 5)), 5); // at end
+    }
+
+    #[test]
+    fn flat_cursor_multi_line() {
+        // "ab\ncde\nf" — flat chars: a=0 b=1 \n=2 c=3 d=4 e=5 \n=6 f=7
+        let lines = lines_of(&["ab", "cde", "f"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 2)), 2); // end of line 0
+        assert_eq!(flat_cursor_pos(&lines, (1, 0)), 3); // just after first \n
+        assert_eq!(flat_cursor_pos(&lines, (1, 2)), 5);
+        assert_eq!(flat_cursor_pos(&lines, (2, 0)), 7); // after second \n
+        assert_eq!(flat_cursor_pos(&lines, (2, 1)), 8); // end of buffer
+    }
+
+    #[test]
+    fn flat_cursor_wide_chars() {
+        // Char-wise, not width-wise: CJK and emoji count 1 each.
+        let lines = lines_of(&["日本語", "a👍b"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 2)), 2);
+        assert_eq!(flat_cursor_pos(&lines, (0, 3)), 3); // end of CJK line
+        assert_eq!(flat_cursor_pos(&lines, (1, 0)), 4);
+        assert_eq!(flat_cursor_pos(&lines, (1, 2)), 6); // after the emoji
+        assert_eq!(flat_cursor_pos(&lines, (1, 3)), 7); // end
+    }
+
+    #[test]
+    fn flat_cursor_clamps_out_of_range_col() {
+        let lines = lines_of(&["ab", "cd"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 99)), 2);
+        assert_eq!(flat_cursor_pos(&lines, (1, 99)), 5);
+    }
+
+    #[test]
+    fn accessors_round_trip() {
+        let mut app = test_app();
+        assert!(app.input_is_empty());
+        assert_eq!(app.cursor_char_pos(), 0);
+
+        app.set_input_text("hello\nworld");
+        assert_eq!(app.input_text(), "hello\nworld");
+        assert!(!app.input_is_empty());
+        // set_input_text puts the cursor at the very end.
+        assert_eq!(app.cursor_char_pos(), 11);
+        assert_eq!(app.input_first_line(), "hello");
+
+        app.insert_at_cursor("!");
+        assert_eq!(app.input_text(), "hello\nworld!");
+        assert_eq!(app.cursor_char_pos(), 12);
+
+        app.clear_input();
+        assert!(app.input_is_empty());
+        assert_eq!(app.input_text(), "");
+        assert_eq!(app.cursor_char_pos(), 0);
+        assert_eq!(app.input_first_line(), "");
+    }
+
+    #[test]
+    fn editor_cursor_matches_flat_pos_after_typing() {
+        let mut app = test_app();
+        app.set_input_text("日本\nab");
+        // cursor at end: row 1 col 2 → flat 3 (line0) + 2
+        assert_eq!(app.editor.cursor(), (1, 2));
+        assert_eq!(app.cursor_char_pos(), 5);
+    }
+
+    // ---- live-MXC lifecycle (receive-side guard, last-good cache) ----
+
+    /// A never-completing stand-in for the subscriber: `myx_task.is_some()`
+    /// is the receive-side guard bit; the task body is irrelevant.
+    fn dummy_subscriber() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
+    }
+
+    fn live_sentinel() -> super::super::theme::Theme {
+        super::super::theme::Theme {
+            bg: ratatui::style::Color::Rgb(1, 2, 3),
+            ..Default::default()
+        }
+    }
+
+    /// Receive-side guard (shady F1): `UnboundedSender::send` is synchronous,
+    /// so a palette queued before `/theme nord` + `abort()` still arrives.
+    /// With `myx_task` gone the arm must drop it — the cache staying empty
+    /// is the deterministic proxy (the animated-apply duration depends on
+    /// the user's `theme_transition` knob, so we don't assert on the slot).
+    #[test]
+    fn stale_myx_palette_after_switch_away_is_dropped() {
+        let mut app = test_app();
+        assert!(app.myx_task.is_none());
+        super::super::loop_arms::handle_myx_theme_arm(&mut app, (live_sentinel(), Some(600)));
+        assert!(
+            app.myx_last_live.is_none(),
+            "guarded arm must drop the stale palette before caching or applying"
+        );
+    }
+
+    /// Preview shield (shady F4): while a settings theme preview is browsing,
+    /// a live palette is CACHED but not applied — the preview owns the screen.
+    #[tokio::test]
+    async fn live_palette_is_cached_but_not_applied_during_settings_preview() {
+        let mut app = test_app();
+        app.myx_task = Some(dummy_subscriber());
+        let mut st = super::super::settings::SettingsState::new();
+        st.original_theme_name = Some("myx".to_string());
+        app.settings = Some(st);
+
+        let live = live_sentinel();
+        super::super::loop_arms::handle_myx_theme_arm(&mut app, (live.clone(), None));
+
+        assert_eq!(
+            app.myx_last_live.as_ref(),
+            Some(&live),
+            "must cache as last-good"
+        );
+        assert!(
+            app.theme_transition.is_none(),
+            "preview shield must skip the apply entirely"
+        );
+        app.myx_task.take().unwrap().abort();
+    }
+
+    /// Last-good cache (shady F3): re-applying "myx" over a RUNNING
+    /// subscriber resolves to the cached live palette; without a subscriber
+    /// (or for any other theme) it resolves exactly like the static loader.
+    #[tokio::test]
+    async fn resolve_apply_theme_prefers_live_cache_only_while_subscriber_runs() {
+        let mut app = test_app();
+        let live = live_sentinel();
+        app.myx_last_live = Some(live.clone());
+
+        // No running subscriber → static resolution, cache ignored.
+        assert_eq!(
+            app.resolve_apply_theme("myx"),
+            super::super::theme::load_theme_by_name("myx")
+        );
+
+        app.myx_task = Some(dummy_subscriber());
+        assert_eq!(app.resolve_apply_theme("myx"), Some(live));
+        // Other themes never see the cache.
+        assert_eq!(
+            app.resolve_apply_theme("nord"),
+            super::super::theme::load_theme_by_name("nord")
+        );
+        app.myx_task.take().unwrap().abort();
+    }
+
+    /// Settings-path lifecycle (shady F2 / okarin F1): committing a theme
+    /// through the settings modal must reconcile the subscriber exactly like
+    /// `/theme` does — spawn on "myx", abort + clear cache on switch-away.
+    #[tokio::test]
+    async fn settings_theme_commit_reconciles_the_subscriber() {
+        let mut app = test_app();
+        app.apply_theme_from_settings("myx");
+        assert!(
+            app.myx_task.is_some(),
+            "settings apply of myx must start the live layer"
+        );
+
+        app.myx_last_live = Some(live_sentinel());
+        app.apply_theme_from_settings("nord");
+        assert!(
+            app.myx_task.is_none(),
+            "settings apply away from myx must stop the subscriber"
+        );
+        assert!(
+            app.myx_last_live.is_none(),
+            "the last-good cache must not survive switch-away"
         );
     }
 }

@@ -332,9 +332,9 @@ impl TestHarness {
 
     // ── State inspection ─────────────────────────────────────────────────────
 
-    /// Current contents of the input box.
-    pub fn input_contents(&self) -> &str {
-        &self.app.input
+    /// Current contents of the input box (flattened from the editor).
+    pub fn input_contents(&self) -> String {
+        self.app.input_text()
     }
 
     /// Whether a `Quit` action was dispatched (the real loop would start the

@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+pub(crate) mod mxc;
 mod palettes;
+pub(crate) mod transition;
 
 /// Identifies a piece of high-value modal chrome for per-part style
 /// resolution. Each variant maps to an optional `<modal>.border` /
@@ -24,6 +26,7 @@ pub(crate) enum ModalKind {
 /// Field names are what the theme file uses as keys. Unknown keys are
 /// ignored; missing keys keep the default. Colors are written as `#rrggbb`
 /// or `#rgb` hex.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Theme {
     // Markdown
     pub(crate) code_fg: Color,
@@ -124,28 +127,28 @@ impl Default for Theme {
         Self {
             code_fg: Color::Rgb(170, 210, 220),
             code_bg: Color::Rgb(14, 18, 24),
-            heading_color: Color::Rgb(80, 210, 230),
+            heading_color: Color::Rgb(72, 202, 222),
             quote_color: Color::Rgb(85, 100, 120),
-            list_bullet_color: Color::Rgb(50, 190, 210),
-            table_border_color: Color::Rgb(35, 55, 70),
-            table_header_color: Color::Rgb(80, 210, 230),
+            list_bullet_color: Color::Rgb(48, 184, 204),
+            table_border_color: Color::Rgb(38, 49, 67),
+            table_header_color: Color::Rgb(72, 202, 222),
             table_cell_color: Color::Rgb(175, 185, 200),
 
-            bg: Color::Rgb(20, 24, 34),
+            bg: Color::Rgb(19, 23, 33),
             // Recessed transcript surface; deliberately distinct from user and tool cards.
-            message_bg: Color::Rgb(10, 12, 18),
-            border: Color::Rgb(28, 36, 50),
-            border_active: Color::Rgb(50, 180, 210),
-            muted: Color::Rgb(50, 58, 72),
+            message_bg: Color::Rgb(11, 13, 20),
+            border: Color::Rgb(33, 42, 58),
+            border_active: Color::Rgb(54, 190, 210),
+            muted: Color::Rgb(62, 73, 90),
 
             user_color: Color::Rgb(185, 195, 215),
-            user_bg: Color::Rgb(16, 20, 30),
-            claude_label: Color::Rgb(50, 200, 220),
+            user_bg: Color::Rgb(19, 23, 33),
+            claude_label: Color::Rgb(72, 202, 222),
             claude_text: Color::Rgb(192, 198, 210),
             thinking_color: Color::Rgb(45, 55, 75),
-            tool_label: Color::Rgb(70, 170, 220),
-            tool_param: Color::Rgb(65, 100, 135),
-            tool_result_color: Color::Rgb(55, 120, 130),
+            tool_label: Color::Rgb(66, 174, 198),
+            tool_param: Color::Rgb(85, 119, 151),
+            tool_result_color: Color::Rgb(106, 151, 164),
             tool_result_ok: Color::Rgb(50, 175, 160),
             error_color: Color::Rgb(230, 70, 70),
             warning_color: Color::Rgb(220, 180, 60),
@@ -153,11 +156,11 @@ impl Default for Theme {
             header_fg: Color::Rgb(110, 125, 150),
             status_streaming: Color::Rgb(220, 175, 60),
             status_ready: Color::Rgb(50, 195, 190),
-            help_fg: Color::Rgb(42, 52, 68),
-            input_fg: Color::Rgb(188, 195, 210),
-            prompt_fg: Color::Rgb(50, 180, 210),
-            separator: Color::Rgb(24, 30, 42),
-            cost_color: Color::Rgb(210, 170, 80),
+            help_fg: Color::Rgb(55, 67, 86),
+            input_fg: Color::Rgb(196, 203, 216),
+            prompt_fg: Color::Rgb(54, 190, 210),
+            separator: Color::Rgb(30, 38, 53),
+            cost_color: Color::Rgb(218, 178, 76),
 
             subagent_border: Color::Rgb(40, 45, 75),
             subagent_name: Color::Rgb(140, 130, 220),
@@ -184,8 +187,10 @@ impl Default for Theme {
             tool_subagent: Color::Reset,
             tool_ext: Color::Reset,
             tool_generic: Color::Reset,
-            tool_input_bg: Color::Reset,
-            tool_output_bg: Color::Reset,
+            // Tool input/output are explicit rather than generic derived tints:
+            // the paired panels must remain visibly distinct through tmux.
+            tool_input_bg: Color::Rgb(23, 28, 40),
+            tool_output_bg: Color::Rgb(32, 40, 55),
 
             // Per-part overrides are absent by default => resolvers fall back
             // to base tokens => zero visual change across all 18 palettes.
@@ -225,6 +230,7 @@ impl Theme {
             "nord" => Some(Self::nord()),
             "dracula" => Some(Self::dracula()),
             "monokai" => Some(Self::monokai()),
+            "myx" => Some(Self::myx()),
             "gruvbox" => Some(Self::gruvbox()),
             "catppuccin" => Some(Self::catppuccin()),
             "tokyo-night" => Some(Self::tokyo_night()),
@@ -487,6 +493,18 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
     Theme::builtin(name)
 }
 
+/// The `theme = <name>` value from config, if any. Used at boot to decide
+/// whether the live-MXC subscriber should start alongside the "myx" theme.
+/// (A `~/.synaps-cli/theme` override file wins over this for *colors*, same
+/// as `load_theme_from_config` — this only reports the configured name.)
+///
+/// Routed through the real config loader (shady F6): a second hand-rolled
+/// parser drifted on lines like `theme = "myx" # comment`, silently keeping
+/// the boot subscriber off while the color loader still resolved myx.
+pub(crate) fn configured_theme_name() -> Option<String> {
+    synaps_cli::config::load_config().theme
+}
+
 /// Whether the root TUI paints an opaque canvas. `false` preserves the exact
 /// legacy 0.7.0 layout behavior outside individual widgets.
 pub(crate) static BACKGROUND_OPAQUE: LazyLock<AtomicBool> =
@@ -511,14 +529,15 @@ mod theme_tests {
     use super::*;
 
     #[test]
-    fn tool_styling_defaults_to_reset() {
-        // Neon is NOT in Default — tool_* fields are Reset (derive-from-palette sentinel).
+    fn default_tool_panels_are_explicit() {
+        // The default theme is hand-tuned: argument and result panels must
+        // remain visibly distinct through the SSH → tmux rendering path.
         let t = Theme::default();
         assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_read, Color::Reset);
         assert_eq!(t.tool_generic, Color::Reset);
-        assert_eq!(t.tool_input_bg, Color::Reset);
-        assert_eq!(t.tool_output_bg, Color::Reset);
+        assert_eq!(t.tool_input_bg, Color::Rgb(23, 28, 40));
+        assert_eq!(t.tool_output_bg, Color::Rgb(32, 40, 55));
     }
 
     #[test]
@@ -550,7 +569,8 @@ mod theme_tests {
         // Other palettes should NOT inherit neon — they get Reset via Default.
         let t = Theme::builtin("dracula").expect("dracula exists");
         assert_eq!(t.tool_bash, Color::Reset);
-        assert_eq!(t.tool_input_bg, Color::Reset);
+        assert_eq!(t.tool_input_bg, Color::Rgb(23, 28, 40));
+        assert_eq!(t.tool_output_bg, Color::Rgb(32, 40, 55));
     }
 
     // ---- Per-part chrome overrides (P19.1) --------------------------------
@@ -599,8 +619,8 @@ mod theme_tests {
         // Every built-in palette, with no part overrides, must resolve each
         // part to its base token — the "zero regression across 18 palettes"
         // guarantee, asserted directly against the resolvers.
-        // The 18 named palettes plus the built-in `default` (19 total).
-        const NAMES: [&str; 19] = [
+        // The 19 named palettes plus the built-in `default` (20 total).
+        const NAMES: [&str; 20] = [
             "default",
             "night-city",
             "neon-rain",
@@ -613,6 +633,7 @@ mod theme_tests {
             "nord",
             "dracula",
             "monokai",
+            "myx",
             "gruvbox",
             "catppuccin",
             "tokyo-night",
@@ -801,6 +822,7 @@ mod message_canvas_tests {
         "nord",
         "dracula",
         "monokai",
+        "myx",
         "gruvbox",
         "catppuccin",
         "tokyo-night",
@@ -901,7 +923,14 @@ mod message_canvas_tests {
                 f64::from(hi - lo) / f64::from(hi)
             }
         }
-        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+        // "myx" is exempt: its bg and canvas are BOTH verbatim Myx-designed
+        // surfaces (library panel + background), not a derived recess — this
+        // guard exists for derivation drift, and Myx's own hierarchy sits at
+        // 84% saturation retention by design.
+        for name in BUILTINS
+            .iter()
+            .filter(|n| !FLUSH.contains(n) && **n != "myx")
+        {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
             let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
             let base = saturation(bg);

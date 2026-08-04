@@ -17,7 +17,7 @@ Extensions can:
 - **Confirm** — ask for explicit user approval before a tool call proceeds
 - **Modify** — replace `before_tool_call` input before execution
 - **Replace** — rewrite `after_tool_call` output before it enters history (compression, redaction, summarization; requires `tools.transform_output`)
-- **Inject** — prepend context into the system prompt before a request reaches the LLM
+- **Inject** — attach context to the outgoing request before it reaches the LLM (`on_session_start` → system prompt, session-stable; `before_message` → newest user message, per-turn ephemeral)
 
 Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
 
@@ -96,7 +96,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 | `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅            | ✅ modify    |
 | `after_tool_call`   | A tool has finished executing                            | ❌          | ❌            | ❌           |
 | `before_message`    | A user message is about to be sent to the model          | ❌          | ❌            | ✅           |
-| `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ❌           |
+| `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ✅           |
 | `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
 
 **Notes:**
@@ -105,7 +105,8 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 - `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `before_tool_call` supports `modify`, which replaces the tool input before execution. Trace logs record that modification occurred without logging the modified input.
 - `after_tool_call` supports `replace`, which rewrites the tool **output** before it enters history (compression, redaction, summarization). It requires `tools.transform_output` *in addition to* `tools.intercept`; the first `replace` wins and stops the chain. A `replace` from an extension lacking the permission, or a malformed/crashed handler, is ignored and the original output is preserved.
-- `before_message` supports `inject`; injected content from matching extensions is accumulated.
+- `before_message` supports `inject`; injected content from matching extensions is accumulated. It is attached to the newest user message as a trailing ephemeral text block, positioned after the conversational cache marker (never the system prompt).
+- `on_session_start` supports `inject`; the content is appended to the system prompt once and carried unchanged for the whole session (session-stable, cache-safe).
 - The remaining hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 
 ---
@@ -173,7 +174,7 @@ Permissions are checked before events are delivered. An extension that lacks a h
 
 ## Context Injection
 
-When an extension returns a `HookResult::Inject` from a supported hook, the provided content is prepended to the system prompt before it reaches the LLM. This allows extensions to dynamically augment the assistant's context — for example, injecting the current user's timezone, a relevant memory, or a policy statement.
+When an extension returns a `HookResult::Inject` from a supported hook, the provided content is attached to the outgoing request before it reaches the LLM. Placement depends on the hook, chosen for prompt-cache safety: `on_session_start` content is appended to the system prompt (session-stable), while `before_message` content is attached to the newest user message as a trailing ephemeral text block, positioned after the conversational cache marker so the cached durable prefix stays intact. This allows extensions to dynamically augment the assistant's context — for example, injecting the current user's timezone, a relevant memory, or a policy statement. See [`protocol.md`](./protocol.md) §`inject` for the full placement contract.
 
 ```json
 {
@@ -212,7 +213,7 @@ The official extension collection is maintained in the [synaps-deck](https://git
 
 - **audit-log** — writes all tool calls and results to a structured JSONL file
 - **confirm-shell** — prompts for human confirmation before any `bash` execution
-- **memory-injector** — injects relevant memories from a local store into the system prompt
+- **memory-injector** — injects relevant memories from a local store into the model's context
 - **rate-limiter** — blocks tool calls that exceed a configurable per-minute threshold
 
 Install any of them individually:

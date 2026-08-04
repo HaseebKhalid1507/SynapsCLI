@@ -198,6 +198,7 @@ pub(crate) async fn run_setup(
     // ── Engine-managed background tasks (inbox watcher, socket, extensions) ──
     let background = boot.background;
     let ext_mgr_shared = boot.ext_manager;
+    let session_id_for_hook = app.session.id.clone();
 
     // Legacy sidecar key migration
     loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
@@ -213,10 +214,12 @@ pub(crate) async fn run_setup(
         synaps_cli::extensions::loader::spawn_discover_and_load(
             std::sync::Arc::clone(&ext_mgr_shared),
             app.extension_loader_tx.clone(),
+            Some(session_id_for_hook.clone()),
         );
     }
 
-    // on_session_start hook already fired by engine::setup::boot()
+    // on_session_start is emitted by the extension loader once subscribers
+    // exist — not at engine boot, where it reached nobody. See loader.rs.
 
     // ── Event loop ──
     // Track whether the render thread currently has an active boot or exit

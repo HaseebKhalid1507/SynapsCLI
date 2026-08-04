@@ -60,6 +60,15 @@ pub struct HandlerRegistration {
 /// the handler list, and registration takes a write lock only briefly.
 pub struct HookBus {
     handlers: RwLock<HashMap<HookKind, Vec<HandlerRegistration>>>,
+    /// Context injected by `on_session_start` handlers, held for the lifetime
+    /// of the session.
+    ///
+    /// `before_message` injection is per-turn and re-applied on every request.
+    /// Session-start injection is the once-per-session equivalent: an
+    /// extension that wants to hand the model a session handoff should not
+    /// have to fake it by tracking "have I injected yet?" across every
+    /// message, and should not pay to re-send it each turn.
+    session_injection: RwLock<Option<String>>,
 }
 
 impl HookBus {
@@ -67,7 +76,22 @@ impl HookBus {
     pub fn new() -> Self {
         Self {
             handlers: RwLock::new(HashMap::new()),
+            session_injection: RwLock::new(None),
         }
+    }
+
+    /// Record context injected by an `on_session_start` handler.
+    ///
+    /// Called once, by whoever emits the session-start event, after
+    /// extensions have loaded. Later calls replace the stored value.
+    pub async fn set_session_injection(&self, content: String) {
+        *self.session_injection.write().await = Some(content);
+    }
+
+    /// Context injected at session start, if any. Read on every turn while
+    /// composing the system prompt.
+    pub async fn session_injection(&self) -> Option<String> {
+        self.session_injection.read().await.clone()
     }
 
     /// Register a handler for a specific hook kind.

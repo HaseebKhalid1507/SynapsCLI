@@ -238,6 +238,14 @@ impl HelperMethods {
     ///
     /// The marker is the message-tail site: bare 5m under both `FiveMinutes`
     /// and `Hybrid`, `"ttl":"1h"` only under uniform `OneHour`.
+    ///
+    /// The marker is stamped on the last DURABLE block of the last message:
+    /// trailing per-turn extension-context blocks (see `attach_turn_context`)
+    /// are skipped, because they exist only in this one request — a cache
+    /// entry terminating in them could never be matched by any later request,
+    /// which would kill every conversational cache hit in tool-free chat
+    /// (#297 follow-up). Mid-message `cache_control` breakpoints are legal;
+    /// the ephemeral block rides after the marker as an uncached tail.
     pub(super) fn annotate_cache_breakpoint(messages: &mut [SharedMessage], ttl: CacheTtl) {
         let Some(last) = messages.last_mut() else {
             return;
@@ -252,7 +260,11 @@ impl HelperMethods {
             last["content"] = json!([{"type": "text", "text": text}]);
         }
 
-        if let Some(block) = last["content"].as_array_mut().and_then(|c| c.last_mut()) {
+        if let Some(block) = last["content"].as_array_mut().and_then(|c| {
+            c.iter_mut()
+                .rev()
+                .find(|b| !super::stream::is_ephemeral_turn_context_block(b))
+        }) {
             block["cache_control"] = cache_control_value(ttl, MarkerSite::MessageTail);
         }
     }

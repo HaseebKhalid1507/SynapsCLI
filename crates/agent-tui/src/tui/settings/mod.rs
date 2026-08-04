@@ -25,6 +25,7 @@ const BUILTIN_THEMES: &[&str] = &[
     "nord",
     "dracula",
     "monokai",
+    "myx",
     "gruvbox",
     "catppuccin",
     "tokyo-night",

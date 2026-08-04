@@ -8,7 +8,7 @@
 # there again — new logic belongs in run_setup.rs / dispatch.rs /
 # loop_arms.rs / stream_handler.rs.
 #
-# CEILING = 460 (actual post-split count 431 + ~30 lines of margin for
+# CEILING = 480 (bumped from 460 for the live-MXC myx-theme arm; margin for
 # comments/small glue). Bump only with review, never to "make CI green".
 #
 # Usage: bash scripts/loc-ratchet.sh
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-CEILING=460
+CEILING=480
 TARGET_FILE="crates/agent-tui/src/tui/mod.rs"
 
 # Resolve relative to repo root regardless of CWD.

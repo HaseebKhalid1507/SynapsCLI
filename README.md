@@ -130,7 +130,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days. Continuous memory persists across projects.
 - **🤖 Autonomous mode.** `synaps watcher` runs a fleet with heartbeats, crash recovery, cost limits, and session handoff.
 - **⚡ Fast and lean.** ~210K lines of Rust, one 20MB binary, ~2ms cold start, zero runtime deps.
-- **🎨 18 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
+- **🎨 19 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 ---
 

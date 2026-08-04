@@ -710,6 +710,10 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
+        "theme_transition" => synaps_cli::config::read_config_value("theme_transition")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "on".to_string()),
         _ => "?".into(),
     }
 }

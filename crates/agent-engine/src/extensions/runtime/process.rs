@@ -937,13 +937,22 @@ impl ProcessExtension {
         if id_is_present && method_field.is_some() {
             // Inbound request from the extension. Spawn a task to handle it
             // so the reader loop is never blocked on memory I/O or other work.
-            let id = match id_field.and_then(Value::as_u64) {
-                Some(id) => id,
-                None => {
-                    tracing::trace!(
+            // JSON-RPC 2.0 §4: `id` MUST be a String, Number, or Null. The
+            // extension picks its own request ids and is the only party that
+            // correlates them, so echo whatever it sent back verbatim rather
+            // than forcing it through u64.
+            //
+            // This previously required a numeric id and dropped everything
+            // else at trace level. `docs/extensions/protocol.md` shows string
+            // ids in its own examples, so an extension written against the
+            // documentation hung forever with no diagnostic. (#291 defect 3)
+            let id = match id_field {
+                Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+                _ => {
+                    tracing::warn!(
                         extension = %extension_id,
                         frame = %value,
-                        "Discarding inbound request with non-numeric id",
+                        "Discarding inbound request: JSON-RPC id must be a string or a number",
                     );
                     return;
                 }
@@ -1007,13 +1016,18 @@ impl ProcessExtension {
         }
 
         if id_is_present {
+            // Response frames are different: the id must be one WE issued, and
+            // the runtime only ever issues numeric ids. A non-numeric id here
+            // cannot correlate to anything, so it is genuinely a protocol
+            // error on the extension's side — say so at warn, not trace.
             let id = match id_field.and_then(Value::as_u64) {
                 Some(id) => id,
                 None => {
-                    tracing::trace!(
+                    tracing::warn!(
                         extension = %extension_id,
                         frame = %value,
-                        "Discarding frame with non-numeric id",
+                        "Discarding response frame: id does not match any request \
+                         the runtime issued (runtime request ids are always numeric)",
                     );
                     return;
                 }

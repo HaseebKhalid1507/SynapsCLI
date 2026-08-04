@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] — 2026-08-04
+
+### Added
+
+- **`myx` theme — album-reactive colors via MXC.** Synaps now ships a builtin
+  theme that subscribes to the Myx Color Protocol socket
+  (`$XDG_RUNTIME_DIR/myx/theme.sock`) while active: every track change in the
+  Myx music player re-derives a 16-token palette from the album art and Synaps
+  recolors itself live. Fully functional without Myx installed (static
+  tokyonight-based snapshot); works across machines over an SSH Unix-socket
+  forward. The subscriber can never hurt the session: capped-backoff reconnect,
+  keep-last-good on disconnect, bounded line reads, and a socket-ownership
+  check on the `/tmp` fallback.
+- **Animated theme transitions.** Theme changes — `/theme`, settings, and live
+  MXC palettes — now cross-fade with ease-in-out easing instead of snapping.
+  New `theme_transition = on | off | <ms>` config knob (default 350ms, also in
+  the settings modal); MXC's per-message `fade_ms` is honored. Transitions ride
+  the existing animation tick: zero idle cost, byte-exact landing.
+- **Real input editing (tui-textarea).** The input editor now runs on a
+  maintained editing core: proper cursor movement and selection behavior,
+  Ctrl-Z/Ctrl-Y undo/redo, and Alt-Enter to insert a newline in any terminal.
+
+### Performance
+
+- **Prompt-cache fix: per-turn context no longer rewrites your history.**
+  Extension-injected per-message context (memory, tasks, timestamps) was
+  appended to the system prompt — mutating the cache prefix and forcing the
+  entire conversation history to be re-uploaded at write pricing on every user
+  turn. Injection now rides the newest user message after the cache
+  breakpoint: measured per-turn cache writes dropped from ~97K tokens to ~13
+  in long sessions, with 99–100% cache hits. Long-running sessions are
+  dramatically cheaper.
+
+### Fixed
+
+- **Extension protocol:** `on_session_start` is delivered (and can inject
+  session context); the protocol contract is drift-checked against the engine
+  itself; string JSON-RPC request ids accepted; capability ids validated with
+  the runtime's own validator.
+- **Multiline paste:** terminals/tmux converting `\n` to `\r` in bracketed
+  paste no longer collapses pasted text onto one line.
+- **tmux rendering:** transcript-canvas edges no longer paint the wrong color;
+  invisible transcript canvas preserved under tmux.
+
+### Changed
+
+- **Theme polish wave:** refined default surface hierarchy, user turns lifted
+  onto chrome (default + ocean), hand-picked conversation canvas for every
+  builtin theme, and more breathing room between turns.
+
+
 ## [0.7.1] — 2026-08-01
 
 ### Added
