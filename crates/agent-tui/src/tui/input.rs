@@ -767,9 +767,13 @@ fn route_settings(
                     }
                 }
                 super::settings::InputOutcome::PreviewTheme { name } => {
-                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
-                        // Animated preview; arrow-key browsing retargets the
-                        // in-flight fade from its current frame (no jumps).
+                    // Animated preview; arrow-key browsing retargets the
+                    // in-flight fade from its current frame (no jumps).
+                    // Browsing onto "myx" shows the cached live palette
+                    // when the subscriber is healthy, not the stale static
+                    // snapshot. Previews are transient: they never persist
+                    // and never touch the subscriber lifecycle.
+                    if let Some(theme) = app.resolve_apply_theme(&name) {
                         super::theme::transition::apply_animated(
                             &mut app.theme_transition,
                             theme,
@@ -779,7 +783,16 @@ fn route_settings(
                     }
                 }
                 super::settings::InputOutcome::RevertTheme => {
-                    let theme = super::theme::load_theme_from_config();
+                    // Esc-revert: config is untouched, so the subscriber
+                    // needs no reconcile. When reverting onto a live myx
+                    // (subscriber running), restore the last-good live
+                    // palette — the static config load would strand the
+                    // screen on the snapshot until the next track change.
+                    let theme = app
+                        .myx_last_live
+                        .clone()
+                        .filter(|_| app.myx_task.is_some())
+                        .unwrap_or_else(super::theme::load_theme_from_config);
                     super::theme::transition::apply_animated(
                         &mut app.theme_transition,
                         theme,

@@ -843,11 +843,36 @@ pub(crate) fn boot_myx_live(app: &mut App) {
 /// Live-MXC arm body: apply a palette on the UI thread through the exact
 /// `set_theme` + `invalidate` path `/theme` uses — animated, honoring the
 /// wire's advisory `fade_ms` (clamped to 0..=2000ms; 0 = intentional snap;
-/// absent = 350ms fallback). The subscriber task only ever sends; it never
-/// touches theme state. Rapid track changes retarget the in-flight fade
-/// from its current frame — never queued, never a jump.
+/// absent = the configured `theme_transition` default). The subscriber task
+/// only ever sends; it never touches theme state. Rapid track changes
+/// retarget the in-flight fade from its current frame — never queued,
+/// never a jump.
 pub(crate) fn handle_myx_theme_arm(app: &mut App, msg: (theme::Theme, Option<u64>)) {
     let (palette, fade_ms) = msg;
+    // RECEIVE-SIDE GUARD: the unbounded channel outlives the subscriber
+    // task, and `UnboundedSender::send` is synchronous — `abort()` cannot
+    // un-send an already-queued palette. So a palette can arrive AFTER the
+    // user switched away from myx and must not clobber the freshly chosen
+    // theme. `myx_task` is `Some` exactly while the active theme is "myx"
+    // (`sync_myx_live` is the single writer, on this thread, on every
+    // persisted theme-apply path): its absence means drop the message.
+    if app.myx_task.is_none() {
+        return;
+    }
+    // Always remember the freshest live palette — re-applying "myx"
+    // statically (/theme myx again, settings Esc-revert) restores this via
+    // `App::resolve_apply_theme` instead of stranding on the snapshot.
+    app.myx_last_live = Some(palette.clone());
+    // A settings theme PREVIEW owns the screen: a live palette must not
+    // clobber the browse mid-preview. The cache above holds it; every
+    // preview exit path (Enter-apply, Esc-revert) resolves through it.
+    if app
+        .settings
+        .as_ref()
+        .is_some_and(|st| st.original_theme_name.is_some())
+    {
+        return;
+    }
     app.apply_theme_animated(palette, theme::transition::wire_fade_duration(fade_ms));
 }
 

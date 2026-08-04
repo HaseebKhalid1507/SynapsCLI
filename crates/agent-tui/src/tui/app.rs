@@ -216,7 +216,16 @@ pub(crate) struct App {
     /// The running MXC subscriber, present only while the "myx" theme is
     /// active. Aborted on theme switch-away (`sync_myx_live`) and at
     /// shutdown, so no task leaks and nothing writes after teardown.
+    /// `Some` here doubles as the receive-side guard's "the active theme is
+    /// still myx" bit: `sync_myx_live` is the single writer, on this thread,
+    /// on every theme-apply path.
     pub(crate) myx_task: Option<tokio::task::JoinHandle<()>>,
+    /// Last-good LIVE palette from the MXC subscriber. Re-applying "myx"
+    /// statically (`/theme myx` again, settings Esc-revert, picker browse)
+    /// restores this instead of stranding on the static snapshot until the
+    /// next track change. Cleared on switch-away so a stale album palette
+    /// can never resurrect through it.
+    pub(crate) myx_last_live: Option<super::theme::Theme>,
     /// In-flight animated theme cross-fade (theme::transition). `Some` is
     /// the "animation active" signal the tick GUARD in mod.rs keys on; the
     /// tick arm advances it and clears it on landing, so idle cost returns
@@ -334,6 +343,7 @@ impl App {
             myx_theme_rx: myx_theme_rx_init,
             myx_theme_tx: myx_theme_tx_init,
             myx_task: None,
+            myx_last_live: None,
             theme_transition: None,
             keybinds: None,
             clock,
@@ -787,7 +797,10 @@ impl App {
             if is_valid {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
-                        let new_theme = super::theme::load_theme_by_name(name).unwrap_or_default();
+                        // Prefer the cached live palette when re-applying
+                        // "myx" over a healthy subscriber — the static
+                        // snapshot would strand until the next track change.
+                        let new_theme = self.resolve_apply_theme(name).unwrap_or_default();
                         // Animated cross-fade (350ms default; theme_transition
                         // knob can retune or disable it). The tick arm applies
                         // frames through the same set_theme path as before.
@@ -846,7 +859,36 @@ impl App {
             if let Some(h) = self.myx_task.take() {
                 h.abort();
             }
+            // A queued stale palette must not resurrect through the
+            // last-good cache after switch-away (the receive-side guard in
+            // `handle_myx_theme_arm` drops the message itself).
+            self.myx_last_live = None;
         }
+    }
+
+    /// Resolve the theme to apply for `name`: prefers the cached last-good
+    /// LIVE palette when (re-)applying "myx" over a running subscriber, so
+    /// `/theme myx`, settings picker browse, and Esc-revert land back on the
+    /// palette that is actually current — not the static snapshot.
+    pub(crate) fn resolve_apply_theme(&self, name: &str) -> Option<super::theme::Theme> {
+        if name == "myx" && self.myx_task.is_some() {
+            if let Some(live) = &self.myx_last_live {
+                return Some(live.clone());
+            }
+        }
+        super::theme::load_theme_by_name(name)
+    }
+
+    /// Settings-modal theme commit: the same persisted + animated apply as
+    /// `/theme <name>`, INCLUDING the live-MXC subscriber reconcile. Every
+    /// theme-apply path that changes the persisted theme must call
+    /// `sync_myx_live`, or switching away from myx leaks the subscriber
+    /// (album colors re-stomp the chosen theme on every track change) and
+    /// switching to myx never goes live.
+    pub(crate) fn apply_theme_from_settings(&mut self, name: &str) {
+        let target = self.resolve_apply_theme(name).unwrap_or_default();
+        self.apply_theme_animated(target, None);
+        self.sync_myx_live(name);
     }
 }
 
@@ -2072,5 +2114,106 @@ mod tests {
         // cursor at end: row 1 col 2 → flat 3 (line0) + 2
         assert_eq!(app.editor.cursor(), (1, 2));
         assert_eq!(app.cursor_char_pos(), 5);
+    }
+
+    // ---- live-MXC lifecycle (receive-side guard, last-good cache) ----
+
+    /// A never-completing stand-in for the subscriber: `myx_task.is_some()`
+    /// is the receive-side guard bit; the task body is irrelevant.
+    fn dummy_subscriber() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
+    }
+
+    fn live_sentinel() -> super::super::theme::Theme {
+        super::super::theme::Theme {
+            bg: ratatui::style::Color::Rgb(1, 2, 3),
+            ..Default::default()
+        }
+    }
+
+    /// Receive-side guard (shady F1): `UnboundedSender::send` is synchronous,
+    /// so a palette queued before `/theme nord` + `abort()` still arrives.
+    /// With `myx_task` gone the arm must drop it — the cache staying empty
+    /// is the deterministic proxy (the animated-apply duration depends on
+    /// the user's `theme_transition` knob, so we don't assert on the slot).
+    #[test]
+    fn stale_myx_palette_after_switch_away_is_dropped() {
+        let mut app = test_app();
+        assert!(app.myx_task.is_none());
+        super::super::loop_arms::handle_myx_theme_arm(&mut app, (live_sentinel(), Some(600)));
+        assert!(
+            app.myx_last_live.is_none(),
+            "guarded arm must drop the stale palette before caching or applying"
+        );
+    }
+
+    /// Preview shield (shady F4): while a settings theme preview is browsing,
+    /// a live palette is CACHED but not applied — the preview owns the screen.
+    #[tokio::test]
+    async fn live_palette_is_cached_but_not_applied_during_settings_preview() {
+        let mut app = test_app();
+        app.myx_task = Some(dummy_subscriber());
+        let mut st = super::super::settings::SettingsState::new();
+        st.original_theme_name = Some("myx".to_string());
+        app.settings = Some(st);
+
+        let live = live_sentinel();
+        super::super::loop_arms::handle_myx_theme_arm(&mut app, (live.clone(), None));
+
+        assert_eq!(app.myx_last_live.as_ref(), Some(&live), "must cache as last-good");
+        assert!(
+            app.theme_transition.is_none(),
+            "preview shield must skip the apply entirely"
+        );
+        app.myx_task.take().unwrap().abort();
+    }
+
+    /// Last-good cache (shady F3): re-applying "myx" over a RUNNING
+    /// subscriber resolves to the cached live palette; without a subscriber
+    /// (or for any other theme) it resolves exactly like the static loader.
+    #[tokio::test]
+    async fn resolve_apply_theme_prefers_live_cache_only_while_subscriber_runs() {
+        let mut app = test_app();
+        let live = live_sentinel();
+        app.myx_last_live = Some(live.clone());
+
+        // No running subscriber → static resolution, cache ignored.
+        assert_eq!(
+            app.resolve_apply_theme("myx"),
+            super::super::theme::load_theme_by_name("myx")
+        );
+
+        app.myx_task = Some(dummy_subscriber());
+        assert_eq!(app.resolve_apply_theme("myx"), Some(live));
+        // Other themes never see the cache.
+        assert_eq!(
+            app.resolve_apply_theme("nord"),
+            super::super::theme::load_theme_by_name("nord")
+        );
+        app.myx_task.take().unwrap().abort();
+    }
+
+    /// Settings-path lifecycle (shady F2 / okarin F1): committing a theme
+    /// through the settings modal must reconcile the subscriber exactly like
+    /// `/theme` does — spawn on "myx", abort + clear cache on switch-away.
+    #[tokio::test]
+    async fn settings_theme_commit_reconciles_the_subscriber() {
+        let mut app = test_app();
+        app.apply_theme_from_settings("myx");
+        assert!(
+            app.myx_task.is_some(),
+            "settings apply of myx must start the live layer"
+        );
+
+        app.myx_last_live = Some(live_sentinel());
+        app.apply_theme_from_settings("nord");
+        assert!(
+            app.myx_task.is_none(),
+            "settings apply away from myx must stop the subscriber"
+        );
+        assert!(
+            app.myx_last_live.is_none(),
+            "the last-good cache must not survive switch-away"
+        );
     }
 }
