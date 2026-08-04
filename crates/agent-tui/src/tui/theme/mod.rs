@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+pub(crate) mod mxc;
 mod palettes;
 
 /// Identifies a piece of high-value modal chrome for per-part style
