@@ -192,7 +192,10 @@ fn wrap_extension_context(base: &str, content: &str) -> String {
 ///   system-prompt path had).
 fn attach_turn_context(messages: &[SharedMessage], guarded: &str) -> Vec<SharedMessage> {
     let mut out = messages.to_vec();
-    let Some(slot) = out.last_mut().filter(|m| m["role"].as_str() == Some("user")) else {
+    let Some(slot) = out
+        .last_mut()
+        .filter(|m| m["role"].as_str() == Some("user"))
+    else {
         tracing::warn!(
             "per-turn extension context dropped: request does not end with a user message"
         );
@@ -392,12 +395,12 @@ impl StreamMethods {
                                 // than inferred from user reports.
                                 tracing::info!(
                                     event = "turn_budget_round_renewed",
-                                    dimension = agent_core::BudgetDimension::ProviderRounds.as_str(),
+                                    dimension =
+                                        agent_core::BudgetDimension::ProviderRounds.as_str(),
                                     renewals_used = budget_meter.round_renewals_used(),
                                     renewals_remaining = remaining,
                                     elapsed_secs = budget_meter.elapsed().as_secs(),
-                                    max_elapsed_secs =
-                                        budget_meter.budget().max_elapsed.as_secs(),
+                                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
                                     tool_calls_used = budget_meter.tool_calls_used(),
                                     "provider-round checkpoint: renewed, continuing automatically"
                                 );
@@ -1673,8 +1676,18 @@ mod tests {
         HelperMethods::annotate_cache_breakpoint(&mut req2, CacheTtl::FiveMinutes);
 
         // Sanity: the two requests genuinely carry different ephemeral tails.
-        let tail1 = req1[0]["content"].as_array().unwrap().last().unwrap().clone();
-        let tail2 = req2[2]["content"].as_array().unwrap().last().unwrap().clone();
+        let tail1 = req1[0]["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let tail2 = req2[2]["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
         assert!(is_ephemeral_turn_context_block(&tail1));
         assert!(is_ephemeral_turn_context_block(&tail2));
         assert_ne!(tail1, tail2);
