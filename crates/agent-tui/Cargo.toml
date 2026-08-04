@@ -43,6 +43,10 @@ syntect       = { version = "5", default-features = false, features = ["default-
 arc-swap      = "1"
 unicode-width = "0.2.0"
 arboard       = "3"
+# Input editing state machine (hybrid plan §4): maintained fork of tui-textarea.
+# TextArea is never rendered — it owns editing semantics only; the existing
+# soft-wrap render pipeline consumes flat (text, cursor) via compat accessors.
+tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"] }
 
 # Signal handling (tui/signals.rs)
 signal-hook  = { version = "0.3", features = ["iterator"] }

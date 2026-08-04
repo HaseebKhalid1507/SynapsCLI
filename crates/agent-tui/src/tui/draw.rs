@@ -519,7 +519,7 @@ pub(crate) fn build_render_model(
     };
     let input_inner_width = term_size.width.saturating_sub(2);
     let (input_lines, _, _) =
-        super::view_model::input_wrap_info(inputs.input, inputs.cursor_pos, input_inner_width);
+        super::view_model::input_wrap_info(&inputs.input, inputs.cursor_pos, input_inner_width);
     let max_input_lines: u16 = 10;
     let input_height = input_lines.min(max_input_lines) + 2;
     let download_height: u16 = if !inputs.active_tasks.is_empty() {

@@ -29,10 +29,11 @@ pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 /// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
-    pub(crate) input: String,
-    /// Cursor position as a **char index** (not byte index).
-    /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
-    pub(crate) cursor_pos: usize,
+    /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
+    /// rendered — snapshot time derives flat `(text, cursor)` via the
+    /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
+    /// soft-wrap render pipeline.
+    pub(crate) editor: tui_textarea::TextArea<'static>,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     /// `api_messages.len()` at active-turn start. Failure repair may only
@@ -240,8 +241,7 @@ impl App {
             tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
         Self {
             transcript: TranscriptStore::new(clock.clone()),
-            input: String::new(),
-            cursor_pos: 0,
+            editor: tui_textarea::TextArea::default(),
             api_messages: Vec::new(),
             streaming: false,
             turn_baseline: 0,
@@ -369,19 +369,48 @@ impl App {
         }
     }
 
-    /// Restore SynapsCLI's TUI after casino (or failed spawn).
-    /// Convert char-based cursor_pos to byte offset in self.input.
-    pub(crate) fn cursor_byte_pos(&self) -> usize {
-        self.input
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
+    // ── Editor accessors (hybrid plan §3.1) ────────────────────────────────
+    // The editor is the sole input-buffer state; these accessors are the only
+    // way in/out. The render path materializes one flat `(text, cursor)` pair
+    // per frame in `ViewInputs::from_app`.
+
+    /// Flat input text — editor lines joined by `\n`.
+    pub(crate) fn input_text(&self) -> String {
+        self.editor.lines().join("\n")
     }
 
-    /// Number of chars in self.input (for bounds checking cursor_pos).
-    pub(crate) fn input_char_count(&self) -> usize {
-        self.input.chars().count()
+    /// First line of the buffer, borrowed — for cheap hot-path guards that
+    /// only care about the line a slash command lives on (`/`-detection).
+    pub(crate) fn input_first_line(&self) -> &str {
+        self.editor.lines().first().map_or("", |s| s.as_str())
+    }
+
+    /// True when the input buffer contains no text at all.
+    pub(crate) fn input_is_empty(&self) -> bool {
+        let lines = self.editor.lines();
+        lines.len() <= 1 && lines.first().map_or(true, |l| l.is_empty())
+    }
+
+    /// Flat **char** index of the editor cursor within `input_text()`.
+    pub(crate) fn cursor_char_pos(&self) -> usize {
+        flat_cursor_pos(self.editor.lines(), self.editor.cursor())
+    }
+
+    /// Replace the whole buffer, cursor moved to the end of the text.
+    pub(crate) fn set_input_text(&mut self, s: &str) {
+        self.editor = tui_textarea::TextArea::from(s.split('\n'));
+        self.editor.move_cursor(tui_textarea::CursorMove::Bottom);
+        self.editor.move_cursor(tui_textarea::CursorMove::End);
+    }
+
+    /// Clear the whole buffer (today's Ctrl-U semantics — plan §3.2 note).
+    pub(crate) fn clear_input(&mut self) {
+        self.editor = tui_textarea::TextArea::default();
+    }
+
+    /// Insert text at the cursor (paste, sidecar transcription, tab-complete).
+    pub(crate) fn insert_at_cursor(&mut self, s: &str) {
+        self.editor.insert_str(s);
     }
 
     /// Calculate the number of visual lines the input needs, given an inner width.
@@ -619,7 +648,7 @@ impl App {
         }
         match self.history_index {
             None => {
-                self.input_stash = self.input.clone();
+                self.input_stash = self.input_text();
                 self.history_index = Some(self.input_history.len() - 1);
             }
             Some(i) if i > 0 => {
@@ -628,8 +657,9 @@ impl App {
             _ => return,
         }
         if let Some(idx) = self.history_index {
-            self.input = self.input_history[idx].clone();
-            self.cursor_pos = self.input.chars().count();
+            let text = self.input_history[idx].clone();
+            // set_input_text rebuilds the editor with the cursor at the end.
+            self.set_input_text(&text);
         }
     }
 
@@ -637,13 +667,13 @@ impl App {
         if let Some(i) = self.history_index {
             if i + 1 < self.input_history.len() {
                 self.history_index = Some(i + 1);
-                self.input = self.input_history[i + 1].clone();
+                let text = self.input_history[i + 1].clone();
+                self.set_input_text(&text);
             } else {
                 self.history_index = None;
-                self.input = self.input_stash.clone();
-                self.input_stash.clear();
+                let stash = std::mem::take(&mut self.input_stash);
+                self.set_input_text(&stash);
             }
-            self.cursor_pos = self.input.chars().count();
         }
     }
 
@@ -758,6 +788,19 @@ impl App {
     pub(crate) fn render_lines(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
         self.transcript.render_lines(width, &self.render_ctx())
     }
+}
+
+/// Map the editor's `(row, col)` char-wise cursor to a flat char index into
+/// `lines.join("\n")` — the only new math in the hybrid design (plan §3.1):
+/// `sum(chars(lines[..row]) + 1) + col`, the `+ 1` counting each `\n`.
+/// `col` is clamped to the row's char count defensively.
+pub(crate) fn flat_cursor_pos(lines: &[String], (row, col): (usize, usize)) -> usize {
+    let mut flat = 0;
+    for line in lines.iter().take(row) {
+        flat += line.chars().count() + 1; // +1 for the joining '\n'
+    }
+    let row_chars = lines.get(row).map_or(0, |l| l.chars().count());
+    flat + col.min(row_chars)
 }
 
 #[cfg(test)]
@@ -1863,5 +1906,88 @@ mod tests {
             expected_flat.len(),
             "cum_heights total must track the reference render after insert + incremental rebuild"
         );
+    }
+
+    // ── flat_cursor_pos (hybrid plan §3.1 helper) ──────────────────────────
+
+    fn lines_of(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flat_cursor_empty_buffer() {
+        assert_eq!(flat_cursor_pos(&lines_of(&[""]), (0, 0)), 0);
+        // Truly empty slice must not panic either.
+        assert_eq!(flat_cursor_pos(&[], (0, 0)), 0);
+    }
+
+    #[test]
+    fn flat_cursor_single_line() {
+        let lines = lines_of(&["hello"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 0)), 0);
+        assert_eq!(flat_cursor_pos(&lines, (0, 3)), 3);
+        assert_eq!(flat_cursor_pos(&lines, (0, 5)), 5); // at end
+    }
+
+    #[test]
+    fn flat_cursor_multi_line() {
+        // "ab\ncde\nf" — flat chars: a=0 b=1 \n=2 c=3 d=4 e=5 \n=6 f=7
+        let lines = lines_of(&["ab", "cde", "f"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 2)), 2); // end of line 0
+        assert_eq!(flat_cursor_pos(&lines, (1, 0)), 3); // just after first \n
+        assert_eq!(flat_cursor_pos(&lines, (1, 2)), 5);
+        assert_eq!(flat_cursor_pos(&lines, (2, 0)), 7); // after second \n
+        assert_eq!(flat_cursor_pos(&lines, (2, 1)), 8); // end of buffer
+    }
+
+    #[test]
+    fn flat_cursor_wide_chars() {
+        // Char-wise, not width-wise: CJK and emoji count 1 each.
+        let lines = lines_of(&["日本語", "a👍b"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 2)), 2);
+        assert_eq!(flat_cursor_pos(&lines, (0, 3)), 3); // end of CJK line
+        assert_eq!(flat_cursor_pos(&lines, (1, 0)), 4);
+        assert_eq!(flat_cursor_pos(&lines, (1, 2)), 6); // after the emoji
+        assert_eq!(flat_cursor_pos(&lines, (1, 3)), 7); // end
+    }
+
+    #[test]
+    fn flat_cursor_clamps_out_of_range_col() {
+        let lines = lines_of(&["ab", "cd"]);
+        assert_eq!(flat_cursor_pos(&lines, (0, 99)), 2);
+        assert_eq!(flat_cursor_pos(&lines, (1, 99)), 5);
+    }
+
+    #[test]
+    fn accessors_round_trip() {
+        let mut app = test_app();
+        assert!(app.input_is_empty());
+        assert_eq!(app.cursor_char_pos(), 0);
+
+        app.set_input_text("hello\nworld");
+        assert_eq!(app.input_text(), "hello\nworld");
+        assert!(!app.input_is_empty());
+        // set_input_text puts the cursor at the very end.
+        assert_eq!(app.cursor_char_pos(), 11);
+        assert_eq!(app.input_first_line(), "hello");
+
+        app.insert_at_cursor("!");
+        assert_eq!(app.input_text(), "hello\nworld!");
+        assert_eq!(app.cursor_char_pos(), 12);
+
+        app.clear_input();
+        assert!(app.input_is_empty());
+        assert_eq!(app.input_text(), "");
+        assert_eq!(app.cursor_char_pos(), 0);
+        assert_eq!(app.input_first_line(), "");
+    }
+
+    #[test]
+    fn editor_cursor_matches_flat_pos_after_typing() {
+        let mut app = test_app();
+        app.set_input_text("日本\nab");
+        // cursor at end: row 1 col 2 → flat 3 (line0) + 2
+        assert_eq!(app.editor.cursor(), (1, 2));
+        assert_eq!(app.cursor_char_pos(), 5);
     }
 }
