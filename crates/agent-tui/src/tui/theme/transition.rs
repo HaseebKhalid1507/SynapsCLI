@@ -42,9 +42,11 @@ use super::Theme;
 /// Same pattern as `theme::BACKGROUND_OPAQUE`: read config once at first use,
 /// mutate live from the settings modal via [`set_transition_mode`].
 static TRANSITION_DEFAULT_MS: LazyLock<AtomicU64> = LazyLock::new(|| {
-    synaps_cli::config::load_config()
-        .theme_transition
-        .duration_ms()
+    AtomicU64::new(
+        synaps_cli::config::load_config()
+            .theme_transition
+            .duration_ms(),
+    )
 });
 
 /// Live-apply a new `theme_transition` mode (settings modal hot path).
