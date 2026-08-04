@@ -658,6 +658,17 @@ pub(crate) async fn handle_animation_tick(
         app.request_redraw();
     }
     app.secret_prompts.poll_requests(secret_prompt_rx);
+    // Animated theme cross-fade: advance the active transition one frame
+    // through the SAME set_theme path every other apply uses. On landing,
+    // transition::advance clears app.theme_transition and hands back the
+    // byte-exact target — so the tick GUARD's `theme_transition.is_some()`
+    // term goes false and this arm stops firing (no permanent-60fps leak).
+    if let Some(frame) =
+        theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
+    {
+        theme::set_theme(frame);
+        app.invalidate();
+    }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
     // queue's is_active() so SecretPrompt is pushed/popped (§5).
@@ -819,4 +830,57 @@ pub(crate) async fn handle_animation_tick(
         return true;
     }
     false
+}
+
+/// Live-MXC (myx theme) boot: start the subscriber iff the configured theme
+/// is "myx". Later /theme switches reconcile via `App::sync_myx_live`.
+pub(crate) fn boot_myx_live(app: &mut App) {
+    if theme::configured_theme_name().as_deref() == Some("myx") {
+        app.sync_myx_live("myx");
+    }
+}
+
+/// Live-MXC arm body: apply a palette on the UI thread through the exact
+/// `set_theme` + `invalidate` path `/theme` uses — animated, honoring the
+/// wire's advisory `fade_ms` (clamped to 0..=2000ms; 0 = intentional snap;
+/// absent = the configured `theme_transition` default). The subscriber task
+/// only ever sends; it never touches theme state. Rapid track changes
+/// retarget the in-flight fade from its current frame — never queued,
+/// never a jump.
+pub(crate) fn handle_myx_theme_arm(app: &mut App, msg: (theme::Theme, Option<u64>)) {
+    let (palette, fade_ms) = msg;
+    // RECEIVE-SIDE GUARD: the unbounded channel outlives the subscriber
+    // task, and `UnboundedSender::send` is synchronous — `abort()` cannot
+    // un-send an already-queued palette. So a palette can arrive AFTER the
+    // user switched away from myx and must not clobber the freshly chosen
+    // theme. `myx_task` is `Some` exactly while the active theme is "myx"
+    // (`sync_myx_live` is the single writer, on this thread, on every
+    // persisted theme-apply path): its absence means drop the message.
+    if app.myx_task.is_none() {
+        return;
+    }
+    // Always remember the freshest live palette — re-applying "myx"
+    // statically (/theme myx again, settings Esc-revert) restores this via
+    // `App::resolve_apply_theme` instead of stranding on the snapshot.
+    app.myx_last_live = Some(palette.clone());
+    // A settings theme PREVIEW owns the screen: a live palette must not
+    // clobber the browse mid-preview. The cache above holds it; every
+    // preview exit path (Enter-apply, Esc-revert) resolves through it.
+    if app
+        .settings
+        .as_ref()
+        .is_some_and(|st| st.original_theme_name.is_some())
+    {
+        return;
+    }
+    app.apply_theme_animated(palette, theme::transition::wire_fade_duration(fade_ms));
+}
+
+/// Live-MXC teardown: after this the app is tearing down and no background
+/// task may write into it. `abort()` is safe mid-await — the task holds no
+/// locks and owns no external state; queued palettes die with the receiver.
+pub(crate) fn abort_myx_live(app: &mut App) {
+    if let Some(h) = app.myx_task.take() {
+        h.abort();
+    }
 }

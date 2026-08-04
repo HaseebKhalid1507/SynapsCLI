@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use super::app::{App, ChatMessage};
 use super::settings;
-use super::theme;
 
 /// Decide whether to repaint on this event-loop iteration.
 ///
@@ -62,15 +61,16 @@ pub(super) fn apply_setting(
 
     match synaps_cli::config::write_config_value(key, value) {
         Ok(()) => {
+            if key == "theme" {
+                // Same apply as /theme: animated cross-fade PLUS the
+                // live-MXC subscriber reconcile (spawn on "myx", abort on
+                // switch-away). Skipping sync_myx_live here leaked the
+                // subscriber forever — album colors re-stomped the chosen
+                // theme on every track change (shady F2 / okarin F1).
+                app.apply_theme_from_settings(value);
+            }
             if let Some(st) = app.settings.as_mut() {
-                if key == "theme" {
-                    if let Some(t) = theme::load_theme_by_name(value) {
-                        theme::set_theme(t);
-                    }
-                    st.row_error = None;
-                } else {
-                    st.row_error = None;
-                }
+                st.row_error = None;
                 st.edit_mode = None;
             }
         }

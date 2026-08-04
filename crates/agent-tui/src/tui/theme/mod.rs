@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+pub(crate) mod mxc;
 mod palettes;
+pub(crate) mod transition;
 
 /// Identifies a piece of high-value modal chrome for per-part style
 /// resolution. Each variant maps to an optional `<modal>.border` /
@@ -24,6 +26,7 @@ pub(crate) enum ModalKind {
 /// Field names are what the theme file uses as keys. Unknown keys are
 /// ignored; missing keys keep the default. Colors are written as `#rrggbb`
 /// or `#rgb` hex.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Theme {
     // Markdown
     pub(crate) code_fg: Color,
@@ -227,6 +230,7 @@ impl Theme {
             "nord" => Some(Self::nord()),
             "dracula" => Some(Self::dracula()),
             "monokai" => Some(Self::monokai()),
+            "myx" => Some(Self::myx()),
             "gruvbox" => Some(Self::gruvbox()),
             "catppuccin" => Some(Self::catppuccin()),
             "tokyo-night" => Some(Self::tokyo_night()),
@@ -489,6 +493,18 @@ pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
     Theme::builtin(name)
 }
 
+/// The `theme = <name>` value from config, if any. Used at boot to decide
+/// whether the live-MXC subscriber should start alongside the "myx" theme.
+/// (A `~/.synaps-cli/theme` override file wins over this for *colors*, same
+/// as `load_theme_from_config` — this only reports the configured name.)
+///
+/// Routed through the real config loader (shady F6): a second hand-rolled
+/// parser drifted on lines like `theme = "myx" # comment`, silently keeping
+/// the boot subscriber off while the color loader still resolved myx.
+pub(crate) fn configured_theme_name() -> Option<String> {
+    synaps_cli::config::load_config().theme
+}
+
 /// Whether the root TUI paints an opaque canvas. `false` preserves the exact
 /// legacy 0.7.0 layout behavior outside individual widgets.
 pub(crate) static BACKGROUND_OPAQUE: LazyLock<AtomicBool> =
@@ -603,8 +619,8 @@ mod theme_tests {
         // Every built-in palette, with no part overrides, must resolve each
         // part to its base token — the "zero regression across 18 palettes"
         // guarantee, asserted directly against the resolvers.
-        // The 18 named palettes plus the built-in `default` (19 total).
-        const NAMES: [&str; 19] = [
+        // The 19 named palettes plus the built-in `default` (20 total).
+        const NAMES: [&str; 20] = [
             "default",
             "night-city",
             "neon-rain",
@@ -617,6 +633,7 @@ mod theme_tests {
             "nord",
             "dracula",
             "monokai",
+            "myx",
             "gruvbox",
             "catppuccin",
             "tokyo-night",
@@ -805,6 +822,7 @@ mod message_canvas_tests {
         "nord",
         "dracula",
         "monokai",
+        "myx",
         "gruvbox",
         "catppuccin",
         "tokyo-night",
@@ -905,7 +923,14 @@ mod message_canvas_tests {
                 f64::from(hi - lo) / f64::from(hi)
             }
         }
-        for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
+        // "myx" is exempt: its bg and canvas are BOTH verbatim Myx-designed
+        // surfaces (library panel + background), not a derived recess — this
+        // guard exists for derivation drift, and Myx's own hierarchy sits at
+        // 84% saturation retention by design.
+        for name in BUILTINS
+            .iter()
+            .filter(|n| !FLUSH.contains(n) && **n != "myx")
+        {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
             let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
             let base = saturation(bg);

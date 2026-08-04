@@ -219,6 +219,52 @@ impl CacheTtl {
     }
 }
 
+/// Animated theme-transition mode, parsed from `theme_transition`:
+/// - `"on"` (default): cross-fade theme changes over the default 350 ms.
+/// - `"off"`: instant snap — accessibility, and mercy on tmux-over-ssh.
+/// - integer milliseconds: cross-fade over that duration (clamped to
+///   0–2000 ms; `0` behaves like `off`).
+///
+/// Purely a TUI presentation knob: it changes *how* a new palette is
+/// applied, never *which* palette wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeTransitionMode {
+    #[default]
+    On,
+    Off,
+    Ms(u64),
+}
+
+impl ThemeTransitionMode {
+    /// Default cross-fade duration for `On` (and the fallback when a live
+    /// palette update carries no advisory duration of its own).
+    pub const DEFAULT_MS: u64 = 350;
+    /// Duration ceiling — both this knob and MXC wire `fade_ms` clamp here.
+    pub const MAX_MS: u64 = 2000;
+
+    /// Parse a config value (case-insensitive). Returns `None` for unknown
+    /// values so the caller can warn and fall back to the default.
+    pub fn parse(val: &str) -> Option<ThemeTransitionMode> {
+        match val.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Some(ThemeTransitionMode::On),
+            "off" | "false" | "no" => Some(ThemeTransitionMode::Off),
+            other => other
+                .parse::<u64>()
+                .ok()
+                .map(|ms| ThemeTransitionMode::Ms(ms.min(Self::MAX_MS))),
+        }
+    }
+
+    /// Effective default duration in milliseconds; `0` means "snap".
+    pub fn duration_ms(self) -> u64 {
+        match self {
+            ThemeTransitionMode::On => Self::DEFAULT_MS,
+            ThemeTransitionMode::Off => 0,
+            ThemeTransitionMode::Ms(ms) => ms.min(Self::MAX_MS),
+        }
+    }
+}
+
 /// Runtime event routing configuration parsed from `events.*` keys.
 ///
 /// Controls how runtime events (from the `EventQueue`) are delivered in
@@ -490,6 +536,9 @@ pub struct SynapsConfig {
     /// Default: 3. Range 1–20.
     pub scroll_lines: Option<u16>,
     pub theme: Option<String>,
+    /// Animated theme transitions: `"on"` (350 ms cross-fade, default),
+    /// `"off"` (instant snap), or integer milliseconds (0–2000).
+    pub theme_transition: ThemeTransitionMode,
     /// Whether the TUI paints its own opaque background. `false` preserves the terminal background.
     pub tui_background_opaque: bool,
     pub agent_name: Option<String>,
@@ -548,6 +597,7 @@ impl Default for SynapsConfig {
             max_fps: 60,
             scroll_lines: None,
             theme: None,
+            theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
             agent_name: None,
             identity: None,
@@ -589,6 +639,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "max_fps",
     "scroll_lines",
     "theme",
+    "theme_transition",
     "tui_background_opaque",
     "agent_name",
     "identity",
@@ -995,6 +1046,12 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     .push(format!("scroll_lines = {val} — not a number; ignoring")),
             },
             "theme" => config.theme = Some(val.to_string()),
+            "theme_transition" => match ThemeTransitionMode::parse(val) {
+                Some(mode) => config.theme_transition = mode,
+                None => config.warnings.push(format!(
+                    "theme_transition = {val} — expected on, off, or milliseconds (0–2000); using on"
+                )),
+            },
             "tui_background_opaque" => match val {
                 "true" | "1" | "on" | "yes" | "opaque" => config.tui_background_opaque = true,
                 "false" | "0" | "off" | "no" | "invisible" => config.tui_background_opaque = false,
@@ -1496,6 +1553,59 @@ mod tests {
     #[test]
     fn test_max_fps_default_is_60() {
         assert_eq!(SynapsConfig::default().max_fps, 60);
+    }
+
+    // ── theme_transition parse table (animated theme transitions) ──
+
+    #[test]
+    fn test_theme_transition_parse_table() {
+        use ThemeTransitionMode as M;
+        assert_eq!(M::parse("on"), Some(M::On));
+        assert_eq!(M::parse("ON"), Some(M::On));
+        assert_eq!(M::parse("off"), Some(M::Off));
+        assert_eq!(M::parse("Off"), Some(M::Off));
+        // integer ms, clamped to 0..=2000
+        assert_eq!(M::parse("500"), Some(M::Ms(500)));
+        assert_eq!(M::parse("0"), Some(M::Ms(0)));
+        assert_eq!(M::parse("2000"), Some(M::Ms(2000)));
+        assert_eq!(M::parse("99999"), Some(M::Ms(2000)), "clamped to MAX_MS");
+        // garbage → None (caller warns + keeps default)
+        assert_eq!(M::parse("fast"), None);
+        assert_eq!(M::parse(""), None);
+        assert_eq!(M::parse("-5"), None);
+        assert_eq!(M::parse("1.5"), None);
+    }
+
+    #[test]
+    fn test_theme_transition_duration_ms() {
+        use ThemeTransitionMode as M;
+        assert_eq!(M::On.duration_ms(), M::DEFAULT_MS);
+        assert_eq!(M::DEFAULT_MS, 350);
+        assert_eq!(M::Off.duration_ms(), 0);
+        assert_eq!(M::Ms(120).duration_ms(), 120);
+        assert_eq!(M::Ms(0).duration_ms(), 0, "0 ms behaves like off");
+        assert_eq!(M::Ms(u64::MAX).duration_ms(), M::MAX_MS);
+    }
+
+    #[test]
+    fn test_theme_transition_config_key_parses_and_defaults() {
+        use ThemeTransitionMode as M;
+        assert_eq!(SynapsConfig::default().theme_transition, M::On);
+        assert_eq!(
+            super::load_config_from_str("theme_transition = off\n").theme_transition,
+            M::Off
+        );
+        assert_eq!(
+            super::load_config_from_str("theme_transition = 750\n").theme_transition,
+            M::Ms(750)
+        );
+        let bad = super::load_config_from_str("theme_transition = warp\n");
+        assert_eq!(bad.theme_transition, M::On, "bad value keeps default");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("theme_transition")),
+            "{:?}",
+            bad.warnings
+        );
     }
 
     #[test]

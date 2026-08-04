@@ -100,8 +100,14 @@ pub async fn run(
         mut boot_fx_sent,
         mut exit_fx_sent,
         mut last_draw,
-    } = run_setup::run_setup(continue_session, system, prompt_manifest, profile, no_extensions)
-        .await?;
+    } = run_setup::run_setup(
+        continue_session,
+        system,
+        prompt_manifest,
+        profile,
+        no_extensions,
+    )
+    .await?;
     // P16.1+P16.2: terminal capabilities — env detection merged with the
     // DA1-fenced query burst run inside run_setup() (after raw-mode enable,
     // BEFORE the EventStream above was created; see run_setup.rs). Still
@@ -112,6 +118,8 @@ pub async fn run(
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.
     let mut event_reader = Some(event_reader);
+    // Live-MXC layer (myx theme): boot the subscriber when configured.
+    loop_arms::boot_myx_live(&mut app);
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     loop {
@@ -212,6 +220,11 @@ pub async fn run(
                 loop_arms::handle_widget_arm(&mut app, widget_event);
             }
 
+            // ── Live MXC palettes (myx theme) — UI-thread apply, same path as /theme ──
+            Some(myx_theme) = app.myx_theme_rx.recv() => {
+                loop_arms::handle_myx_theme_arm(&mut app, myx_theme);
+            }
+
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
             sidecar_event = async {
                 if app.sidecars.is_empty() {
@@ -248,7 +261,7 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
                 if loop_arms::handle_animation_tick(
                     &mut app, &runtime, &config, &registry, &render_handle,
                     &secret_prompt_rx, &boot_done, &exit_done,
@@ -335,6 +348,9 @@ pub async fn run(
             }
         }
     }
+
+    // Stop the live-MXC subscriber FIRST — no background task writes past here.
+    loop_arms::abort_myx_live(&mut app);
 
     // ── PART 2: Bounded teardown — two sequential budgets.
     //

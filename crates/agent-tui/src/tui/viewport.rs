@@ -358,7 +358,10 @@ mod scrub_gate_tests {
         );
         // Ordering: the SetBackgroundColor must appear BEFORE any blank space.
         let sgr_pos = s.find("\x1b[48;2;23;24;37m").expect("sgr present");
-        let first_space = bytes.iter().position(|&b| b == b' ').expect("space present");
+        let first_space = bytes
+            .iter()
+            .position(|&b| b == b' ')
+            .expect("space present");
         assert!(
             sgr_pos < first_space,
             "SetBackgroundColor must come before the first blank space so the \
