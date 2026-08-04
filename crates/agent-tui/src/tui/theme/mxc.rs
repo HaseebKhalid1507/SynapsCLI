@@ -149,7 +149,11 @@ pub(crate) fn parse_hex(s: &str) -> Option<Rgb8> {
         return None;
     }
     let n = u32::from_str_radix(body, 16).ok()?;
-    Some((((n >> 16) & 0xff) as u8, ((n >> 8) & 0xff) as u8, (n & 0xff) as u8))
+    Some((
+        ((n >> 16) & 0xff) as u8,
+        ((n >> 8) & 0xff) as u8,
+        (n & 0xff) as u8,
+    ))
 }
 
 /// Classify and decode one NDJSON line (spec §3, §5.3).
