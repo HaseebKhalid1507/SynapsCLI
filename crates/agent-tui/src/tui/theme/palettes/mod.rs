@@ -7,6 +7,7 @@ mod gruvbox;
 mod ice;
 mod lavender;
 mod monokai;
+mod myx;
 mod neon_rain;
 mod night_city;
 mod nord;

@@ -228,6 +228,7 @@ impl Theme {
             "nord" => Some(Self::nord()),
             "dracula" => Some(Self::dracula()),
             "monokai" => Some(Self::monokai()),
+            "myx" => Some(Self::myx()),
             "gruvbox" => Some(Self::gruvbox()),
             "catppuccin" => Some(Self::catppuccin()),
             "tokyo-night" => Some(Self::tokyo_night()),
@@ -604,8 +605,8 @@ mod theme_tests {
         // Every built-in palette, with no part overrides, must resolve each
         // part to its base token — the "zero regression across 18 palettes"
         // guarantee, asserted directly against the resolvers.
-        // The 18 named palettes plus the built-in `default` (19 total).
-        const NAMES: [&str; 19] = [
+        // The 19 named palettes plus the built-in `default` (20 total).
+        const NAMES: [&str; 20] = [
             "default",
             "night-city",
             "neon-rain",
@@ -618,6 +619,7 @@ mod theme_tests {
             "nord",
             "dracula",
             "monokai",
+            "myx",
             "gruvbox",
             "catppuccin",
             "tokyo-night",
@@ -806,6 +808,7 @@ mod message_canvas_tests {
         "nord",
         "dracula",
         "monokai",
+        "myx",
         "gruvbox",
         "catppuccin",
         "tokyo-night",

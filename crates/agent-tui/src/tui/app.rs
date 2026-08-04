@@ -707,6 +707,7 @@ impl App {
             ("nord", "arctic frost blues"),
             ("dracula", "purple/pink/cyan vibrant"),
             ("monokai", "classic orange/pink/green"),
+            ("myx", "album-reactive colors via Myx (MXC)"),
             ("gruvbox", "warm earthy tones"),
             ("catppuccin", "soft pastels, cozy dark"),
             ("tokyo-night", "dark blue-purple, soft accents"),
@@ -719,6 +720,20 @@ impl App {
         if arg.is_empty() {
             self.push_msg(ChatMessage::System("Available themes:".to_string()));
             for (name, desc) in descriptions {
+                // Soft detection annotation for the live theme: "myx" always
+                // works (static fallback), but say whether Myx is around.
+                if *name == "myx" {
+                    let status = if super::theme::mxc::myx_detected() {
+                        "live"
+                    } else {
+                        "static — myx not detected"
+                    };
+                    self.push_msg(ChatMessage::System(format!(
+                        "  {:<15} — {} [{}]",
+                        name, desc, status
+                    )));
+                    continue;
+                }
                 self.push_msg(ChatMessage::System(format!("  {:<15} — {}", name, desc)));
             }
             let themes_dir = synaps_cli::config::base_dir().join("themes");
