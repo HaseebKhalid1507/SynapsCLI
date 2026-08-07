@@ -20,7 +20,6 @@
 
 ---
 
-<!-- TODO: replace with the hero demo GIF (see task #115): single strong view, high contrast, app not shell -->
 <p align="center">
   <img src="https://github.com/user-attachments/assets/8e0ae020-cf63-4547-b769-782625cbd1f6" alt="SynapsCLI — a crew of agents running in parallel" width="900" />
 </p>
@@ -181,7 +180,7 @@ cargo build && cargo test
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome, the maintainer answers fast.
 
-Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) — questions, ideas, show-and-tell, or just to watch the crew run.
+Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) - questions, ideas, show-and-tell, or just to watch the crew run.
 
 ---
 
