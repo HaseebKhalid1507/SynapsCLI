@@ -66,12 +66,6 @@ synaps login          # OAuth, cloud credentials, provider keys, or local Ollama
 synaps                # launch the TUI
 ```
 
-Headless, same engine, for scripts and CI:
-
-```bash
-echo "summarize the git diff" | synaps chat
-```
-
 ### Sign in with what you already pay for, use cloud identity, or run locally
 
 ```bash
