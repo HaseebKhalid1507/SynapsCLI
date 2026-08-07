@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
+  <img src="https://github.com/user-attachments/assets/30332bb2-2ea0-4d53-9b59-97db77878d38" alt="SynapsCLI" width="100%" />
 </p>
 
 <h3 align="center">Lightning fast terminal-native agent runtime</h3>
