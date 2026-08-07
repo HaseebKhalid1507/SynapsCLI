@@ -116,16 +116,16 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 | Command | What it does |
 |---------|-------------|
-| `synaps` | Interactive TUI: streaming, markdown, syntax highlighting, subagent panel |
-| `synaps chat` | Headless, same engine, stdin/stdout. Scripts, pipes, CI |
+| `synaps` | The TUI. Streaming, markdown, a live subagent panel |
+| `synaps chat` | Same engine, stdin/stdout. Pipes, scripts, CI |
+| `synaps rpc` | JSON-RPC over stdio. Embed the engine in other software |
 | `synaps server` | WebSocket API: token auth, origin validation, streaming |
-| `synaps rpc` | Line-JSON IPC for bridges (Slack, Discord) |
-| `synaps watcher` | Supervisor daemon for autonomous agent fleets |
-| `synaps auth-broker` | Credential broker for multi-machine shared auth |
+| `synaps watcher` | Supervisor for unattended fleets: heartbeats, restarts, cost limits |
+| `synaps auth-broker` | One credential, many machines. Short-lived tokens over TLS |
 
 ## Configuration
 
-No YAML. No TOML. No JSON. Just `key = value` in `~/.synaps-cli/config`:
+One file, `key = value`, at `~/.synaps-cli/config`:
 
 ```ini
 model = anthropic/claude-sonnet-4-6
@@ -154,7 +154,7 @@ Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot:
 └── main.py | index.js | <any>    # JSON-RPC 2.0 over stdio, any language
 ```
 
-Extensions are separate processes, not linked code, so they're language-agnostic, crash-isolated, and sandboxed. Hook `before_tool_call`, `before_message`, `on_session_start`, and 4 more.
+Extensions are separate processes speaking JSON-RPC over stdio: any language, crash-isolated, with a permissions manifest gating what each one can touch. Seven lifecycle hooks, from `before_tool_call` to `on_session_end`.
 
 Protocol spec: [docs/extensions/](docs/extensions/).
 
