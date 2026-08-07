@@ -102,22 +102,15 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 ## What's in the box
 
-- **🎭 Named agents.** Crew members with roles. Dispatch by name, watch them think in a live panel.
-- **🔄 Steer them mid-flight.** Dispatch, poll, steer, inspect, collect, and explicitly reconcile. Redirect an agent while it is still working; bounded tombstones preserve the collection path after finished-worker cleanup.
-- **🔐 Brokered provider identity.** Typed OAuth, cloud, and API-key identities survive login, model selection, routing, and status without stripping the provider. Long-lived credentials remain inside the broker boundary.
-- **🧩 Policy-driven orchestration.** Exact model identities, typed roles, write scopes, concurrency limits, and lifecycle gates authorize workers before credentials, network, billing, threads, or worker state.
-- **⚙️ Exact reasoning controls.** `/settings` and `/effort` expose only modes supported by the active provider-qualified model, including distinct Codex `xhigh`/`max`/`ultra` and Claude Fable 5 `max`/`ultracode` semantics.
-- **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **🌐 Native and cloud model transports.** Claude, ChatGPT/Codex, Grok/xAI, GitHub Copilot, Gemini Code Assist, Kimi (Moonshot AI), Azure OpenAI, Amazon Bedrock, and Google Vertex AI, plus OpenAI-compatible providers such as Groq, Cerebras, NVIDIA NIM, OpenRouter, or local Ollama. Provider and account support varies; unsupported routes fail closed.
-- **🧠 Continuous memory.** Project-scoped persistent memory with sensitivity classes. Context, decisions, and entities survive across sessions automatically.
-- **💰 Per-turn budgets.** Tool calls, wall clock, provider rounds, output tokens, result bytes, and cost — all bounded and logged per turn.
-- **📡 Event bus.** Any script, cron, or service can poke a running session and the agent reacts in real time.
-- **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days. Continuous memory persists across projects.
-- **🤖 Autonomous mode.** `synaps watcher` runs a fleet with heartbeats, crash recovery, cost limits, and session handoff.
-- **⚡ Fast and lean.** ~210K lines of Rust, one 20MB binary, ~2ms cold start, zero runtime deps.
-- **🎨 19 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
-
----
+- 🎭 **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
+- 🤖 **Runs without you.** `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
+- 🔐 **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held.
+- 💰 **Bounded turns.** Caps on tool calls, wall clock, tokens, bytes, and cost. An agent can't spend what you didn't give it.
+- 🧠 **Memory that survives.** Project-scoped memory, `/compact` checkpoints, sessions that chain across days.
+- 🌐 **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
+- 🧩 **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
+- ⚡ **Lean is fast.** One 20MB binary, 20ms cold start. No framework tax, no interpreter warming up.
+- 🎨 **19 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 ## Modes
 
