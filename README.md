@@ -55,6 +55,8 @@ cargo build --release && ./target/release/synaps
 ```
 </details>
 
+Linux and macOS. Windows is not supported.
+
 *New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
 
 ---
@@ -170,7 +172,7 @@ Protocol spec: [docs/extensions/](docs/extensions/).
 
 ## Contributing
 
-Synaps is young (started April 2026) and moving fast: 1,900+ commits in its first 3 months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+Synaps is young (started April 2026) and moving fast: 1,995 commits and ~190K lines of Rust in its first four months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
