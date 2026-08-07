@@ -100,6 +100,14 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 ---
 
+## Why Synaps
+
+- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
+- **Own your agent.** The system prompt is a file on disk. The tool list is opt-out. Your turns are yours; nothing phones home.
+- **Multi-agent is the default.** Single-agent is just n=1.
+- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
+- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
+
 ## What's in the box
 
 - **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
@@ -175,15 +183,7 @@ Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) — que
 
 ---
 
-## Philosophy
-
-- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
-- **Multi-agent is the default.** Single-agent is just n=1.
-- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
-- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
-
-<details>
-<summary><b>Architecture</b></summary>
+## Architecture
 
 ```
 crates/
@@ -194,7 +194,6 @@ crates/
 └── (root)           # the `synaps` binary crate: CLI dispatch, login, watcher, broker
 ```
 Native Anthropic, OpenAI Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the same `StreamEvent`, so the TUI and tool loop stay provider-blind. Provider-qualified identities and pre-authorized execution plans remain typed through routing.
-</details>
 
 ---
 
