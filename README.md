@@ -2,7 +2,7 @@
   <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
 </p>
 
-<h3 align="center">Lightning fast terminal native agent harness</h3>
+<h3 align="center">Lightning fast terminal-native agent runtime</h3>
 
 <p align="center">
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
@@ -15,7 +15,7 @@
 
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 20MB, 2ms boot.
+  Any model, 20MB, 20ms cold start.
 </p>
 
 ---
