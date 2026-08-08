@@ -13,6 +13,8 @@
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
+
+
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
   Any model, 20MB, 20ms cold start.
@@ -21,7 +23,7 @@
 ---
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/8e0ae020-cf63-4547-b769-782625cbd1f6" alt="SynapsCLI — a crew of agents running in parallel" width="900" />
+  <img src="https://github.com/user-attachments/assets/c8a444e6-6975-474a-bc87-f02e744975ed" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
 </p>
 
 Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. The terminal UI is one client of the engine: `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive it. Extend it with plugins in any language and MCP servers.
