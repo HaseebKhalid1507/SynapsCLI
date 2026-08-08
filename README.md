@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
+  <img src="https://github.com/user-attachments/assets/30332bb2-2ea0-4d53-9b59-97db77878d38" alt="SynapsCLI" width="100%" />
 </p>
 
-<h3 align="center">Lightning fast terminal native agent harness</h3>
+<h3 align="center">Lightning fast terminal-native agent runtime</h3>
 
 <p align="center">
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
@@ -13,19 +13,20 @@
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
+
+
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 20MB, 2ms boot.
+  Any model, 20MB, 20ms cold start.
 </p>
 
 ---
 
-<!-- TODO: replace with the hero demo GIF (see task #115): single strong view, high contrast, app not shell -->
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/8e0ae020-cf63-4547-b769-782625cbd1f6" alt="SynapsCLI — a crew of agents running in parallel" width="900" />
+  <img src="https://github.com/user-attachments/assets/c8a444e6-6975-474a-bc87-f02e744975ed" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
 </p>
 
-Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agents with built-in tools, subagents, and extensions, and works with any model, from Claude and ChatGPT to a local Ollama. Run it as a TUI, headless in CI, a server, or a daemon. Extend it with plugins in any language, MCP, and an event bus, and adapt it to your workflow instead of the other way around.
+Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. The terminal UI is one client of the engine: `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive it. Extend it with plugins in any language and MCP servers.
 
 ---
 
@@ -64,6 +65,8 @@ cargo build --release && ./target/release/synaps
 ```
 </details>
 
+Linux and macOS. Windows is not supported.
+
 *New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
 
 ---
@@ -73,12 +76,6 @@ cargo build --release && ./target/release/synaps
 ```bash
 synaps login          # OAuth, cloud credentials, provider keys, or local Ollama
 synaps                # launch the TUI
-```
-
-Headless, same engine, for scripts and CI:
-
-```bash
-echo "summarize the git diff" | synaps chat
 ```
 
 ### Sign in with what you already pay for, use cloud identity, or run locally
@@ -115,39 +112,40 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 ---
 
+## Why Synaps
+
+- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
+- **Own your agent.** The system prompt is a file on disk. The tool list is opt-out. Your turns are yours; nothing phones home.
+- **Multi-agent is the default.** Single-agent is just n=1.
+- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
+- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
+
 ## What's in the box
 
-- **🎭 Named agents.** Crew members with roles. Dispatch by name, watch them think in a live panel.
-- **🔄 Steer them mid-flight.** Dispatch, poll, steer, inspect, collect, and explicitly reconcile. Redirect an agent while it is still working; bounded tombstones preserve the collection path after finished-worker cleanup.
-- **🔐 Brokered provider identity.** Typed OAuth, cloud, and API-key identities survive login, model selection, routing, and status without stripping the provider. Long-lived credentials remain inside the broker boundary.
-- **🧩 Policy-driven orchestration.** Exact model identities, typed roles, write scopes, concurrency limits, and lifecycle gates authorize workers before credentials, network, billing, threads, or worker state.
-- **⚙️ Exact reasoning controls.** `/settings` and `/effort` expose only modes supported by the active provider-qualified model, including distinct Codex `xhigh`/`max`/`ultra` and Claude Fable 5 `max`/`ultracode` semantics.
-- **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **🌐 Native and cloud model transports.** Claude, ChatGPT/Codex, Grok/xAI, GitHub Copilot, Gemini Code Assist, Kimi (Moonshot AI), Azure OpenAI, Amazon Bedrock, and Google Vertex AI, plus OpenAI-compatible providers such as Groq, Cerebras, NVIDIA NIM, OpenRouter, or local Ollama. Provider and account support varies; unsupported routes fail closed.
-- **🧠 Continuous memory.** Project-scoped persistent memory with sensitivity classes. Context, decisions, and entities survive across sessions automatically.
-- **💰 Per-turn budgets.** Tool calls, wall clock, provider rounds, output tokens, result bytes, and cost — all bounded and logged per turn.
-- **📡 Event bus.** Any script, cron, or service can poke a running session and the agent reacts in real time.
-- **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days. Continuous memory persists across projects.
-- **🤖 Autonomous mode.** `synaps watcher` runs a fleet with heartbeats, crash recovery, cost limits, and session handoff.
-- **⚡ Fast and lean.** ~210K lines of Rust, one 20MB binary, ~2ms cold start, zero runtime deps.
-- **🎨 19 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
-
----
+- **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
+- **Runs without you.** `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
+- **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held.
+- **Bounded turns.** Caps on tool calls, wall clock, tokens, bytes, and cost. An agent can't spend what you didn't give it.
+- **Memory that survives.** Project-scoped memory, `/compact` checkpoints, sessions that chain across days.
+- **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
+- **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
+- **Lean is fast.** One 20MB binary, 20ms cold start. No framework tax, no interpreter warming up.
+- **19 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 ## Modes
 
 | Command | What it does |
 |---------|-------------|
-| `synaps` | Interactive TUI: streaming, markdown, syntax highlighting, subagent panel |
-| `synaps chat` | Headless, same engine, stdin/stdout. Scripts, pipes, CI |
+| `synaps` | The TUI. Streaming, markdown, a live subagent panel |
+| `synaps chat` | Same engine, stdin/stdout. Pipes, scripts, CI |
+| `synaps rpc` | JSON-RPC over stdio. Embed the engine in other software |
 | `synaps server` | WebSocket API: token auth, origin validation, streaming |
-| `synaps rpc` | Line-JSON IPC for bridges (Slack, Discord) |
-| `synaps watcher` | Supervisor daemon for autonomous agent fleets |
-| `synaps auth-broker` | Credential broker for multi-machine shared auth |
+| `synaps watcher` | Supervisor for unattended fleets: heartbeats, restarts, cost limits |
+| `synaps auth-broker` | One credential, many machines. Short-lived tokens over TLS |
 
 ## Configuration
 
-No YAML. No TOML. No JSON. Just `key = value` in `~/.synaps-cli/config`:
+One file, `key = value`, at `~/.synaps-cli/config`:
 
 ```ini
 model = anthropic/claude-opus-5
@@ -176,7 +174,7 @@ Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot:
 └── main.py | index.js | <any>    # JSON-RPC 2.0 over stdio, any language
 ```
 
-Extensions are separate processes, not linked code, so they're language-agnostic, crash-isolated, and sandboxed. Hook `before_tool_call`, `before_message`, `on_session_start`, and 4 more.
+Extensions are separate processes speaking JSON-RPC over stdio: any language, crash-isolated, with a permissions manifest gating what each one can touch. Seven lifecycle hooks, from `before_tool_call` to `on_session_end`.
 
 Protocol spec: [docs/extensions/](docs/extensions/).
 
@@ -184,7 +182,7 @@ Protocol spec: [docs/extensions/](docs/extensions/).
 
 ## Contributing
 
-Synaps is young (started April 2026) and moving fast: 1,900+ commits in its first 3 months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+Synaps is young (started April 2026) and moving fast: 1,995 commits and ~190K lines of Rust in its first four months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
@@ -193,14 +191,11 @@ cargo build && cargo test
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome, the maintainer answers fast.
 
-Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) — questions, ideas, show-and-tell, or just to watch the crew run.
+Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) - questions, ideas, show-and-tell, or just to watch the crew run.
 
 ---
 
 ## Architecture
-
-<details>
-<summary><b>Crate layout</b></summary>
 
 ```
 crates/
@@ -211,7 +206,6 @@ crates/
 └── (root)           # the `synaps` binary crate: CLI dispatch, login, watcher, broker
 ```
 Native Anthropic, OpenAI Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the same `StreamEvent`, so the TUI and tool loop stay provider-blind. Provider-qualified identities and pre-authorized execution plans remain typed through routing.
-</details>
 
 ---
 
@@ -223,6 +217,4 @@ Apache 2.0. See [LICENSE](LICENSE).
   <sub>Synaps is built with Synaps.</sub>
 </p>
 
-<p align="center">
-  <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
-</p>
+<!--  Never Fade Away  -->

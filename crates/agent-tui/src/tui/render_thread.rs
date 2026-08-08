@@ -465,7 +465,16 @@ fn render_thread_body(
 
         // ── 2. Apply pending clear before rendering ───────────────────────────
         if pending_clear {
-            terminal.clear().ok();
+            // Force ratatui to treat the entire screen as dirty: resize()
+            // resets BOTH front and back buffers (clear() only resets the back
+            // buffer, leaving the front stale — diff-draws against it produce
+            // black patches after a full terminal handoff like gamba).
+            if let Ok(size) = terminal.size() {
+                let area = ratatui::layout::Rect::from((ratatui::layout::Position::ORIGIN, size));
+                terminal.resize(area).ok();
+            } else {
+                terminal.clear().ok();
+            }
             pending_clear = false;
         }
 

@@ -31,8 +31,9 @@ fn which_gamba() -> Option<std::path::PathBuf> {
 impl App {
     pub(crate) fn restore_terminal(&self) {
         crossterm::terminal::enable_raw_mode().ok();
+        let mut stdout = std::io::stdout();
         crossterm::execute!(
-            std::io::stdout(),
+            stdout,
             crossterm::terminal::EnterAlternateScreen,
             // Mirror setup_terminal(): the casino subprocess disables mouse
             // capture + bracketed paste on its way out, so re-enable both or
@@ -41,6 +42,20 @@ impl App {
             crossterm::event::EnableBracketedPaste
         )
         .ok();
+        // Re-push kitty keyboard protocol — the subprocess may have popped or
+        // reset it, breaking modifier-heavy chords (Ctrl+Shift, Ctrl+Alt, etc.).
+        // Best-effort, same as setup_terminal().
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        );
+        // Hide the hardware cursor — setup_terminal() hides it for the whole
+        // TUI lifecycle. Without this the cursor reappears at a stale position
+        // and jitters during the first redraws after returning from the casino.
+        crossterm::execute!(stdout, crossterm::cursor::Hide).ok();
     }
 
     /// Yield terminal to casino — tears down TUI, spawns GamblersDen.
@@ -51,9 +66,19 @@ impl App {
         }
         let bin = which_gamba().ok_or_else(|| "🎰 Nothing to see here...".to_string())?;
 
-        // Tear down our TUI
+        // Tear down our TUI — full inverse of setup_terminal() so the casino
+        // subprocess inherits a clean cooked terminal.
         crossterm::terminal::disable_raw_mode().ok();
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
+        let mut stdout = std::io::stdout();
+        let _ = crossterm::execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+        crossterm::execute!(
+            stdout,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableMouseCapture,
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen
+        )
+        .ok();
         // Spawn the casino (non-blocking)
         match std::process::Command::new(&bin)
             .stdin(std::process::Stdio::inherit())
