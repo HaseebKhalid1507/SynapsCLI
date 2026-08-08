@@ -3,7 +3,7 @@
 **Commit:** `17051f2` — merge: A3 crate split + #116 render thread
 **Branch:** `dev`
 **Date:** 2026-06-13
-**Scope:** `docs/116-render-model-spec.md` + `docs/A3-spec.md` versus merged implementation
+**Scope:** `docs/specs/116-render-model-spec.md` + `docs/specs/A3-spec.md` versus merged implementation
 
 ---
 
@@ -18,7 +18,7 @@ resolved (both in its favour).
 
 ---
 
-## 1. `docs/116-render-model-spec.md` — conformance
+## 1. `docs/specs/116-render-model-spec.md` — conformance
 
 ### §3 `RenderModel` struct
 
@@ -148,7 +148,7 @@ enum RenderCmd {
 
 ---
 
-## 2. `docs/A3-spec.md` — conformance
+## 2. `docs/specs/A3-spec.md` — conformance
 
 **CONFORMANT.** The 3-crate layout (`agent-core → agent-engine → agent-tui → bin(synaps)`) is implemented and matches the spec's target DAG.
 

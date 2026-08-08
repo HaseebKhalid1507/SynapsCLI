@@ -1,11 +1,27 @@
+# Build
 /target
+
+# Secrets / env
 .env
+.env.*
+!.env.example
+
+# Editor / OS
 *.swp
 *.swo
 .DS_Store
 .vscode/
 .idea/
+
+# Logs
 *.log
+
+# Agent + workflow working state (internal; not for the published repo)
 .claude/
+.plans/
+.convergence/
+.worktrees/
 .worktrees/harbor/
+
+# Generated docs mirror
 wiki/

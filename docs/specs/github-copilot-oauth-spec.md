@@ -29,7 +29,7 @@ This document separates:
    (`OAuthProviderId`, `BrokerCredentialStrategy`, `LocalBroker` /
    `RemoteBroker`, atomic `auth.json` merge storage). See
    `docs/decisions/credential-broker-checkpoint-1.md` and
-   `docs/grok-xai-oauth-spec.md`.
+   `docs/specs/grok-xai-oauth-spec.md`.
 3. Device Authorization Grant (RFC 8628) is preferred over localhost callback
    because that is what official Copilot CLI documents for interactive login.
 4. We will **not** ship a design that vends the long-lived GitHub user token
@@ -713,8 +713,8 @@ cargo clippy --all-targets -- --deny warnings
 | Broker | `crates/agent-core/src/core/auth/broker.rs`, `src/cmd/auth_broker.rs` |
 | Login UI | `src/cmd/login.rs` |
 | Runtime route | `crates/agent-engine/src/runtime/openai/mod.rs` |
-| Specs | `docs/github-copilot-oauth-spec.md` (this file) |
-| Prior art | `docs/grok-xai-oauth-spec.md`, `docs/decisions/credential-broker-checkpoint-1.md` |
+| Specs | `docs/specs/github-copilot-oauth-spec.md` (this file) |
+| Prior art | `docs/specs/grok-xai-oauth-spec.md`, `docs/decisions/credential-broker-checkpoint-1.md` |
 
 ---
 
@@ -778,7 +778,7 @@ cargo clippy --all-targets -- --deny warnings
 
 ### In-repo architecture references
 
-15. `docs/grok-xai-oauth-spec.md` — sibling OAuth provider spec pattern
+15. `docs/specs/grok-xai-oauth-spec.md` — sibling OAuth provider spec pattern
 16. `docs/decisions/credential-broker-checkpoint-1.md` — broker vending policy
 17. `crates/agent-core/src/core/auth/provider.rs` — typed OAuth registry
 18. `crates/agent-core/src/core/auth/broker.rs` — access-token vs proxy boundary

@@ -458,7 +458,7 @@ After Tasks 8-10:
 **Files likely touched:**
 
 - `src/skills/post_install.rs`
-- `docs/plugin-setup-scripts.md`
+- `docs/extensions/plugin-setup-scripts.md`
 
 **Scope:** S
 
@@ -542,7 +542,7 @@ After Tasks 8-10:
 **Dependencies:** Tasks 1-12  
 **Files likely touched:**
 
-- `docs/plugin-setup-scripts.md`
+- `docs/extensions/plugin-setup-scripts.md`
 - `docs/extensions/*` or new doc if appropriate
 
 **Scope:** S

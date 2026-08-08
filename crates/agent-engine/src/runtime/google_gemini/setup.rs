@@ -3,7 +3,7 @@
 //!
 //! Experimental. `cloudcode-pa.googleapis.com/v1internal` is a
 //! product-client-observed integration surface and is not documented as a
-//! stable public third-party API; see docs/google-gemini-oauth-spec.md.
+//! stable public third-party API; see docs/specs/google-gemini-oauth-spec.md.
 //!
 //! This module never touches secrets or the network directly — it composes
 //! typed `ProxyRequest` values through a `CredentialBroker`, so all upstream

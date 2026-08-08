@@ -30,6 +30,15 @@ Synaps is an agent runtime written in Rust. It runs agents with built-in tools, 
 
 ---
 
+## Philosophy
+
+- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
+- **Multi-agent is the default.** Single-agent is just n=1.
+- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
+- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
+
+---
+
 ## Install
 
 ```bash
@@ -139,7 +148,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 One file, `key = value`, at `~/.synaps-cli/config`:
 
 ```ini
-model = anthropic/claude-sonnet-4-6
+model = anthropic/claude-opus-5
 thinking = high
 theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.

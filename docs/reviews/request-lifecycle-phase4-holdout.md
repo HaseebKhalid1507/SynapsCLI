@@ -84,7 +84,7 @@ Final retained CP-11 evidence at `3ea1c757`:
   0 failed, 10 ignored.
 - `git diff --check` — clean for committed changes.
 - Working tree contains only the pre-existing unstaged
-  `docs/request-lifecycle-hardening-spec.md` edit; it was excluded from the
+  `docs/specs/request-lifecycle-hardening-spec.md` edit; it was excluded from the
   reviewed committed specification.
 
 The Judge personally inspected committed source/diffs/tests for the outer

@@ -261,7 +261,7 @@ The field comment says "retained for Step 2 ordering / debug; not read by render
 - `crates/agent-engine/src/runtime/sse.rs:7` — "REVIEW.md P2"
 - `crates/agent-engine/src/runtime/api.rs:793` — "REVIEW.md P2"
 
-`REVIEW.md` does not exist at the repo root. The closest file is `docs/REVIEW-S205.md`. These references are unresolvable — anyone following up cannot look up P2/P5.
+`REVIEW.md` does not exist at the repo root. The closest file is `docs/reviews/REVIEW-S205.md`. These references are unresolvable — anyone following up cannot look up P2/P5.
 
 **Severity: NIT**
 

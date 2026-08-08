@@ -2,7 +2,7 @@
 
 > Reviewer: **Chrollo** (architecture & crate-boundaries lens)
 > Branch: `dev` @ `17051f2`  ·  Scope: read-only
-> Compared against: `docs/A3-spec.md`, `docs/A3-recon.md`
+> Compared against: `docs/specs/A3-spec.md`, `docs/reviews/A3-recon.md`
 
 ---
 
@@ -220,7 +220,7 @@ This is **intentional** (per `A3-spec.md:131-133`), but the subcrates have full 
 
 ## 5. Spec compliance
 
-Cross-checked against `docs/A3-spec.md`:
+Cross-checked against `docs/specs/A3-spec.md`:
 
 | Spec claim | Status |
 |---|---|

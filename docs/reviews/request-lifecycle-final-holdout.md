@@ -64,5 +64,5 @@ listing and metadata paths, bounded reads, adversarial victim-sentinel tests,
 prior-fix preservation, and retained gate totals. It did not modify files or
 rerun Cargo commands.
 
-The unrelated unstaged `docs/request-lifecycle-hardening-spec.md` edit was
+The unrelated unstaged `docs/specs/request-lifecycle-hardening-spec.md` edit was
 excluded from the committed review and remains uncommitted by design.

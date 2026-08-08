@@ -36,7 +36,7 @@ pub const PROVIDER: &str = "github-copilot";
 
 /// Public native-client id observed in Copilot editor clients (VS Code lineage).
 /// Not a client secret. Provenance: community consensus + device-flow examples;
-/// not a first-class constant on docs.github.com. See docs/github-copilot-oauth-spec.md.
+/// not a first-class constant on docs.github.com. See docs/specs/github-copilot-oauth-spec.md.
 pub const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 /// Least-privilege scope among common working values (community-observed).
@@ -75,7 +75,7 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 // /copilot_internal/v2/token after a successful device-flow authorization).
 // User-Agent identifies Synaps honestly; Copilot-Integration-Id / Editor-* match
 // the conventional vscode-chat integration surface used by public clients.
-// See docs/github-copilot-oauth-spec.md §C5 / U4.
+// See docs/specs/github-copilot-oauth-spec.md §C5 / U4.
 pub const MINT_USER_AGENT: &str = "SynapsCLI/0.6.0";
 pub const MINT_EDITOR_VERSION: &str = "vscode/1.107.0";
 pub const MINT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";

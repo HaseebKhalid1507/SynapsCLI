@@ -1,6 +1,6 @@
 //! Google Gemini (Code Assist) runtime — broker-proxied only.
 //!
-//! Experimental. See docs/google-gemini-oauth-spec.md.
+//! Experimental. See docs/specs/google-gemini-oauth-spec.md.
 
 pub mod runtime;
 pub mod setup;
