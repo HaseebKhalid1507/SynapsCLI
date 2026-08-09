@@ -52,9 +52,8 @@ cargo install synaps              # crates.io
 brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
 yay -S synaps                               # Arch / EndeavourOS
 
-# Debian/Ubuntu
-curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
-sudo dpkg -i synaps_amd64.deb
+# Debian/Ubuntu — .deb is attached to every release:
+# https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest
 
 # Shell installer (any platform)
 curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
