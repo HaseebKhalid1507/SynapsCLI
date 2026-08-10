@@ -165,8 +165,9 @@ enum Command {
         /// Address to bind, e.g. `0.0.0.0:8181` or `127.0.0.1:8181`.
         #[arg(long, default_value = "127.0.0.1:8181")]
         bind: String,
-        /// Token clients must present (`Authorization: Bearer <token>`). Falls
-        /// back to `--machine-token-file`, then `SYNAPS_BROKER_TOKEN`.
+        /// REJECTED — a token in argv leaks via `ps aux` and
+        /// /proc/<pid>/cmdline. Use `--machine-token-file` or
+        /// `SYNAPS_BROKER_TOKEN`. Still parsed so we can emit a migration error.
         #[arg(long)]
         machine_token: Option<String>,
         /// Read the machine token from a file (avoids exposing it in argv/`ps`).
