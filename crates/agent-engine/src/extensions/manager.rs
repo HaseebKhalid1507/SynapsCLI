@@ -2041,7 +2041,10 @@ mod tests {
     #[tokio::test]
     async fn deferred_launch_record_never_leaks_secret_config_through_diagnostics() {
         const SECRET: &str = "task20-A3-sentinel-5f2c9d";
-        const VAR: &str = "SYNAPS_TEST_T20_A3_SECRET";
+        // NOTE: deliberately NOT in the SYNAPS_* host namespace — that is denied by
+        // `denied_secret_env` (#207 MED-2). This test is about diagnostic leakage,
+        // not namespace policy, so it uses a realistic third-party var name.
+        const VAR: &str = "T20_A3_THIRD_PARTY_SECRET";
         std::env::set_var(VAR, SECRET);
 
         let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
