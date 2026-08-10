@@ -868,6 +868,54 @@ impl ExtensionManager {
         Ok(())
     }
 
+    /// Env vars an extension may never pull in through `secret_env`.
+    ///
+    /// Security (#207 MED-2): `secret_env` names an arbitrary process
+    /// environment variable, and [`Self::resolve_config`] reads it verbatim
+    /// into the config handed to the extension at `initialize`. Nothing
+    /// constrained that name, so a manifest could declare the HOST's own
+    /// provider credential — `secret_env: "ANTHROPIC_API_KEY"` — and a plugin
+    /// installed for something unrelated would be handed the user's API key.
+    ///
+    /// Default-deny the credentials the host itself holds, plus the whole
+    /// `SYNAPS_*` host namespace except this extension's own scoped override.
+    /// Third-party secrets an extension legitimately needs (`GITHUB_TOKEN`,
+    /// and friends) are unaffected.
+    fn denied_secret_env(var: &str, id: &str) -> Option<&'static str> {
+        const HOST_CREDENTIALS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "XAI_API_KEY",
+            "GROQ_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MISTRAL_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ];
+        let up = var.trim().to_ascii_uppercase();
+        if up.is_empty() {
+            return Some("secret_env must not be empty");
+        }
+        if HOST_CREDENTIALS.contains(&up.as_str()) {
+            return Some(
+                "that variable holds a host credential; extensions are never handed the host's own provider keys",
+            );
+        }
+        let own_prefix = format!(
+            "SYNAPS_EXTENSION_{}_",
+            id.replace('-', "_").to_ascii_uppercase()
+        );
+        if up.starts_with("SYNAPS_") && !up.starts_with(&own_prefix) {
+            return Some(
+                "SYNAPS_* is the host namespace; declare your own SYNAPS_EXTENSION_<ID>_<KEY> variable instead",
+            );
+        }
+        None
+    }
+
     fn resolve_config(
         id: &str,
         entries: &[ExtensionConfigEntry],
@@ -914,6 +962,17 @@ impl ExtensionManager {
                 continue;
             }
             let config_key = format!("extension.{}.{}", id, key);
+            // Security (#207 MED-2): validate the declared env var name BEFORE
+            // any resolution path can read it. Fails at load, loudly, rather
+            // than silently handing a host credential to the extension.
+            if let Some(secret_env) = &entry.secret_env {
+                if let Some(reason) = Self::denied_secret_env(secret_env, id) {
+                    return Err(format!(
+                        "Extension '{}' config key '{}' declares secret_env '{}': {}",
+                        id, key, secret_env, reason
+                    ));
+                }
+            }
             if let Ok(value) = std::env::var(format!(
                 "SYNAPS_EXTENSION_{}_{}",
                 id.replace('-', "_").to_ascii_uppercase(),
@@ -1982,7 +2041,10 @@ mod tests {
     #[tokio::test]
     async fn deferred_launch_record_never_leaks_secret_config_through_diagnostics() {
         const SECRET: &str = "task20-A3-sentinel-5f2c9d";
-        const VAR: &str = "SYNAPS_TEST_T20_A3_SECRET";
+        // NOTE: deliberately NOT in the SYNAPS_* host namespace — that is denied by
+        // `denied_secret_env` (#207 MED-2). This test is about diagnostic leakage,
+        // not namespace policy, so it uses a realistic third-party var name.
+        const VAR: &str = "T20_A3_THIRD_PARTY_SECRET";
         std::env::set_var(VAR, SECRET);
 
         let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
@@ -2644,5 +2706,66 @@ mod tests {
                 "{live} is a legitimate plugin name and must stay discoverable"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_env_allowlist_tests {
+    use super::*;
+
+    fn entry(key: &str, secret_env: &str) -> ExtensionConfigEntry {
+        serde_json::from_value(serde_json::json!({
+            "key": key,
+            "type": "string",
+            "secret_env": secret_env,
+        }))
+        .unwrap()
+    }
+
+    /// #207 MED-2: a manifest must not be able to name the host's own
+    /// provider credential and have it handed over at initialize.
+    #[test]
+    fn host_provider_credentials_are_rejected() {
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "anthropic_api_key", // case-insensitive
+        ] {
+            let err = ExtensionManager::resolve_config("evil", &[entry("k", var)], None)
+                .expect_err(&format!("{var} must be rejected"));
+            assert!(err.contains("host credential"), "unexpected error: {err}");
+        }
+    }
+
+    /// The whole SYNAPS_* namespace is the host's, except this extension's
+    /// own scoped override.
+    #[test]
+    fn host_namespace_is_rejected_but_own_scope_is_allowed() {
+        let err = ExtensionManager::resolve_config("evil", &[entry("k", "SYNAPS_BROKER_TOKEN")], None)
+            .expect_err("host namespace must be rejected");
+        assert!(err.contains("host namespace"), "unexpected error: {err}");
+
+        // an extension's own scoped var is fine
+        assert!(
+            ExtensionManager::denied_secret_env("SYNAPS_EXTENSION_MY_PLUGIN_TOKEN", "my-plugin")
+                .is_none()
+        );
+    }
+
+    /// Third-party secrets an extension legitimately needs still work.
+    #[test]
+    fn third_party_secrets_are_still_allowed() {
+        for var in ["GITHUB_TOKEN", "STRIPE_KEY", "MY_SERVICE_TOKEN"] {
+            assert!(
+                ExtensionManager::denied_secret_env(var, "some-ext").is_none(),
+                "{var} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_secret_env_is_rejected() {
+        assert!(ExtensionManager::denied_secret_env("   ", "x").is_some());
     }
 }
