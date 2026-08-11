@@ -30,9 +30,10 @@ Synaps is an agent runtime written in Rust. It runs agents with built-in tools, 
 
 ---
 
-## Philosophy
+## Why Synaps
 
 - **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
+- **Own your agent.** The system prompt is a file on disk. The tool list is opt-out. Your turns are yours; nothing phones home.
 - **Multi-agent is the default.** Single-agent is just n=1.
 - **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
 - **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
@@ -110,14 +111,6 @@ OAuth and cloud credentials flow through the typed credential broker; long-lived
 Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a running Ollama just works. Point it anywhere else with `provider.local.url` in config or the `LOCAL_ENDPOINT` env var. Your keys, your box, nothing phones home.
 
 ---
-
-## Why Synaps
-
-- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
-- **Own your agent.** The system prompt is a file on disk. The tool list is opt-out. Your turns are yours; nothing phones home.
-- **Multi-agent is the default.** Single-agent is just n=1.
-- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
-- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
 
 ## What's in the box
 
