@@ -438,7 +438,6 @@ mod tests {
             "xai-auth/grok-4.5",
             "xai-auth/grok-4.5-latest",
             "xai-auth/grok-4.6",
-            "xai-auth/grok-4.6-latest",
         ] {
             for level in [Adaptive, Low, Medium, High] {
                 assert!(
@@ -622,10 +621,6 @@ mod tests {
             Some(High)
         );
         assert_eq!(default_level_for_model("xai-auth/grok-4.6"), Some(High));
-        assert_eq!(
-            default_level_for_model("xai-auth/grok-4.6-latest"),
-            Some(High)
-        );
         assert_eq!(
             default_level_for_model("xai-auth/grok-4.20-multi-agent-0309"),
             Some(Adaptive)

@@ -73,12 +73,6 @@ pub const XAI_TEXT_MODELS: &[XaiModelDescriptor] = &[
         context_tokens: None,
         reasoning: true,
     },
-    XaiModelDescriptor {
-        id: "grok-4.6-latest",
-        label: "Grok 4.6 (latest alias)",
-        context_tokens: None,
-        reasoning: true,
-    },
 ];
 
 pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
@@ -89,9 +83,11 @@ pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
 
 /// Documented reasoning capability for an exact xAI model id.
 ///
-/// Evidence: official xAI docs. `grok-4.5`/`grok-4.5-latest` and
-/// `grok-4.6`/`grok-4.6-latest` support low/medium/high effort, default high,
-/// and reasoning cannot be disabled. `grok-4.20-multi-agent-0309` supports
+/// Evidence: official xAI docs and a live `GET /v1/models` probe
+/// (2026-08-14). `grok-4.5`/`grok-4.5-latest` and `grok-4.6` support
+/// low/medium/high effort, default high, and reasoning cannot be disabled.
+/// xAI has not published a `grok-4.6-latest` alias (upstream 404), so only
+/// the bare id is cataloged. `grok-4.20-multi-agent-0309` supports
 /// low/medium/high/xhigh where effort controls agent count. No other exact id
 /// has documented effort support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,13 +112,11 @@ pub enum XaiReasoningCapability {
 pub fn xai_static_capability(model_id: &str) -> Option<XaiReasoningCapability> {
     use agent_core::reasoning::ReasoningLevel::*;
     match model_id {
-        "grok-4.5" | "grok-4.5-latest" | "grok-4.6" | "grok-4.6-latest" => {
-            Some(XaiReasoningCapability::Effort {
-                supported: &[Low, Medium, High],
-                default_level: Some(High),
-                can_disable: false,
-            })
-        }
+        "grok-4.5" | "grok-4.5-latest" | "grok-4.6" => Some(XaiReasoningCapability::Effort {
+            supported: &[Low, Medium, High],
+            default_level: Some(High),
+            can_disable: false,
+        }),
         "grok-4.20-multi-agent-0309" => Some(XaiReasoningCapability::Effort {
             supported: &[Low, Medium, High, XHigh],
             // Effort controls agent count; no documented default level.
@@ -180,7 +174,6 @@ mod tests {
                 "grok-4.5",
                 "grok-4.5-latest",
                 "grok-4.6",
-                "grok-4.6-latest",
             ]
         );
     }
@@ -203,7 +196,6 @@ mod tests {
                 "grok-4.5",
                 "grok-4.5-latest",
                 "grok-4.6",
-                "grok-4.6-latest",
             ]
         );
     }
@@ -213,7 +205,7 @@ mod tests {
     #[test]
     fn grok_45_and_46_family_effort_capability_is_exact() {
         use agent_core::reasoning::ReasoningLevel::*;
-        for id in ["grok-4.5", "grok-4.5-latest", "grok-4.6", "grok-4.6-latest"] {
+        for id in ["grok-4.5", "grok-4.5-latest", "grok-4.6"] {
             match xai_static_capability(id) {
                 Some(XaiReasoningCapability::Effort {
                     supported,

@@ -2443,7 +2443,6 @@ mod xai_tests {
             "grok-4.5",
             "grok-4.5-latest",
             "grok-4.6",
-            "grok-4.6-latest",
             "grok-4.3",
             "grok-4.20-0309-non-reasoning",
         ] {
@@ -2458,7 +2457,6 @@ mod xai_tests {
             "grok-4.5",
             "grok-4.5-latest",
             "grok-4.6",
-            "grok-4.6-latest",
             "grok-4.20-multi-agent-0309",
             "grok-4.3",
         ] {
