@@ -141,6 +141,38 @@ pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
     )
 }
 
+/// Resolve the PowerShell executable. Prefers pwsh (PowerShell 7+, the
+/// cross-platform build with sane defaults) and falls back to the
+/// Windows-bundled powershell.exe (5.1).
+#[cfg(windows)]
+pub(crate) fn powershell_program() -> std::ffi::OsString {
+    let on_path = |exe: &str| {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
+            .unwrap_or(false)
+    };
+    if on_path("pwsh.exe") {
+        return "pwsh".into();
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            let candidate = std::path::Path::new(&pf).join(r"PowerShell\7\pwsh.exe");
+            if candidate.is_file() {
+                return candidate.into_os_string();
+            }
+        }
+    }
+    // powershell.exe is always present on Windows (System32).
+    "powershell".into()
+}
+
+/// Unix stub — the powershell tool is only registered on Windows, so this is
+/// never called there; it exists so cross-compilation `cargo check` works.
+#[cfg(not(windows))]
+pub(crate) fn powershell_program() -> std::ffi::OsString {
+    "pwsh".into()
+}
+
 #[async_trait::async_trait]
 impl Tool for BashTool {
     fn origin(&self) -> crate::tools::ToolOrigin {
@@ -183,9 +215,36 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let requested_timeout = params["timeout"]
-            .as_u64()
-            .unwrap_or(ctx.limits.bash_timeout);
+        let script = bash_script_with_secure_sudo(command);
+        run_shell_command(
+            &script,
+            ShellSpec::Bash,
+            params["timeout"].as_u64(),
+            ctx,
+        )
+        .await
+    }
+}
+
+/// Which shell backend the shared executor drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellSpec {
+    Bash,
+    PowerShell,
+}
+
+/// Shared execution core for bash + powershell: piped stdin/stdout/stderr,
+/// chunked streaming with byte-conservation accounting, secret-prompt
+/// interception, truncation, timeout. The only per-shell differences are
+/// which program is spawned and which args it takes.
+pub(crate) async fn run_shell_command(
+    script: &str,
+    spec: ShellSpec,
+    requested_timeout: Option<u64>,
+    ctx: ToolContext,
+) -> Result<String> {
+    {
+        let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
         // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
         // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
         let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
@@ -195,10 +254,14 @@ impl Tool for BashTool {
         };
         let max_output = ctx.limits.max_tool_buffer;
 
-        let script = bash_script_with_secure_sudo(command);
-        let mut cmd = tokio::process::Command::new(bash_program());
-        cmd.arg("-c")
-            .arg(&script)
+        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
+            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
+            ShellSpec::PowerShell => {
+                (powershell_program(), vec!["-NoProfile".into(), "-Command".into(), script.into()])
+            }
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
