@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
 mod cmd;
+#[cfg(unix)]
 mod watcher;
 
 // ── Allocator ────────────────────────────────────────────────────────────────

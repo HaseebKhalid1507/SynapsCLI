@@ -6,6 +6,7 @@ use synaps_cli::events::registry::{
 };
 use synaps_cli::events::{Event, EventChannel, EventContent, EventSource, Severity};
 use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
@@ -123,10 +124,26 @@ async fn send_via_socket(socket_path: &str, json: &str) -> anyhow::Result<()> {
             socket_path
         );
     }
-    let mut stream = UnixStream::connect(socket_path).await?;
+    let mut stream = connect_session_transport(socket_path).await?;
     stream.write_all(json.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn connect_session_transport(socket_path: &str) -> anyhow::Result<UnixStream> {
+    Ok(UnixStream::connect(socket_path).await?)
+}
+
+/// Windows: the socket_path is only an identifier — connect to the named pipe
+/// derived from it (must match the engine's `pipe_name_for` derivation).
+#[cfg(windows)]
+async fn connect_session_transport(
+    socket_path: &str,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let pipe_name = synaps_cli::events::socket::pipe_name_for(socket_path);
+    Ok(ClientOptions::new().open(&pipe_name)?)
 }
 
 fn write_inbox(event: &Event) -> anyhow::Result<()> {

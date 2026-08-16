@@ -48,8 +48,7 @@ arboard       = "3"
 # soft-wrap render pipeline consumes flat (text, cursor) via compat accessors.
 tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"] }
 
-# Signal handling (tui/signals.rs)
-signal-hook  = { version = "0.3", features = ["iterator"] }
+# Signal handling (tui/signals.rs) — see [target.'cfg(unix)'.dependencies]
 
 # Render-thread synchronisation (tui/render_thread.rs)
 parking_lot  = "0.12"
@@ -58,6 +57,9 @@ parking_lot  = "0.12"
 # Headless TUI test harness (tui::testing). Pulls in the engine's offline
 # Runtime constructor. Never enabled in production builds.
 testing = ["agent-engine/testing"]
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", features = ["iterator"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"
