@@ -299,7 +299,14 @@ impl App {
             needs_redraw: true,
             force_redraw: false,
             logo_dismiss_t: None,
-            logo_build_t: Some(0.0),
+            // SYNAPS_NO_BOOT_FX=1: skip both the tachyonfx boot effect and the
+            // ASCII logo build animation (full-screen redraws per frame are
+            // brutal over high-latency/SSH links).
+            logo_build_t: if std::env::var("SYNAPS_NO_BOOT_FX").map_or(false, |v| v == "1") {
+                None
+            } else {
+                Some(0.0)
+            },
             subagents: Vec::new(),
             abort_context: None,
             queued_message: None,
