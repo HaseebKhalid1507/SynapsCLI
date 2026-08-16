@@ -190,6 +190,13 @@ fn socket_dir_trust(_sock: &std::path::Path) -> SocketDirTrust {
     SocketDirTrust::Missing
 }
 
+/// Windows: no uid concept in this context; the mxc socket path is never
+/// connected to (socket_dir_trust always returns Missing).
+#[cfg(windows)]
+fn uid() -> u32 {
+    0
+}
+
 /// Soft detection for the theme listing: is Myx plausibly present? True when
 /// the MXC socket exists (Myx running or recently crashed) or a `myx` binary
 /// is on `$PATH`. Purely cosmetic — the theme works either way.
