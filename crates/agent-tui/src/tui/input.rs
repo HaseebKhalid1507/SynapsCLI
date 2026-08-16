@@ -1023,6 +1023,32 @@ mod tests {
         assert_eq!(app.modal_stack.top(), PaneId::Chat);
     }
 
+    /// Windows consoles and kitty-protocol terminals emit a Release event for
+    /// every key press. `handle_event` must drop Release events for ALL panes
+    /// (the chat textarea tolerates them, but modal pane handlers would act
+    /// twice — the "double-tap" navigation bug on Windows).
+    #[test]
+    fn key_release_events_are_dropped_in_models_pane() {
+        use crate::tui::focus::PaneId;
+        use crate::tui::models::ModelsModalState;
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        app.models = Some(ModelsModalState::new());
+        app.modal_stack.push(PaneId::Models);
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let release = Event::Key(crossterm::event::KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::empty(),
+        });
+        assert!(matches!(
+            handle_event(release, &mut app, &runtime, false, &registry, &keybinds, 3),
+            InputAction::None
+        ));
+    }
+
     fn make_app() -> App {
         App::new(Session::new("test-model", "low", None))
     }
