@@ -92,6 +92,41 @@ fn append_bounded(output: &mut String, text: &str, max_output: usize) -> bool {
     }
 }
 
+/// Resolve the bash executable for the bash tool.
+///
+/// Unix: `bash` from PATH, as always. Windows: bash is usually NOT on PATH —
+/// prefer an explicit PATH hit, then Git Bash's known install locations, then
+/// WSL's `bash.exe` (runs inside the default distro) as a last resort.
+pub(crate) fn bash_program() -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        "bash".into()
+    }
+    #[cfg(windows)]
+    {
+        let on_path = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("bash.exe").is_file()))
+            .unwrap_or(false);
+        if on_path {
+            return "bash".into();
+        }
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(pf) = std::env::var_os(var) {
+                let candidate = std::path::Path::new(&pf).join(r"Git\bin\bash.exe");
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+        let wsl = std::path::Path::new(r"C:\Windows\System32\bash.exe");
+        if wsl.is_file() {
+            return wsl.as_os_str().to_os_string();
+        }
+        // Nothing found — let spawn fail with a readable NotFound error.
+        "bash".into()
+    }
+}
+
 pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
     // sudo normally opens /dev/tty for password input, bypassing our piped
     // stdin/stderr and corrupting the TUI. In the non-interactive bash tool,
@@ -161,7 +196,7 @@ impl Tool for BashTool {
         let max_output = ctx.limits.max_tool_buffer;
 
         let script = bash_script_with_secure_sudo(command);
-        let mut cmd = tokio::process::Command::new("bash");
+        let mut cmd = tokio::process::Command::new(bash_program());
         cmd.arg("-c")
             .arg(&script)
             .stdin(std::process::Stdio::piped())

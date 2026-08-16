@@ -318,9 +318,17 @@ impl SessionManager {
         let id = format!("shell_{:02}", seq);
 
         // --- Resolve parameters with config defaults ---
-        let command = opts
-            .command
-            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "bash".into()));
+        let command = opts.command.unwrap_or_else(|| {
+            std::env::var("SHELL").unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    // No $SHELL convention on Windows; PowerShell is the
+                    // native interactive default and always present.
+                    "powershell".into()
+                } else {
+                    "bash".into()
+                }
+            })
+        });
         let rows = opts.rows.unwrap_or(self.config.default_rows);
         let cols = opts.cols.unwrap_or(self.config.default_cols);
 
