@@ -71,6 +71,19 @@ pub(super) fn handle_event(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
+    // Key-release filter: Windows' console (and any terminal negotiating the
+    // kitty keyboard protocol) delivers BOTH Press and Release events for
+    // every keystroke; Unix legacy input delivers Press only. The chat
+    // textarea already ignores Release internally (tui-textarea), but the
+    // modal pane handlers below act on raw `Event::Key` — without this gate
+    // every keypress in /models, /settings, etc. fires twice on Windows.
+    // Repeat is deliberately kept (held-key navigation).
+    if let Event::Key(k) = &event {
+        if k.kind == crossterm::event::KeyEventKind::Release {
+            return InputAction::None;
+        }
+    }
+
     // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
     // `Chat` (empty stack) is the base pane; every modal + the folded-in
     // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.
