@@ -116,7 +116,7 @@ assets = [
     ["target/release/hidden", "usr/bin/", "755"],
 ]
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
+[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [workspace]
