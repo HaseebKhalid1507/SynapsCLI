@@ -455,7 +455,7 @@ pub(crate) async fn run_shell_command(
                         };
                         streamed_bytes += delta.len();
                         if !delta.is_empty() {
-                            let _ = txd.send(delta);
+                            txd.send(delta);
                         }
                     }
                 }
@@ -463,7 +463,7 @@ pub(crate) async fn run_shell_command(
                 if !added_all {
                     full_output.push_str(&format!("\n\n[output truncated at {}]", max_output));
                     if let Some(ref txd) = ctx.channels.tx_delta {
-                        let _ = txd.send(format!("\n\n[output truncated at {}]", max_output));
+                        txd.send(format!("\n\n[output truncated at {}]", max_output));
                     }
                     truncated = true;
                     let _ = child.kill().await;
