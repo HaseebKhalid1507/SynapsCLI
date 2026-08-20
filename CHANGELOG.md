@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] — 2026-08-20
+
+### Added
+
+- **Windows support.** Native PowerShell tool that shares the bash execution
+  core, a named-pipe event transport, a Git Bash/WSL bash resolver, and a
+  PowerShell-default system prompt on Windows (bash when running under WSL).
+  Unix-only subsystems (jemalloc, the file watcher, MXC, signal-hook) are gated
+  off cleanly so the port builds and runs natively.
+- **xAI Grok 4.6.** `grok-4.6` added to the model catalog.
+- **OpenAI Zero Data Retention.** `store: false` is now asserted explicitly on
+  the `chat/completions` path (parity with the Codex Responses path), gated to
+  `api.openai.com` so OpenAI-compatible providers that strict-validate the body
+  are unaffected. All OpenAI requests remain stateless (no `previous_response_id`).
+- **`SYNAPS_NO_BOOT_FX=1`** environment variable to skip the boot animation and
+  freeze the idle logo gradient redraw.
+
+### Fixed
+
+- Surface an actionable message for the Anthropic Consumer Terms `400` error.
+- Terminal restore performs a full teardown/restore and resets both ratatui
+  buffers (fixes garbled state after exit).
+- TUI: drop key-Release events that caused Windows/kitty double-keypresses in
+  modal panes.
+- Dropped the phantom `grok-4.6-latest` alias (xAI never published it).
+
+### Security
+
+- Reject a raw `--machine-token` flag — #207 **CRIT-1**.
+- Default-deny host credentials in extension `secret_env` — #207 **MED-2**.
+
 ## [0.8.0] — 2026-08-04
 
 ### Added
