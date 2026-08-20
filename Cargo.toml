@@ -51,7 +51,7 @@ fs4 = "0.13"
 toml = "0.8"
 notify = "6.1"
 globset = "0.4"
-signal-hook = { version = "0.3", features = ["iterator"] }
+
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
@@ -116,7 +116,10 @@ assets = [
     ["target/release/hidden", "usr/bin/", "755"],
 ]
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", features = ["iterator"] }
+
+[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [workspace]

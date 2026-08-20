@@ -2423,10 +2423,26 @@ mod xai_tests {
     }
 
     #[test]
+    fn grok46_emits_exact_documented_efforts() {
+        for (level, effort) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+        ] {
+            let body = body_for("grok-4.6", level).expect("supported effort");
+            assert_eq!(body["reasoning"], json!({"effort": effort}), "{level}");
+            assert_eq!(body["model"], "grok-4.6");
+            assert_eq!(body["stream"], json!(true));
+            assert_eq!(body["max_output_tokens"], json!(1024));
+        }
+    }
+
+    #[test]
     fn adaptive_omits_reasoning_field_provider_default() {
         for model in [
             "grok-4.5",
             "grok-4.5-latest",
+            "grok-4.6",
             "grok-4.3",
             "grok-4.20-0309-non-reasoning",
         ] {
@@ -2440,6 +2456,7 @@ mod xai_tests {
         for model in [
             "grok-4.5",
             "grok-4.5-latest",
+            "grok-4.6",
             "grok-4.20-multi-agent-0309",
             "grok-4.3",
         ] {
@@ -2453,13 +2470,14 @@ mod xai_tests {
 
     #[test]
     fn unsupported_named_efforts_are_rejected_pre_network() {
-        // 4.5 has no documented xhigh; max/ultra never exist on xAI.
+        // 4.5/4.6 have no documented xhigh; max/ultra never exist on xAI.
         for level in [
             ReasoningLevel::XHigh,
             ReasoningLevel::Max,
             ReasoningLevel::Ultra,
         ] {
             assert!(body_for("grok-4.5", level).is_err(), "{level}");
+            assert!(body_for("grok-4.6", level).is_err(), "{level}");
         }
         // Intrinsic-reasoning models have no documented effort control.
         assert!(body_for("grok-4.3", ReasoningLevel::Medium).is_err());

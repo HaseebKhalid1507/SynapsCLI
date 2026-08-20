@@ -1,5 +1,9 @@
 // src/events/socket.rs
-// Unix socket listener for per-session event delivery
+// Per-session event delivery listener.
+// Unix: a Unix domain socket at `socket_path`.
+// Windows: a named pipe whose name is derived deterministically from
+// `socket_path` (see `pipe_name_for`), so clients holding the registry's
+// socket_path can connect without any registry format change.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -7,12 +11,27 @@ use std::sync::{
 };
 
 use tokio::io::AsyncReadExt;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 use super::queue::EventQueue;
 use super::types::Event;
 
 const MAX_PAYLOAD: usize = 256 * 1024; // 256KB
+
+/// Derive the Windows named-pipe name for a session socket path. Both the
+/// engine (server) and `synaps send` (client) call this on the registry's
+/// `socket_path`, so the two sides agree without changing the registry format.
+/// The path is hashed because pipe names live in a flat namespace and must
+/// not contain path separators.
+#[cfg(windows)]
+pub fn pipe_name_for(socket_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(socket_path.as_bytes());
+    // 16 bytes of the hash is plenty for uniqueness and keeps the name short.
+    let hex: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
+    format!(r"\\.\pipe\synaps-session-{}", hex)
+}
 
 /// Remove socket file if it exists. Best-effort, never panics.
 /// Sockets now live in ~/.synaps-cli/run/ (mode 0700), so symlink
@@ -41,6 +60,7 @@ pub fn cleanup_socket(socket_path: &str) {
 ///
 /// Protocol: client connects → sends full JSON event → closes connection.
 /// One event per connection. Max payload 256KB.
+#[cfg(unix)]
 pub fn listen_session_socket(
     socket_path: String,
     queue: Arc<EventQueue>,
@@ -106,7 +126,78 @@ pub fn listen_session_socket(
     })
 }
 
-async fn handle_connection(stream: &mut tokio::net::UnixStream, queue: &EventQueue) {
+/// Windows implementation: a named pipe server. Same protocol and shutdown
+/// semantics as the Unix listener. The `socket_path` is never created on
+/// disk — it only seeds the pipe name via `pipe_name_for`.
+#[cfg(windows)]
+pub fn listen_session_socket(
+    socket_path: String,
+    queue: Arc<EventQueue>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    tokio::spawn(async move {
+        let pipe_name = pipe_name_for(&socket_path);
+        let mut server = match ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("socket: failed to create pipe {}: {}", pipe_name, e);
+                return;
+            }
+        };
+
+        tracing::info!("socket: listening on {}", pipe_name);
+
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // Poll connect with a timeout so we can check shutdown
+            // periodically (mirrors the Unix accept loop). connect() is
+            // resumable after a timeout drop on the same server instance.
+            let accept =
+                tokio::time::timeout(std::time::Duration::from_millis(500), server.connect());
+
+            match accept.await {
+                Ok(Ok(())) => {
+                    // Spin up the next pipe instance before handing this
+                    // connection off, so new clients can connect immediately.
+                    let next = match ServerOptions::new().create(&pipe_name) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("socket: failed to recreate pipe: {}", e);
+                            break;
+                        }
+                    };
+                    let mut connected = std::mem::replace(&mut server, next);
+                    let queue = queue.clone();
+                    tokio::spawn(async move {
+                        // 5s timeout prevents slow-send DoS from parking tasks indefinitely
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle_connection(&mut connected, &queue),
+                        )
+                        .await;
+                    });
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("socket: accept error: {}", e);
+                }
+                Err(_) => {
+                    // Timeout — loop around and check shutdown flag
+                }
+            }
+        }
+
+        tracing::info!("socket: shut down {}", pipe_name);
+    })
+}
+
+async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, queue: &EventQueue) {
     // Read up to MAX_PAYLOAD + 1 so we can detect oversized payloads
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];
@@ -114,6 +205,8 @@ async fn handle_connection(stream: &mut tokio::net::UnixStream, queue: &EventQue
     loop {
         match stream.read(&mut chunk).await {
             Ok(0) => break, // EOF — client closed connection
+            // Named pipes surface client disconnect as BrokenPipe, not Ok(0)
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
             Ok(n) => {
                 if buf.len() + n > MAX_PAYLOAD {
                     tracing::warn!(
@@ -152,7 +245,7 @@ async fn handle_connection(stream: &mut tokio::net::UnixStream, queue: &EventQue
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::events::{Event, Severity};

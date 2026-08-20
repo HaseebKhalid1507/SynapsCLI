@@ -40,6 +40,8 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::tools::bash::BashTool),
+            #[cfg(windows)]
+            Arc::new(crate::tools::powershell::PowerShellTool),
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
             Arc::new(crate::tools::edit::EditTool),
@@ -130,6 +132,8 @@ impl ToolRegistry {
     pub fn without_subagent() -> Self {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::tools::bash::BashTool),
+            #[cfg(windows)]
+            Arc::new(crate::tools::powershell::PowerShellTool),
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
             Arc::new(crate::tools::edit::EditTool),

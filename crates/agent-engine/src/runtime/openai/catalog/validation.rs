@@ -433,8 +433,12 @@ mod tests {
     // ── xAI mutation matrix ──────────────────────────────────────────────────
 
     #[test]
-    fn xai_45_accepts_exact_efforts_and_rejects_off_xhigh_max_ultra() {
-        for model in ["xai-auth/grok-4.5", "xai-auth/grok-4.5-latest"] {
+    fn xai_45_and_46_accept_exact_efforts_and_reject_off_xhigh_max_ultra() {
+        for model in [
+            "xai-auth/grok-4.5",
+            "xai-auth/grok-4.5-latest",
+            "xai-auth/grok-4.6",
+        ] {
             for level in [Adaptive, Low, Medium, High] {
                 assert!(
                     validate_reasoning_mutation(model, level).is_ok(),
@@ -616,6 +620,7 @@ mod tests {
             default_level_for_model("xai-auth/grok-4.5-latest"),
             Some(High)
         );
+        assert_eq!(default_level_for_model("xai-auth/grok-4.6"), Some(High));
         assert_eq!(
             default_level_for_model("xai-auth/grok-4.20-multi-agent-0309"),
             Some(Adaptive)
@@ -638,6 +643,10 @@ mod tests {
     fn xai_options_derive_from_exact_capabilities() {
         assert_eq!(
             thinking_options_for_model("xai-auth/grok-4.5"),
+            vec!["adaptive", "low", "medium", "high"]
+        );
+        assert_eq!(
+            thinking_options_for_model("xai-auth/grok-4.6"),
             vec!["adaptive", "low", "medium", "high"]
         );
         assert_eq!(
@@ -673,6 +682,7 @@ mod tests {
         );
         // xAI: documented effort control / intrinsic / non-reasoning.
         assert_eq!(reasoning_type_for_model("xai-auth/grok-4.5"), "effort");
+        assert_eq!(reasoning_type_for_model("xai-auth/grok-4.6"), "effort");
         assert_eq!(reasoning_type_for_model("xai-auth/grok-4.3"), "intrinsic");
         assert_eq!(
             reasoning_type_for_model("xai-auth/grok-4.20-0309-non-reasoning"),

@@ -226,23 +226,37 @@ pub async fn run(
         (None, None) => None,
     };
 
-    // B3: token precedence — flag > file (read once, not in argv) > env.
-    let machine_token = match machine_token {
-        Some(t) => Some(t),
-        None => match machine_token_file {
-            Some(ref path) => Some(
-                std::fs::read_to_string(path)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "could not read --machine-token-file {}: {e}",
-                            path.display()
-                        )
-                    })?
-                    .trim()
-                    .to_string(),
-            ),
-            None => std::env::var("SYNAPS_BROKER_TOKEN").ok(),
-        },
+    // B3 (security): the raw `--machine-token` flag is REJECTED outright. A
+    // secret passed in argv is world-readable through `ps aux` and
+    // /proc/<pid>/cmdline for the whole life of the process, so any local user
+    // can lift the broker credential — which fronts OAuth tokens for every
+    // configured provider. The flag is still parsed so we can emit this
+    // migration error instead of clap's opaque "unexpected argument".
+    // Token sources are file > env only.
+    if machine_token.is_some() {
+        anyhow::bail!(
+            "--machine-token is no longer accepted: a token in argv is visible to every local \
+             user via `ps aux` and /proc/<pid>/cmdline, which leaks the broker credential.\n\
+             \n\
+             Use one of these instead:\n\
+             \x20 --machine-token-file <path>   (file readable only by this user)\n\
+             \x20 SYNAPS_BROKER_TOKEN=<token>   (environment variable)"
+        );
+    }
+
+    let machine_token = match machine_token_file {
+        Some(ref path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not read --machine-token-file {}: {e}",
+                        path.display()
+                    )
+                })?
+                .trim()
+                .to_string(),
+        ),
+        None => std::env::var("SYNAPS_BROKER_TOKEN").ok(),
     }
     .filter(|s| !s.trim().is_empty());
 
@@ -270,7 +284,7 @@ pub async fn run(
     // operator explicitly opts in.
     if machine_token.is_none() && !addr.ip().is_loopback() && !insecure_no_auth {
         anyhow::bail!(
-            "refusing to start: no machine token (set --machine-token / --machine-token-file / \
+            "refusing to start: no machine token (set --machine-token-file / \
              SYNAPS_BROKER_TOKEN) while bound to non-loopback {addr}. That would serve credentials \
              unauthenticated to the network. Pass --insecure-no-auth to override, or bind 127.0.0.1."
         );

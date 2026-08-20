@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
 mod cmd;
+#[cfg(unix)]
 mod watcher;
 
 // ── Allocator ────────────────────────────────────────────────────────────────
@@ -34,7 +35,7 @@ mod watcher;
 // or retained history. Gated to non-musl: musl's allocator already returns
 // memory readily, and the Pria agentic-VM runtime is a musl build we don't want
 // to perturb.
-#[cfg(not(target_env = "musl"))]
+#[cfg(all(unix, not(target_env = "musl")))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -52,7 +53,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // jemalloc reads the config from `_rjem_malloc_conf` — NOT `malloc_conf`. An
 // earlier revision exported the unmangled name, which jemalloc silently ignored
 // (verified: opt.dirty_decay_ms sat at the 10000ms default). Keep this mangled.
-#[cfg(not(target_env = "musl"))]
+#[cfg(all(unix, not(target_env = "musl")))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: &[u8] = b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
@@ -165,8 +166,9 @@ enum Command {
         /// Address to bind, e.g. `0.0.0.0:8181` or `127.0.0.1:8181`.
         #[arg(long, default_value = "127.0.0.1:8181")]
         bind: String,
-        /// Token clients must present (`Authorization: Bearer <token>`). Falls
-        /// back to `--machine-token-file`, then `SYNAPS_BROKER_TOKEN`.
+        /// REJECTED — a token in argv leaks via `ps aux` and
+        /// /proc/<pid>/cmdline. Use `--machine-token-file` or
+        /// `SYNAPS_BROKER_TOKEN`. Still parsed so we can emit a migration error.
         #[arg(long)]
         machine_token: Option<String>,
         /// Read the machine token from a file (avoids exposing it in argv/`ps`).

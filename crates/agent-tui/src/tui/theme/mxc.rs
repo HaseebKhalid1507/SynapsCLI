@@ -158,6 +158,7 @@ enum SocketDirTrust {
     Untrusted,
 }
 
+#[cfg(unix)]
 fn socket_dir_trust(sock: &std::path::Path) -> SocketDirTrust {
     use std::os::unix::fs::MetadataExt;
     let Some(dir) = sock.parent() else {
@@ -173,12 +174,27 @@ fn socket_dir_trust(sock: &std::path::Path) -> SocketDirTrust {
 /// Current uid without a libc dependency: owner of `/proc/self`, falling
 /// back to the owner of `$HOME`. Only reached when `XDG_RUNTIME_DIR` is
 /// unset, which is already an unusual session.
+#[cfg(unix)]
 fn uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self")
         .or_else(|_| std::fs::metadata(std::env::var_os("HOME").unwrap_or_else(|| "/".into())))
         .map(|m| m.uid())
         .unwrap_or(0)
+}
+
+/// Windows: Myx (a Linux compositor companion) is never present — treat the
+/// socket dir as missing so the client loop idles quietly.
+#[cfg(windows)]
+fn socket_dir_trust(_sock: &std::path::Path) -> SocketDirTrust {
+    SocketDirTrust::Missing
+}
+
+/// Windows: no uid concept in this context; the mxc socket path is never
+/// connected to (socket_dir_trust always returns Missing).
+#[cfg(windows)]
+fn uid() -> u32 {
+    0
 }
 
 /// Soft detection for the theme listing: is Myx plausibly present? True when
@@ -433,6 +449,7 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme
                     );
                 }
             }
+            #[cfg(unix)]
             SocketDirTrust::Trusted => {
                 if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
                     match run_session(stream, &tx, &mut backoff, &mut skew_warned).await {
@@ -441,6 +458,8 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme
                     }
                 }
             }
+            #[cfg(windows)]
+            SocketDirTrust::Trusted => unreachable!("socket_dir_trust never returns Trusted on Windows"),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_CAP);

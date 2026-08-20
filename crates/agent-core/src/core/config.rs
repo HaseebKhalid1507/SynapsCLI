@@ -1255,6 +1255,14 @@ pub fn is_favorite_model(id: &str) -> bool {
 /// Resolve the system prompt from CLI flag, config file, or default.
 /// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
 pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
+    #[cfg(windows)]
+    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal on Windows. \
+        You have access to powershell, bash, read, and write tools. \
+        Prefer the powershell tool for system commands and filesystem operations — it is native \
+        to Windows and avoids quoting/path translation issues. \
+        Use bash only when the task specifically requires WSL or a Unix environment. \
+        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
+    #[cfg(not(windows))]
     const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal. \
         You have access to bash, read, and write tools. \
         Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";

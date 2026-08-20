@@ -61,12 +61,10 @@ dirs               = "5"
 fs4                = "0.13"
 notify             = "6.1"
 globset            = "0.4"
-libc               = "0.2"
 zeroize            = "1.8.2"
 tempfile           = "3"
 
-# Signals / process
-signal-hook        = { version = "0.3", features = ["iterator"] }
+# Signals / process (Unix only — see [target.'cfg(unix)'.dependencies])
 
 # PTY / shell
 portable-pty       = "0.9"
@@ -87,6 +85,10 @@ arc-swap           = "1"
 # Test-support surface: offline Runtime construction for headless harnesses.
 # Never enabled in production builds; enabled by synaps-tui's `testing` feature.
 testing = []
+
+[target.'cfg(unix)'.dependencies]
+libc        = "0.2"
+signal-hook = { version = "0.3", features = ["iterator"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"

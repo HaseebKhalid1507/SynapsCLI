@@ -99,6 +99,8 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
         403 => format!("Access denied (HTTP 403{kind}). Your account may not have access to this model."),
         404 => format!("Model or endpoint not found (HTTP 404{kind}). Check the model name with /model."),
         413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),
+        400 if body_mentions(body, "Consumer Terms") =>
+            "Anthropic requires accepting updated Consumer Terms: sign in at claude.ai with this account, accept the terms, then retry.".to_string(),
         400 if body_mentions(body, "extended-cache-ttl") =>
             "Bad request (HTTP 400) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.".to_string(),
         400 if body_mentions(body, "prompt is too long") || body_mentions(body, "max_tokens") || body_mentions(body, "context") =>
