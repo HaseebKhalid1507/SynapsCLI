@@ -230,6 +230,15 @@ pub(crate) async fn call_oai_stream_inner(
     body.insert("model".to_string(), json!(cfg.model.clone()));
     body.insert("messages".to_string(), serde_json::to_value(oai_messages)?);
     body.insert("stream".to_string(), json!(true));
+    // ZDR: OpenAI's Zero Data Retention requires `store:false` on the wire.
+    // Chat Completions already defaults to false, but we assert it explicitly so the
+    // guarantee is provable in request logs (parity with the Codex Responses path,
+    // build_codex_body). Gated to api.openai.com (covers eu.api.openai.com) so we
+    // never send an unknown field to OpenAI-compatible providers that strict-validate
+    // the body (Groq/xAI/Google), mirroring the googleapis stream_options carve-out.
+    if cfg.base_url.contains("api.openai.com") {
+        body.insert("store".to_string(), json!(false));
+    }
     if let Some(stream_options) = stream_options {
         body.insert(
             "stream_options".to_string(),
