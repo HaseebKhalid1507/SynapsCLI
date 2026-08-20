@@ -656,7 +656,7 @@ pub(crate) async fn handle_animation_tick(
         // user disabled boot visuals (SYNAPS_NO_BOOT_FX=1), which also
         // freezes this gradient to stop per-frame redraws over slow links.
         || (app.transcript.is_empty()
-            && !std::env::var("SYNAPS_NO_BOOT_FX").map_or(false, |v| v == "1"))
+            && !std::env::var("SYNAPS_NO_BOOT_FX").is_ok_and(|v| v == "1"))
         || !app.subagents.is_empty()
     {
         app.request_redraw();
