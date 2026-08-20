@@ -92,6 +92,41 @@ fn append_bounded(output: &mut String, text: &str, max_output: usize) -> bool {
     }
 }
 
+/// Resolve the bash executable for the bash tool.
+///
+/// Unix: `bash` from PATH, as always. Windows: bash is usually NOT on PATH —
+/// prefer an explicit PATH hit, then Git Bash's known install locations, then
+/// WSL's `bash.exe` (runs inside the default distro) as a last resort.
+pub(crate) fn bash_program() -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        "bash".into()
+    }
+    #[cfg(windows)]
+    {
+        let on_path = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("bash.exe").is_file()))
+            .unwrap_or(false);
+        if on_path {
+            return "bash".into();
+        }
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(pf) = std::env::var_os(var) {
+                let candidate = std::path::Path::new(&pf).join(r"Git\bin\bash.exe");
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+        let wsl = std::path::Path::new(r"C:\Windows\System32\bash.exe");
+        if wsl.is_file() {
+            return wsl.as_os_str().to_os_string();
+        }
+        // Nothing found — let spawn fail with a readable NotFound error.
+        "bash".into()
+    }
+}
+
 pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
     // sudo normally opens /dev/tty for password input, bypassing our piped
     // stdin/stderr and corrupting the TUI. In the non-interactive bash tool,
@@ -104,6 +139,38 @@ pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
 }}
 {command}"#
     )
+}
+
+/// Resolve the PowerShell executable. Prefers pwsh (PowerShell 7+, the
+/// cross-platform build with sane defaults) and falls back to the
+/// Windows-bundled powershell.exe (5.1).
+#[cfg(windows)]
+pub(crate) fn powershell_program() -> std::ffi::OsString {
+    let on_path = |exe: &str| {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
+            .unwrap_or(false)
+    };
+    if on_path("pwsh.exe") {
+        return "pwsh".into();
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            let candidate = std::path::Path::new(&pf).join(r"PowerShell\7\pwsh.exe");
+            if candidate.is_file() {
+                return candidate.into_os_string();
+            }
+        }
+    }
+    // powershell.exe is always present on Windows (System32).
+    "powershell".into()
+}
+
+/// Unix stub — the powershell tool is only registered on Windows, so this is
+/// never called there; it exists so cross-compilation `cargo check` works.
+#[cfg(not(windows))]
+pub(crate) fn powershell_program() -> std::ffi::OsString {
+    "pwsh".into()
 }
 
 #[async_trait::async_trait]
@@ -148,9 +215,36 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let requested_timeout = params["timeout"]
-            .as_u64()
-            .unwrap_or(ctx.limits.bash_timeout);
+        let script = bash_script_with_secure_sudo(command);
+        run_shell_command(
+            &script,
+            ShellSpec::Bash,
+            params["timeout"].as_u64(),
+            ctx,
+        )
+        .await
+    }
+}
+
+/// Which shell backend the shared executor drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellSpec {
+    Bash,
+    PowerShell,
+}
+
+/// Shared execution core for bash + powershell: piped stdin/stdout/stderr,
+/// chunked streaming with byte-conservation accounting, secret-prompt
+/// interception, truncation, timeout. The only per-shell differences are
+/// which program is spawned and which args it takes.
+pub(crate) async fn run_shell_command(
+    script: &str,
+    spec: ShellSpec,
+    requested_timeout: Option<u64>,
+    ctx: ToolContext,
+) -> Result<String> {
+    {
+        let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
         // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
         // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
         let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
@@ -160,10 +254,14 @@ impl Tool for BashTool {
         };
         let max_output = ctx.limits.max_tool_buffer;
 
-        let script = bash_script_with_secure_sudo(command);
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg(&script)
+        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
+            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
+            ShellSpec::PowerShell => {
+                (powershell_program(), vec!["-NoProfile".into(), "-Command".into(), script.into()])
+            }
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -357,7 +455,7 @@ impl Tool for BashTool {
                         };
                         streamed_bytes += delta.len();
                         if !delta.is_empty() {
-                            let _ = txd.send(delta);
+                            txd.send(delta);
                         }
                     }
                 }
@@ -365,7 +463,7 @@ impl Tool for BashTool {
                 if !added_all {
                     full_output.push_str(&format!("\n\n[output truncated at {}]", max_output));
                     if let Some(ref txd) = ctx.channels.tx_delta {
-                        let _ = txd.send(format!("\n\n[output truncated at {}]", max_output));
+                        txd.send(format!("\n\n[output truncated at {}]", max_output));
                     }
                     truncated = true;
                     let _ = child.kill().await;

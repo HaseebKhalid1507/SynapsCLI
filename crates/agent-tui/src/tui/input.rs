@@ -71,6 +71,19 @@ pub(super) fn handle_event(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
+    // Key-release filter: Windows' console (and any terminal negotiating the
+    // kitty keyboard protocol) delivers BOTH Press and Release events for
+    // every keystroke; Unix legacy input delivers Press only. The chat
+    // textarea already ignores Release internally (tui-textarea), but the
+    // modal pane handlers below act on raw `Event::Key` — without this gate
+    // every keypress in /models, /settings, etc. fires twice on Windows.
+    // Repeat is deliberately kept (held-key navigation).
+    if let Event::Key(k) = &event {
+        if k.kind == crossterm::event::KeyEventKind::Release {
+            return InputAction::None;
+        }
+    }
+
     // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
     // `Chat` (empty stack) is the base pane; every modal + the folded-in
     // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.
@@ -1008,6 +1021,32 @@ mod tests {
         }
         assert!(app.models.is_none());
         assert_eq!(app.modal_stack.top(), PaneId::Chat);
+    }
+
+    /// Windows consoles and kitty-protocol terminals emit a Release event for
+    /// every key press. `handle_event` must drop Release events for ALL panes
+    /// (the chat textarea tolerates them, but modal pane handlers would act
+    /// twice — the "double-tap" navigation bug on Windows).
+    #[test]
+    fn key_release_events_are_dropped_in_models_pane() {
+        use crate::tui::focus::PaneId;
+        use crate::tui::models::ModelsModalState;
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        app.models = Some(ModelsModalState::new());
+        app.modal_stack.push(PaneId::Models);
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let release = Event::Key(crossterm::event::KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::empty(),
+        });
+        assert!(matches!(
+            handle_event(release, &mut app, &runtime, false, &registry, &keybinds, 3),
+            InputAction::None
+        ));
     }
 
     fn make_app() -> App {

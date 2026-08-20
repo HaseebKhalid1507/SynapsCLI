@@ -180,7 +180,10 @@ pub(crate) async fn run_setup(
     // on facts. Cloned because `term_caps` is also returned in `RunContext`.
     let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal, term_caps.clone());
     // Boot effect is sent via the command channel so the render thread owns it.
-    render_handle.send_boot_fx(boot_effect());
+    // SYNAPS_NO_BOOT_FX=1 skips it (slow/high-latency links, screen readers).
+    if std::env::var("SYNAPS_NO_BOOT_FX").map_or(true, |v| v != "1") {
+        render_handle.send_boot_fx(boot_effect());
+    }
 
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -225,7 +228,7 @@ pub(crate) async fn run_setup(
     // Track whether the render thread currently has an active boot or exit
     // effect.  The render thread owns the actual Effect values; we track
     // "has been sent and not yet done" on the main side for the tick throttle.
-    let boot_fx_sent = true; // boot_effect() is sent at startup above
+    let boot_fx_sent = std::env::var("SYNAPS_NO_BOOT_FX").map_or(true, |v| v != "1");
     let exit_fx_sent = false;
     let last_draw = Instant::now() - std::time::Duration::from_secs(1);
 
