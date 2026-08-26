@@ -140,6 +140,7 @@ pub(crate) fn lerp_theme(from: &Theme, to: &Theme, t: f32) -> Theme {
         border: c!(border),
         border_active: c!(border_active),
         muted: c!(muted),
+        system_msg: c!(system_msg),
         user_color: c!(user_color),
         user_bg: c!(user_bg),
         claude_label: c!(claude_label),
