@@ -254,7 +254,7 @@ impl Tool for SubagentStartTool {
                     // one-shots — paying the 1h write premium (~2× input price) on them
                     // is unrecoverable waste (~$0.23 per 10-spawn fan-out). (#110)
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
-                    runtime.set_system_prompt(system_prompt);
+                    runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model_a.clone());
                     runtime.set_tools(super::subagent_tools().await);
                     runtime.install_worker_orchestration(Arc::clone(
