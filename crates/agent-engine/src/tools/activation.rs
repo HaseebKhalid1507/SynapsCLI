@@ -533,8 +533,11 @@ pub enum ToolAuthorizationError {
     #[error("Tool call denied: tool is not activated for this session: {0}")]
     NotActivated(ToolId),
     /// The session tool set snapshot predates the current catalog
-    /// generation; it must be rebuilt deterministically, never silently
-    /// reused.
+    /// generation. NOTE: since the per-tool digest-validation fix,
+    /// generation drift alone is NO LONGER a denial reason at execution
+    /// time — [`ExecutionGate::authorize`] and [`route_session_set`] no
+    /// longer construct this variant. It is retained for API stability and
+    /// for any future caller that genuinely requires generation equality.
     #[error(
         "Tool call denied: session tool set generation {} is stale against catalog generation {}",
         set.value(),
@@ -567,9 +570,11 @@ pub enum ToolAuthorizationError {
 /// 1. resolve wire name → exact live `ToolId` (deterministic reverse
 ///    mapping; aliases cannot pick a different identity);
 /// 2. the identity must be cataloged;
-/// 3. the session tool set snapshot must match the catalog generation;
-/// 4. the identity must be core (pinned digest intact) or hold an exact
-///    session activation grant (session, tool, generation, digest);
+/// 3. the identity must be core (pinned digest intact) or hold an exact
+///    session activation grant covering (session, tool, digest) — see
+///    [`grant_covers_execution`]: catalog generation drift alone does NOT
+///    deny at execution time; only a real change to the called tool's
+///    record (digest, presence, provenance) does;
 /// 5. source trust is re-evaluated conservatively — see the honesty note
 ///    on [`check_source_trust`]: this re-checks typed source/provenance
 ///    consistency and denies Unknown/Unverified, but does NOT yet consult
@@ -603,6 +608,16 @@ impl ExecutionGate {
     /// acquired from the catalog record's factory and returned inside the
     /// typed [`AuthorizedToolCall`]. Failure acquires nothing and leaves the
     /// session set untouched (the gate never mutates it).
+    ///
+    /// SECURITY INVARIANT (per-tool digest validation): no tool executes
+    /// unless its CURRENT catalog record — presence of the exact `ToolId`,
+    /// schema digest, and source/trust provenance — exactly matches what
+    /// the session pinned at core-build/activation time. Catalog
+    /// generation inequality ALONE is no longer a denial reason at
+    /// execution time: an unrelated background mutation (e.g. a plugin
+    /// load mid-round) must not kill in-flight calls to byte-identical
+    /// tools. Any REAL drift of the called tool's record — changed digest,
+    /// removal, changed provenance — still denies typed and closed.
     pub fn authorize(
         catalog: &ToolCatalog,
         session: &SessionToolSet,
@@ -613,33 +628,51 @@ impl ExecutionGate {
             .get(&tool_id)
             .ok_or_else(|| ToolAuthorizationError::NotCataloged(tool_id.clone()))?;
 
-        // Snapshot-generation check first: a stale session set must be
-        // rebuilt deterministically, never consulted for grants.
-        if session.is_stale(catalog) {
-            return Err(ToolAuthorizationError::StaleSessionSet {
-                set: session.catalog_generation(),
-                catalog: catalog.generation(),
-            });
-        }
+        // Generation drift is observed (for logging) but NOT a wholesale
+        // denial: the per-tool checks below are unconditional and judge the
+        // called tool's CURRENT record against the session's pins. The
+        // round-top rebuild (runtime/stream.rs) still uses `is_stale` to
+        // refresh the set deterministically between rounds.
+        let generation_drift = session.is_stale(catalog);
 
         // Core status or exact activation grant, with pinned-digest
-        // verification either way.
+        // verification either way — unconditional, drift or not.
         let activation_basis;
         if let Some(pinned) = session.core_schema_digest(&tool_id) {
             if pinned != record.schema_digest() {
+                if generation_drift {
+                    tracing::warn!(
+                        tool = %tool_id,
+                        set_generation = session.catalog_generation().value(),
+                        catalog_generation = catalog.generation().value(),
+                        "tool denied under catalog generation drift: pinned core schema digest \
+                         no longer matches the current catalog record"
+                    );
+                }
                 return Err(ToolAuthorizationError::SchemaDigestMismatch(tool_id));
             }
             activation_basis = ActivationBasis::Core;
         } else if let Some(activated) = session.activation(&tool_id) {
             if activated.schema_digest() != record.schema_digest() {
+                if generation_drift {
+                    tracing::warn!(
+                        tool = %tool_id,
+                        set_generation = session.catalog_generation().value(),
+                        catalog_generation = catalog.generation().value(),
+                        "tool denied under catalog generation drift: activation grant schema \
+                         digest no longer matches the current catalog record"
+                    );
+                }
                 return Err(ToolAuthorizationError::SchemaDigestMismatch(tool_id));
             }
-            // Exact-tuple grant re-check (session, tool, generation,
-            // digest); any drift invalidates the grant.
-            if !activated.grant().covers(
+            // Execution-time grant re-check on the (session, tool, digest)
+            // tuple — deliberately WITHOUT the generation term (see
+            // `grant_covers_execution`). Grant ISSUANCE and activation stay
+            // generation-strict (`validate_grant`, `covers()`).
+            if !grant_covers_execution(
+                activated.grant(),
                 session.session().as_str(),
                 &tool_id,
-                catalog.generation(),
                 record.schema_digest(),
             ) {
                 return Err(ToolAuthorizationError::NotActivated(tool_id));
@@ -654,8 +687,20 @@ impl ExecutionGate {
         // Conservative source trust re-check immediately before
         // acquisition: typed source/provenance consistency only (see
         // check_source_trust) — live manifest permission/revocation state
-        // is not consulted here yet (Task 20).
+        // is not consulted here yet (Task 20). Unconditional: a tool
+        // removed and re-added under different provenance is caught here
+        // even when its schema digest is unchanged.
         check_source_trust(record)?;
+
+        if generation_drift {
+            tracing::warn!(
+                tool = %tool_id,
+                set_generation = session.catalog_generation().value(),
+                catalog_generation = catalog.generation().value(),
+                "tool call survived catalog generation drift: current record digest, presence \
+                 and provenance exactly match the session's pins"
+            );
+        }
 
         // Effect classes (Task 24) are execution-SCHEDULING policy, not
         // authorization policy: every class may execute once authorized —
@@ -686,6 +731,26 @@ impl ExecutionGate {
         let resolved = Self::resolve(registry, wire_name)?;
         Self::authorize(registry.catalog(), session, resolved)
     }
+}
+
+/// Execution-time grant coverage: (session, tool, digest) equality WITHOUT
+/// the generation term of [`SessionActivationGrant::covers`]. Rationale: at
+/// execution time the tool's identity and schema are already re-validated
+/// against the CURRENT catalog record, so requiring the pinned generation to
+/// equal the live one only makes unrelated catalog mutations (background
+/// plugin loads) kill in-flight calls to byte-identical tools. `covers()`
+/// itself (agent-core) stays exact-tuple and is still what grant ISSUANCE
+/// and activation validation (`validate_grant`) enforce — this relaxation
+/// applies ONLY to re-validation of an already-established authorization.
+fn grant_covers_execution(
+    grant: &SessionActivationGrant,
+    session_id: &str,
+    tool_id: &ToolId,
+    schema_digest: &SchemaDigest,
+) -> bool {
+    grant.session_id() == session_id
+        && grant.tool_id() == tool_id
+        && grant.schema_digest() == schema_digest
 }
 
 /// Conservative per-source trust policy — CONSISTENCY check, not a live
@@ -873,11 +938,20 @@ pub fn activate_model_initiated(
 /// Resolve the session tool set for the extension-provider route (Task 17,
 /// closing the Task 16 policy divergence): when the runtime threads its
 /// RETAINED per-stream set, the route consumes THAT set's current state —
-/// including exact activations — at its pinned generation. A stale retained
-/// set is DENIED typed (`StaleSessionSet`); the route must never silently
-/// mint a fresh default-core set for the same round. Only callers with no
-/// retained handle at all (internal/sync helpers) fall back to a fresh
-/// default-core set with zero activations under a locally minted session.
+/// including exact activations — at its pinned generation. The route must
+/// never silently mint a fresh default-core set for the same round. Only
+/// callers with no retained handle at all (internal/sync helpers) fall back
+/// to a fresh default-core set with zero activations under a locally minted
+/// session.
+///
+/// Generation drift is deliberately SURVIVED here (per-tool digest
+/// validation fix): the retained set is served as-is even when the catalog
+/// generation moved past its snapshot, because every actual execution still
+/// passes through [`ExecutionGate::authorize`], which unconditionally
+/// re-validates each called tool's current record (presence, digest,
+/// provenance) against the session's pins. Denying the whole retained set
+/// wholesale would let an unrelated background catalog mutation kill an
+/// entire in-flight round of byte-identical tools.
 pub fn route_session_set(
     retained: Option<&SharedSessionToolSet>,
     catalog: &ToolCatalog,
@@ -889,10 +963,12 @@ pub fn route_session_set(
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.is_stale(catalog) {
-                return Err(ToolAuthorizationError::StaleSessionSet {
-                    set: guard.catalog_generation(),
-                    catalog: catalog.generation(),
-                });
+                tracing::warn!(
+                    set_generation = guard.catalog_generation().value(),
+                    catalog_generation = catalog.generation().value(),
+                    "serving retained session tool set across catalog generation drift; \
+                     per-call ExecutionGate::authorize still protects execution"
+                );
             }
             Ok(guard.clone())
         }

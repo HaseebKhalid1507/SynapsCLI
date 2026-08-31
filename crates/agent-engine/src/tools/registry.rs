@@ -556,20 +556,23 @@ impl ToolRegistry {
     /// capability identity is core or exactly-activated in `session`,
     /// preserving cached byte ordering, API-safe names, and collision
     /// suffixes. Pure read: no catalog insertion, no schema rebuild, no
-    /// factory invocation, no process/network. Catalog generation drift or
-    /// a changed pinned schema digest fails typed instead of serving a
-    /// stale projection. Default runtime exposure (`tools_schema`) is
-    /// unaffected until Task 18 opts in.
+    /// factory invocation, no process/network. Default runtime exposure
+    /// (`tools_schema`) is unaffected until Task 18 opts in.
+    ///
+    /// Drift handling (per-tool digest validation fix): catalog generation
+    /// drift does NOT fail the whole projection — an unrelated background
+    /// mutation must not blank a session's entire tool schema. Instead the
+    /// projection is validated per tool: entries whose CURRENT catalog
+    /// record digest matches the session's pin are included; entries whose
+    /// record drifted (changed digest) or vanished (uncataloged) are
+    /// skipped with a warning — they would be denied by the execution gate
+    /// anyway, so advertising them would be dishonest. The typed
+    /// [`SessionSchemaError`] is retained for genuinely unprojectable
+    /// cases.
     pub fn session_tools_schema(
         &self,
         session: &crate::tools::activation::SessionToolSet,
     ) -> Result<Vec<Value>, SessionSchemaError> {
-        if session.is_stale(&self.catalog) {
-            return Err(SessionSchemaError::StaleSessionSet {
-                set: session.catalog_generation(),
-                catalog: self.catalog.generation(),
-            });
-        }
         let mut projected = Vec::new();
         for entry in self.cached_schema.iter() {
             let Some(api_name) = entry["name"].as_str() else {
@@ -586,12 +589,21 @@ impl ToolRegistry {
             let Some(pinned) = pinned else {
                 continue; // not part of this session's set — absent.
             };
-            let record = self
-                .catalog
-                .get(&id)
-                .ok_or_else(|| SessionSchemaError::NotCataloged(id.clone()))?;
+            let Some(record) = self.catalog.get(&id) else {
+                tracing::warn!(
+                    tool = %id,
+                    "session schema projection skips uncataloged session member \
+                     (removed since the session pinned it)"
+                );
+                continue;
+            };
             if pinned != record.schema_digest() {
-                return Err(SessionSchemaError::SchemaDigestMismatch(id));
+                tracing::warn!(
+                    tool = %id,
+                    "session schema projection skips drifted session member \
+                     (schema digest changed since the session pinned it)"
+                );
+                continue;
             }
             projected.push(entry.clone());
         }
@@ -621,7 +633,10 @@ impl ToolRegistry {
 }
 
 /// Typed failure for [`ToolRegistry::session_tools_schema`]. Metadata-only:
-/// bounded identities and generation counters, never schema bytes.
+/// bounded identities and generation counters, never schema bytes. Since the
+/// per-tool digest-validation fix the projection skips drifted/removed
+/// members instead of failing; these variants are retained for API
+/// stability and genuinely unprojectable future cases.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionSchemaError {
     #[error(

@@ -186,12 +186,29 @@ fn projection_never_mutates_default_full_schema_exposure() {
 }
 
 #[test]
-fn stale_session_set_fails_projection_typed() {
+fn drifted_session_set_projects_only_digest_matching_pins() {
     let mut registry = collision_registry();
     let set = SessionToolSet::default_core_for_catalog(session_id(), registry.catalog());
-    registry.register(Arc::new(NamedTool("late_tool")));
-
-    registry
+    let before = registry
         .session_tools_schema(&set)
-        .expect_err("stale set must fail projection");
+        .expect("fresh projection ok");
+
+    // Unrelated registration drifts the generation; the session's pinned
+    // members are untouched, so the projection survives and serves exactly
+    // the digest-matching pins — the late tool is absent (never pinned).
+    registry.register(Arc::new(NamedTool("late_tool")));
+    let after = registry
+        .session_tools_schema(&set)
+        .expect("drifted set still projects per-tool");
+    assert_eq!(
+        serde_json::to_vec(&after).expect("serializes"),
+        serde_json::to_vec(&before).expect("serializes"),
+        "projection across unrelated drift is byte-identical to the fresh one"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|s| s["name"].as_str() == Some("late_tool")),
+        "unpinned late registration must not appear in the session projection"
+    );
 }

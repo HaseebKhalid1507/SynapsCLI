@@ -788,7 +788,7 @@ fn activate_many_rejects_untrusted_source() {
 // ── Drift invalidation through the public surface ───────────────────────────
 
 #[test]
-fn catalog_generation_drift_invalidates_activation_and_projection() {
+fn catalog_generation_drift_keeps_unchanged_tools_but_blocks_new_grants() {
     let mut registry = fixture_registry();
     let mut set = minimal_set(&registry);
     activate_exact_for_user(&mut set, registry.catalog(), &ToolId::builtin("beta_tool"))
@@ -798,17 +798,17 @@ fn catalog_generation_drift_invalidates_activation_and_projection() {
     // Catalog mutation (dynamic registration) advances the generation.
     registry.register(Arc::new(FixtureTool::builtin("late_tool")));
 
-    let denial = ExecutionGate::authorize_wire_call(&registry, &set, "beta_tool")
-        .expect_err("stale set denies");
-    assert!(matches!(
-        denial,
-        ToolAuthorizationError::StaleSessionSet { .. }
-    ));
+    // Per-tool digest validation: the activated tool's current record is
+    // byte-identical, so execution and projection SURVIVE the unrelated
+    // drift (wholesale generation denial would kill the in-flight round).
+    ExecutionGate::authorize_wire_call(&registry, &set, "beta_tool")
+        .expect("unchanged activated tool survives unrelated drift");
     registry
         .session_tools_schema(&set)
-        .expect_err("stale set fails projection");
+        .expect("projection survives drift, serving only digest-matching pins");
 
-    // Fresh grants against the OLD generation cannot rescue a stale set.
+    // Grant issuance/activation stays generation-STRICT: fresh grants
+    // against the old snapshot cannot extend a drifted set.
     let err = activate_exact_for_user(&mut set, registry.catalog(), &ToolId::builtin("gamma_tool"))
         .expect_err("stale snapshot denies further activation");
     assert!(matches!(
@@ -822,7 +822,7 @@ fn catalog_generation_drift_invalidates_activation_and_projection() {
 // ── Extension-provider route threading ──────────────────────────────────────
 
 #[test]
-fn route_session_set_consumes_retained_set_and_denies_stale() {
+fn route_session_set_consumes_retained_set_and_survives_drift() {
     let mut registry = fixture_registry();
     let set = shared(minimal_set(&registry));
     activate_exact_for_user(
@@ -843,14 +843,16 @@ fn route_session_set_consumes_retained_set_and_denies_stale() {
     assert!(routed.activation(&ToolId::builtin("beta_tool")).is_some());
     ExecutionGate::authorize_wire_call(&registry, &routed, "beta_tool").expect("authorized");
 
-    // Retained + stale: DENY — never silently mint a fresh set mid-round.
+    // Retained + drifted: still served (never a fresh mid-round mint, never
+    // a wholesale kill) — per-call gate authorization is what protects
+    // execution, and it still passes for the byte-identical tool.
     registry.register(Arc::new(FixtureTool::builtin("late_tool")));
-    let err = route_session_set(Some(&set), registry.catalog(), session_id)
-        .expect_err("stale retained set denies");
-    assert!(matches!(
-        err,
-        ToolAuthorizationError::StaleSessionSet { .. }
-    ));
+    let routed = route_session_set(Some(&set), registry.catalog(), session_id)
+        .expect("drifted retained set is still served");
+    assert!(routed.is_stale(registry.catalog()));
+    assert!(routed.activation(&ToolId::builtin("beta_tool")).is_some());
+    ExecutionGate::authorize_wire_call(&registry, &routed, "beta_tool")
+        .expect("unchanged tool authorizes across drift");
 
     // No retained handle (internal callers): fail closed to a fresh
     // default-core set with zero activations, as before.
