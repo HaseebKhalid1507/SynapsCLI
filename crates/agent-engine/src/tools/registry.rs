@@ -497,6 +497,22 @@ impl ToolRegistry {
         self.catalog.set_generation_for_tests(generation);
     }
 
+    /// Boundary-test support: upsert one catalog record IN PLACE without
+    /// touching the live tool map — how a hostile/aberrant dynamic source
+    /// could replace a capability record behind a session's back. Doc-hidden
+    /// for the same reason as [`Self::resume_catalog_generation_for_tests`]:
+    /// integration tests run without a `testing` feature.
+    #[doc(hidden)]
+    pub fn upsert_catalog_record_for_tests(
+        &mut self,
+        replaced: Option<&crate::tools::catalog::ToolId>,
+        record: crate::tools::catalog::CapabilityRecord,
+    ) {
+        self.catalog
+            .upsert(replaced, record)
+            .expect("test upsert must be structurally valid");
+    }
+
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         let runtime_name = self
             .api_to_runtime_names
@@ -559,21 +575,22 @@ impl ToolRegistry {
     /// factory invocation, no process/network. Default runtime exposure
     /// (`tools_schema`) is unaffected until Task 18 opts in.
     ///
-    /// Drift handling (per-tool digest validation fix): catalog generation
-    /// drift does NOT fail the whole projection — an unrelated background
-    /// mutation must not blank a session's entire tool schema. Instead the
-    /// projection is validated per tool: entries whose CURRENT catalog
-    /// record digest matches the session's pin are included; entries whose
-    /// record drifted (changed digest) or vanished (uncataloged) are
-    /// skipped with a warning — they would be denied by the execution gate
-    /// anyway, so advertising them would be dishonest. The typed
-    /// [`SessionSchemaError`] is retained for genuinely unprojectable
-    /// cases.
+    /// Drift handling (per-tool digest + provenance validation fix): catalog
+    /// generation drift does NOT fail the whole projection — an unrelated
+    /// background mutation must not blank a session's entire tool schema.
+    /// Instead the projection is validated per tool: entries whose CURRENT
+    /// catalog record digest AND trust provenance match the session's pins
+    /// are included; entries whose record drifted (changed digest, changed
+    /// provenance — even an internally coherent one) or vanished
+    /// (uncataloged) are dropped fail-closed and REPORTED in the returned
+    /// [`SessionSchemaProjection::dropped`] list — they would be denied by
+    /// the execution gate anyway, so advertising them would be dishonest.
     pub fn session_tools_schema(
         &self,
         session: &crate::tools::activation::SessionToolSet,
-    ) -> Result<Vec<Value>, SessionSchemaError> {
+    ) -> SessionSchemaProjection {
         let mut projected = Vec::new();
+        let mut dropped = Vec::new();
         for entry in self.cached_schema.iter() {
             let Some(api_name) = entry["name"].as_str() else {
                 continue;
@@ -584,30 +601,49 @@ impl ToolRegistry {
             };
             let id = tool_id_for(tool.as_ref());
             let pinned = session
-                .core_schema_digest(&id)
-                .or_else(|| session.activation(&id).map(|a| a.schema_digest()));
-            let Some(pinned) = pinned else {
+                .core_pin(&id)
+                .map(|pin| (pin.schema_digest(), pin.provenance()))
+                .or_else(|| {
+                    session
+                        .activation(&id)
+                        .map(|a| (a.schema_digest(), a.provenance()))
+                });
+            let Some((pinned_digest, pinned_provenance)) = pinned else {
                 continue; // not part of this session's set — absent.
             };
             let Some(record) = self.catalog.get(&id) else {
                 tracing::warn!(
                     tool = %id,
-                    "session schema projection skips uncataloged session member \
+                    "session schema projection drops uncataloged session member \
                      (removed since the session pinned it)"
                 );
+                dropped.push((id, DroppedSessionMember::Uncataloged));
                 continue;
             };
-            if pinned != record.schema_digest() {
+            if pinned_digest != record.schema_digest() {
                 tracing::warn!(
                     tool = %id,
-                    "session schema projection skips drifted session member \
+                    "session schema projection drops drifted session member \
                      (schema digest changed since the session pinned it)"
                 );
+                dropped.push((id, DroppedSessionMember::SchemaDigestMismatch));
+                continue;
+            }
+            if pinned_provenance != record.provenance() {
+                tracing::warn!(
+                    tool = %id,
+                    "session schema projection drops drifted session member \
+                     (trust provenance changed since the session pinned it)"
+                );
+                dropped.push((id, DroppedSessionMember::ProvenanceMismatch));
                 continue;
             }
             projected.push(entry.clone());
         }
-        Ok(projected)
+        SessionSchemaProjection {
+            schema: projected,
+            dropped,
+        }
     }
 
     /// Return runtime names of tools owned by the given extension id, sorted ascending.
@@ -632,26 +668,31 @@ impl ToolRegistry {
     }
 }
 
-/// Typed failure for [`ToolRegistry::session_tools_schema`]. Metadata-only:
-/// bounded identities and generation counters, never schema bytes. Since the
-/// per-tool digest-validation fix the projection skips drifted/removed
-/// members instead of failing; these variants are retained for API
-/// stability and genuinely unprojectable future cases.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum SessionSchemaError {
-    #[error(
-        "session tool set generation {} is stale against catalog generation {}",
-        set.value(),
-        catalog.value()
-    )]
-    StaleSessionSet {
-        set: crate::tools::catalog::CatalogGeneration,
-        catalog: crate::tools::catalog::CatalogGeneration,
-    },
-    #[error("session member is not cataloged: {0}")]
-    NotCataloged(crate::tools::catalog::ToolId),
-    #[error("schema digest changed since the session pinned it: {0}")]
-    SchemaDigestMismatch(crate::tools::catalog::ToolId),
+/// Typed projection report for [`ToolRegistry::session_tools_schema`]: the
+/// projected schema entries PLUS every pinned session member that was
+/// dropped fail-closed, with the typed reason. Metadata-only reasons:
+/// bounded identities, never schema bytes. Callers can surface `dropped`
+/// for audit/telemetry instead of losing the signal to a log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSchemaProjection {
+    /// The entries served to the provider, in cached byte order.
+    pub schema: Vec<Value>,
+    /// Pinned session members excluded from the projection and why. A
+    /// dropped member's schema is NEVER served — the execution gate would
+    /// deny it anyway.
+    pub dropped: Vec<(crate::tools::catalog::ToolId, DroppedSessionMember)>,
+}
+
+/// Why a pinned session member was dropped from a schema projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DroppedSessionMember {
+    /// The member's `ToolId` is no longer in the catalog.
+    Uncataloged,
+    /// The current record's schema digest differs from the session's pin.
+    SchemaDigestMismatch,
+    /// The current record's trust provenance differs from the session's
+    /// pin (the coherent-imposter case).
+    ProvenanceMismatch,
 }
 
 /// Fail-closed message for infallible compatibility wrappers over typed

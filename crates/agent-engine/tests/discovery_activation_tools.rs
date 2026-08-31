@@ -336,9 +336,7 @@ async fn activate_tools_confirmed_exact_activation_leaves_siblings_denied() {
 
     // The session projection now contains the activated schema; the sibling
     // remains absent (also covered in session_schema_projection.rs).
-    let projection = registry
-        .session_tools_schema(&set.read().unwrap())
-        .expect("projection of fresh set succeeds");
+    let projection = registry.session_tools_schema(&set.read().unwrap()).schema;
     let names: Vec<&str> = projection
         .iter()
         .filter_map(|s| s["name"].as_str())
@@ -799,13 +797,15 @@ fn catalog_generation_drift_keeps_unchanged_tools_but_blocks_new_grants() {
     registry.register(Arc::new(FixtureTool::builtin("late_tool")));
 
     // Per-tool digest validation: the activated tool's current record is
-    // byte-identical, so execution and projection SURVIVE the unrelated
+    // schema-identical, so execution and projection SURVIVE the unrelated
     // drift (wholesale generation denial would kill the in-flight round).
     ExecutionGate::authorize_wire_call(&registry, &set, "beta_tool")
         .expect("unchanged activated tool survives unrelated drift");
-    registry
-        .session_tools_schema(&set)
-        .expect("projection survives drift, serving only digest-matching pins");
+    let report = registry.session_tools_schema(&set);
+    assert!(
+        report.dropped.is_empty(),
+        "projection survives unrelated drift, dropping nothing"
+    );
 
     // Grant issuance/activation stays generation-STRICT: fresh grants
     // against the old snapshot cannot extend a drifted set.
@@ -834,8 +834,7 @@ fn route_session_set_consumes_retained_set_and_survives_drift() {
 
     // Retained + fresh: the route receives the SAME set state/generation,
     // including the exact activation — not a fresh default-core mint.
-    let routed = route_session_set(Some(&set), registry.catalog(), session_id)
-        .expect("fresh retained set is used");
+    let routed = route_session_set(Some(&set), registry.catalog(), session_id);
     assert_eq!(
         routed.catalog_generation(),
         set.read().unwrap().catalog_generation()
@@ -845,10 +844,9 @@ fn route_session_set_consumes_retained_set_and_survives_drift() {
 
     // Retained + drifted: still served (never a fresh mid-round mint, never
     // a wholesale kill) — per-call gate authorization is what protects
-    // execution, and it still passes for the byte-identical tool.
+    // execution, and it still passes for the schema-identical tool.
     registry.register(Arc::new(FixtureTool::builtin("late_tool")));
-    let routed = route_session_set(Some(&set), registry.catalog(), session_id)
-        .expect("drifted retained set is still served");
+    let routed = route_session_set(Some(&set), registry.catalog(), session_id);
     assert!(routed.is_stale(registry.catalog()));
     assert!(routed.activation(&ToolId::builtin("beta_tool")).is_some());
     ExecutionGate::authorize_wire_call(&registry, &routed, "beta_tool")
@@ -856,8 +854,7 @@ fn route_session_set_consumes_retained_set_and_survives_drift() {
 
     // No retained handle (internal callers): fail closed to a fresh
     // default-core set with zero activations, as before.
-    let fallback =
-        route_session_set(None, registry.catalog(), session_id).expect("fallback minted");
+    let fallback = route_session_set(None, registry.catalog(), session_id);
     assert_eq!(fallback.activated().count(), 0);
     assert!(!fallback.is_stale(registry.catalog()));
 }

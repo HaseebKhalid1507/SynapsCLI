@@ -230,7 +230,7 @@ fn dormant_extension_tools_are_searchable_gated_and_never_spawn() {
     );
     let projected: Vec<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();

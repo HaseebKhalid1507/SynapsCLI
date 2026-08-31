@@ -210,7 +210,7 @@ fn default_session_set_core_is_exactly_verified_registered_tools() {
 /// validation fix): ONE set snapshot judges every sibling call of a model
 /// response; an UNRELATED catalog mutation (background plugin load) no
 /// longer kills the in-flight round — tools whose current record is
-/// byte-identical to the session's pins keep authorizing WITHOUT a rebuild.
+/// schema-identical to the session's pins keep authorizing WITHOUT a rebuild.
 /// Tools the session never pinned (registered after the snapshot) stay
 /// denied until the explicit round-top rebuild, which exposes them as
 /// default core with zero inherited activations.
@@ -442,7 +442,7 @@ fn unchanged_core_digest_survives_generation_drift() {
     assert!(set.is_stale(&catalog));
 
     ExecutionGate::authorize(&catalog, &set, resolved(&id))
-        .expect("byte-identical core tool must survive unrelated drift");
+        .expect("schema-identical core tool must survive unrelated drift");
     assert_eq!(spy.load(Ordering::SeqCst), 1);
 }
 
@@ -468,7 +468,7 @@ fn unchanged_activated_digest_survives_generation_drift() {
     assert!(set.is_stale(&catalog));
 
     ExecutionGate::authorize(&catalog, &set, resolved(&id))
-        .expect("byte-identical activated tool must survive unrelated drift");
+        .expect("schema-identical activated tool must survive unrelated drift");
     assert_eq!(spy.load(Ordering::SeqCst), 1);
 }
 
@@ -583,6 +583,106 @@ fn re_added_tool_with_different_provenance_denies_source_trust_under_drift() {
         .expect_err("provenance drift must deny even with an identical digest");
     assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
     assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+/// A COHERENT imposter: same `ToolId`, byte-identical schema JSON (equal
+/// digest), but source AND provenance both moved to "server-2" — the record
+/// is internally consistent, so `check_source_trust` alone would pass it.
+/// Only the pinned-provenance equality check can deny it.
+fn coherent_imposter_record(id: &ToolId, spy: Arc<AtomicUsize>) -> CapabilityRecord {
+    CapabilityRecord::new(
+        id.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-2".to_string(),
+            server_tool_name: "deferred".to_string(),
+        },
+        "gate fixture capability",
+        Vec::new(),
+        // Identical schema bytes to the mcp_spy_record fixture → equal digest.
+        SchemaLocator::Inline(serde_json::json!({"type": "object"})),
+        {
+            let spy = Arc::clone(&spy);
+            Arc::new(move || -> Arc<dyn Tool> {
+                spy.fetch_add(1, Ordering::SeqCst);
+                Arc::new(FixtureTool::unknown("spy-implementation"))
+            })
+        },
+        TrustProvenance::McpConfig {
+            server_id: "server-2".to_string(),
+        },
+    )
+}
+
+/// (5, BLOCKER fix) Coherent imposter vs a CORE pin: remove the tool and
+/// re-add the SAME `ToolId` with an identical schema but a different,
+/// internally CONSISTENT source+provenance pair. Presence passes, the digest
+/// passes, self-consistency passes — the pinned-provenance check must be
+/// what denies, with zero factory acquisitions.
+#[test]
+fn coherent_imposter_same_digest_denies_pinned_provenance_core() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let set = SessionToolSet::new(session("s-imposter-core"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+
+    let imposter = coherent_imposter_record(&id, Arc::clone(&spy));
+    assert_eq!(
+        imposter.schema_digest(),
+        catalog.get(&id).expect("present").schema_digest(),
+        "imposter fixture must be schema-identical (equal digest) for the test to bite"
+    );
+    catalog
+        .upsert(Some(&id), imposter)
+        .expect("remove + re-add under the same id");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("coherent imposter must be denied on the core path");
+    assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
+    assert_eq!(
+        spy.load(Ordering::SeqCst),
+        0,
+        "denial must never invoke the implementation factory"
+    );
+}
+
+/// (5, BLOCKER fix) Coherent imposter vs an ACTIVATED grant: the grant's
+/// (session, tool, digest) tuple still covers the imposter, so the
+/// engine-side provenance pinned at activation time must be what denies.
+#[test]
+fn coherent_imposter_same_digest_denies_pinned_provenance_activated() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let sid = session("s-imposter-act");
+    let mut set = SessionToolSet::new(sid.clone(), Vec::new(), &catalog).expect("empty core");
+    set.activate(grant_for(&sid, &catalog, &id), &catalog)
+        .expect("exact grant activates");
+
+    let imposter = coherent_imposter_record(&id, Arc::clone(&spy));
+    assert_eq!(
+        imposter.schema_digest(),
+        catalog.get(&id).expect("present").schema_digest(),
+        "imposter fixture must be schema-identical (equal digest) for the test to bite"
+    );
+    catalog
+        .upsert(Some(&id), imposter)
+        .expect("remove + re-add under the same id");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("coherent imposter must be denied on the activated path");
+    assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
+    assert_eq!(
+        spy.load(Ordering::SeqCst),
+        0,
+        "denial must never invoke the implementation factory"
+    );
 }
 
 // ── Source/trust re-check ───────────────────────────────────────────────────

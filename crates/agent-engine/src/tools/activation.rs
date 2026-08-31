@@ -41,10 +41,15 @@ pub enum RuntimeLease {
 
 /// One exact activation held by a session: the validated grant plus lease
 /// placeholder metadata. The grant carries the pinned catalog generation and
-/// schema digest.
+/// schema digest; the trust provenance of the catalog record is pinned
+/// engine-side at activation time (the grant type in agent-core is
+/// deliberately untouched) so execution can detect a record that was
+/// removed and re-added under a different — even internally coherent —
+/// source/provenance.
 #[derive(Clone, Debug)]
 pub struct ActivatedTool {
     grant: SessionActivationGrant,
+    provenance: TrustProvenance,
     lease: RuntimeLease,
 }
 
@@ -55,6 +60,11 @@ impl ActivatedTool {
 
     pub fn schema_digest(&self) -> &SchemaDigest {
         self.grant.schema_digest()
+    }
+
+    /// The trust provenance of the catalog record at activation time.
+    pub fn provenance(&self) -> &TrustProvenance {
+        &self.provenance
     }
 
     pub fn catalog_generation(&self) -> CatalogGeneration {
@@ -116,15 +126,38 @@ pub enum ActivationError {
     },
 }
 
+/// Per-tool pins captured when a core tool enters a session's set: the
+/// schema digest AND the trust provenance of the catalog record at build
+/// time. Pinning provenance (not just the digest) closes the coherent-
+/// imposter hole: a tool removed and re-added under the SAME `ToolId` with a
+/// schema-identical body but a different, internally consistent
+/// source/provenance must still be denied at execution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorePin {
+    schema_digest: SchemaDigest,
+    provenance: TrustProvenance,
+}
+
+impl CorePin {
+    pub fn schema_digest(&self) -> &SchemaDigest {
+        &self.schema_digest
+    }
+
+    pub fn provenance(&self) -> &TrustProvenance {
+        &self.provenance
+    }
+}
+
 /// The small configured core set plus exact activated deferred tools for one
 /// session, pinned to the catalog generation it was built against. Core
-/// tools are pinned with the schema digest of their catalog record at build
-/// time, so later drift is detectable per tool, not just per generation.
+/// tools are pinned with the schema digest AND trust provenance of their
+/// catalog record at build time, so later drift is detectable per tool, not
+/// just per generation.
 #[derive(Clone, Debug)]
 pub struct SessionToolSet {
     session: SessionId,
     catalog_generation: CatalogGeneration,
-    core: BTreeMap<ToolId, SchemaDigest>,
+    core: BTreeMap<ToolId, CorePin>,
     activated: BTreeMap<ToolId, ActivatedTool>,
     /// Session schema-generation counter (spec §7.7): advances by exactly
     /// one for every successful nonempty activation batch (a single
@@ -136,8 +169,9 @@ pub struct SessionToolSet {
 impl SessionToolSet {
     /// Build a fresh set for one session. Every configured core id must
     /// exist in the catalog (typed failure otherwise) and its schema digest
-    /// is pinned from the catalog record; the set starts with zero
-    /// activations — nothing is inherited from any other session.
+    /// AND trust provenance are pinned from the catalog record; the set
+    /// starts with zero activations — nothing is inherited from any other
+    /// session.
     pub fn new(
         session: SessionId,
         core: impl IntoIterator<Item = ToolId>,
@@ -148,7 +182,13 @@ impl SessionToolSet {
             let Some(record) = catalog.get(&id) else {
                 return Err(SessionToolSetError::UnknownCoreTool(id));
             };
-            validated.insert(id, record.schema_digest().clone());
+            validated.insert(
+                id,
+                CorePin {
+                    schema_digest: record.schema_digest().clone(),
+                    provenance: record.provenance().clone(),
+                },
+            );
         }
         Ok(Self {
             session,
@@ -248,6 +288,12 @@ impl SessionToolSet {
     /// The schema digest pinned for a configured core tool at build time,
     /// or `None` when the id is not in this session's core set.
     pub fn core_schema_digest(&self, id: &ToolId) -> Option<&SchemaDigest> {
+        self.core.get(id).map(CorePin::schema_digest)
+    }
+
+    /// The full (digest, provenance) pin for a configured core tool, or
+    /// `None` when the id is not in this session's core set.
+    pub fn core_pin(&self, id: &ToolId) -> Option<&CorePin> {
         self.core.get(id)
     }
 
@@ -335,10 +381,16 @@ impl SessionToolSet {
         catalog: &ToolCatalog,
     ) -> Result<(), ActivationError> {
         self.validate_grant(&grant, catalog)?;
+        let provenance = catalog
+            .get(grant.tool_id())
+            .expect("validate_grant verified the record exists")
+            .provenance()
+            .clone();
         self.activated.insert(
             grant.tool_id().clone(),
             ActivatedTool {
                 grant,
+                provenance,
                 lease: RuntimeLease::NotAcquired,
             },
         );
@@ -392,10 +444,16 @@ impl SessionToolSet {
         ordered.sort_by(|a, b| a.tool_id().cmp(b.tool_id()));
         let applied = ordered.len();
         for grant in ordered {
+            let provenance = catalog
+                .get(grant.tool_id())
+                .expect("validate_grant verified the record exists")
+                .provenance()
+                .clone();
             self.activated.insert(
                 grant.tool_id().clone(),
                 ActivatedTool {
                     grant,
+                    provenance,
                     lease: RuntimeLease::NotAcquired,
                 },
             );
@@ -532,21 +590,6 @@ pub enum ToolAuthorizationError {
     /// exact activation grant (the forged deferred-call case).
     #[error("Tool call denied: tool is not activated for this session: {0}")]
     NotActivated(ToolId),
-    /// The session tool set snapshot predates the current catalog
-    /// generation. NOTE: since the per-tool digest-validation fix,
-    /// generation drift alone is NO LONGER a denial reason at execution
-    /// time — [`ExecutionGate::authorize`] and [`route_session_set`] no
-    /// longer construct this variant. It is retained for API stability and
-    /// for any future caller that genuinely requires generation equality.
-    #[error(
-        "Tool call denied: session tool set generation {} is stale against catalog generation {}",
-        set.value(),
-        catalog.value()
-    )]
-    StaleSessionSet {
-        set: CatalogGeneration,
-        catalog: CatalogGeneration,
-    },
     /// The capability's current schema digest differs from the digest the
     /// session pinned at core-build/activation time — a changed tool is
     /// never silently blessed.
@@ -557,9 +600,13 @@ pub enum ToolAuthorizationError {
     /// policy exists.
     #[error("Tool call denied: source provenance is unverified: {0}")]
     UntrustedSource(ToolId),
-    /// The catalog record's source and trust provenance disagree — an
-    /// internally inconsistent record must never authorize.
-    #[error("Tool call denied: catalog source and trust provenance disagree: {0}")]
+    /// Source/trust provenance failure: either the catalog record's source
+    /// and trust provenance disagree (an internally inconsistent record must
+    /// never authorize), or the record's CURRENT provenance differs from the
+    /// provenance the session pinned at core-build/activation time (a tool
+    /// removed and re-added under a different — even internally coherent —
+    /// provenance must never authorize).
+    #[error("Tool call denied: source/trust provenance is inconsistent or drifted from the session's pin: {0}")]
     SourceProvenanceMismatch(ToolId),
 }
 
@@ -575,6 +622,10 @@ pub enum ToolAuthorizationError {
 ///    [`grant_covers_execution`]: catalog generation drift alone does NOT
 ///    deny at execution time; only a real change to the called tool's
 ///    record (digest, presence, provenance) does;
+/// 4. the record's CURRENT trust provenance must equal the provenance the
+///    session PINNED at core-build/activation time — this closes the
+///    coherent-imposter hole (same `ToolId`, schema-identical body,
+///    different but internally consistent source/provenance);
 /// 5. source trust is re-evaluated conservatively — see the honesty note
 ///    on [`check_source_trust`]: this re-checks typed source/provenance
 ///    consistency and denies Unknown/Unverified, but does NOT yet consult
@@ -609,15 +660,23 @@ impl ExecutionGate {
     /// typed [`AuthorizedToolCall`]. Failure acquires nothing and leaves the
     /// session set untouched (the gate never mutates it).
     ///
-    /// SECURITY INVARIANT (per-tool digest validation): no tool executes
-    /// unless its CURRENT catalog record — presence of the exact `ToolId`,
-    /// schema digest, and source/trust provenance — exactly matches what
-    /// the session pinned at core-build/activation time. Catalog
-    /// generation inequality ALONE is no longer a denial reason at
+    /// SECURITY INVARIANT (per-tool digest + provenance validation): no
+    /// tool executes unless its CURRENT catalog record — presence of the
+    /// exact `ToolId`, schema digest, and source/trust provenance — exactly
+    /// matches what the session pinned at core-build/activation time.
+    /// Catalog generation inequality ALONE is no longer a denial reason at
     /// execution time: an unrelated background mutation (e.g. a plugin
-    /// load mid-round) must not kill in-flight calls to byte-identical
+    /// load mid-round) must not kill in-flight calls to schema-identical
     /// tools. Any REAL drift of the called tool's record — changed digest,
-    /// removal, changed provenance — still denies typed and closed.
+    /// removal, changed provenance (even to an internally coherent one) —
+    /// still denies typed and closed.
+    ///
+    /// ACCEPTED RESIDUAL RISK: [`SchemaDigest`] hashes the schema JSON
+    /// only, not the implementation factory. A record replaced in place
+    /// with an identical schema AND identical pinned provenance but a
+    /// different implementation passes this gate; the exposure is bounded
+    /// by the deterministic round-top rebuild (runtime/stream.rs), which
+    /// re-pins the set against the current catalog between provider rounds.
     pub fn authorize(
         catalog: &ToolCatalog,
         session: &SessionToolSet,
@@ -636,10 +695,13 @@ impl ExecutionGate {
         let generation_drift = session.is_stale(catalog);
 
         // Core status or exact activation grant, with pinned-digest
-        // verification either way — unconditional, drift or not.
+        // verification either way — unconditional, drift or not. The pinned
+        // trust provenance is carried out of each branch for the
+        // unconditional pinned-provenance check below.
         let activation_basis;
-        if let Some(pinned) = session.core_schema_digest(&tool_id) {
-            if pinned != record.schema_digest() {
+        let pinned_provenance: &TrustProvenance;
+        if let Some(pin) = session.core_pin(&tool_id) {
+            if pin.schema_digest() != record.schema_digest() {
                 if generation_drift {
                     tracing::warn!(
                         tool = %tool_id,
@@ -651,6 +713,7 @@ impl ExecutionGate {
                 }
                 return Err(ToolAuthorizationError::SchemaDigestMismatch(tool_id));
             }
+            pinned_provenance = pin.provenance();
             activation_basis = ActivationBasis::Core;
         } else if let Some(activated) = session.activation(&tool_id) {
             if activated.schema_digest() != record.schema_digest() {
@@ -677,6 +740,7 @@ impl ExecutionGate {
             ) {
                 return Err(ToolAuthorizationError::NotActivated(tool_id));
             }
+            pinned_provenance = activated.provenance();
             activation_basis = ActivationBasis::Exact {
                 catalog_generation: activated.catalog_generation(),
             };
@@ -684,12 +748,32 @@ impl ExecutionGate {
             return Err(ToolAuthorizationError::NotActivated(tool_id));
         }
 
+        // Unconditional pinned-provenance equality (BLOCKER fix): the
+        // record's CURRENT trust provenance must equal the provenance the
+        // session pinned at core-build/activation time. This — not the
+        // self-consistency check below — is what catches the coherent
+        // imposter: a tool removed and re-added under the same `ToolId`
+        // with a schema-identical body but a different, internally
+        // consistent source/provenance pair.
+        if pinned_provenance != record.provenance() {
+            if generation_drift {
+                tracing::warn!(
+                    tool = %tool_id,
+                    set_generation = session.catalog_generation().value(),
+                    catalog_generation = catalog.generation().value(),
+                    "tool denied under catalog generation drift: current record provenance \
+                     no longer matches the provenance the session pinned"
+                );
+            }
+            return Err(ToolAuthorizationError::SourceProvenanceMismatch(tool_id));
+        }
+
         // Conservative source trust re-check immediately before
-        // acquisition: typed source/provenance consistency only (see
-        // check_source_trust) — live manifest permission/revocation state
-        // is not consulted here yet (Task 20). Unconditional: a tool
-        // removed and re-added under different provenance is caught here
-        // even when its schema digest is unchanged.
+        // acquisition: typed source/provenance SELF-consistency plus the
+        // deny-by-default for Unknown/Unverified (see check_source_trust) —
+        // live manifest permission/revocation state is not consulted here
+        // yet (Task 20). This complements (does not replace) the
+        // pinned-provenance equality above.
         check_source_trust(record)?;
 
         if generation_drift {
@@ -738,7 +822,7 @@ impl ExecutionGate {
 /// execution time the tool's identity and schema are already re-validated
 /// against the CURRENT catalog record, so requiring the pinned generation to
 /// equal the live one only makes unrelated catalog mutations (background
-/// plugin loads) kill in-flight calls to byte-identical tools. `covers()`
+/// plugin loads) kill in-flight calls to schema-identical tools. `covers()`
 /// itself (agent-core) stays exact-tuple and is still what grant ISSUANCE
 /// and activation validation (`validate_grant`) enforce — this relaxation
 /// applies ONLY to re-validation of an already-established authorization.
@@ -951,12 +1035,13 @@ pub fn activate_model_initiated(
 /// re-validates each called tool's current record (presence, digest,
 /// provenance) against the session's pins. Denying the whole retained set
 /// wholesale would let an unrelated background catalog mutation kill an
-/// entire in-flight round of byte-identical tools.
+/// entire in-flight round of schema-identical tools. Infallible: neither
+/// path can be denied anymore, so the return type is the plain set.
 pub fn route_session_set(
     retained: Option<&SharedSessionToolSet>,
     catalog: &ToolCatalog,
     fallback_session: impl FnOnce() -> SessionId,
-) -> Result<SessionToolSet, ToolAuthorizationError> {
+) -> SessionToolSet {
     match retained {
         Some(shared) => {
             let guard = shared
@@ -970,11 +1055,8 @@ pub fn route_session_set(
                      per-call ExecutionGate::authorize still protects execution"
                 );
             }
-            Ok(guard.clone())
+            guard.clone()
         }
-        None => Ok(SessionToolSet::default_core_for_catalog(
-            fallback_session(),
-            catalog,
-        )),
+        None => SessionToolSet::default_core_for_catalog(fallback_session(), catalog),
     }
 }
