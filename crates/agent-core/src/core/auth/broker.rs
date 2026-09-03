@@ -1724,6 +1724,33 @@ async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<String,
         .map_err(|_| BrokerError::Transport("response body was not valid UTF-8".into()))
 }
 
+/// Cap on how much of a non-2xx upstream body is read for *classification*
+/// only (spec §5.1). Error envelopes are tiny; anything larger is cut off
+/// and simply fails to classify.
+const MAX_PROXY_ERROR_CLASSIFY_BYTES: usize = 8 * 1024;
+
+/// Read at most `cap` bytes of an untrusted error body for classification.
+/// Never fails: overflow truncates (so JSON no longer parses → no label),
+/// transport errors and non-UTF-8 yield `None`. The returned text must only
+/// ever be fed to a vetted classifier — never to an error string or log.
+async fn read_error_body_for_classification(resp: reqwest::Response, cap: usize) -> Option<String> {
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(1024));
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        let room = cap.saturating_sub(buf.len());
+        if chunk.len() >= room {
+            buf.extend_from_slice(&chunk[..room]);
+            // Drop the rest unread: truncated JSON cannot classify, which is
+            // the intended fail-closed outcome for oversized bodies.
+            return String::from_utf8(buf).ok();
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// Legacy discovery for a static key: login config first, then env vars.
 /// Only callable from inside the broker boundary.
 fn discover_legacy_static_key(spec: &StaticProviderSpec) -> Option<String> {
@@ -1886,14 +1913,27 @@ impl CredentialBroker for LocalBroker {
         let status = resp.status();
         if !status.is_success() {
             // Spec §5.1: the upstream may echo the full request (prompts,
-            // tool schemas, credentials) in its error body. Drop the body
-            // unread — only the typed status reaches the error. The stable
-            // `provider request failed: {status}` prefix (with canonical
-            // reason phrase, e.g. `429 Too Many Requests`) is the transport
-            // contract engine-side classifiers parse.
-            drop(resp);
+            // tool schemas, credentials) in its error body. The body is read
+            // (bounded) for *classification only*: it selects one of OUR
+            // static labels or nothing — no provider bytes reach the error
+            // or the log. The stable `provider request failed: {status}`
+            // prefix (with canonical reason phrase, e.g. `429 Too Many
+            // Requests`) is the transport contract engine-side classifiers
+            // parse; the optional ` [label]` suffix follows it and contains
+            // no ':' so `redact_provider_proxy_error` keeps it intact.
+            let label = read_error_body_for_classification(resp, MAX_PROXY_ERROR_CLASSIFY_BYTES)
+                .await
+                .as_deref()
+                .and_then(crate::error::vetted_proxy_error_label);
+            tracing::warn!(
+                provider = %request.provider,
+                status = status.as_u16(),
+                label = label.unwrap_or("-"),
+                "provider request failed"
+            );
+            let label_suffix = label.map(|l| format!(" [{l}]")).unwrap_or_default();
             return Err(BrokerError::Transport(format!(
-                "provider request failed: {status}"
+                "provider request failed: {status}{label_suffix}"
             )));
         }
         use futures::StreamExt;
@@ -3328,6 +3368,148 @@ mod tests {
             "escapes must not reach errors: {msg}"
         );
         assert_no_hostile_bytes(&msg);
+    }
+
+    /// Drive `proxy_stream` against an upstream that answers `/chat/completions`
+    /// with `status` + `body`, returning the Transport error message.
+    async fn stream_error_message(status: axum::http::StatusCode, body: String) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move || async move { (status, body) }),
+        );
+        let url = spawn_upstream(app).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url);
+        let err = broker
+            .proxy_stream(ProxyRequest {
+                provider: LOCAL_PROVIDER_KEY.into(),
+                method: ProxyMethod::Post,
+                path: "/chat/completions".into(),
+                body: None,
+                stream: true,
+                body_bytes: None,
+            })
+            .await
+            .err()
+            .expect("non-2xx upstream must not yield a stream");
+        assert!(matches!(err, BrokerError::Transport(_)));
+        format!("{err}")
+    }
+
+    /// Everything after the `provider request failed: ` marker.
+    fn after_marker(msg: &str) -> &str {
+        let marker = "provider request failed: ";
+        let idx = msg.find(marker).expect("marker present");
+        &msg[idx + marker.len()..]
+    }
+
+    /// Kimi Code weekly-quota 403: the vetted `access_terminated_error`
+    /// class is surfaced as OUR static label so callers can tell quota
+    /// exhaustion from an auth failure — while none of the body's text
+    /// reaches the error, and the suffix stays ':'-free so engine-side
+    /// `redact_provider_proxy_error` / `broker_error_status` keep parsing.
+    #[tokio::test]
+    async fn local_broker_stream_403_kimi_quota_surfaces_vetted_label_only() {
+        let kimi_body = "{\"error\":{\"type\":\"access_terminated_error\",\"message\":\
+                         \"You've reached your weekly (7-day) usage limit. Your quota will \
+                         reset when the current 7-day window ends. \"}}";
+        let msg = stream_error_message(axum::http::StatusCode::FORBIDDEN, kimi_body.into()).await;
+        assert!(
+            msg.ends_with("provider request failed: 403 Forbidden [access_terminated_error]"),
+            "expected exact labelled prefix: {msg}"
+        );
+        assert!(!msg.contains("weekly"), "body text leaked: {msg}");
+        assert!(!msg.contains("quota"), "body text leaked: {msg}");
+        assert!(!msg.contains('{'), "raw JSON leaked: {msg}");
+        assert!(
+            !after_marker(&msg).contains(':'),
+            "suffix must not contain ':' (engine truncates there): {msg}"
+        );
+    }
+
+    /// Hostile/unvetted `error.type` never becomes a label and its bytes
+    /// never reach the error.
+    #[tokio::test]
+    async fn local_broker_stream_429_unvetted_type_yields_no_label() {
+        let body = format!(
+            "{{\"error\":{{\"type\":\"<script>ECHO:secret\",\"message\":\"ECHOED {HOSTILE_SENTINEL}\"}}}}"
+        );
+        let msg = stream_error_message(axum::http::StatusCode::TOO_MANY_REQUESTS, body).await;
+        assert!(
+            msg.ends_with("provider request failed: 429 Too Many Requests"),
+            "no label expected: {msg}"
+        );
+        assert!(!msg.contains('['), "unexpected label: {msg}");
+        assert!(!msg.contains("script"), "hostile type leaked: {msg}");
+        assert!(!msg.contains("secret"), "hostile type leaked: {msg}");
+        assert!(!after_marker(&msg).contains(':'), "got: {msg}");
+        assert_no_hostile_bytes(&msg);
+    }
+
+    /// Non-JSON (HTML) error page → no label, no leak.
+    #[tokio::test]
+    async fn local_broker_stream_html_body_yields_no_label() {
+        let body =
+            format!("<html><body>ECHOED {HOSTILE_SENTINEL} access_terminated_error</body></html>");
+        let msg = stream_error_message(axum::http::StatusCode::BAD_GATEWAY, body).await;
+        assert!(
+            msg.ends_with("provider request failed: 502 Bad Gateway"),
+            "no label expected: {msg}"
+        );
+        assert!(!msg.contains("html"), "body leaked: {msg}");
+        assert!(!msg.contains('['), "unexpected label: {msg}");
+        assert_no_hostile_bytes(&msg);
+    }
+
+    /// Body larger than the classification cap: truncated read, no label,
+    /// no panic, no error from the reader itself.
+    #[tokio::test]
+    async fn local_broker_stream_oversized_body_yields_no_label_without_panic() {
+        // Valid vetted envelope, but padded far past the cap so the read is
+        // cut off before the closing braces → cannot parse → no label.
+        let pad = "x".repeat(MAX_PROXY_ERROR_CLASSIFY_BYTES * 4);
+        let body = format!(
+            "{{\"error\":{{\"message\":\"ECHOED {HOSTILE_SENTINEL} {pad}\",\"type\":\"access_terminated_error\"}}}}"
+        );
+        let msg = stream_error_message(axum::http::StatusCode::FORBIDDEN, body).await;
+        assert!(
+            msg.ends_with("provider request failed: 403 Forbidden"),
+            "no label expected for oversized body: {msg}"
+        );
+        assert!(!msg.contains('['), "unexpected label: {msg}");
+        assert!(
+            msg.len() < 200,
+            "oversized body leaked: {} bytes",
+            msg.len()
+        );
+        assert_no_hostile_bytes(&msg);
+    }
+
+    /// The truncating reader itself: overflow returns the first `cap` bytes
+    /// (never an error), and a multibyte char split at the cap yields `None`
+    /// rather than panicking.
+    #[tokio::test]
+    async fn read_error_body_for_classification_truncates_and_never_fails() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/big", get(|| async { "a".repeat(100) }))
+            .route("/utf8", get(|| async { format!("{}é", "a".repeat(9)) }));
+        let url = spawn_upstream(app).await;
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("{url}/big")).send().await.unwrap();
+        let got = read_error_body_for_classification(resp, 10).await;
+        assert_eq!(got.as_deref(), Some("aaaaaaaaaa"));
+
+        // 'é' is 2 bytes at offset 9..11; cap 10 splits it.
+        let resp = client.get(format!("{url}/utf8")).send().await.unwrap();
+        let got = read_error_body_for_classification(resp, 10).await;
+        assert_eq!(got, None);
+
+        // Under the cap: whole body.
+        let resp = client.get(format!("{url}/utf8")).send().await.unwrap();
+        let got = read_error_body_for_classification(resp, 1024).await;
+        assert_eq!(got.as_deref(), Some("aaaaaaaaaé"));
     }
 
     /// LocalBroker::anthropic_usage: a non-2xx usage-endpoint body must never

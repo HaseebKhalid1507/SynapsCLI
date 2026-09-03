@@ -57,6 +57,103 @@ fn vetted_error_type(body: &str) -> Option<&'static str> {
     VETTED_ERROR_TYPES.iter().find(|t| **t == ty).copied()
 }
 
+/// Wire error classes we recognise on broker-proxied (OpenAI-compatible)
+/// non-2xx responses. Superset of [`VETTED_ERROR_TYPES`]: it adds the
+/// OpenAI/Kimi/xAI-style `error.type` / `error.code` values so a proxied
+/// failure can be named via OUR static label — never the provider's bytes.
+///
+/// INVARIANT: no label may contain `':'`. Engine-side
+/// `redact_provider_proxy_error` truncates the transport message at the
+/// first `':'` after the `provider request failed: {status}` marker, so a
+/// colon in a label would silently strip it.
+pub const VETTED_PROXY_ERROR_TYPES: &[&str] = &[
+    // Anthropic classes (kept in sync with `VETTED_ERROR_TYPES`).
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "request_too_large",
+    "rate_limit_error",
+    "api_error",
+    "overloaded_error",
+    "billing_error",
+    "timeout_error",
+    // OpenAI-compatible / Kimi / xAI classes.
+    "access_terminated_error",
+    "invalid_authentication_error",
+    "insufficient_quota",
+    "quota_exceeded",
+    "server_error",
+    "model_not_found",
+    "invalid_api_key",
+];
+
+/// Classify an untrusted proxied error body onto a vetted static label.
+///
+/// Parses `body` as JSON and reads, in order, `error.type`, `error.code`,
+/// then top-level `type` / `code` (each must be a JSON string). Returns OUR
+/// constant only on an exact match; the untrusted value itself is never
+/// surfaced. Non-JSON, oversized-truncated, or unrecognised bodies yield
+/// `None` — classification never fails loudly.
+pub fn vetted_proxy_error_label(body: &str) -> Option<&'static str> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let candidates = [
+        v.get("error").and_then(|e| e.get("type")),
+        v.get("error").and_then(|e| e.get("code")),
+        v.get("type"),
+        v.get("code"),
+    ];
+    let label = candidates
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(|ty| VETTED_PROXY_ERROR_TYPES.iter().find(|t| **t == ty).copied());
+    label
+}
+
+/// User-actionable message for a broker-proxied non-2xx response when the
+/// (status, vetted label) pair is one we understand; `None` otherwise so the
+/// caller keeps the raw `provider request failed: …` prefix.
+///
+/// `provider` is a runtime-owned key (e.g. `kimi-code`, `xai-auth`) — never
+/// provider bytes. `label` must be one of OUR constants (typically from
+/// [`vetted_proxy_error_label`]); an unknown label is treated as absent.
+pub fn humanize_proxy_status_error(
+    provider: &str,
+    status: u16,
+    label: Option<&str>,
+) -> Option<String> {
+    let label = label.and_then(|l| VETTED_PROXY_ERROR_TYPES.iter().find(|t| **t == l).copied());
+    match (status, label?) {
+        (403, "access_terminated_error") => {
+            let mut msg = format!(
+                "{provider}: usage quota exhausted (HTTP 403). Your plan's usage window is used up — \
+                 wait for the reset or upgrade, or switch models with /model."
+            );
+            if provider == "kimi-code" {
+                msg.push_str(
+                    " Kimi Code quotas are weekly; `synaps status` or the Kimi membership page \
+                     shows the reset time.",
+                );
+            }
+            Some(msg)
+        }
+        (401, "invalid_authentication_error" | "authentication_error" | "invalid_api_key") => {
+            Some(format!(
+                "{provider}: authentication rejected (HTTP 401). Run `synaps login --provider {provider}`."
+            ))
+        }
+        (429, "rate_limit_error") => Some(format!(
+            "{provider}: rate limited (HTTP 429). Wait for the limit to reset, or switch models with /model."
+        )),
+        (429, "insufficient_quota" | "quota_exceeded") => Some(format!(
+            "{provider}: usage quota exhausted (HTTP 429). Add credit or wait for the quota to reset, \
+             or switch models with /model."
+        )),
+        _ => None,
+    }
+}
+
 /// Classification-only peek at the untrusted error body: true when it
 /// contains the given fixed pattern. The body text itself is never emitted.
 fn body_mentions(body: &str, pattern: &str) -> bool {
@@ -179,6 +276,160 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KIMI_403_BODY: &str = r#"{"error":{"type":"access_terminated_error","message":"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends."}}"#;
+
+    #[test]
+    fn proxy_labels_never_contain_colon_and_are_superset_of_anthropic() {
+        for label in VETTED_PROXY_ERROR_TYPES {
+            assert!(
+                !label.contains(':'),
+                "label {label:?} would be truncated by the engine"
+            );
+            assert!(
+                !label.contains('['),
+                "label {label:?} breaks the [label] suffix"
+            );
+        }
+        for label in VETTED_ERROR_TYPES {
+            assert!(
+                VETTED_PROXY_ERROR_TYPES.contains(label),
+                "proxy list must be a superset: missing {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_label_reads_error_type() {
+        assert_eq!(
+            vetted_proxy_error_label(KIMI_403_BODY),
+            Some("access_terminated_error")
+        );
+    }
+
+    #[test]
+    fn proxy_label_falls_back_to_error_code_then_top_level() {
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"code":"invalid_api_key","message":"x"}}"#),
+            Some("invalid_api_key")
+        );
+        // error.type present but unvetted → fall through to error.code.
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"type":"weird","code":"insufficient_quota"}}"#),
+            Some("insufficient_quota")
+        );
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"type":"server_error"}"#),
+            Some("server_error")
+        );
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"code":"model_not_found"}"#),
+            Some("model_not_found")
+        );
+    }
+
+    #[test]
+    fn proxy_label_rejects_non_string_non_json_and_hostile_values() {
+        assert_eq!(vetted_proxy_error_label(r#"{"error":{"type":42}}"#), None);
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"code":["a"]}}"#),
+            None
+        );
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"type":"<script>ECHO:secret"}}"#),
+            None
+        );
+        // Prefix/suffix variants must not match — exact only.
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"type":"access_terminated_error2"}}"#),
+            None
+        );
+        assert_eq!(
+            vetted_proxy_error_label(r#"{"error":{"type":"Access_Terminated_Error"}}"#),
+            None
+        );
+        assert_eq!(vetted_proxy_error_label("<html>403 Forbidden</html>"), None);
+        assert_eq!(vetted_proxy_error_label(""), None);
+        // Truncated JSON (oversized body cut at the cap) must not parse.
+        assert_eq!(vetted_proxy_error_label(&KIMI_403_BODY[..40]), None);
+    }
+
+    #[test]
+    fn humanize_proxy_403_access_terminated_is_quota_not_auth() {
+        let msg = humanize_proxy_status_error("kimi-code", 403, Some("access_terminated_error"))
+            .expect("known combo");
+        assert!(
+            msg.starts_with("kimi-code: usage quota exhausted (HTTP 403)"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("/model"), "got: {msg}");
+        assert!(msg.contains("weekly"), "kimi-specific hint missing: {msg}");
+        assert!(msg.contains("synaps status"), "got: {msg}");
+        assert!(
+            !msg.contains("login"),
+            "quota must not be misreported as auth: {msg}"
+        );
+
+        let generic = humanize_proxy_status_error("xai-auth", 403, Some("access_terminated_error"))
+            .expect("known combo");
+        assert!(
+            generic.starts_with("xai-auth: usage quota exhausted (HTTP 403)"),
+            "got: {generic}"
+        );
+        assert!(
+            !generic.contains("weekly"),
+            "kimi hint leaked to other provider: {generic}"
+        );
+    }
+
+    #[test]
+    fn humanize_proxy_401_points_to_provider_login() {
+        for label in [
+            "invalid_authentication_error",
+            "authentication_error",
+            "invalid_api_key",
+        ] {
+            let msg = humanize_proxy_status_error("xai-auth", 401, Some(label)).expect(label);
+            assert!(msg.contains("HTTP 401"), "got: {msg}");
+            assert!(
+                msg.contains("synaps login --provider xai-auth"),
+                "got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn humanize_proxy_429_distinguishes_rate_limit_from_quota() {
+        let rl = humanize_proxy_status_error("groq", 429, Some("rate_limit_error")).unwrap();
+        let q1 = humanize_proxy_status_error("groq", 429, Some("insufficient_quota")).unwrap();
+        let q2 = humanize_proxy_status_error("groq", 429, Some("quota_exceeded")).unwrap();
+        assert!(rl.contains("rate limited"), "got: {rl}");
+        assert!(q1.contains("quota exhausted"), "got: {q1}");
+        assert_eq!(q1, q2);
+        assert_ne!(rl, q1);
+    }
+
+    #[test]
+    fn humanize_proxy_unknown_combos_return_none() {
+        assert_eq!(humanize_proxy_status_error("kimi-code", 403, None), None);
+        assert_eq!(
+            humanize_proxy_status_error("kimi-code", 403, Some("rate_limit_error")),
+            None
+        );
+        assert_eq!(
+            humanize_proxy_status_error("kimi-code", 500, Some("server_error")),
+            None
+        );
+        assert_eq!(
+            humanize_proxy_status_error("kimi-code", 401, Some("access_terminated_error")),
+            None
+        );
+        // Unvetted label strings are treated as absent, never echoed.
+        assert_eq!(
+            humanize_proxy_status_error("kimi-code", 403, Some("<script>ECHO")),
+            None
+        );
+    }
 
     #[test]
     fn test_humanize_529_overloaded() {
