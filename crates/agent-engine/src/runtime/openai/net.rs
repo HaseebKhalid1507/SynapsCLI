@@ -42,10 +42,7 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
     // terminal stream failure — API failures, not configuration errors.
     if msg.starts_with("codex request failed:")
         || msg.starts_with("openai request failed:")
-        || msg.starts_with("Codex response failed in stream.")
-        || msg.starts_with("Codex response was incomplete.")
-        || msg.starts_with("Codex completed without text or tool output.")
-        || msg.starts_with("Codex response stream ended without a terminal event.")
+        || is_responses_terminal_failure_message(&msg)
     {
         tracing::warn!(error = %msg, "provider API error");
         return RuntimeError::ApiStatus(msg);
@@ -53,6 +50,29 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
 
     tracing::warn!(error = %msg, "provider config error");
     RuntimeError::Config(format!("openai provider: {msg}"))
+}
+
+/// Responses-API terminal stream failures are `"{label}{suffix}"` where the
+/// label is a provider display name ("Codex", "xAI") and the suffix is one of
+/// the static templates in `stream.rs`. Match label-independently on the
+/// suffix so every provider label classifies as an API failure.
+fn is_responses_terminal_failure_message(msg: &str) -> bool {
+    use super::stream::{
+        RESPONSES_CAPACITY_SUFFIX, RESPONSES_CONTEXT_SUFFIX, RESPONSES_EMPTY_SUFFIX,
+        RESPONSES_FAILED_SUFFIX, RESPONSES_INCOMPLETE_SUFFIX, RESPONSES_MISSING_TERMINAL_SUFFIX,
+    };
+    const SUFFIXES: &[&str] = &[
+        RESPONSES_FAILED_SUFFIX,
+        RESPONSES_CAPACITY_SUFFIX,
+        RESPONSES_CONTEXT_SUFFIX,
+        RESPONSES_INCOMPLETE_SUFFIX,
+        RESPONSES_EMPTY_SUFFIX,
+        RESPONSES_MISSING_TERMINAL_SUFFIX,
+    ];
+    SUFFIXES.iter().any(|suffix| {
+        msg.strip_suffix(suffix)
+            .is_some_and(|label| !label.is_empty() && !label.contains(char::is_whitespace))
+    })
 }
 
 /// Walk the boxed error and its source chain looking for a `reqwest::Error`.
@@ -166,6 +186,13 @@ mod tests {
             "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
             "Codex completed without text or tool output. Retry the request.",
             "Codex response stream ended without a terminal event. Retry the request.",
+            "Codex rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.",
+            // xAI-labelled variants (xai-auth Responses route).
+            "xAI response failed in stream. Provider error details withheld because they can echo request content.",
+            "xAI reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model.",
+            "xAI completed without text or tool output. Retry the request.",
+            "xAI response stream ended without a terminal event. Retry the request.",
+            "xAI response was incomplete. Retry the request or reduce the requested output/context size.",
         ] {
             let err = provider_error_to_runtime(msg.into());
             assert!(
@@ -174,6 +201,21 @@ mod tests {
             );
             assert!(!err.to_string().starts_with("Config error"));
         }
+    }
+
+    /// A message that merely mentions a suffix mid-sentence (or carries a
+    /// non-label prefix) must not be mistaken for a Responses terminal.
+    #[test]
+    fn responses_terminal_matcher_requires_bare_label_prefix() {
+        assert!(!is_responses_terminal_failure_message(
+            "No API key for 'xai'. response failed in stream."
+        ));
+        assert!(!is_responses_terminal_failure_message(
+            " response failed in stream. Provider error details withheld because they can echo request content."
+        ));
+        assert!(is_responses_terminal_failure_message(
+            "xAI reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model."
+        ));
     }
 
     #[test]
