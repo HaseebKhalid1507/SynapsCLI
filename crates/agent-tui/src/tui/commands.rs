@@ -418,7 +418,9 @@ pub(super) async fn handle_command(
         };
         return match result {
             CommandResult::Quit => CommandAction::Quit,
-            CommandResult::ModelChanged { .. } => {
+            CommandResult::ModelChanged {
+                reasoning_clamped, ..
+            } => {
                 // Use the runtime's cleaned model string, not the raw arg.
                 let applied = runtime.model().to_string();
                 app.session.model = applied.clone();
@@ -427,6 +429,13 @@ pub(super) async fn handle_command(
                     "model set to: {} {}",
                     applied, status
                 )));
+                // Session-only: the user's configured thinking value stays theirs.
+                if let Some(clamp) = reasoning_clamped {
+                    app.session.thinking_level = runtime.thinking_level().to_string();
+                    app.push_msg(ChatMessage::System(reasoning_clamp_notice(
+                        &clamp, &applied,
+                    )));
+                }
                 CommandAction::None
             }
             CommandResult::ThinkingChanged { spec } => {
@@ -1207,6 +1216,19 @@ pub(super) fn handle_streaming_command(
         "quit" | "exit" => CommandAction::Quit,
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
     }
+}
+
+/// Notice shown when a model change forced a reasoning-level substitution.
+pub(crate) fn reasoning_clamp_notice(
+    clamp: &synaps_cli::runtime::ReasoningClamp,
+    model: &str,
+) -> String {
+    format!(
+        "thinking → {} (clamped from {}: not supported by {})",
+        clamp.to.as_str(),
+        clamp.from.as_str(),
+        model
+    )
 }
 
 #[cfg(test)]
