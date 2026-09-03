@@ -132,8 +132,7 @@ pub fn humanize_proxy_status_error(
             );
             if provider == "kimi-code" {
                 msg.push_str(
-                    " Kimi Code quotas are weekly; `synaps status` or the Kimi membership page \
-                     shows the reset time.",
+                    " Kimi Code quotas are weekly; the Kimi membership page shows the reset time.",
                 );
             }
             Some(msg)
@@ -364,7 +363,7 @@ mod tests {
         );
         assert!(msg.contains("/model"), "got: {msg}");
         assert!(msg.contains("weekly"), "kimi-specific hint missing: {msg}");
-        assert!(msg.contains("synaps status"), "got: {msg}");
+        assert!(msg.contains("membership page"), "got: {msg}");
         assert!(
             !msg.contains("login"),
             "quota must not be misreported as auth: {msg}"

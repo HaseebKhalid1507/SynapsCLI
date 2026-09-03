@@ -24,7 +24,22 @@ pub type BoxedProviderError = Box<dyn std::error::Error + Send + Sync>;
 /// Classify an error escaping the OpenAI/Codex provider route into the
 /// right `RuntimeError` variant. Also logs the full cause chain at WARN —
 /// provider-route failures were previously invisible in the logs.
+///
+/// Provider-agnostic form: broker status labels are classified but not
+/// humanized. Prefer [`provider_error_to_runtime_for`] when the qualified
+/// model (and therefore the provider key) is known.
 pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
+    provider_error_to_runtime_for("", e)
+}
+
+/// Like [`provider_error_to_runtime`], but `qualified_model` (e.g.
+/// `kimi-code/k3`) lets a vetted broker status label such as
+/// `provider request failed: 403 Forbidden [access_terminated_error]` be
+/// rendered as an actionable, provider-aware message. The label is one of
+/// OUR static constants (selected broker-side, never provider bytes) and the
+/// humanizer only ever returns our own text; the raw prefix message is kept
+/// for the log line.
+pub fn provider_error_to_runtime_for(qualified_model: &str, e: BoxedProviderError) -> RuntimeError {
     // Transport-level failure (connect / timeout / mid-stream drop)?
     if let Some(re) = find_reqwest_error(e.as_ref()) {
         let msg = humanize_provider_network_error(re);
@@ -45,11 +60,44 @@ pub fn provider_error_to_runtime(e: BoxedProviderError) -> RuntimeError {
         || is_responses_terminal_failure_message(&msg)
     {
         tracing::warn!(error = %msg, "provider API error");
+        if let Some(human) = humanize_broker_status_message(qualified_model, &msg) {
+            return RuntimeError::ApiStatus(human);
+        }
         return RuntimeError::ApiStatus(msg);
     }
 
     tracing::warn!(error = %msg, "provider config error");
     RuntimeError::Config(format!("openai provider: {msg}"))
+}
+
+/// Render a broker status failure carrying a vetted label as an actionable
+/// message. `None` when the message has no label, the label is unknown to
+/// the humanizer, or the provider key cannot be derived from the model.
+fn humanize_broker_status_message(qualified_model: &str, msg: &str) -> Option<String> {
+    let provider = qualified_model.split_once('/')?.0;
+    if provider.is_empty() {
+        return None;
+    }
+    let status = crate::runtime::trace::openai::broker_error_status(msg)?;
+    let label = broker_error_label(msg)?;
+    crate::core::error::humanize_proxy_status_error(provider, status, Some(label))
+}
+
+/// Extract the `[label]` the broker appends after the canonical reason
+/// phrase (`provider request failed: 403 Forbidden [access_terminated_error]`).
+/// Only identifier-shaped labels are accepted; anything else is `None`.
+pub(crate) fn broker_error_label(msg: &str) -> Option<&str> {
+    const MARKER: &str = "provider request failed: ";
+    let rest = &msg[msg.find(MARKER)? + MARKER.len()..];
+    let open = rest.find(" [")?;
+    let after = &rest[open + 2..];
+    let close = after.find(']')?;
+    let label = &after[..close];
+    (!label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+    .then_some(label)
 }
 
 /// Responses-API terminal stream failures are `"{label}{suffix}"` where the
@@ -270,6 +318,86 @@ mod tests {
                 .to_string()
                 .starts_with("Config error: openai provider: "),
             "must keep the historical prefix for genuine config errors: {runtime_err}"
+        );
+    }
+
+    /// A broker status failure carrying a vetted label is humanized into an
+    /// actionable, provider-aware message when the qualified model is known
+    /// — and never echoes anything but our own text.
+    #[test]
+    fn vetted_kimi_quota_label_is_humanized_for_known_provider() {
+        let raw = "openai request failed: broker transport error: provider request failed: 403 Forbidden [access_terminated_error]";
+        let err: BoxedProviderError = raw.into();
+        let runtime_err = provider_error_to_runtime_for("kimi-code/k3", err);
+        let RuntimeError::ApiStatus(msg) = runtime_err else {
+            panic!("expected ApiStatus, got {runtime_err:?}");
+        };
+        assert!(
+            msg.starts_with("kimi-code: usage quota exhausted (HTTP 403)"),
+            "{msg}"
+        );
+        assert!(msg.contains("weekly"), "{msg}");
+        assert!(
+            !msg.contains("login"),
+            "quota must not read as an auth failure: {msg}"
+        );
+        assert!(
+            !msg.contains("[access_terminated_error]"),
+            "label must be rendered, not leaked: {msg}"
+        );
+    }
+
+    /// Without a provider key (legacy entry point) or without a label the
+    /// raw, status-only prefix message is preserved verbatim.
+    #[test]
+    fn broker_status_without_label_or_provider_keeps_raw_message() {
+        let labelled = "openai request failed: broker transport error: provider request failed: 403 Forbidden [access_terminated_error]";
+        match provider_error_to_runtime(labelled.into()) {
+            RuntimeError::ApiStatus(msg) => assert_eq!(msg, labelled),
+            other => panic!("expected ApiStatus, got {other:?}"),
+        }
+        let plain =
+            "openai request failed: broker transport error: provider request failed: 403 Forbidden";
+        match provider_error_to_runtime_for("kimi-code/k3", plain.into()) {
+            RuntimeError::ApiStatus(msg) => assert_eq!(msg, plain),
+            other => panic!("expected ApiStatus, got {other:?}"),
+        }
+        // Unknown (status, label) combos also fall through unchanged.
+        let unknown =
+            "openai request failed: provider request failed: 418 I'm a teapot [server_error]";
+        match provider_error_to_runtime_for("groq/llama", unknown.into()) {
+            RuntimeError::ApiStatus(msg) => assert_eq!(msg, unknown),
+            other => panic!("expected ApiStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_error_label_accepts_only_identifier_shaped_labels() {
+        assert_eq!(
+            broker_error_label(
+                "x: provider request failed: 403 Forbidden [access_terminated_error]"
+            ),
+            Some("access_terminated_error")
+        );
+        assert_eq!(
+            broker_error_label("provider request failed: 403 Forbidden"),
+            None
+        );
+        assert_eq!(
+            broker_error_label("provider request failed: 403 Forbidden []"),
+            None
+        );
+        assert_eq!(
+            broker_error_label("provider request failed: 403 Forbidden [<script>ECHO]"),
+            None
+        );
+        assert_eq!(
+            broker_error_label("provider request failed: 403 Forbidden [Mixed-Case]"),
+            None
+        );
+        assert_eq!(
+            broker_error_label("no marker here [access_terminated_error]"),
+            None
         );
     }
 }
