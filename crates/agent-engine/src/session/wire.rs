@@ -710,8 +710,9 @@ mod tests {
         // Every SessionEventWire variant (18) + every StreamEvent leaf (18; Stream counted once).
         assert_eq!(all.len(), 17 + 18);
         for ev in all {
-            let before = format!("{:?}", env(ev.clone()));
-            let wire: WireEnvelope = env(ev).into();
+            let e = env(ev);
+            let before = format!("{e:?}");
+            let wire: WireEnvelope = e.into();
             let line = encode_line(&wire).unwrap();
             assert_eq!(line.matches('\n').count(), 1, "one line per frame");
             let back: WireEnvelope = decode_line(line.trim_end()).unwrap();
