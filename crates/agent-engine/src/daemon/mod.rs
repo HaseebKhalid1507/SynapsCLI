@@ -126,8 +126,10 @@ pub struct DaemonState {
     pub reloading: AtomicBool,
     /// Generation announced in `Reloading`/`Bye{Reloading}`.
     pub reload_generation: std::sync::atomic::AtomicU64,
-    /// Cancelled once per process life: every conn sends `Reloading` + `Bye`.
-    pub reload_announce: CancellationToken,
+    /// Cancelled once per reload attempt: every conn sends `Reloading` +
+    /// `Bye`. Replaced with a fresh token when the exec fails (M4) so the
+    /// surviving image accepts connections again — read via `announce()`.
+    pub reload_announce: Mutex<CancellationToken>,
     /// The flock, held here (not on `Daemon`) so `reload` can hand its fd
     /// to the next image.
     pub lock_fd: Mutex<Option<DaemonLock>>,
@@ -139,6 +141,24 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn uptime_s(&self) -> u64 {
         self.started.elapsed().as_secs()
+    }
+
+    /// The current reload-announce token (clone; select on `.cancelled()`).
+    pub fn announce(&self) -> CancellationToken {
+        self.reload_announce
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Fire the announce (every conn says `Reloading` + `Bye`).
+    pub fn fire_announce(&self) {
+        self.announce().cancel();
+    }
+
+    /// Exec failed: arm a fresh token so new connections are served again.
+    pub fn reset_announce(&self) {
+        *self.reload_announce.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
     }
 
     /// B4: ONE session map — `EngineHost` owns it; these delegate.
@@ -269,7 +289,7 @@ impl Daemon {
             generation,
             reloading: AtomicBool::new(false),
             reload_generation: std::sync::atomic::AtomicU64::new(generation),
-            reload_announce: CancellationToken::new(),
+            reload_announce: Mutex::new(CancellationToken::new()),
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
         });

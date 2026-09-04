@@ -173,6 +173,50 @@ pub fn version_gate(current: &PrintVersion, new: &PrintVersion) -> Result<(), St
     }
 }
 
+/// M8: `--exe` must be something we would trust to `execv` in our own pid:
+/// an existing regular file (canonicalised), executable, owned by our uid
+/// (or root — package-installed binaries), not group/world-writable.
+/// Returns the canonical path. Same-uid 0600 socket → not a privilege
+/// boundary; this is a footgun guard, not a sandbox.
+#[cfg(unix)]
+pub fn validate_exe(exe: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let canon = exe
+        .canonicalize()
+        .map_err(|e| format!("--exe {}: {e}", exe.display()))?;
+    let md = std::fs::metadata(&canon).map_err(|e| format!("--exe {}: {e}", canon.display()))?;
+    if !md.is_file() {
+        return Err(format!("--exe {}: not a regular file", canon.display()));
+    }
+    let mode = md.permissions().mode();
+    if mode & 0o111 == 0 {
+        return Err(format!("--exe {}: not executable", canon.display()));
+    }
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if md.uid() != uid && md.uid() != 0 {
+        return Err(format!(
+            "--exe {}: owned by uid {} (expected {} or root)",
+            canon.display(),
+            md.uid(),
+            uid
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "--exe {}: group/world-writable (mode {:o})",
+            canon.display(),
+            mode & 0o777
+        ));
+    }
+    Ok(canon)
+}
+
+#[cfg(not(unix))]
+pub fn validate_exe(exe: &Path) -> Result<PathBuf, String> {
+    exe.canonicalize().map_err(|e| format!("--exe {}: {e}", exe.display()))
+}
+
 /// Run `<exe> daemon --print-version` (5 s) and parse it.
 pub async fn probe_version(exe: &Path) -> Result<PrintVersion, String> {
     let out = tokio::time::timeout(
@@ -285,6 +329,7 @@ pub async fn prepare(
             .and_then(|i| i.exe)
             .unwrap_or_else(resolve_exe)
     });
+    let exe = validate_exe(&exe).map_err(ReloadError::Refused)?;
     let new = probe_version(&exe).await.map_err(ReloadError::Refused)?;
     version_gate(&PrintVersion::current(), &new).map_err(ReloadError::Refused)?;
     if state.reloading.swap(true, Ordering::SeqCst) {
@@ -340,7 +385,7 @@ pub async fn prepare(
     // 4. announce — every OTHER conn selects on `reload_announce` and sends
     //    Event(Reloading) + Bye{Reloading}; give their writers ≤ 1 s.
     state.reload_generation.store(generation, Ordering::SeqCst);
-    state.reload_announce.cancel();
+    state.fire_announce();
     let t1 = std::time::Instant::now();
     while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(1) {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -350,10 +395,12 @@ pub async fn prepare(
 
 /// Step 5: rewrite `daemon.json` (generation+1, same pid), stop sidecars,
 /// hand the flock to the next image and `execv`. Returns only on failure —
-/// then `daemon.json`/reload-state are restored and the old image keeps
-/// serving (sessions checkpointed but alive; clients that got `Bye`
-/// reconnect to THIS image — a `reconnect_of.generation` mismatch is
-/// tolerated, the daemon answers with its own generation).
+/// then `daemon.json`/reload-state are restored, extension discovery is
+/// re-spawned (the sidecars were stopped for the exec — M4: no zombie
+/// daemon without hooks), and the old image keeps serving (sessions
+/// checkpointed but alive; clients that got `Bye` reconnect to THIS image
+/// — a `reconnect_of.generation` mismatch is tolerated, the daemon answers
+/// with its own generation).
 pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) -> ReloadError {
     let mut info = registry::read_daemon_json(paths).unwrap_or_else(|| registry::DaemonInfo {
         pid: std::process::id(),
@@ -381,6 +428,27 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
     info.generation = prev_generation;
     let _ = registry::write_daemon_json(paths, &info);
     let _ = std::fs::remove_file(&p.rs_path);
+    state.reload_generation.store(prev_generation, Ordering::SeqCst);
+    state.reset_announce();
+    // Sidecars were shut down for the exec: bring them back (bounded like
+    // `run_foreground`'s first discovery) so the surviving image has hooks.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _loader = crate::extensions::loader::spawn_discover_and_load(
+        Arc::clone(state.host.ext_manager()),
+        tx,
+        None,
+    );
+    let wait = async {
+        while let Some(ev) = rx.recv().await {
+            if let crate::extensions::loader::ExtensionLoaderEvent::Finished { loaded, failed } = ev {
+                tracing::info!(loaded = loaded.len(), failed = failed.len(), "daemon: extensions re-discovered after failed reload");
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
+        tracing::warn!("daemon: extension re-discovery still running after 10 s");
+    }
     state.reloading.store(false, Ordering::SeqCst);
     ReloadError::ExecFailed(err)
 }
@@ -518,6 +586,27 @@ mod tests {
         assert!(version_gate(&cur, &pv("0.8.9", 2)).is_err(), "older refused");
         assert!(version_gate(&cur, &pv("0.9.0", 1)).is_err(), "older protocol refused");
         assert!(version_gate(&cur, &pv("garbage", 2)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_exe_refuses_missing_dirs_non_exec_and_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        assert!(validate_exe(&d.path().join("nope")).unwrap_err().contains("nope"));
+        assert!(validate_exe(d.path()).unwrap_err().contains("not a regular file"));
+        let f = d.path().join("bin");
+        std::fs::write(&f, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_exe(&f).unwrap_err().contains("not executable"));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_exe(&f).unwrap_err().contains("writable"));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(validate_exe(&f).unwrap(), f.canonicalize().unwrap());
+        // A symlink resolves to its target.
+        let l = d.path().join("link");
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+        assert_eq!(validate_exe(&l).unwrap(), f.canonicalize().unwrap());
     }
 
     #[test]

@@ -330,7 +330,7 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
 
     // A: model/context/system survived.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (mut a2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: a_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    let (a2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: a_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
     assert_eq!(snap.view.model, "claude-opus-4-6", "/model survived reload");
     assert_eq!(snap.view.context_window, 1_000_000, "settings_replay survived reload");
     assert_eq!(snap.view.system_prompt.as_deref(), Some("reload-me"), "/system survived reload");
@@ -339,9 +339,89 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
 
     // B: attach unparks with its history.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (mut b2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: b_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    let (b2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: b_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
     assert_eq!(snap.conversation.api_messages.len(), 2, "parked session's history survived reload");
     b2.detach().await;
 
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+/// A script that answers `--print-version` with OUR version (passes the
+/// gate) and then strips its own exec bit, so the `execv` that follows
+/// fails with EACCES: the one way past `validate_exe` + the probe.
+fn self_disarming_binary(dir: &Path) -> PathBuf {
+    let p = dir.join("synaps-disarm");
+    let pv = serde_json::to_string(&agent_engine::daemon::reload::PrintVersion::current()).unwrap();
+    std::fs::write(
+        &p,
+        format!("#!/bin/sh\nif [ \"$2\" = \"--print-version\" ]; then echo '{pv}'; chmod 644 \"$0\"; exit 0; fi\nexit 1\n"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// M4 + M8: `--exe` is validated up front (non-executable / world-writable
+/// / missing → refused, nothing disturbed); an `execv` that fails AFTER the
+/// gate leaves the old image serving — generation unchanged, reload-state
+/// gone, `reloading` cleared (a second reload is accepted), a turn works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn exe_validation_refuses_and_exec_failure_keeps_serving() {
+    use std::os::unix::fs::PermissionsExt;
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let pid = d.child.id();
+    let (mut t, _) = attach_create(&d.paths, guard.home.path()).await;
+    one_turn(&mut t, "before").await;
+
+    // Refused up front: missing, non-executable, world-writable.
+    let missing = guard.home.path().join("does-not-exist");
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(missing)).await;
+    assert!(matches!(r, Err(TransportError::Refused(ref m)) if m.contains("does-not-exist")), "{r:?}");
+    let noexec = fake_older_binary(guard.home.path());
+    std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(noexec.clone())).await;
+    assert!(matches!(r, Err(TransportError::Refused(ref m)) if m.contains("not executable")), "{r:?}");
+    std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(noexec)).await;
+    assert!(matches!(r, Err(TransportError::Refused(ref m)) if m.contains("writable")), "{r:?}");
+    assert_eq!(registry::read_daemon_json(&d.paths).unwrap().generation, 1);
+
+    // Past the gate: the requester is told Bye{Reloading} BEFORE the exec
+    // (the reply is Ok(2)); the exec then fails and the old image keeps
+    // serving — generation restored, reload-state removed, socket alive.
+    let disarm = self_disarming_binary(guard.home.path());
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(disarm)).await;
+    assert!(matches!(r, Ok(2)), "{r:?}");
+    let t0 = std::time::Instant::now();
+    loop {
+        let info = registry::read_daemon_json(&d.paths).unwrap();
+        if info.generation == 1
+            && !agent_engine::daemon::reload::reload_state_path(&d.paths).exists()
+            && SocketTransport::ping(&d.paths.sock).await.is_ok()
+        {
+            assert_eq!(info.pid, pid);
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "old image did not recover: {info:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(registry::is_alive(&d.paths));
+
+    // The session was checkpointed (Aborted-free: it was idle) but is alive;
+    // the mirror reconnects and a turn works.
+    let snap = tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.unwrap().expect("reconnected");
+    assert_eq!(snap.conversation.api_messages.len(), 2);
+    let after = one_turn(&mut t, "after").await;
+    assert_eq!(after.len(), 4);
+    // `reloading` cleared: a second (refused) reload is judged on its merits.
+    let old = fake_older_binary(guard.home.path());
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(old)).await;
+    assert!(matches!(r, Err(TransportError::Refused(ref m)) if m.contains("older")), "{r:?}");
+
+    t.detach().await;
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }

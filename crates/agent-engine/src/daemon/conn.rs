@@ -188,9 +188,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
 
     // ── control loop (no session allocated) ──
     let attach = loop {
+        let announce = state.announce();
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
-            _ = state.reload_announce.cancelled() => {
+            _ = announce.cancelled() => {
                 let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                 let _ = writer.await;
                 return;
@@ -365,7 +366,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let sid = handle.id.clone();
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
-    let fwd_announce = state.reload_announce.clone();
+    let fwd_announce = state.announce();
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -421,10 +422,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let mut ended = false;
     let mut stopping = false;
     let mut reloading = false;
+    let announce = state.announce();
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
-            _ = state.reload_announce.cancelled() => { reloading = true; break; }
+            _ = announce.cancelled() => { reloading = true; break; }
             _ = handle.closed() => { ended = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
         };
