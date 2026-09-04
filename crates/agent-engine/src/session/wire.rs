@@ -277,6 +277,7 @@ pub enum WireSessionEvent {
     PromptResolved { prompt_id: u64 },
     External { event: crate::events::types::Event },
     AutoTurnCapReached { cap: u32 },
+    Idle,
     Steered { text: String, delivered: bool },
     Dequeued { text: String },
     SystemNotice { text: String },
@@ -514,6 +515,7 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
             S::External(event) => Self::External { event },
             S::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
+            S::Idle => Self::Idle,
             S::Steered { text, delivered } => Self::Steered { text, delivered },
             S::Dequeued { text } => Self::Dequeued { text },
             S::SystemNotice(text) => Self::SystemNotice { text },
@@ -542,6 +544,7 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
             W::External { event } => Self::External(event),
             W::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
+            W::Idle => Self::Idle,
             W::Steered { text, delivered } => Self::Steered { text, delivered },
             W::Dequeued { text } => Self::Dequeued { text },
             W::SystemNotice { text } => Self::SystemNotice(text),
@@ -679,6 +682,7 @@ mod tests {
             S::PromptResolved { prompt_id: 3 },
             S::External(crate::events::types::Event::simple("cli", "hello", None)),
             S::AutoTurnCapReached { cap: 5 },
+            S::Idle,
             S::Steered { text: "s".into(), delivered: true },
             S::Dequeued { text: "d".into() },
             S::SystemNotice("sys".into()),
@@ -708,8 +712,8 @@ mod tests {
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // Every SessionEventWire variant (18) + every StreamEvent leaf (18; Stream counted once).
-        assert_eq!(all.len(), 17 + 18);
+        // Every SessionEventWire variant (19) + every StreamEvent leaf (18; Stream counted once).
+        assert_eq!(all.len(), 18 + 18);
         for ev in all {
             let e = env(ev);
             let before = format!("{e:?}");

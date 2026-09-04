@@ -78,6 +78,7 @@ impl Client {
             }
             SessionEventWire::Dequeued { text } => self.out(&format!("[dequeued] {text}\n")),
             SessionEventWire::AutoTurnCapReached { cap } => self.out(&format!("[auto-turn cap {cap} reached]\n")),
+            SessionEventWire::Idle => {}
             SessionEventWire::External(e) => self.out(&format!("[event {}] {}\n", e.source.name, e.content.text)),
             SessionEventWire::ClientJoined { client, kind } => self.out(&format!("[client #{} joined ({kind:?})]\n", client.0)),
             SessionEventWire::ClientLeft { client } => self.out(&format!("[client #{} left]\n", client.0)),
