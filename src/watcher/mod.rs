@@ -41,7 +41,10 @@ pub(crate) fn watcher_dir() -> PathBuf {
 
 pub(crate) fn agent_binary() -> PathBuf {
     // Same binary, different subcommand
-    std::env::current_exe().unwrap_or_default()
+    std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("[watcher] current_exe() failed: {e}");
+        PathBuf::new()
+    })
 }
 
 pub(crate) fn log(msg: &str) {
