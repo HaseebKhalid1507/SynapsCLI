@@ -51,7 +51,17 @@ const TURN_REPLAY_CAP: usize = 4096;
 /// what `App::capture_abort_context` walks in the TUI transcript
 /// (`ChatMessage::{Thinking,Text,ToolUse,ToolResult}` since the last user
 /// message). Consecutive text/thinking deltas coalesce like
-/// `append_or_update_*` does.
+/// `append_or_update_*` does; tool-result deltas accumulate per `tool_id`
+/// at the position of the first delta and the final `ToolResult` replaces
+/// them in place (`Transcript::on_tool_result_delta`/`on_tool_result`), so
+/// an abort mid-tool captures the partial output exactly as the TUI does.
+///
+/// Known divergence from the TUI (documented, not closed): the TUI walks
+/// its transcript back to the last `ChatMessage::User` card. During an
+/// event-triggered auto-turn there is no User card, so the TUI's context
+/// also includes the PREVIOUS turn's output; `TurnLog` is cleared at every
+/// `start_turn` and holds the current turn only. The actor's content is
+/// the narrower, arguably correct one.
 #[derive(Default)]
 struct TurnLog {
     parts: Vec<TurnPart>,
@@ -61,12 +71,43 @@ enum TurnPart {
     Thinking(String),
     Text(String),
     ToolUse { name: String, input: String },
-    ToolResult(String),
+    ToolResult { tool_id: String, content: String },
 }
 
 impl TurnLog {
     fn clear(&mut self) {
         self.parts.clear();
+    }
+
+    fn tool_result_mut(&mut self, tool_id: &str) -> Option<&mut String> {
+        self.parts.iter_mut().rev().find_map(|p| match p {
+            TurnPart::ToolResult { tool_id: id, content } if id == tool_id => Some(content),
+            _ => None,
+        })
+    }
+
+    /// `Transcript::on_tool_result_delta`: append to the in-flight result
+    /// for this tool, or open one.
+    fn tool_result_delta(&mut self, tool_id: String, delta: String) {
+        match self.tool_result_mut(&tool_id) {
+            Some(c) => c.push_str(&delta),
+            None => self.parts.push(TurnPart::ToolResult {
+                tool_id,
+                content: delta,
+            }),
+        }
+    }
+
+    /// `Transcript::on_tool_result`: the final result replaces any
+    /// delta-buffered content in place.
+    fn tool_result(&mut self, tool_id: String, result: String) {
+        match self.tool_result_mut(&tool_id) {
+            Some(c) => *c = result,
+            None => self.parts.push(TurnPart::ToolResult {
+                tool_id,
+                content: result,
+            }),
+        }
     }
 
     fn text(&mut self, t: &str) {
@@ -101,7 +142,7 @@ impl TurnLog {
                     let input_preview: String = input.chars().take(200).collect();
                     parts.push(format!("[tool_use]: {} — {}", name, input_preview));
                 }
-                TurnPart::ToolResult(content) if !content.is_empty() => {
+                TurnPart::ToolResult { content, .. } if !content.is_empty() => {
                     let preview: String = content.chars().take(300).collect();
                     parts.push(format!("[tool_result]: {}", preview));
                 }
@@ -524,8 +565,11 @@ impl SessionActor {
                     input: input_str,
                 });
             }
-            StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-                self.turn_log.parts.push(TurnPart::ToolResult(result));
+            StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, delta }) => {
+                self.turn_log.tool_result_delta(tool_id, delta);
+            }
+            StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+                self.turn_log.tool_result(tool_id, result);
             }
             StreamEvent::Llm(_) => {}
             StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
