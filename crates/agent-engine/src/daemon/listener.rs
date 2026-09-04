@@ -17,7 +17,18 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        // Reload (C3) execs the daemon in place: the listener must NOT
+        // survive exec — the new image rebinds the path. tokio sets
+        // FD_CLOEXEC; assert it rather than trust it.
+        let fd = listener.as_raw_fd();
+        // SAFETY: fcntl on our own fd.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            // SAFETY: as above.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        }
     }
     Ok(listener)
 }

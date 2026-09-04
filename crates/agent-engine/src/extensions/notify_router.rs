@@ -6,9 +6,11 @@
 //! `SessionEventWire::ExtensionNotification` via
 //! [`crate::host::EngineHost::broadcast_extension_notification`].
 //!
-//! Frames carry no session id today, so every session receives every frame
-//! (documented; per-session routing arrives when the extension contract adds
-//! `params.session_id`, day 2). Delivery is non-blocking: a session whose
+//! Routing (phase 3, C2): a frame whose `params.session_id` is a string is
+//! delivered to THAT session only (dropped with a `debug!` if it is not
+//! live); a frame without one is daemon-global and goes to every session
+//! (the pre-phase-3 behaviour — `docs/extensions/session-id.md` §plugin
+//! contract). Delivery is non-blocking: a session whose
 //! command queue is full drops the frame with a `warn!` — widget upserts are
 //! idempotent last-writer-wins UI state (`loop_arms.rs` semantics), and
 //! blocking would backpressure the extension's lossless fan-out and stall
@@ -63,11 +65,43 @@ pub async fn forward_extension_notifications(
                     "ignoring malformed widget frame");
                 continue;
             }
-            let delivered = host
-                .broadcast_extension_notification(&ext_id, &frame.method, frame.params)
-                .await;
+            let delivered = match route_target(&frame.params) {
+                Some(sid) => {
+                    let id = crate::session::SessionId(sid.to_string());
+                    match host.attach(&id) {
+                        Some(handle) => {
+                            let cmd = crate::session::SessionCommand::HostEvent(
+                                crate::session::HostEvent::ExtensionNotification {
+                                    extension_id: ext_id.clone(),
+                                    method: frame.method.clone(),
+                                    params: frame.params,
+                                },
+                            );
+                            match handle.send(cmd).await {
+                                Ok(()) => 1,
+                                Err(err) => {
+                                    tracing::warn!(session = %id, extension = %ext_id,
+                                        method = %frame.method, error = %err,
+                                        "dropping extension notification for session");
+                                    0
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::debug!(session = %id, extension = %ext_id,
+                                method = %frame.method,
+                                "extension notification for a session that is not live; dropped");
+                            0
+                        }
+                    }
+                }
+                None => {
+                    host.broadcast_extension_notification(&ext_id, &frame.method, frame.params)
+                        .await
+                }
+            };
             tracing::trace!(extension = %ext_id, method = %frame.method, sessions = delivered,
-                "extension notification broadcast");
+                "extension notification routed");
         }
         // Channel closed (EOF/restart). Stop if the extension is gone for
         // good; otherwise wait and resubscribe.
@@ -83,5 +117,31 @@ pub async fn forward_extension_notifications(
             tracing::debug!(extension = %ext_id, "notification router: extension unloaded; stopping");
             return;
         }
+    }
+}
+
+/// `params.session_id` when it is a non-empty string — the frame is
+/// session-scoped; otherwise daemon-global (broadcast).
+pub fn route_target(params: &serde_json::Value) -> Option<&str> {
+    params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_target;
+
+    #[test]
+    fn route_target_is_session_id_string_or_global() {
+        assert_eq!(
+            route_target(&serde_json::json!({"id": "w", "session_id": "s-1"})),
+            Some("s-1")
+        );
+        assert_eq!(route_target(&serde_json::json!({"id": "w"})), None);
+        assert_eq!(route_target(&serde_json::json!({"session_id": ""})), None);
+        assert_eq!(route_target(&serde_json::json!({"session_id": 7})), None);
+        assert_eq!(route_target(&serde_json::json!(null)), None);
     }
 }

@@ -222,8 +222,9 @@ async fn attach_to_session_with_history_over_1mib() {
 }
 
 /// §4 MED: a client may only send the user-facing subset; `Detach` only for
-/// its own id; `End`/`Attach`/`Resync` are refused with an `Error` frame and
-/// the session stays alive for everyone else.
+/// its own id; `End{host reason}`/`Attach`/`Resync` are refused with an
+/// `Error` frame and the session stays alive for everyone else
+/// (`End{ClientQuit}` passes the conn since C4 — ownership is the actor's).
 #[tokio::test]
 #[serial]
 async fn client_commands_are_whitelisted() {
@@ -259,7 +260,7 @@ async fn client_commands_are_whitelisted() {
     }
     b.send(SessionCommand::Detach { client: other }).await.unwrap();
     assert!(refused(&mut b).await.contains("not your client id"));
-    b.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.unwrap();
+    b.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
     assert!(refused(&mut b).await.contains("end:"));
     b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror }).await.unwrap();
     assert!(refused(&mut b).await.contains("attach:"));
@@ -305,6 +306,8 @@ async fn stale_socket_reaped_and_second_daemon_refused() {
             profile: None,
             started_at: chrono::Utc::now(),
             socket: paths.sock.to_string_lossy().into_owned(),
+            exe: None,
+            generation: 1,
         },
     )
     .unwrap();
@@ -391,4 +394,20 @@ async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
     // now: zero connections + one client-less idle session → exits
     tokio::time::timeout(Duration::from_secs(5), d.wait()).await.expect("idle-exit fired with a live idle session");
     assert!(!paths.sock.exists());
+}
+
+/// C2: `Purge` is a control fast path — answered with `Pong`, no session
+/// allocated.
+#[tokio::test]
+#[serial]
+async fn purge_frame_answers_pong() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+    let pong = SocketTransport::purge(&paths.sock).await.unwrap();
+    assert_eq!(pong.pid, std::process::id());
+    assert_eq!(pong.sessions, 0);
+    assert!(d.state.live_sessions().is_empty());
+    d.state.request_shutdown(false);
 }

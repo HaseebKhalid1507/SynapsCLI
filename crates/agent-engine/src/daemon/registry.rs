@@ -22,6 +22,17 @@ pub struct DaemonInfo {
     pub profile: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub socket: String,
+    /// Executable to re-exec on `reload` (argv[0] canonicalised at first
+    /// start; `--exe` overrides and is recorded). C3.
+    #[serde(default)]
+    pub exe: Option<std::path::PathBuf>,
+    /// Reload counter (starts at 1; `Welcome.generation`). C3.
+    #[serde(default = "one")]
+    pub generation: u64,
+}
+
+fn one() -> u64 {
+    1
 }
 
 #[cfg(unix)]
@@ -44,6 +55,11 @@ fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
     std::fs::write(&tmp, body)?;
     chmod_600(&tmp);
     std::fs::rename(&tmp, path)
+}
+
+/// 0600 tmp + rename (reload-state).
+pub fn write_private_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
+    write_atomic(path, body)
 }
 
 pub fn read_daemon_json(paths: &DaemonPaths) -> Option<DaemonInfo> {
@@ -72,6 +88,37 @@ impl DaemonLock {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl DaemonLock {
+    /// Adopt an already-locked fd inherited across `execv` (reload). The
+    /// flock travels with the open file description, so the new image
+    /// holds the SAME lock without a release/acquire gap.
+    #[cfg(unix)]
+    pub fn adopt(fd: i32) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        if fd < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative lock fd"));
+        }
+        // SAFETY: the parent image cleared CLOEXEC on exactly this fd and
+        // handed it to us via SYNAPS_DAEMON_LOCK_FD; we take ownership.
+        let file = unsafe { File::from_raw_fd(fd) };
+        // Restore CLOEXEC so tool subprocesses never inherit the lock.
+        // SAFETY: fcntl on our own fd.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+        Ok(Self { file })
+    }
+
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        self.file.as_raw_fd()
     }
 }
 
@@ -142,6 +189,8 @@ mod tests {
             profile: None,
             started_at: chrono::Utc::now(),
             socket: p.sock.to_string_lossy().into_owned(),
+            exe: None,
+            generation: 1,
         };
         write_daemon_json(&p, &info).unwrap();
         assert_eq!(read_daemon_json(&p).unwrap(), info);
