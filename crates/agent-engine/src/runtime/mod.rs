@@ -708,6 +708,7 @@ impl RuntimeParts {
     }
 
     /// Fresh shell session manager, no reaper (offline / headless).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     pub(crate) fn without_reaper(host: crate::host::HostParts) -> Self {
         Self {
             host,

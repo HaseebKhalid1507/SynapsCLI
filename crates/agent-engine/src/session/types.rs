@@ -333,6 +333,7 @@ pub enum EndReason {
 /// StreamEvent in-process (LocalTransport) — that IS the byte-identical
 /// contract. The socket boundary converts to `wire::WireSessionEvent`.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Attached carries the full snapshot by design (§2.4)
 pub enum SessionEventWire {
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
