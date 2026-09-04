@@ -50,6 +50,8 @@ pub struct SelfMem {
     pub jemalloc_active_kb: u64,
     pub jemalloc_resident_kb: u64,
     pub jemalloc_retained_kb: u64,
+    #[serde(default)]
+    pub jemalloc_metadata_kb: u64,
 }
 
 /// Totals over a set of [`ProcMem`] rows.
@@ -133,6 +135,7 @@ pub fn self_snapshot() -> SelfMem {
             snap.jemalloc_active_kb = stats::active::read().unwrap_or(0) as u64 / 1024;
             snap.jemalloc_resident_kb = stats::resident::read().unwrap_or(0) as u64 / 1024;
             snap.jemalloc_retained_kb = stats::retained::read().unwrap_or(0) as u64 / 1024;
+            snap.jemalloc_metadata_kb = stats::metadata::read().unwrap_or(0) as u64 / 1024;
         }
     }
     snap
@@ -173,6 +176,73 @@ pub fn log_turn_memory() {
         broker_installs = crate::auth::global_broker_install_count(),
         "turn memory"
     );
+}
+
+/// Process-start anchor for [`ladder`]'s `t_ms`. Pinned by the first
+/// [`ladder`] call (the `main` stage in the attach client), so call it first.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// The boot-ladder sink: `SYNAPS_MEM_TRACE_FILE` (default
+/// `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log`), opened once, 0600.
+/// `None` when the file could not be opened (the ladder then drops lines).
+fn ladder_sink() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static SINK: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = std::env::var_os("SYNAPS_MEM_TRACE_FILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let dir = std::env::var_os("XDG_RUNTIME_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+                dir.join(format!("synaps-memtrace-{}.log", std::process::id()))
+            });
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path).ok().map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Boot-ladder stage (PLAN-phase4 §7.1): appends one line to the trace file
+/// — **not** `tracing` (the attach client has no subscriber) and **not**
+/// stderr (it is the TUI). No-op (one atomic load) unless `SYNAPS_MEM_TRACE=1`.
+///
+/// Line format: `t_ms=<since first call> stage=<stage> rss_anon_kb=…
+/// jemalloc_allocated_kb=… active_kb=… resident_kb=… retained_kb=…
+/// metadata_kb=… threads=… <extra>`.
+pub fn ladder(stage: &'static str, extra: &dyn std::fmt::Display) {
+    if !mem_trace_enabled() {
+        return;
+    }
+    let start = *START.get_or_init(std::time::Instant::now);
+    let line = ladder_line(start.elapsed().as_millis(), stage, &self_snapshot(), extra);
+    if let Some(sink) = ladder_sink() {
+        if let Ok(mut f) = sink.lock() {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+fn ladder_line(t_ms: u128, stage: &str, s: &SelfMem, extra: &dyn std::fmt::Display) -> String {
+    let extra = extra.to_string();
+    let sep = if extra.is_empty() { "" } else { " " };
+    format!(
+        "t_ms={t_ms} stage={stage} rss_anon_kb={} jemalloc_allocated_kb={} active_kb={} resident_kb={} retained_kb={} metadata_kb={} threads={}{sep}{extra}\n",
+        s.rss_anon_kb,
+        s.jemalloc_allocated_kb,
+        s.jemalloc_active_kb,
+        s.jemalloc_resident_kb,
+        s.jemalloc_retained_kb,
+        s.jemalloc_metadata_kb,
+        s.threads,
+    )
 }
 
 /// Scrub credentials out of a space-joined argv before it leaves the
@@ -455,6 +525,42 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_line_format_and_noop_when_disabled() {
+        let s = SelfMem {
+            rss_anon_kb: 1,
+            jemalloc_allocated_kb: 2,
+            jemalloc_active_kb: 3,
+            jemalloc_resident_kb: 4,
+            jemalloc_retained_kb: 5,
+            jemalloc_metadata_kb: 6,
+            threads: 7,
+            ..SelfMem::default()
+        };
+        assert_eq!(
+            ladder_line(42, "http", &s, &"build_ms=3"),
+            "t_ms=42 stage=http rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7 build_ms=3\n"
+        );
+        assert_eq!(
+            ladder_line(0, "main", &s, &""),
+            "t_ms=0 stage=main rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7\n"
+        );
+        // `mem_trace_enabled()` is cached per process and the test binary
+        // does not set SYNAPS_MEM_TRACE: `ladder` must be a no-op and must
+        // not create the default trace file.
+        if mem_trace_enabled() {
+            return; // the harness itself is tracing; nothing to assert
+        }
+        let dir = std::env::temp_dir().join(format!("synaps-ladder-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("trace.log");
+        std::env::set_var("SYNAPS_MEM_TRACE_FILE", &file);
+        ladder("main", &"");
+        assert!(!file.exists(), "ladder wrote while disabled");
+        std::env::remove_var("SYNAPS_MEM_TRACE_FILE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn classify_roles_from_cmdline() {

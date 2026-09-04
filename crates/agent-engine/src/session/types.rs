@@ -211,6 +211,19 @@ pub struct ClientMeta {
     pub terminal: Option<String>,
     /// Client-generated uuid; reattach dedup (day 3).
     pub instance: String,
+    /// How much history this client wants mirrored (phase 4).
+    #[serde(default)]
+    pub history: HistoryMode,
+    /// Display items in `Attached.display_tail` / `DisplayTail` queries (phase 4).
+    #[serde(default = "default_tail_items")]
+    pub tail_items: usize,
+}
+
+/// Default for `ClientMeta.tail_items`: matches the TUI's resumed-display cap.
+pub const DEFAULT_TAIL_ITEMS: usize = 120;
+
+fn default_tail_items() -> usize {
+    DEFAULT_TAIL_ITEMS
 }
 
 impl ClientMeta {
@@ -220,7 +233,38 @@ impl ClientMeta {
             kind,
             terminal: None,
             instance: uuid::Uuid::new_v4().to_string(),
+            history: HistoryMode::default(),
+            tail_items: DEFAULT_TAIL_ITEMS,
         }
+    }
+}
+
+/// What a client wants in `Attached` / `Conversation`: the full
+/// `api_messages` mirror (`Full`, the 741b6b60 behaviour) or only the
+/// digest + a daemon-side display tail (`Digest`, phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    #[default]
+    Full,
+    Digest,
+}
+
+impl HistoryMode {
+    /// `SYNAPS_CLIENT_HISTORY=full|digest`; `default` wins when unset or
+    /// unrecognised.
+    pub fn from_env_or(default: Self) -> Self {
+        match std::env::var("SYNAPS_CLIENT_HISTORY").ok().as_deref().map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("full") => Self::Full,
+            Some(v) if v.eq_ignore_ascii_case("digest") => Self::Digest,
+            _ => default,
+        }
+    }
+
+    /// What `synaps --attach` asks for. P4-0 returns `Full`; B's last
+    /// commit flips to `Digest`.
+    pub fn attach_client_default() -> Self {
+        Self::Full
     }
 }
 
@@ -696,6 +740,10 @@ pub struct ConversationSnapshot {
     #[serde(default)]
     pub header: SessionHeader,
     pub api_messages: Vec<crate::SharedMessage>,
+    /// `api_messages.len()` on the daemon — always filled by the actor;
+    /// `api_messages` itself may be empty for `HistoryMode::Digest` clients.
+    #[serde(default)]
+    pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
     pub abort_context: Option<String>,

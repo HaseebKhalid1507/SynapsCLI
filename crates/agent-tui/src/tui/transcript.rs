@@ -539,6 +539,14 @@ pub(crate) struct TranscriptStore {
     /// [`Self::set_show_full_output`], which invalidates internally.
     show_full_output: bool,
 
+    // ── Scrollback cap (P4-0 stub; enforcement lands with phase-4 B6) ─────────
+    /// Max retained messages (0 = unbounded).
+    #[allow(dead_code)]
+    max_msgs: usize,
+    /// Max retained source bytes (0 = unbounded).
+    #[allow(dead_code)]
+    max_bytes: usize,
+
     // ── Tool timing (moved in slice b′; locked decision #2) ──────────────────
     /// Tracks when the current tool started executing (for elapsed time display)
     tool_start_time: Option<std::time::Instant>,
@@ -620,6 +628,8 @@ impl TranscriptStore {
             scroll_anchor: None,
             cache: CacheState::Missing,
             show_full_output: false,
+            max_msgs: 0,
+            max_bytes: 0,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
             viewport: None,
@@ -629,6 +639,21 @@ impl TranscriptStore {
             #[cfg(any(test, feature = "testing"))]
             probe: PerfProbe::default(),
         }
+    }
+
+    /// Scrollback cap: `msgs` messages / `bytes` source bytes, 0 = unbounded.
+    /// **P4-0 stub** — stores the fields only; enforcement (front drain +
+    /// sentinel + cache/selection fixups) is phase-4 B6. In-process stays
+    /// 0/0, so the reference differential cannot move.
+    pub(crate) fn set_scrollback(&mut self, msgs: usize, bytes: usize) {
+        self.max_msgs = msgs;
+        self.max_bytes = bytes;
+    }
+
+    /// The configured cap (`msgs`, `bytes`); 0 = unbounded.
+    #[allow(dead_code)]
+    pub(crate) fn scrollback(&self) -> (usize, usize) {
+        (self.max_msgs, self.max_bytes)
     }
 
     // ── Perf probe surface (test-only; P11 §5.2 / lock L4) ───────────────────

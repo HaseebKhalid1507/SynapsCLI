@@ -29,6 +29,29 @@ pub(crate) struct ResumePending {
     pub clamp_notice: Option<String>,
 }
 
+/// Scrollback cap for [`super::transcript::TranscriptStore::set_scrollback`]
+/// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 2 MiB, Local → 0/0
+/// (unbounded — today's behaviour, so the R-vs-L differential cannot move).
+/// `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` (aliases
+/// `SYNAPS_CLIENT_SCROLLBACK_MSGS` / `_BYTES`) override either (0 =
+/// unbounded); unparsable values fall back to the mode default.
+pub(crate) fn scrollback_from_env(mode: &super::run_setup::TransportMode) -> (usize, usize) {
+    let (msgs, bytes) = match mode {
+        super::run_setup::TransportMode::Socket => (400, 2 * 1024 * 1024),
+        super::run_setup::TransportMode::Local { .. } => (0, 0),
+    };
+    let env = |keys: [&str; 2], default: usize| {
+        keys.iter()
+            .find_map(|k| std::env::var(k).ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    (
+        env(["SYNAPS_TUI_SCROLLBACK", "SYNAPS_CLIENT_SCROLLBACK_MSGS"], msgs),
+        env(["SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_BYTES"], bytes),
+    )
+}
+
 pub(crate) fn apply_header(s: &mut Session, h: &agent_engine::session::SessionHeader) {
     s.id = h.id.clone();
     s.title = h.title.clone();

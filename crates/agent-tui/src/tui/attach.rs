@@ -11,15 +11,15 @@ use std::sync::Arc;
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::{Attach, Hello};
 use agent_engine::session::{
-    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, SessionCommand, SessionConfig,
-    SessionId, TransportError,
+    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, HistoryMode, SessionCommand,
+    SessionConfig, SessionId, TransportError,
 };
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
 use synaps_cli::Result;
 
 use super::app::ChatMessage;
-use super::run_setup::{app_from_snapshot, finish_setup, TransportMode};
+use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp, TransportMode};
 
 /// What to attach to.
 pub struct AttachOpts {
@@ -78,7 +78,9 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
             None,
         )));
     }
-    let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Tui)).await {
+    let hello = Hello::new(ClientKind::Tui)
+        .with_history(HistoryMode::from_env_or(HistoryMode::attach_client_default()));
+    let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
         Err(TransportError::Version { client, daemon }) => {
             return Err(cfg_err(format!(
@@ -152,9 +154,14 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     }
     let keybind_registry = Arc::new(std::sync::RwLock::new(keybinds));
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-    let http = agent_engine::runtime::build_host_http_client()?;
+    let http = LazyHttp::new();
+    if std::env::var("SYNAPS_CLIENT_HTTP").is_ok_and(|v| v == "eager") {
+        http.get()?;
+    }
 
     let mut app = app_from_snapshot(&snapshot);
+    let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
+    app.transcript.set_scrollback(msgs, bytes);
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }

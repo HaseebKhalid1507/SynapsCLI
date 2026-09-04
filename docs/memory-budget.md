@@ -102,6 +102,25 @@ SYNAPS_LOG_BUFFER_LINES=128000     old tracing-appender buffer
 SYNAPS_CONFIG_LOCK=0               skip fs4 lock in write_config_value
 ```
 
+Phase 4 — thin client (`synaps --attach`), PLAN-phase4-client §8.5. Rows are
+"(phase 4, pending)" until the owning package lands; P4-0 rows are live.
+
+| Env | Default | Effect | Status |
+|---|---|---|---|
+| `SYNAPS_CLIENT_HISTORY=full\|digest` | `full` until B7, then `digest` | `full` restores the 741b6b60 mirror + `Query{Messages}` resync + `MessageHistory` forwarding | parsed (P4-0); Digest path (phase 4, pending B) |
+| `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | display items in `Attached.display_tail` / `/resync` | (phase 4, pending B) |
+| `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` | Socket 400 / 2 MiB; Local 0 / 0 | 0 = unbounded | parsed (P4-0); enforcement (phase 4, pending B6) |
+| `SYNAPS_CLIENT_MALLOC=off` | on | skip bg-thread/decay/tcache mallctls | (phase 4, pending A) |
+| `SYNAPS_CLIENT_PURGE_SECS` | 10 | idle purge delay; 0 disables | (phase 4, pending A) |
+| `SYNAPS_CLIENT_TCACHE=0` | 1 | disable main-thread tcache (fallback) | (phase 4, pending A) |
+| `SYNAPS_CLIENT_REEXEC_MALLOC=1` | off | re-exec with `_RJEM_MALLOC_CONF=narenas:1,…` (fallback) | (phase 4, pending A) |
+| `SYNAPS_CLIENT_SIGNAL_THREAD=1` | off | keep the signal-hook thread on the socket client | (phase 4, pending A) |
+| `SYNAPS_MEMPROF_PURGE=1` | off | purge on every `Idle` immediately (bench) | (phase 4, pending A) |
+| `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | boot ladder (`memstat::ladder`) | sink + `http` stage (P4-0); remaining stages (phase 4, pending A) |
+| `SYNAPS_CLIENT_HTTP=eager` | lazy | build the reqwest client at boot (bisect aid) | live (P4-0) |
+| `SYNAPS_TUI_SYNTECT=full` | curated | full default `SyntaxSet` | (phase 4, pending C) |
+| `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | 0 = never evict | (phase 4, pending C) |
+
 ## Observability
 
 - `synaps status --memory [--json] [--pid N]` — per-session process trees

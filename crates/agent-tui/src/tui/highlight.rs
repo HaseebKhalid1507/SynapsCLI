@@ -56,6 +56,15 @@ static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
 });
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+/// Drop the syntect `SyntaxSet` when it has not been used for `idle`
+/// (PLAN-phase4 §3 C2). **P4-0 stub**: the set is a `LazyLock` today and
+/// cannot be evicted, so this always returns `false`; C2 replaces the
+/// static with a `SyntaxCache` and makes this real. A's idle arm calls it.
+#[allow(dead_code)]
+pub(crate) fn evict_if_idle(_idle: std::time::Duration) -> bool {
+    false
+}
+
 // ── Test-only highlight instrumentation (Slice 0 / T241) ─────────────────────
 //
 // Two counters:

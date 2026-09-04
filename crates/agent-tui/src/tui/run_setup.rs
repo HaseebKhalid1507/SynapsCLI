@@ -32,6 +32,46 @@ pub(crate) enum TransportMode {
     Socket,
 }
 
+/// Client-local HTTP client, built on first use (P4-0). The in-process TUI
+/// seeds it with the host's client (`LazyHttp::from`), so nothing changes
+/// there; the socket client (`--attach`) pays for reqwest + rustls + the
+/// native root store only when `/models`, `/settings` or a catalog expand
+/// actually asks (`SYNAPS_CLIENT_HTTP=eager` builds it at boot — bisect aid).
+pub(crate) struct LazyHttp(std::cell::OnceCell<reqwest::Client>);
+
+impl LazyHttp {
+    /// Empty; the first `get()` builds via `build_host_http_client`.
+    pub(crate) fn new() -> Self {
+        Self(std::cell::OnceCell::new())
+    }
+
+    /// The client, building it on first use (emits the `http` ladder stage).
+    pub(crate) fn get(&self) -> Result<&reqwest::Client> {
+        if let Some(c) = self.0.get() {
+            return Ok(c);
+        }
+        let t0 = Instant::now();
+        let client = agent_engine::runtime::build_host_http_client()?;
+        agent_core::core::memstat::ladder(
+            "http",
+            &format_args!("build_ms={}", t0.elapsed().as_millis()),
+        );
+        Ok(self.0.get_or_init(|| client))
+    }
+
+    /// Already built?
+    #[allow(dead_code)]
+    pub(crate) fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+impl From<reqwest::Client> for LazyHttp {
+    fn from(client: reqwest::Client) -> Self {
+        Self(std::cell::OnceCell::from(client))
+    }
+}
+
 /// Everything `run()`'s event loop and teardown consume from the boot
 /// prologue. Fields are handed back by value so `run()` owns them exactly as
 /// it did when they were locals — the loop's `&mut` borrows are unchanged.
@@ -41,8 +81,8 @@ pub(crate) struct RunContext {
     /// `SocketTransport` for `--attach`).
     pub link: SessionLink,
     /// Client-local HTTP client for catalog/model-list fetches (the same
-    /// builder the host uses).
-    pub http: reqwest::Client,
+    /// builder the host uses; lazy on the socket path).
+    pub http: LazyHttp,
     pub prompt_bridge: PromptBridge,
     pub mode: TransportMode,
     pub config: synaps_cli::SynapsConfig,
@@ -113,7 +153,7 @@ pub(crate) async fn run_setup(
     let keybind_registry = Arc::clone(host.keybind_registry());
     let mcp_server_count = host.mcp_server_count();
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-    let http = host.parts().client.clone();
+    let http = LazyHttp::from(host.parts().client.clone());
     let ext_mgr_shared = Arc::clone(host.ext_manager());
 
     let mut app = app_from_snapshot(&snapshot);
@@ -229,7 +269,7 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
 pub(crate) async fn finish_setup(
     mut app: App,
     transport: Box<dyn ClientTransport>,
-    http: reqwest::Client,
+    http: LazyHttp,
     mode: TransportMode,
     config: synaps_cli::SynapsConfig,
     registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
