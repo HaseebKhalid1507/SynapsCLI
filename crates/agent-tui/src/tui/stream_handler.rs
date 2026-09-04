@@ -217,47 +217,6 @@ fn publish_frame(
     }
 }
 
-/// The two strings the actor still sends as `SystemNotice` where the TUI
-/// used to push a typed line (until the actor emits `Aborted`/`Cleared`
-/// itself). Returns the typed envelope, or the notice unchanged.
-/// Idempotent with the typed event via [`shim_dedup`]: if both the notice
-/// and `Aborted`/`Cleared` arrive, the second is dropped.
-fn shim_notice(text: String) -> SessionEventWire {
-    match text.as_str() {
-        "aborted" => SessionEventWire::Aborted {
-            context_saved: false,
-        },
-        "aborted — context saved for next message" => SessionEventWire::Aborted {
-            context_saved: true,
-        },
-        s if s.starts_with("session cleared → ") => SessionEventWire::Cleared {
-            session_id: s["session cleared → ".len()..].to_string(),
-        },
-        _ => SessionEventWire::SystemNotice(text),
-    }
-}
-
-/// `true` when `event` is an `Aborted`/`Cleared` already rendered since the
-/// last `TurnStarted` (the shimmed notice and the typed event both arrived).
-/// Keyed on the full value: two `/clear`s carry different session ids and
-/// both render; two aborts without a turn between them are impossible.
-fn shim_dedup(app: &mut App, event: &SessionEventWire) -> bool {
-    let key = match event {
-        SessionEventWire::Aborted { context_saved } => format!("aborted:{context_saved}"),
-        SessionEventWire::Cleared { session_id } => format!("cleared:{session_id}"),
-        SessionEventWire::TurnStarted { .. } => {
-            app.shim_seen = None;
-            return false;
-        }
-        _ => return false,
-    };
-    if app.shim_seen.as_deref() == Some(key.as_str()) {
-        return true;
-    }
-    app.shim_seen = Some(key);
-    false
-}
-
 /// Event card + HUD mark for a drained engine event (was the presentation
 /// half of `handle_event_queue_arm`, verbatim).
 pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Event) {
@@ -330,14 +289,7 @@ pub(super) async fn handle_session_event_arm(
     >,
 ) -> ArmFlow {
     let me = link.client_id();
-    let event = match env.event {
-        SessionEventWire::SystemNotice(text) => shim_notice(text),
-        other => other,
-    };
-    if shim_dedup(app, &event) {
-        return ArmFlow::Continue;
-    }
-    match event {
+    match env.event {
         SessionEventWire::Stream(ev) => {
             let do_draw = needs_immediate_draw(&ev);
             let view = std::sync::Arc::clone(link.view());

@@ -113,28 +113,6 @@ fn session_abort_renders_error_line_and_stops_streaming() {
 }
 
 #[test]
-fn session_abort_via_actor_notice_shim_matches_typed() {
-    // Until the actor emits `Aborted`, it sends the same text as a notice;
-    // both must render the identical frame.
-    let (typed, _) = frame_for(vec![
-        turn(TurnTrigger::User, None),
-        text("partial"),
-        W::Aborted {
-            context_saved: true,
-        },
-    ]);
-    let (shim, _) = frame_for(vec![
-        turn(TurnTrigger::User, None),
-        text("partial"),
-        W::SystemNotice {
-            text: "aborted — context saved for next message".into(),
-        },
-    ]);
-    assert_eq!(typed, shim);
-    assert!(typed.contains("aborted — context saved for next message"));
-}
-
-#[test]
 fn session_event_card_and_cap_notice() {
     let ev = agent_engine::events::types::Event::simple("watcher", "disk is full", None);
     let (frame, _) = frame_for(vec![
@@ -191,71 +169,21 @@ fn session_owner_change_toasts_previous_owner() {
     assert!(frame.contains("input taken over by client #3"), "{frame}");
 }
 
+/// The actor's `SystemNotice` text is rendered as a plain system line —
+/// there is no text→typed shim any more: `Aborted`/`Cleared` are typed
+/// events on the wire (engine db603206), so a notice that happens to read
+/// "aborted" is just a notice.
 #[test]
-fn session_abort_notice_plus_typed_renders_once() {
-    // Shim idempotency: the actor may send BOTH the notice text and the
-    // typed `Aborted` (engine emitting typed events while the notice is
-    // still there) — exactly one "aborted" line, same frame as typed-only.
-    let (typed, _) = frame_for(vec![
+fn session_notice_text_is_not_a_typed_event() {
+    let (frame, _) = frame_for(vec![
         turn(TurnTrigger::User, None),
         text("partial"),
-        W::Aborted {
-            context_saved: true,
-        },
-        W::Idle,
-    ]);
-    let (both, _) = frame_for(vec![
-        turn(TurnTrigger::User, None),
-        text("partial"),
-        W::SystemNotice {
-            text: "aborted — context saved for next message".into(),
-        },
-        W::Aborted {
-            context_saved: true,
-        },
-        W::Idle,
-    ]);
-    assert_eq!(typed, both);
-    assert_eq!(both.matches("aborted — context saved").count(), 1, "{both}");
-    // A later turn's abort renders again (latch resets on TurnStarted).
-    let (two_turns, _) = frame_for(vec![
-        turn(TurnTrigger::User, None),
-        text("partial"),
-        W::Aborted {
-            context_saved: false,
-        },
-        W::Idle,
-        turn(TurnTrigger::User, None),
-        text("partial 2"),
-        W::SystemNotice {
-            text: "aborted".into(),
-        },
-        W::Aborted {
-            context_saved: false,
-        },
-        W::Idle,
-    ]);
-    assert_eq!(two_turns.matches("aborted").count(), 2, "{two_turns}");
-}
-
-#[test]
-fn session_cleared_notice_plus_typed_renders_once() {
-    let (both, _) = frame_for(vec![
-        turn(TurnTrigger::User, None),
-        text("old stuff"),
-        done(),
         W::SystemNotice {
             text: "session cleared → new-1".into(),
         },
-        W::Cleared {
-            session_id: "new-1".into(),
-        },
-        // A second /clear (different id) must still render.
-        W::Cleared {
-            session_id: "new-2".into(),
-        },
     ]);
-    assert_eq!(both.matches("new session started").count(), 2, "{both}");
+    assert!(frame.contains("partial"), "{frame}");
+    assert!(!frame.contains("new session started"), "{frame}");
 }
 
 #[test]

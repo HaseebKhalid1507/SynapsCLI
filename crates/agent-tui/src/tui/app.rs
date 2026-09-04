@@ -125,10 +125,6 @@ pub(crate) struct App {
     /// Counter for unique subagent IDs within a session
     /// Saved context from an aborted response — injected into the next user message
     pub(crate) abort_context: Option<String>,
-    /// Dedupe key of the last `Aborted`/`Cleared` rendered since the last
-    /// `TurnStarted` — the actor's `SystemNotice` text and its typed event
-    /// may BOTH arrive (shim + typed); only one line is rendered.
-    pub(crate) shim_seen: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
     pub(crate) queued_message: Option<String>,
     /// Tracks paste state: snapshot of input before first paste, and total pasted char count
@@ -360,7 +356,6 @@ impl App {
             },
             subagents: Vec::new(),
             abort_context: None,
-            shim_seen: None,
             queued_message: None,
             input_before_paste: None,
             pasted_char_count: 0,
