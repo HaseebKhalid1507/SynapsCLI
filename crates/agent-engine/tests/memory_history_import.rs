@@ -133,6 +133,7 @@ fn fixture_session(id: &str, system_prompt: Option<&str>, api_messages: Vec<Valu
         total_input_tokens: 0,
         total_output_tokens: 0,
         session_cost: 0.0,
+        message_count: 0,
         api_messages: api_messages.into_iter().map(Arc::new).collect(),
         abort_context: None,
         parent_session: None,

@@ -388,7 +388,7 @@ fn a01_first_request_core_only_within_budget() {
     const DOCUMENTED_FIRST_REQUEST_BUDGET_BYTES: usize = 8 * 1024;
 
     let set = SessionToolSet::progressive_core_for_catalog(sid("a01"), registry.catalog());
-    let schemas = registry.session_tools_schema(&set).unwrap();
+    let schemas = registry.session_tools_schema(&set).schema;
     let names: BTreeSet<String> = schemas
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
@@ -421,7 +421,7 @@ fn a02_dormant_bodies_absent_from_first_request() {
     let registry = acceptance_registry(&mcp, &ext);
     // Progressive (flag ON): dormant builtin/MCP/extension schemas absent.
     let set = progressive_set(&registry, &sid("a02"));
-    let serialized = serde_json::to_string(&*registry.session_tools_schema(&set).unwrap()).unwrap();
+    let serialized = serde_json::to_string(&registry.session_tools_schema(&set).schema).unwrap();
     assert!(
         !serialized.contains(SCHEMA_MARKER),
         "dormant builtin schema leaked"
@@ -437,7 +437,7 @@ fn a02_dormant_bodies_absent_from_first_request() {
     // Legacy (flag OFF): full catalog exposed — documented compatibility.
     let legacy = legacy_set(&registry, &sid("a02"));
     let legacy_serialized =
-        serde_json::to_string(&*registry.session_tools_schema(&legacy).unwrap()).unwrap();
+        serde_json::to_string(&registry.session_tools_schema(&legacy).schema).unwrap();
     assert!(
         legacy_serialized.contains("ext__srv__echo_tool"),
         "flag-off keeps the legacy full exposure"
@@ -515,7 +515,7 @@ fn a04_activation_adds_exactly_one_schema() {
     let mut set = progressive_set(&registry, &sid("a04"));
     let before: BTreeSet<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();
@@ -527,7 +527,7 @@ fn a04_activation_adds_exactly_one_schema() {
     .unwrap();
     let after: BTreeSet<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();
@@ -619,7 +619,7 @@ fn a06_alias_spellings_cannot_bypass_activation() {
         .unwrap();
         registry
             .session_tools_schema(&probe)
-            .unwrap()
+            .schema
             .iter()
             .filter_map(|s| s["name"].as_str().map(String::from))
             .find(|n| registry.runtime_name_for_api(n) == "fixture-plugin:search")
@@ -796,20 +796,19 @@ fn a10_revocation_digest_generation_invalidate() {
         Err(ToolAuthorizationError::NotActivated(ref id)) if *id == echo
     ));
 
-    // 2. Catalog generation change (registry mutation) invalidates the
-    // whole stale session set at the gate.
+    // 2. Catalog generation change (unrelated registry mutation) marks the
+    // set stale but does NOT deny per-tool: the gate validates each pinned
+    // record's digest + provenance individually (6b668835), so an unchanged
+    // activated tool keeps authorizing while fresh grants are blocked.
     let mut set2 =
         SessionToolSet::progressive_core_for_catalog(session.clone(), registry.catalog());
     activate_exact_for_user(&mut set2, registry.catalog(), &echo).unwrap();
     registry
         .try_disable(&["dormant_07".to_string()])
         .expect("disable advances the catalog generation");
-    let err = ExecutionGate::authorize_wire_call(&registry, &set2, "ext__srv__echo_tool")
-        .expect_err("stale generation must deny");
-    assert!(matches!(
-        err,
-        ToolAuthorizationError::StaleSessionSet { .. }
-    ));
+    assert!(set2.is_stale(registry.catalog()));
+    ExecutionGate::authorize_wire_call(&registry, &set2, "ext__srv__echo_tool")
+        .expect("schema-identical activated tool survives unrelated drift");
 
     // 3. Schema digest drift: a session set whose grant was pinned under
     // the ORIGINAL schema must be denied against a registry whose live
@@ -892,7 +891,7 @@ fn a11_cross_provider_logical_set_equivalence() {
     modes.push(("flag-off/legacy", legacy_set(&registry, &sid("a11-legacy"))));
     for (mode, set) in modes {
         // Anthropic-side: the session projection (api-safe names).
-        let schemas = registry.session_tools_schema(&set).unwrap();
+        let schemas = registry.session_tools_schema(&set).schema;
         let anthropic_logical: BTreeSet<String> = schemas
             .iter()
             .filter_map(|s| s["name"].as_str())
@@ -1012,7 +1011,7 @@ async fn a12_skill_bodies_lazy_and_exact() {
     tools.register(Arc::new(LoadSkillTool::new(registry.clone())));
     tools.register(Arc::new(SearchSkillsTool::new(registry.clone())));
     let set = SessionToolSet::progressive_core_for_catalog(sid("a12"), tools.catalog());
-    let projection = serde_json::to_string(&*tools.session_tools_schema(&set).unwrap()).unwrap();
+    let projection = serde_json::to_string(&tools.session_tools_schema(&set).schema).unwrap();
     assert!(
         projection.contains("load_skill"),
         "projection includes the skill tools"
@@ -1064,13 +1063,13 @@ fn a13_activate_many_single_generation_update() {
     // Stable order: projection order deterministic across runs.
     let names: Vec<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();
     let again: Vec<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();

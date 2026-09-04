@@ -273,7 +273,7 @@
     }
   },
   {
-    "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections.",
+    "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections. Image files (PNG, JPEG, GIF, WebP) are returned as an image the model can see, up to 3.5 MB.",
     "name": "read",
     "parameters": {
       "properties": {

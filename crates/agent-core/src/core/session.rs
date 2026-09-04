@@ -17,6 +17,13 @@ pub struct Session {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
+    /// Persisted listing hint: `api_messages.len()` at save time. Declared
+    /// BEFORE `api_messages` so it lands in the header that
+    /// `read_session_header` reads without touching the message array.
+    /// Not authoritative in memory — use `api_messages.len()`; refreshed by
+    /// `session_journal::save_session_in_dir`. Legacy files → 0.
+    #[serde(default)]
+    pub message_count: usize,
     pub api_messages: Vec<SharedMessage>,
     /// Saved abort context — injected into the next user message on /continue
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +76,7 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
             parent_session: None,
@@ -117,6 +125,7 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,
             parent_session: Some(parent.id.clone()),
@@ -390,8 +399,9 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
 }
 
 /// Read + parse just the metadata header of one session file into a
-/// [`SessionInfo`] (no message history). `message_count` is left 0 — it isn't
-/// parsed in the header read; use [`Session::info`] when an exact count matters.
+/// [`SessionInfo`] (no message history). `message_count` comes from the
+/// persisted header field (written at save time); legacy files without it
+/// report 0.
 fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<SessionInfo> {
     #[derive(Deserialize)]
     struct SessionMetadata {
@@ -405,12 +415,11 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
         updated_at: DateTime<Utc>,
         #[serde(default)]
         session_cost: f64,
+        #[serde(default)]
+        message_count: usize,
     }
     let header = read_session_header(dir, file_name)?;
     let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
-    // Cheap message count: each api_message has exactly one "role" field.
-    // Count occurrences without deserializing the full array.
-    let message_count = header.matches("\"role\":").count();
     let mut info = SessionInfo {
         id: meta.id,
         title: meta.title,
@@ -419,7 +428,7 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         session_cost: meta.session_cost,
-        message_count,
+        message_count: meta.message_count,
     };
     // Journal freshness overlay (Task 35): when an opt-in journal exists,
     // its bounded meta tail is newer than the (possibly lagging) snapshot
@@ -428,6 +437,9 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
         if tail.updated_at > info.updated_at {
             info.updated_at = tail.updated_at;
             info.session_cost = tail.session_cost;
+            if let Some(count) = tail.message_count {
+                info.message_count = count;
+            }
         }
     }
     Some(info)
@@ -1029,6 +1041,70 @@ mod tests {
                 "original",
                 "no bytes may be written through the planted symlink"
             );
+        }
+    }
+
+    mod header_message_count {
+        use super::*;
+        use crate::core::session_journal::{save_session_in_dir, SessionPersistence};
+        use std::sync::Arc;
+
+        fn session_with(n: usize) -> Session {
+            let mut s = Session::new("claude-sonnet-4-6", "medium", None);
+            for i in 0..n {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                s.api_messages
+                    .push(Arc::new(serde_json::json!({"role": role, "content": format!("m{i}")})));
+            }
+            s
+        }
+
+        /// save → header reader round-trip: the count is persisted in the
+        /// header (before `api_messages`), so the truncating reader sees it.
+        #[test]
+        fn json_save_persists_count_in_header() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let s = session_with(7);
+            save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+            let header = read_session_header(&dir, &format!("{}.json", s.id)).unwrap();
+            assert!(
+                !header.contains("\"api_messages\""),
+                "header must stop before the message array"
+            );
+            let info = parse_session_header(&dir, &format!("{}.json", s.id)).unwrap();
+            assert_eq!(info.message_count, 7);
+        }
+
+        /// Journal mode: appended messages update the count via the meta tail.
+        #[test]
+        fn journal_append_updates_count() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = session_with(2);
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            s.api_messages
+                .push(Arc::new(serde_json::json!({"role": "user", "content": "more"})));
+            s.updated_at = Utc::now();
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            let info = parse_session_header(&dir, &format!("{}.json", s.id)).unwrap();
+            assert_eq!(info.message_count, 3);
+        }
+
+        /// Legacy files without the field report 0, never fail to parse.
+        #[test]
+        fn legacy_header_defaults_to_zero() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let s = session_with(3);
+            // Strip the field textually to keep declaration order (a
+            // `to_value` round-trip would re-sort keys alphabetically).
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(json.contains("\"message_count\":0,"));
+            let legacy = json.replace("\"message_count\":0,", "");
+            save_json_in_dir(&dir, &s.id, legacy.as_bytes()).unwrap();
+            let info = parse_session_header(&dir, &format!("{}.json", s.id)).unwrap();
+            assert_eq!(info.message_count, 0);
         }
     }
 }

@@ -292,6 +292,8 @@ pub struct SaveReceipt {
 pub struct JournalMetaTail {
     pub updated_at: DateTime<Utc>,
     pub session_cost: f64,
+    /// `None` for meta records written before the count was journaled.
+    pub message_count: Option<usize>,
 }
 
 /// `sessions/<id>.journal` — single-extension name so the session id stays
@@ -344,6 +346,8 @@ struct SessionMeta {
     total_output_tokens: u64,
     session_cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     abort_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_session: Option<String>,
@@ -369,6 +373,7 @@ impl SessionMeta {
             total_input_tokens: s.total_input_tokens,
             total_output_tokens: s.total_output_tokens,
             session_cost: s.session_cost,
+            message_count: Some(s.api_messages.len()),
             abort_context: s.abort_context.clone(),
             parent_session: s.parent_session.clone(),
             compacted_into: s.compacted_into.clone(),
@@ -503,6 +508,12 @@ pub fn save_session_in_dir(
     // ONE strict resolution per save (fix2); every artifact operation below
     // is relative to this handle.
     let handle = create_sessions_dir(dir)?;
+    // Refresh the persisted listing hint at the single save choke point so
+    // the header always carries the current count (messages are Arc-shared;
+    // the clone is cheap).
+    let mut session = session.clone();
+    session.message_count = session.api_messages.len();
+    let session = &session;
     match mode {
         SessionPersistence::Json => {
             let json = serde_json::to_string(session).map_err(std::io::Error::other)?;
@@ -699,6 +710,7 @@ pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
                 freshest = Some(JournalMetaTail {
                     updated_at: meta.updated_at,
                     session_cost: meta.session_cost,
+                    message_count: meta.message_count,
                 });
             }
         }
