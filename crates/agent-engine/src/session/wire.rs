@@ -154,7 +154,9 @@ pub enum DaemonFrame {
         uptime_s: u64,
         sessions: usize,
     },
-    SessionList(Vec<SessionMeta>),
+    SessionList {
+        sessions: Vec<SessionMeta>,
+    },
     Attached(AttachedWire),
     Event(WireEnvelope),
     Error {
@@ -705,8 +707,8 @@ mod tests {
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // Every SessionEventWire variant is covered (18) + every StreamEvent leaf (18).
-        assert_eq!(all.len(), 18 + 18);
+        // Every SessionEventWire variant (18) + every StreamEvent leaf (18; Stream counted once).
+        assert_eq!(all.len(), 17 + 18);
         for ev in all {
             let before = format!("{:?}", env(ev.clone()));
             let wire: WireEnvelope = env(ev).into();
@@ -754,7 +756,7 @@ mod tests {
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 1, min: 1, max: 1 }, message: "no".into() },
             DaemonFrame::Pong { pid: 1, uptime_s: 2, sessions: 0 },
-            DaemonFrame::SessionList(vec![meta()]),
+            DaemonFrame::SessionList { sessions: vec![meta()] },
             DaemonFrame::Attached(AttachedWire::new(
                 ClientId(1),
                 AttachSnapshot {
