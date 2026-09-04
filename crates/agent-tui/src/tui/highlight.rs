@@ -657,6 +657,44 @@ mod tests {
         false
     }
 
+    /// PLAN-phase4 §8.4 C1/C2 numbers. Run in release, once per mode:
+    /// `cargo test -p synaps-tui --release --lib -- --ignored measure_hl_first --nocapture`
+    /// and again with `SYNAPS_TUI_SYNTECT=full`. Prints RssAnon before the
+    /// first highlight, after it (`hl_first` step), after eviction, and after
+    /// the reload, with `load_ms` for both loads.
+    #[test]
+    #[ignore]
+    #[serial_test::serial(highlight_cache)]
+    fn measure_hl_first() {
+        use agent_core::core::memstat::self_snapshot;
+        let code = include_str!("../../tests/fixtures/highlight/sample.rs.txt");
+        let py = include_str!("../../tests/fixtures/highlight/sample.py.txt");
+        let _ = evict_now();
+        let mode = std::env::var("SYNAPS_TUI_SYNTECT").unwrap_or_else(|_| "curated".into());
+        let base = self_snapshot().rss_anon_kb;
+        let t0 = Instant::now();
+        let _ = highlight_code_block(code, "rust", "");
+        let first_ms = t0.elapsed().as_millis();
+        let after_first = self_snapshot().rss_anon_kb;
+        let _ = highlight_code_block(py, "python", "");
+        let _ = highlight_code_block(code, "rust", "");
+        let after_more = self_snapshot().rss_anon_kb;
+        assert!(evict_now());
+        let after_evict = self_snapshot().rss_anon_kb;
+        let t1 = Instant::now();
+        let _ = highlight_code_block(code, "rust", "");
+        let reload_ms = t1.elapsed().as_millis();
+        let after_reload = self_snapshot().rss_anon_kb;
+        eprintln!(
+            "measure_hl_first mode={mode} dump_bytes={} rss_anon_kb: base={base} hl_first={after_first} (+{}) +py={after_more} (+{}) evicted={after_evict} ({:+}) reload={after_reload} (+{}) first_hl_ms={first_ms} reload_hl_ms={reload_ms}",
+            CURATED_DUMP.len(),
+            after_first as i64 - base as i64,
+            after_more as i64 - base as i64,
+            after_evict as i64 - after_more as i64,
+            after_reload as i64 - after_evict as i64,
+        );
+    }
+
     #[test]
     fn single_code_theme_is_the_palette_theme() {
         let full = ThemeSet::load_defaults();
