@@ -192,6 +192,73 @@ fn session_owner_change_toasts_previous_owner() {
 }
 
 #[test]
+fn session_abort_notice_plus_typed_renders_once() {
+    // Shim idempotency: the actor may send BOTH the notice text and the
+    // typed `Aborted` (engine emitting typed events while the notice is
+    // still there) — exactly one "aborted" line, same frame as typed-only.
+    let (typed, _) = frame_for(vec![
+        turn(TurnTrigger::User, None),
+        text("partial"),
+        W::Aborted {
+            context_saved: true,
+        },
+        W::Idle,
+    ]);
+    let (both, _) = frame_for(vec![
+        turn(TurnTrigger::User, None),
+        text("partial"),
+        W::SystemNotice {
+            text: "aborted — context saved for next message".into(),
+        },
+        W::Aborted {
+            context_saved: true,
+        },
+        W::Idle,
+    ]);
+    assert_eq!(typed, both);
+    assert_eq!(both.matches("aborted — context saved").count(), 1, "{both}");
+    // A later turn's abort renders again (latch resets on TurnStarted).
+    let (two_turns, _) = frame_for(vec![
+        turn(TurnTrigger::User, None),
+        text("partial"),
+        W::Aborted {
+            context_saved: false,
+        },
+        W::Idle,
+        turn(TurnTrigger::User, None),
+        text("partial 2"),
+        W::SystemNotice {
+            text: "aborted".into(),
+        },
+        W::Aborted {
+            context_saved: false,
+        },
+        W::Idle,
+    ]);
+    assert_eq!(two_turns.matches("aborted").count(), 2, "{two_turns}");
+}
+
+#[test]
+fn session_cleared_notice_plus_typed_renders_once() {
+    let (both, _) = frame_for(vec![
+        turn(TurnTrigger::User, None),
+        text("old stuff"),
+        done(),
+        W::SystemNotice {
+            text: "session cleared → new-1".into(),
+        },
+        W::Cleared {
+            session_id: "new-1".into(),
+        },
+        // A second /clear (different id) must still render.
+        W::Cleared {
+            session_id: "new-2".into(),
+        },
+    ]);
+    assert_eq!(both.matches("new session started").count(), 2, "{both}");
+}
+
+#[test]
 fn session_cleared_resets_transcript() {
     let (frame, _) = frame_for(vec![
         turn(TurnTrigger::User, None),
