@@ -363,30 +363,38 @@ impl Drop for Pane {
     }
 }
 
-/// Socket-pane normalisation on top of [`normalise`]: the attach banner
-/// (`attached to <id> as client #N (Mirror)`) exists only on S; the
-/// in-process boot line `resumed session`/`new session` shapes are the same
-/// on both. Nothing else is dropped.
+/// Socket-pane normalisation on top of [`normalise`] — the documented L≡S
+/// drops (phase 4 §7.4 G9):
+/// 1. the attach banner (`attached to <id> as client #N (Mirror)`), a
+///    System card that exists only on S;
+/// 2. blank rows — the banner card shifts the top-anchored transcript by
+///    its rows while the input box/footer stay bottom-anchored, so the
+///    empty region between them differs in height. Content rows, their
+///    order and the chrome (header, box, footer) are all compared.
 fn normalise_socket(frame: &str) -> String {
     let attached = regex::Regex::new(r"^\s*attached to <id> as client #\d+ \([A-Za-z]+\).*$").unwrap();
-    let norm = normalise(frame);
-    let lines: Vec<&str> = norm.lines().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut i = 0;
-    while i < lines.len() {
-        if attached.is_match(lines[i]) {
-            // The banner is a System card: its text row + the blank
-            // separator row after it.
-            i += 1;
-            if i < lines.len() && lines[i].trim().is_empty() {
-                i += 1;
+    normalise(frame)
+        .lines()
+        .filter(|l| !attached.is_match(l) && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Journal diff for L≡S: the session `.json` files only. `index.jsonl`
+/// (start/end lifecycle events) is dropped — S's `/quit` is a `Detach`, the
+/// daemon session lives on, so its `end` event is written later (or never
+/// in the test's window). Documented drop.
+fn normalise_journal_socket(dir: &Path) -> String {
+    let tmp = tempfile::TempDir::new().unwrap();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if e.path().is_file() && name.to_string_lossy().ends_with(".json") {
+                let _ = std::fs::copy(e.path(), tmp.path().join(name));
             }
-            continue;
         }
-        out.push(lines[i]);
-        i += 1;
     }
-    out.join("\n")
+    normalise_journal(tmp.path())
 }
 
 /// Copy a pane's sessions dir under `target/tui-e2e/<scenario>.<tag>.sessions/`
@@ -648,7 +656,8 @@ async fn tui_reference_binary_differential() {
             // The daemon writes S's journal; give the detach a beat, then stop it.
             std::thread::sleep(Duration::from_millis(500));
             keep_sessions(&out_dir, sc.name, "sock", s.home.path());
-            let js = normalise_journal(&s.home.path().join(".synaps-cli/sessions"));
+            let jl = normalise_journal_socket(&l.home.path().join(".synaps-cli/sessions"));
+            let js = normalise_journal_socket(&s.home.path().join(".synaps-cli/sessions"));
             if let Some(d) = diff_report_named(&format!("{}/journal", sc.name), ("L", &jl), ("S", &js)) {
                 socket_failures.push(d);
             }
