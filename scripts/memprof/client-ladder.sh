@@ -55,7 +55,8 @@ sample() { # label
   local a t
   a=$(awk '/^RssAnon:/{print $2}' "/proc/$CPID/status" 2>/dev/null)
   t=$(awk '/^Threads:/{print $2}' "/proc/$CPID/status" 2>/dev/null)
-  echo "extern:$1 t_ms=$(( ($(date +%s%N)-t0)/1000000 )) rss_anon_kb=${a:-?} threads=${t:-?} comms=$(cat /proc/$CPID/task/*/comm 2>/dev/null | sort | uniq -c | awk '{printf "%s×%s,", $2, $1}')"
+  local h; h=$(awk '/^AnonHugePages:/{print $2}' "/proc/$CPID/smaps_rollup" 2>/dev/null)
+  echo "extern:$1 t_ms=$(( ($(date +%s%N)-t0)/1000000 )) rss_anon_kb=${a:-?} anon_huge_kb=${h:-?} threads=${t:-?} comms=$(cat /proc/$CPID/task/*/comm 2>/dev/null | sort | uniq -c | awk '{printf "%s×%s,", $2, $1}')"
 }
 sleep "$PRE"; EXT_PRE=$(sample pre)
 sleep $((SETTLE - PRE)); EXT_POST=$(sample post)
@@ -73,13 +74,13 @@ if [ ! -s "$TRACE" ]; then
   exit 0
 fi
 {
-  printf "%-8s %-16s %10s %8s %10s %10s %10s %10s %8s %4s  %s\n" t_ms stage rss_anon Δ alloc active resident retained meta thr extra
+  printf "%-8s %-16s %10s %8s %10s %10s %10s %10s %8s %8s %4s  %s\n" t_ms stage rss_anon Δ alloc active resident retained meta huge thr extra
   awk '
   function kv(k,   i) { for (i=1;i<=NF;i++) if (index($i, k"=")==1) return substr($i, length(k)+2); return "" }
   {
-    t=kv("t_ms"); s=kv("stage"); a=kv("rss_anon_kb"); al=kv("jemalloc_allocated_kb"); ac=kv("active_kb"); r=kv("resident_kb"); rt=kv("retained_kb"); m=kv("metadata_kb"); th=kv("threads")
-    extra=""; for (i=1;i<=NF;i++) if ($i !~ /^(t_ms|stage|rss_anon_kb|jemalloc_allocated_kb|active_kb|resident_kb|retained_kb|metadata_kb|threads)=/) extra=extra " " $i
+    t=kv("t_ms"); s=kv("stage"); a=kv("rss_anon_kb"); al=kv("jemalloc_allocated_kb"); ac=kv("active_kb"); r=kv("resident_kb"); rt=kv("retained_kb"); m=kv("metadata_kb"); th=kv("threads"); hg=kv("anon_huge_kb")
+    extra=""; for (i=1;i<=NF;i++) if ($i !~ /^(t_ms|stage|rss_anon_kb|jemalloc_allocated_kb|active_kb|resident_kb|retained_kb|metadata_kb|threads|anon_huge_kb)=/) extra=extra " " $i
     d = (prev=="") ? "" : sprintf("%+d", a-prev); prev=a
-    printf "%-8s %-16s %10s %8s %10s %10s %10s %10s %8s %4s %s\n", t, s, a, d, al, ac, r, rt, m, th, extra
+    printf "%-8s %-16s %10s %8s %10s %10s %10s %10s %8s %8s %4s %s\n", t, s, a, d, al, ac, r, rt, m, hg, th, extra
   }' "$TRACE"
 } | tee "${OUT:-/dev/null}"

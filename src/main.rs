@@ -334,6 +334,7 @@ fn main() -> anyhow::Result<()> {
     if thin {
         // Ladder START pins on the first call — `main` must be first (§7.1).
         agent_core::core::memstat::ladder("main", &"");
+        tui::client_diet::tune_allocator();
     }
     let rt = if thin {
         tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?

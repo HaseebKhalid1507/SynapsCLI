@@ -132,6 +132,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     let mut first_frame_done = false;
+    let mut idle_purge = client_diet::IdlePurge::new(matches!(mode, run_setup::TransportMode::Socket));
     loop {
         // Only draw when something actually changed. During streaming, coalesce
         // redraws to the configured frame budget (`max_fps`, default 60fps =
@@ -190,6 +191,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                 }
             }
         }
+        idle_purge.observe(app.streaming || app.compacting);
 
         tokio::select! {
 
@@ -207,6 +209,11 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                     // Fall through to unified bounded-teardown below the loop.
                     break;
                 }
+            }
+
+            // ── Client diet: idle purge (socket client only; §4.4) ──
+            _ = idle_purge.wait() => {
+                idle_purge.fire();
             }
 
             // ── Ping results — fires when a model ping completes ──
