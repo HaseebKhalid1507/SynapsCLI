@@ -82,3 +82,22 @@ async fn worker_ignores_host_progressive_disclosure_and_keeps_extension_tools() 
     assert!(reg.get("alpha:do_thing").is_some(), "extension tool present");
 }
 
+
+#[tokio::test]
+async fn worker_has_its_own_http_client_pool() {
+    let h = host_with_disclosure_on().await;
+    let fg = h.foreground_runtime().await.unwrap();
+    let w1 = h.worker_runtime().await.unwrap();
+    let w2 = h.worker_runtime().await.unwrap();
+    let fg_id = fg.http_client_pool_id();
+    assert_ne!(fg_id, w1.http_client_pool_id(), "worker pool != host pool");
+    assert_ne!(fg_id, w2.http_client_pool_id(), "worker pool != host pool");
+    assert_ne!(
+        w1.http_client_pool_id(),
+        w2.http_client_pool_id(),
+        "each worker owns its pool"
+    );
+    // Foregrounds keep sharing the host's client.
+    let fg2 = h.foreground_runtime().await.unwrap();
+    assert_eq!(fg_id, fg2.http_client_pool_id());
+}

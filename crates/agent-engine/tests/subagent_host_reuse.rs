@@ -1,7 +1,12 @@
 //! B2: subagents spawn from the process `EngineHost` — shared credential
-//! source / token cache (no `set_global_broker` re-install, no cache eviction),
-//! cached worker registry template, one HTTP client. Legacy env restores the
-//! fresh-runtime path.
+//! source / token cache (ONE broker install, no cache eviction) and a cached
+//! worker registry template. Legacy env restores the fresh-runtime path.
+//!
+//! NOT shared: the HTTP client. Workers `block_on` throwaway `current_thread`
+//! runtimes and hyper parks each connection's I/O driver on the runtime that
+//! opened it, so a shared pool would hand worker-born connections to the
+//! foreground and kill its stream when the worker exited. Each worker builds
+//! its own client (see `tests/worker_runtime_isolation.rs`).
 
 use agent_engine::{EngineHost, HostOpts};
 use std::sync::Arc;

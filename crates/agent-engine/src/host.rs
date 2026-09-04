@@ -201,6 +201,7 @@ impl EngineHost {
     /// runtime dropped. A per-worker pool dies with its runtime, as before.
     pub async fn worker_runtime(&self) -> Result<Runtime> {
         let mut host = self.parts.clone();
+        host.client = crate::runtime::build_host_http_client()?;
         host.hook_bus = Arc::new(HookBus::new());
         host.tools = Arc::new(RwLock::new(self.worker_registry().await));
         host.mcp_runtime = None;

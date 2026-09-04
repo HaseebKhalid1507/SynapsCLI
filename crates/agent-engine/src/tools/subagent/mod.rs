@@ -63,7 +63,7 @@ pub fn legacy_fresh_runtime() -> bool {
 }
 
 /// Build the runtime a subagent runs on. Preferred: `EngineHost::worker_runtime()`
-/// — shares the host HTTP client, credential source and token cache (so NO
+/// — shares the host credential source and token cache (so NO
 /// `set_global_broker` re-install and NO token-cache eviction per spawn) and
 /// takes a clone of the cached worker registry template. Legacy path (no host
 /// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +

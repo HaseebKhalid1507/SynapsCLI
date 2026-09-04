@@ -62,7 +62,7 @@ compare the columns, not the historical gate constants.
 | Log-appender buffer 128 000 → 16 384 lines (`agent-core/src/core/logging.rs`) | −3.9 MB anon / process | `SYNAPS_LOG_BUFFER_LINES=128000` |
 | Tokio workers `ncpu` → `min(4, ncpu)` (`src/main.rs`) | −1…−4 MB (stacks + jemalloc tcaches) | `SYNAPS_WORKER_THREADS=0` (ncpu) or `=n` |
 | Drop derived request body after serialisation (`runtime/api.rs`) | 0 idle; less transient during long-session turns | none (lifetime only) |
-| Subagents spawn from `EngineHost` (shared client/creds/token cache/cached worker registry) | ~1–2 MB per live subagent; no token-cache eviction per spawn | `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` |
+| Subagents spawn from `EngineHost` (shared creds/token cache/cached worker registry; own HTTP client — hyper parks connection drivers on the worker's throwaway runtime, so a shared pool would hand dying connections to the foreground) | ~1–2 MB per live subagent; no token-cache eviction per spawn | `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` |
 | `SessionToolSet` round-top rebuild carries forward activations | 0 | `SYNAPS_TOOLSET_CARRY_FORWARD=0` |
 | `write_config_value` fs4 lock | 0 | `SYNAPS_CONFIG_LOCK=0` |
 
