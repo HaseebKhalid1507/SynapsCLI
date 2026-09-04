@@ -427,7 +427,10 @@ mod tests {
         let r = tokio::time::timeout(std::time::Duration::from_secs(2), link.resume("x"))
             .await
             .unwrap();
-        assert!(r.unwrap_err().ends_with("input owned by client #2"));
+        match r {
+            Err(e) => assert!(e.ends_with("input owned by client #2"), "{e}"),
+            Ok(_) => panic!("resume must be refused"),
+        }
         // Nothing leaked into the loop's buffer.
         assert!(link.buffered.is_empty());
     }

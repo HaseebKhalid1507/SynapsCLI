@@ -215,9 +215,11 @@ fn is_streaming_request(req_body: &[u8]) -> bool {
 
 fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
     match script {
-        Script::SseOrJson { sse, json, .. } => {
+        Script::SseOrJson {
+            sse: sse_body, json, ..
+        } => {
             if is_streaming_request(req_body) {
-                sse((*sse).to_string())
+                sse((*sse_body).to_string())
             } else {
                 (
                     StatusCode::OK,
