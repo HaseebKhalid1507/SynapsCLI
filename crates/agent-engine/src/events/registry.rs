@@ -449,6 +449,6 @@ mod daemon_paths_tests {
         assert_eq!(p.json, d.join("daemon.json"));
         assert_eq!(p.pid, d.join("daemon.pid"));
         let p = daemon_paths_in(d, Some("work/../evil"));
-        assert_eq!(p.sock, d.join("daemon-work_____evil.sock"));
+        assert_eq!(p.sock, d.join("daemon-work____evil.sock"));
     }
 }
