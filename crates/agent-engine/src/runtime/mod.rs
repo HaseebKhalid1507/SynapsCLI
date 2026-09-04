@@ -1294,6 +1294,12 @@ impl Runtime {
         &self.hook_bus
     }
 
+    /// Background shell/PTY sessions owned by this runtime (`Checkpoint`
+    /// and `Parked` close them via `shutdown_all`).
+    pub fn session_manager(&self) -> &Arc<crate::tools::shell::SessionManager> {
+        &self.session_manager
+    }
+
     /// Runtime-scoped tool-session identity used by the stream execution
     /// gate (Task 16). Shared by clones (which share the tool registry);
     /// fresh per independently constructed `Runtime`.
