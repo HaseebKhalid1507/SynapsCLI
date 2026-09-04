@@ -29,6 +29,9 @@ REF=${1:-$HOME/Projects/agent-runtime-ref/target/release/synaps}
 [ -x "$REF" ] || { echo "reference binary not found: $REF" >&2; exit 2; }
 command -v tmux >/dev/null || { echo "tmux required" >&2; exit 2; }
 cd "$HERE"
-SYNAPS_TUI_E2E=1 SYNAPS_REF_BIN="$REF" ${SYNAPS_TUI_E2E_ONLY:+SYNAPS_TUI_E2E_ONLY=$SYNAPS_TUI_E2E_ONLY} \
+# `env` so the optional vars are real assignments (a `${X:+X=$X}` word after
+# the command name is a command, not an assignment).
+env SYNAPS_TUI_E2E=1 SYNAPS_REF_BIN="$REF" \
+  ${SYNAPS_TUI_E2E_ONLY:+SYNAPS_TUI_E2E_ONLY=$SYNAPS_TUI_E2E_ONLY} \
   ${SYNAPS_TUI_E2E_SOCKET:+SYNAPS_TUI_E2E_SOCKET=$SYNAPS_TUI_E2E_SOCKET} \
   cargo test --test tui_transport_differential -- --ignored --nocapture 2>&1 | tail -${SYNAPS_TUI_E2E_TAIL:-60}
