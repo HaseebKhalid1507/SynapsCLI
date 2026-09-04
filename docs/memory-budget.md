@@ -107,9 +107,9 @@ Phase 4 — thin client (`synaps --attach`), PLAN-phase4-client §8.5. Rows are
 
 | Env | Default | Effect | Status |
 |---|---|---|---|
-| `SYNAPS_CLIENT_HISTORY=full\|digest` | `full` until B7, then `digest` | `full` restores the 741b6b60 mirror + `Query{Messages}` resync + `MessageHistory` forwarding | parsed (P4-0); Digest path (phase 4, pending B) |
-| `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | display items in `Attached.display_tail` / `/resync` | (phase 4, pending B) |
-| `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` | Socket 400 / 2 MiB; Local 0 / 0 | 0 = unbounded | parsed (P4-0); enforcement (phase 4, pending B6) |
+| `SYNAPS_CLIENT_HISTORY=full\|digest` | `digest` (B7) | `full` restores the 741b6b60 mirror + `Query{Messages}` resync + `MessageHistory` forwarding | phase 4 B1–B7 |
+| `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | display items in `Attached.display_tail` / `/resync` | phase 4 B7 |
+| `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` | Socket 400 / 2 MiB; Local 0 / 0 | 0 = unbounded; drain past cap+64 msgs / cap+256 KiB, one sentinel line, `/resync` reloads | phase 4 B6 |
 | `SYNAPS_CLIENT_MALLOC=off` | on | skip bg-thread/decay/tcache mallctls | (phase 4, pending A) |
 | `SYNAPS_CLIENT_PURGE_SECS` | 10 | idle purge delay; 0 disables | (phase 4, pending A) |
 | `SYNAPS_CLIENT_TCACHE=0` | 1 | disable main-thread tcache (fallback) | (phase 4, pending A) |

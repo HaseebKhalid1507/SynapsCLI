@@ -83,6 +83,20 @@ C: bye | socket close = Detach (turn keeps running)
   `Query{Messages}` under the reserved id `DIGEST_RESYNC_QUERY_ID` (= 2^63) and re-emits the
   `Conversation` with the fetched history. Per-event wire cost is O(1) in history size; the O(history)
   cost is paid once per attach and once per tool round (`MessageHistory`, which the engine emits anyway).
+- **Phase 4 (thin client) — `HistoryMode::Digest`** (`hello.client.history = "digest"`, `tail_items`,
+  the `synaps --attach` default; `SYNAPS_CLIENT_HISTORY=full` restores the mirror above wholesale): the
+  daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
+  `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted}` projected by
+  `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
+  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). The conn
+  forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that
+  follows; `messages_len` is always filled); the mid-turn `replay` ring is filtered the same way. The
+  client keeps NO mirror, never re-serialises history for `matches()`, never issues `Query{Messages}`;
+  after compaction/resume it issues one `Query{DisplayTail{items}}` (ordinary id) and rebuilds from the
+  answer. `/resync` is the manual path. Per-event AND per-attach wire cost is O(tail), not O(history).
+  Digest mode is the TUI's; `synaps attach`/`send` stay Full. Frames are read into one reused buffer per
+  connection (shrunk to 64 KiB after any > 1 MiB frame). `serde_json` `float_roundtrip` is on: `cost`
+  crosses the wire bit-exact (the footer's `$0.0002` used to read `$0.0001` on the socket).
 - **Frame cap: 64 MiB both directions**, distinct from rpc's 1 MiB (an `Attached` for a long session is
   several MiB). Enforced symmetrically: `encode_line` refuses to build an oversize frame (the daemon sends
   `Error{"daemon could not encode a frame: …"}` and closes), both readers are `take()`-bounded and reply
