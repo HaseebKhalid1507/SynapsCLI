@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use phase2::{spawn_stub, Script, ANTHROPIC_SSE, ANTHROPIC_SSE_PREFIX, ANTHROPIC_SSE_TOOL_USE};
+use phase2::{
+    spawn_stub, Script, ANTHROPIC_MESSAGES_JSON, ANTHROPIC_SSE, ANTHROPIC_SSE_PREFIX,
+    ANTHROPIC_SSE_TOOL_USE,
+};
 
 /// Anthropic SSE turn calling `bash` with a command that prints a password
 /// prompt on stderr and reads the answer from stdin — the bash tool's
@@ -171,11 +174,15 @@ fn scenarios() -> Vec<Scenario> {
         },
         // HIGH #1: `/compact` must push exactly the reference's lines
         // (disclosure + "compacting conversation..." then the ✓ line). The
-        // summary request is answered by the same stub (`compact_call` goes
-        // through the session's provider client).
+        // summary request (non-streaming `call_api_simple`) is answered by
+        // the same stub with a Messages JSON body.
         Scenario {
             name: "compaction",
-            script: Script::Sse(ANTHROPIC_SSE),
+            script: Script::SseOrJson {
+                sse: ANTHROPIC_SSE,
+                json: ANTHROPIC_MESSAGES_JSON,
+                json_delay: Duration::from_millis(0),
+            },
             steps: vec![
                 Type("hello"),
                 Key("Enter"),
@@ -193,28 +200,29 @@ fn scenarios() -> Vec<Scenario> {
         // Submit while the compaction summary is in flight → "queued: …"
         // then "queued message restored: …" after the swap (the reference's
         // `compact_task.is_some()` branch / the actor's `compact.is_some()`).
-        // Every request is paced so the summary call is a ~2 s window.
+        // The summary reply is delayed 2 s to open the window.
         Scenario {
             name: "queued_during_compaction",
-            script: Script::Paced {
-                body: ANTHROPIC_SSE,
-                frame_delay: Duration::from_millis(300),
+            script: Script::SseOrJson {
+                sse: ANTHROPIC_SSE,
+                json: ANTHROPIC_MESSAGES_JSON,
+                json_delay: Duration::from_millis(2000),
             },
             steps: vec![
                 Type("hello"),
                 Key("Enter"),
-                Wait(3000),
+                Wait(1500),
                 Type("again"),
                 Key("Enter"),
-                Wait(3000),
+                Wait(1500),
                 Type("/compact"),
                 Key("Enter"),
-                Wait(700),
+                Wait(600),
                 Type("later"),
                 Key("Enter"),
                 Wait(400),
                 Capture("queued"),
-                Wait(3500),
+                Wait(3000),
                 Capture("after_compact"),
             ],
             extensions: false,
@@ -462,9 +470,14 @@ async fn tui_reference_binary_differential() {
         std::thread::sleep(Duration::from_millis(1500));
         let before = failures.len();
         for (label, frames) in &captures {
-            let file = out_dir.join(format!("{}.{label}", sc.name));
-            let _ = std::fs::write(file.with_extension("ref.txt"), &frames[0]);
-            let _ = std::fs::write(file.with_extension("new.txt"), &frames[1]);
+            let _ = std::fs::write(
+                out_dir.join(format!("{}.{label}.ref.txt", sc.name)),
+                &frames[0],
+            );
+            let _ = std::fs::write(
+                out_dir.join(format!("{}.{label}.new.txt", sc.name)),
+                &frames[1],
+            );
             if let Some(d) = diff_report(&format!("{}/{label}", sc.name), &frames[0], &frames[1]) {
                 failures.push(d);
             }
