@@ -386,6 +386,7 @@ mod tests {
                     let _ = w.write_all(encode_line(&DaemonFrame::Bye).unwrap().as_bytes()).await;
                     break;
                 }
+                ClientFrame::Cmd { cmd: SessionCommand::Detach { .. }, .. } => continue,
                 _ => DaemonFrame::Error { session_id: None, message: "nope".into() },
             };
             w.write_all(encode_line(&reply).unwrap().as_bytes()).await.unwrap();
