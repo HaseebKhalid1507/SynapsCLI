@@ -12,24 +12,36 @@
 //! Exactly ONE waiter on notified() exists while idle at the prompt.
 //! Piped stdin, EOF, and CRLF behaviour are preserved.
 
+#[cfg(feature = "legacy_inline")]
 use futures::StreamExt;
+#[cfg(feature = "legacy_inline")]
 use serde_json::json;
+#[cfg(feature = "legacy_inline")]
 use std::io::{self, Write};
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::engine::commands::{self, CommandResult};
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::engine::reactor::{
     claim_auto_turn, drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP,
 };
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::engine::session::ConversationState;
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::engine::setup::{self, EngineOpts};
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
 };
+#[cfg(feature = "legacy_inline")]
 use synaps_cli::{flush_stdout, CancellationToken};
+#[cfg(feature = "legacy_inline")]
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 /// What was read while waiting at the prompt.
+#[cfg(feature = "legacy_inline")]
 enum PromptRead {
     /// User typed (or pipe delivered) a line.
     Line(String),
@@ -42,7 +54,25 @@ enum PromptRead {
     Error(std::io::Error),
 }
 
+/// Entry point. Runs on the `SessionActor` via `LocalTransport` (A2); the
+/// pre-actor inline loop is kept behind `--features legacy_inline` +
+/// `SYNAPS_CHAT_INLINE=1` until day 3.
 pub async fn run(
+    continue_session: Option<String>,
+    system: Option<String>,
+    agent: Option<String>,
+    profile: Option<String>,
+    no_extensions: bool,
+) -> synaps_cli::Result<()> {
+    #[cfg(feature = "legacy_inline")]
+    if std::env::var("SYNAPS_CHAT_INLINE").map(|v| v == "1").unwrap_or(false) {
+        return run_inline(continue_session, system, agent, profile, no_extensions).await;
+    }
+    actor::run(continue_session, system, agent, profile, no_extensions).await
+}
+
+#[cfg(feature = "legacy_inline")]
+async fn run_inline(
     continue_session: Option<String>,
     system: Option<String>,
     agent: Option<String>,
@@ -660,4 +690,428 @@ pub async fn run(
         )));
     }
     Ok(())
+}
+
+// ── A2: `synaps chat` on the SessionActor ─────────────────────────────────────
+
+mod actor {
+    //! Same stdin/stdout/stderr rendering as the inline loop; the turn
+    //! machine (submit, usage, save, auto-turns, compaction) lives in the
+    //! actor. stdin is only polled while the session is idle, so a piped
+    //! line is always a `Submit` — exactly the inline loop's sequencing.
+
+    use std::io::{self, Write};
+
+    use synaps_cli::engine::commands;
+    use agent_engine::session::{
+        ClientKind, ClientMeta, ClientTransport, EndReason, Envelope, LocalTransport,
+        SessionCommand, SessionConfig, SessionEventWire, SessionQuery, SessionSetting,
+    };
+    use agent_engine::{EngineHost, HostOpts};
+    use synaps_cli::flush_stdout;
+    use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+    use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
+    struct Render {
+        is_tty: bool,
+        in_thinking: bool,
+        streaming: bool,
+        idle: bool,
+        fatal: Option<synaps_cli::TurnError>,
+        cost: f64,
+        ended: bool,
+    }
+
+    impl Render {
+        fn end_thinking(&mut self) {
+            if self.in_thinking {
+                eprintln!("\x1b[0m");
+                self.in_thinking = false;
+            }
+        }
+
+        async fn on_event(&mut self, transport: &LocalTransport, env: Envelope) {
+            match env.event {
+                SessionEventWire::Stream(ev) => self.on_stream(ev),
+                SessionEventWire::TurnStarted { .. } => {
+                    self.streaming = true;
+                    self.idle = false;
+                }
+                SessionEventWire::Conversation(c) => self.cost = c.cost,
+                SessionEventWire::Idle => self.idle = true,
+                SessionEventWire::Prompt(pr) => {
+                    // Headless chat has no prompt UI: cancel, as the inline
+                    // loop did by passing no SecretPromptHandle.
+                    let _ = transport
+                        .send(SessionCommand::Answer {
+                            prompt_id: pr.id,
+                            value: None,
+                        })
+                        .await;
+                }
+                SessionEventWire::External(event) => {
+                    eprintln!(
+                        "\x1b[36m⚡ [event] {}\x1b[0m",
+                        synaps_cli::events::format_event_for_agent(&event)
+                    );
+                }
+                SessionEventWire::AutoTurnCapReached { cap } => {
+                    eprintln!(
+                        "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
+                        cap
+                    );
+                }
+                SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
+                SessionEventWire::Ended { .. } => self.ended = true,
+                _ => {}
+            }
+        }
+
+        fn on_stream(&mut self, ev: StreamEvent) {
+            match ev {
+                StreamEvent::Llm(LlmEvent::Thinking(text)) => {
+                    if !self.in_thinking {
+                        eprint!("\x1b[2m");
+                        self.in_thinking = true;
+                    }
+                    eprint!("{}", text);
+                    io::stderr().flush().ok();
+                }
+                StreamEvent::Llm(LlmEvent::Text(text)) => {
+                    self.end_thinking();
+                    print!("{}", text);
+                    flush_stdout();
+                }
+                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
+                    self.end_thinking();
+                    eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
+                    io::stderr().flush().ok();
+                }
+                StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name, input, ..
+                }) => {
+                    let input_preview = serde_json::to_string(&input).unwrap_or_default();
+                    let preview: String = input_preview.chars().take(60).collect();
+                    eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+                }
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
+                    let preview: String = result.chars().take(80).collect();
+                    eprintln!("\x1b[32m  → {}\x1b[0m", preview);
+                }
+                StreamEvent::Agent(AgentEvent::SubagentStart {
+                    agent_name,
+                    task_preview,
+                    ..
+                }) => eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", agent_name, task_preview),
+                StreamEvent::Agent(AgentEvent::SubagentDone {
+                    result_preview,
+                    duration_secs,
+                    ..
+                }) => {
+                    let status = if result_preview.starts_with("[TIMED OUT") {
+                        "\u{26a0} timed out".to_string()
+                    } else if result_preview.starts_with("ERROR") {
+                        let preview: String = result_preview.chars().take(40).collect();
+                        format!("\u{2718} {}", preview)
+                    } else {
+                        let preview: String = result_preview.chars().take(40).collect();
+                        format!("\u{2714} {}", preview)
+                    };
+                    eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
+                }
+                StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
+                    eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                }
+                StreamEvent::Session(SessionEvent::Notice(text)) => {
+                    eprintln!("\x1b[2m{}\x1b[0m", text);
+                }
+                StreamEvent::Session(SessionEvent::Done) => {
+                    self.end_thinking();
+                    println!();
+                    self.streaming = false;
+                }
+                StreamEvent::Session(SessionEvent::Error(err)) => {
+                    eprintln!("\x1b[31m❌ {}\x1b[0m", err.message);
+                    self.end_thinking();
+                    println!();
+                    eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
+                    self.fatal = Some(err);
+                    self.streaming = false;
+                }
+                _ => {}
+            }
+        }
+
+        /// Pump events until the reply for query `id` arrives.
+        async fn reply(&mut self, t: &mut LocalTransport, id: u64) -> serde_json::Value {
+            while let Some(env) = t.next_event().await {
+                if let SessionEventWire::QueryResult { id: rid, value } = &env.event {
+                    if *rid == id {
+                        return value.clone();
+                    }
+                }
+                self.on_event(t, env).await;
+                if self.ended {
+                    break;
+                }
+            }
+            serde_json::Value::Null
+        }
+    }
+
+    pub(super) async fn run(
+        continue_session: Option<String>,
+        system: Option<String>,
+        agent: Option<String>,
+        profile: Option<String>,
+        no_extensions: bool,
+    ) -> synaps_cli::Result<()> {
+        // Agent prompt resolves before any session work (inline loop: exit 1).
+        let agent_prompt = match agent {
+            Some(ref agent_name) => match synaps_cli::tools::resolve_agent_prompt(agent_name) {
+                Ok(p) => {
+                    eprintln!("🎭 Agent: {}", agent_name);
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("❌ {}", e);
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+
+        let host = EngineHost::boot_and_install(HostOpts {
+            profile,
+            no_extensions,
+        })
+        .await?;
+        // Extension discovery completes BEFORE the session exists, so
+        // `on_session_start` reaches subscribers and the first API call sees
+        // extension-registered tools (piped stdin is ready immediately).
+        if !no_extensions {
+            host.ext_manager().write().await.discover_and_load().await;
+        }
+
+        let handle = host
+            .create_session(SessionConfig {
+                continue_session: continue_session.map(Some),
+                system,
+                auto_compact: true,
+                ..SessionConfig::default()
+            })
+            .await?;
+        let (mut t, snap) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Chat))
+            .await
+            .map_err(|e| synaps_cli::RuntimeError::Session(e.to_string()))?;
+        if let Some(p) = agent_prompt {
+            let _ = t.send(SessionCommand::Set(SessionSetting::SystemPrompt { text: p })).await;
+        }
+
+        let session_id = snap.meta.id.as_str().to_string();
+        eprintln!(
+            "synaps {} | {} | session {}",
+            env!("CARGO_PKG_VERSION"),
+            snap.view.model,
+            &session_id[..8.min(session_id.len())]
+        );
+        if snap.meta.continued {
+            eprintln!(
+                "↳ resumed session ({} messages)",
+                snap.conversation.api_messages.len()
+            );
+        }
+        if host.mcp_server_count() > 0 {
+            eprintln!("↳ {} MCP servers available", host.mcp_server_count());
+        }
+        eprintln!();
+
+        let mut r = Render {
+            is_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            in_thinking: false,
+            streaming: false,
+            idle: true,
+            fatal: None,
+            cost: snap.conversation.cost,
+            ended: false,
+        };
+        let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
+        let mut next_query: u64 = 1;
+        let mut prompt_shown = false;
+
+        loop {
+            if r.idle && r.is_tty && !prompt_shown {
+                eprint!("❯ ");
+                io::stderr().flush().ok();
+                prompt_shown = true;
+            }
+            // stdin only while idle: a piped line is always a Submit.
+            let line = tokio::select! {
+                biased;
+                ev = t.next_event() => match ev {
+                    Some(env) => {
+                        r.on_event(&t, env).await;
+                        if r.ended { break; }
+                        // Headless (piped): an unrecovered failure terminates
+                        // after the turn settles; TTY users keep their session.
+                        if r.idle && r.fatal.is_some() && !r.is_tty { break; }
+                        if r.idle && r.fatal.is_some() { r.fatal = None; }
+                        continue;
+                    }
+                    None => break,
+                },
+                line = stdin_lines.next_line(), if r.idle => match line {
+                    Ok(Some(l)) => l,
+                    Ok(None) => break,
+                    Err(e) => { eprintln!("input error: {}", e); break; }
+                },
+            };
+            prompt_shown = false;
+
+            let trimmed = line.trim_end_matches('\r').trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Some((cmd, arg)) = commands::parse_command(trimmed) {
+                let id = next_query;
+                next_query += 1;
+                let _ = t
+                    .send(SessionCommand::EngineCommand {
+                        id,
+                        name: cmd.to_string(),
+                        arg: arg.to_string(),
+                    })
+                    .await;
+                let reply = r.reply(&mut t, id).await;
+                if r.ended {
+                    break;
+                }
+                match reply["kind"].as_str().unwrap_or("none") {
+                    "quit" => break,
+                    "notice" => eprintln!("{}", reply["text"].as_str().unwrap_or("")),
+                    "error" => eprintln!("error: {}", reply["text"].as_str().unwrap_or("")),
+                    "output" => println!("{}", reply["text"].as_str().unwrap_or("")),
+                    "unhandled" => match cmd {
+                        "clear" => {
+                            let _ = t.send(SessionCommand::NewSession).await;
+                        }
+                        "sessions" => {
+                            let id = next_query;
+                            next_query += 1;
+                            let _ = t
+                                .send(SessionCommand::Query {
+                                    id,
+                                    query: SessionQuery::Status,
+                                })
+                                .await;
+                            let status = r.reply(&mut t, id).await;
+                            let current = status["session"].as_str().unwrap_or("");
+                            match synaps_cli::list_recent_sessions(20) {
+                                Ok(sessions) => {
+                                    for s in sessions.iter().take(20) {
+                                        let marker = if s.id == current { "→ " } else { "  " };
+                                        eprintln!(
+                                            "{}{} {} ({}, ${:.4})",
+                                            marker,
+                                            &s.id[..8],
+                                            s.title,
+                                            s.model,
+                                            s.session_cost
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!("error: {}", e),
+                            }
+                        }
+                        "status" => {
+                            let id = next_query;
+                            next_query += 1;
+                            let _ = t
+                                .send(SessionCommand::Query {
+                                    id,
+                                    query: SessionQuery::Status,
+                                })
+                                .await;
+                            let st = r.reply(&mut t, id).await;
+                            let id2 = next_query;
+                            next_query += 1;
+                            let _ = t
+                                .send(SessionCommand::Query {
+                                    id: id2,
+                                    query: SessionQuery::ContextAssessment,
+                                })
+                                .await;
+                            let ctx = r.reply(&mut t, id2).await;
+                            let sid = st["session"].as_str().unwrap_or("");
+                            eprintln!("session: {}", &sid[..8.min(sid.len())]);
+                            eprintln!("model: {}", st["model"].as_str().unwrap_or(""));
+                            eprintln!(
+                                "tokens: {}↑ {}↓",
+                                st["tokens"]["input"].as_u64().unwrap_or(0),
+                                st["tokens"]["output"].as_u64().unwrap_or(0)
+                            );
+                            eprintln!("cost: ${:.4}", st["cost"].as_f64().unwrap_or(0.0));
+                            eprintln!("messages: {}", st["messages"].as_u64().unwrap_or(0));
+                            eprintln!(
+                                "context: ~{} of {} budget tokens ({} window)",
+                                ctx["used_tokens"].as_u64().unwrap_or(0),
+                                ctx["budget_tokens"].as_u64().unwrap_or(0),
+                                ctx["provider_window"].as_u64().unwrap_or(0)
+                            );
+                        }
+                        "help" => {
+                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                        }
+                        _ => eprintln!("unknown command: /{} (try /help)", cmd),
+                    },
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Regular user message.
+            r.idle = false;
+            if t
+                .send(SessionCommand::Submit {
+                    text: trimmed.to_string(),
+                    attachments: Vec::new(),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // ── Shutdown: End → actor saves, fires on_session_end, unregisters ──
+        if !r.ended {
+            let _ = t
+                .send(SessionCommand::End {
+                    reason: EndReason::ClientQuit,
+                })
+                .await;
+            while !r.ended {
+                match t.next_event().await {
+                    Some(env) => r.on_event(&t, env).await,
+                    None => break,
+                }
+            }
+        }
+
+        eprintln!(
+            "session saved: {} (${:.4})",
+            &session_id[..8.min(session_id.len())],
+            r.cost
+        );
+
+        if let Some(err) = r.fatal {
+            return Err(synaps_cli::RuntimeError::Session(format!(
+                "turn failed: {} [{}]",
+                err.message,
+                err.category_label()
+            )));
+        }
+        Ok(())
+    }
 }

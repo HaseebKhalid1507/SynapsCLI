@@ -14,6 +14,8 @@ rust-version = "1.80"
 
 [features]
 testing = ["agent-tui/testing", "agent-engine/testing"]
+# Pre-actor inline `synaps chat` loop (A2 kill-switch, with SYNAPS_CHAT_INLINE=1). Deleted on day 3.
+legacy_inline = []
 
 [dependencies]
 # Non-musl only: jemalloc + background purge to stop glibc RSS ratchet on
