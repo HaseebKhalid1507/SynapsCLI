@@ -35,9 +35,13 @@ pub const LOWER_AUTHORITY_HEADER: &str =
 /// discovered from the process working directory (bounded upward `.git` /
 /// `.synaps-project` marker walk, worktree-safe, `SYNAPS_PROJECT_ROOT`
 /// override) — every cwd inside one project resolves to one scope.
-fn host_scope() -> Result<ProjectScope> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| RuntimeError::Tool(format!("memory: cannot resolve workspace root: {e}")))?;
+fn host_scope(cwd: Option<&std::path::Path>) -> Result<ProjectScope> {
+    let cwd = match cwd {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| {
+            RuntimeError::Tool(format!("memory: cannot resolve workspace root: {e}"))
+        })?,
+    };
     ProjectScope::discover(&cwd)
         .map_err(|e| RuntimeError::Tool(format!("memory: cannot resolve project scope: {e}")))
 }
@@ -120,8 +124,8 @@ impl Tool for MemorySearchTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let scope = host_scope()?;
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let scope = host_scope(ctx.capabilities.cwd.as_deref())?;
         verify_project_arg(&params, &scope)?;
         let query = ProjectMemoryQuery {
             content_contains: params["query"].as_str().map(String::from),
@@ -209,8 +213,8 @@ impl Tool for MemoryFetchTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let scope = host_scope()?;
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let scope = host_scope(ctx.capabilities.cwd.as_deref())?;
         verify_project_arg(&params, &scope)?;
         let ids: Vec<&str> = params["ids"]
             .as_array()
@@ -308,8 +312,8 @@ impl Tool for MemoryStoreTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let scope = host_scope()?;
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let scope = host_scope(ctx.capabilities.cwd.as_deref())?;
         verify_project_arg(&params, &scope)?;
         let content = params["content"]
             .as_str()
@@ -399,8 +403,8 @@ impl Tool for MemoryForgetTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let scope = host_scope()?;
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let scope = host_scope(ctx.capabilities.cwd.as_deref())?;
         verify_project_arg(&params, &scope)?;
         let id = params["id"]
             .as_str()
@@ -423,6 +427,24 @@ mod tests {
     use crate::test_env::BaseDirGuard;
 
     const BODY_SENTINEL: &str = "MEMORY-BODY-SENTINEL-4af1";
+
+    #[test]
+    #[serial]
+    fn host_scope_uses_capability_cwd_when_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let nested = project.join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        // The env override would short-circuit discovery; make sure it is unset.
+        let saved = std::env::var_os("SYNAPS_PROJECT_ROOT");
+        std::env::remove_var("SYNAPS_PROJECT_ROOT");
+        let scope = host_scope(Some(&nested)).unwrap();
+        if let Some(v) = saved {
+            std::env::set_var("SYNAPS_PROJECT_ROOT", v);
+        }
+        assert_eq!(scope.root(), project.canonicalize().unwrap());
+    }
     /// Placed at the END of stored bodies — beyond any snippet budget, so
     /// its appearance in search output would prove a full-body leak.
     const TAIL_SENTINEL: &str = "MEMORY-TAIL-SENTINEL-9be2";
@@ -680,7 +702,7 @@ mod tests {
         );
 
         // A matching confirmation is accepted.
-        let scope = host_scope().unwrap();
+        let scope = host_scope(None).unwrap();
         let ok = MemoryStoreTool
             .execute(
                 json!({"content": "confirmed", "project": scope.key()}),

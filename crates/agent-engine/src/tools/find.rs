@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext};
+use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -45,11 +45,14 @@ impl Tool for FindTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         let pattern = params["pattern"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing pattern parameter".to_string()))?;
-        let path = expand_path(params["path"].as_str().unwrap_or("."));
+        let path = resolve_path_in(
+            params["path"].as_str().unwrap_or("."),
+            ctx.capabilities.cwd.as_deref(),
+        );
         let file_type = params["type"].as_str();
 
         let mut cmd = Command::new("find");

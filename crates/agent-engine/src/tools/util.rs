@@ -64,10 +64,41 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Expand `raw` (tilde-aware) and, when `cwd` is `Some`, anchor a relative
+/// path to it. `None` returns the expanded path untouched — still relative,
+/// resolved by the OS against the process cwd exactly as before (§3.4).
+pub(crate) fn resolve_path_in(raw: &str, cwd: Option<&std::path::Path>) -> PathBuf {
+    let expanded = expand_path(raw);
+    match cwd {
+        Some(base) if expanded.is_relative() => base.join(expanded),
+        _ => expanded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn resolve_path_in_anchors_relative_to_cwd() {
+        let base = std::path::Path::new("/tmp/synaps-cwd-test");
+        assert_eq!(
+            resolve_path_in("rel/file.txt", Some(base)),
+            base.join("rel/file.txt")
+        );
+        assert_eq!(
+            resolve_path_in("/abs/file.txt", Some(base)),
+            PathBuf::from("/abs/file.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_path_in_none_is_byte_identical_to_expand_path() {
+        for raw in ["rel/file.txt", "./x", "/abs", "~/foo", "~"] {
+            assert_eq!(resolve_path_in(raw, None), expand_path(raw), "{raw}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]
