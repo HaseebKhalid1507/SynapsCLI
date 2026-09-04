@@ -327,7 +327,6 @@ pub(crate) fn spawn_session_background(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IndexRecord {
     Start,
-    #[allow(dead_code)] // B3 unpark / C3 rehydrate
     Skip,
 }
 

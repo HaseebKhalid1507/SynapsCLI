@@ -20,6 +20,16 @@
 # idle session). Requires SYNAPS_DAEMON=1 (exported here). Sessions are REAL
 # SessionActors.
 #
+# DAEMON=1 PARKED=1 mode (PLAN-phase3 §5.5): every session is created from a
+# FIXTURE_MSGS_MB (default 2) MB fixture journal (make-fixture-session.sh) via
+# `synaps attach --continue <fixture> --create`; the daemon runs with
+# SYNAPS_DAEMON_PARK_GRACE_SECS=$PARK_GRACE (default 5). Samples the daemon
+# tree RssAnon with N clients attached (live), then kills every client, waits
+# PARK_GRACE+2 s, purges, and samples again (parked). Columns: live_anon,
+# live_marginal, parked_anon, parked_marginal, ratio, attach_ms (a fresh
+# attach to a parked session = unpark latency). Gates: parked_marginal
+# <= 1.0 MB and <= 0.25 x live_marginal; daemon procs constant.
+#
 # Never touches tmux servers other than `-L bench`. No root needed.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -29,6 +39,9 @@ REPEAT=${REPEAT:-3}
 SETTLE=${SETTLE:-12}
 TAG=$(basename "$BIN")
 DAEMON=${DAEMON:-0}
+PARKED=${PARKED:-0}
+PARK_GRACE=${PARK_GRACE:-5}
+FIXTURE_MSGS_MB=${FIXTURE_MSGS_MB:-2}
 [ "$DAEMON" = 1 ] && export SYNAPS_DAEMON=1
 
 median() { sort -n | awk '{a[NR]=$1} END{ if (NR==0) print "n/a"; else if (NR%2) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }'; }
@@ -98,6 +111,54 @@ run_once_daemon() { # N i -> prints "pss_kb daemon_pss_kb procs_beyond_daemon st
   echo "$pss $dpss $((procs-dprocs)) $dprocs ${starts[0]:-0} ${danon:-0} $out"
 }
 
+purge() { "$BIN" daemon purge >/dev/null 2>&1 || true; sleep 1; }
+
+run_once_parked() { # N i -> prints "live_anon_kb parked_anon_kb dprocs_live dprocs_parked attach_ms out"
+  local n=$1 i=$2 out=/tmp/memprof-$TAG-parked-N$n-r$i.txt
+  tmux -L bench kill-server 2>/dev/null; sleep 1
+  "$BIN" daemon stop >/dev/null 2>&1
+  local ids=() s
+  for s in $(seq 1 "$n"); do
+    local id="memprof-fix-$s-$i-$$"
+    "$HERE/make-fixture-session.sh" "$id" "$FIXTURE_MSGS_MB" >/dev/null
+    ids+=("$id")
+  done
+  tmux -L bench new -d -s d -x 120 -y 40 "exec env SYNAPS_DAEMON_PARK_GRACE_SECS=$PARK_GRACE $BIN daemon --foreground"
+  for _ in $(seq 1 500); do sleep 0.02; "$BIN" daemon status --json 2>/dev/null | grep -q '"ok":true' && break; done
+  local dpid; dpid=$(tmux -L bench list-panes -t d -F '#{pane_pid}')
+  for s in $(seq 1 "$n"); do
+    "$HERE/launch.sh" "s$s" "$BIN" attach --continue "${ids[$((s-1))]}" --create >/dev/null
+    sleep 0.3
+  done
+  sleep "$SETTLE"; purge
+  {
+    echo "== $BIN PARKED N=$n run=$i fixture_mb=$FIXTURE_MSGS_MB grace=$PARK_GRACE"
+    echo "-- live daemon tree RssAnon"; tree_anon "$dpid"
+    "$BIN" daemon status --json 2>/dev/null
+  } > "$out"
+  local live_anon live_procs
+  live_anon=$(awk '/^-- live daemon tree RssAnon/{f=1} f&&/^TREE_ANON/{print $2; exit}' "$out")
+  live_procs=$(awk '/^-- live daemon tree RssAnon/{f=1} f&&/^pid=/{c++} /^TREE_ANON/{print c; exit}' "$out")
+  # Detach every client (kill its tmux session) → grace → parked.
+  for s in $(seq 1 "$n"); do tmux -L bench kill-session -t "s$s" 2>/dev/null; done
+  sleep $((PARK_GRACE + 2)); purge
+  {
+    echo "-- parked daemon tree RssAnon"; tree_anon "$dpid"
+    "$BIN" daemon status --json 2>/dev/null
+  } >> "$out"
+  local parked_anon parked_procs
+  parked_anon=$(awk '/^-- parked daemon tree RssAnon/{f=1} f&&/^TREE_ANON/{print $2; exit}' "$out")
+  parked_procs=$(awk '/^-- parked daemon tree RssAnon/{f=1} f&&/^pid=/{c++} /^TREE_ANON/{print c; exit}' "$out")
+  # Unpark latency: one fresh attach to a parked session.
+  local attach_ms
+  attach_ms=$("$HERE/launch.sh" "u1" "$BIN" attach "${ids[0]}" | sed -E 's/.*ready after ([0-9]+) ms.*/\1/')
+  echo "-- attach_to_parked_ms=$attach_ms" >> "$out"
+  "$BIN" daemon stop >/dev/null 2>&1
+  tmux -L bench kill-server 2>/dev/null
+  for id in "${ids[@]}"; do rm -f "${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}/sessions/$id".json*; done
+  echo "${live_anon:-0} ${parked_anon:-0} ${live_procs:-0} ${parked_procs:-0} ${attach_ms:-0} $out"
+}
+
 # Sum RssAnon (kB) over PID and all descendants; prints per-pid lines + TREE_ANON <kB>.
 tree_anon() {
   local root=$1 tot=0
@@ -110,6 +171,29 @@ tree_anon() {
   done
   echo "TREE_ANON $tot"
 }
+
+if [ "$DAEMON" = 1 ] && [ "$PARKED" = 1 ]; then
+  echo "binary=$BIN repeat=$REPEAT settle=${SETTLE}s mode=DAEMON+PARKED fixture_mb=$FIXTURE_MSGS_MB grace=${PARK_GRACE}s"
+  printf "%-4s %-12s %-14s %-12s %-16s %-8s %-12s %-10s\n" N "live_anon_MB" "live_marginal" "parked_anon" "parked_marginal" "ratio" "daemon_procs" "attach_ms(med)"
+  prev_live=""; prev_parked=""
+  for n in $NS; do
+    L=(); PK=(); DP=(); S=()
+    for i in $(seq 1 "$REPEAT"); do
+      read -r live parked lprocs pprocs ams out < <(run_once_parked "$n" "$i")
+      L+=("$live"); PK+=("$parked"); DP+=("$lprocs/$pprocs"); S+=("$ams")
+    done
+    l_med=$(printf '%s\n' "${L[@]}" | median)
+    p_med=$(printf '%s\n' "${PK[@]}" | median)
+    s_med=$(printf '%s\n' "${S[@]}" | median)
+    lmarg=$( [ -n "$prev_live" ] && awk -v a="$l_med" -v b="$prev_live" 'BEGIN{printf "%.2f", (a-b)/1024}' || echo "-" )
+    pmarg=$( [ -n "$prev_parked" ] && awk -v a="$p_med" -v b="$prev_parked" 'BEGIN{printf "%.2f", (a-b)/1024}' || echo "-" )
+    ratio=$( [ -n "$prev_live" ] && awk -v a="$p_med" -v b="$prev_parked" -v c="$l_med" -v d="$prev_live" 'BEGIN{ if (c-d>0) printf "%.2f", (a-b)/(c-d); else print "n/a" }' || echo "-" )
+    printf "%-4s %-12.1f %-14s %-12.1f %-16s %-8s %-12s %-10s\n" "$n" "$(awk -v k="$l_med" 'BEGIN{print k/1024}')" "$lmarg" "$(awk -v k="$p_med" 'BEGIN{print k/1024}')" "$pmarg" "$ratio" "${DP[0]}" "$s_med"
+    prev_live=$l_med; prev_parked=$p_med
+  done
+  echo "gates (§5.5): parked_marginal <= 1.0 MB; parked_marginal <= 0.25 x live_marginal; daemon_procs constant; attach_ms to a parked session <= 500 ms (informational above)"
+  exit 0
+fi
 
 if [ "$DAEMON" = 1 ]; then
   echo "binary=$BIN repeat=$REPEAT settle=${SETTLE}s mode=DAEMON"

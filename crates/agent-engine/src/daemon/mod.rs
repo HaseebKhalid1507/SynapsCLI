@@ -278,7 +278,11 @@ const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// as busy: the daemon never exits under a running turn (jcode mistake #1).
 pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     use crate::session::wire::IDLE_PROBE_QUERY_ID;
-    use crate::session::{SessionCommand, SessionEventWire, SessionQuery};
+    use crate::session::{SessionCommand, SessionEventWire, SessionLifecycle, SessionQuery};
+    // B3: a parked session is idle by construction — no probe, no wake.
+    if handle.lifecycle() == SessionLifecycle::Parked {
+        return true;
+    }
     let mut rx = handle.subscribe();
     if handle.send(SessionCommand::Query { id: IDLE_PROBE_QUERY_ID, query: SessionQuery::Status }).await.is_err() {
         return false;

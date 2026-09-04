@@ -18,3 +18,8 @@ pub const HOOKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(HO
 pub const EXTENSIONS_READY_TIMEOUT_SECS: u64 = 30;
 pub const EXTENSIONS_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(EXTENSIONS_READY_TIMEOUT_SECS);
+
+/// `SessionActor::unpark` bound (B3): journal load + runtime rebuild.
+/// Transports wait `ATTACH_TIMEOUT_PARKED` (25 s) for a parked attach.
+pub const UNPARK_TIMEOUT_SECS: u64 = 20;
+pub const UNPARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(UNPARK_TIMEOUT_SECS);

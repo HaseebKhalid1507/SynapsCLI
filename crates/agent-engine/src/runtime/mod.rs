@@ -766,6 +766,17 @@ fn canonical_trusted_worker_model(model: &str) -> String {
     }
 }
 
+/// The owning runtime stops its shell-session reaper when it goes away
+/// (clones carry `None`). Without this every dropped `Runtime` — a parked
+/// session, a finished worker — left a 30 s ticker holding the manager.
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(c) = &self.reaper_cancel {
+            c.cancel();
+        }
+    }
+}
+
 impl Runtime {
     pub async fn new() -> Result<Self> {
         // UNCHANGED semantics: fresh everything (tests, `synaps agent`).

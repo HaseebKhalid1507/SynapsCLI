@@ -159,6 +159,89 @@ impl TurnLog {
     }
 }
 
+/// A field that is `None` exactly while the session is `Parked` (B3).
+/// Derefs to the value so the turn machine reads `self.runtime` / `self.conv`
+/// unchanged; every command that needs them goes through `ensure_live()`
+/// first, so the panic path is a programming error, not a runtime state.
+pub(crate) struct Live<T>(Option<T>);
+
+impl<T> Live<T> {
+    pub(crate) fn new(v: T) -> Self {
+        Self(Some(v))
+    }
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.is_some()
+    }
+    pub(crate) fn park_take(&mut self) -> Option<T> {
+        self.0.take()
+    }
+    pub(crate) fn unpark_set(&mut self, v: T) {
+        self.0 = Some(v);
+    }
+}
+
+impl<T> std::ops::Deref for Live<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("session is parked: runtime/conv unavailable")
+    }
+}
+
+impl<T> std::ops::DerefMut for Live<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("session is parked: runtime/conv unavailable")
+    }
+}
+
+/// `SYNAPS_DAEMON_PARK_GRACE_SECS`: `never` → `None` (Parked disabled);
+/// `n` → n seconds after the last detach once idle; default 60.
+pub fn park_grace() -> Option<std::time::Duration> {
+    match std::env::var("SYNAPS_DAEMON_PARK_GRACE_SECS") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("never") => None,
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+            .or(Some(DEFAULT_PARK_GRACE)),
+        Err(_) => Some(DEFAULT_PARK_GRACE),
+    }
+}
+
+pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Non-persisted runtime knobs replayed after unpark (last-wins per
+/// variant). Model/reasoning/system prompt live in the journal already.
+fn replayable(setting: &SessionSetting) -> bool {
+    matches!(
+        setting,
+        SessionSetting::ContextWindow { .. }
+            | SessionSetting::CompactionModel { .. }
+            | SessionSetting::ApiRetries { .. }
+            | SessionSetting::SubagentTimeout { .. }
+            | SessionSetting::MaxToolOutput { .. }
+            | SessionSetting::BashTimeout { .. }
+            | SessionSetting::BashMaxTimeout { .. }
+            | SessionSetting::GrantWorkerModel { .. }
+    )
+}
+
+fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
+    match setting {
+        SessionSetting::ContextWindow { tokens } => rt.set_context_window(*tokens),
+        SessionSetting::CompactionModel { model } => rt.set_compaction_model(model.clone()),
+        SessionSetting::ApiRetries { n } => rt.set_api_retries(*n),
+        SessionSetting::SubagentTimeout { secs } => rt.set_subagent_timeout(*secs),
+        SessionSetting::MaxToolOutput { bytes } => rt.set_max_tool_output(*bytes),
+        SessionSetting::BashTimeout { secs } => rt.set_bash_timeout(*secs),
+        SessionSetting::BashMaxTimeout { secs } => rt.set_bash_max_timeout(*secs),
+        SessionSetting::GrantWorkerModel { model } => {
+            let _ = rt.grant_worker_model(model);
+        }
+        _ => {}
+    }
+}
+
 /// One attached client: its meta + the mode it attached with (B1 ownership
 /// needs the mode to pick the next owner when the owner detaches).
 pub(crate) struct AttachedClient {
@@ -226,9 +309,22 @@ pub struct SessionActor {
     pub(crate) id: SessionId,
     pub(crate) meta: SessionMeta,
     pub(crate) config: SessionConfig,
-    /// THE runtime; `session_id` + `cwd` set by `create`.
-    pub(crate) runtime: Runtime,
-    pub(crate) conv: ConversationState,
+    /// THE runtime; `session_id` + `cwd` set by `create`. `None` ⇔ Parked.
+    pub(crate) runtime: Live<Runtime>,
+    /// `None` ⇔ Parked.
+    pub(crate) conv: Live<ConversationState>,
+    /// B3: unpark needs a fresh `foreground_runtime()`.
+    pub(crate) host: Arc<EngineHost>,
+    /// Kept across Park (`finish()` needs it without a Runtime).
+    pub(crate) hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    /// Session-lifetime queue; `background` pushes into it, every Runtime
+    /// this actor builds is pointed at it (`Runtime::set_event_queue`).
+    pub(crate) event_queue: Arc<crate::events::EventQueue>,
+    /// Last-wins per variant; replayed after unpark (non-persisted knobs).
+    pub(crate) settings_replay: Vec<SessionSetting>,
+    pub(crate) keep_warm: bool,
+    /// Armed on last-detach-while-idle / idle-while-detached.
+    pub(crate) park_deadline: Option<tokio::time::Instant>,
     // ── turn machine: the run() loop locals + App fields ──
     pub(crate) stream: Option<ActiveStream>,
     pub(crate) cancel: Option<CancellationToken>,
@@ -362,6 +458,9 @@ impl SessionActor {
         conv.abort_context = sb.abort_context;
 
         let view = RuntimeView::from_runtime(&runtime).await;
+        let hook_bus = Arc::clone(runtime.hook_bus());
+        let event_queue = Arc::clone(runtime.event_queue());
+        let keep_warm = cfg.keep_warm;
         let (
             handle,
             SessionEndpoints {
@@ -378,8 +477,14 @@ impl SessionActor {
             id,
             meta,
             config: cfg,
-            runtime,
-            conv,
+            runtime: Live::new(runtime),
+            conv: Live::new(conv),
+            host: Arc::clone(host),
+            hook_bus,
+            event_queue,
+            settings_replay: Vec::new(),
+            keep_warm,
+            park_deadline: None,
             stream: None,
             cancel: None,
             steer_tx: None,
@@ -451,12 +556,17 @@ impl SessionActor {
     }
 
     pub(crate) async fn save(&mut self) {
-        if self.config.persist {
+        if self.config.persist && self.conv.is_live() {
             self.conv.save().await;
         }
     }
 
+    /// Recomputes `state` from clients/streaming and (re)arms or disarms the
+    /// park grace timer. A no-op while Parking/Parked.
     pub(crate) fn update_attach_state(&mut self) {
+        if matches!(self.state, AttachState::Parking | AttachState::Parked) {
+            return;
+        }
         self.state = if self.attached.is_empty() {
             AttachState::Detached {
                 running: self.streaming,
@@ -464,6 +574,158 @@ impl SessionActor {
         } else {
             AttachState::Attached(self.attached.len())
         };
+        self.rearm_park();
+    }
+
+    // ── Parked (B3) ──────────────────────────────────────────────────────
+
+    pub(crate) fn is_parked(&self) -> bool {
+        matches!(self.state, AttachState::Parked)
+    }
+
+    pub(crate) fn can_park(&self) -> bool {
+        self.attached.is_empty()
+            && !self.streaming
+            && self.compact.is_none()
+            && self.pending_prompts.is_empty()
+            && self.conv.is_live()
+            && self.conv.queued_message.is_none()
+            && !self.keep_warm
+            && self.config.persist
+            && !self.is_parked()
+    }
+
+    fn rearm_park(&mut self) {
+        if !self.can_park() {
+            self.park_deadline = None;
+            return;
+        }
+        match park_grace() {
+            Some(grace) => {
+                if self.park_deadline.is_none() {
+                    self.park_deadline = Some(tokio::time::Instant::now() + grace);
+                }
+            }
+            None => self.park_deadline = None,
+        }
+    }
+
+    fn set_lifecycle(&mut self, l: SessionLifecycle) {
+        self.lifecycle
+            .store(l as u8, std::sync::atomic::Ordering::Release);
+        self.emit(SessionEventWire::Lifecycle(l));
+    }
+
+    /// Save, close PTYs, drop `conv` THEN `runtime`. `background` (inbox
+    /// watcher + per-session UDS + registry) stays: `synaps send` keeps
+    /// resolving and its push into `event_queue` is the wake-up.
+    pub(crate) async fn park(&mut self) {
+        self.park_deadline = None;
+        if !self.can_park() {
+            return;
+        }
+        self.state = AttachState::Parking;
+        self.set_lifecycle(SessionLifecycle::Parking);
+        if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+            .await
+            .is_err()
+        {
+            tracing::warn!(session = %self.id, "park: save timed out — staying live");
+            self.state = AttachState::Detached { running: false };
+            self.set_lifecycle(SessionLifecycle::Live);
+            return;
+        }
+        if self.runtime.session_manager().active_count() > 0 {
+            self.emit(SessionEventWire::SystemNotice(
+                "parked: background shells closed".into(),
+            ));
+        }
+        self.runtime.session_manager().shutdown_all();
+        self.turn_replay.clear();
+        // Drop order: conv first, then runtime — a panic between them can
+        // never leave a Runtime without state to save.
+        let conv = self.conv.park_take();
+        drop(conv);
+        let runtime = self.runtime.park_take();
+        drop(runtime);
+        self.state = AttachState::Parked;
+        self.set_lifecycle(SessionLifecycle::Parked);
+        tracing::info!(session = %self.id, "session parked");
+    }
+
+    /// Rebuild `runtime` + `conv` from the journal (`load_session_in_dir`
+    /// via `resolve_session_and_prompt`), replay non-persisted settings,
+    /// `finish_session_setup(IndexRecord::Skip)`. On error the session
+    /// stays Parked (nothing is half-built).
+    pub(crate) async fn unpark(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let journal_id = (**self.journal_id.load()).clone();
+        let host = Arc::clone(&self.host);
+        let cfg = self.config.clone();
+        let queue = Arc::clone(&self.event_queue);
+        let replay = self.settings_replay.clone();
+        let build = async move {
+            let config: crate::SynapsConfig = (**host.config()).clone();
+            let mut runtime = host.foreground_runtime().await?;
+            runtime.set_event_queue(queue);
+            let sb = crate::engine::setup::resolve_session_and_prompt(
+                &mut runtime,
+                &Some(Some(journal_id)),
+                cfg.system.as_deref(),
+                cfg.prompt_manifest.as_deref(),
+            )?;
+            runtime.set_cwd(cfg.cwd.clone());
+            if let Some(ref m) = cfg.model_override {
+                runtime.set_model(m.clone());
+            }
+            crate::engine::setup::finish_session_setup(
+                &mut runtime,
+                &config,
+                &sb.session,
+                cfg.cwd.clone(),
+                crate::engine::setup::IndexRecord::Skip,
+            );
+            for s in &replay {
+                replay_setting(&mut runtime, s);
+            }
+            Ok::<_, crate::RuntimeError>((runtime, sb))
+        };
+        let (runtime, sb) = match tokio::time::timeout(budgets::UNPARK_TIMEOUT, build).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(crate::RuntimeError::Session(format!(
+                    "unpark timed out after {}s",
+                    budgets::UNPARK_TIMEOUT_SECS
+                )))
+            }
+        };
+        let mut conv = ConversationState::from_resumed(sb.session);
+        conv.api_messages = sb.api_messages;
+        conv.total_input_tokens = sb.total_input_tokens;
+        conv.total_output_tokens = sb.total_output_tokens;
+        conv.session_cost = sb.session_cost;
+        conv.abort_context = sb.abort_context;
+        self.runtime.unpark_set(runtime);
+        self.conv.unpark_set(conv);
+        self.publish_view().await;
+        self.state = AttachState::Detached { running: false };
+        self.set_lifecycle(SessionLifecycle::Live);
+        self.update_attach_state();
+        tracing::info!(session = %self.id, ms = started.elapsed().as_millis() as u64, "session unparked");
+        Ok(())
+    }
+
+    /// Unpark if Parked. `Err` = still Parked; the caller reports it
+    /// (`Refused` to a client, `AttachRefused` to an attacher, a warning
+    /// for host wakes).
+    pub(crate) async fn ensure_live(&mut self) -> std::result::Result<(), String> {
+        if !self.is_parked() {
+            return Ok(());
+        }
+        self.unpark()
+            .await
+            .map_err(|e| format!("session parked and could not be restored: {e}"))
     }
 
     /// `stream_handler.rs:264`: a turn OR a compaction blocks auto-turns.
@@ -588,13 +850,15 @@ impl SessionActor {
             self.emit(SessionEventWire::Dequeued { text: q });
         }
         // Flush any events that arrived during streaming
-        for formatted in self.conv.pending_events.drain(..) {
-            self.conv
-                .api_messages
-                .push(std::sync::Arc::new(serde_json::json!({
-                    "role": "user",
-                    "content": formatted
-                })));
+        {
+            let conv: &mut ConversationState = &mut self.conv;
+            for formatted in conv.pending_events.drain(..) {
+                conv.api_messages
+                    .push(std::sync::Arc::new(serde_json::json!({
+                        "role": "user",
+                        "content": formatted
+                    })));
+            }
         }
         self.clear_stream();
         // Cancel all running reactive subagents; recover a poisoned guard
@@ -629,11 +893,21 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
+        if self.is_parked() {
+            if self.event_queue.is_empty() {
+                return;
+            }
+            if let Err(e) = self.ensure_live().await {
+                tracing::warn!(session = %self.id, error = %e, "event wake could not unpark; events stay queued");
+                return;
+            }
+        }
         let busy = self.busy();
+        let conv: &mut ConversationState = &mut self.conv;
         let drained = drain_event_queue(
-            self.runtime.event_queue(),
-            &mut self.conv.api_messages,
-            &mut self.conv.pending_events,
+            &self.event_queue,
+            &mut conv.api_messages,
+            &mut conv.pending_events,
             busy,
             self.steer_tx.as_ref(),
         );
@@ -754,13 +1028,15 @@ impl SessionActor {
                 self.publish_subagent_rows();
                 // Flush events that arrived during streaming into api_messages
                 let had_pending = !self.conv.pending_events.is_empty();
-                for formatted in self.conv.pending_events.drain(..) {
-                    self.conv
-                        .api_messages
-                        .push(std::sync::Arc::new(serde_json::json!({
-                            "role": "user",
-                            "content": formatted
-                        })));
+                {
+                    let conv: &mut ConversationState = &mut self.conv;
+                    for formatted in conv.pending_events.drain(..) {
+                        conv.api_messages
+                            .push(std::sync::Arc::new(serde_json::json!({
+                                "role": "user",
+                                "content": formatted
+                            })));
+                    }
                 }
                 if let Some(queued) = self.conv.queued_message.take() {
                     after = After::AutoSendQueued(queued);
@@ -918,6 +1194,12 @@ impl SessionActor {
     // ── settings / queries / engine commands ─────────────────────────────
 
     pub(crate) async fn apply_setting(&mut self, id: u64, setting: SessionSetting) {
+        if replayable(&setting) {
+            let disc = std::mem::discriminant(&setting);
+            self.settings_replay
+                .retain(|s| std::mem::discriminant(s) != disc);
+            self.settings_replay.push(setting.clone());
+        }
         let name = match &setting {
             SessionSetting::Model { .. } => "model",
             SessionSetting::ReasoningLevel { .. } => "reasoning_level",
@@ -1014,10 +1296,32 @@ impl SessionActor {
     }
 
     pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
+        // Status/View never wake a parked session (the idle probe must not).
+        if self.is_parked() {
+            let value = match query {
+                SessionQuery::Status => serde_json::json!({
+                    "session": (**self.journal_id.load()).clone(),
+                    "model": self.view.load().model,
+                    "lifecycle": SessionLifecycle::Parked,
+                    "streaming": false,
+                    "auto_turns": self.consecutive_auto_turns,
+                    "attached": 0,
+                    "pending_prompts": 0,
+                }),
+                SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
+                _ => match self.ensure_live().await {
+                    Ok(()) => return Box::pin(self.query(id, query)).await,
+                    Err(e) => serde_json::json!({ "error": e }),
+                },
+            };
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
         let value = match query {
             SessionQuery::Status => serde_json::json!({
                 "session": self.conv.session.id,
                 "model": self.runtime.model(),
+                "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
                 "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
                 "cost": self.conv.session_cost,
                 "messages": self.conv.api_messages.len(),
@@ -1094,7 +1398,11 @@ impl SessionActor {
     /// (else read-only + notice); `Takeover` steals with
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
-    fn attach(&mut self, client: ClientMeta, mode: AttachMode) {
+    async fn attach(&mut self, client: ClientMeta, mode: AttachMode) {
+        if let Err(e) = self.ensure_live().await {
+            self.emit(SessionEventWire::AttachRefused { message: e });
+            return;
+        }
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
@@ -1235,6 +1543,47 @@ impl SessionActor {
                 return ControlFlow::Continue(());
             }
         }
+        // B3: anything that needs the runtime wakes a parked session first.
+        if self.is_parked() {
+            let needs_runtime = !matches!(
+                cmd,
+                SessionCommand::Attach { .. }
+                    | SessionCommand::Detach { .. }
+                    | SessionCommand::End { .. }
+                    | SessionCommand::Query { .. }
+                    | SessionCommand::Answer { .. }
+                    | SessionCommand::Save
+                    | SessionCommand::Cancel
+                    | SessionCommand::Checkpoint { .. }
+                    | SessionCommand::Resync { .. }
+                    | SessionCommand::HostEvent(_)
+            );
+            if matches!(cmd, SessionCommand::HostEvent(_)) {
+                return ControlFlow::Continue(()); // nobody attached, nothing to render
+            }
+            if matches!(cmd, SessionCommand::Save | SessionCommand::Cancel | SessionCommand::Checkpoint { .. }) {
+                if let SessionCommand::Checkpoint { .. } = cmd {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: super::wire::CHECKPOINT_QUERY_ID,
+                        value: serde_json::json!({ "ok": true, "parked": true }),
+                    });
+                }
+                return ControlFlow::Continue(()); // already on disk / idle
+            }
+            if needs_runtime {
+                if let Err(e) = self.ensure_live().await {
+                    match from {
+                        Some(c) => self.emit(SessionEventWire::Refused {
+                            client: c,
+                            command: command_name(&cmd).to_string(),
+                            reason: e,
+                        }),
+                        None => self.emit(SessionEventWire::SystemNotice(e)),
+                    }
+                    return ControlFlow::Continue(());
+                }
+            }
+        }
         match cmd {
             SessionCommand::Submit { text, .. } => self.submit(text).await,
             SessionCommand::Steer { text } => {
@@ -1267,7 +1616,7 @@ impl SessionActor {
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(id, name, arg).await
             }
-            SessionCommand::Attach { client, mode } => self.attach(client, mode),
+            SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
             SessionCommand::Detach { client } => self.detach(client),
             SessionCommand::End { reason } => return ControlFlow::Break(reason),
             SessionCommand::Resync { .. } => self.emit(SessionEventWire::SystemNotice(
@@ -1286,9 +1635,14 @@ impl SessionActor {
                 "resume: not implemented in this build".into(),
             )),
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
-            SessionCommand::KeepWarm { .. } => self.emit(SessionEventWire::SystemNotice(
-                "keep_warm: not implemented in this build".into(),
-            )),
+            SessionCommand::KeepWarm { on } => {
+                self.keep_warm = on;
+                self.rearm_park();
+                self.emit(SessionEventWire::SystemNotice(format!(
+                    "keep-warm {}",
+                    if on { "on: this session will not be parked" } else { "off" }
+                )));
+            }
             SessionCommand::HostEvent(ev) => match ev {
                 HostEvent::ExtensionNotification {
                     extension_id,
@@ -1322,17 +1676,25 @@ impl SessionActor {
             self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
         }
 
-        let session_id = self.conv.session.id.clone();
-        let api_messages = self.conv.api_messages.clone();
+        let parked = !self.conv.is_live();
+        let session_id = (**self.journal_id.load()).clone();
+        let api_messages = if parked {
+            None
+        } else {
+            Some(self.conv.api_messages.clone())
+        };
 
-        // STEP 1: save — own bounded budget, highest priority.
+        // STEP 1: save — own bounded budget, highest priority. A parked
+        // session is already on disk: end record only.
         let persist = self.config.persist;
         let save_fut = async {
             if persist {
-                self.conv.save().await;
+                if !parked {
+                    self.conv.save().await;
+                }
                 let mut index_record =
                     crate::core::session_index::SessionIndexRecord::end(&session_id);
-                index_record.turns = Some(api_messages.len());
+                index_record.turns = api_messages.as_ref().map(|m| m.len());
                 if let Err(err) = crate::core::session_index::append_record(&index_record) {
                     tracing::warn!("failed to append session end index record: {}", err);
                 }
@@ -1350,25 +1712,30 @@ impl SessionActor {
 
         // STEP 2 (C2): on_session_end — per session, concurrent, fail-open,
         // own budget; clears this session's keyed injection.
+        let hook_bus = Arc::clone(&self.hook_bus);
         crate::extensions::loader::emit_session_end(
-            self.runtime.hook_bus(),
+            &hook_bus,
             &session_id,
-            Some(api_messages),
+            api_messages,
             budgets::HOOKS_TIMEOUT,
         )
         .await;
 
-        // STEP 3: bounded observability flush.
-        if let Some(outcome) = self
-            .runtime
-            .shutdown_observability_async(crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT)
-            .await
-        {
-            if !outcome.is_flushed() {
-                tracing::warn!(
-                    stats = ?outcome.stats(),
-                    "observability flush timed out — detached worker keeps draining"
-                );
+        // STEP 3: bounded observability flush (live only).
+        if self.runtime.is_live() {
+            if let Some(outcome) = self
+                .runtime
+                .shutdown_observability_async(
+                    crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+                )
+                .await
+            {
+                if !outcome.is_flushed() {
+                    tracing::warn!(
+                        stats = ?outcome.stats(),
+                        "observability flush timed out — detached worker keeps draining"
+                    );
+                }
             }
         }
 
@@ -1401,6 +1768,13 @@ async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
     }
 }
 
+async fn park_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
     match rx {
         Some(r) => {
@@ -1417,7 +1791,7 @@ impl SessionTask {
 
     /// Unbiased select (the TUI loop is unbiased too).
     pub async fn run(mut self) {
-        let queue = Arc::clone(self.0.runtime.event_queue());
+        let queue = Arc::clone(&self.0.event_queue);
         let reason = loop {
             let actor = &mut self.0;
             tokio::select! {
@@ -1433,11 +1807,15 @@ impl SessionTask {
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
+                _ = park_timer(actor.park_deadline) => actor.park().await,
                 _ = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;
-                    let id = actor.conv.session.id.clone();
-                    crate::extensions::loader::emit_session_start(actor.runtime.hook_bus(), &id).await;
-                    actor.publish_view().await;
+                    let id = (**actor.journal_id.load()).clone();
+                    let bus = Arc::clone(&actor.hook_bus);
+                    crate::extensions::loader::emit_session_start(&bus, &id).await;
+                    if actor.runtime.is_live() {
+                        actor.publish_view().await;
+                    }
                 },
                 ev = next_stream_event(&mut actor.stream) => match ev {
                     Some(ev) => actor.on_stream_event(ev).await,
