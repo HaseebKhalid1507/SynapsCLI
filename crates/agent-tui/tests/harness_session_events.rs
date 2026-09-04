@@ -215,3 +215,92 @@ fn session_compaction_lines() {
     assert!(frame.contains("compacting conversation..."), "{frame}");
     assert!(frame.contains("compaction failed: boom"), "{frame}");
 }
+
+/// Phase 4 §2.3 (B5): a compaction under Digest mode — the `Conversation`
+/// arrives with NO messages (as on the wire) and the arm fetches the
+/// daemon's `DisplayTail` — renders the same transcript as Full mode,
+/// where the snapshot carries the history and is projected locally.
+#[test]
+fn session_compaction_digest_matches_full() {
+    use agent_engine::session::wire::ConversationDigest;
+    use agent_engine::session::{ConversationSnapshot, SessionEventWire as S, SessionHeader};
+
+    let history: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "<context-summary>old</context-summary>"})),
+        std::sync::Arc::new(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "after compaction text"}]})),
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "follow-up question"})),
+        std::sync::Arc::new(serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "deep"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})),
+    ];
+    let header = SessionHeader {
+        id: "sess-new".into(),
+        ..Default::default()
+    };
+    let applied = || W::CompactionApplied {
+        previous_session_id: "sess-old".into(),
+        session_id: "sess-new".into(),
+        chains_advanced: vec!["main".into()],
+        queued_restored: None,
+        msg_count: 40,
+    };
+
+    // Full mode: the Conversation carries the history.
+    let full_snap = ConversationSnapshot {
+        header: header.clone(),
+        messages_len: history.len(),
+        api_messages: history.clone(),
+        ..Default::default()
+    };
+    let mut full = TestHarness::boot_with_size(100, 30);
+    full.feed_event(applied().into());
+    full.feed_event(S::Conversation(full_snap.clone()));
+    let full_frame = full.snapshot();
+
+    // Digest mode: the Conversation is the wire digest (no messages); the arm
+    // must query DisplayTail from the (scripted) daemon.
+    let digest_snap = ConversationDigest::of(&full_snap).into_snapshot(Vec::new());
+    assert!(digest_snap.api_messages.is_empty());
+    assert_eq!(digest_snap.messages_len, history.len());
+    let mut digest = TestHarness::boot_with_size(100, 30);
+    digest.set_history(history.clone());
+    digest.feed_event(applied().into());
+    digest.feed_event(S::Conversation(digest_snap));
+    let digest_frame = digest.snapshot();
+
+    assert!(full_frame.contains("after compaction text"), "{full_frame}");
+    assert!(full_frame.contains("follow-up question"), "{full_frame}");
+    assert!(full_frame.contains("chain 'main' advanced: sess-old → sess-new"), "{full_frame}");
+    assert!(full_frame.contains("✓ compacted 40 messages"), "{full_frame}");
+    assert!(!full_frame.contains("<context-summary>"), "{full_frame}");
+    assert_eq!(full_frame, digest_frame, "Digest rebuild must render byte-identical to Full");
+    assert!(
+        digest.sent_commands().iter().any(|c| c.contains("Query") && c.contains("DisplayTail")),
+        "Digest mode fetched the tail: {:?}",
+        digest.sent_commands()
+    );
+    assert!(
+        !full.sent_commands().iter().any(|c| c.contains("DisplayTail")),
+        "Full mode never queries: {:?}",
+        full.sent_commands()
+    );
+}
+
+/// `/resync` reloads the transcript from the engine's history.
+#[test]
+fn slash_resync_reloads_transcript_from_engine_history() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.set_history(vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "from the daemon"})),
+        std::sync::Arc::new(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "reloaded reply"}]})),
+    ]);
+    h.feed_event(text("stale live text").into());
+    let before = h.snapshot();
+    assert!(before.contains("stale live text"), "{before}");
+    h.run_slash_command("resync", "");
+    let after = h.snapshot();
+    assert!(after.contains("from the daemon"), "{after}");
+    assert!(after.contains("reloaded reply"), "{after}");
+    assert!(after.contains("transcript resynced"), "{after}");
+    assert!(!after.contains("stale live text"), "{after}");
+}

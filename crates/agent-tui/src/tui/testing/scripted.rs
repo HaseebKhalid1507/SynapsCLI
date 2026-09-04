@@ -28,7 +28,9 @@ pub struct ScriptedTransport {
     meta: SessionMeta,
     runtime: Runtime,
     session: Session,
-    api_messages: Vec<synaps_cli::SharedMessage>,
+    /// Shared with the harness (`TestHarness::set_history`) so a test can
+    /// stage the engine-side history a `DisplayTail`/`Messages` query answers.
+    api_messages: Arc<Mutex<Vec<synaps_cli::SharedMessage>>>,
     view: Arc<RuntimeView>,
     queue: VecDeque<Envelope>,
     seq: u64,
@@ -69,7 +71,7 @@ impl ScriptedTransport {
             meta,
             runtime,
             session,
-            api_messages: Vec::new(),
+            api_messages: Arc::new(Mutex::new(Vec::new())),
             view,
             queue: VecDeque::new(),
             seq: 0,
@@ -94,7 +96,12 @@ impl ScriptedTransport {
     }
 
     pub fn set_api_messages(&mut self, msgs: Vec<synaps_cli::SharedMessage>) {
-        self.api_messages = msgs;
+        *self.api_messages.lock().unwrap() = msgs;
+    }
+
+    /// Handle to the engine-side history this transport answers queries from.
+    pub fn history(&self) -> Arc<Mutex<Vec<synaps_cli::SharedMessage>>> {
+        Arc::clone(&self.api_messages)
     }
 
     /// Queue an envelope for `next_event` (tape `SessionEvent` steps).
@@ -287,17 +294,21 @@ impl ScriptedTransport {
                     SessionQuery::View => serde_json::to_value(&*self.view).unwrap_or_default(),
                     SessionQuery::ContextReport => {
                         use synaps_cli::engine::commands::{context_command, CommandResult};
-                        match context_command(&self.runtime, Some(&self.api_messages)) {
+                        let msgs = self.api_messages.lock().unwrap().clone();
+                        match context_command(&self.runtime, Some(&msgs)) {
                             CommandResult::Output(text) => serde_json::json!({ "text": text }),
                             CommandResult::Error(e) => serde_json::json!({ "error": e }),
                             other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                         }
                     }
                     SessionQuery::Messages => {
-                        serde_json::to_value(&self.api_messages).unwrap_or_default()
+                        serde_json::to_value(&*self.api_messages.lock().unwrap()).unwrap_or_default()
                     }
                     SessionQuery::DisplayTail { items } => serde_json::to_value(
-                        agent_engine::session::display::display_tail(&self.api_messages, items),
+                        agent_engine::session::display::display_tail(
+                            &self.api_messages.lock().unwrap(),
+                            items,
+                        ),
                     )
                     .unwrap_or_default(),
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
@@ -314,7 +325,7 @@ impl ScriptedTransport {
                     self.runtime.thinking_level(),
                     self.runtime.system_prompt(),
                 );
-                self.api_messages.clear();
+                self.api_messages.lock().unwrap().clear();
                 self.push_event(SessionEventWire::Cleared {
                     session_id: self.session.id.clone(),
                 });

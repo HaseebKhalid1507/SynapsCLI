@@ -353,10 +353,11 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Conversation(snap) => {
             app.apply_conversation(&snap);
             if let Some(applied) = app.compaction_applied.take() {
-                finish_compaction(app, &snap, applied);
+                super::helpers::rebuild_display_from_conversation(&snap, app, link).await;
+                finish_compaction(app, applied);
             }
             if let Some(pending) = app.resume_pending.take() {
-                super::helpers::rebuild_display_messages(&snap.api_messages, app);
+                super::helpers::rebuild_display_from_conversation(&snap, app, link).await;
                 if let Some(notice) = pending.clamp_notice {
                     app.push_msg(ChatMessage::System(notice));
                 }
@@ -563,14 +564,10 @@ pub(super) async fn handle_session_event_arm(
 }
 
 /// `CompactionApplied` + the `Conversation` that followed: the lines the
-/// compaction poll used to push (loop_arms.rs:783-812).
-fn finish_compaction(
-    app: &mut App,
-    snap: &agent_engine::session::ConversationSnapshot,
-    applied: super::app::CompactionApplied,
-) {
+/// compaction poll used to push (loop_arms.rs:783-812). The transcript was
+/// rebuilt by the caller (`rebuild_display_from_conversation`).
+fn finish_compaction(app: &mut App, applied: super::app::CompactionApplied) {
     let old_id = applied.previous_session_id;
-    super::helpers::rebuild_display_messages(&snap.api_messages, app);
     for name in &applied.chains_advanced {
         app.push_msg(ChatMessage::System(format!(
             "chain '{}' advanced: {} → {}",

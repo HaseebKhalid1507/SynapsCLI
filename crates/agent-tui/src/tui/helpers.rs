@@ -214,6 +214,52 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
     app.invalidate();
 }
 
+/// Rebuild the transcript after a `Conversation` that changed history shape
+/// (compaction, resume). Full mode / in-process: the snapshot carries the
+/// history → project locally. Digest mode: the snapshot's `api_messages` is
+/// empty while `messages_len > 0` → one `DisplayTail` roundtrip to the
+/// daemon (ordering preserved: the link buffers concurrent envelopes).
+/// Returns false (and pushes an Error line) when the roundtrip failed; the
+/// transcript is then stale until `/resync`.
+pub(super) async fn rebuild_display_from_conversation(
+    snap: &agent_engine::session::ConversationSnapshot,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> bool {
+    if !snap.api_messages.is_empty() || snap.messages_len == 0 {
+        rebuild_display_messages(&snap.api_messages, app);
+        return true;
+    }
+    reload_display_tail(app, link).await
+}
+
+/// `/resync` and the Digest-mode rebuild: fetch the daemon's projection and
+/// replace the transcript with it.
+pub(super) async fn reload_display_tail(
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> bool {
+    match link
+        .query(agent_engine::session::SessionQuery::DisplayTail {
+            items: DISPLAY_TAIL_ITEMS,
+        })
+        .await
+        .and_then(|v| {
+            serde_json::from_value::<agent_engine::session::DisplayTail>(v).map_err(|e| e.to_string())
+        }) {
+        Ok(tail) => {
+            apply_display_tail(&tail, app);
+            true
+        }
+        Err(e) => {
+            app.push_msg(ChatMessage::Error(format!(
+                "history reload failed: {e} — /resync to retry"
+            )));
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::app::{App, ChatMessage, LineCache, MsgSlot};

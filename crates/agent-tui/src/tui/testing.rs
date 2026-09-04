@@ -94,6 +94,8 @@ pub struct TestHarness {
     /// Feeds the secret-prompt pane exactly like production (`Prompt` envelopes).
     prompt_bridge: PromptBridge,
     scripted_log: std::sync::Arc<std::sync::Mutex<scripted::ScriptedLog>>,
+    /// The scripted session's engine-side history (`DisplayTail`/`Messages`).
+    scripted_history: std::sync::Arc<std::sync::Mutex<Vec<synaps_cli::SharedMessage>>>,
     secret_prompt_rx: std::sync::Arc<
         std::sync::Mutex<
             tokio::sync::mpsc::UnboundedReceiver<synaps_cli::tools::SecretPromptRequest>,
@@ -170,12 +172,14 @@ impl TestHarness {
 
         let transport = scripted::ScriptedTransport::new(Runtime::new_headless());
         let scripted_log = std::sync::Arc::clone(&transport.log);
+        let scripted_history = transport.history();
         let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         TestHarness {
             app,
             link: SessionLink::new(Box::new(transport)),
             prompt_bridge: PromptBridge::new(secret_prompt_tx),
             scripted_log,
+            scripted_history,
             secret_prompt_rx: std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx)),
             registry: Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, Vec::new())),
             keybinds: KeybindRegistry::new(),
@@ -693,6 +697,13 @@ impl TestHarness {
         }
         self.app.secret_prompts.poll_requests(&self.secret_prompt_rx);
         input::reconcile_secret_prompt(&mut self.app);
+        self
+    }
+
+    /// Stage the engine-side history the scripted session answers
+    /// `Query{DisplayTail|Messages}` from (phase 4 Digest-mode rebuilds).
+    pub fn set_history(&mut self, msgs: Vec<synaps_cli::SharedMessage>) -> &mut Self {
+        *self.scripted_history.lock().unwrap() = msgs;
         self
     }
 
