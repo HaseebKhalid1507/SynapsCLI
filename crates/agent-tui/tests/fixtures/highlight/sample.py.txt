@@ -1,0 +1,20 @@
+"""Module docstring."""
+import os
+from typing import List, Optional
+
+@dataclass
+class Foo(Base):
+    x: int = 0
+
+    def method(self, items: List[str], flag: Optional[bool] = None) -> str:
+        # comment
+        s = f"value {self.x!r} {items[0]:>10}"
+        b = b'\x00bytes' + rb"raw"
+        if flag is not None and len(items) >= 2:
+            return s.upper()
+        yield from (i * 2.5 for i in range(10))
+        raise ValueError("bad %s" % items)
+
+async def main():
+    await asyncio.sleep(1)
+    print(lambda a, *b, **c: a)

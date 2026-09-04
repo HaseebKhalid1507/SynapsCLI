@@ -1,0 +1,23 @@
+//! doc comment
+use std::collections::HashMap;
+
+/// A thing.
+#[derive(Debug, Clone)]
+pub struct Thing<'a, T: Default> {
+    name: &'a str,
+    items: Vec<T>,
+}
+
+impl<'a, T: Default> Thing<'a, T> {
+    pub fn new(name: &'a str) -> Self {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        m.insert("x".to_string(), 0x1f);
+        Self { name, items: vec![T::default(); 3] }
+    }
+}
+
+fn main() {
+    let t = Thing::<u8>::new("hi");
+    println!("{:?} {}", t, r#"raw"#);
+    match Some(1.5e3_f64) { Some(x) if x > 1.0 => {}, _ => unreachable!() }
+}

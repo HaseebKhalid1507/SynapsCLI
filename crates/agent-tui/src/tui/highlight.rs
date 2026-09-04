@@ -49,10 +49,27 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(clamped)
 }
 
+/// Curated syntect dump written by `build.rs` (PLAN-phase4 §3 C1): the
+/// `CURATED` grammars plus their include closure. Colours are golden-tested
+/// identical to the full default set (`tests/highlight_curated.rs`).
+static CURATED_DUMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/curated_newlines.packdump"));
+
+/// `SYNAPS_TUI_SYNTECT=full` → syntect's full default set (kill-switch for a
+/// language missing from the curated list). Anything else → curated dump.
+fn load_syntax_set() -> SyntaxSet {
+    if std::env::var("SYNAPS_TUI_SYNTECT").is_ok_and(|v| v == "full") {
+        return SyntaxSet::load_defaults_newlines();
+    }
+    // The dump is produced by this same build, so a decode failure is a build
+    // bug — fall back to the full set rather than lose highlighting.
+    syntect::dumps::from_uncompressed_data(CURATED_DUMP)
+        .unwrap_or_else(|_| SyntaxSet::load_defaults_newlines())
+}
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
     #[cfg(any(test, feature = "testing"))]
     SYNTAX_SET_TOUCHED.store(true, std::sync::atomic::Ordering::Relaxed);
-    SyntaxSet::load_defaults_newlines()
+    load_syntax_set()
 });
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
