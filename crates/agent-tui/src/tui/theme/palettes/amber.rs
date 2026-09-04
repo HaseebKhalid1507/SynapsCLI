@@ -19,6 +19,7 @@ impl Theme {
             border: Color::Rgb(40, 30, 15),
             border_active: Color::Rgb(255, 176, 0),
             muted: Color::Rgb(80, 65, 35),
+            system_msg: Color::Rgb(160, 135, 80),
 
             user_color: Color::Rgb(220, 200, 160),
             user_bg: Color::Rgb(18, 14, 8),

@@ -366,8 +366,7 @@ pub(crate) fn theme_from_mxc(x: &MxcColors) -> Theme {
         border: c(x.border),
         border_active: c(x.border_active),
         muted: c(x.text_muted),
-
-        // Messages
+        system_msg: c(x.text_muted),
         user_color: c(x.accent),
         user_bg: c(x.background_panel),
         claude_label: c(x.primary),

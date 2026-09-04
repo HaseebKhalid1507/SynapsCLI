@@ -19,6 +19,7 @@ impl Theme {
             border: Color::Rgb(15, 30, 45),
             border_active: Color::Rgb(0, 206, 209),
             muted: Color::Rgb(45, 75, 105),
+            system_msg: Color::Rgb(100, 150, 190),
 
             user_color: Color::Rgb(170, 210, 245),
             // User turns share the header/footer chrome surface.
