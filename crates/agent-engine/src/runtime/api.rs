@@ -1129,6 +1129,10 @@ impl ApiMethods {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
             .into();
+        // The derived request body is dead weight for the whole network wait
+        // (retries reuse `body_bytes`): release it — and its owned `system`
+        // block copy — before the first send (§3.6 f3).
+        drop(body);
 
         trace_outgoing_request(
             model,

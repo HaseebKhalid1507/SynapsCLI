@@ -56,7 +56,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(all(unix, not(target_env = "musl")))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8] = b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8] =
+    b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[derive(Parser)]
 #[command(
@@ -264,8 +265,35 @@ enum AuthAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Tokio worker-thread count (§3.6 process diet). `SYNAPS_WORKER_THREADS`:
+/// `n > 0` → exactly `n`; `0` → tokio's default (one per core, the old
+/// behaviour — the kill-switch); unset/invalid → `min(4, available_parallelism)`.
+/// Only the async worker pool is capped; `spawn_blocking` is untouched.
+fn worker_threads() -> Option<usize> {
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    worker_threads_from(std::env::var("SYNAPS_WORKER_THREADS").ok().as_deref(), ncpu)
+}
+
+fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
+    match raw.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(ncpu.clamp(1, 4)),
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = worker_threads() {
+        builder.worker_threads(n);
+    }
+    let rt = builder.enable_all().thread_name("synaps-rt").build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
@@ -410,4 +438,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::worker_threads_from;
+
+    #[test]
+    fn worker_threads_env_matrix() {
+        assert_eq!(worker_threads_from(None, 24), Some(4));
+        assert_eq!(worker_threads_from(None, 2), Some(2));
+        assert_eq!(worker_threads_from(None, 0), Some(1));
+        assert_eq!(worker_threads_from(Some("0"), 24), None);
+        assert_eq!(worker_threads_from(Some("8"), 24), Some(8));
+        assert_eq!(worker_threads_from(Some(" 3 "), 24), Some(3));
+        assert_eq!(worker_threads_from(Some("bogus"), 24), Some(4));
+    }
 }
