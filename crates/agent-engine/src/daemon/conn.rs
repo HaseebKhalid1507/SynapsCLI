@@ -51,7 +51,10 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
-        C::End { .. } => Err("end: sessions are ended by `synaps daemon stop`, not by clients"),
+        // C4: an owner may end its session (`/end`); the actor enforces
+        // ownership (B1 `is_input_command`), the conn only screens reasons.
+        C::End { reason: EndReason::ClientQuit } => Ok(()),
+        C::End { .. } => Err("end: only ClientQuit may come from a client (host reasons are the daemon's)"),
         C::Resync { .. } => Err("resync: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
     }

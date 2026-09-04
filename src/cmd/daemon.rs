@@ -316,12 +316,16 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     } else {
         for m in list {
             println!(
-                "{}  model={}  cwd={}  created={}{}",
+                "{}  {:?}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
                 m.id,
+                m.lifecycle,
+                m.clients,
+                m.input_owner.map_or("-".into(), |c| format!("#{}", c.0)),
                 m.model,
                 m.cwd.as_deref().map_or("-".into(), |p| p.display().to_string()),
                 m.created_at.format("%H:%M:%S"),
-                m.name.as_deref().map_or(String::new(), |n| format!("  name={n}"))
+                m.name.as_deref().map_or(String::new(), |n| format!("  name={n}")),
+                if m.journal_id != m.id.as_str() { format!("  journal={}", m.journal_id) } else { String::new() }
             );
         }
     }

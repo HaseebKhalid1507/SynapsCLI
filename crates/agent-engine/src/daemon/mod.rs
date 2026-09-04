@@ -149,8 +149,18 @@ impl DaemonState {
         map.values().cloned().collect()
     }
 
+    /// Metas with the handle cells filled in (`lifecycle`, `journal_id`);
+    /// `clients`/`input_owner`/`awaiting_input` come with B4's cells.
     pub fn session_metas(&self) -> Vec<SessionMeta> {
-        self.live_sessions().iter().map(|h| h.meta().clone()).collect()
+        self.live_sessions()
+            .iter()
+            .map(|h| {
+                let mut m = h.meta().clone();
+                m.lifecycle = h.lifecycle();
+                m.journal_id = h.journal_id();
+                m
+            })
+            .collect()
     }
 
     pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {

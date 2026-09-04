@@ -222,8 +222,9 @@ async fn attach_to_session_with_history_over_1mib() {
 }
 
 /// §4 MED: a client may only send the user-facing subset; `Detach` only for
-/// its own id; `End`/`Attach`/`Resync` are refused with an `Error` frame and
-/// the session stays alive for everyone else.
+/// its own id; `End{host reason}`/`Attach`/`Resync` are refused with an
+/// `Error` frame and the session stays alive for everyone else
+/// (`End{ClientQuit}` passes the conn since C4 — ownership is the actor's).
 #[tokio::test]
 #[serial]
 async fn client_commands_are_whitelisted() {
@@ -259,7 +260,7 @@ async fn client_commands_are_whitelisted() {
     }
     b.send(SessionCommand::Detach { client: other }).await.unwrap();
     assert!(refused(&mut b).await.contains("not your client id"));
-    b.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.unwrap();
+    b.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
     assert!(refused(&mut b).await.contains("end:"));
     b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror }).await.unwrap();
     assert!(refused(&mut b).await.contains("attach:"));
