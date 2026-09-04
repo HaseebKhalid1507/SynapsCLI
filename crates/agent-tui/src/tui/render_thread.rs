@@ -138,6 +138,24 @@ pub(crate) struct RenderHandle {
 }
 
 impl RenderHandle {
+    /// A handle with no render thread behind it (harness): frames land in a
+    /// slot nobody reads; commands go to a receiver nobody polls. Unparking
+    /// the current thread is a no-op.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn headless() -> Self {
+        let inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
+        // Keep the receiver alive for the handle's lifetime so sends never
+        // error (they are ignored either way).
+        std::mem::forget(cmd_rx);
+        RenderHandle {
+            slot: FrameSlot::new(inner, std::thread::current()),
+            cmd_tx,
+            join_handle: None,
+        }
+    }
+
     /// Publish a new frame snapshot to the render thread (latest-wins).
     /// Replaces any unread frame and wakes the render thread via `unpark()`.
     pub(crate) fn publish(&self, model: std::sync::Arc<super::render_model::RenderModel>) {

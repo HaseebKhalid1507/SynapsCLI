@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::{list_recent_sessions, resolve_session, Runtime, Session};
+use synaps_cli::list_recent_sessions;
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -123,34 +123,38 @@ pub enum ExtensionsMemoryAction {
 pub(super) async fn execute_command_action(
     action: CommandAction,
     app: &mut App,
-    runtime: &Runtime,
+    link: &mut super::session_link::SessionLink,
 ) {
     if let CommandAction::PluginCommand { command, arg } = action {
-        match synaps_cli::skills::commands::execute_plugin_command_with_tools(
-            &command,
-            &arg,
-            runtime.tools_shared(),
-        )
-        .await
+        // Tools-backed plugin command runs on THE runtime's tool set
+        // (actor_cmds::plugin_command); reply = {status, stdout, stderr}.
+        match link
+            .plugin_command(&command.plugin, &command.name, &arg)
+            .await
         {
-            Ok(output) => {
+            Ok(value) if value["kind"] == "plugin_output" => {
+                let status = value["status"]
+                    .as_i64()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                let stdout = value["stdout"].as_str().unwrap_or("");
+                let stderr = value["stderr"].as_str().unwrap_or("");
                 let mut lines = vec![format!(
                     "plugin command /{}:{} exited with {}",
-                    command.plugin,
-                    command.name,
-                    output
-                        .status
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".to_string())
+                    command.plugin, command.name, status
                 )];
-                if !output.stdout.trim().is_empty() {
-                    lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
+                if !stdout.trim().is_empty() {
+                    lines.push(format!("stdout:\n{}", stdout.trim_end()));
                 }
-                if !output.stderr.trim().is_empty() {
-                    lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
+                if !stderr.trim().is_empty() {
+                    lines.push(format!("stderr:\n{}", stderr.trim_end()));
                 }
                 app.push_msg(ChatMessage::System(lines.join("\n")));
             }
+            Ok(value) => app.push_msg(ChatMessage::Error(format!(
+                "plugin command failed: {}",
+                value["text"].as_str().unwrap_or("unknown error")
+            ))),
             Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
         }
     }
@@ -325,27 +329,12 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
-/// Re-apply a saved session's reasoning level as explicit, clamped to the
-/// current model. Returns a notice when the saved level was clamped.
-fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) -> Option<String> {
-    runtime
-        .restore_session_reasoning(thinking_level)
-        .map(|clamp| {
-            format!(
-                "thinking → {} (clamped from {}: not supported by {})",
-                clamp.to.as_str(),
-                clamp.from.as_str(),
-                runtime.model()
-            )
-        })
-}
-
 /// Handle a slash command when NOT streaming.
 pub(super) async fn handle_command(
     cmd: &str,
     arg: &str,
     app: &mut App,
-    runtime: &mut Runtime,
+    link: &mut super::session_link::SessionLink,
     system_prompt_path: &Path,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
@@ -396,14 +385,18 @@ pub(super) async fn handle_command(
     // not own session messages, so the surface passes them in. Must run
     // before the generic engine intercept (which has no history access).
     if cmd == "context" {
-        match synaps_cli::engine::commands::context_command(runtime, Some(&app.api_messages)) {
-            synaps_cli::engine::commands::CommandResult::Output(text) => {
-                app.push_msg(ChatMessage::System(text));
+        match link
+            .query(agent_engine::session::SessionQuery::ContextReport)
+            .await
+        {
+            Ok(value) => {
+                if let Some(text) = value["text"].as_str() {
+                    app.push_msg(ChatMessage::System(text.to_string()));
+                } else if let Some(e) = value["error"].as_str() {
+                    app.push_msg(ChatMessage::Error(e.to_string()));
+                }
             }
-            synaps_cli::engine::commands::CommandResult::Error(e) => {
-                app.push_msg(ChatMessage::Error(e));
-            }
-            _ => {}
+            Err(e) => app.push_msg(ChatMessage::Error(e)),
         }
         return CommandAction::None;
     }
@@ -419,17 +412,39 @@ pub(super) async fn handle_command(
     } else {
         cmd
     };
-    if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
-        use synaps_cli::engine::commands::{
-            persist_to_config, thinking_config_value, CommandResult,
+    // `/compact` keeps the TUI's own guards + `SessionCommand::Compact`
+    // (dispatch.rs Compact arm) instead of the actor's chat-style path.
+    if let Some(synaps_cli::engine::commands::CommandResult::Compact {
+        custom_instructions,
+    }) = synaps_cli::engine::commands::evaluate_engine_command(cmd, arg)
+    {
+        return CommandAction::Compact {
+            custom_instructions,
         };
-        return match result {
-            CommandResult::Quit => CommandAction::Quit,
-            CommandResult::ModelChanged {
-                reasoning_clamped, ..
-            } => {
-                // Use the runtime's cleaned model string, not the raw arg.
-                let applied = runtime.model().to_string();
+    }
+    if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
+        || matches!(cmd, "context" | "trace" | "memory")
+    {
+        use synaps_cli::engine::commands::persist_to_config;
+        let value = match link.engine_command(cmd, arg).await {
+            Ok(v) => v,
+            Err(e) => {
+                app.push_msg(ChatMessage::Error(e));
+                return CommandAction::None;
+            }
+        };
+        let text = |v: &serde_json::Value| v["text"].as_str().unwrap_or("").to_string();
+        // `event` carries the structured kind (model_changed/thinking_changed)
+        // alongside the chat-facing `kind`/`text`.
+        let key = value["event"]
+            .as_str()
+            .or_else(|| value["kind"].as_str())
+            .unwrap_or("none");
+        return match key {
+            "quit" => CommandAction::Quit,
+            "model_changed" => {
+                // The runtime's cleaned model string, not the raw arg.
+                let applied = value["model"].as_str().unwrap_or("").to_string();
                 app.session.model = applied.clone();
                 let status = persist_to_config("model", &applied);
                 app.push_msg(ChatMessage::System(format!(
@@ -437,35 +452,41 @@ pub(super) async fn handle_command(
                     applied, status
                 )));
                 // Session-only: the user's configured thinking value stays theirs.
-                if let Some(clamp) = reasoning_clamped {
-                    app.session.thinking_level = runtime.thinking_level().to_string();
-                    app.push_msg(ChatMessage::System(reasoning_clamp_notice(
-                        &clamp, &applied,
+                if let (Some(from), Some(to)) = (
+                    value["clamp"]["from"].as_str(),
+                    value["clamp"]["to"].as_str(),
+                ) {
+                    app.session.thinking_level = to.to_string();
+                    app.push_msg(ChatMessage::System(reasoning_clamp_notice_wire(
+                        &agent_engine::session::ReasoningClampWire {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                        },
+                        &applied,
                     )));
                 }
                 CommandAction::None
             }
-            CommandResult::ThinkingChanged { spec } => {
-                app.session.thinking_level = thinking_config_value(spec);
-                let status = persist_to_config("thinking", &thinking_config_value(spec));
+            "thinking_changed" => {
+                let config_value = value["config_value"].as_str().unwrap_or("").to_string();
+                let level = value["level"].as_str().unwrap_or("").to_string();
+                app.session.thinking_level = config_value.clone();
+                let status = persist_to_config("thinking", &config_value);
                 app.push_msg(ChatMessage::System(format!(
                     "thinking set to: {} {}",
-                    spec.level(),
-                    status,
+                    level, status,
                 )));
                 CommandAction::None
             }
-            CommandResult::Compact {
-                custom_instructions,
-            } => CommandAction::Compact {
-                custom_instructions,
+            "compact" => CommandAction::Compact {
+                custom_instructions: value["instructions"].as_str().map(str::to_string),
             },
-            CommandResult::Error(e) => {
-                app.push_msg(ChatMessage::Error(e));
+            "error" => {
+                app.push_msg(ChatMessage::Error(text(&value)));
                 CommandAction::None
             }
-            CommandResult::Output(text) => {
-                app.push_msg(ChatMessage::System(text));
+            "output" => {
+                app.push_msg(ChatMessage::System(text(&value)));
                 CommandAction::None
             }
             _ => CommandAction::None,
@@ -474,15 +495,19 @@ pub(super) async fn handle_command(
 
     match cmd {
         "prompt" => match arg.trim() {
-            "reload" | "apply" => match runtime.reload_prompt() {
-                Ok(generation) => app.push_msg(ChatMessage::System(format!(
-                    "prompt applied (generation {generation})"
+            "reload" | "apply" => match link
+                .set_checked(agent_engine::session::SessionSetting::ReloadPrompt)
+                .await
+            {
+                Ok(applied) => app.push_msg(ChatMessage::System(format!(
+                    "prompt applied (generation {})",
+                    applied.view.prompt_generation
                 ))),
                 Err(error) => app.push_msg(ChatMessage::Error(format!(
                     "prompt reload rejected: {error}"
                 ))),
             },
-            "status" | "" => match runtime.prompt_inspection_json() {
+            "status" | "" => match link.view().prompt_inspection.clone() {
                 Some(status) => app.push_msg(ChatMessage::System(status)),
                 None => app.push_msg(ChatMessage::Error("no prompt manifest is active".into())),
             },
@@ -491,23 +516,14 @@ pub(super) async fn handle_command(
             )),
         },
         "clear" => {
-            app.save_session().await;
-            app.transcript.clear();
-            app.invalidate();
-            app.api_messages.clear();
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_cache_read_tokens = 0;
-            app.total_cache_creation_tokens = 0;
-            app.session_cost = 0.0;
-            app.input_tokens = 0;
-            app.output_tokens = 0;
-            app.session = Session::new(
-                runtime.model(),
-                runtime.thinking_level(),
-                runtime.system_prompt(),
-            );
-            app.push_msg(ChatMessage::System("new session started".to_string()));
+            // The actor saves + clears; presentation on `Cleared` +
+            // `Conversation` (stream_handler).
+            if let Err(e) = link
+                .send(agent_engine::session::SessionCommand::NewSession)
+                .await
+            {
+                app.push_msg(ChatMessage::Error(format!("clear failed: {e}")));
+            }
         }
         "model" | "models" => {
             // Non-empty args are intercepted by handle_engine_command above
@@ -526,7 +542,10 @@ pub(super) async fn handle_command(
                 ));
             } else if arg == "save" {
                 let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
-                match std::fs::write(system_prompt_path, runtime.system_prompt().unwrap_or("")) {
+                match std::fs::write(
+                    system_prompt_path,
+                    link.view().system_prompt.as_deref().unwrap_or(""),
+                ) {
                     Ok(_) => app.push_msg(ChatMessage::System(format!(
                         "saved to {}",
                         system_prompt_path.display()
@@ -534,11 +553,24 @@ pub(super) async fn handle_command(
                     Err(e) => app.push_msg(ChatMessage::Error(format!("failed to save: {}", e))),
                 }
             } else if arg == "show" {
-                let prompt = runtime.system_prompt().unwrap_or("(none)");
-                app.push_msg(ChatMessage::System(prompt.to_string()));
+                let prompt = link
+                    .view()
+                    .system_prompt
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_string());
+                app.push_msg(ChatMessage::System(prompt));
             } else {
-                runtime.set_system_prompt(arg.to_string());
-                app.push_msg(ChatMessage::System("system prompt updated".to_string()));
+                match link
+                    .set_checked(agent_engine::session::SessionSetting::SystemPrompt {
+                        text: arg.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        app.push_msg(ChatMessage::System("system prompt updated".to_string()))
+                    }
+                    Err(e) => app.push_msg(ChatMessage::Error(e)),
+                }
             }
         }
         "thinking" => {
@@ -546,8 +578,8 @@ pub(super) async fn handle_command(
             // (set + persist); only the empty-arg status case reaches here.
             app.push_msg(ChatMessage::System(format!(
                 "thinking: {} ({})",
-                runtime.thinking_level(),
-                runtime.thinking_budget()
+                link.view().thinking_level,
+                link.view().thinking_budget
             )));
         }
         "context" => {
@@ -559,7 +591,7 @@ pub(super) async fn handle_command(
                 "" => {
                     app.push_msg(ChatMessage::System(format!(
                         "context window: {} tokens",
-                        runtime.context_window()
+                        link.view().context_window
                     )));
                     None
                 }
@@ -571,8 +603,18 @@ pub(super) async fn handle_command(
                 }
             };
             if let Some(window) = window {
-                runtime.set_context_window(window);
-                app.last_turn_context_window = runtime.context_window();
+                match link
+                    .set_checked(agent_engine::session::SessionSetting::ContextWindow {
+                        tokens: window,
+                    })
+                    .await
+                {
+                    Ok(applied) => app.last_turn_context_window = applied.view.context_window,
+                    Err(e) => {
+                        app.push_msg(ChatMessage::Error(e));
+                        return CommandAction::None;
+                    }
+                }
                 let canonical = arg.to_ascii_lowercase();
                 let status =
                     synaps_cli::engine::commands::persist_to_config("context_window", &canonical);
@@ -650,43 +692,20 @@ pub(super) async fn handle_command(
                     "usage: /resume <name_or_id>".to_string(),
                 ));
             } else {
-                match resolve_session(arg) {
-                    Ok(session) => {
-                        runtime.set_model(session.model.clone());
-                        // A resumed session owns its saved choice. Preserve that
-                        // explicit provenance across later model switches.
-                        let clamp_notice =
-                            restore_session_reasoning(runtime, &session.thinking_level);
-                        if let Some(ref sp) = session.system_prompt {
-                            runtime.set_system_prompt(sp.clone());
-                        }
-                        app.save_session().await;
-                        let old_id = app.session.id.clone();
+                // The actor saves the current session, loads the target,
+                // restores model/reasoning/system prompt and swaps the
+                // conversation (actor_cmds::resume); the `Conversation`
+                // that follows carries the new messages + header.
+                match link.resume(arg).await {
+                    Ok(reply) => {
                         app.transcript.clear();
                         app.invalidate();
-                        app.api_messages = session.api_messages.clone();
-                        app.total_input_tokens = session.total_input_tokens;
-                        app.total_output_tokens = session.total_output_tokens;
-                        app.session_cost = session.session_cost;
-                        super::rebuild_display_messages(&session.api_messages, app);
-                        let new_id = session.id.clone();
-                        app.session = session;
-                        if let Some(notice) = clamp_notice {
-                            // Keep the session file in sync with the clamped runtime.
-                            app.session.thinking_level = runtime.thinking_level().to_string();
-                            app.push_msg(ChatMessage::System(notice));
-                        }
-                        let via = if synaps_cli::chain::load_chain(arg).is_ok() {
-                            format!(" (via chain '{}')", arg)
-                        } else if synaps_cli::session::find_session_by_name(arg).is_ok() {
-                            format!(" (via name '{}')", arg)
-                        } else {
-                            String::new()
-                        };
-                        app.push_msg(ChatMessage::System(format!(
-                            "switched from {} to {}{}",
-                            old_id, new_id, via
-                        )));
+                        app.resume_pending = Some(super::app::ResumePending {
+                            old_id: reply.old_id,
+                            new_id: reply.new_id,
+                            via: reply.via,
+                            clamp_notice: reply.clamp_notice,
+                        });
                     }
                     Err(e) => {
                         app.push_msg(ChatMessage::Error(format!("failed to load session: {}", e)));
@@ -695,25 +714,27 @@ pub(super) async fn handle_command(
             }
         }
         "saveas" => {
+            // Naming lives on the actor's session (it owns the journal):
+            // `EngineCommand{saveas}` → actor_cmds sets/clears the name and
+            // force-saves; reply text is rendered as before.
             let trimmed = arg.trim();
-            if trimmed.is_empty() {
-                app.session.clear_name();
-                // Force save even with no messages — persist the name change
-                let _ = app.session.save().await;
-                app.push_msg(ChatMessage::System("session name cleared".into()));
-            } else {
-                match app.session.set_name(trimmed) {
-                    Ok(()) => {
-                        // Force save even with no messages — persist the name change
-                        let _ = app.session.save().await;
-                        app.push_msg(ChatMessage::System(format!("session named '{}'", trimmed)));
+            match link.engine_command("saveas", trimmed).await {
+                Ok(value) => match value["kind"].as_str() {
+                    Some("output") => {
+                        app.session.name = value["name"].as_str().map(str::to_string);
+                        app.push_msg(ChatMessage::System(
+                            value["text"].as_str().unwrap_or("").to_string(),
+                        ));
                     }
-                    Err(e) => {
-                        app.push_msg(ChatMessage::Error(format!("saveas failed: {}", e)));
-                    }
-                }
+                    _ => app.push_msg(ChatMessage::Error(format!(
+                        "saveas failed: {}",
+                        value["text"].as_str().unwrap_or("unknown error")
+                    ))),
+                },
+                Err(e) => app.push_msg(ChatMessage::Error(format!("saveas failed: {}", e))),
             }
         }
+
         "help" => {
             let trimmed = arg.trim();
             if trimmed == "find" || trimmed.starts_with("find ") {
@@ -929,7 +950,7 @@ pub(super) async fn handle_command(
             return CommandAction::Status;
         }
         "stats" => {
-            let receipt = build_stats_receipt(app, runtime);
+            let receipt = build_stats_receipt(app, &**link.view());
             app.push_msg(ChatMessage::System(receipt));
             return CommandAction::None;
         }
@@ -1124,7 +1145,10 @@ pub(super) async fn handle_command(
 ///
 /// Returns a multi-line string ready to be pushed as `ChatMessage::System`.
 /// Exported for unit testing.
-pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
+pub(crate) fn build_stats_receipt(
+    app: &App,
+    runtime: &impl agent_engine::session::RuntimeRead,
+) -> String {
     use synaps_cli::pricing::calculate_cost_split;
 
     let model = runtime.model().to_string();
@@ -1260,6 +1284,7 @@ pub(super) fn handle_streaming_command(
 }
 
 /// Notice shown when a model change forced a reasoning-level substitution.
+#[allow(dead_code)]
 pub(crate) fn reasoning_clamp_notice(
     clamp: &synaps_cli::runtime::ReasoningClamp,
     model: &str,
@@ -1272,13 +1297,24 @@ pub(crate) fn reasoning_clamp_notice(
     )
 }
 
+/// Same line from the wire form (`SettingApplied.clamp`).
+pub(crate) fn reasoning_clamp_notice_wire(
+    clamp: &agent_engine::session::ReasoningClampWire,
+    model: &str,
+) -> String {
+    format!(
+        "thinking → {} (clamped from {}: not supported by {})",
+        clamp.to, clamp.from, model
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::command_output_event_to_chat_message;
     use super::{
         build_stats_receipt, edit_distance, execute_command_action,
         execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix,
-        restore_session_reasoning, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction,
+        CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction,
     };
     use crate::tui::app::ChatMessage;
     use async_trait::async_trait;
@@ -1352,7 +1388,7 @@ mod tests {
             }],
         );
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
         let registry = Arc::new(registry);
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
@@ -1361,7 +1397,7 @@ mod tests {
             "policy:mode",
             "strict",
             &mut app,
-            &mut runtime,
+            &mut link,
             &system_prompt_path,
             &registry,
             &keybinds,
@@ -1375,6 +1411,13 @@ mod tests {
             }
             _ => panic!("expected plugin command action"),
         }
+    }
+
+    /// A `SessionLink` over the scripted in-memory actor (A5).
+    fn scripted_link(runtime: synaps_cli::Runtime) -> crate::tui::session_link::SessionLink {
+        crate::tui::session_link::SessionLink::new(Box::new(
+            crate::tui::testing::scripted::ScriptedTransport::new(runtime),
+        ))
     }
 
     struct EchoTool;
@@ -1404,6 +1447,7 @@ mod tests {
         tools.register(Arc::new(EchoTool));
         let mut runtime = synaps_cli::Runtime::new().await.unwrap();
         runtime.set_tools(tools);
+        let mut link = scripted_link(runtime);
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
         let command = Arc::new(RegisteredPluginCommand {
             plugin: "policy".to_string(),
@@ -1415,6 +1459,9 @@ mod tests {
             },
             plugin_root: PathBuf::from("/tmp/policy"),
         });
+        // The actor resolves the command by plugin:name on the host's
+        // registry; the scripted actor resolves it here.
+        crate::tui::testing::scripted::register_plugin_command(Arc::clone(&command));
 
         execute_command_action(
             CommandAction::PluginCommand {
@@ -1422,7 +1469,7 @@ mod tests {
                 arg: "hello".to_string(),
             },
             &mut app,
-            &runtime,
+            &mut link,
         )
         .await;
 
@@ -1642,7 +1689,7 @@ mod tests {
 
     async fn invoke_extensions(arg: &str) -> CommandAction {
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
         let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
@@ -1650,7 +1697,7 @@ mod tests {
             "extensions",
             arg,
             &mut app,
-            &mut runtime,
+            &mut link,
             &system_prompt_path,
             &registry,
             &keybinds,
@@ -1847,13 +1894,13 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ));
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "capture",
             "toggle",
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -1879,13 +1926,13 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ));
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "capture",
             "",
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -1902,13 +1949,13 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ));
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "capture",
             "status",
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -1937,13 +1984,13 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ));
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "capture",
             "toggle",
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -1963,13 +2010,13 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ));
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "capture",
             "bogus",
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -1987,14 +2034,14 @@ mod tests {
         plugins: Vec<synaps_cli::skills::Plugin>,
     ) -> (CommandAction, crate::tui::app::App) {
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], plugins));
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
         let action = handle_command(
             "sidecar",
             arg,
             &mut app,
-            &mut runtime,
+            &mut link,
             &PathBuf::from("/tmp/sp"),
             &registry,
             &keybinds,
@@ -2159,7 +2206,7 @@ mod tests {
         app.total_cache_write_1h = 200;
         app.session_cost = 0.0042;
 
-        let runtime = synaps_cli::Runtime::new().await.unwrap();
+        let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
 
         assert!(receipt.contains("Session Stats"), "missing header");
@@ -2169,40 +2216,5 @@ mod tests {
         assert!(receipt.contains("saved:"), "missing savings line");
         assert!(receipt.contains("5m:"), "missing 5m split");
         assert!(receipt.contains("1h:"), "missing 1h split");
-    }
-
-    #[tokio::test]
-    async fn resume_restores_ultra_with_explicit_provenance() {
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
-        runtime.set_model("openai-codex/gpt-5.6-sol".to_string());
-
-        restore_session_reasoning(&mut runtime, "ultra");
-
-        assert_eq!(
-            runtime.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::Ultra
-        );
-        assert!(runtime.is_reasoning_explicit());
-        runtime.set_model("openai-codex/gpt-5.6-terra".to_string());
-        assert_eq!(
-            runtime.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::Ultra,
-            "restored explicit Ultra must survive model switches"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_clamps_unsupported_saved_level() {
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
-        runtime.set_model("xai-auth/grok-4.6".to_string());
-
-        let notice = restore_session_reasoning(&mut runtime, "xhigh");
-
-        assert!(notice.is_some(), "clamp must be surfaced");
-        assert_eq!(
-            runtime.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::High
-        );
-        assert!(runtime.is_reasoning_explicit());
     }
 }

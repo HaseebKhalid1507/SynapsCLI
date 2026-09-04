@@ -1,25 +1,17 @@
-//! Stream event handling — processes StreamEvent variants from the runtime.
+//! Session-event handling — the presentation half of the turn machine
+//! (PLAN-phase3 §2.4). `Stream(ev)` keeps `handle_stream_event` as it was;
+//! every other envelope maps to the `ChatMessage`/state mutation the inline
+//! turn machine used to perform. The actor never renders.
 
-use serde_json::json;
-use synaps_cli::engine::reactor::{
-    claim_auto_turn, drain_event_queue, wake_action, EventDisposition, WakeAction, AUTO_TURN_CAP,
-};
-use synaps_cli::{AgentEvent, CancellationToken, LlmEvent, Runtime, SessionEvent, StreamEvent};
+use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+
+use agent_engine::session::{Envelope, RuntimeView, SessionEventWire, TurnTrigger};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
 use super::render_thread::RenderHandle;
+use super::session_link::{PromptBridge, SessionLink};
 use super::view_model::ViewInputs;
-
-/// What the event loop should do after processing a stream event.
-pub(super) enum StreamAction {
-    /// Continue processing — no special action needed.
-    Continue,
-    /// Stream completed and a queued message should be auto-sent.
-    AutoSendQueued(String),
-    /// Stream completed and buffered events need a model turn.
-    AutoTriggerEvents,
-}
 
 /// Returns true if the event should trigger an immediate redraw.
 pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
@@ -36,12 +28,10 @@ pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
     )
 }
 
-/// Process a StreamEvent, update app state, return what the loop should do.
-pub(super) async fn handle_stream_event(
-    event: StreamEvent,
-    app: &mut App,
-    runtime: &Runtime,
-) -> StreamAction {
+/// Process a StreamEvent, update app state. Presentation only: history,
+/// saves, queued/pending flushes and auto-turns are the actor's (mirrored
+/// back by `Conversation` / `TurnStarted`).
+pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &RuntimeView) {
     match event {
         StreamEvent::Llm(LlmEvent::Thinking(text)) => {
             app.append_or_update_thinking(&text);
@@ -62,19 +52,15 @@ pub(super) async fn handle_stream_event(
         }) => {
             let input_str = serde_json::to_string(&input).unwrap_or_default();
             app.on_tool_use_finalized(tool_id, tool_name, input_str);
-            return StreamAction::Continue;
         }
         StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
             app.on_tool_result_delta(tool_id, delta);
-            return StreamAction::Continue;
         }
         StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
             app.on_tool_result(tool_id, result);
-            return StreamAction::Continue;
         }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             app.api_messages = history;
-            app.save_session().await;
         }
         StreamEvent::Agent(AgentEvent::SubagentStart {
             subagent_id,
@@ -148,7 +134,7 @@ pub(super) async fn handle_stream_event(
             cache_creation_1h,
             model: usage_model,
         }) => {
-            let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
+            let model_for_pricing = usage_model.as_deref().unwrap_or(&view.model);
             app.add_usage(
                 input_tokens,
                 output_tokens,
@@ -157,7 +143,7 @@ pub(super) async fn handle_stream_event(
                 cache_creation_5m,
                 cache_creation_1h,
                 model_for_pricing,
-                Some(runtime.context_window()),
+                Some(view.context_window),
             );
         }
         StreamEvent::Session(SessionEvent::Notice(text)) => {
@@ -169,40 +155,18 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
             app.drop_empty_thinking();
-            // Reconcile HUD against registry instead of clearing — retains running entries
-            // whose tx_events is now dead (stream dropped) but threads live on.
-            // Poison-recovering lock: a panicked subagent thread must not block teardown.
-            {
-                let rows = runtime
-                    .subagent_registry()
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .display_rows();
-                reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
-            }
+            // Reconcile HUD against the registry rows (last `SubagentRows`)
+            // instead of clearing — retains running entries whose tx_events
+            // is now dead (stream dropped) but threads live on.
+            reconcile_subagents(
+                &mut app.subagents,
+                &app.subagent_rows,
+                std::time::Instant::now(),
+            );
             // NOTE: cleanup_finished removed — engine now reaps at turn completion
             // inside the tokio::spawn wrapper (runtime/mod.rs) before Done is sent.
-
-            // Flush events that arrived during streaming into api_messages
-            let had_pending = !app.pending_events.is_empty();
-            for formatted in app.pending_events.drain(..) {
-                app.api_messages
-                    .push(std::sync::Arc::new(serde_json::json!({
-                        "role": "user",
-                        "content": formatted
-                    })));
-            }
-
-            // Check for queued message to auto-send
-            if let Some(queued) = app.queued_message.take() {
-                return StreamAction::AutoSendQueued(queued);
-            }
-
-            // If events arrived during streaming, trigger a new model turn
-            if had_pending {
-                app.save_session().await;
-                return StreamAction::AutoTriggerEvents;
-            }
+            // Pending-event flush / queued auto-send / auto-trigger: the
+            // actor's; it announces the next turn with `TurnStarted`.
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
             app.drop_empty_thinking();
@@ -214,330 +178,431 @@ pub(super) async fn handle_stream_event(
                 err.category_label()
             )));
             app.streaming = false;
-            // Reconcile HUD against registry on error path too (same as Done).
-            {
-                let rows = runtime
-                    .subagent_registry()
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .display_rows();
-                reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
-            }
-            // Restore a valid trailing state: remove only invalid messages
-            // appended by the ACTIVE turn. A pre-existing trailing user
-            // message (the prompt that started the turn) is never removed —
-            // it stays in history so the failed turn can be retried with
-            // full context (spec §5.2).
-            synaps_cli::engine::stream::repair_history_after_failure(
-                &mut app.api_messages,
-                app.turn_baseline,
+            // Reconcile HUD against registry rows on error path too (same as Done).
+            reconcile_subagents(
+                &mut app.subagents,
+                &app.subagent_rows,
+                std::time::Instant::now(),
             );
+            // History repair is the actor's (mirrored by `Conversation`).
         }
     }
-    StreamAction::Continue
 }
 
-// ── P12.4: stream-lifecycle select! arms — pure code-motion from run(). ──
-// The select! arm EXPRESSIONS (the event-queue `notified()` wake and the
-// `stream.next()` polling future) stay inline in mod.rs; only the arm
-// BODIES moved here, verbatim, apart from `*`-derefs for the loop-owned
-// locals now borrowed via `&mut` and dropping the `stream_handler::` path
-// prefix at the new scope. Behavior byte-identical — streaming lifecycle
-// (delta → tool_use → done/abort) is the product's hot path.
+// ── Session-event arm (PLAN-phase3 §2.4) ─────────────────────────────────
 
-/// The in-flight response stream, owned by the `run()` loop and lent to the
-/// arm handlers below so they can clear/replace it exactly as the inline
-/// arms did.
-pub(super) type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
+/// Outcome of one envelope for the `run()` loop.
+pub(super) enum ArmFlow {
+    Continue,
+    /// `Ended` arrived: the session is gone; leave the loop.
+    Ended,
+}
 
-/// Event-bus wake arm body: drain queued engine events into the transcript,
-/// steer them into an active stream (or buffer), and auto-trigger a model
-/// turn when idle.
-pub(super) async fn handle_event_queue_arm(
+fn publish_frame(
     app: &mut App,
-    runtime: &Runtime,
-    secret_prompt_handle: &synaps_cli::tools::SecretPromptHandle,
-    stream: &mut Option<ActiveStream>,
-    cancel_token: &mut Option<CancellationToken>,
-    steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    view: &RuntimeView,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &RenderHandle,
 ) {
-    let busy = app.streaming || app.compact_task.is_some();
-
-    // Drain via the central reactor function.
-    let drained = drain_event_queue(
-        runtime.event_queue(),
-        &mut app.api_messages,
-        &mut app.pending_events,
-        busy,
-        steer_tx.as_ref(),
-    );
-
-    if drained.is_empty() {
-        return;
+    let term_size = crossterm::terminal::size()
+        .map(|(w, h)| ratatui::layout::Size {
+            width: w,
+            height: h,
+        })
+        .unwrap_or_default();
+    let built = build_render_model(&mut ViewInputs::from_app(app), view, registry, term_size);
+    if let Some((model, patch)) = built {
+        patch.apply(app);
+        render_handle.publish(model);
     }
+}
 
-    // Presentation: push each event to the transcript and update the HUD.
-    for de in &drained {
-        let event = &de.event;
-        let severity_str = event
-            .content
-            .severity
-            .as_ref()
-            .map(|s| s.as_str().to_string())
-            .unwrap_or_else(|| "medium".to_string());
-        app.push_msg(ChatMessage::Event {
-            source: event.source.source_type.clone(),
-            severity: severity_str,
-            text: event.content.text.clone(),
-        });
+/// The two strings the actor still sends as `SystemNotice` where the TUI
+/// used to push a typed line (until the actor emits `Aborted`/`Cleared`
+/// itself). Returns the typed envelope, or the notice unchanged.
+fn shim_notice(text: String) -> SessionEventWire {
+    match text.as_str() {
+        "aborted" => SessionEventWire::Aborted {
+            context_saved: false,
+        },
+        "aborted — context saved for next message" => SessionEventWire::Aborted {
+            context_saved: true,
+        },
+        s if s.starts_with("session cleared → ") => SessionEventWire::Cleared {
+            session_id: s["session cleared → ".len()..].to_string(),
+        },
+        _ => SessionEventWire::SystemNotice(text),
+    }
+}
 
-        // Seam 3: subagent_completion → mark HUD entry done directly from
-        // event data (no lock needed — data was embedded at finalizer time).
-        if event.content.content_type == "subagent_completion" {
-            if let Some(data) = &event.content.data {
-                let maybe_id = data["subagent_id"].as_u64();
-                let maybe_status = data["status"].as_str();
-                let maybe_duration = data["duration_secs"].as_f64();
-                if let (Some(sid), Some(status_str)) = (maybe_id, maybe_status) {
-                    let now = std::time::Instant::now();
-                    if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == sid && !s.done) {
-                        sa.done = true;
-                        sa.done_at = Some(now);
-                        if let Some(dur) = maybe_duration {
-                            sa.duration_secs = Some(dur);
-                        }
-                        sa.status = match status_str {
-                            "completed" => "\u{2714} done".to_string(),
-                            "cancelled" => "\u{26a0} cancelled".to_string(),
-                            "timed_out" => "\u{26a0} timed out".to_string(),
-                            s if s.starts_with("fail") => {
-                                let reason = data["error"].as_str().unwrap_or("error");
-                                let preview: String = reason.chars().take(30).collect();
-                                format!("\u{2718} {}", preview)
-                            }
-                            _ => format!("\u{2714} {status_str}"),
-                        };
+/// Event card + HUD mark for a drained engine event (was the presentation
+/// half of `handle_event_queue_arm`, verbatim).
+pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Event) {
+    let severity_str = event
+        .content
+        .severity
+        .as_ref()
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_else(|| "medium".to_string());
+    app.push_msg(ChatMessage::Event {
+        source: event.source.source_type.clone(),
+        severity: severity_str,
+        text: event.content.text.clone(),
+    });
+
+    // Seam 3: subagent_completion → mark HUD entry done directly from
+    // event data (no lock needed — data was embedded at finalizer time).
+    if event.content.content_type == "subagent_completion" {
+        if let Some(data) = &event.content.data {
+            let maybe_id = data["subagent_id"].as_u64();
+            let maybe_status = data["status"].as_str();
+            let maybe_duration = data["duration_secs"].as_f64();
+            if let (Some(sid), Some(status_str)) = (maybe_id, maybe_status) {
+                let now = std::time::Instant::now();
+                if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == sid && !s.done) {
+                    sa.done = true;
+                    sa.done_at = Some(now);
+                    if let Some(dur) = maybe_duration {
+                        sa.duration_secs = Some(dur);
                     }
+                    sa.status = match status_str {
+                        "completed" => "\u{2714} done".to_string(),
+                        "cancelled" => "\u{26a0} cancelled".to_string(),
+                        "timed_out" => "\u{26a0} timed out".to_string(),
+                        s if s.starts_with("fail") => {
+                            let reason = data["error"].as_str().unwrap_or("error");
+                            let preview: String = reason.chars().take(30).collect();
+                            format!("\u{2718} {}", preview)
+                        }
+                        _ => format!("\u{2714} {status_str}"),
+                    };
                 }
             }
         }
     }
     app.invalidate();
-
-    // Wake decision.
-    let auto_turn_enabled = true; // C2+ will wire config; always on for C1
-    let action = wake_action(
-        &drained,
-        &app.api_messages,
-        busy,
-        auto_turn_enabled,
-        app.consecutive_auto_turns,
-    );
-
-    match action {
-        WakeAction::RunTurn => {
-            // Cap check: if we ARE at cap this would have returned Forward.
-            // Increment before spawning so cap is visible for the next wake.
-            // Optional guard: skip if a stream is already active (shouldn't
-            // happen if wake_action saw busy=false, but defend against it).
-            if stream.is_some() {
-                tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
-            } else {
-                app.consecutive_auto_turns += 1;
-                let ct = CancellationToken::new();
-                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                app.streaming = true;
-                app.turn_baseline = app.api_messages.len();
-                app.spinner_frame = 0;
-                *stream = Some(
-                    runtime
-                        .run_stream_with_messages(
-                            app.api_messages.clone(),
-                            ct.clone(),
-                            Some(s_rx),
-                            Some(secret_prompt_handle.clone()),
-                            false,
-                        )
-                        .await,
-                );
-                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                *cancel_token = Some(ct);
-                *steer_tx = Some(s_tx);
-            }
-        }
-        WakeAction::Forward => {
-            // Check if we hit the cap (some Injected events but cap blocked RunTurn).
-            let hit_cap = drained
-                .iter()
-                .any(|d| d.disposition == EventDisposition::Injected)
-                && !busy
-                && auto_turn_enabled
-                && app.consecutive_auto_turns >= synaps_cli::engine::reactor::AUTO_TURN_CAP;
-            if hit_cap {
-                app.push_msg(ChatMessage::System(format!(
-                    "auto-turn cap reached ({} consecutive) — waiting for your input",
-                    synaps_cli::engine::reactor::AUTO_TURN_CAP
-                )));
-                app.invalidate();
-            }
-        }
-        WakeAction::Nothing => {}
-    }
 }
 
-/// Stream-event arm body: route one `StreamEvent` through
-/// [`handle_stream_event`] and act on the returned [`StreamAction`] —
-/// continue (incl. Done/Error stream-state teardown + gamba reclaim),
-/// auto-send a queued message, or auto-trigger buffered events.
+/// The auto-turn cap line (was stream_handler.rs:368-378 / :516-520).
+pub(super) fn on_auto_turn_cap(app: &mut App, cap: u32) {
+    app.push_msg(ChatMessage::System(format!(
+        "auto-turn cap reached ({} consecutive) — waiting for your input",
+        cap
+    )));
+    app.invalidate();
+}
+
+/// One envelope from the session → the exact `ChatMessage`s / state
+/// mutations the inline turn machine performed (§2.4 table).
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_stream_arm(
-    maybe_event: Option<StreamEvent>,
+pub(super) async fn handle_session_event_arm(
+    env: Envelope,
     app: &mut App,
-    runtime: &Runtime,
+    link: &mut SessionLink,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     render_handle: &RenderHandle,
-    secret_prompt_handle: &synaps_cli::tools::SecretPromptHandle,
-    stream: &mut Option<ActiveStream>,
-    cancel_token: &mut Option<CancellationToken>,
-    steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
-) {
-    if let Some(event) = maybe_event {
-        let do_draw = needs_immediate_draw(&event);
-        let action = handle_stream_event(event, app, runtime).await;
-
-        match action {
-            StreamAction::Continue => {
-                // For Done/Error, clear stream state
-                if !app.streaming {
-                    *stream = None;
-                    *cancel_token = None;
-                    *steer_tx = None;
-                    // Reclaim gamba if running — resume render thread
-                    // after reclaim restores the terminal.
-                    if let Some(msg) = app.reclaim_gamba() {
-                        render_handle.resume();
-                        app.push_msg(ChatMessage::System(msg));
-                        app.invalidate();
-                    }
-                }
-            }
-            StreamAction::AutoSendQueued(queued) => {
-                // Drop old stream state (important for cleanup)
-                drop(stream.take());
-                drop(cancel_token.take());
-                drop(steer_tx.take());
-                // Reclaim gamba if running — resume render thread
-                // after reclaim restores the terminal.
+    prompt_bridge: &mut PromptBridge,
+    ext_mgr: Option<
+        &std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    >,
+) -> ArmFlow {
+    let me = link.client_id();
+    let event = match env.event {
+        SessionEventWire::SystemNotice(text) => shim_notice(text),
+        other => other,
+    };
+    match event {
+        SessionEventWire::Stream(ev) => {
+            let do_draw = needs_immediate_draw(&ev);
+            let view = std::sync::Arc::clone(link.view());
+            handle_stream_event(ev, app, &view);
+            // For Done/Error: reclaim gamba if running — resume render
+            // thread after reclaim restores the terminal.
+            if !app.streaming {
                 if let Some(msg) = app.reclaim_gamba() {
                     render_handle.resume();
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate();
                 }
-                // Auto-send the queued message (user-authored — reset auto-turn counter)
-                app.consecutive_auto_turns = 0;
-                app.push_msg(ChatMessage::User(queued.clone()));
-                app.transcript.scroll_to_bottom();
-                let api_content = if let Some(ref ctx) = app.abort_context {
-                    let combined = format!("{}\n\n{}", ctx, queued);
-                    app.abort_context = None;
-                    combined
-                } else {
-                    queued
-                };
-                app.api_messages.push(std::sync::Arc::new(
-                    json!({"role": "user", "content": api_content}),
-                ));
-                let ct = CancellationToken::new();
-                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                app.status_text = Some("connecting…".to_string());
+            }
+            if do_draw {
+                publish_frame(app, &view, registry, render_handle);
+            }
+        }
+        SessionEventWire::TurnStarted {
+            turn_baseline,
+            trigger,
+            user_text,
+        } => match trigger {
+            TurnTrigger::User | TurnTrigger::PluginCommand => {
+                // Pre-send presentation (User card, "connecting…",
+                // streaming=true, spinner, frame) already happened in the
+                // dispatch arm; this is the tail after the stream opened.
                 app.streaming = true;
-                app.turn_baseline = app.api_messages.len();
-                app.spinner_frame = 0;
-                let term_size = crossterm::terminal::size()
-                    .map(|(w, h)| ratatui::layout::Size {
-                        width: w,
-                        height: h,
-                    })
-                    .unwrap_or_default();
-                let built = build_render_model(
-                    &mut ViewInputs::from_app(app),
-                    runtime,
-                    registry,
-                    term_size,
-                );
-                if let Some((model, patch)) = built {
-                    patch.apply(app);
-                    render_handle.publish(model);
-                }
-                *stream = Some(
-                    runtime
-                        .run_stream_with_messages(
-                            app.api_messages.clone(),
-                            ct.clone(),
-                            Some(s_rx),
-                            Some(secret_prompt_handle.clone()),
-                            false,
-                        )
-                        .await,
-                );
+                app.turn_baseline = turn_baseline;
                 app.status_text = None;
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                *cancel_token = Some(ct);
-                *steer_tx = Some(s_tx);
             }
-            StreamAction::AutoTriggerEvents => {
-                drop(stream.take());
-                drop(cancel_token.take());
-                drop(steer_tx.take());
-
-                // Use the central claim_auto_turn gate: allows turns 1-5
-                // (counter < CAP), denies the 6th (counter == CAP).
-                // Increment happens inside claim on success — no inline +=.
-                if claim_auto_turn(&mut app.consecutive_auto_turns) {
-                    let ct = CancellationToken::new();
-                    let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                    app.streaming = true;
-                    app.turn_baseline = app.api_messages.len();
-                    app.spinner_frame = 0;
-                    *stream = Some(
-                        runtime
-                            .run_stream_with_messages(
-                                app.api_messages.clone(),
-                                ct.clone(),
-                                Some(s_rx),
-                                Some(secret_prompt_handle.clone()),
-                                false,
-                            )
-                            .await,
-                    );
-                    app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                    *cancel_token = Some(ct);
-                    *steer_tx = Some(s_tx);
-                } else {
-                    app.push_msg(ChatMessage::System(format!(
-                        "auto-turn cap reached ({} consecutive) — waiting for your input",
-                        AUTO_TURN_CAP
-                    )));
+            TurnTrigger::QueuedAuto => {
+                if let Some(msg) = app.reclaim_gamba() {
+                    render_handle.resume();
+                    app.push_msg(ChatMessage::System(msg));
                     app.invalidate();
+                }
+                // Auto-send of the queued message (user-authored).
+                app.consecutive_auto_turns = 0;
+                if let Some(q) = user_text {
+                    app.push_msg(ChatMessage::User(q));
+                }
+                app.transcript.scroll_to_bottom();
+                app.status_text = Some("connecting…".to_string());
+                app.streaming = true;
+                app.turn_baseline = turn_baseline;
+                app.spinner_frame = 0;
+                let view = std::sync::Arc::clone(link.view());
+                publish_frame(app, &view, registry, render_handle);
+                app.status_text = None;
+                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+            }
+            TurnTrigger::EventAuto | TurnTrigger::Compaction => {
+                app.streaming = true;
+                app.turn_baseline = turn_baseline;
+                app.spinner_frame = 0;
+                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+            }
+        },
+        SessionEventWire::Conversation(snap) => {
+            app.apply_conversation(&snap);
+            if let Some(applied) = app.compaction_applied.take() {
+                finish_compaction(app, applied);
+            }
+            if let Some(pending) = app.resume_pending.take() {
+                let msgs = app.api_messages.clone();
+                super::helpers::rebuild_display_messages(&msgs, app);
+                if let Some(notice) = pending.clamp_notice {
+                    app.push_msg(ChatMessage::System(notice));
+                }
+                let via = pending
+                    .via
+                    .map(|v| format!(" (via {v})"))
+                    .unwrap_or_default();
+                app.push_msg(ChatMessage::System(format!(
+                    "switched from {} to {}{}",
+                    pending.old_id, pending.new_id, via
+                )));
+            }
+        }
+        SessionEventWire::Prompt(req) => prompt_bridge.on_prompt(req),
+        SessionEventWire::PromptResolved { prompt_id } => {
+            if prompt_bridge.on_resolved(prompt_id) {
+                app.secret_prompts.dismiss();
+                app.invalidate();
+            }
+        }
+        SessionEventWire::External(ev) => on_external(app, &ev),
+        SessionEventWire::AutoTurnCapReached { cap } => on_auto_turn_cap(app, cap),
+        SessionEventWire::Idle => {}
+        SessionEventWire::Steered { text, delivered } => {
+            if delivered {
+                app.push_msg(ChatMessage::System(format!("→ steering: {}", text)));
+            } else {
+                app.push_msg(ChatMessage::System(format!("queued: {}", text)));
+            }
+            app.queued_message = Some(text);
+        }
+        SessionEventWire::Dequeued { text } => {
+            app.push_msg(ChatMessage::System(format!("dequeued: {}", text)));
+        }
+        SessionEventWire::SystemNotice(text) => {
+            app.push_msg(ChatMessage::System(sanitize_notice(&text)));
+        }
+        SessionEventWire::LoaderProgress(ev) => {
+            super::loop_arms::handle_extension_loader_event(app, link.view(), ev, ext_mgr).await;
+            app.request_redraw();
+        }
+        SessionEventWire::ExtensionNotification {
+            extension_id,
+            method,
+            params,
+        } => {
+            // Socket path: the in-process watchers are not running, so the
+            // widget frames arrive here (same parse the watchers use). In
+            // process the watchers own `widget_rx`; the actor sees no frames.
+            if ext_mgr.is_none() && synaps_cli::extensions::widgets::is_widget_method(&method) {
+                if let Ok(event) =
+                    synaps_cli::extensions::widgets::parse_widget_event(&method, &params)
+                {
+                    let ev = synaps_cli::extensions::widgets::ExtensionWidgetEvent {
+                        extension_id,
+                        event,
+                    };
+                    if super::loop_arms::handle_widget_event(app, ev) {
+                        app.request_redraw();
+                    }
                 }
             }
         }
-
-        if do_draw {
-            let term_size = crossterm::terminal::size()
-                .map(|(w, h)| ratatui::layout::Size {
-                    width: w,
-                    height: h,
-                })
-                .unwrap_or_default();
-            let built =
-                build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
-            if let Some((model, patch)) = built {
-                patch.apply(app);
-                render_handle.publish(model);
+        SessionEventWire::SettingChanged(_) | SessionEventWire::QueryResult { .. } => {
+            // Unsolicited (another client's Set / a host query): the view
+            // was refreshed by `SessionLink::note`; nothing to render.
+        }
+        SessionEventWire::Attached { .. }
+        | SessionEventWire::ClientJoined { .. }
+        | SessionEventWire::ClientLeft { .. } => {}
+        SessionEventWire::Ended { .. } => return ArmFlow::Ended,
+        SessionEventWire::Aborted { context_saved } => {
+            app.streaming = false;
+            app.subagents.clear();
+            // The actor decided (`TurnLog::abort_context`); the mirror's
+            // `abort_context` only lands with the `Conversation` that follows.
+            let abort_msg = if context_saved {
+                "aborted — context saved for next message"
+            } else {
+                "aborted"
+            };
+            app.drop_empty_thinking();
+            app.push_msg(ChatMessage::Error(abort_msg.to_string()));
+        }
+        SessionEventWire::Cleared { .. } => {
+            app.transcript.clear();
+            app.invalidate();
+            app.api_messages.clear();
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_cache_read_tokens = 0;
+            app.total_cache_creation_tokens = 0;
+            app.session_cost = 0.0;
+            app.input_tokens = 0;
+            app.output_tokens = 0;
+            app.push_msg(ChatMessage::System("new session started".to_string()));
+        }
+        SessionEventWire::CompactionStarted { disclosure, .. } => {
+            app.push_msg(ChatMessage::System(disclosure));
+            app.push_msg(ChatMessage::System(
+                "compacting conversation...".to_string(),
+            ));
+            app.status_text = Some("compacting…".to_string());
+            app.spinner_frame = 0;
+            app.compacting = true;
+        }
+        SessionEventWire::CompactionApplied {
+            previous_session_id,
+            session_id,
+            chains_advanced,
+            queued_restored,
+            msg_count,
+        } => {
+            // The successor's messages/header arrive in the `Conversation`
+            // that follows; the lines are pushed once it has been applied.
+            app.compaction_applied = Some(super::app::CompactionApplied {
+                previous_session_id,
+                session_id,
+                chains_advanced,
+                queued_restored,
+                msg_count,
+            });
+        }
+        SessionEventWire::CompactionFailed { message, panicked } => {
+            if panicked {
+                app.push_msg(ChatMessage::Error(format!(
+                    "compaction task panicked: {}",
+                    message
+                )));
+            } else {
+                app.push_msg(ChatMessage::Error(format!("compaction failed: {}", message)));
+            }
+            app.status_text = None;
+            app.compacting = false;
+            app.invalidate();
+        }
+        SessionEventWire::CompactionCancelled => {
+            app.push_msg(ChatMessage::System("compaction cancelled".to_string()));
+            app.status_text = None;
+            app.compacting = false;
+            app.invalidate();
+        }
+        SessionEventWire::SubagentRows(rows) => app.subagent_rows = rows,
+        SessionEventWire::Resumed { .. } => {}
+        SessionEventWire::InputOwnerChanged { from, to, .. } => {
+            if from == Some(me) && to != Some(me) {
+                let who = to
+                    .map(|c| format!("client #{}", c.0))
+                    .unwrap_or_else(|| "nobody".to_string());
+                app.toasts.upsert(
+                    super::toast::Toast::new("input-owner", format!("input taken over by {who}"))
+                        .titled("Session"),
+                );
+            } else if to == Some(me) && from != Some(me) {
+                app.toasts.upsert(
+                    super::toast::Toast::new("input-owner", "you own input").titled("Session"),
+                );
+            }
+            app.request_redraw();
+        }
+        SessionEventWire::Refused {
+            client,
+            command,
+            reason,
+        } => {
+            if client == me {
+                app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
+                // §6 #9: a Submit refused after the editor was cleared —
+                // give the text back.
+                if let Some(text) = app.last_submitted.take() {
+                    app.set_input_text(&text);
+                }
             }
         }
+        SessionEventWire::AttachRefused { message } => {
+            app.push_msg(ChatMessage::Error(format!("attach refused: {message}")));
+        }
+        SessionEventWire::Lifecycle(state) => {
+            app.toasts.upsert(
+                super::toast::Toast::new("lifecycle", format!("session {state:?}"))
+                    .titled("Session"),
+            );
+            app.request_redraw();
+        }
+        SessionEventWire::Reloading { generation, .. } => {
+            app.toasts.upsert(
+                super::toast::Toast::new(
+                    "reload",
+                    format!("daemon reloading (generation {generation})…"),
+                )
+                .titled("Daemon")
+                .ttl(None),
+            );
+            app.request_redraw();
+        }
     }
+    ArmFlow::Continue
+}
+
+/// `CompactionApplied` + the `Conversation` that followed: the lines the
+/// compaction poll used to push (loop_arms.rs:783-812).
+fn finish_compaction(app: &mut App, applied: super::app::CompactionApplied) {
+    let old_id = applied.previous_session_id;
+    let msgs = app.api_messages.clone();
+    super::helpers::rebuild_display_messages(&msgs, app);
+    for name in &applied.chains_advanced {
+        app.push_msg(ChatMessage::System(format!(
+            "chain '{}' advanced: {} → {}",
+            name, old_id, app.session.id
+        )));
+    }
+    if let Some(q) = applied.queued_restored {
+        app.push_msg(ChatMessage::System(format!(
+            "queued message restored: {}",
+            q
+        )));
+    }
+    app.push_msg(ChatMessage::System(format!(
+        "✓ compacted {} messages → new session {} (from {})",
+        applied.msg_count, app.session.id, old_id
+    )));
+    app.status_text = None;
+    app.compacting = false;
+    app.invalidate();
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text
