@@ -7,7 +7,11 @@
 #   (git worktree add ~/Projects/agent-runtime-ref f0ee1e62 && cargo build --release).
 #
 # Two panes per scenario: (R) the reference binary, (L) this binary
-# in-process. There is no socket pane — L≡S is #111's gate, not this script's.
+# in-process. SYNAPS_TUI_E2E_SOCKET=1 adds a third pane (S): a private daemon
+# per scenario in the pane's HOME (SYNAPS_DAEMON=1 SYNAPS_RUNTIME_DIR=<home>/run,
+# same stub) and `synaps --attach`; L≡S is printed as a second table
+# ("SOCKET DIFF: empty (N)") modulo the socket normaliser (drops the
+# `attached to … as client #…` banner; session ids as before).
 #
 # Scenarios (SYNAPS_TUI_E2E_ONLY=<name> to run one): plain_turn, tool_loop,
 # abort_mid_stream, steer_mid_stream, settings_model_change, clear,
@@ -26,4 +30,5 @@ REF=${1:-$HOME/Projects/agent-runtime-ref/target/release/synaps}
 command -v tmux >/dev/null || { echo "tmux required" >&2; exit 2; }
 cd "$HERE"
 SYNAPS_TUI_E2E=1 SYNAPS_REF_BIN="$REF" ${SYNAPS_TUI_E2E_ONLY:+SYNAPS_TUI_E2E_ONLY=$SYNAPS_TUI_E2E_ONLY} \
-  cargo test --test tui_transport_differential -- --ignored --nocapture 2>&1 | tail -60
+  ${SYNAPS_TUI_E2E_SOCKET:+SYNAPS_TUI_E2E_SOCKET=$SYNAPS_TUI_E2E_SOCKET} \
+  cargo test --test tui_transport_differential -- --ignored --nocapture 2>&1 | tail -${SYNAPS_TUI_E2E_TAIL:-60}
