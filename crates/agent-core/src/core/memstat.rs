@@ -152,6 +152,85 @@ pub fn purge_arenas() {
     }
 }
 
+/// Outcome of one mallctl write, for the ladder line (never fatal).
+pub type MallctlResult = std::result::Result<(), String>;
+
+#[cfg(all(unix, not(target_env = "musl")))]
+fn mallctl_err(name: &str, e: impl std::fmt::Display) -> String {
+    format!("{name}: {e}")
+}
+
+/// `background_thread` on/off. Turning it off joins every `jemalloc_bg_thd`
+/// (PLAN-phase4 §4.1) — call before spawning threads so none are created for
+/// the arenas they touch. No-op `Ok` without jemalloc.
+pub fn set_background_threads(on: bool) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        tikv_jemalloc_ctl::background_thread::write(on)
+            .map_err(|e| mallctl_err("background_thread", e))
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = on;
+        Ok(())
+    }
+}
+
+/// Current `background_thread` setting (`None` without jemalloc).
+pub fn background_threads_enabled() -> Option<bool> {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        tikv_jemalloc_ctl::background_thread::read().ok()
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        None
+    }
+}
+
+/// Decay times for **existing** arenas (`arena.<ALL>.*_decay_ms`) and the
+/// default for future ones (`arenas.*_decay_ms`). `0` = purge a freed run
+/// on the next decay tick; `-1` = never. §4.2.
+pub fn set_decay_ms(dirty_ms: i64, muzzy_ms: i64) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        use tikv_jemalloc_ctl::raw;
+        // ssize_t on every supported target.
+        let d = dirty_ms as libc::ssize_t;
+        let m = muzzy_ms as libc::ssize_t;
+        unsafe {
+            raw::write(b"arenas.dirty_decay_ms\0", d)
+                .map_err(|e| mallctl_err("arenas.dirty_decay_ms", e))?;
+            raw::write(b"arenas.muzzy_decay_ms\0", m)
+                .map_err(|e| mallctl_err("arenas.muzzy_decay_ms", e))?;
+            raw::write(b"arena.4096.dirty_decay_ms\0", d)
+                .map_err(|e| mallctl_err("arena.4096.dirty_decay_ms", e))?;
+            raw::write(b"arena.4096.muzzy_decay_ms\0", m)
+                .map_err(|e| mallctl_err("arena.4096.muzzy_decay_ms", e))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = (dirty_ms, muzzy_ms);
+        Ok(())
+    }
+}
+
+/// `thread.tcache.enabled` for the **calling** thread (§4.3 fallback).
+pub fn set_thread_tcache(on: bool) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        unsafe { tikv_jemalloc_ctl::raw::write(b"thread.tcache.enabled\0", on) }
+            .map_err(|e| mallctl_err("thread.tcache.enabled", e))
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = on;
+        Ok(())
+    }
+}
+
 /// `SYNAPS_MEM_TRACE=1` turns on the per-turn memory trace and the broker
 /// install log line. Read once; one atomic load per call afterwards.
 pub fn mem_trace_enabled() -> bool {

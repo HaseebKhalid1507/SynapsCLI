@@ -330,7 +330,12 @@ fn is_thin_client() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
-    let rt = if is_thin_client() {
+    let thin = is_thin_client();
+    if thin {
+        // Ladder START pins on the first call — `main` must be first (§7.1).
+        agent_core::core::memstat::ladder("main", &"");
+    }
+    let rt = if thin {
         tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?
     } else {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -339,6 +344,9 @@ fn main() -> anyhow::Result<()> {
         }
         builder.enable_all().thread_name("synaps-rt").build()?
     };
+    if thin {
+        agent_core::core::memstat::ladder("runtime", &"");
+    }
     // The log-appender guard lives on the process `EngineHost` (a static —
     // never dropped by Rust). Flush it on every exit path so the teardown
     // burst (session save, hooks, extension shutdown) reaches disk.

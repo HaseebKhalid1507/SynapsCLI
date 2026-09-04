@@ -4,6 +4,7 @@ mod transcript;
 mod app;
 /// A4: the TUI over `SocketTransport` (`synaps --attach`).
 pub mod attach;
+pub mod client_diet;
 mod clock;
 mod commands;
 mod dispatch;
@@ -130,6 +131,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     loop_arms::boot_myx_live(&mut app);
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
+    let mut first_frame_done = false;
     loop {
         // Only draw when something actually changed. During streaming, coalesce
         // redraws to the configured frame budget (`max_fps`, default 60fps =
@@ -182,6 +184,10 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             if let Some((model, patch)) = built {
                 patch.apply(&mut app);
                 render_handle.publish(model);
+                if !first_frame_done {
+                    first_frame_done = true;
+                    agent_core::core::memstat::ladder("first_frame", &"");
+                }
             }
         }
 
@@ -371,6 +377,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             },
         };
         let _ = link.send(cmd).await;
+        agent_core::core::memstat::ladder("detach", &"");
         if let run_setup::TransportMode::Local { .. } = mode {
             match tokio::time::timeout(teardown, link.wait_ended()).await {
                 Ok(true) => tracing::debug!("clean teardown completed"),
