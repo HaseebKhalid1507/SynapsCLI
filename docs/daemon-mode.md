@@ -44,7 +44,7 @@ With no ID: attaches to the single live session, creates one if none, lists if s
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
 
-## Protocol summary (line-JSON over UDS, `MAX_FRAME_BYTES` = 1 MiB, same framing as `synaps rpc`)
+## Protocol summary (line-JSON over UDS, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
@@ -60,11 +60,31 @@ C: bye | socket close = Detach (turn keeps running)
 - Version policy: exact match on `protocol_version` (min == max == 1) → `Refused{Version}` **loudly**
   (client exit 2). Different *binary* version, same protocol → allowed; `attach` prints a notice.
   `WireSessionEvent` has `#[serde(other)] Unknown` so additive variants from a newer daemon are tolerated.
-- `WireSessionEvent` is a lossless mirror of `SessionEventWire` (`StreamEvent`/`TurnError`/
-  `ExtensionLoaderEvent` mirrored variant-for-variant; round-trip test covers every variant).
-  Conversion happens only at the socket boundary; in-process transports never serialise.
+- `WireSessionEvent` mirrors `SessionEventWire` variant-for-variant (`StreamEvent`/`TurnError`/
+  `ExtensionLoaderEvent` included; round-trip test covers every variant), with **one lossy variant**:
+  `Conversation` goes over the wire as a `ConversationDigest` `{messages_len, messages_hash (FNV-1a),
+  tokens, cost, abort_context, queued_message, pending_events_len, consecutive_auto_turns}` — never the
+  messages. Full `api_messages` travel only in `Attached` and `QueryResult{Messages}`. `SocketTransport`
+  keeps a local mirror (seeded by `Attached`, updated by `Stream(MessageHistory)`), fills the digest in
+  when the hash matches, and on a miss (compaction, abort repair, flushed events) issues one
+  `Query{Messages}` under the reserved id `DIGEST_RESYNC_QUERY_ID` (= 2^63) and re-emits the
+  `Conversation` with the fetched history. Per-event wire cost is O(1) in history size; the O(history)
+  cost is paid once per attach and once per tool round (`MessageHistory`, which the engine emits anyway).
+- **Frame cap: 64 MiB both directions**, distinct from rpc's 1 MiB (an `Attached` for a long session is
+  several MiB). Enforced symmetrically: `encode_line` refuses to build an oversize frame (the daemon sends
+  `Error{"daemon could not encode a frame: …"}` and closes), both readers are `take()`-bounded and reply
+  `Error{"frame exceeds 64 MiB limit"}` + close. Tested: a > 1 MiB history attaches
+  (`attach_to_session_with_history_over_1mib`), a 2 MiB `ping` is answered, a 64 MiB + 10 B frame is refused.
+- Query ids ≥ `RESERVED_QUERY_ID_BASE` (2^63) belong to the transport/daemon (`DIGEST_RESYNC_QUERY_ID`,
+  `IDLE_PROBE_QUERY_ID`); `SocketTransport` never surfaces them as `QueryResult`.
 - First frame not `Hello` / malformed → `Refused{Protocol}`; oversize frame → `Error` + close;
   `Cmd` before `Attach` → `Error`, connection stays open.
+- **Client command whitelist** (`conn.rs::client_may_send`): an attached client may send `Submit`,
+  `Steer`, `Cancel`, `Answer`, `Set`, `Compact`, `NewSession`, `Save`, `Query`, `EngineCommand`, and
+  `Detach` **for its own client id only**. `Detach{other}`, `Attach`, `Resync`, `End`, `HostEvent` →
+  `Error{"refused: …"}` and nothing reaches the actor. Sessions are ended by `synaps daemon stop`, not
+  by clients. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
+  (`client_commands_are_whitelisted`).
 - `Attach::Create` fills `cwd` from `Hello.cwd`; it must be absolute and exist.
 
 ## Security posture
@@ -77,6 +97,9 @@ C: bye | socket close = Detach (turn keeps running)
   sources for any `tracing::` line mentioning `answer`/`value`.
 - Backpressure, never silent drops: bounded writer queues both ways (`CMD_CHAN_CAP` = 256);
   `send` returns `TransportError::Backpressure`; the daemon replies `Error{"backpressure…"}`.
+- **The daemon trusts its uid.** Anyone who can open the socket can `shutdown`, `Attach::Create` with any
+  `SessionConfig` (`prompt_manifest`, `auto_approve_confirms`, `persist:false`), and `Cancel`/`Compact`
+  a session someone else is attached to. That is the same trust as the shell that started the daemon.
 
 ## Lifecycle
 
@@ -84,7 +107,25 @@ C: bye | socket close = Detach (turn keeps running)
 - Daemon SIGTERM/SIGINT/`Shutdown` → `End{HostShutdown}` to every session **concurrently** under ONE
   `TEARDOWN_TIMEOUT` (SAVE + HOOKS) budget, then `ExtensionManager::shutdown_all`, then unlink files.
   Attached clients see `Ended` before `Bye`.
-- `--idle-exit SECS`: exit after SECS with zero connections **and** zero live sessions (default: never).
+- `--idle-exit SECS`: exit after SECS of **zero connections and no session running a turn** (default:
+  never). Sessions never end on their own (no `Parked` yet), so the monitor probes each client-less
+  session with `Query{Status}` (reserved id `IDLE_PROBE_QUERY_ID`) and treats `streaming:true`, a pending
+  prompt, or **no answer within 2 s** (actor inside `compact()`/preflight, queue full) as busy — the
+  daemon never exits under a running turn and never aborts one. Idle client-less sessions are ended
+  through the normal `End{HostShutdown}` path (saved to `sessions/<id>.json`; `synaps attach --continue`
+  brings them back). Tested: `idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn`.
+- **Extension notification router** (`extensions::notify_router`) is spawned by `run_foreground` after
+  discovery: every sidecar's `widget.*` frames fan out to **every** live session as
+  `ExtensionNotification`. Frames carry no session id, so **widgets are daemon-global under
+  `SYNAPS_DAEMON=1`** (a widget upsert from work in session A shows in session B's client). Per-session
+  routing needs `params.session_id` from the extension contract — day 2; `heartbeat`/`jawz-widget` are
+  last-writer-wins until then (`docs/extensions/session-id.md`).
+- **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
+  `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
+  Spawned compaction is day 2.
+- `daemon stop` while a turn is streaming cancels it **and captures an abort context** (`finish()` →
+  `cancel_turn()`), so the session is "aborted" on disk; the TUI's quit-mid-turn only cancels the token.
+  Defensible (the next `--continue` tells the model the previous answer was cut), documented here.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 
 ## cwd caveats (risk §6.1)
@@ -92,6 +133,28 @@ C: bye | socket close = Detach (turn keeps running)
 Tools, shell and the memory tool honour the session `cwd` (`Runtime.cwd`). Still process-wide in the
 daemon today: memory project scope, `host_project_root`, project-local plugin discovery, extension
 process cwd. Start the daemon in the project you care about until day 2's `memory_project_scope(cwd)`.
+
+## What changes on the default (in-process) path — read before merging
+
+Honest list of behaviour changes on this branch with `SYNAPS_DAEMON` **unset**:
+
+1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The differential test
+   (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
+   inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
+   plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
+   queue-while-busy, cancel/abort-context, secret-prompt round-trip are asserted by actor unit tests, not
+   by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
+   stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
+   One byte-level difference: **chat's abort context is now `"{ctx}\n\n{msg}"` (context first, wrapper
+   applied once — the TUI shape)** where inline chat built `"{msg}\n\n[ABORT CONTEXT…{ctx}…]"` and
+   re-wrapped; only visible on `synaps chat --continue` of an aborted session.
+2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
+   `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
+   *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
+   provider prompt-cache prefix differ between run 1 and run 2 for every MCP user. Intended (the cache
+   finally has a writer), but it is a default-path change. `SYNAPS_MCP_CACHE_WRITEBACK=0` restores the
+   old read-only behaviour.
+3. Hook events carry `session_id` (additive; `SYNAPS_HOOK_SESSION_ID=0`).
 
 ## Memory acceptance — `DAEMON=1 SYNAPS_DAEMON=1 scripts/memprof/bench-sessions.sh BIN 1 2 3`
 
@@ -122,7 +185,7 @@ Raw runs: `/tmp/memprof-synaps-b-daemon-N<N>-r<i>.txt` on bella.
 
 ## Not landed today (day 2/3)
 
-`--attach` driving the TUI over `SocketTransport` (needs A4); `--continue X` attach-if-live; `Resync` after
+`--attach` driving the TUI over `SocketTransport` (needs A4); `Resync` after
 `Lagged` via `turn_replay`; delta coalescing; `--tcp`; HTTP+SSE front-end; `prompt_over_wire` and
 `detach_without_abort_over_socket` integration tests (need a secret-prompting tool fixture + `Endless`
 script through the actor — the paths are exercised by the actor unit tests and the socket tests above).

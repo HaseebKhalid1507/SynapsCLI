@@ -83,5 +83,14 @@ Safety properties:
 - a write-back failure is logged and never surfaces: the lease is already
   live.
 
+**This is on by default in every mode, including the single-session TUI /
+`synaps chat` with `SYNAPS_DAEMON` unset.** Before: exact mode with no cache
+meant "MCP tools are not discoverable this run", every run. After: run 1
+writes the cache, run 2 registers dormant tools at boot — the tool list,
+system prompt and provider prompt-cache prefix differ between the first and
+second run for every MCP user. That is the feature working, but it is the
+one default-path behaviour change of daemon-mode phase 2; it is listed in
+`docs/daemon-mode.md` under "What changes on the default path".
+
 Kill-switch: `SYNAPS_MCP_CACHE_WRITEBACK=0` (also `false`/`off`) — never
 write. The cache remains a supported *input*.

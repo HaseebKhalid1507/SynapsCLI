@@ -33,6 +33,10 @@ extension that ignores `session_id` sees the same shape it always did.
 ## Why: one sidecar, many sessions
 
 In daemon mode one extension process serves every session in the daemon.
+The reverse direction is fanned out too: `synaps daemon` runs the
+notification router (`extensions::notify_router`), which delivers every
+sidecar's `widget.*` frames to **every** live session — widgets are
+daemon-global under `SYNAPS_DAEMON=1` until frames carry `params.session_id`.
 "Last tool call"-style state keyed on nothing is now keyed on the wrong thing:
 two sessions interleave their hooks on the same stdin. Key per-session state
 on `params.session_id`, and treat `null` as "no session (worker)".
