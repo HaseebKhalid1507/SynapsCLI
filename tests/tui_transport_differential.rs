@@ -2,11 +2,21 @@
 //! REFERENCE BINARY built at `f0ee1e62` (the in-process TUI before the port):
 //! the only oracle independent of the actor's author.
 //!
-//! For each scenario, three tmux panes run identical `send-keys` scripts
-//! against the same scripted provider stub: (R) the reference binary,
-//! (L) this binary in-process, (S) `synaps daemon --foreground` + this
-//! binary `--attach` (when `SYNAPS_TUI_E2E_SOCKET=1`). After each step the
-//! pane is captured, normalised and diffed. The journals are diffed too.
+//! For each scenario, two tmux panes run identical `send-keys` scripts
+//! against the same scripted provider stub: (R) the reference binary and
+//! (L) this binary in-process. After each step the pane is captured,
+//! normalised and diffed. The journals are diffed too.
+//!
+//! There is NO socket pane here: L≡S (`--attach` against a daemon) is
+//! #111's gate and is not claimed by this file.
+//!
+//! Scenarios: plain_turn, tool_loop, abort_mid_stream, steer_mid_stream,
+//! settings_model_change, clear, compaction, queued_during_compaction,
+//! secret_prompt, extension_loaded. `queue_while_busy_then_autosend`
+//! (the `Steered{delivered:false}` → auto-send-on-Done branch) is NOT
+//! here: it needs the stream's steering receiver closed before `Done` is
+//! processed, which neither binary reaches deterministically (same reason
+//! as `session_actor_differential.rs` ext header #2).
 //!
 //! Ignored unless `SYNAPS_TUI_E2E=1`; needs `SYNAPS_REF_BIN=<path>` and
 //! `tmux`. Run via `scripts/tui-e2e/differential.sh`.
@@ -20,6 +30,33 @@ use std::process::Command;
 use std::time::Duration;
 
 use phase2::{spawn_stub, Script, ANTHROPIC_SSE, ANTHROPIC_SSE_PREFIX, ANTHROPIC_SSE_TOOL_USE};
+
+/// Anthropic SSE turn calling `bash` with a command that prints a password
+/// prompt on stderr and reads the answer from stdin — the bash tool's
+/// `detect_password_prompt` raises a secret prompt (`Prompt` envelope →
+/// secret-prompt pane on both binaries). Deterministic: the tool result is
+/// `len=<answer length>`.
+const ANTHROPIC_SSE_BASH_PASSWORD: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_04\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_pw\",\"name\":\"bash\",\"input\":{}}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",",
+    "\"partial_json\":\"{\\\"command\\\":\\\"printf 'Password: ' >&2; read -r p; echo len=${#p}\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// The in-tree process-extension fixture (`crates/agent-tui/tests/fixtures/
+/// interactive_command_extension.py`), planted as an installed plugin under
+/// the pane's `SYNAPS_BASE_DIR/plugins/` so the loader arm, `ext_ready`
+/// waiter and `on_session_start` timing are inside the oracle.
+const EXTENSION_FIXTURE: &str = "crates/agent-tui/tests/fixtures/interactive_command_extension.py";
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
@@ -39,6 +76,8 @@ struct Scenario {
     name: &'static str,
     script: Script,
     steps: Vec<Step>,
+    /// Plant the extension fixture and run WITHOUT `--no-extensions`.
+    extensions: bool,
 }
 
 fn scenarios() -> Vec<Scenario> {
@@ -53,6 +92,7 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(1500),
                 Capture("after_turn"),
             ],
+            extensions: false,
         },
         Scenario {
             name: "tool_loop",
@@ -63,6 +103,7 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(2500),
                 Capture("after_tool_turn"),
             ],
+            extensions: false,
         },
         Scenario {
             name: "abort_mid_stream",
@@ -76,6 +117,7 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(800),
                 Capture("after_abort"),
             ],
+            extensions: false,
         },
         Scenario {
             name: "steer_mid_stream",
@@ -92,6 +134,7 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(800),
                 Capture("after_abort"),
             ],
+            extensions: false,
         },
         Scenario {
             name: "settings_model_change",
@@ -110,6 +153,7 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(600),
                 Capture("after_context"),
             ],
+            extensions: false,
         },
         Scenario {
             name: "clear",
@@ -123,6 +167,90 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(600),
                 Capture("after_clear"),
             ],
+            extensions: false,
+        },
+        // HIGH #1: `/compact` must push exactly the reference's lines
+        // (disclosure + "compacting conversation..." then the ✓ line). The
+        // summary request is answered by the same stub (`compact_call` goes
+        // through the session's provider client).
+        Scenario {
+            name: "compaction",
+            script: Script::Sse(ANTHROPIC_SSE),
+            steps: vec![
+                Type("hello"),
+                Key("Enter"),
+                Wait(1500),
+                Type("again"),
+                Key("Enter"),
+                Wait(1500),
+                Type("/compact"),
+                Key("Enter"),
+                Wait(2500),
+                Capture("after_compact"),
+            ],
+            extensions: false,
+        },
+        // Submit while the compaction summary is in flight → "queued: …"
+        // then "queued message restored: …" after the swap (the reference's
+        // `compact_task.is_some()` branch / the actor's `compact.is_some()`).
+        // Every request is paced so the summary call is a ~2 s window.
+        Scenario {
+            name: "queued_during_compaction",
+            script: Script::Paced {
+                body: ANTHROPIC_SSE,
+                frame_delay: Duration::from_millis(300),
+            },
+            steps: vec![
+                Type("hello"),
+                Key("Enter"),
+                Wait(3000),
+                Type("again"),
+                Key("Enter"),
+                Wait(3000),
+                Type("/compact"),
+                Key("Enter"),
+                Wait(700),
+                Type("later"),
+                Key("Enter"),
+                Wait(400),
+                Capture("queued"),
+                Wait(3500),
+                Capture("after_compact"),
+            ],
+            extensions: false,
+        },
+        // `bash` prints `Password:` on stderr → secret prompt pane on both
+        // binaries; the answer goes back to the tool's stdin (`PromptBridge`
+        // on the new side, the inline pane on the reference).
+        Scenario {
+            name: "secret_prompt",
+            script: Script::SeqSse(&[ANTHROPIC_SSE_BASH_PASSWORD, ANTHROPIC_SSE]),
+            steps: vec![
+                Type("do it"),
+                Key("Enter"),
+                Wait(2000),
+                Capture("prompting"),
+                Type("abc"),
+                Key("Enter"),
+                Wait(2500),
+                Capture("after_answer"),
+            ],
+            extensions: false,
+        },
+        // Extension loader arm + `ext_ready` wait + on_session_start with a
+        // real process extension loaded (no `--no-extensions`).
+        Scenario {
+            name: "extension_loaded",
+            script: Script::Sse(ANTHROPIC_SSE),
+            steps: vec![
+                Wait(1500),
+                Capture("booted"),
+                Type("hello"),
+                Key("Enter"),
+                Wait(1500),
+                Capture("after_turn"),
+            ],
+            extensions: true,
         },
     ]
 }
@@ -148,18 +276,23 @@ fn wait_ready(pane: &str) {
     panic!("pane {pane} never became ready:\n{}", tmux(&["capture-pane", "-pt", pane]));
 }
 
-/// Strip what is allowed to differ (§5.1): session ids, timings, spinner.
+/// Strip what is allowed to differ (§5.1): session ids, timings, the build
+/// sha in the welcome banner, spinner. Deliberately narrow — a bare 8-digit
+/// number (token counts, cost cents) must survive so a real footer diff is
+/// visible.
 fn normalise(frame: &str) -> String {
     let id_re = regex::Regex::new(r"\d{8}-\d{6}-[0-9a-f]{4}").unwrap();
     let ms_re = regex::Regex::new(r"\b\d+(\.\d+)?\s?(ms|s)\b").unwrap();
-    let sha_re = regex::Regex::new(r"\b[0-9a-f]{8}(-dirty)?\b").unwrap();
+    // The build sha (`GIT_HASH`, `git rev-parse --short`) is rendered
+    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs).
+    let sha_re = regex::Regex::new(r"(?P<pre>· )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'];
     frame
         .lines()
         .map(|l| {
             let l = id_re.replace_all(l, "<id>");
             let l = ms_re.replace_all(&l, "<t>");
-            let l = sha_re.replace_all(&l, "<sha>");
+            let l = sha_re.replace_all(&l, "${pre}<sha>");
             let l: String = l.chars().map(|c| if spinner.contains(&c) { '·' } else { c }).collect();
             l.trim_end().to_string()
         })
@@ -191,12 +324,38 @@ struct Pane {
     home: tempfile::TempDir,
 }
 
-fn spawn_pane(name: &str, bin: &Path, base_url: &str, extra: &[&str]) -> Pane {
+fn plant_extension(base: &Path) {
+    let root = base.join("plugins").join("demo-plugin");
+    std::fs::create_dir_all(root.join(".synaps-plugin")).unwrap();
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXTENSION_FIXTURE);
+    std::fs::copy(&src, root.join("ext.py")).expect("extension fixture present");
+    std::fs::write(
+        root.join(".synaps-plugin").join("plugin.json"),
+        serde_json::json!({
+            "name": "demo-plugin",
+            "version": "0.0.1",
+            "extension": {
+                "protocol_version": 1,
+                "runtime": "process",
+                "command": "python3",
+                "args": ["ext.py"],
+                "permissions": ["tools.register"],
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn spawn_pane(name: &str, bin: &Path, base_url: &str, extensions: bool) -> Pane {
     let home = tempfile::TempDir::new().unwrap();
     let base = home.path().join(".synaps-cli");
     std::fs::create_dir_all(&base).unwrap();
     std::fs::write(base.join("config"), "theme = \"default\"\n").unwrap();
     std::fs::write(base.join("auth.json"), phase2::synthetic_auth_json()).unwrap();
+    if extensions {
+        plant_extension(&base);
+    }
     let env = format!(
         "HOME={h} SYNAPS_BASE_DIR={b} SYNAPS_ANTHROPIC_BASE_URL={u} SYNAPS_NO_BOOT_FX=1 TERM=xterm-256color COLUMNS={c} LINES={r}",
         h = home.path().display(),
@@ -206,9 +365,9 @@ fn spawn_pane(name: &str, bin: &Path, base_url: &str, extra: &[&str]) -> Pane {
         r = ROWS,
     );
     let cmd = format!(
-        "exec env {env} {} --no-extensions {}",
+        "exec env {env} {} {}",
         bin.display(),
-        extra.join(" ")
+        if extensions { "" } else { "--no-extensions" }
     );
     tmux(&[
         "new",
@@ -278,6 +437,7 @@ async fn tui_reference_binary_differential() {
     let new_bin = PathBuf::from(env!("CARGO_BIN_EXE_synaps"));
     let only = std::env::var("SYNAPS_TUI_E2E_ONLY").ok();
     let mut failures = Vec::new();
+    let mut table: Vec<(&'static str, bool)> = Vec::new();
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tui-e2e");
     let _ = std::fs::create_dir_all(&out_dir);
 
@@ -290,8 +450,8 @@ async fn tui_reference_binary_differential() {
         // two binaries must not share the arrival order.
         let (url_r, _h1, _b1) = spawn_stub(sc.script.clone()).await;
         let (url_l, _h2, _b2) = spawn_stub(sc.script.clone()).await;
-        let r = spawn_pane("r", &ref_bin, &url_r, &[]);
-        let l = spawn_pane("l", &new_bin, &url_l, &[]);
+        let r = spawn_pane("r", &ref_bin, &url_r, sc.extensions);
+        let l = spawn_pane("l", &new_bin, &url_l, sc.extensions);
         let mut captures = Vec::new();
         drive(&[&r, &l], &sc.steps, &mut captures);
         // Quit both so the journals are flushed.
@@ -300,6 +460,7 @@ async fn tui_reference_binary_differential() {
             tmux(&["send-keys", "-t", &p.name, "Enter"]);
         }
         std::thread::sleep(Duration::from_millis(1500));
+        let before = failures.len();
         for (label, frames) in &captures {
             let file = out_dir.join(format!("{}.{label}", sc.name));
             let _ = std::fs::write(file.with_extension("ref.txt"), &frames[0]);
@@ -313,10 +474,15 @@ async fn tui_reference_binary_differential() {
         if let Some(d) = diff_report(&format!("{}/journal", sc.name), &jr, &jl) {
             failures.push(d);
         }
+        table.push((sc.name, failures.len() == before));
         tmux(&["kill-server"]);
     }
+    println!("scenario                   diff empty?");
+    for (name, ok) in &table {
+        println!("{name:<26} {}", if *ok { "yes" } else { "NO" });
+    }
     if failures.is_empty() {
-        println!("REFERENCE DIFF: empty");
+        println!("REFERENCE DIFF: empty ({} scenarios)", table.len());
     } else {
         panic!("REFERENCE DIFF:\n{}", failures.join("\n"));
     }
