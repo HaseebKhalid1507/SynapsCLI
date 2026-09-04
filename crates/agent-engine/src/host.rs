@@ -50,8 +50,10 @@ pub struct EngineHost {
     worker_registry: std::sync::Mutex<Option<(CatalogGeneration, ToolRegistry)>>,
     /// File-appender flush guard. Lives for the process (≥ any renderer), so
     /// log lines emitted after `boot()` returns can never be dropped by an
-    /// early guard drop (the old `setup::boot` bug).
-    #[allow(dead_code)]
+    /// early guard drop (the old `setup::boot` bug). Rust runs no static
+    /// destructors, so it is released explicitly by [`Self::flush_logs`] at
+    /// process exit — otherwise the tail of the log dies with the writer
+    /// thread.
     log_guard: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
 }
 
@@ -149,6 +151,22 @@ impl EngineHost {
 
     pub fn current() -> Option<Arc<Self>> {
         HOST.get().cloned()
+    }
+
+    /// Flush the non-blocking log writer: drops the appender guard, which
+    /// drains the channel and joins the writer thread (≤ 1 s). Idempotent.
+    /// Lines logged AFTER this call are dropped, so it belongs at the very
+    /// last exit point (`main` return, panic hook), not at session shutdown.
+    pub fn flush_logs(&self) {
+        let guard = self.log_guard.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(guard);
+    }
+
+    /// [`Self::flush_logs`] on the installed host, if any.
+    pub fn flush_installed_logs() {
+        if let Some(h) = HOST.get() {
+            h.flush_logs();
+        }
     }
 
     pub fn parts(&self) -> &HostParts {

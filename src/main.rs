@@ -301,7 +301,17 @@ fn main() -> anyhow::Result<()> {
         builder.worker_threads(n);
     }
     let rt = builder.enable_all().thread_name("synaps-rt").build()?;
-    rt.block_on(async_main())
+    // The log-appender guard lives on the process `EngineHost` (a static —
+    // never dropped by Rust). Flush it on every exit path so the teardown
+    // burst (session save, hooks, extension shutdown) reaches disk.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        synaps_cli::EngineHost::flush_installed_logs();
+    }));
+    let result = rt.block_on(async_main());
+    synaps_cli::EngineHost::flush_installed_logs();
+    result
 }
 
 async fn async_main() -> anyhow::Result<()> {
