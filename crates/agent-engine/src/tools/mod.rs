@@ -204,15 +204,25 @@ impl ToolOutput {
     }
 
     /// `(summary, Some(blocks))` for rich output, `(text, None)` for plain.
-    /// Debug builds assert the `blocks[0]` text-first invariant here — this
-    /// is the one choke point every rich result passes through.
+    /// This is the one choke point every rich result passes through, so the
+    /// `blocks[0]` text-first invariant is ENFORCED here in every build: a
+    /// `Blocks` value whose first block is not `{"type":"text"}` gets a text
+    /// block built from `summary` prepended. Debug builds additionally
+    /// assert that an existing leading text block matches `summary`.
     pub fn into_parts(self) -> (String, Option<Vec<Value>>) {
         match self {
             Self::Text(s) => (s, None),
-            Self::Blocks { blocks, summary } => {
+            Self::Blocks {
+                mut blocks,
+                summary,
+            } => {
+                let text_first = blocks.first().is_some_and(|b| b["type"] == "text");
+                if !text_first {
+                    blocks.insert(0, serde_json::json!({"type": "text", "text": summary}));
+                }
                 debug_assert!(
-                    blocks.first().is_some_and(|b| b["type"] == "text" && b["text"] == summary),
-                    "ToolOutput::Blocks invariant: blocks[0] must be a text block equal to summary"
+                    blocks[0]["text"] == summary,
+                    "ToolOutput::Blocks invariant: blocks[0] text must equal summary"
                 );
                 (summary, Some(blocks))
             }
@@ -286,3 +296,45 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 mod test_helpers;
+
+#[cfg(test)]
+mod tool_output_tests {
+    use super::ToolOutput;
+    use serde_json::json;
+
+    #[test]
+    fn into_parts_prepends_summary_text_when_blocks_not_text_first() {
+        let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+        let out = ToolOutput::Blocks {
+            blocks: vec![img.clone()],
+            summary: "[image 1x1]".into(),
+        };
+        let (summary, blocks) = out.into_parts();
+        let blocks = blocks.unwrap();
+        assert_eq!(summary, "[image 1x1]");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], json!({"type": "text", "text": "[image 1x1]"}));
+        assert_eq!(blocks[1], img);
+    }
+
+    #[test]
+    fn into_parts_prepends_summary_text_when_blocks_empty() {
+        let out = ToolOutput::Blocks {
+            blocks: vec![],
+            summary: "s".into(),
+        };
+        let (_, blocks) = out.into_parts();
+        assert_eq!(blocks.unwrap(), vec![json!({"type": "text", "text": "s"})]);
+    }
+
+    #[test]
+    fn into_parts_leaves_well_formed_blocks_alone() {
+        let blocks = vec![json!({"type": "text", "text": "ok"}), json!({"type": "image"})];
+        let out = ToolOutput::Blocks {
+            blocks: blocks.clone(),
+            summary: "ok".into(),
+        };
+        let (_, got) = out.into_parts();
+        assert_eq!(got.unwrap(), blocks);
+    }
+}
