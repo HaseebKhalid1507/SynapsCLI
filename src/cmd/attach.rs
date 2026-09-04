@@ -122,7 +122,15 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME\n"),
+            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG]\n"),
+            _ if line.starts_with("/cmd ") => {
+                let rest = line["/cmd ".len()..].trim();
+                let (name, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+                let _ = self
+                    .t
+                    .send(SessionCommand::EngineCommand { id: 2, name: name.to_string(), arg: arg.trim().to_string() })
+                    .await;
+            }
             _ if line.starts_with("/model ") => {
                 let model = line["/model ".len()..].trim().to_string();
                 let _ = self.t.send(SessionCommand::Set(SessionSetting::Model { model })).await;

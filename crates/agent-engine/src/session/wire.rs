@@ -744,6 +744,8 @@ mod tests {
             ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Takeover }),
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status } },
             ClientFrame::Bye,
         ];
         for f in frames {
