@@ -127,7 +127,8 @@ impl ApiMethods {
         {
             drop(tx);
             let _ = drain.await;
-            return result.map_err(crate::runtime::openai::net::provider_error_to_runtime);
+            return result
+                .map_err(|e| crate::runtime::openai::net::provider_error_to_runtime_for(model, e));
         }
         let qualified_model = model;
         let execution_plan = options
@@ -563,8 +564,9 @@ impl ApiMethods {
         {
             drop(tx);
             let _ = drain.await;
-            let response =
-                result.map_err(crate::runtime::openai::net::provider_error_to_runtime)?;
+            let response = result.map_err(|e| {
+                crate::runtime::openai::net::provider_error_to_runtime_for(model, e)
+            })?;
             return Ok(Self::concat_response_text(&response));
         }
         let model = model.strip_prefix("anthropic/").unwrap_or(model);

@@ -207,6 +207,14 @@ pub async fn emit_after_tool_call(
     crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
 }
 
+/// A reasoning-level substitution performed during a model change because the
+/// newly selected model does not support the previously active level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningClamp {
+    pub from: agent_core::reasoning::ReasoningLevel,
+    pub to: agent_core::reasoning::ReasoningLevel,
+}
+
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
 #[derive(Clone)]
@@ -1104,15 +1112,23 @@ impl Runtime {
             .grant_worker_model(model)
     }
 
-    pub fn set_model(&mut self, model: String) {
-        let _ = self.try_set_model(model);
+    /// Infallible model change. Returns the reasoning clamp applied (if any)
+    /// when the current level is not supported by the new model; errors from
+    /// `try_set_model` are swallowed (model left unchanged).
+    pub fn set_model(&mut self, model: String) -> Option<ReasoningClamp> {
+        self.try_set_model(model).ok().flatten()
     }
 
     /// Apply a model change while preserving orchestration lifecycle invariants.
     /// Returns an error instead of mutating either model or policy when active
     /// workers still require collection/reconciliation or when the replacement
     /// foreground cannot produce a trusted manifestless policy snapshot.
-    pub fn try_set_model(&mut self, model: String) -> std::result::Result<(), String> {
+    /// On success, returns `Some(ReasoningClamp)` when an explicit reasoning
+    /// level had to be substituted because the new model does not support it.
+    pub fn try_set_model(
+        &mut self,
+        model: String,
+    ) -> std::result::Result<Option<ReasoningClamp>, String> {
         // Older model pickers passed the rendered health row back here, e.g.
         // `✅  339ms  groq/llama-3.3-70b`. Remove that exact decoration shape,
         // rather than searching inside the ID: provider-qualified IDs may
@@ -1185,7 +1201,39 @@ impl Runtime {
                 self.set_reasoning_level(level);
             }
         }
-        Ok(())
+        // An explicit level that the new model rejects would otherwise make
+        // every subsequent turn fail pre-network until the user runs
+        // `/thinking`. Substitute the nearest documented level instead, keeping
+        // the explicit provenance flag so later switches still honor the user.
+        Ok(self.clamp_reasoning_to_model())
+    }
+
+    /// If the current effective reasoning level fails validation against the
+    /// current model, replace it with the model's documented default (or the
+    /// first documented option that validates). The `explicit_reasoning` flag
+    /// is preserved. Returns the substitution performed, if any; leaves state
+    /// untouched (and returns `None`) when nothing validates.
+    fn clamp_reasoning_to_model(&mut self) -> Option<ReasoningClamp> {
+        use crate::runtime::openai::catalog::validation::{
+            default_level_for_model, thinking_options_for_model, validate_reasoning_mutation,
+        };
+        let model = self.model.as_str();
+        let from = self.reasoning_level();
+        if validate_reasoning_mutation(model, from).is_ok() {
+            return None;
+        }
+        let to = default_level_for_model(model)
+            .filter(|level| validate_reasoning_mutation(model, *level).is_ok())
+            .or_else(|| {
+                thinking_options_for_model(model)
+                    .iter()
+                    .filter_map(|opt| agent_core::reasoning::ReasoningLevel::parse(opt))
+                    .find(|level| validate_reasoning_mutation(model, *level).is_ok())
+            })?;
+        let explicit = self.explicit_reasoning;
+        self.set_reasoning_level(to);
+        self.explicit_reasoning = explicit;
+        Some(ReasoningClamp { from, to })
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
@@ -1921,6 +1969,16 @@ impl Runtime {
             self.set_reasoning_level_explicit(level);
         } else if let Some(budget) = config.thinking_budget {
             self.set_thinking_budget_explicit(budget);
+        }
+        // A configured level the configured model rejects would boot into a
+        // permanently failing state; clamp exactly as `/model` does.
+        if let Some(clamp) = self.clamp_reasoning_to_model() {
+            tracing::warn!(
+                from = clamp.from.as_str(),
+                to = clamp.to.as_str(),
+                model = %self.model,
+                "configured reasoning level not supported by model; clamped"
+            );
         }
         self.context_window_override = config.context_window;
         self.compaction_model = config.compaction_model.clone();
@@ -4652,6 +4710,102 @@ mod set_reasoning_level_checked_tests {
             ReasoningLevel::Low,
             "explicit level must not be overwritten by the model default"
         );
+    }
+
+    /// Explicit level the new model rejects is clamped to the model default;
+    /// provenance stays explicit so later switches still honor the user.
+    #[test]
+    fn explicit_unsupported_level_is_clamped_to_model_default_on_switch() {
+        let mut rt = Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::XHigh);
+        let clamp = rt
+            .try_set_model("xai-auth/grok-4.6".to_string())
+            .expect("model switch succeeds");
+        assert_eq!(
+            clamp,
+            Some(ReasoningClamp {
+                from: ReasoningLevel::XHigh,
+                to: ReasoningLevel::High,
+            })
+        );
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(
+            rt.is_reasoning_explicit(),
+            "clamp keeps explicit provenance"
+        );
+        assert_eq!(rt.model(), "xai-auth/grok-4.6");
+    }
+
+    /// Explicit level the new model supports is left alone: no clamp reported.
+    #[test]
+    fn explicit_supported_level_is_not_clamped_on_switch() {
+        let mut rt = Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::High);
+        let clamp = rt.try_set_model("xai-auth/grok-4.6".to_string()).unwrap();
+        assert_eq!(clamp, None);
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit());
+    }
+
+    /// Non-explicit levels keep taking the new model's default (unchanged
+    /// behavior) and report no clamp — the default is applied, not substituted.
+    #[test]
+    fn non_explicit_default_application_reports_no_clamp() {
+        let mut rt = Runtime::new_headless();
+        rt.set_reasoning_level(ReasoningLevel::XHigh);
+        let clamp = rt.try_set_model("xai-auth/grok-4.6".to_string()).unwrap();
+        assert_eq!(clamp, None);
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(!rt.is_reasoning_explicit());
+    }
+
+    /// Explicit Max on an xAI model without Max support clamps to a level that
+    /// validates for that exact model (documented default Adaptive).
+    #[test]
+    fn explicit_max_clamps_to_validating_option_on_multi_agent_model() {
+        let model = "xai-auth/grok-4.20-multi-agent-0309";
+        let mut rt = Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::Max);
+        let clamp = rt
+            .try_set_model(model.to_string())
+            .unwrap()
+            .expect("Max is not supported: must clamp");
+        assert_eq!(clamp.from, ReasoningLevel::Max);
+        assert!(
+            crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+                model, clamp.to
+            )
+            .is_ok(),
+            "clamped level {} must validate",
+            clamp.to
+        );
+        assert_eq!(rt.reasoning_level(), clamp.to);
+        assert!(rt.is_reasoning_explicit());
+    }
+
+    /// `set_model` (infallible wrapper) still surfaces the clamp.
+    #[test]
+    fn set_model_returns_clamp() {
+        let mut rt = Runtime::new_headless();
+        rt.set_reasoning_level_explicit(ReasoningLevel::XHigh);
+        let clamp = rt.set_model("xai-auth/grok-4.6".to_string());
+        assert_eq!(clamp.map(|c| c.to), Some(ReasoningLevel::High));
+    }
+
+    /// Boot path: config `model` + unsupported explicit `thinking` no longer
+    /// boots into a permanently failing state.
+    #[test]
+    fn apply_config_clamps_unsupported_explicit_level_against_config_model() {
+        let mut rt = Runtime::new_headless();
+        rt.apply_config(&crate::config::SynapsConfig {
+            model: Some("xai-auth/grok-4.6".to_string()),
+            thinking_level: Some(ReasoningLevel::XHigh),
+            ..Default::default()
+        });
+        assert_eq!(rt.model(), "xai-auth/grok-4.6");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit());
+        assert!(rt.set_reasoning_level_checked(rt.reasoning_level()).is_ok());
     }
 }
 

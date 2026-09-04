@@ -542,6 +542,7 @@ async fn drive_responses(
         None,
         agent_core::reasoning::ReasoningLevel::Adaptive,
         cancel,
+        0,
         trace,
         true,
     )

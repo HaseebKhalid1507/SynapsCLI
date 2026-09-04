@@ -215,9 +215,22 @@ pub async fn run(
                     if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
                         match result {
                             CommandResult::Quit => break,
-                            CommandResult::ModelChanged { model } => {
+                            CommandResult::ModelChanged {
+                                model,
+                                reasoning_clamped,
+                            } => {
                                 conv.session.model = runtime.model().to_string();
                                 eprintln!("model → {}", model);
+                                if let Some(clamp) = reasoning_clamped {
+                                    conv.session.thinking_level =
+                                        runtime.thinking_level().to_string();
+                                    eprintln!(
+                                        "thinking → {} (clamped from {}: not supported by {})",
+                                        clamp.to.as_str(),
+                                        clamp.from.as_str(),
+                                        runtime.model()
+                                    );
+                                }
                             }
                             CommandResult::ThinkingChanged { spec } => {
                                 conv.session.thinking_level = spec.config_value();

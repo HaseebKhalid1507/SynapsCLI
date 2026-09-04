@@ -1249,11 +1249,26 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
 
     if let Some(result) = engine_result {
         match result {
-            CommandResult::ModelChanged { model } => {
-                state.conv.write().await.session.model = model.clone();
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("model set to: {model}"),
-                });
+            CommandResult::ModelChanged {
+                model,
+                reasoning_clamped,
+            } => {
+                let mut message = format!("model set to: {model}");
+                {
+                    let mut conv = state.conv.write().await;
+                    conv.session.model = model.clone();
+                    if let Some(clamp) = reasoning_clamped {
+                        let rt = state.runtime.lock().await;
+                        conv.session.thinking_level = rt.thinking_level().to_string();
+                        message.push_str(&format!(
+                            "; thinking → {} (clamped from {}: not supported by {})",
+                            clamp.to.as_str(),
+                            clamp.from.as_str(),
+                            rt.model()
+                        ));
+                    }
+                }
+                let _ = broadcast.send(ServerMessage::System { message });
             }
             CommandResult::ThinkingChanged { spec } => {
                 state.conv.write().await.session.thinking_level = spec.config_value();

@@ -53,9 +53,12 @@ pub enum CommandResult {
     /// Error message.
     Error(String),
 
-    /// Model was changed.
+    /// Model was changed. `reasoning_clamped` is populated when the runtime
+    /// had to substitute the active reasoning level because the new model does
+    /// not support it (see `Runtime::try_set_model`).
     ModelChanged {
         model: String,
+        reasoning_clamped: Option<crate::runtime::ReasoningClamp>,
     },
 
     /// Thinking level was changed.
@@ -190,9 +193,12 @@ pub fn handle_engine_command(
         "memory" => return Some(memory_command(arg, runtime)),
         _ => {}
     }
-    let result = evaluate_engine_command(cmd, arg)?;
-    match &result {
-        CommandResult::ModelChanged { model } => runtime.set_model(model.clone()),
+    let mut result = evaluate_engine_command(cmd, arg)?;
+    match &mut result {
+        CommandResult::ModelChanged {
+            model,
+            reasoning_clamped,
+        } => *reasoning_clamped = runtime.set_model(model.clone()),
         CommandResult::ThinkingChanged { spec } => {
             // Validate and apply the spec against model capabilities BEFORE
             // mutating runtime. State is unchanged on Err.
@@ -222,6 +228,7 @@ pub fn evaluate_engine_command(cmd: &str, arg: &str) -> Option<CommandResult> {
     match cmd {
         "model" | "models" if !arg.is_empty() => Some(CommandResult::ModelChanged {
             model: arg.to_string(),
+            reasoning_clamped: None,
         }),
         "thinking" if !arg.is_empty() => match parse_thinking_arg(arg) {
             Ok(spec) => Some(CommandResult::ThinkingChanged { spec }),
@@ -385,7 +392,9 @@ mod tests {
     #[test]
     fn model_command_carries_model_name() {
         match evaluate_engine_command("model", "claude-sonnet-4-6") {
-            Some(CommandResult::ModelChanged { model }) => assert_eq!(model, "claude-sonnet-4-6"),
+            Some(CommandResult::ModelChanged { model, .. }) => {
+                assert_eq!(model, "claude-sonnet-4-6")
+            }
             other => panic!("expected ModelChanged, got {:?}", other),
         }
         assert!(matches!(
@@ -745,6 +754,40 @@ mod tests {
         }
         assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
         assert!(rt.is_reasoning_explicit());
+    }
+
+    /// `/model` onto a model that rejects the explicit level reports the clamp
+    /// so surfaces can tell the user, and leaves the runtime in a usable state.
+    #[test]
+    fn model_command_reports_reasoning_clamp_for_unsupported_explicit_level() {
+        let mut rt = crate::Runtime::new_headless();
+        handle_engine_command("thinking", "xhigh", &mut rt).expect("thinking applies");
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::XHigh);
+        match handle_engine_command("model", "xai-auth/grok-4.6", &mut rt) {
+            Some(CommandResult::ModelChanged {
+                model,
+                reasoning_clamped,
+            }) => {
+                assert_eq!(model, "xai-auth/grok-4.6");
+                assert_eq!(
+                    reasoning_clamped,
+                    Some(crate::runtime::ReasoningClamp {
+                        from: ReasoningLevel::XHigh,
+                        to: ReasoningLevel::High,
+                    })
+                );
+            }
+            other => panic!("expected ModelChanged, got {:?}", other),
+        }
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit());
+        // Supported explicit level: no clamp reported.
+        match handle_engine_command("model", "xai-auth/grok-4.5", &mut rt) {
+            Some(CommandResult::ModelChanged {
+                reasoning_clamped, ..
+            }) => assert_eq!(reasoning_clamped, None),
+            other => panic!("expected ModelChanged, got {:?}", other),
+        }
     }
 
     #[test]
