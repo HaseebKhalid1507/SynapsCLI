@@ -110,16 +110,40 @@ Phase 4 — thin client (`synaps --attach`), PLAN-phase4-client §8.5. Rows are
 | `SYNAPS_CLIENT_HISTORY=full\|digest` | `full` until B7, then `digest` | `full` restores the 741b6b60 mirror + `Query{Messages}` resync + `MessageHistory` forwarding | parsed (P4-0); Digest path (phase 4, pending B) |
 | `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | display items in `Attached.display_tail` / `/resync` | (phase 4, pending B) |
 | `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` | Socket 400 / 2 MiB; Local 0 / 0 | 0 = unbounded | parsed (P4-0); enforcement (phase 4, pending B6) |
-| `SYNAPS_CLIENT_MALLOC=off` | on | skip bg-thread/decay/tcache mallctls | (phase 4, pending A) |
-| `SYNAPS_CLIENT_PURGE_SECS` | 10 | idle purge delay; 0 disables | (phase 4, pending A) |
-| `SYNAPS_CLIENT_TCACHE=0` | 1 | disable main-thread tcache (fallback) | (phase 4, pending A) |
-| `SYNAPS_CLIENT_REEXEC_MALLOC=1` | off | re-exec with `_RJEM_MALLOC_CONF=narenas:1,…` (fallback) | (phase 4, pending A) |
-| `SYNAPS_CLIENT_SIGNAL_THREAD=1` | off | keep the signal-hook thread on the socket client | (phase 4, pending A) |
-| `SYNAPS_MEMPROF_PURGE=1` | off | purge on every `Idle` immediately (bench) | (phase 4, pending A) |
-| `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | boot ladder (`memstat::ladder`) | sink + `http` stage (P4-0); remaining stages (phase 4, pending A) |
+| `SYNAPS_CLIENT_MALLOC=off` (alias `SYNAPS_CLIENT_ALLOC=default`) | on | skip the re-exec and the THP/bg-thread/decay/tcache mallctls (`client_diet::tune_allocator`) | live (A2) |
+| `SYNAPS_CLIENT_REEXEC=0` | re-exec on | the thin client re-execs itself once with `PR_SET_THP_DISABLE` inherited + `_RJEM_MALLOC_CONF=narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0` (`SYNAPS_CLIENT_MALLOC_CONF` overrides). Without it 6 MB of the client is three 2 MiB huge pages already resident at `main` (bss, main stack, jemalloc's first chunk) on a `THP=always` box | live (A2) |
+| `SYNAPS_CLIENT_THP=1` | THP off | keep transparent huge pages (in-image `prctl` only; the re-exec is the one that matters) | live (A2) |
+| `SYNAPS_CLIENT_PURGE_SECS` (alias `SYNAPS_CLIENT_PURGE_IDLE_SECS`) | 10 | idle purge delay after the busy→idle edge (turn/compaction done); 0 disables. Re-purges every 30 s while idle | live (A2) |
+| `SYNAPS_CLIENT_TCACHE=0` | 1 | disable main-thread tcache (fallback; not needed — retention is 0.00 MB) | live (A2) |
+| `SYNAPS_CLIENT_SIGNAL_THREAD=1` | off | keep the signal-hook thread on the socket client (default: `tokio::signal` on the current-thread driver) | live (A3) |
+| `SYNAPS_MEMPROF_PURGE=1` | off | purge immediately on every busy→idle edge (bench / `client_bounded`) | live (A2) |
+| `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | boot ladder (`memstat::ladder`): reexec, main, alloc, runtime, attach:enter, connect, attached, purge:attached, config, http (lazy), app, terminal, termcaps, render_thread, event_stream, replay, first_frame, idle+N, purged, detach. `scripts/memprof/client-ladder.sh BIN [MB]` prints it with a Δ column | live (A1) |
 | `SYNAPS_CLIENT_HTTP=eager` | lazy | build the reqwest client at boot (bisect aid) | live (P4-0) |
 | `SYNAPS_TUI_SYNTECT=full` | curated | full default `SyntaxSet` | (phase 4, pending C) |
 | `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | 0 = never evict | (phase 4, pending C) |
+
+### Phase 4 A — thin-client numbers (bella, 2026-09-04, release, `client-ladder.sh` + `bench-sessions.sh CLIENT=1` median of 3, tmux 120×40, `THP=always`)
+
+| Lever | Stage / metric | Before (P4-0 @ 96652717) | After A3 | Δ |
+|---|---|---|---|---|
+| baseline | `main` RssAnon | 6.9 MB (6 MB = 3 × 2 MiB AnonHugePages; jemalloc meta 2.4 MB) | 0.85 MB (post re-exec, 0 huge) | −6.0 |
+| baseline | `runtime` | +8 KB | +52 KB | |
+| baseline | `attached` (fixture 0) | +0 | +12 KB | |
+| A2 | `purge:attached` − `attached` | n/a | 0 (decode transient is < 1 page on an empty session) | |
+| P4-0 | `http` stage at boot | absent (lazy) | absent | |
+| baseline | `terminal` (120×40) | +0 (hidden in an existing huge page) | +476 KB | (the double buffer, now visible) |
+| A2 | `render_thread` + `event_stream` | **+4.1 MB** (two thread stacks × 2 MiB THP) | +92 KB | −4.0 |
+| — | `first_frame` t_ms | 5 ms | 6 ms | |
+| A2 | `idle+10` pre-purge RssAnon | 19.4 MB | 2.34 MB | −17.0 |
+| A2 | `purged` RssAnon (**G1**) | 19.4 MB (never purged in 25 s) | **2.34 MB** ✓ | −17.0 |
+| A2/A3 | threads (**G3**) | 8 (`synaps`×2, `agent-tui-rende`, `signal-listener`, `jemalloc_bg_thd`×4) | **3** (`synaps`×2, `agent-tui-rende`) ✓ | −5 |
+| A4 | retention at sample (**G7**) | n/a | **0.00 MB** ✓ | |
+| A4 | first frame (**G4**) | — | **9–10 ms** ✓ (attach_ms 46–47 incl. tmux exec + re-exec) | |
+| A4 | all-in marginal N=2→3 (**G5**) | 17.6 MB (docs §5.6) | **1.7 MB** (N=1→2: 6.0) ✓ | |
+| pre-B | G2 RssAnon, fixture 20 MB (post-purge) | — | 78.5 MB ✗, `bounded_delta` 76.3 MB ✗ (the mirror, §2) | B4/B7 |
+| pre-B | G6 `client_bounded` (40 tool turns) | — | 3.6 / 4.5 / 5.3 / 6.3 MB @ 10/20/30/40, slope 2.62 MB ✗, max 6.3 ✓ | B4/B7 |
+
+The `.bss` and `cargo bloat` findings (§9 asks) are in `docs/daemon-mode.md` §"Phase 4 A".
 
 ## Observability
 

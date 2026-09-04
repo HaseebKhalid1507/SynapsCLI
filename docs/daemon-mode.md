@@ -15,7 +15,8 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
 | `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
-| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` for attach clients is not wired yet (A4/C4 client diet). |
+| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` makes the `--attach` client purge on every busy→idle edge (phase 4 A2). |
+| `SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_MALLOC=off`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_SECS`, `SYNAPS_CLIENT_TCACHE=0`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_MEM_TRACE=1` | Phase 4 A thin-client diet — see `docs/memory-budget.md` §Kill-switches (phase 4 rows) and §"Phase 4 A" for the measured table. |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
 | `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
@@ -294,6 +295,74 @@ Reading, honestly:
 
 Raw runs: `/tmp/memprof-synaps-fb-{before,after}-daemon-N<N>-r1.txt` on bella (the 15 s runs
 overwrote the 8 s ones for the same N; the 8 s values above are transcribed from the earlier console).
+
+### Phase 4 A — the thin client (bella, 2026-09-04, release @ A3, `THP=always`)
+
+`scripts/memprof/client-ladder.sh BIN 0` — before (P4-0, external `/proc` sample; no stages yet):
+`RssAnon 17.3–19.4 MB, threads 8` (`agent-tui-rende`, `jemalloc_bg_thd`×4, `signal-listener`, `synaps`×2),
+unchanged between 7 s and 25 s (the bg thread never purged). A1 ladder on the same code:
+
+```
+t_ms  stage          rss_anon      Δ  alloc active resident retained  meta  thr
+0     main               6876          109    128     2568     1920  2460    2
+…     terminal           6968     +0  1636   1776     4224      272  2469    2
+5     render_thread     11092  +4124  1665   1812     4352     2284  2587    4
+5     event_stream      11124    +32                                       6
+5     first_frame       13180  +2048  1819   1952     4584     2144  2733    6
+25908 detach            19356  +6176  2200   2504     5248     5672  2829    8
+```
+
+RssAnon moved in 2 MiB steps while jemalloc's own resident barely moved: `THP=always` hands every
+touched thread stack (and the `.bss`, the main stack, jemalloc's first chunk) a huge page. After A2
+(re-exec with `PR_SET_THP_DISABLE` + `_RJEM_MALLOC_CONF=narenas:1,background_thread:false,
+dirty_decay_ms:0`, then bg-threads-off / decay-0 mallctls, purge on `Attached` and 10 s after idle):
+
+```
+t_ms  stage          rss_anon      Δ  alloc active resident retained  meta huge thr
+0     reexec             6876          109    128     2568     1920  2460 6144   2
+0     main                848  -6028   109    128     2456     1920  2349    0   1
+0     alloc              1016   +168   thp_off=ok bg_off=ok decay0=ok bg_now=Some(false)
+4     attached           1464    +12   messages_len=2 replay=0 tail_items=120
+4     terminal           1972   +476   cols=120 rows=40
+5     render_thread      1996    +24                                         2
+5     event_stream       2064    +68                                         4
+6     first_frame        2136    +44  1807   1952     4292       96  2444    0   4
+10006 idle+N             2336   +200                                       n=10
+10007 purged             2336     +0  2152   2300     4644     2308  2448    0   4
+```
+
+`DAEMON=1 CLIENT=1 BOUNDED=1 SETTLE=12 bench-sessions.sh /tmp/synaps-a3 1 2 3` (median of 3):
+
+| N | fixture | client_anon_post | client_anon_pre | retention | threads | first_frame_ms | attach_ms | daemon_anon | anon_marginal | all_in_marginal |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0 MB | 2.25 MB | 2.25 | 0.00 | 3 | 9 | 46 | 33.2 | – | – |
+| 2 | 0 MB | 2.26 MB | 2.26 | 0.00 | 3 | 8.5 | 47 | 37.0 | 3.77 | 6.03 |
+| 3 | 0 MB | 2.27 MB | 2.27 | 0.00 | 3 | 10 | 47 | 36.5 | −0.55 | **1.71** |
+| 3 | 20 MB | 78.54 MB | 78.54 | 0.00 | 3 | 167 | 201 | 269.4 | – | – |
+
+`bounded_delta = 76.27 MB` (pre-B: the history mirror, PLAN-phase4 §2 — B4/B7 own it).
+Gates at A3: G1 ✓ 2.3 MB (≤ 10), G3 ✓ 3 (≤ 4), G4 ✓ 9 ms (≤ 100), G5 ✓ 1.7 MB (≤ 10), G7 ✓ 0.00
+(≤ 0.5); G2 ✗ / G6 ✗ pre-B (`client_bounded`: 3.6 → 6.3 MB over 40 tool turns, slope 2.62 MB).
+The `anon_marginal` column is daemon-side purge noise (−0.55 … +3.77); the daemon is not on A's
+list. Threads at idle: `synaps`×2 (main + crossterm's unnamed reader), `agent-tui-rende`.
+
+**Why THP was invisible until now:** `RssAnon` counts the 2 MiB page the moment one byte of it is
+touched; jemalloc's `stats.resident` counts what jemalloc touched. The 8-thread, 19 MB client was
+~6 × 2 MiB of thread stacks + bss + arena chunks and ~2 MB of real heap. The same mechanism inflates
+the daemon (one huge page per touched thread stack × 26 threads) — not addressed here; a
+`PR_SET_THP_DISABLE` before the runtime is the obvious day-2 lever for it.
+
+**§9 asks.** (2) The 2.1 MB `.bss` is jemalloc: `_rjem_je_arena_emap_global` = 0x200078 (2,097,272 B,
+the extent radix tree), then `_rjem_je_arenas` 32 KB and crossbeam's `atomic_cell` lock table 8.5 KB —
+nothing of ours. Resident only where touched, i.e. one 2 MiB huge page the moment jemalloc boots on a
+`THP=always` box (that is the `reexec`→`main` −6 MB above), a few 4 KiB pages after the re-exec.
+(1) `cargo bloat --release --crates` (unstripped release, LTO): `.text` 18.1 MiB of a 34.4 MiB
+unstripped file — agent_engine 4.0 MiB (22.3 %), std 3.6, agent_tui 1.0, agent_core 1.0, tokio 0.86,
+synaps (bin) 0.79, h2 0.65, serde_json 0.44, rustls 0.41, regex_automata 0.39, serde+serde_core 0.64,
+ring 0.28, clap 0.23, hyper 0.23, axum 0.22, jemalloc 0.19, reqwest 0.16, syntect 0.07 (+ fancy_regex
+0.07). A separate `synaps-attach` binary could drop at most agent_engine's provider/MCP/daemon paths
+and axum/h2/rustls/ring (≈ 5–6 MiB of text) — none of which is RssAnon; §5's "no separate binary"
+stands: the client's private memory is now 2.3 MB and text is shared with the daemon.
 
 ## Not landed today (day 2/3)
 
