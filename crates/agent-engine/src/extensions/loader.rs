@@ -117,6 +117,15 @@ pub fn spawn_discover_and_load(
     tx: mpsc::UnboundedSender<ExtensionLoaderEvent>,
     session_id: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
+    // Host seam (C2): when this is the process host's manager, tell the host
+    // a walk is in flight BEFORE the task runs, and flip `extensions_ready`
+    // at Finished so `SessionActor::create` fires `on_session_start` only
+    // once extensions are subscribed.
+    let host = crate::host::EngineHost::current()
+        .filter(|host| Arc::ptr_eq(host.ext_manager(), &manager));
+    if let Some(host) = &host {
+        host.note_extensions_loading();
+    }
     tokio::spawn(async move {
         let _ = tx.send(ExtensionLoaderEvent::Started);
         let (loaded, failed) = manager
@@ -133,6 +142,9 @@ pub fn spawn_discover_and_load(
             emit_session_start(&hook_bus, &session_id).await;
         }
 
+        if let Some(host) = &host {
+            host.mark_extensions_ready();
+        }
         let _ = tx.send(ExtensionLoaderEvent::Finished { loaded, failed });
     })
 }

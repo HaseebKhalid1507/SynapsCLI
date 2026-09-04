@@ -65,7 +65,13 @@ pub struct EngineHost {
     /// actor so the actor outlives any single client; the actor task removes
     /// itself here when it finishes.
     sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
-    // C: extensions_ready goes here
+    /// C2: flips to `true` when extension discovery on `ext_manager` has
+    /// finished (the loader sets it; `extensions_ready()` awaits it). The
+    /// paired flag records that a loader was DISPATCHED, so a session
+    /// created between `spawn_discover_and_load` and its first lock
+    /// acquisition still waits instead of racing the walk.
+    extensions_ready: tokio::sync::watch::Sender<bool>,
+    extensions_loading: std::sync::atomic::AtomicBool,
 }
 
 static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
@@ -147,6 +153,8 @@ impl EngineHost {
             worker_registry: std::sync::Mutex::new(None),
             log_guard: std::sync::Mutex::new(log_guard),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            extensions_ready: tokio::sync::watch::channel(false).0,
+            extensions_loading: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -339,5 +347,91 @@ impl EngineHost {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id)
+    }
+
+    // ── shared extension host (Phase 2, C) ────────────────────────────────
+
+    /// Loader seam (C2): a discovery pass for this host's manager has been
+    /// dispatched. Called synchronously by `spawn_discover_and_load` before
+    /// its task runs, so `extensions_ready()` cannot slip through the gap.
+    pub fn note_extensions_loading(&self) {
+        self.extensions_loading
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Loader seam (C2): discovery finished — every `extensions_ready()`
+    /// waiter proceeds. Idempotent.
+    pub fn mark_extensions_ready(&self) {
+        self.extensions_ready.send_replace(true);
+    }
+
+    /// Resolve once extension discovery on this host is known-finished, so a
+    /// session's `on_session_start` lands on subscribed extensions. Resolves
+    /// IMMEDIATELY when no loader was dispatched (hosts that never load
+    /// extensions, `--no-extensions`, tests) or discovery already completed
+    /// on the manager (in-process `discover_and_load()` callers such as
+    /// `synaps chat`); otherwise awaits the loader's `Finished`. Never
+    /// blocks forever: a loader that dies drops the sender and we return.
+    pub async fn extensions_ready(&self) {
+        let mut rx = self.extensions_ready.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        // A running walk holds the manager write lock; this read waits it out.
+        if self.ext_manager.read().await.discovery_done().is_some() {
+            return;
+        }
+        if !self
+            .extensions_loading
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// C3: push one extension notification frame to every live session
+    /// (non-blocking; a session whose command queue is full drops it with a
+    /// warning — widget upserts are idempotent last-writer-wins). Frames
+    /// carry no session id today, hence broadcast. Returns how many
+    /// sessions accepted it.
+    pub async fn broadcast_extension_notification(
+        &self,
+        ext_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> usize {
+        let handles: Vec<SessionHandle> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut delivered = 0;
+        for handle in handles {
+            let cmd = crate::session::SessionCommand::HostEvent(
+                crate::session::HostEvent::ExtensionNotification {
+                    extension_id: ext_id.to_string(),
+                    method: method.to_string(),
+                    params: params.clone(),
+                },
+            );
+            match handle.send(cmd).await {
+                Ok(()) => delivered += 1,
+                Err(err) => tracing::warn!(
+                    session = %handle.id,
+                    extension = %ext_id,
+                    method = %method,
+                    error = %err,
+                    "dropping extension notification for session"
+                ),
+            }
+        }
+        delivered
     }
 }
