@@ -325,12 +325,19 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
-fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) {
-    if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(thinking_level) {
-        runtime.set_reasoning_level_explicit(level);
-    } else if let Some(budget) = synaps_cli::models::budget_for_thinking_level(thinking_level) {
-        runtime.set_thinking_budget_explicit(budget);
-    }
+/// Re-apply a saved session's reasoning level as explicit, clamped to the
+/// current model. Returns a notice when the saved level was clamped.
+fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) -> Option<String> {
+    runtime
+        .restore_session_reasoning(thinking_level)
+        .map(|clamp| {
+            format!(
+                "thinking → {} (clamped from {}: not supported by {})",
+                clamp.to.as_str(),
+                clamp.from.as_str(),
+                runtime.model()
+            )
+        })
 }
 
 /// Handle a slash command when NOT streaming.
@@ -648,7 +655,8 @@ pub(super) async fn handle_command(
                         runtime.set_model(session.model.clone());
                         // A resumed session owns its saved choice. Preserve that
                         // explicit provenance across later model switches.
-                        restore_session_reasoning(runtime, &session.thinking_level);
+                        let clamp_notice =
+                            restore_session_reasoning(runtime, &session.thinking_level);
                         if let Some(ref sp) = session.system_prompt {
                             runtime.set_system_prompt(sp.clone());
                         }
@@ -663,6 +671,11 @@ pub(super) async fn handle_command(
                         super::rebuild_display_messages(&session.api_messages, app);
                         let new_id = session.id.clone();
                         app.session = session;
+                        if let Some(notice) = clamp_notice {
+                            // Keep the session file in sync with the clamped runtime.
+                            app.session.thinking_level = runtime.thinking_level().to_string();
+                            app.push_msg(ChatMessage::System(notice));
+                        }
                         let via = if synaps_cli::chain::load_chain(arg).is_ok() {
                             format!(" (via chain '{}')", arg)
                         } else if synaps_cli::session::find_session_by_name(arg).is_ok() {
@@ -2176,5 +2189,20 @@ mod tests {
             agent_core::reasoning::ReasoningLevel::Ultra,
             "restored explicit Ultra must survive model switches"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_clamps_unsupported_saved_level() {
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_model("xai-auth/grok-4.6".to_string());
+
+        let notice = restore_session_reasoning(&mut runtime, "xhigh");
+
+        assert!(notice.is_some(), "clamp must be surfaced");
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::High
+        );
+        assert!(runtime.is_reasoning_explicit());
     }
 }

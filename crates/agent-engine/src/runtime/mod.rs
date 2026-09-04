@@ -1305,6 +1305,22 @@ impl Runtime {
         self.explicit_reasoning = true;
     }
 
+    /// Restore a saved session's `thinking_level` string as an explicit user
+    /// choice, then clamp it against the current model. Call **after**
+    /// `set_model(session.model)`: re-applying the saved level would otherwise
+    /// undo the clamp `set_model` performed (old grok+xhigh session files).
+    /// Returns the clamp applied, if any, so callers can surface it.
+    pub fn restore_session_reasoning(&mut self, thinking_level: &str) -> Option<ReasoningClamp> {
+        if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(thinking_level) {
+            self.set_reasoning_level_explicit(level);
+        } else if let Some(budget) = crate::models::budget_for_thinking_level(thinking_level) {
+            self.set_thinking_budget_explicit(budget);
+        } else {
+            return None;
+        }
+        self.clamp_reasoning_to_model()
+    }
+
     /// Set a custom numeric thinking budget as an **explicit user choice**
     /// (e.g. `/thinking 8192`). Retains the exact budget in `thinking_budget`
     /// while syncing `named_level` to the nearest named level for display.
@@ -4790,6 +4806,35 @@ mod set_reasoning_level_checked_tests {
         rt.set_reasoning_level_explicit(ReasoningLevel::XHigh);
         let clamp = rt.set_model("xai-auth/grok-4.6".to_string());
         assert_eq!(clamp.map(|c| c.to), Some(ReasoningLevel::High));
+    }
+
+    /// Resume path: a saved grok+xhigh session (written before clamping
+    /// existed) must not resume into a permanently failing state.
+    #[test]
+    fn restore_session_reasoning_clamps_after_reapply() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.6".to_string());
+        let clamp = rt.restore_session_reasoning("xhigh");
+        assert_eq!(
+            clamp,
+            Some(ReasoningClamp {
+                from: ReasoningLevel::XHigh,
+                to: ReasoningLevel::High,
+            })
+        );
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::High);
+        assert!(rt.is_reasoning_explicit());
+        assert!(rt.set_reasoning_level_checked(rt.reasoning_level()).is_ok());
+    }
+
+    /// Supported saved level restores verbatim with no clamp.
+    #[test]
+    fn restore_session_reasoning_keeps_supported_level() {
+        let mut rt = Runtime::new_headless();
+        rt.set_model("xai-auth/grok-4.6".to_string());
+        assert_eq!(rt.restore_session_reasoning("low"), None);
+        assert_eq!(rt.reasoning_level(), ReasoningLevel::Low);
+        assert!(rt.is_reasoning_explicit());
     }
 
     /// Boot path: config `model` + unsupported explicit `thinking` no longer
