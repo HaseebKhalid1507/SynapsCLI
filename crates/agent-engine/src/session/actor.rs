@@ -661,6 +661,10 @@ impl SessionActor {
         drop(conv);
         let runtime = self.runtime.park_take();
         drop(runtime);
+        // Hand the freed pages back: jemalloc otherwise keeps them as
+        // dirty/muzzy for its decay window, and a parked session that
+        // still shows in RssAnon buys nothing.
+        crate::core::memstat::purge_arenas();
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");

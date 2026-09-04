@@ -138,7 +138,7 @@ run_once_parked() { # N i -> prints "live_anon_kb parked_anon_kb dprocs_live dpr
   } > "$out"
   local live_anon live_procs
   live_anon=$(awk '/^-- live daemon tree RssAnon/{f=1} f&&/^TREE_ANON/{print $2; exit}' "$out")
-  live_procs=$(awk '/^-- live daemon tree RssAnon/{f=1} f&&/^pid=/{c++} /^TREE_ANON/{print c; exit}' "$out")
+  live_procs=$(awk '/^-- live daemon tree RssAnon/{f=1} f&&/^pid=/{c++} f&&/^TREE_ANON/{print c; exit}' "$out")
   # Detach every client (kill its tmux session) → grace → parked.
   for s in $(seq 1 "$n"); do tmux -L bench kill-session -t "s$s" 2>/dev/null; done
   sleep $((PARK_GRACE + 2)); purge
@@ -148,7 +148,7 @@ run_once_parked() { # N i -> prints "live_anon_kb parked_anon_kb dprocs_live dpr
   } >> "$out"
   local parked_anon parked_procs
   parked_anon=$(awk '/^-- parked daemon tree RssAnon/{f=1} f&&/^TREE_ANON/{print $2; exit}' "$out")
-  parked_procs=$(awk '/^-- parked daemon tree RssAnon/{f=1} f&&/^pid=/{c++} /^TREE_ANON/{print c; exit}' "$out")
+  parked_procs=$(awk '/^-- parked daemon tree RssAnon/{f=1} f&&/^pid=/{c++} f&&/^TREE_ANON/{print c; exit}' "$out")
   # Unpark latency: one fresh attach to a parked session.
   local attach_ms
   attach_ms=$("$HERE/launch.sh" "u1" "$BIN" attach "${ids[0]}" | sed -E 's/.*ready after ([0-9]+) ms.*/\1/')
