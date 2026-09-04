@@ -180,7 +180,7 @@ async fn test_working_directory() {
     let manager = SessionManager::new(ShellConfig::default());
 
     let mut opts = default_opts();
-    opts.command = Some("bash".to_string());
+    opts.command = Some("/bin/bash --norc --noprofile".to_string());
     opts.working_directory = Some("/tmp".to_string());
 
     let (session_id, _initial, _status) = manager
@@ -213,7 +213,7 @@ async fn test_environment_variables() {
     env.insert("MY_VAR".to_string(), "test123".to_string());
 
     let mut opts = default_opts();
-    opts.command = Some("bash".to_string());
+    opts.command = Some("/bin/bash --norc --noprofile".to_string());
     opts.env = env;
 
     let (session_id, _initial, _status) = manager
