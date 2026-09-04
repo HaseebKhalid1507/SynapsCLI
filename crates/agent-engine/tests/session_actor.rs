@@ -560,3 +560,313 @@ async fn duplicate_continue_attaches_to_live_session() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(host.sessions().len(), 0);
 }
+
+// ── prompts + lifecycle (§11 #4) ──────────────────────────────────────────
+
+/// Turn requesting the prompting fixture tool; the stub then serves SSE_HI
+/// for the follow-up round.
+const SSE_PROMPT_TOOL_USE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_p1\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_prompt\",\"name\":\"prompt_fixture\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Builtin-origin tool that asks for a secret through the stream's
+/// `SecretPromptHandle` and reports only its length (never the value).
+struct PromptFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for PromptFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "prompts for a secret"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        Ok(match handle.prompt("Secret".into(), "enter secret".into()).await {
+            Some(v) => format!("answered:{}", v.len()),
+            None => "cancelled".to_string(),
+        })
+    }
+}
+
+async fn prompt_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(PromptFixtureTool));
+    host
+}
+
+fn tool_results(snap: &agent_engine::session::ConversationSnapshot) -> Vec<String> {
+    snap.api_messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flat_map(|b| b.iter())
+        .filter(|b| b["type"] == "tool_result")
+        .map(|b| b["content"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+fn prompt_id(env: &Envelope) -> Option<u64> {
+    match &env.event {
+        SessionEventWire::Prompt(p) => Some(p.id),
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_prompt_survives_detach_and_replays_on_attach() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+    // Never replayed: prompts are not in the turn ring.
+    a.send(SessionCommand::Detach {
+        client: a.client_id(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientLeft { .. })).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(handle.is_alive(), "tool blocks on the prompt; session stays live");
+
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    assert!(snap.streaming);
+    assert_eq!(snap.pending_prompts.len(), 1);
+    assert_eq!(snap.pending_prompts[0].id, pid);
+    assert_eq!(snap.pending_prompts[0].title, "Secret");
+    assert!(
+        !snap.replay.iter().any(|e| matches!(e.event, SessionEventWire::Prompt(_))),
+        "prompt is in pending_prompts, not in replay"
+    );
+
+    b.send(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("s3cret".into()),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::PromptResolved { prompt_id } if prompt_id == pid
+    )));
+    let conv = last_conversation(&seen);
+    assert_eq!(tool_results(&conv), vec!["answered:6".to_string()]);
+    assert!(
+        !seen.iter().any(|e| format!("{:?}", e.event).contains("s3cret")),
+        "the answer never appears on the event stream"
+    );
+    end(&mut b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn answer_dedup_on_prompt_id() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+
+    // Unknown id: ignored. Same id twice: second ignored.
+    for (id, v) in [(pid + 100, "zzz"), (pid, "aaaaaa"), (pid, "bb")] {
+        a.send(SessionCommand::Answer {
+            prompt_id: id,
+            value: Some(v.into()),
+        })
+        .await
+        .unwrap();
+    }
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let resolved = seen
+        .iter()
+        .filter(|e| matches!(e.event, SessionEventWire::PromptResolved { .. }))
+        .count();
+    assert_eq!(resolved, 1, "exactly one PromptResolved");
+    assert_eq!(tool_results(&last_conversation(&seen)), vec!["answered:6".to_string()]);
+    end(&mut a).await;
+}
+
+/// on_session_end spy: records whether the session file existed when the
+/// hook fired (save must precede it).
+struct SessionEndSpy {
+    file_present_at_hook: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+#[async_trait::async_trait]
+impl agent_engine::extensions::runtime::ExtensionHandler for SessionEndSpy {
+    fn id(&self) -> &str {
+        "session-end-spy"
+    }
+    async fn handle(
+        &self,
+        event: &agent_engine::extensions::hooks::events::HookEvent,
+    ) -> agent_engine::extensions::hooks::events::HookResult {
+        if let Some(id) = &event.session_id {
+            let present = agent_engine::core::session::Session::load(id).is_ok();
+            *self.file_present_at_hook.lock().unwrap() = Some(present);
+        }
+        agent_engine::extensions::hooks::events::HookResult::Continue
+    }
+    async fn shutdown(&self) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn end_saves_then_emits_session_end_then_ended() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let at_hook = Arc::new(std::sync::Mutex::new(None));
+    host.parts()
+        .hook_bus
+        .subscribe(
+            agent_engine::extensions::hooks::events::HookKind::OnSessionEnd,
+            Arc::new(SessionEndSpy {
+                file_present_at_hook: Arc::clone(&at_hook),
+            }),
+            None,
+            None,
+            agent_engine::extensions::permissions::PermissionSet::from_strings(&[
+                "session.lifecycle".to_string(),
+            ]),
+        )
+        .await
+        .unwrap();
+
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let id = handle.id.clone();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    a.send(SessionCommand::End {
+        reason: EndReason::ClientQuit,
+    })
+    .await
+    .unwrap();
+    let tail = until(&mut a, |e| matches!(e, SessionEventWire::Ended { .. })).await;
+    // Ended is the last envelope; the hook already ran and saw the file.
+    assert_eq!(
+        *at_hook.lock().unwrap(),
+        Some(true),
+        "on_session_end fired after save, before Ended"
+    );
+    assert!(matches!(
+        tail.last().unwrap().event,
+        SessionEventWire::Ended {
+            reason: EndReason::ClientQuit
+        }
+    ));
+    assert!(a.next_event().await.is_none(), "nothing after Ended");
+    let saved = agent_engine::core::session::Session::load(id.as_str()).expect("on disk");
+    assert_eq!(saved.api_messages.len(), 2);
+    handle.closed().await;
+}
+
+/// Host-level `daemon stop`: End{HostShutdown} to N live sessions
+/// concurrently → N session files on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn host_shutdown_saves_every_session() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    const N: usize = 3;
+    let mut clients = Vec::new();
+    for i in 0..N {
+        let handle = host
+            .create_session(SessionConfig {
+                persist: true,
+                ..cfg()
+            })
+            .await
+            .unwrap();
+        let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+            .await
+            .unwrap();
+        t.send(submit(&format!("hello {i}"))).await.unwrap();
+        until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+        clients.push((handle, t));
+    }
+    assert_eq!(host.sessions().len(), N);
+
+    let ends = clients.into_iter().map(|(handle, mut t)| async move {
+        t.send(SessionCommand::End {
+            reason: EndReason::HostShutdown,
+        })
+        .await
+        .unwrap();
+        until(&mut t, |e| matches!(e, SessionEventWire::Ended { .. })).await;
+        handle.closed().await;
+        handle.id.clone()
+    });
+    let ids = tokio::time::timeout(
+        Duration::from_secs(agent_engine::session::budgets::TEARDOWN_TIMEOUT_SECS),
+        futures::future::join_all(ends),
+    )
+    .await
+    .expect("all sessions end within the teardown budget");
+    for (i, id) in ids.iter().enumerate() {
+        let saved = agent_engine::core::session::Session::load(id.as_str())
+            .unwrap_or_else(|e| panic!("session {id:?} on disk: {e}"));
+        assert_eq!(saved.api_messages.len(), 2);
+        assert_eq!(saved.api_messages[0]["content"], format!("hello {i}"));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(host.sessions().len(), 0);
+}
