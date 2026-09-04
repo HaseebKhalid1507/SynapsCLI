@@ -367,13 +367,21 @@ impl EngineHost {
     }
 
     /// Every registered handle (B4: THE session map; `DaemonState`
-    /// delegates here). Dead handles are dropped defensively — the task
-    /// removes itself, so this should never actually find one.
+    /// delegates here). Dead handles are dropped defensively: the actor
+    /// task drops `cmd_rx` when `run()` returns and `remove_session` runs
+    /// *after* — a listing in that window sees `is_alive() == false`. That
+    /// is an ordering window, not an invariant violation, so it is logged
+    /// at debug, never asserted.
     pub fn session_handles(&self) -> Vec<SessionHandle> {
         let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let before = map.len();
         map.retain(|_, h| h.is_alive());
-        debug_assert_eq!(before, map.len(), "a dead session handle lingered in the host map");
+        if before != map.len() {
+            tracing::debug!(
+                pruned = before - map.len(),
+                "session_handles: pruned ended sessions ahead of their self-removal"
+            );
+        }
         map.values().cloned().collect()
     }
 

@@ -262,11 +262,14 @@ pub(crate) struct CompactionJob {
 
 /// Commands that only the input owner may send (B1). Everything else
 /// (`Answer`, `Query`, `Save`, `Detach`, `Attach`, `Resync`, `HostEvent`)
-/// is open to every attached client.
+/// is open to every attached client. `Checkpoint` cancels the owner's turn
+/// and kills its PTYs, so it is owner-only from a client (M1); the daemon
+/// sends it `from: None`.
 fn is_input_command(cmd: &SessionCommand) -> bool {
     matches!(
         cmd,
-        SessionCommand::Submit { .. }
+        SessionCommand::Checkpoint { .. }
+            | SessionCommand::Submit { .. }
             | SessionCommand::SubmitPrepared { .. }
             | SessionCommand::Steer { .. }
             | SessionCommand::Cancel
