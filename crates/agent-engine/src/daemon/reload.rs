@@ -7,12 +7,16 @@
 //! What reload cannot preserve (§2.8, stated once): in-flight turns
 //! (checkpointed = cancelled with abort context), pending prompts (answered
 //! `None`), PTY/background shells (closed, announced), `turn_replay`,
-//! un-persisted `TurnLog`, the prompt manifest path and non-persisted
-//! runtime settings (`settings_replay` is B3's — until it lands only what
-//! the journal holds comes back: messages, model, thinking, system prompt,
-//! abort context). What it preserves: every session's journal, its id
-//! (the rehydrated session continues the same journal), its cwd, its
-//! keep-warm pin and parked/live state (recorded; honoured once B3 lands).
+//! un-persisted `TurnLog`, input ownership (the owner reclaims it on
+//! reconnect via `was_owner`). What it preserves — each session's
+//! `Checkpoint{Reload}` reply carries a `SessionReloadRecord`: its journal
+//! and id (the rehydrated session continues the same journal), its
+//! `SessionConfig` as created (cwd, system, prompt manifest, compaction
+//! policy, auto-compact, …), its keep-warm pin, its lifecycle (a Parked
+//! session comes back Parked), the non-persisted runtime knobs
+//! (`settings_replay`: context window, compaction model, retries,
+//! timeouts, tool-output cap, worker grants, `/system`), and the CURRENT
+//! model/thinking (`/model` mid-session survives).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -26,7 +30,7 @@ use super::DaemonState;
 use crate::session::wire::{ClientFrame, CHECKPOINT_QUERY_ID, PROTOCOL_VERSION};
 use crate::session::{
     CheckpointReason, SessionCommand, SessionConfig, SessionEventWire, SessionHandle,
-    SessionLifecycle,
+    SessionLifecycle, SessionReloadRecord, SessionSetting,
 };
 
 /// Env: path of the reload-state file handed to the new image.
@@ -101,6 +105,9 @@ pub struct ReloadSession {
     pub config: SessionConfig,
     pub keep_warm: bool,
     pub lifecycle: SessionLifecycle,
+    /// Non-persisted knobs re-`Set` after create (incl. `/system`).
+    #[serde(default)]
+    pub settings_replay: Vec<SessionSetting>,
     pub input_owner_kind: Option<crate::session::ClientKind>,
 }
 
@@ -193,46 +200,66 @@ pub async fn probe_version(exe: &Path) -> Result<PrintVersion, String> {
         .map_err(|e| format!("{} --print-version: unparsable output ({e})", exe.display()))
 }
 
-async fn checkpoint_one(handle: SessionHandle) -> bool {
+/// `Checkpoint{Reload}` → the actor's `SessionReloadRecord` (`None` when
+/// the checkpoint did not confirm in budget).
+async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
     let mut rx = handle.subscribe();
     if handle
         .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
         .await
         .is_err()
     {
-        return false;
+        return None;
     }
     let wait = async {
         loop {
             match rx.recv().await {
                 Ok(env) => {
-                    if let SessionEventWire::QueryResult { id, .. } = env.event {
+                    if let SessionEventWire::QueryResult { id, value } = env.event {
                         if id == CHECKPOINT_QUERY_ID {
-                            return true;
+                            return serde_json::from_value(value["record"].clone()).ok();
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
     };
-    tokio::time::timeout(CHECKPOINT_BUDGET, wait).await.unwrap_or(false)
+    tokio::time::timeout(CHECKPOINT_BUDGET, wait).await.unwrap_or(None)
 }
 
-fn record(handle: &SessionHandle) -> ReloadSession {
+/// The session as it IS: the actor's record when the checkpoint confirmed,
+/// else what the handle alone knows (journal, cwd, keep-warm, lifecycle,
+/// current model from the published view).
+fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
+    let journal_id = handle.journal_id();
+    let (config, keep_warm, lifecycle, settings_replay, model) = match rec {
+        Some(r) => (r.config, r.keep_warm, r.lifecycle, r.settings_replay, r.model),
+        None => (
+            SessionConfig {
+                cwd: meta.cwd.clone(),
+                ..SessionConfig::default()
+            },
+            false,
+            handle.lifecycle(),
+            Vec::new(),
+            handle.view().model.clone(),
+        ),
+    };
     ReloadSession {
         id: meta.id.as_str().to_string(),
-        journal_id: handle.journal_id(),
+        journal_id: journal_id.clone(),
         config: SessionConfig {
-            continue_session: Some(Some(handle.journal_id())),
-            cwd: meta.cwd.clone(),
-            model_override: Some(meta.model.clone()),
-            ..SessionConfig::default()
+            continue_session: Some(Some(journal_id)),
+            model_override: Some(model),
+            keep_warm,
+            ..config
         },
-        keep_warm: false,
-        lifecycle: handle.lifecycle(),
+        keep_warm,
+        lifecycle,
+        settings_replay,
         input_owner_kind: None,
     }
 }
@@ -291,17 +318,19 @@ pub async fn prepare(
     }
     let handles = state.live_sessions();
     let results = futures::future::join_all(handles.iter().cloned().map(checkpoint_one)).await;
-    for (h, ok) in handles.iter().zip(results) {
-        if !ok {
-            tracing::warn!(session = %h.id, "reload: checkpoint did not confirm; continuing");
+    let mut sessions = Vec::with_capacity(handles.len());
+    for (h, rec) in handles.iter().zip(results) {
+        if rec.is_none() {
+            tracing::warn!(session = %h.id, "reload: checkpoint did not confirm; recording from the handle");
         }
+        sessions.push(record(h, rec));
     }
 
     // 3. reload-state (0600, atomic).
     let rs = ReloadState {
         generation,
         written_at: chrono::Utc::now(),
-        sessions: handles.iter().map(record).collect(),
+        sessions,
         expected_clients: state.connections.load(Ordering::SeqCst),
     };
     let rs_path = reload_state_path(paths);
@@ -421,9 +450,26 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
 /// Rehydrate every recorded session BEFORE accepting. A session that
 /// fails to come back is logged and skipped (its journal is on disk;
 /// `--continue` brings it back).
+///
+/// A session whose journal was never written (no turn yet — `save` skips
+/// an empty conversation) cannot be continued; it is recreated fresh under
+/// a new id and aliased from the old one.
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     for s in &rs.sessions {
-        match state.create(s.config.clone()).await {
+        let created = match state.create(s.config.clone()).await {
+            Ok(h) => Ok(h),
+            Err(e) if s.config.continue_session.is_some() => {
+                tracing::warn!(session = %s.id, error = %e, "daemon: journal not continuable; recreating fresh");
+                state
+                    .create(SessionConfig {
+                        continue_session: None,
+                        ..s.config.clone()
+                    })
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match created {
             Ok(h) => {
                 let new_id = h.id.as_str().to_string();
                 if new_id != s.id {
@@ -433,10 +479,22 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(s.id.clone(), new_id.clone());
                 }
+                // Non-persisted knobs (host-originated `Set`: no owner check).
+                for (i, setting) in s.settings_replay.iter().enumerate() {
+                    let _ = h
+                        .send(SessionCommand::Set {
+                            id: u64::MAX - i as u64,
+                            setting: setting.clone(),
+                        })
+                        .await;
+                }
                 if s.keep_warm {
                     let _ = h.send(SessionCommand::KeepWarm { on: true }).await;
                 }
-                tracing::info!(old = %s.id, new = %new_id, "daemon: session rehydrated after reload");
+                if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
+                    let _ = h.send(SessionCommand::Park).await;
+                }
+                tracing::info!(old = %s.id, new = %new_id, lifecycle = ?s.lifecycle, "daemon: session rehydrated after reload");
             }
             Err(e) => tracing::warn!(session = %s.id, error = %e, "daemon: session could not be rehydrated"),
         }

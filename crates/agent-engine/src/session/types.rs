@@ -370,9 +370,28 @@ pub enum SessionCommand {
     Checkpoint { reason: CheckpointReason },
     /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
     KeepWarm { on: bool },
+    /// Host-only (never wire): park now if `can_park()` (reload rehydrates
+    /// a Parked session Parked). A no-op otherwise.
+    #[serde(skip)]
+    Park,
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
+}
+
+/// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
+/// session as it IS (not as it was created): the actor's config, keep-warm
+/// pin, lifecycle, the non-persisted knobs (`settings_replay`, incl.
+/// `/system`), and the CURRENT model/thinking.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionReloadRecord {
+    pub config: SessionConfig,
+    pub keep_warm: bool,
+    pub lifecycle: SessionLifecycle,
+    #[serde(default)]
+    pub settings_replay: Vec<SessionSetting>,
+    pub model: String,
+    pub thinking_level: String,
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -411,6 +430,7 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::NewSession => f.write_str("NewSession"),
             Self::Save => f.write_str("Save"),
+            Self::Park => f.write_str("Park"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }

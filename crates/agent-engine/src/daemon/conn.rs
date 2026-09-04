@@ -56,6 +56,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::End { reason: EndReason::ClientQuit } => Ok(()),
         C::End { .. } => Err("end: only ClientQuit may come from a client (host reasons are the daemon's)"),
         C::Resync { .. } => Err("resync: not a client command"),
+        C::Park => Err("park: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
     }
 }

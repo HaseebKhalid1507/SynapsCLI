@@ -45,11 +45,16 @@ fn bin() -> &'static str {
 /// Spawn `synaps daemon --foreground` under the guard's HOME with the stub
 /// provider; wait for the socket to answer Ping (≤ 20 s).
 async fn spawn_daemon(guard: &HomeGuard, url: &str) -> DaemonProc {
+    spawn_daemon_env(guard, url, &[]).await
+}
+
+async fn spawn_daemon_env(guard: &HomeGuard, url: &str, extra: &[(&str, &str)]) -> DaemonProc {
     let run = guard.base_dir().join("run");
     std::fs::create_dir_all(&run).unwrap();
     let paths = registry::daemon_paths_in(&run, None);
     let child = Command::new(bin())
         .args(["daemon", "--foreground"])
+        .envs(extra.iter().copied())
         .env("HOME", guard.home.path())
         .env("SYNAPS_BASE_DIR", guard.base_dir())
         .env("SYNAPS_RUNTIME_DIR", &run)
@@ -247,5 +252,96 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     assert_eq!(snap.conversation.api_messages.len(), 1, "the interrupted assistant turn is not in the history");
 
     t.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+/// Wait until `sessions` lists `sid` with `want` (≤ `for_`).
+async fn wait_listed_lifecycle(paths: &registry::DaemonPaths, sid: &SessionId, want: SessionLifecycle, for_: Duration) -> bool {
+    let t0 = std::time::Instant::now();
+    loop {
+        let metas = SocketTransport::sessions(&paths.sock).await.unwrap_or_default();
+        if metas.iter().any(|m| &m.id == sid && m.lifecycle == want) {
+            return true;
+        }
+        if t0.elapsed() > for_ {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// H3 (§5.4 `reload_preserves_parked_and_keep_warm`): reload-state carries
+/// the session as it IS — `/model` mid-session, a keep-warm pin, a
+/// non-persisted knob (`/context`), and a Parked session comes back Parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_preserves_model_keep_warm_settings_and_parked() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon_env(&guard, &url, &[("SYNAPS_DAEMON_PARK_GRACE_SECS", "0")]).await;
+    let pid_before = d.child.id();
+
+    // Session A: turn, /model, /context, keep-warm → stays Live (pinned).
+    let (mut a, snap) = attach_create(&d.paths, guard.home.path()).await;
+    assert_eq!(snap.view.model, "claude-sonnet-4-5");
+    let a_id = a.session_id().clone();
+    one_turn(&mut a, "hello").await;
+    a.send_from_self(SessionCommand::Set { id: 1, setting: SessionSetting::Model { model: "claude-opus-4-6".into() } }).await.unwrap();
+    a.send_from_self(SessionCommand::Set { id: 2, setting: SessionSetting::ContextWindow { tokens: Some(1_000_000) } }).await.unwrap();
+    a.send_from_self(SessionCommand::Set { id: 3, setting: SessionSetting::SystemPrompt { text: "reload-me".into() } }).await.unwrap();
+    a.send_from_self(SessionCommand::KeepWarm { on: true }).await.unwrap();
+    let mut seen = 0;
+    while seen < 3 {
+        let env = tokio::time::timeout(Duration::from_secs(10), a.next_event()).await.unwrap().unwrap();
+        if let SessionEventWire::SettingChanged(_) = env.event {
+            seen += 1;
+        }
+    }
+    a.detach().await;
+
+    // Session B: one turn, detach → parks (grace 0).
+    let (mut b, _) = attach_create(&d.paths, guard.home.path()).await;
+    let b_id = b.session_id().clone();
+    one_turn(&mut b, "park me").await;
+    b.detach().await;
+    assert!(wait_listed_lifecycle(&d.paths, &b_id, SessionLifecycle::Parked, Duration::from_secs(10)).await, "B parks");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A pinned stays Live");
+
+    let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(gen, 2);
+    let t0 = std::time::Instant::now();
+    loop {
+        if registry::read_daemon_json(&d.paths).is_some_and(|i| i.generation == 2)
+            && SocketTransport::ping(&d.paths.sock).await.is_ok()
+        {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "new image never answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
+
+    // B came back Parked; A came back Live with the pin.
+    assert!(wait_listed_lifecycle(&d.paths, &b_id, SessionLifecycle::Parked, Duration::from_secs(10)).await, "B rehydrated Parked");
+    assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A rehydrated Live");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A keep-warm survived (not parked after grace)");
+
+    // A: model/context/system survived.
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut a2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: a_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    assert_eq!(snap.view.model, "claude-opus-4-6", "/model survived reload");
+    assert_eq!(snap.view.context_window, 1_000_000, "settings_replay survived reload");
+    assert_eq!(snap.view.system_prompt.as_deref(), Some("reload-me"), "/system survived reload");
+    assert_eq!(snap.conversation.api_messages.len(), 2);
+    a2.detach().await;
+
+    // B: attach unparks with its history.
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut b2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: b_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    assert_eq!(snap.conversation.api_messages.len(), 2, "parked session's history survived reload");
+    b2.detach().await;
+
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }

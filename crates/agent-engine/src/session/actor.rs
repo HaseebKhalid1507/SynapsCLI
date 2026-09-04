@@ -211,11 +211,13 @@ pub fn park_grace() -> Option<std::time::Duration> {
 pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Non-persisted runtime knobs replayed after unpark (last-wins per
-/// variant). Model/reasoning/system prompt live in the journal already.
+/// variant). Model/reasoning live in the journal already; `/system` is
+/// runtime-only (never journaled) so it replays too (M7).
 fn replayable(setting: &SessionSetting) -> bool {
     matches!(
         setting,
-        SessionSetting::ContextWindow { .. }
+        SessionSetting::SystemPrompt { .. }
+            | SessionSetting::ContextWindow { .. }
             | SessionSetting::CompactionModel { .. }
             | SessionSetting::ApiRetries { .. }
             | SessionSetting::SubagentTimeout { .. }
@@ -228,6 +230,7 @@ fn replayable(setting: &SessionSetting) -> bool {
 
 fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
     match setting {
+        SessionSetting::SystemPrompt { text } => rt.set_system_prompt(text.clone()),
         SessionSetting::ContextWindow { tokens } => rt.set_context_window(*tokens),
         SessionSetting::CompactionModel { model } => rt.set_compaction_model(model.clone()),
         SessionSetting::ApiRetries { n } => rt.set_api_retries(*n),
@@ -301,6 +304,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Resume { .. } => "resume",
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::Park => "park",
         SessionCommand::HostEvent(_) => "host_event",
     }
 }
@@ -562,6 +566,21 @@ impl SessionActor {
     pub(crate) async fn save(&mut self) {
         if self.config.persist && self.conv.is_live() {
             self.conv.save().await;
+        }
+    }
+
+    /// C3: the checkpoint reply payload (`SessionReloadRecord`).
+    pub(crate) fn reload_record(&self) -> SessionReloadRecord {
+        let view = self.view.load();
+        SessionReloadRecord {
+            config: self.config.clone(),
+            keep_warm: self.keep_warm,
+            lifecycle: SessionLifecycle::from_u8(
+                self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
+            ),
+            settings_replay: self.settings_replay.clone(),
+            model: view.model.clone(),
+            thinking_level: view.thinking_level.clone(),
         }
     }
 
@@ -1727,9 +1746,10 @@ impl SessionActor {
         };
         self.emit(SessionEventWire::SystemNotice(notice.to_string()));
         self.runtime.session_manager().shutdown_all();
+        let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
         self.emit(SessionEventWire::QueryResult {
             id: super::wire::CHECKPOINT_QUERY_ID,
-            value: serde_json::json!({ "ok": true }),
+            value: serde_json::json!({ "ok": true, "record": record }),
         });
     }
 
@@ -1774,17 +1794,25 @@ impl SessionActor {
                     | SessionCommand::Save
                     | SessionCommand::Cancel
                     | SessionCommand::Checkpoint { .. }
+                    | SessionCommand::Park
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
             );
             if matches!(cmd, SessionCommand::HostEvent(_)) {
                 return ControlFlow::Continue(()); // nobody attached, nothing to render
             }
-            if matches!(cmd, SessionCommand::Save | SessionCommand::Cancel | SessionCommand::Checkpoint { .. }) {
+            if matches!(
+                cmd,
+                SessionCommand::Save
+                    | SessionCommand::Cancel
+                    | SessionCommand::Park
+                    | SessionCommand::Checkpoint { .. }
+            ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
+                    let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
                     self.emit(SessionEventWire::QueryResult {
                         id: super::wire::CHECKPOINT_QUERY_ID,
-                        value: serde_json::json!({ "ok": true, "parked": true }),
+                        value: serde_json::json!({ "ok": true, "parked": true, "record": record }),
                     });
                 }
                 return ControlFlow::Continue(()); // already on disk / idle
@@ -1853,6 +1881,7 @@ impl SessionActor {
                 "resume: not implemented in this build".into(),
             )),
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
+            SessionCommand::Park => self.park().await,
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.rearm_park();
