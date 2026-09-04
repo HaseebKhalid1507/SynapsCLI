@@ -53,12 +53,30 @@ fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
     synaps_cli::RuntimeError::Config(e.to_string())
 }
 
+/// What `--attach` prints when there is no daemon to attach to: says so,
+/// and how to start one (profile-aware).
+pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -> String {
+    let start = match profile {
+        Some(p) => format!("synaps --profile {p} daemon --detach"),
+        None => "synaps daemon --detach".to_string(),
+    };
+    let why = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    format!(
+        "no daemon is running{why} — nothing to attach to.\n\
+         start one with:  {start}\n\
+         or run in the foreground:  {}\n\
+         then re-run `synaps --attach` (SYNAPS_DAEMON=1).",
+        start.replace("--detach", "--foreground")
+    )
+}
+
 pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     let paths = agent_engine::daemon::registry::daemon_paths(opts.profile.as_deref());
     if !agent_engine::daemon::registry::is_alive(&paths) {
-        return Err(cfg_err(
-            "daemon not running (start it with `synaps daemon --detach`)",
-        ));
+        return Err(cfg_err(daemon_not_running_message(
+            opts.profile.as_deref(),
+            None,
+        )));
     }
     let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Tui)).await {
         Ok(c) => c,
@@ -66,6 +84,14 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
             return Err(cfg_err(format!(
                 "protocol version mismatch (client {client}, daemon {daemon}); restart or reload the daemon with this binary"
             )))
+        }
+        Err(TransportError::Io(e)) => {
+            // Lock held but the socket is gone/refusing: the daemon is dead
+            // or still booting — same advice, with the cause.
+            return Err(cfg_err(daemon_not_running_message(
+                opts.profile.as_deref(),
+                Some(&format!("{}: {e}", paths.sock.display())),
+            )));
         }
         Err(e) => return Err(cfg_err(format!("connect: {e}"))),
     };
@@ -183,4 +209,26 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
         let _ = ctx.link.send(SessionCommand::KeepWarm { on: true }).await;
     }
     super::run_loop(ctx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_running_message_says_so_and_how_to_start() {
+        let m = daemon_not_running_message(None, None);
+        assert!(m.starts_with("no daemon is running"), "{m}");
+        assert!(m.contains("synaps daemon --detach"), "{m}");
+        assert!(m.contains("synaps daemon --foreground"), "{m}");
+        let m = daemon_not_running_message(Some("work"), Some("connection refused"));
+        assert!(m.contains("(connection refused)"), "{m}");
+        assert!(m.contains("synaps --profile work daemon --detach"), "{m}");
+    }
+
+    #[test]
+    fn attach_mode_flags_override_env() {
+        assert_eq!(attach_mode(false, true), AttachMode::Takeover);
+        assert_eq!(attach_mode(true, false), AttachMode::Observe);
+    }
 }

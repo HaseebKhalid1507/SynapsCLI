@@ -90,6 +90,10 @@ struct Cli {
     /// EXPERIMENTAL (SYNAPS_DAEMON=1): run the TUI attached to a daemon
     /// session instead of in-process. Optionally a session ID (prefix ok);
     /// with no live session a new one is created (`--continue` continues).
+    /// The daemon must already be running (`synaps daemon --detach`).
+    /// Modifiers: --observe (read-only), --takeover (steal input),
+    /// --keep-warm (never parked); default mode is SYNAPS_ATTACH_MODE or
+    /// mirror (input only if nobody owns it).
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
 
@@ -97,7 +101,9 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "takeover")]
     observe: bool,
 
-    /// With --attach: steal input ownership from the current owner.
+    /// With --attach: steal input ownership from the current owner (the
+    /// previous owner is told; without it a second client is read-only
+    /// while the owner is attached).
     #[arg(long, global = true)]
     takeover: bool,
 
