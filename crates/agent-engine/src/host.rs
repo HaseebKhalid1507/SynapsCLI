@@ -339,16 +339,50 @@ impl EngineHost {
         }
         let (handle, task) = SessionActor::create(self, cfg).await?;
         let id = handle.id.clone();
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), handle.clone());
+        self.adopt_session(handle.clone());
         let host = Arc::clone(self);
         tokio::spawn(async move {
-            task.run().await;
+            // A panicking actor must still leave the map (§6 #12): the
+            // handle would otherwise be listed forever and attach → Closed.
+            use futures::FutureExt;
+            if std::panic::AssertUnwindSafe(task.run())
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!(session = %id, "session actor panicked");
+            }
             host.remove_session(&id);
         });
         Ok(handle)
+    }
+
+    /// Register a handle built elsewhere (daemon test factories). The
+    /// caller owns the task; `remove_session` when it ends.
+    pub fn adopt_session(&self, handle: SessionHandle) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle.id.clone(), handle);
+    }
+
+    /// Every registered handle (B4: THE session map; `DaemonState`
+    /// delegates here). Dead handles are dropped defensively: the actor
+    /// task drops `cmd_rx` when `run()` returns and `remove_session` runs
+    /// *after* — a listing in that window sees `is_alive() == false`. That
+    /// is an ordering window, not an invariant violation, so it is logged
+    /// at debug, never asserted.
+    pub fn session_handles(&self) -> Vec<SessionHandle> {
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        map.retain(|_, h| h.is_alive());
+        if before != map.len() {
+            tracing::debug!(
+                pruned = before - map.len(),
+                "session_handles: pruned ended sessions ahead of their self-removal"
+            );
+        }
+        map.values().cloned().collect()
     }
 
     /// Resolve a `continue_session` request the same way
@@ -389,13 +423,12 @@ impl EngineHost {
             .cloned()
     }
 
-    /// Metadata of every live session.
+    /// Metadata of every live session, with the live cells filled
+    /// (lifecycle, clients, input_owner, awaiting_input, journal_id).
     pub fn sessions(&self) -> Vec<SessionMeta> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|h| h.meta().clone())
+        self.session_handles()
+            .iter()
+            .map(|h| h.meta_live())
             .collect()
     }
 

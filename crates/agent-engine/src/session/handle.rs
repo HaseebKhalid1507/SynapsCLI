@@ -4,12 +4,21 @@
 //! `ClientTransport` is built on it. `echo_for_test` ships a stand-in actor
 //! so package B can build the wire before the real `SessionActor` exists.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
 
 use super::transport::TransportError;
-use super::types::{Envelope, SessionCommand, SessionId, SessionMeta};
+use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionId, SessionLifecycle, SessionMeta};
+
+/// Live client accounting published by the actor (B4 `sessions()` listing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Presence {
+    pub clients: usize,
+    pub input_owner: Option<ClientId>,
+    pub awaiting_input: usize,
+}
 use super::view::RuntimeView;
 
 /// Bounded command queue depth (rpc `WRITER_CHAN_CAP` precedent).
@@ -29,11 +38,17 @@ pub fn events_cap() -> usize {
 #[derive(Clone)]
 pub struct SessionHandle {
     pub id: SessionId,
-    cmd_tx: mpsc::Sender<SessionCommand>,
+    cmd_tx: mpsc::Sender<Addressed>,
     events: broadcast::Sender<Envelope>,
     meta: Arc<SessionMeta>,
     /// Sync, lock-free read of the last published RuntimeView (§2.7).
     view: Arc<arc_swap::ArcSwap<RuntimeView>>,
+    /// Written by the actor (Live/Parking/Parked/Ending).
+    lifecycle: Arc<AtomicU8>,
+    /// `conv.session.id` — changes on LinkedSuccessor compaction.
+    journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Clients / input owner / pending prompts, written by the actor.
+    presence: Arc<arc_swap::ArcSwap<Presence>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -47,9 +62,12 @@ impl std::fmt::Debug for SessionHandle {
 
 /// Actor-side ends of a session's channels, minted with the handle.
 pub struct SessionEndpoints {
-    pub cmd_rx: mpsc::Receiver<SessionCommand>,
+    pub cmd_rx: mpsc::Receiver<Addressed>,
     pub events: broadcast::Sender<Envelope>,
     pub view: Arc<arc_swap::ArcSwap<RuntimeView>>,
+    pub lifecycle: Arc<AtomicU8>,
+    pub journal_id: Arc<arc_swap::ArcSwap<String>>,
+    pub presence: Arc<arc_swap::ArcSwap<Presence>>,
 }
 
 impl SessionHandle {
@@ -59,12 +77,18 @@ impl SessionHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHAN_CAP);
         let (events, _) = broadcast::channel(events_cap());
         let view = Arc::new(arc_swap::ArcSwap::from_pointee(view));
+        let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
+        let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
+        let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
             events: events.clone(),
             meta: Arc::new(meta),
             view: Arc::clone(&view),
+            lifecycle: Arc::clone(&lifecycle),
+            journal_id: Arc::clone(&journal_id),
+            presence: Arc::clone(&presence),
         };
         (
             handle,
@@ -72,18 +96,60 @@ impl SessionHandle {
                 cmd_rx,
                 events,
                 view,
+                lifecycle,
+                journal_id,
+                presence,
             },
         )
     }
 
-    /// Send a command. `Backpressure` when the queue is full (never drop
-    /// silently); `Closed` once the actor is gone.
+    /// Send a host-originated command (`from: None`). `Backpressure` when
+    /// the queue is full (never drop silently); `Closed` once the actor is
+    /// gone.
     pub async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        self.send_addressed(Addressed { from: None, cmd })
+    }
+
+    /// Send on behalf of an attached client (ownership is enforced by the
+    /// actor, B1).
+    pub async fn send_from(&self, from: ClientId, cmd: SessionCommand) -> Result<(), TransportError> {
+        self.send_addressed(Addressed { from: Some(from), cmd })
+    }
+
+    fn send_addressed(&self, cmd: Addressed) -> Result<(), TransportError> {
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Closed),
         }
+    }
+
+    /// Park/unpark state as last written by the actor.
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        SessionLifecycle::from_u8(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    /// Current `conv.session.id` (= `id` until a LinkedSuccessor compaction).
+    pub fn journal_id(&self) -> String {
+        (**self.journal_id.load()).clone()
+    }
+
+    /// Clients / input owner / pending prompts as last published.
+    pub fn presence(&self) -> Presence {
+        **self.presence.load()
+    }
+
+    /// `meta()` with the live cells filled in (lifecycle, clients, owner,
+    /// awaiting_input, journal_id) — what listings show.
+    pub fn meta_live(&self) -> SessionMeta {
+        let mut m = (*self.meta).clone();
+        let p = self.presence();
+        m.lifecycle = self.lifecycle();
+        m.clients = p.clients;
+        m.input_owner = p.input_owner;
+        m.awaiting_input = p.awaiting_input;
+        m.journal_id = self.journal_id();
+        m
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {
@@ -140,6 +206,11 @@ pub mod echo {
             continued: false,
             continue_info: None,
             host_pid: std::process::id(),
+            lifecycle: SessionLifecycle::Live,
+            clients: 0,
+            input_owner: None,
+            awaiting_input: 0,
+            journal_id: id.0.clone(),
         }
     }
 
@@ -202,6 +273,7 @@ pub mod echo {
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
+                input_owner: None,
             }
         }
 
@@ -237,6 +309,7 @@ pub mod echo {
                     self.emit(SessionEventWire::TurnStarted {
                         turn_baseline: baseline,
                         trigger: TurnTrigger::User,
+                        user_text: None,
                     });
                     self.emit(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(
                         text.clone(),
@@ -276,17 +349,19 @@ pub mod echo {
                     };
                     self.emit(SessionEventWire::QueryResult { id, value });
                 }
-                SessionCommand::Set(setting) => {
+                SessionCommand::Set { id, setting } => {
                     let mut view = (**self.view.load()).clone();
                     if let SessionSetting::Model { model } = &setting {
                         view.model = model.clone();
                     }
                     self.view.store(Arc::new(view.clone()));
                     self.emit(SessionEventWire::SettingChanged(SettingApplied {
+                        id,
                         setting: "echo".into(),
                         ok: true,
                         message: None,
                         view,
+                        clamp: None,
                     }));
                 }
                 SessionCommand::End { reason } => {
@@ -311,7 +386,7 @@ pub mod echo {
             clients: HashMap::new(),
             conv: ConversationSnapshot::default(),
         };
-        while let Some(cmd) = ep.cmd_rx.recv().await {
+        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
             if !echo.handle(cmd) {
                 break;
             }
@@ -349,7 +424,8 @@ mod tests {
             e0.event,
             SessionEventWire::TurnStarted {
                 turn_baseline: 0,
-                trigger: TurnTrigger::User
+                trigger: TurnTrigger::User,
+                user_text: None,
             }
         ));
         let e1 = next(&mut rx).await;
@@ -406,9 +482,10 @@ mod tests {
         let mut rx = handle.subscribe();
         assert_eq!(handle.view().model, "echo");
         handle
-            .send(SessionCommand::Set(SessionSetting::Model {
-                model: "other".into(),
-            }))
+            .send(SessionCommand::Set {
+                id: 0,
+                setting: SessionSetting::Model { model: "other".into() },
+            })
             .await
             .unwrap();
         let e = next(&mut rx).await;

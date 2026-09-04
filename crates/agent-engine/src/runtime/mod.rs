@@ -766,6 +766,17 @@ fn canonical_trusted_worker_model(model: &str) -> String {
     }
 }
 
+/// The owning runtime stops its shell-session reaper when it goes away
+/// (clones carry `None`). Without this every dropped `Runtime` — a parked
+/// session, a finished worker — left a 30 s ticker holding the manager.
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(c) = &self.reaper_cancel {
+            c.cancel();
+        }
+    }
+}
+
 impl Runtime {
     pub async fn new() -> Result<Self> {
         // UNCHANGED semantics: fresh everything (tests, `synaps agent`).
@@ -1282,9 +1293,22 @@ impl Runtime {
         &self.event_queue
     }
 
+    /// Install a session-lifetime queue (B3 unpark: the queue outlives the
+    /// `Runtime` so `synaps send` keeps resolving while parked). Must be
+    /// called before the first turn — in-flight streams hold a clone.
+    pub fn set_event_queue(&mut self, queue: Arc<crate::events::EventQueue>) {
+        self.event_queue = queue;
+    }
+
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus
+    }
+
+    /// Background shell/PTY sessions owned by this runtime (`Checkpoint`
+    /// and `Parked` close them via `shutdown_all`).
+    pub fn session_manager(&self) -> &Arc<crate::tools::shell::SessionManager> {
+        &self.session_manager
     }
 
     /// Runtime-scoped tool-session identity used by the stream execution

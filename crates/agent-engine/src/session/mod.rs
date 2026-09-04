@@ -7,6 +7,7 @@
 //! the daemon UDS. `agent-tui` must never be a dependency of anything here.
 
 pub mod actor;
+pub mod actor_cmds;
 pub mod budgets;
 pub mod handle;
 pub mod socket_transport;

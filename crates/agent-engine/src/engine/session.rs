@@ -101,6 +101,7 @@ impl ConversationState {
         consecutive_auto_turns: u32,
     ) -> crate::session::ConversationSnapshot {
         crate::session::ConversationSnapshot {
+            header: crate::session::SessionHeader::from(&self.session),
             api_messages: self.api_messages.clone(),
             tokens: crate::session::ConversationTokens {
                 input: self.total_input_tokens,

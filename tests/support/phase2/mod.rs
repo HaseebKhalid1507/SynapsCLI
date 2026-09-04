@@ -171,6 +171,13 @@ pub enum Script {
     /// SSE bodies answered per arrival order; the last body repeats for any
     /// further hits (tool-loop fixtures: tool-use turn, then continuation).
     SeqSse(&'static [&'static str]),
+    /// `body` split on the SSE frame boundary (`\n\n`), each frame preceded
+    /// by `frame_delay` — a deterministic mid-stream window for steer /
+    /// event-injection differential scenarios.
+    Paced {
+        body: &'static str,
+        frame_delay: Duration,
+    },
     /// Delay headers, then a comment first byte, then the model events, with
     /// each SSE frame fragmented into small chunks.
     Timed {
@@ -257,6 +264,23 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
                     tokio::task::yield_now().await;
                     Some((Ok(frame), i + 1))
                 }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        Script::Paced { body, frame_delay } => {
+            let frames: Vec<Bytes> = body
+                .split_inclusive("\n\n")
+                .map(|f| Bytes::copy_from_slice(f.as_bytes()))
+                .collect();
+            let delay = *frame_delay;
+            let stream = futures::stream::unfold((0usize, frames), move |(i, frames)| async move {
+                let frame = frames.get(i).cloned()?;
+                tokio::time::sleep(delay).await;
+                Some((Ok::<_, std::convert::Infallible>(frame), (i + 1, frames)))
             });
             Response::builder()
                 .status(StatusCode::OK)

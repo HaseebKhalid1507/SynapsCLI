@@ -27,13 +27,28 @@ pub enum TransportError {
     Protocol(String),
     #[error("version: client {client} daemon {daemon}")]
     Version { client: u32, daemon: u32 },
+    /// The operation does not exist on this transport (e.g. `reconnect` on
+    /// `LocalTransport`).
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+    /// The daemon announced a reload and closed; `reconnect` applies.
+    #[error("daemon reloading (generation {generation})")]
+    Reloading { generation: u64 },
+    /// The daemon/actor refused the attach or command (`AttachRefused`,
+    /// `DaemonFrame::Error` during attach).
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 #[async_trait::async_trait]
 pub trait ClientTransport: Send {
     fn session_id(&self) -> &SessionId;
     fn meta(&self) -> &SessionMeta;
+    /// Host-originated send (`from: None`; bypasses input ownership).
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError>;
+    /// Send stamped with this client's id (the TUI uses this; ownership is
+    /// enforced by the actor, B1).
+    async fn send_from_self(&self, cmd: SessionCommand) -> Result<(), TransportError>;
     /// Next envelope, or `None` when the session ended / socket closed.
     async fn next_event(&mut self) -> Option<Envelope>;
     /// Sync, cheap, never stale by more than one `SettingChanged`: what the
@@ -41,26 +56,46 @@ pub trait ClientTransport: Send {
     fn view(&self) -> Arc<RuntimeView>;
     /// Client id assigned at Attach (needed for Detach/Resync).
     fn client_id(&self) -> ClientId;
+    /// The mode this transport attached with.
+    fn mode(&self) -> AttachMode;
+    /// Current input owner — updated from `Attached` / `InputOwnerChanged`.
+    fn input_owner(&self) -> Option<ClientId>;
+    /// Socket only (Local returns `Err(Unsupported)`): after `Reloading`/EOF,
+    /// reconnect with backoff and re-attach with `mode` (C3/A4).
+    async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError>;
 }
 
 /// Attach handshake budget.
 pub const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Attach budget when the listed lifecycle is `Parked` (unpark ≤ 20 s, B3).
+pub const ATTACH_TIMEOUT_PARKED: std::time::Duration = std::time::Duration::from_secs(25);
 
 pub struct LocalTransport {
     handle: SessionHandle,
     rx: broadcast::Receiver<Envelope>,
     client: ClientId,
     meta: SessionMeta,
+    mode: AttachMode,
+    input_owner: Option<ClientId>,
     /// Set after `Ended` (or actor gone): `next_event` returns `None` from then on.
     ended: bool,
 }
 
 impl LocalTransport {
-    /// Attach in-process: sends Attach, awaits the Attached envelope
-    /// (bounded 5 s), returns the transport + snapshot.
+    /// Attach in-process as a `Mirror` (= `attach_with(.., Mirror)`).
     pub async fn attach(
         handle: SessionHandle,
         meta: ClientMeta,
+    ) -> Result<(Self, AttachSnapshot), TransportError> {
+        Self::attach_with(handle, meta, AttachMode::Mirror).await
+    }
+
+    /// Attach in-process: sends Attach, awaits the Attached envelope
+    /// (bounded 5 s), returns the transport + snapshot.
+    pub async fn attach_with(
+        handle: SessionHandle,
+        meta: ClientMeta,
+        mode: AttachMode,
     ) -> Result<(Self, AttachSnapshot), TransportError> {
         // Subscribe BEFORE sending so the Attached reply cannot be missed.
         // `Attached` is broadcast; with one attach in flight per handle at a
@@ -69,18 +104,22 @@ impl LocalTransport {
         handle
             .send(SessionCommand::Attach {
                 client: meta,
-                mode: AttachMode::Mirror,
+                mode,
             })
             .await?;
 
         let wait = async {
             loop {
                 match rx.recv().await {
-                    Ok(env) => {
-                        if let SessionEventWire::Attached { client, snapshot } = env.event {
+                    Ok(env) => match env.event {
+                        SessionEventWire::Attached { client, snapshot } => {
                             return Ok((client, snapshot));
                         }
-                    }
+                        SessionEventWire::AttachRefused { message } => {
+                            return Err(TransportError::Refused(message));
+                        }
+                        _ => {}
+                    },
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
                         return Err(TransportError::Closed)
@@ -88,7 +127,12 @@ impl LocalTransport {
                 }
             }
         };
-        let (client, snapshot) = match tokio::time::timeout(ATTACH_TIMEOUT, wait).await {
+        let timeout = if handle.lifecycle() == super::types::SessionLifecycle::Parked {
+            ATTACH_TIMEOUT_PARKED
+        } else {
+            ATTACH_TIMEOUT
+        };
+        let (client, snapshot) = match tokio::time::timeout(timeout, wait).await {
             Ok(r) => r?,
             Err(_) => return Err(TransportError::Protocol("attach timed out".into())),
         };
@@ -99,6 +143,8 @@ impl LocalTransport {
                 rx,
                 client,
                 meta,
+                mode,
+                input_owner: snapshot.input_owner,
                 ended: false,
             },
             snapshot,
@@ -124,6 +170,10 @@ impl ClientTransport for LocalTransport {
         self.handle.send(cmd).await
     }
 
+    async fn send_from_self(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        self.handle.send_from(self.client, cmd).await
+    }
+
     async fn next_event(&mut self) -> Option<Envelope> {
         if self.ended {
             return None;
@@ -144,8 +194,10 @@ impl ClientTransport for LocalTransport {
         };
         match recv {
             Ok(env) => {
-                if matches!(env.event, SessionEventWire::Ended { .. }) {
-                    self.ended = true;
+                match &env.event {
+                    SessionEventWire::Ended { .. } => self.ended = true,
+                    SessionEventWire::InputOwnerChanged { to, .. } => self.input_owner = *to,
+                    _ => {}
                 }
                 Some(env)
             }
@@ -174,6 +226,18 @@ impl ClientTransport for LocalTransport {
 
     fn client_id(&self) -> ClientId {
         self.client
+    }
+
+    fn mode(&self) -> AttachMode {
+        self.mode
+    }
+
+    fn input_owner(&self) -> Option<ClientId> {
+        self.input_owner
+    }
+
+    async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        Err(TransportError::Unsupported("reconnect: in-process transport"))
     }
 }
 
@@ -214,6 +278,9 @@ mod tests {
             .unwrap();
         assert_eq!(t.session_id().as_str(), "lt-1");
         assert_eq!(t.client_id(), ClientId(1));
+        assert_eq!(t.mode(), AttachMode::Mirror);
+        assert!(t.input_owner().is_none());
+        assert!(matches!(t.reconnect(AttachMode::Mirror).await, Err(TransportError::Unsupported(_))));
         assert_eq!(snap.meta.model, "echo");
         assert_eq!(t.view().model, "echo");
         assert!(snap.conversation.api_messages.is_empty());

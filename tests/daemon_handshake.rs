@@ -126,7 +126,7 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     c.send(&ClientFrame::Sessions).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::SessionList { .. })));
     c.send(&ClientFrame::Bye).await;
-    assert!(matches!(c.recv().await, Some(DaemonFrame::Bye)));
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Bye { .. })));
 
     d.shutdown_token().cancel();
     d.wait().await;

@@ -12,7 +12,16 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Allow start with `progressive_tool_disclosure=false` **and** MCP servers configured (legacy `McpTool` connections would be shared across sessions). Same as `--allow-legacy-mcp`. |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
+| `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
+| `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
+| `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
+| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` for attach clients is not wired yet (A4/C4 client diet). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
+| `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
+| `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
+| `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does. |
+| `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
+| `synaps daemon reload` / `stop` / `purge` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs. `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
@@ -21,7 +30,9 @@ synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--allo
 synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
 synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s)
 synaps daemon sessions [--json]
-synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT]
+synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
+synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
+synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
 synaps --attach [ID]                 # today: notice + routes to `synaps attach` (daemon-attached TUI is day 2)
 ```
 
@@ -31,7 +42,9 @@ stderr tail). Measured on bella: ready in ~75 ms.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
-`/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query).
+`/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);
+`/keep-warm on|off`. Typed events render as `[aborted…]`, `[session cleared → id]`, `[compacting: …]`,
+`[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
 
@@ -115,18 +128,72 @@ C: bye | socket close = Detach (turn keeps running)
   through the normal `End{HostShutdown}` path (saved to `sessions/<id>.json`; `synaps attach --continue`
   brings them back). Tested: `idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn`.
 - **Extension notification router** (`extensions::notify_router`) is spawned by `run_foreground` after
-  discovery: every sidecar's `widget.*` frames fan out to **every** live session as
-  `ExtensionNotification`. Frames carry no session id, so **widgets are daemon-global under
-  `SYNAPS_DAEMON=1`** (a widget upsert from work in session A shows in session B's client). Per-session
-  routing needs `params.session_id` from the extension contract — day 2; `heartbeat`/`jawz-widget` are
-  last-writer-wins until then (`docs/extensions/session-id.md`).
+  discovery: a sidecar's `widget.*` frame goes to the session named by `params.session_id` (dropped with
+  a `debug!` if that session is not live), or to **every** live session when the frame carries none
+  (daemon-global — the pre-phase-3 behaviour). Plugin contract: `docs/extensions/session-id.md`;
+  `heartbeat`/`jawz-widget` stay last-writer-wins until their own repos adopt it.
 - **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
   `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
   Spawned compaction is day 2.
-- `daemon stop` while a turn is streaming cancels it **and captures an abort context** (`finish()` →
-  `cancel_turn()`), so the session is "aborted" on disk; the TUI's quit-mid-turn only cancels the token.
-  Defensible (the next `--continue` tells the model the previous answer was cut), documented here.
+- **Quit mid-turn saves an abort context — default path, every host.** `End{ClientQuit}` (chat's
+  stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which only detaches) and `daemon stop` while a turn
+  is streaming run `finish()` → `cancel_turn()`: the turn is cancelled **and** the partial output is
+  captured as `abort_context` and saved, so the next `--continue` prepends `[ABORT CONTEXT…]` — where the
+  pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
+  `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
+
+## Reload (`synaps daemon reload`, phase 3 C3)
+
+Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control connection:
+
+1. **Version gate** before anything is disturbed: `<exe> daemon --print-version` (hidden flag, 5 s) must
+   succeed, speak protocol ≥ ours, and be **newer or equal** by semver (`RefuseReason::ReloadRefused{why}`
+   otherwise; equal allows same-version rebuilds). `exe` = `daemon.json.exe` (argv[0] canonicalised at
+   first start — not `/proc/self/exe`, which reads "(deleted)" after an in-place rebuild) or `--exe`.
+2. **Drain**: `Attach::Create` → `Refused{Busy}`, `Submit`/`SubmitPrepared`/`Compact` → `Error("daemon
+   reloading; retry in a moment")`; wait ≤ `--drain-secs` for every session to be idle; then
+   `Checkpoint{Reload}` every session concurrently (≤ `SAVE_TIMEOUT`+1 s each): cancel with abort context,
+   answer prompts `None`, save, close PTYs, notice.
+3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle}`.
+4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
+   `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
+5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
+   inheritable (`SYNAPS_DAEMON_LOCK_FD`), `execv(exe, original argv)`. The listener is CLOEXEC (asserted in
+   `listener::bind`) — closed at exec; the new image rebinds. **Exec failure**: `daemon.json`/reload-state
+   restored, `reloading` cleared, the reload-announce token re-armed (new connections are served again),
+   extension discovery re-spawned (the sidecars were stopped for the exec — bounded 10 s like boot), old
+   image keeps serving (sessions checkpointed but alive; the requester already got `Bye{Reloading}` and
+   reconnects to the same generation). `--exe` is validated **before** the probe: canonical path, regular
+   file, executable, owned by our uid or root, not group/world-writable; then `--print-version` must parse
+   and pass the gate. Tested: `exe_validation_refuses_and_exec_failure_keeps_serving`.
+6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
+   description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
+   (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
+   ids for one generation (they differ only after a LinkedSuccessor compaction).
+7. **Clients**: `SocketTransport::next_event` returns `None` with `last_error = Reloading{generation}`;
+   `reconnect(mode)` backs off, sends `Hello{reconnect_of}` and `Attach::Existing{id, Takeover iff
+   was_owner else mode}` — two reconnecting mirrors cannot both take over.
+
+**Not preserved** (stated once): in-flight turns (checkpointed = cancelled with abort context), pending
+prompts (`None`), PTY/background shells (closed, announced before exec), `turn_replay`, un-persisted
+`TurnLog`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
+**Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
+LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
+back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
+(`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
+worker grants, **`/system`**), and the **current** model/thinking (a `/model` change mid-session
+survives; the create-time `--model` override is not re-applied). A session that never ran a turn has no
+journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
+
+Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
+and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
+owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
+checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
+keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 
 ## cwd caveats (risk §6.1)
 
@@ -155,6 +222,10 @@ Honest list of behaviour changes on this branch with `SYNAPS_DAEMON` **unset**:
    finally has a writer), but it is a default-path change. `SYNAPS_MCP_CACHE_WRITEBACK=0` restores the
    old read-only behaviour.
 3. Hook events carry `session_id` (additive; `SYNAPS_HOOK_SESSION_ID=0`).
+4. **`synaps chat` renders typed events**: `/compact` prints `compacting...`, the disclosure line and
+   `[compacted → ~N tokens]` (one each — the actor emits `CompactionStarted/Applied/Failed/Cancelled`,
+   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}`, `/clear` renders
+   `Cleared{session_id}`. Quit mid-turn saves an abort context (§Lifecycle above).
 
 ## Memory acceptance — `DAEMON=1 SYNAPS_DAEMON=1 scripts/memprof/bench-sessions.sh BIN 1 2 3`
 

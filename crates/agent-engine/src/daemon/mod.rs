@@ -10,6 +10,7 @@ pub mod conn;
 pub mod lifecycle;
 pub mod listener;
 pub mod registry;
+pub mod reload;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -111,13 +112,30 @@ impl DaemonOpts {
 /// Shared by the accept loop and every connection.
 pub struct DaemonState {
     pub host: Arc<EngineHost>,
+    pub paths: DaemonPaths,
     pub profile: Option<String>,
     pub started: Instant,
-    pub sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     pub factory: SessionFactory,
     pub connections: AtomicUsize,
     pub shutdown: CancellationToken,
     pub force_shutdown: AtomicBool,
+    // ── C3 reload ──
+    /// Reload counter (`Welcome.generation`; starts at 1).
+    pub generation: u64,
+    /// Drain: refuse `Attach::Create` / new turns while set.
+    pub reloading: AtomicBool,
+    /// Generation announced in `Reloading`/`Bye{Reloading}`.
+    pub reload_generation: std::sync::atomic::AtomicU64,
+    /// Cancelled once per reload attempt: every conn sends `Reloading` +
+    /// `Bye`. Replaced with a fresh token when the exec fails (M4) so the
+    /// surviving image accepts connections again — read via `announce()`.
+    pub reload_announce: Mutex<CancellationToken>,
+    /// The flock, held here (not on `Daemon`) so `reload` can hand its fd
+    /// to the next image.
+    pub lock_fd: Mutex<Option<DaemonLock>>,
+    /// `old id → new id` for one generation (ids differ only if a
+    /// LinkedSuccessor compaction happened since boot).
+    pub reload_aliases: Mutex<HashMap<String, String>>,
 }
 
 impl DaemonState {
@@ -125,30 +143,59 @@ impl DaemonState {
         self.started.elapsed().as_secs()
     }
 
-    /// Live handles only (dead actors are dropped on read).
+    /// The current reload-announce token (clone; select on `.cancelled()`).
+    pub fn announce(&self) -> CancellationToken {
+        self.reload_announce
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Fire the announce (every conn says `Reloading` + `Bye`).
+    pub fn fire_announce(&self) {
+        self.announce().cancel();
+    }
+
+    /// Exec failed: arm a fresh token so new connections are served again.
+    pub fn reset_announce(&self) {
+        *self.reload_announce.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
+    }
+
+    /// B4: ONE session map — `EngineHost` owns it; these delegate.
     pub fn live_sessions(&self) -> Vec<SessionHandle> {
-        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, h| h.is_alive());
-        map.values().cloned().collect()
+        self.host.session_handles()
     }
 
+    /// Listing metas with lifecycle / clients / input_owner / journal_id
+    /// (B4: `EngineHost::sessions()` fills the handle cells).
     pub fn session_metas(&self) -> Vec<SessionMeta> {
-        self.live_sessions().iter().map(|h| h.meta().clone()).collect()
+        self.host.sessions()
     }
 
+    /// Live handle by id; falls back to the C3 reload alias
+    /// (`old id → new id`, set when a LinkedSuccessor compaction happened
+    /// since boot) so clients reconnecting after `daemon reload` find
+    /// their session under the id they last saw.
     pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
-        self.live_sessions().into_iter().find(|h| &h.id == id)
+        self.host.attach(id).filter(|h| h.is_alive()).or_else(|| {
+            let alias = self
+                .reload_aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id.as_str())
+                .cloned()?;
+            self.host
+                .attach(&SessionId::from(alias.as_str()))
+                .filter(|h| h.is_alive())
+        })
     }
 
     pub fn insert(&self, handle: SessionHandle) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(handle.id.clone(), handle);
+        self.host.adopt_session(handle);
     }
 
     pub fn remove(&self, id: &SessionId) {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.host.remove_session(id);
     }
 
     pub async fn create(&self, cfg: SessionConfig) -> Result<SessionHandle, String> {
@@ -170,7 +217,6 @@ pub struct Daemon {
     pub paths: DaemonPaths,
     pub state: Arc<DaemonState>,
     accept: tokio::task::JoinHandle<()>,
-    _lock: DaemonLock,
 }
 
 /// Refuse-to-start check (§2.11): legacy `McpTool` connections would be
@@ -203,30 +249,49 @@ impl Daemon {
         if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
             anyhow::bail!("refusing to start: {msg}");
         }
-        registry::reap_stale(&paths);
-        let lock = match DaemonLock::try_acquire(&paths)? {
-            Some(l) => l,
+        // C3: after `reload` the new image ADOPTS the inherited flock and
+        // skips `reap_stale` (the old image's files are ours).
+        let adopted = reload::adopt_from_env()?;
+        let (lock, reload_state) = match adopted {
+            Some((lock, rs, rs_path)) => {
+                let _ = std::fs::remove_file(&rs_path);
+                (lock, Some(rs))
+            }
             None => {
-                let who = registry::read_daemon_json(&paths).map(|i| i.pid);
-                anyhow::bail!(
-                    "another daemon holds {} (pid {})",
-                    paths.lock.display(),
-                    who.map_or("unknown".to_string(), |p| p.to_string())
-                );
+                registry::reap_stale(&paths);
+                let lock = match DaemonLock::try_acquire(&paths)? {
+                    Some(l) => l,
+                    None => {
+                        let who = registry::read_daemon_json(&paths).map(|i| i.pid);
+                        anyhow::bail!(
+                            "another daemon holds {} (pid {})",
+                            paths.lock.display(),
+                            who.map_or("unknown".to_string(), |p| p.to_string())
+                        );
+                    }
+                };
+                (lock, None)
             }
         };
+        let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
         let listener = listener::bind(&paths.sock)?;
 
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
         let state = Arc::new(DaemonState {
             host,
+            paths: paths.clone(),
             profile: opts.profile.clone(),
             started: Instant::now(),
-            sessions: Mutex::new(HashMap::new()),
             factory,
             connections: AtomicUsize::new(0),
             shutdown: CancellationToken::new(),
             force_shutdown: AtomicBool::new(false),
+            generation,
+            reloading: AtomicBool::new(false),
+            reload_generation: std::sync::atomic::AtomicU64::new(generation),
+            reload_announce: Mutex::new(CancellationToken::new()),
+            lock_fd: Mutex::new(Some(lock)),
+            reload_aliases: Mutex::new(HashMap::new()),
         });
 
         let info = DaemonInfo {
@@ -236,16 +301,23 @@ impl Daemon {
             profile: opts.profile.clone(),
             started_at: chrono::Utc::now(),
             socket: paths.sock.to_string_lossy().into_owned(),
+            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
+            generation,
         };
         registry::write_daemon_json(&paths, &info)?;
+
+        // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
+        if let Some(rs) = &reload_state {
+            reload::rehydrate(&state, rs).await;
+        }
 
         let accept = tokio::spawn(listener::accept_loop(Arc::clone(&state), listener, state.shutdown.clone()));
         if let Some(idle) = opts.idle_exit {
             tokio::spawn(idle_monitor(Arc::clone(&state), idle));
         }
         signal_ready();
-        tracing::info!(sock = %paths.sock.display(), pid = info.pid, "daemon: listening");
-        Ok(Self { paths, state, accept, _lock: lock })
+        tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
+        Ok(Self { paths, state, accept })
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -264,7 +336,8 @@ impl Daemon {
             crate::events::socket::cleanup_socket(&p.to_string_lossy());
         }
         tracing::info!("daemon: stopped");
-        // `_lock` drops here → flock released.
+        // Release the flock last.
+        drop(self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
 }
 
@@ -278,7 +351,11 @@ const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// as busy: the daemon never exits under a running turn (jcode mistake #1).
 pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     use crate::session::wire::IDLE_PROBE_QUERY_ID;
-    use crate::session::{SessionCommand, SessionEventWire, SessionQuery};
+    use crate::session::{SessionCommand, SessionEventWire, SessionLifecycle, SessionQuery};
+    // B3: a parked session is idle by construction — no probe, no wake.
+    if handle.lifecycle() == SessionLifecycle::Parked {
+        return true;
+    }
     let mut rx = handle.subscribe();
     if handle.send(SessionCommand::Query { id: IDLE_PROBE_QUERY_ID, query: SessionQuery::Status }).await.is_err() {
         return false;

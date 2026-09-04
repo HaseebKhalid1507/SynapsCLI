@@ -312,15 +312,18 @@ async fn set_applies_and_publishes_view() {
     let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
         .await
         .unwrap();
-    a.send(SessionCommand::Set(SessionSetting::ContextWindow {
-        tokens: Some(4242),
-    }))
+    a.send(SessionCommand::Set {
+        id: 42,
+        setting: SessionSetting::ContextWindow { tokens: Some(4242) },
+    })
     .await
     .unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::SettingChanged(_))).await;
     match &seen.last().unwrap().event {
         SessionEventWire::SettingChanged(s) => {
             assert!(s.ok);
+            assert_eq!(s.id, 42);
+            assert!(s.clamp.is_none());
             assert_eq!(s.setting, "context_window");
             assert_eq!(s.view.context_window, 4242);
         }
@@ -424,9 +427,10 @@ async fn cancel_while_idle_is_a_noop() {
     a.send(submit("again")).await.unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(
-        !seen.iter().any(|e| matches!(&e.event,
-            SessionEventWire::SystemNotice(n) if n.starts_with("aborted"))),
-        "no abort notice"
+        !seen
+            .iter()
+            .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })),
+        "no Aborted event"
     );
     let conv = last_conversation(&seen);
     assert_eq!(conv.api_messages.len(), 4);

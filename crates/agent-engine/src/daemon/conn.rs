@@ -4,6 +4,7 @@
 //! `Answer`/`Submit`/`Steer`); `Answer` values are forwarded to the actor
 //! and nowhere else.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::DaemonState;
 use crate::session::handle::CMD_CHAN_CAP;
-use crate::session::transport::{TransportError, ATTACH_TIMEOUT};
+use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
 
@@ -36,17 +37,26 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::Steer { .. }
         | C::Cancel
         | C::Answer { .. }
-        | C::Set(_)
+        | C::Set { .. }
         | C::Compact { .. }
         | C::NewSession
         | C::Save
         | C::Query { .. }
-        | C::EngineCommand { .. } => Ok(()),
+        | C::EngineCommand { .. }
+        | C::SubmitPrepared { .. }
+        | C::PluginCommand { .. }
+        | C::Resume { .. }
+        | C::Checkpoint { .. }
+        | C::KeepWarm { .. } => Ok(()),
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
-        C::End { .. } => Err("end: sessions are ended by `synaps daemon stop`, not by clients"),
+        // C4: an owner may end its session (`/end`); the actor enforces
+        // ownership (B1 `is_input_command`), the conn only screens reasons.
+        C::End { reason: EndReason::ClientQuit } => Ok(()),
+        C::End { .. } => Err("end: only ClientQuit may come from a client (host reasons are the daemon's)"),
         C::Resync { .. } => Err("resync: not a client command"),
+        C::Park => Err("park: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
     }
 }
@@ -86,7 +96,7 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            let bye = matches!(frame, DaemonFrame::Bye | DaemonFrame::Refused { .. });
+            let bye = matches!(frame, DaemonFrame::Bye { .. } | DaemonFrame::Refused { .. });
             match encode_line(&frame) {
                 Ok(line) => {
                     if w.write_all(line.as_bytes()).await.is_err() {
@@ -169,6 +179,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         profile: state.profile.clone(),
         sessions: state.session_metas(),
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
+        generation: state.generation,
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -177,8 +188,14 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
 
     // ── control loop (no session allocated) ──
     let attach = loop {
+        let announce = state.announce();
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye).await; let _ = writer.await; return; }
+            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
+            _ = announce.cancelled() => {
+                let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
+                let _ = writer.await;
+                return;
+            }
             r = read_frame(&mut reader, &mut line) => r,
         };
         match frame {
@@ -192,20 +209,59 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 state.request_shutdown(force);
                 return;
             }
-            Ok(Read::Frame(ClientFrame::Attach(a))) => break a,
+            Ok(Read::Frame(ClientFrame::Attach(a))) => {
+                if matches!(a, Attach::Create { .. }) && state.reloading.load(Ordering::SeqCst) {
+                    let _ = tx
+                        .send(DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() })
+                        .await;
+                    continue;
+                }
+                break a;
+            }
             Ok(Read::Frame(ClientFrame::Cmd { session_id, .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached".into() }).await;
+            }
+            // C3: the whole §2.8 sequence runs on this connection's task;
+            // on success the process is replaced and this never returns.
+            Ok(Read::Frame(ref f @ ClientFrame::Reload { .. })) => {
+                let req = super::reload::ReloadRequest::from_frame(f).expect("reload frame");
+                match super::reload::prepare(&state, &state.paths, req).await {
+                    Err(super::reload::ReloadError::Refused(why)) => {
+                        let _ = tx
+                            .send(DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: why.clone() }, message: why })
+                            .await;
+                    }
+                    Err(super::reload::ReloadError::ExecFailed(e)) => {
+                        let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("reload: {e}") }).await;
+                    }
+                    Ok(prepared) => {
+                        // Tell the requester, flush, close — then exec.
+                        let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
+                        drop(tx);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+                        let e = super::reload::exec(&state, &state.paths, prepared).await;
+                        tracing::error!(error = %e, "daemon: reload did not exec");
+                        return;
+                    }
+                }
+            }
+            // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
+            Ok(Read::Frame(ClientFrame::Purge)) => {
+                agent_core::core::memstat::purge_arenas();
+                let _ = tx
+                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
+                    .await;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
@@ -229,7 +285,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx
                     .send(DaemonFrame::Error { session_id: Some(session_id), message: "unknown session".into() })
                     .await;
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
@@ -246,7 +302,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                             message: format!("cwd must be an absolute existing directory: {}", cwd.display()),
                         })
                         .await;
-                    let _ = tx.send(DaemonFrame::Bye).await;
+                    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                     let _ = writer.await;
                     return;
                 }
@@ -255,7 +311,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 Ok(h) => (h, mode),
                 Err(e) => {
                     let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("create session: {e}") }).await;
-                    let _ = tx.send(DaemonFrame::Bye).await;
+                    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                     let _ = writer.await;
                     return;
                 }
@@ -266,18 +322,19 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let mut rx = handle.subscribe();
     if let Err(e) = handle.send(SessionCommand::Attach { client: hello.client.clone(), mode }).await {
         let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: format!("attach: {e}") }).await;
-        let _ = tx.send(DaemonFrame::Bye).await;
+        let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
         let _ = writer.await;
         return;
     }
-    let attached = tokio::time::timeout(ATTACH_TIMEOUT, async {
+    let attach_budget = if handle.lifecycle() == SessionLifecycle::Parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
+    let attached = tokio::time::timeout(attach_budget, async {
         loop {
             match rx.recv().await {
-                Ok(env) => {
-                    if let SessionEventWire::Attached { client, snapshot } = env.event {
-                        return Some((client, snapshot));
-                    }
-                }
+                Ok(env) => match env.event {
+                    SessionEventWire::Attached { client, snapshot } => return Some(Ok((client, snapshot))),
+                    SessionEventWire::AttachRefused { message } => return Some(Err(message)),
+                    _ => {}
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -285,10 +342,16 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     })
     .await;
     let (client, snapshot) = match attached {
-        Ok(Some(x)) => x,
+        Ok(Some(Ok(x))) => x,
+        Ok(Some(Err(message))) => {
+            let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message }).await;
+            let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+            let _ = writer.await;
+            return;
+        }
         _ => {
             let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: "attach timed out".into() }).await;
-            let _ = tx.send(DaemonFrame::Bye).await;
+            let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
             let _ = writer.await;
             return;
         }
@@ -303,10 +366,29 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let sid = handle.id.clone();
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
+    let fwd_announce = state.announce();
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
-            match rx.recv().await {
+            let next = tokio::select! {
+                biased;
+                r = rx.recv() => r,
+                // C3: reload announced — the checkpoint's events (abort
+                // notice, Conversation with abort_context) are already in
+                // the broadcast; drain what is there, then stop.
+                _ = fwd_announce.cancelled() => {
+                    while let Ok(env) = rx.try_recv() {
+                        if matches!(env.event, SessionEventWire::Attached { .. }) {
+                            continue;
+                        }
+                        if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            };
+            match next {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
                     if matches!(env.event, SessionEventWire::Attached { .. }) {
@@ -339,9 +421,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
 
     let mut ended = false;
     let mut stopping = false;
+    let mut reloading = false;
+    let announce = state.announce();
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
+            _ = announce.cancelled() => { reloading = true; break; }
             _ = handle.closed() => { ended = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
         };
@@ -355,7 +440,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
-                match handle.send(cmd).await {
+                if state.reloading.load(Ordering::SeqCst)
+                    && matches!(cmd, SessionCommand::Submit { .. } | SessionCommand::SubmitPrepared { .. } | SessionCommand::Compact { .. })
+                {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "daemon reloading; retry in a moment".into() }).await;
+                    continue;
+                }
+                match handle.send_from(client, cmd).await {
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
                         let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "backpressure: command queue full".into() }).await;
@@ -378,12 +469,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
                 break;
             }
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
+            }
+            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
             Ok(Read::Oversize) => {
@@ -394,6 +488,30 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("malformed frame: {e}") }).await;
             }
         }
+    }
+
+    // C3: reload — the session is checkpointed and will be rehydrated by
+    // the next image; tell the client to reconnect and stop forwarding.
+    if reloading {
+        // The forwarder drains and exits on the announce; bound it anyway.
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward).await.is_err() {
+            forward.abort();
+            let _ = forward.await;
+        }
+        let (generation, retry_after_ms) = match reload_bye(&state) {
+            ByeReason::Reloading { generation, retry_after_ms } => (generation, retry_after_ms),
+            _ => unreachable!(),
+        };
+        let env = crate::session::Envelope {
+            session_id: sid.clone(),
+            seq: u64::MAX,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Reloading { generation, retry_after_ms },
+        };
+        let _ = tx.send(DaemonFrame::Event(env.into())).await;
+        let _ = tx.send(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, retry_after_ms }) }).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        return;
     }
 
     // Socket gone / Bye = Detach. The turn keeps running (§8).
@@ -416,8 +534,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     if !handle.is_alive() {
         state.remove(&sid);
     }
-    let _ = tx.send(DaemonFrame::Bye).await;
+    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
+}
+
+fn reload_bye(state: &DaemonState) -> ByeReason {
+    ByeReason::Reloading {
+        generation: state.reload_generation.load(Ordering::SeqCst),
+        retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
 }

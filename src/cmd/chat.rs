@@ -712,6 +712,10 @@ mod actor {
     use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
     use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
+    /// Reserved query id for the post-compaction token readout (user
+    /// queries start at 1 and count up).
+    const COMPACT_TOKENS_QUERY: u64 = u64::MAX - 1;
+
     struct Render {
         is_tty: bool,
         in_thinking: bool,
@@ -762,6 +766,45 @@ mod actor {
                     );
                 }
                 SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
+                SessionEventWire::Aborted { context_saved } => eprintln!(
+                    "\x1b[2m{}\x1b[0m",
+                    if context_saved {
+                        "aborted — context saved for next message"
+                    } else {
+                        "aborted"
+                    }
+                ),
+                SessionEventWire::Cleared { session_id } => eprintln!(
+                    "session cleared → {}",
+                    &session_id[..8.min(session_id.len())]
+                ),
+                // B2: spawned compaction reports through typed events — each
+                // rendered exactly once (the inline loop's three lines).
+                SessionEventWire::CompactionStarted { disclosure, .. } => {
+                    eprintln!("compacting...");
+                    eprintln!("{}", disclosure);
+                }
+                SessionEventWire::CompactionApplied { .. } => {
+                    // `compacted → ~N tokens` needs the post-apply assessment.
+                    let _ = transport
+                        .send(SessionCommand::Query {
+                            id: COMPACT_TOKENS_QUERY,
+                            query: SessionQuery::ContextAssessment,
+                        })
+                        .await;
+                }
+                SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
+                    eprintln!(
+                        "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
+                        value["used_tokens"].as_u64().unwrap_or(0)
+                    )
+                }
+                SessionEventWire::CompactionFailed { message, .. } => {
+                    eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
+                }
+                SessionEventWire::CompactionCancelled => {
+                    eprintln!("\x1b[2m[compaction cancelled]\x1b[0m")
+                }
                 SessionEventWire::Ended { .. } => self.ended = true,
                 _ => {}
             }
@@ -905,7 +948,9 @@ mod actor {
             .await
             .map_err(|e| synaps_cli::RuntimeError::Session(e.to_string()))?;
         if let Some(p) = agent_prompt {
-            let _ = t.send(SessionCommand::Set(SessionSetting::SystemPrompt { text: p })).await;
+            let _ = t
+                .send(SessionCommand::Set { id: 0, setting: SessionSetting::SystemPrompt { text: p } })
+                .await;
         }
 
         let session_id = snap.meta.id.as_str().to_string();
@@ -1062,6 +1107,7 @@ mod actor {
                         }
                         "help" => {
                             eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                            eprintln!("quitting (or EOF) mid-turn cancels the turn and saves an abort context for the next --continue");
                         }
                         _ => eprintln!("unknown command: /{} (try /help)", cmd),
                     },

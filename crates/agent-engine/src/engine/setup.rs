@@ -144,7 +144,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     let background = spawn_session_background(&runtime, &sb.session)?;
 
-    finish_session_setup(&mut runtime, &config, &sb.session, None);
+    finish_session_setup(&mut runtime, &config, &sb.session, None, IndexRecord::Start);
 
     // Extension manager: host-owned.
     let ext_manager = Arc::clone(host.ext_manager());
@@ -322,6 +322,14 @@ pub(crate) fn spawn_session_background(
     })
 }
 
+/// Whether `finish_session_setup` appends the session START index record.
+/// `Skip` on unpark (B3) / reload rehydrate (C3): the session already has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexRecord {
+    Start,
+    Skip,
+}
+
 /// Foreground turn budget + session start index record (code motion from
 /// `boot()`). `cwd` = the session's configured cwd (`None` → process cwd).
 pub(crate) fn finish_session_setup(
@@ -329,6 +337,7 @@ pub(crate) fn finish_session_setup(
     config: &crate::SynapsConfig,
     session: &Session,
     cwd: Option<std::path::PathBuf>,
+    index_record: IndexRecord,
 ) {
     // Task 23: the engine's interactive session runs under the FOREGROUND
     // turn budget with typed per-role config overrides applied.
@@ -345,7 +354,7 @@ pub(crate) fn finish_session_setup(
     // point delivered the event to an empty bus in every host — the hook had
     // never once reached an extension. It is now emitted by the loader, after
     // subscribers exist.
-    {
+    if index_record == IndexRecord::Start {
         let mut index_record =
             crate::core::session_index::SessionIndexRecord::start(&session.id);
         index_record.model = Some(session.model.clone());

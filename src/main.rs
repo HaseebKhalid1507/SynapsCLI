@@ -368,6 +368,7 @@ async fn async_main() -> anyhow::Result<()> {
                         create: false,
                         continue_session: cli.continue_session.flatten(),
                         system: cli.system,
+                        ..Default::default()
                     },
                 )
                 .await?;
