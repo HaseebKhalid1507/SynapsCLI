@@ -2,7 +2,8 @@
 
 use serde_json::json;
 use synaps_cli::engine::reactor::{
-    claim_auto_turn, drain_event_queue, wake_action, EventDisposition, WakeAction, AUTO_TURN_CAP,
+    auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue, wake_action_with_cap,
+    EventDisposition, WakeAction,
 };
 use synaps_cli::{AgentEvent, CancellationToken, LlmEvent, Runtime, SessionEvent, StreamEvent};
 
@@ -10,6 +11,18 @@ use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
 use super::render_thread::RenderHandle;
 use super::view_model::ViewInputs;
+
+/// User-facing "cap reached" notice. Names the configured cap and the config
+/// key to raise it. Never emitted when the cap is unlimited (0) — the gate
+/// simply never trips.
+pub(crate) fn auto_turn_cap_message(cap: u32) -> String {
+    format!(
+        "auto-turn cap reached ({} consecutive) — waiting for your input \
+         (raise with `{} = N`, 0 = unlimited)",
+        cap,
+        synaps_cli::engine::reactor::AUTO_TURN_CAP_CONFIG_KEY
+    )
+}
 
 /// What the event loop should do after processing a stream event.
 pub(super) enum StreamAction {
@@ -326,12 +339,13 @@ pub(super) async fn handle_event_queue_arm(
 
     // Wake decision.
     let auto_turn_enabled = true; // C2+ will wire config; always on for C1
-    let action = wake_action(
+    let action = wake_action_with_cap(
         &drained,
         &app.api_messages,
         busy,
         auto_turn_enabled,
         app.consecutive_auto_turns,
+        app.auto_turn_cap,
     );
 
     match action {
@@ -372,12 +386,9 @@ pub(super) async fn handle_event_queue_arm(
                 .any(|d| d.disposition == EventDisposition::Injected)
                 && !busy
                 && auto_turn_enabled
-                && app.consecutive_auto_turns >= synaps_cli::engine::reactor::AUTO_TURN_CAP;
+                && auto_turn_cap_reached(app.consecutive_auto_turns, app.auto_turn_cap);
             if hit_cap {
-                app.push_msg(ChatMessage::System(format!(
-                    "auto-turn cap reached ({} consecutive) — waiting for your input",
-                    synaps_cli::engine::reactor::AUTO_TURN_CAP
-                )));
+                app.push_msg(ChatMessage::System(auto_turn_cap_message(app.auto_turn_cap)));
                 app.invalidate();
             }
         }
@@ -490,10 +501,10 @@ pub(super) async fn handle_stream_arm(
                 drop(cancel_token.take());
                 drop(steer_tx.take());
 
-                // Use the central claim_auto_turn gate: allows turns 1-5
-                // (counter < CAP), denies the 6th (counter == CAP).
+                // Use the central claim_auto_turn gate: allows turns while
+                // counter < cap, denies once counter == cap (cap 0 = unlimited).
                 // Increment happens inside claim on success — no inline +=.
-                if claim_auto_turn(&mut app.consecutive_auto_turns) {
+                if claim_auto_turn_with_cap(&mut app.consecutive_auto_turns, app.auto_turn_cap) {
                     let ct = CancellationToken::new();
                     let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     app.streaming = true;
@@ -514,10 +525,9 @@ pub(super) async fn handle_stream_arm(
                     *cancel_token = Some(ct);
                     *steer_tx = Some(s_tx);
                 } else {
-                    app.push_msg(ChatMessage::System(format!(
-                        "auto-turn cap reached ({} consecutive) — waiting for your input",
-                        AUTO_TURN_CAP
-                    )));
+                    // Unreachable when cap == 0 (claim never denies), so the
+                    // message only ever appears for a finite cap.
+                    app.push_msg(ChatMessage::System(auto_turn_cap_message(app.auto_turn_cap)));
                     app.invalidate();
                 }
             }
