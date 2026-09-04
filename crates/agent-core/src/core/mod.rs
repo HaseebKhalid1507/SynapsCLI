@@ -7,6 +7,7 @@ pub mod config;
 pub mod disclosure;
 pub mod error;
 pub mod logging;
+pub mod memstat;
 pub mod models;
 pub mod private_fs;
 pub mod protocol;

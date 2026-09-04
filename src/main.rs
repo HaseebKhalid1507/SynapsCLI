@@ -157,7 +157,18 @@ enum Command {
         action: AuthAction,
     },
     /// Show account usage and reset times
-    Status,
+    Status {
+        /// Show memory (RSS/PSS/USS/RssAnon) per live session process tree
+        /// instead of account usage. Linux only.
+        #[arg(long)]
+        memory: bool,
+        /// With --memory: emit JSON instead of a table.
+        #[arg(long, requires = "memory")]
+        json: bool,
+        /// With --memory: walk this pid's tree instead of the live sessions.
+        #[arg(long, requires = "memory")]
+        pid: Option<u32>,
+    },
     /// Credential broker — serve short-lived access tokens to client machines
     /// over HTTP/HTTPS so they can share one OAuth credential without storing it.
     ///
@@ -365,10 +376,14 @@ async fn async_main() -> anyhow::Result<()> {
                 .await
                 .map_err(anyhow::Error::msg)?,
         },
-        Some(Command::Status) => {
-            cmd::status::run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Some(Command::Status { memory, json, pid }) => {
+            if memory {
+                cmd::status::run_memory(json, pid).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            } else {
+                cmd::status::run()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
         }
         Some(Command::AuthBroker {
             bind,

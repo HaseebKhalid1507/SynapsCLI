@@ -74,3 +74,146 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// ═══ `synaps status --memory` (§3.7) ═══════════════════════════════════════
+
+use synaps_cli::core::memstat::{self, MemTotals, ProcMem, ProcRole};
+
+#[derive(serde::Serialize)]
+struct SessionMem {
+    session_id: Option<String>,
+    name: Option<String>,
+    root_pid: u32,
+    procs: Vec<ProcMem>,
+    totals: MemTotals,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryReport {
+    sessions: Vec<SessionMem>,
+    totals: MemTotals,
+}
+
+fn collect(pid: Option<u32>) -> Result<MemoryReport, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    match pid {
+        Some(p) => {
+            let procs = memstat::tree(p)?;
+            let totals = MemTotals::of(&procs);
+            sessions.push(SessionMem {
+                session_id: None,
+                name: None,
+                root_pid: p,
+                procs,
+                totals,
+            });
+        }
+        None => {
+            let mut regs = synaps_cli::events::registry::list_active_sessions();
+            regs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+            for reg in regs {
+                let Ok(procs) = memstat::tree(reg.pid) else {
+                    continue;
+                };
+                let totals = MemTotals::of(&procs);
+                sessions.push(SessionMem {
+                    session_id: Some(reg.session_id),
+                    name: reg.name,
+                    root_pid: reg.pid,
+                    procs,
+                    totals,
+                });
+            }
+        }
+    }
+    let all: Vec<ProcMem> = sessions
+        .iter()
+        .flat_map(|s| s.procs.iter().cloned())
+        .collect();
+    let totals = MemTotals::of(&all);
+    Ok(MemoryReport { sessions, totals })
+}
+
+fn mb(kb: u64) -> f64 {
+    kb as f64 / 1024.0
+}
+
+fn role_label(role: &ProcRole) -> String {
+    match role {
+        ProcRole::Engine => "engine".into(),
+        ProcRole::ExtensionSidecar { name } => format!("ext:{name}"),
+        ProcRole::McpServer { name } => format!("mcp:{name}"),
+        ProcRole::Shell => "shell".into(),
+        ProcRole::Other => "other".into(),
+    }
+}
+
+fn print_table(report: &MemoryReport) {
+    if report.sessions.is_empty() {
+        println!("No live sessions (registry empty) — pass --pid N to inspect a process tree.");
+        return;
+    }
+    println!(
+        "{:<8} {:<22} {:>8} {:>8} {:>8} {:>8} {:>4}  {}",
+        "PID", "ROLE", "RSS MB", "PSS MB", "USS MB", "ANON MB", "THR", "CMD"
+    );
+    for s in &report.sessions {
+        let label = match (&s.name, &s.session_id) {
+            (Some(n), Some(id)) => format!("{n} ({id})"),
+            (None, Some(id)) => id.clone(),
+            _ => format!("pid {}", s.root_pid),
+        };
+        println!("── session {label}");
+        for p in &s.procs {
+            let cmd: String = p.cmd.chars().take(60).collect();
+            println!(
+                "{:<8} {:<22} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>4}  {}",
+                p.pid,
+                role_label(&p.role),
+                mb(p.rss_kb),
+                mb(p.pss_kb),
+                mb(p.uss_kb),
+                mb(p.anon_kb),
+                p.threads,
+                cmd
+            );
+        }
+        let t = &s.totals;
+        println!(
+            "{:<8} {:<22} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>4}",
+            "",
+            format!("subtotal ({} procs)", t.procs),
+            mb(t.rss_kb),
+            mb(t.pss_kb),
+            mb(t.uss_kb),
+            mb(t.anon_kb),
+            t.threads
+        );
+    }
+    let t = &report.totals;
+    println!(
+        "{:<8} {:<22} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>4}",
+        "",
+        format!(
+            "TOTAL ({} sessions, {} procs)",
+            report.sessions.len(),
+            t.procs
+        ),
+        mb(t.rss_kb),
+        mb(t.pss_kb),
+        mb(t.uss_kb),
+        mb(t.anon_kb),
+        t.threads
+    );
+}
+
+/// `synaps status --memory [--json] [--pid N]`.
+pub fn run_memory(json: bool, pid: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
+    let report = collect(pid)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_table(&report);
+    }
+    Ok(())
+}
