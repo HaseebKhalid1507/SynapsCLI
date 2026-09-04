@@ -33,7 +33,12 @@ pub struct HostParts {
 }
 
 pub struct HostOpts {
+    /// Applied via `config::set_profile` by the FIRST boot in a process
+    /// only; a later `boot()` with a different profile is not honoured
+    /// (the installed host wins — see [`EngineHost::boot_and_install`]).
     pub profile: Option<String>,
+    /// Echoed to callers (`EngineBoot::no_extensions`) — extension discovery
+    /// is gated by the renderer after boot, not by the host. Not read here.
     pub no_extensions: bool,
 }
 
@@ -62,9 +67,10 @@ static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
 impl EngineHost {
     /// Every step of the old `setup::boot()` that does NOT mention a session:
     /// profile, logging, HTTP client, registry, config, skills, MCP, extension
-    /// manager, OpenAI routing static. Does NOT install the global broker —
-    /// that happens in [`Self::foreground_runtime`] via `apply_config`, exactly
-    /// where the old boot did it relative to session resolution.
+    /// manager. Touches NO process static: the OpenAI routing static is
+    /// written by [`Self::install`] for the winning host only, and the global
+    /// broker is installed in [`Self::foreground_runtime`] via `apply_config`,
+    /// exactly where the old boot did it relative to session resolution.
     pub async fn boot(opts: HostOpts) -> Result<Arc<Self>> {
         if let Some(ref prof) = opts.profile {
             crate::config::set_profile(Some(prof.clone()));
@@ -112,7 +118,6 @@ impl EngineHost {
             None
         };
         let ext_manager = Arc::new(RwLock::new(ext_mgr));
-        crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 
         let parts = HostParts {
             client,
@@ -138,15 +143,37 @@ impl EngineHost {
         }))
     }
 
-    /// Idempotent install of the process host. A second call with a
-    /// different host is a programming error: returns `Err(rejected)` and
-    /// never replaces the installed one.
+    /// Idempotent, atomic install of the process host. Exactly one host ever
+    /// wins the `OnceLock`; the winner's extension manager becomes the
+    /// OpenAI routing static in the same step. A different host arriving
+    /// later (or losing a race) is returned as `Err(rejected)` and never
+    /// replaces the installed one — nor touches any static.
     pub fn install(host: Arc<Self>) -> std::result::Result<(), Arc<Self>> {
-        match HOST.get() {
-            Some(existing) if Arc::ptr_eq(existing, &host) => Ok(()),
-            Some(_) => Err(host),
-            None => HOST.set(host),
+        let installed = HOST.get_or_init(|| {
+            crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(
+                &host.ext_manager,
+            ));
+            Arc::clone(&host)
+        });
+        if Arc::ptr_eq(installed, &host) {
+            Ok(())
+        } else {
+            Err(host)
         }
+    }
+
+    /// The process host: the installed one, else boot + install. Under a
+    /// race the loser is discarded and the installed host returned, so a
+    /// caller never ends up on a host that `current()` does not agree with.
+    pub async fn boot_and_install(opts: HostOpts) -> Result<Arc<Self>> {
+        if let Some(h) = HOST.get() {
+            return Ok(Arc::clone(h));
+        }
+        let h = Self::boot(opts).await?;
+        Ok(match Self::install(h) {
+            Ok(()) => HOST.get().cloned().expect("just installed"),
+            Err(_rejected) => HOST.get().cloned().expect("a winner exists"),
+        })
     }
 
     pub fn current() -> Option<Arc<Self>> {

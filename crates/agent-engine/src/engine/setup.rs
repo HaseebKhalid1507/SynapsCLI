@@ -14,6 +14,8 @@ pub struct EngineOpts {
     pub continue_session: Option<Option<String>>,
     pub system: Option<String>,
     pub prompt_manifest: Option<std::path::PathBuf>,
+    /// Honoured by the first `boot` in a process only: the `EngineHost` is
+    /// built once and later boots reuse it, profile included.
     pub profile: Option<String>,
     pub no_extensions: bool,
 }
@@ -112,18 +114,11 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // and reused by every later boot in the same process. The log-appender
     // guard lives on the host — process lifetime ≥ renderer lifetime — so
     // log lines emitted after boot() returns are never silently dropped.
-    let host = match EngineHost::current() {
-        Some(h) => h,
-        None => {
-            let h = EngineHost::boot(HostOpts {
-                profile: opts.profile.clone(),
-                no_extensions: opts.no_extensions,
-            })
-            .await?;
-            let _ = EngineHost::install(Arc::clone(&h));
-            h
-        }
-    };
+    let host = EngineHost::boot_and_install(HostOpts {
+        profile: opts.profile.clone(),
+        no_extensions: opts.no_extensions,
+    })
+    .await?;
     // `apply_config` is applied inside `foreground_runtime()` — before
     // session resolution, same relative order as before.
     let mut runtime = host.foreground_runtime().await?;

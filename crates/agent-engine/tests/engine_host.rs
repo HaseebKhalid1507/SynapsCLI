@@ -30,17 +30,33 @@ async fn boot_twice_returns_same_host() {
     let b = EngineHost::current().unwrap();
     assert!(Arc::ptr_eq(&a, &b));
 
-    // A second, different host is rejected and never replaces the first.
+    // A second, different host is rejected and never replaces the first —
+    // and never touches the routing static (boot() writes no statics; only
+    // the winning install() does).
+    let routing_before = agent_engine::runtime::openai::extension_manager_for_routing().unwrap();
+    assert!(Arc::ptr_eq(&routing_before, a.ext_manager()));
     let other = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
     })
     .await
     .unwrap();
-    assert!(EngineHost::install(Arc::clone(&other)).is_err());
+    let rejected = EngineHost::install(Arc::clone(&other)).expect_err("rejected");
+    assert!(Arc::ptr_eq(&rejected, &other));
     assert!(Arc::ptr_eq(&a, &EngineHost::current().unwrap()));
+    let routing_after = agent_engine::runtime::openai::extension_manager_for_routing().unwrap();
+    assert!(Arc::ptr_eq(&routing_after, a.ext_manager()), "static untouched");
     // Re-installing the same host is Ok (idempotent).
     assert!(EngineHost::install(Arc::clone(&a)).is_ok());
+    // boot_and_install returns the installed host, not a fresh one.
+    let again = EngineHost::boot_and_install(HostOpts {
+        profile: None,
+        no_extensions: true,
+    })
+    .await
+    .unwrap();
+    assert!(Arc::ptr_eq(&a, &again));
+    drop(other); // process state is clean: nothing points at the loser
 }
 
 #[tokio::test]
