@@ -199,9 +199,11 @@ impl EngineHost {
     /// tools, hook_bus, credential source, token cache, MCP/extension lease
     /// managers. Everything else is fresh (exactly `Runtime::new()`'s values).
     /// `apply_config` runs here — the ONLY place the broker is (re)installed.
+    /// `disabled_tools` is NOT re-applied: `boot()` did it once on the fresh
+    /// registry, before skills/MCP registered, exactly where the old boot did.
     pub async fn foreground_runtime(&self) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
-        runtime.apply_config(&self.config());
+        runtime.apply_config_keep_tools(&self.config());
         Ok(runtime)
     }
 

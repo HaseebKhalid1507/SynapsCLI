@@ -2024,7 +2024,23 @@ impl Runtime {
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
+    /// Includes the `disabled_tools` pass on this runtime's registry — the
+    /// fresh-`Runtime::new()` path, where the registry holds builtins only.
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
+        self.apply_config_inner(config, true);
+    }
+
+    /// `apply_config` WITHOUT the `disabled_tools` pass. Used by
+    /// `EngineHost::foreground_runtime`: the host already disabled builtins
+    /// on the fresh registry before skills/MCP registered (the old boot
+    /// point), and a second pass here would also strip `load_skill`,
+    /// `search_skills`, `connect_mcp_server` and dormant MCP tools — which
+    /// the old boot never did.
+    pub(crate) fn apply_config_keep_tools(&mut self, config: &crate::config::SynapsConfig) {
+        self.apply_config_inner(config, false);
+    }
+
+    fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -2094,9 +2110,9 @@ impl Runtime {
         self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
-        // try_write is safe here: apply_config runs at boot before the registry
-        // is shared with other tasks.
-        if !config.disabled_tools.is_empty() {
+        // try_write is safe here: this runs on a fresh runtime's private
+        // registry before it is shared with other tasks.
+        if disable_tools && !config.disabled_tools.is_empty() {
             if let Ok(mut reg) = self.tools.try_write() {
                 reg.disable(&config.disabled_tools);
             }
