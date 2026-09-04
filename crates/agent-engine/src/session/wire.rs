@@ -268,6 +268,7 @@ impl AttachedWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // mirrors SessionEventWire by design
 pub enum WireSessionEvent {
     Stream { event: WireStreamEvent },
     TurnStarted { turn_baseline: usize, trigger: TurnTrigger },
