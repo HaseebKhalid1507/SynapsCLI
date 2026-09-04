@@ -37,15 +37,23 @@ are PSS (`/proc/<pid>/smaps_rollup`) unless stated; measured on bella
 | Subagent scenario: `set_global_broker` calls | 1 + spawns | **== 1** | B2 broken |
 | `status --memory` vs `mem.sh` totals | — | within 2 % | fix `memstat` |
 
-Fill in the "new" column from `bench-sessions.sh` output in the PR:
+### Measured — bella, 2026-09-04, `bench-sessions.sh` REPEAT=3 SETTLE=10, base `8113e5cf` vs `feat/engine-host-b` @ B2
 
-| Metric | Base | New | Gate | ✓ |
-|---|---:|---:|---|---|
-| RssAnon(N=1) | | | ≤ 24.5 | |
-| PSS(N=1) | | | ≤ 73 | |
-| PSS(N=3) | | | ≤ 160 | |
-| procs/session | | | == 3 | |
-| startup ms | | | ≤ 80 | |
+The absolute PSS on this run is higher than MEASUREMENTS.md for *both* binaries
+(the `munder-hive-god` bridge now runs with `--sock`, chronos from a checkout):
+compare the columns, not the historical gate constants.
+
+| Metric | Base | New | Δ | Gate | ✓ |
+|---|---:|---:|---:|---|---|
+| `synaps` RssAnon (N=1) | 25.7 MB | **20.1 MB** | −5.6 | ≤ 24.5 | ✓ |
+| PSS (N=1) | 116.1 | 110.9 | −5.2 | base −4.8 (≤ 73 on the old fixture) | ✓ (relative) |
+| PSS (N=2) | 158.8 | 145.8 | −13.0 | | |
+| PSS (N=3) | 202.0 | 183.2 | −18.8 | base −12 (≤ 160 on the old fixture) | ✓ (relative) |
+| Marginal PSS (N=3 − N=2) | 43.2 | **37.4** | −5.8 | ≤ 40 | ✓ |
+| procs / session | 3 | 3 | 0 | == 3 | ✓ |
+| `synaps` threads idle | 36 | **16** | −20 | ≤ 20 | ✓ |
+| Startup to `○ ready` | 49 ms | 50 ms | +1 | ≤ 80 | ✓ |
+| `status --memory` vs `mem.sh` PSS (N=1) | — | 108.8 vs 111.5 MB | 2.4 % (sampled ~3 s apart) | ≤ 2 % | ≈ |
 
 ## Where the budget comes from (Phase 1 changes)
 

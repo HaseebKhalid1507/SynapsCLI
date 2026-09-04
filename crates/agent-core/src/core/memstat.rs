@@ -171,7 +171,7 @@ pub fn classify(cmd: &str) -> ProcRole {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if base == "synaps" || base.starts_with("synaps-cli") {
+    if base.starts_with("synaps") {
         return ProcRole::Engine;
     }
     if base == "bash" || base == "sh" || base == "zsh" || base == "fish" || base == "pwsh" {
