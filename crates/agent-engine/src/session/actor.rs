@@ -186,7 +186,15 @@ impl SessionActor {
 
         // C2: per-session on_session_start (keyed injection) once the
         // process-level discovery is known-finished. Never re-runs discovery.
-        host.extensions_ready().await;
+        if tokio::time::timeout(budgets::EXTENSIONS_READY_TIMEOUT, host.extensions_ready())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                budget_secs = budgets::EXTENSIONS_READY_TIMEOUT_SECS,
+                "extensions_ready timed out — on_session_start may miss late extensions"
+            );
+        }
         crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id).await;
 
         let id = SessionId::from(sb.session.id.clone());

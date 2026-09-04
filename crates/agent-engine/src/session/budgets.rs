@@ -11,3 +11,10 @@ pub const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
 
 pub const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(SAVE_TIMEOUT_SECS);
 pub const HOOKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(HOOKS_TIMEOUT_SECS);
+
+/// `SessionActor::create` bound on `EngineHost::extensions_ready()`: the
+/// loader guard should make this unreachable; it exists so a session can
+/// never hang on a loader that never reports (warns, then proceeds).
+pub const EXTENSIONS_READY_TIMEOUT_SECS: u64 = 30;
+pub const EXTENSIONS_READY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(EXTENSIONS_READY_TIMEOUT_SECS);

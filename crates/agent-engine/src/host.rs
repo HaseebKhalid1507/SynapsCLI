@@ -80,6 +80,17 @@ pub struct EngineHost {
 
 static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
 
+/// See [`EngineHost::extensions_loading_guard`].
+pub struct ExtensionsLoadingGuard {
+    host: Arc<EngineHost>,
+}
+
+impl Drop for ExtensionsLoadingGuard {
+    fn drop(&mut self) {
+        self.host.mark_extensions_ready();
+    }
+}
+
 impl EngineHost {
     /// Every step of the old `setup::boot()` that does NOT mention a session:
     /// profile, logging, HTTP client, registry, config, skills, MCP, extension
@@ -413,13 +424,30 @@ impl EngineHost {
         self.extensions_ready.send_replace(true);
     }
 
+    /// Loader seam (C2): `note_extensions_loading()` now, and
+    /// `mark_extensions_ready()` when the guard drops — however the loader
+    /// task ends (return, cancel, panic). Hold it inside the task so a
+    /// panicking walk cannot strand `extensions_ready()` waiters.
+    pub fn extensions_loading_guard(self: &Arc<Self>) -> ExtensionsLoadingGuard {
+        self.note_extensions_loading();
+        ExtensionsLoadingGuard {
+            host: Arc::clone(self),
+        }
+    }
+
     /// Resolve once extension discovery on this host is known-finished, so a
     /// session's `on_session_start` lands on subscribed extensions. Resolves
     /// IMMEDIATELY when no loader was dispatched (hosts that never load
     /// extensions, `--no-extensions`, tests) or discovery already completed
     /// on the manager (in-process `discover_and_load()` callers such as
-    /// `synaps chat`); otherwise awaits the loader's `Finished`. Never
-    /// blocks forever: a loader that dies drops the sender and we return.
+    /// `synaps chat`); otherwise awaits `mark_extensions_ready()`.
+    ///
+    /// The watch sender is a field of the host, so "sender dropped" is NOT a
+    /// wake-up path while the host lives. Liveness comes from
+    /// [`ExtensionsLoadingGuard`] (the loader task marks ready on any exit,
+    /// including panic); callers that must not trust the loader at all
+    /// (`SessionActor::create`) additionally bound the await with
+    /// `budgets::EXTENSIONS_READY_TIMEOUT`.
     pub async fn extensions_ready(&self) {
         let mut rx = self.extensions_ready.subscribe();
         if *rx.borrow() {
