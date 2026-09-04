@@ -226,6 +226,15 @@ fn default_tail_items() -> usize {
     DEFAULT_TAIL_ITEMS
 }
 
+/// `SYNAPS_ATTACH_TAIL_ITEMS` (client side): display items requested in
+/// `Attached.display_tail`; `DEFAULT_TAIL_ITEMS` when unset/invalid.
+pub fn tail_items_from_env() -> usize {
+    std::env::var("SYNAPS_ATTACH_TAIL_ITEMS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TAIL_ITEMS)
+}
+
 impl ClientMeta {
     /// Fresh meta with a random instance id and no terminal.
     pub fn new(kind: ClientKind) -> Self {
@@ -234,7 +243,7 @@ impl ClientMeta {
             terminal: None,
             instance: uuid::Uuid::new_v4().to_string(),
             history: HistoryMode::default(),
-            tail_items: DEFAULT_TAIL_ITEMS,
+            tail_items: tail_items_from_env(),
         }
     }
 }
@@ -261,10 +270,10 @@ impl HistoryMode {
         }
     }
 
-    /// What `synaps --attach` asks for. P4-0 returns `Full`; B's last
-    /// commit flips to `Digest`.
+    /// What `synaps --attach` asks for (phase 4 B7: `Digest`).
+    /// `SYNAPS_CLIENT_HISTORY=full` restores the 741b6b60 mirror wholesale.
     pub fn attach_client_default() -> Self {
-        Self::Full
+        Self::Digest
     }
 }
 
