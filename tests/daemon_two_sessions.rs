@@ -128,8 +128,11 @@ async fn two_sessions_one_daemon_isolated() {
     let bodies = bodies.lock().unwrap();
     let b0 = String::from_utf8_lossy(&bodies[0]);
     let b1 = String::from_utf8_lossy(&bodies[1]);
-    assert!(b0.contains("from a") && !b0.contains("from b"));
-    assert!(b1.contains("from b") && !b1.contains("from a"));
+    let msgs = |b: &str| -> serde_json::Value { serde_json::from_str::<serde_json::Value>(b).unwrap()["messages"].clone() };
+    let (m0, m1) = (msgs(&b0), msgs(&b1));
+    eprintln!("b0 messages: {m0}\nb1 messages: {m1}");
+    assert!(b0.contains("from a") && !b0.contains("from b"), "{m0}");
+    assert!(b1.contains("from b") && !b1.contains("from a"), "{m1}");
 
     // detach a mid-life: session stays; b unaffected
     a.detach().await;
