@@ -363,6 +363,8 @@ pub struct SessionActor {
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
     /// Mirrors `handle.journal_id()` (B2 stores the successor id).
     pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Mirrors `handle.presence()` (clients / owner / pending prompts).
+    pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
 }
 
 impl SessionActor {
@@ -469,6 +471,7 @@ impl SessionActor {
                 view,
                 lifecycle,
                 journal_id,
+                presence,
             },
         ) = SessionHandle::new(meta.clone(), view);
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
@@ -511,6 +514,7 @@ impl SessionActor {
             subagent_tick: None,
             lifecycle,
             journal_id,
+            presence,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -561,9 +565,18 @@ impl SessionActor {
         }
     }
 
+    pub(crate) fn publish_presence(&self) {
+        self.presence.store(Arc::new(super::handle::Presence {
+            clients: self.attached.len(),
+            input_owner: self.input_owner,
+            awaiting_input: self.pending_prompts.len(),
+        }));
+    }
+
     /// Recomputes `state` from clients/streaming and (re)arms or disarms the
     /// park grace timer. A no-op while Parking/Parked.
     pub(crate) fn update_attach_state(&mut self) {
+        self.publish_presence();
         if matches!(self.state, AttachState::Parking | AttachState::Parked) {
             return;
         }
@@ -1336,6 +1349,7 @@ impl SessionActor {
             raised_at: chrono::Utc::now(),
         };
         self.pending_prompts.push_back((pr.clone(), req.response_tx));
+        self.publish_presence();
         self.emit(SessionEventWire::Prompt(pr));
     }
 
@@ -1345,6 +1359,7 @@ impl SessionActor {
         };
         let (_, tx) = self.pending_prompts.remove(pos).expect("position");
         let _ = tx.send(value);
+        self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
     }
 
@@ -1600,6 +1615,7 @@ impl SessionActor {
                 reason,
             });
         }
+        self.publish_presence();
         let snapshot = self.snapshot();
         self.emit(SessionEventWire::Attached {
             client: cid,
@@ -1633,6 +1649,7 @@ impl SessionActor {
                 to: next,
                 reason: OwnerChangeReason::OwnerDetached,
             });
+            self.publish_presence();
         }
     }
 

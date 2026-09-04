@@ -11,12 +11,11 @@ pub mod lifecycle;
 pub mod listener;
 pub mod registry;
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -113,7 +112,6 @@ pub struct DaemonState {
     pub host: Arc<EngineHost>,
     pub profile: Option<String>,
     pub started: Instant,
-    pub sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     pub factory: SessionFactory,
     pub connections: AtomicUsize,
     pub shutdown: CancellationToken,
@@ -125,30 +123,26 @@ impl DaemonState {
         self.started.elapsed().as_secs()
     }
 
-    /// Live handles only (dead actors are dropped on read).
+    /// B4: ONE session map — `EngineHost` owns it; these delegate.
     pub fn live_sessions(&self) -> Vec<SessionHandle> {
-        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, h| h.is_alive());
-        map.values().cloned().collect()
+        self.host.session_handles()
     }
 
+    /// Listing metas with lifecycle / clients / input_owner / journal_id.
     pub fn session_metas(&self) -> Vec<SessionMeta> {
-        self.live_sessions().iter().map(|h| h.meta().clone()).collect()
+        self.host.sessions()
     }
 
     pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
-        self.live_sessions().into_iter().find(|h| &h.id == id)
+        self.host.attach(id).filter(|h| h.is_alive())
     }
 
     pub fn insert(&self, handle: SessionHandle) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(handle.id.clone(), handle);
+        self.host.adopt_session(handle);
     }
 
     pub fn remove(&self, id: &SessionId) {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.host.remove_session(id);
     }
 
     pub async fn create(&self, cfg: SessionConfig) -> Result<SessionHandle, String> {
@@ -222,7 +216,6 @@ impl Daemon {
             host,
             profile: opts.profile.clone(),
             started: Instant::now(),
-            sessions: Mutex::new(HashMap::new()),
             factory,
             connections: AtomicUsize::new(0),
             shutdown: CancellationToken::new(),

@@ -11,6 +11,14 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionId, SessionLifecycle, SessionMeta};
+
+/// Live client accounting published by the actor (B4 `sessions()` listing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Presence {
+    pub clients: usize,
+    pub input_owner: Option<ClientId>,
+    pub awaiting_input: usize,
+}
 use super::view::RuntimeView;
 
 /// Bounded command queue depth (rpc `WRITER_CHAN_CAP` precedent).
@@ -39,6 +47,8 @@ pub struct SessionHandle {
     lifecycle: Arc<AtomicU8>,
     /// `conv.session.id` — changes on LinkedSuccessor compaction.
     journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Clients / input owner / pending prompts, written by the actor.
+    presence: Arc<arc_swap::ArcSwap<Presence>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -57,6 +67,7 @@ pub struct SessionEndpoints {
     pub view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub lifecycle: Arc<AtomicU8>,
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
+    pub presence: Arc<arc_swap::ArcSwap<Presence>>,
 }
 
 impl SessionHandle {
@@ -68,6 +79,7 @@ impl SessionHandle {
         let view = Arc::new(arc_swap::ArcSwap::from_pointee(view));
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
+        let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -76,6 +88,7 @@ impl SessionHandle {
             view: Arc::clone(&view),
             lifecycle: Arc::clone(&lifecycle),
             journal_id: Arc::clone(&journal_id),
+            presence: Arc::clone(&presence),
         };
         (
             handle,
@@ -85,6 +98,7 @@ impl SessionHandle {
                 view,
                 lifecycle,
                 journal_id,
+                presence,
             },
         )
     }
@@ -118,6 +132,24 @@ impl SessionHandle {
     /// Current `conv.session.id` (= `id` until a LinkedSuccessor compaction).
     pub fn journal_id(&self) -> String {
         (**self.journal_id.load()).clone()
+    }
+
+    /// Clients / input owner / pending prompts as last published.
+    pub fn presence(&self) -> Presence {
+        **self.presence.load()
+    }
+
+    /// `meta()` with the live cells filled in (lifecycle, clients, owner,
+    /// awaiting_input, journal_id) — what listings show.
+    pub fn meta_live(&self) -> SessionMeta {
+        let mut m = (*self.meta).clone();
+        let p = self.presence();
+        m.lifecycle = self.lifecycle();
+        m.clients = p.clients;
+        m.input_owner = p.input_owner;
+        m.awaiting_input = p.awaiting_input;
+        m.journal_id = self.journal_id();
+        m
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {

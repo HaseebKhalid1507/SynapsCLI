@@ -434,3 +434,55 @@ async fn no_duplicate_index_start_record_on_unpark_and_status_never_wakes() {
     assert_eq!(starts(handle.id.as_str()), 1, "unpark appends no START record");
     end(&mut b).await;
 }
+
+/// B4: `--idle-exit` fires once every session is parked (REVIEW §5 retired):
+/// a real `Daemon` over the host map, one session, detach → park → the idle
+/// monitor requests shutdown without ever probing (waking) the actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn idle_exit_fires_once_all_sessions_parked() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = agent_engine::daemon::Daemon::start(
+        Arc::clone(&host),
+        agent_engine::daemon::DaemonOpts {
+            runtime_dir: Some(run.path().to_path_buf()),
+            idle_exit: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let token = d.shutdown_token();
+
+    // One map: a session created on the host is what the daemon lists.
+    let handle = host.create_session(pcfg()).await.unwrap();
+    assert_eq!(d.state.live_sessions().len(), 1);
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let metas = d.state.session_metas();
+    assert_eq!(metas[0].clients, 1);
+    assert_eq!(metas[0].input_owner, Some(a.client_id()));
+    assert_eq!(metas[0].lifecycle, SessionLifecycle::Live);
+    assert_eq!(metas[0].journal_id, handle.id.as_str());
+    assert!(!token.is_cancelled(), "a client is attached: not idle");
+
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    assert_eq!(d.state.session_metas()[0].lifecycle, SessionLifecycle::Parked);
+    assert_eq!(d.state.session_metas()[0].clients, 0);
+    tokio::time::timeout(Duration::from_secs(10), token.cancelled())
+        .await
+        .expect("idle-exit fires with a parked session");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "the probe never woke it");
+    d.wait().await;
+    assert!(!handle.is_alive(), "shutdown_all ended the parked session");
+    assert_eq!(host.sessions().len(), 0);
+}

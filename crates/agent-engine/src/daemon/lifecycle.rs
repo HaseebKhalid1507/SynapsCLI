@@ -25,7 +25,9 @@ pub async fn shutdown_all(state: &Arc<DaemonState>, force: bool) {
     if tokio::time::timeout(budget, futures::future::join_all(ends)).await.is_err() {
         tracing::warn!(budget = ?budget, "daemon: session shutdown budget exceeded; continuing");
     }
-    state.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    for h in &sessions {
+        state.host.remove_session(&h.id);
+    }
 
     let ext = Arc::clone(state.host.ext_manager());
     let ext_shutdown = async move { ext.write().await.shutdown_all().await };
