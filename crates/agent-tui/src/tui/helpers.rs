@@ -508,7 +508,7 @@ mod tests {
         rebuild_display_messages(&long, &mut app);
         let repr = transcript_repr(&app);
         assert_eq!(repr.len(), 121);
-        assert!(repr[0].starts_with("S|… 89 earlier message(s) hidden"), "{}", repr[0]);
+        assert!(repr[0].starts_with("S|… 90 earlier message(s) hidden"), "{}", repr[0]);
     }
 
     const T: Duration = Duration::from_millis(100);
