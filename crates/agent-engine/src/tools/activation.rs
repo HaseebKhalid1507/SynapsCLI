@@ -148,6 +148,29 @@ impl CorePin {
     }
 }
 
+/// Why an activation was not carried across a round-top rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropReason {
+    /// The tool is no longer in the catalog.
+    Removed,
+    /// The record's schema digest or trust provenance changed.
+    Drifted,
+}
+
+/// One activation dropped by [`SessionToolSet::rebuilt_for_catalog`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedActivation {
+    pub id: ToolId,
+    pub reason: DropReason,
+}
+
+/// Kill-switch for carry-forward: `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores
+/// the zero-inherit rebuild (every catalog mutation wipes activations).
+pub fn carry_forward_enabled() -> bool {
+    std::env::var("SYNAPS_TOOLSET_CARRY_FORWARD").as_deref() != Ok("0")
+}
+
 /// The small configured core set plus exact activated deferred tools for one
 /// session, pinned to the catalog generation it was built against. Core
 /// tools are pinned with the schema digest AND trust provenance of their
@@ -247,6 +270,76 @@ impl SessionToolSet {
             .collect::<Vec<_>>();
         Self::new(session, core, catalog)
             .expect("progressive core ids are filtered through the catalog")
+    }
+
+    /// Round-top rebuild against a NEWER catalog (`runtime/stream.rs`):
+    /// the core is re-derived exactly as a fresh build would derive it, and
+    /// every prior exact activation whose CURRENT catalog record still
+    /// matches its pinned (schema digest, trust provenance) is re-issued a
+    /// grant at the new generation. Activations whose record is gone or
+    /// drifted are dropped and reported.
+    ///
+    /// This is NOT a gate change: a carried activation is exactly what a
+    /// user re-activation of the same tool would produce against this
+    /// catalog, and `ExecutionGate::authorize` still checks digest and
+    /// provenance against the current record on every call.
+    pub fn rebuilt_for_catalog(
+        &self,
+        catalog: &ToolCatalog,
+        progressive: bool,
+    ) -> (Self, Vec<DroppedActivation>) {
+        let mut next = if progressive {
+            Self::progressive_core_for_catalog(self.session.clone(), catalog)
+        } else {
+            Self::default_core_for_catalog(self.session.clone(), catalog)
+        };
+        let mut dropped = Vec::new();
+        for old in self.activated.values() {
+            let id = old.grant().tool_id().clone();
+            match catalog.get(&id) {
+                // Promoted to core by the new catalog — nothing to carry.
+                Some(_) if next.core.contains_key(&id) => {}
+                // Same checks a re-activation runs (`activate_many`): pinned
+                // digest + provenance unchanged AND the record's source still
+                // agrees with its provenance (`check_source_trust`). A record
+                // whose source drifted under a stable provenance is dropped
+                // as `Drifted` rather than carried into the schema.
+                Some(rec)
+                    if rec.schema_digest() == old.schema_digest()
+                        && rec.provenance() == old.provenance()
+                        && check_source_trust(rec).is_ok() =>
+                {
+                    let grant = SessionActivationGrant::new(
+                        self.session.as_str(),
+                        id.clone(),
+                        catalog.generation(),
+                        rec.schema_digest().clone(),
+                    )
+                    .expect("session id was valid when the set was built");
+                    next.activated.insert(
+                        id,
+                        ActivatedTool {
+                            grant,
+                            provenance: rec.provenance().clone(),
+                            lease: RuntimeLease::NotAcquired,
+                        },
+                    );
+                }
+                Some(_) => dropped.push(DroppedActivation {
+                    id,
+                    reason: DropReason::Drifted,
+                }),
+                None => dropped.push(DroppedActivation {
+                    id,
+                    reason: DropReason::Removed,
+                }),
+            }
+        }
+        // Session schema-generation is bookkeeping for "activation batches
+        // applied"; carrying is not a batch: keep the old counter, +1 iff
+        // anything was dropped (the exposed schema changed).
+        next.schema_generation = self.schema_generation + u64::from(!dropped.is_empty());
+        (next, dropped)
     }
 
     /// Typed EXACT revocation (Task 19 grant invalidation): remove one

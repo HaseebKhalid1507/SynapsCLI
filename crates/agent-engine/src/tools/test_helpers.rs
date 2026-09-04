@@ -27,6 +27,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             mcp_leases: None,
             extension_leases: None,
             memory_context: None,
+            cwd: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

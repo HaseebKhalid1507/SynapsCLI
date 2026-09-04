@@ -222,6 +222,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     mcp_leases: None,
                     extension_leases: None,
                     memory_context: None,
+                    cwd: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -386,6 +387,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     mcp_leases: None,
                     extension_leases: None,
                     memory_context: None,
+                    cwd: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -1629,7 +1631,7 @@ async fn on_session_start_injection_reaches_the_session() {
 
     // Nothing is injected until the event is emitted.
     assert_eq!(
-        hook_bus.session_injection().await,
+        hook_bus.session_injection_for("sess-291").await,
         None,
         "session injection must start empty"
     );
@@ -1654,9 +1656,11 @@ async fn on_session_start_injection_reaches_the_session() {
 
     // The loader stores it for the rest of the session; stream.rs reads it
     // from here when composing the system prompt.
-    hook_bus.set_session_injection(content).await;
+    hook_bus
+        .set_session_injection_for("sess-291", content)
+        .await;
     let stored = hook_bus
-        .session_injection()
+        .session_injection_for("sess-291")
         .await
         .expect("session injection must persist for the session");
     assert!(stored.contains("HANDOFF-SENTINEL"));

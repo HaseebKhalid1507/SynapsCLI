@@ -5,6 +5,7 @@ pub mod engine;
 pub mod events;
 pub mod extensions;
 pub mod help;
+pub mod host;
 pub mod mcp;
 pub mod runtime;
 pub mod sidecar;
@@ -29,6 +30,7 @@ pub use agent_core::SharedMessage;
 pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
 pub use config::{load_config, resolve_system_prompt, SynapsConfig};
 pub use error::{Result, RuntimeError};
+pub use host::{EngineHost, HostOpts, HostParts};
 pub use runtime::{AgentEvent, LlmEvent, Runtime, SessionEvent, StreamEvent};
 pub use serde_json::Value;
 pub use session::{

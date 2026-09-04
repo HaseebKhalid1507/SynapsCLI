@@ -687,8 +687,8 @@ fn parse_comma_list(val: &str) -> Vec<String> {
         .collect()
 }
 
-fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
-    write_config_value(key, &values.join(", "))
+fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> {
+    write_config_value_locked(key, &values.join(", "))
 }
 
 /// Parse shell.* configuration keys and update the ShellConfig.
@@ -1174,10 +1174,54 @@ pub fn read_config_value(key: &str) -> Option<String> {
     None
 }
 
+/// Exclusive advisory lock on `<config>.lock`, held around every
+/// read-modify-write of the config file (same pattern as `auth.json`).
+/// Two writers (`/settings` in two processes, a `/model` favorite toggle
+/// racing a settings edit) no longer lose each other's updates.
+///
+/// Held for the RMW only (< 1 ms); readers (`load_config`) never take it —
+/// they already tolerate the atomic rename. `SYNAPS_CONFIG_LOCK=0` bypasses.
+///
+/// NOT reentrant: flock on a fresh fd of the same file from the same process
+/// conflicts on Linux. Callers that already hold the guard must use the
+/// `_locked` inner fns.
+struct ConfigLock {
+    _file: Option<std::fs::File>,
+}
+
+impl ConfigLock {
+    fn acquire() -> std::io::Result<Self> {
+        if std::env::var("SYNAPS_CONFIG_LOCK").as_deref() == Ok("0") {
+            return Ok(Self { _file: None });
+        }
+        use fs4::fs_std::FileExt;
+        let lock_path = resolve_write_path("config").with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let file = open.open(&lock_path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { _file: Some(file) })
+    }
+}
+
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
 /// Replaces the first existing line that matches the key, or appends if absent.
 /// Preserves comments and unknown keys. Writes atomically via temp file + rename.
 pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
+    write_config_value_locked(key, value)
+}
+
+/// The RMW body; caller holds [`ConfigLock`].
+fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -1232,19 +1276,21 @@ pub fn add_favorite_model(id: &str) -> std::io::Result<()> {
     if trimmed.is_empty() {
         return Ok(());
     }
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     if !values.iter().any(|v| v == trimmed) {
         values.push(trimmed.to_string());
         values.sort();
     }
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Remove a favorite model id (`provider/model`) from config.
 pub fn remove_favorite_model(id: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     values.retain(|v| v != id.trim());
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Return whether a model id is marked as favorite.
@@ -1987,6 +2033,77 @@ context_window = 200k\n\
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("model = claude-opus-4-6"));
         assert!(contents.contains("theme = dracula"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_concurrent_writers_lose_nothing() {
+        let home = make_test_home("concurrent");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "# keep\n").unwrap();
+
+        // HOME is process-global; set it for the whole test, not per thread.
+        with_home(&home, || {
+            let a = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("a_key", &i.to_string()).unwrap();
+                }
+            });
+            let b = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("b_key", &i.to_string()).unwrap();
+                }
+            });
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("# keep"), "{contents}");
+        assert!(contents.contains("a_key = 199"), "{contents}");
+        assert!(contents.contains("b_key = 199"), "{contents}");
+        assert_eq!(contents.matches("a_key").count(), 1);
+        assert_eq!(contents.matches("b_key").count(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = home.join(".synaps-cli/config.lock");
+            let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_lock_kill_switch_still_writes() {
+        let home = make_test_home("lock-off");
+        let cfg = home.join(".synaps-cli/config");
+        std::env::set_var("SYNAPS_CONFIG_LOCK", "0");
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+        std::env::remove_var("SYNAPS_CONFIG_LOCK");
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        assert!(!home.join(".synaps-cli/config.lock").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn add_favorite_model_end_to_end_does_not_deadlock() {
+        let home = make_test_home("favorite-lock");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            add_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+            add_favorite_model("openai/gpt-5").unwrap();
+            remove_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("favorite_models = openai/gpt-5"), "{contents}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

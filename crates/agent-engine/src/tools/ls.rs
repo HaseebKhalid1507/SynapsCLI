@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext};
+use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -36,8 +36,11 @@ impl Tool for LsTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let path = expand_path(params["path"].as_str().unwrap_or("."));
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let path = resolve_path_in(
+            params["path"].as_str().unwrap_or("."),
+            ctx.capabilities.cwd.as_deref(),
+        );
 
         let output = Command::new("ls")
             .arg("-lah")

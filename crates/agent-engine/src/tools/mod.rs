@@ -21,6 +21,8 @@ mod powershell;
 mod read;
 mod secret_prompt;
 mod subagent;
+#[doc(hidden)]
+pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
 
 pub mod activation;
@@ -67,7 +69,7 @@ pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
-pub(crate) use util::{expand_path, strip_ansi, NEXT_SUBAGENT_ID};
+pub(crate) use util::{resolve_path_in, strip_ansi, NEXT_SUBAGENT_ID};
 
 // Facade: expose finalize internals for integration tests without making the
 // subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
@@ -123,6 +125,10 @@ pub struct ToolCapabilities {
     /// while `status`/`disable` still answer deterministically `Off`
     /// (memory off requires no infrastructure).
     pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
+    /// Per-session working directory (Phase 2 daemons serve sessions from N
+    /// directories in one process). `None` = inherit the process cwd — the
+    /// only value Phase 1 ever sets, so behaviour is byte-identical.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Configuration limits and timeouts.

@@ -35,7 +35,8 @@ mod xai;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use broker::{
-    broker_from_source, global_broker, preflight_cloud_capability, set_global_broker, AccessToken,
+    broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,
+    set_global_broker, AccessToken,
     BrokerError, CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream,
     ProxyMethod, ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
     MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES,

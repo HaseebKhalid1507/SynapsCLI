@@ -51,6 +51,9 @@ pub(super) struct StreamSession {
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    /// Conversation id keying the `on_session_start` injection. `None`
+    /// (workers) reads nothing.
+    pub(super) session_id: Option<String>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -256,6 +259,7 @@ impl StreamMethods {
             subagent_registry,
             event_queue,
             hook_bus,
+            session_id,
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
@@ -444,11 +448,14 @@ impl StreamMethods {
             // the catalog generation since the retained set was built (e.g.
             // `connect_mcp_server` drained after the previous round),
             // rebuild it here — explicitly, deterministically, from the
-            // currently verified capabilities, with ZERO inherited
-            // activations (catalog drift invalidates exact activations by
-            // design). This is the ONLY rebuild site; individual calls
-            // never refresh it. The catalog snapshot cloned here feeds the
-            // passive discovery/activation capability context this round.
+            // currently verified capabilities. Exact activations whose
+            // record still matches its pinned digest+provenance are carried
+            // forward (re-issued at the new generation); drifted/removed
+            // ones are dropped. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores
+            // the zero-inherit rebuild. This is the ONLY rebuild site;
+            // individual calls never refresh it. The catalog snapshot cloned
+            // here feeds the passive discovery/activation capability context
+            // this round.
             let (tools_snapshot, catalog_snapshot) = {
                 let registry = tools.read().await;
                 {
@@ -456,7 +463,19 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = if progressive_tool_disclosure {
+                        if crate::tools::activation::carry_forward_enabled() {
+                            let (next, dropped) = set
+                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
+                            for d in &dropped {
+                                tracing::warn!(
+                                    tool = %d.id,
+                                    reason = ?d.reason,
+                                    "activation dropped at round-top rebuild"
+                                );
+                            }
+                            *set = next;
+                        } else {
+                            *set = if progressive_tool_disclosure {
                             crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
                                 tool_session_id.clone(),
                                 registry.catalog(),
@@ -467,6 +486,7 @@ impl StreamMethods {
                                 registry.catalog(),
                             )
                         };
+                        }
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -489,7 +509,11 @@ impl StreamMethods {
 
             // Session-scoped context in system: byte-identical across the
             // whole session, cache-safe by construction.
-            let injected_system: Option<String> = match hook_bus.session_injection().await {
+            let session_injection = match session_id.as_deref() {
+                Some(id) => hook_bus.session_injection_for(id).await,
+                None => None,
+            };
+            let injected_system: Option<String> = match session_injection {
                 Some(content) => Some(wrap_extension_context(
                     system_prompt.as_deref().unwrap_or_default(),
                     &content,
@@ -914,7 +938,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */ },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: None },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -1235,7 +1259,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */ },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: None },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -2125,6 +2149,7 @@ mod rich_output_tests {
             )),
             event_queue: Arc::new(crate::events::EventQueue::new(100)),
             hook_bus,
+            session_id: None,
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
