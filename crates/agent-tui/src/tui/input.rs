@@ -24,6 +24,9 @@ pub(super) enum InputAction {
     SettingsApply(&'static str, String),
     /// Models modal requested switching to a runtime model id.
     ModelsApply(String),
+    /// Models modal "trust" action → `Set{GrantWorkerModel}` (result ignored,
+    /// as the direct `grant_worker_model` call was).
+    GrantWorkerModel(String),
     /// Effort lightbox requested applying a reasoning level (string form).
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
@@ -65,7 +68,7 @@ pub(super) enum InputAction {
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
-    runtime: &synaps_cli::Runtime,
+    runtime: &impl agent_engine::session::RuntimeRead,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
@@ -552,7 +555,11 @@ fn route_effort(event: Event, app: &mut App) -> InputAction {
 /// another modal (§6), so the `InputAction` is returned directly — the
 /// `PaneOutcome` mapping above is realized inline, matching the P7.4
 /// `route_help_find` shape.
-fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> InputAction {
+fn route_models(
+    event: Event,
+    app: &mut App,
+    runtime: &impl agent_engine::session::RuntimeRead,
+) -> InputAction {
     // Invariant (checked by the tripwire): top() == Models ⇒ models is Some.
     let Some(state) = &mut app.models else {
         return InputAction::None;
@@ -575,8 +582,7 @@ fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> I
                 // so subagent dispatch honors the grant this session. The
                 // config favorite is already persisted; a policy refusal (e.g.
                 // malformed ID) must not break the picker interaction.
-                let _ = runtime.grant_worker_model(&model);
-                InputAction::None
+                InputAction::GrantWorkerModel(model)
             }
             super::models::InputOutcome::ExpandProvider(provider) => {
                 InputAction::ModelsExpandProvider(provider)
@@ -646,7 +652,7 @@ fn route_plugins(event: Event, app: &mut App) -> InputAction {
 fn route_settings(
     event: Event,
     app: &mut App,
-    runtime: &synaps_cli::Runtime,
+    runtime: &impl agent_engine::session::RuntimeRead,
     registry: &Arc<CommandRegistry>,
 ) -> InputAction {
     // Invariant (checked by the tripwire): top() == Settings | PluginEditor ⇒

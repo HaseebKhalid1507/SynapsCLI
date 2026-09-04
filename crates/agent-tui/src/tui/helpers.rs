@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use super::app::{App, ChatMessage};
-use super::settings;
+use super::{session_link, settings};
 
 /// Decide whether to repaint on this event-loop iteration.
 ///
@@ -31,19 +31,38 @@ pub(super) fn should_draw(
 ///
 /// The runtime mutation is delegated to the macro-generated dispatch in
 /// `settings/defs.rs` — single source of truth for schema + apply.
-pub(super) fn apply_setting(
+pub(super) async fn apply_setting(
     key: &'static str,
     value: &str,
     app: &mut App,
-    runtime: &mut synaps_cli::Runtime,
+    link: &mut session_link::SessionLink,
 ) {
-    // Runtime mutation (generated from settings/defs.rs).
-    // On Err: set row_error and do NOT write to config — the value was rejected.
-    if let Err(msg) = settings::defs::apply_setting_dispatch(key, value, runtime, app) {
-        if let Some(st) = app.settings.as_mut() {
-            st.row_error = Some((key.to_string(), msg));
+    // Resolve (generated from settings/defs.rs). Runtime keys round-trip
+    // through `Set{id}`; on Err/rejection: set row_error and do NOT write to
+    // config — the value was rejected.
+    match settings::defs::apply_setting_dispatch(key, value, app) {
+        settings::defs::SettingApply::Local(Ok(())) => {}
+        settings::defs::SettingApply::Local(Err(msg)) => {
+            if let Some(st) = app.settings.as_mut() {
+                st.row_error = Some((key.to_string(), msg));
+            }
+            return;
         }
-        return;
+        settings::defs::SettingApply::Session(setting) => match link.set_checked(setting).await {
+            Ok(applied) => {
+                if key == "context_window" {
+                    // Also update the bar denominator immediately so the UI
+                    // reflects the change.
+                    app.last_turn_context_window = applied.view.context_window;
+                }
+            }
+            Err(msg) => {
+                if let Some(st) = app.settings.as_mut() {
+                    st.row_error = Some((key.to_string(), msg));
+                }
+                return;
+            }
+        },
     }
 
     // Keep the embedded session in sync with settings changes so resume sees
@@ -51,7 +70,7 @@ pub(super) fn apply_setting(
     if key == "thinking" {
         app.session.thinking_level = value.to_string();
     } else if key == "model" {
-        app.session.model = runtime.model().to_string();
+        app.session.model = link.view().model.clone();
     }
 
     // `skills` is internal — not persisted via write_config_value.

@@ -1,6 +1,46 @@
 use synaps_cli::pricing::calculate_cost_optional_split;
 use synaps_cli::Session;
 
+/// `SessionHeader` → the `Session` the TUI mirrors (`App.session`). Never
+/// carries `api_messages` — the actor owns the journal.
+pub(crate) fn session_from_header(h: &agent_engine::session::SessionHeader) -> Session {
+    let mut s = Session::new(&h.model, &h.thinking_level, h.system_prompt.as_deref());
+    apply_header(&mut s, h);
+    s
+}
+
+/// `SessionEventWire::CompactionApplied` fields, parked until the
+/// successor `Conversation` lands.
+pub(crate) struct CompactionApplied {
+    pub previous_session_id: String,
+    /// The successor id (also carried by the following `Conversation`).
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub chains_advanced: Vec<String>,
+    pub queued_restored: Option<String>,
+    pub msg_count: usize,
+}
+
+/// `SessionEventWire::Resumed` fields, parked until the `Conversation`.
+pub(crate) struct ResumePending {
+    pub old_id: String,
+    pub new_id: String,
+    pub via: Option<String>,
+    pub clamp_notice: Option<String>,
+}
+
+pub(crate) fn apply_header(s: &mut Session, h: &agent_engine::session::SessionHeader) {
+    s.id = h.id.clone();
+    s.title = h.title.clone();
+    s.name = h.name.clone();
+    s.model = h.model.clone();
+    s.thinking_level = h.thinking_level.clone();
+    s.system_prompt = h.system_prompt.clone();
+    s.created_at = h.created_at;
+    s.updated_at = h.updated_at;
+    s.parent_session = h.parent_session.clone();
+}
+
 // Type re-export shims from slice (a). Kept this release — deleting is churn
 // for no gain. One-release grace per design §5(f).
 // TODO(P9-followup): drop re-exports; callers should import from transcript directly.
@@ -119,17 +159,24 @@ pub(crate) struct App {
     /// arm; `is_active()` is mirrored by `modal_stack.contains(SecretPrompt)`
     /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
     pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
-    /// Background compaction task — polled in the event loop so /compact doesn't block.
-    pub(crate) compact_task: Option<
-        tokio::task::JoinHandle<
-            Result<
-                synaps_cli::runtime::compaction::CompactionOutcome,
-                synaps_cli::error::RuntimeError,
-            >,
-        >,
-    >,
-    /// Events buffered during streaming — injected into api_messages after stream completes
-    pub(crate) pending_events: Vec<String>,
+    /// Compaction in flight on the actor (`CompactionStarted` … `Applied`/
+    /// `Failed`/`Cancelled`). Client-side guard for `/compact` and Submit.
+    pub(crate) compacting: bool,
+    /// Mirror of the actor's buffered-during-streaming event count
+    /// (`ConversationSnapshot.pending_events_len`).
+    pub(crate) pending_events_len: usize,
+    /// Last `SubagentRows` from the actor — the tick arm reconciles the HUD
+    /// from this cache at the same 1 Hz cadence the registry read had.
+    pub(crate) subagent_rows: Vec<synaps_cli::tools::SubagentDisplayRow>,
+    /// `CompactionApplied` waiting for the `Conversation` that carries the
+    /// successor's messages (then the "✓ compacted …" lines are pushed).
+    pub(crate) compaction_applied: Option<CompactionApplied>,
+    /// `Resumed` reply waiting for the `Conversation` that carries the
+    /// resumed session's messages (then the "switched from …" line).
+    pub(crate) resume_pending: Option<ResumePending>,
+    /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
+    /// Submit gives the editor its text back).
+    pub(crate) last_submitted: Option<String>,
     /// Consecutive auto-triggered model turns since the last real user send.
     /// Incremented by the event-reactor wake path; reset on Submit / queued user message.
     /// When this reaches AUTO_TURN_CAP the reactor parks and shows a system message.
@@ -325,8 +372,12 @@ impl App {
             // P7.8: folded off the `run()` local; production wires the mpsc
             // channel separately (mod.rs). Starts empty (no active prompt).
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
-            compact_task: None,
-            pending_events: Vec::new(),
+            compacting: false,
+            pending_events_len: 0,
+            subagent_rows: Vec::new(),
+            compaction_applied: None,
+            resume_pending: None,
+            last_submitted: None,
             consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
             catalog_overrides: std::collections::BTreeMap::new(),
@@ -457,20 +508,22 @@ impl App {
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
     ///
-    pub(crate) async fn save_session(&mut self) {
-        if self.api_messages.is_empty() {
-            return;
-        }
-        self.session.api_messages = self.api_messages.clone();
-        self.session.total_input_tokens = self.total_input_tokens;
-        self.session.total_output_tokens = self.total_output_tokens;
-        self.session.session_cost = self.session_cost;
-        self.session.abort_context = self.abort_context.clone();
-        self.session.updated_at = chrono::Utc::now();
-        self.session.auto_title();
-        if let Err(e) = self.session.save().await {
-            eprintln!("\x1b[31m[ERROR] Failed to save session: {}\x1b[0m", e);
-        }
+    /// Replace the conversation mirrors from a `Conversation(_)` envelope
+    /// (PLAN-phase3 §2.4: replace, never merge). Per-turn `input_tokens`/
+    /// `output_tokens`, the TTL-split cache counters and `api_call_count`
+    /// are client-side per-turn state and stay as `Stream(Usage)` left them.
+    pub(crate) fn apply_conversation(&mut self, conv: &agent_engine::session::ConversationSnapshot) {
+        self.api_messages = conv.api_messages.clone();
+        self.total_input_tokens = conv.tokens.input;
+        self.total_output_tokens = conv.tokens.output;
+        self.total_cache_read_tokens = conv.tokens.cache_read;
+        self.total_cache_creation_tokens = conv.tokens.cache_creation;
+        self.session_cost = conv.cost;
+        self.abort_context = conv.abort_context.clone();
+        self.queued_message = conv.queued_message.clone();
+        self.pending_events_len = conv.pending_events_len;
+        self.consecutive_auto_turns = conv.consecutive_auto_turns;
+        apply_header(&mut self.session, &conv.header);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -636,51 +689,6 @@ impl App {
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
         self.transcript.on_tool_result(tool_id, result);
         self.needs_redraw = true;
-    }
-
-    /// Capture all assistant output since the last user message as abort context.
-    /// This gets injected into the next user message so the model knows what it
-    /// was doing before the abort.
-    pub(crate) fn capture_abort_context(&mut self) {
-        let mut parts: Vec<String> = Vec::new();
-
-        // Walk backwards from the end to find content since last user message
-        for tmsg in self.transcript.messages().iter().rev() {
-            match &tmsg.msg {
-                ChatMessage::User(_) => break, // stop at the last user message
-                ChatMessage::Thinking(t) if !t.is_empty() => {
-                    // Truncate thinking to avoid bloating context
-                    let preview: String = t.chars().take(500).collect();
-                    parts.push(format!("[thinking]: {}", preview));
-                }
-                ChatMessage::Text(t) if !t.is_empty() => {
-                    parts.push(format!("[response]: {}", t));
-                }
-                ChatMessage::ToolUse {
-                    tool_name, input, ..
-                } => {
-                    // Truncate input to keep context lean
-                    let input_preview: String = input.chars().take(200).collect();
-                    parts.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
-                }
-                ChatMessage::ToolResult { content, .. } if !content.is_empty() => {
-                    let preview: String = content.chars().take(300).collect();
-                    parts.push(format!("[tool_result]: {}", preview));
-                }
-                _ => {}
-            }
-        }
-
-        if parts.is_empty() {
-            self.abort_context = None;
-            return;
-        }
-
-        parts.reverse(); // chronological order
-        self.abort_context = Some(format!(
-            "[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]",
-            parts.join("\n")
-        ));
     }
 
     pub(crate) fn history_up(&mut self) {

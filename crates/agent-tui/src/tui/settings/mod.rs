@@ -520,21 +520,28 @@ mod thinking_options_tests {
         let mut rt = synaps_cli::Runtime::new_headless();
         let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
 
-        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.5", &mut rt, &mut app)
-            .unwrap();
+        // The dispatch yields the `Set{Model}`; the actor applies it. Here
+        // the headless runtime plays the actor.
+        let mut apply = |rt: &mut synaps_cli::Runtime, model: &str| {
+            match super::defs::apply_setting_dispatch("model", model, &mut app) {
+                super::defs::SettingApply::Session(
+                    agent_engine::session::SessionSetting::Model { model },
+                ) => rt.set_model(model),
+                _ => panic!("model must resolve to Set{{Model}}"),
+            };
+        };
+        apply(&mut rt, "xai-auth/grok-4.5");
         assert_eq!(super::reasoning_type_for_model(rt.model()), "effort");
         assert_eq!(
             thinking_options_for_model(rt.model()),
             vec!["adaptive", "low", "medium", "high"]
         );
 
-        super::defs::apply_setting_dispatch("model", "xai-auth/grok-4.3", &mut rt, &mut app)
-            .unwrap();
+        apply(&mut rt, "xai-auth/grok-4.3");
         assert_eq!(super::reasoning_type_for_model(rt.model()), "intrinsic");
         assert_eq!(thinking_options_for_model(rt.model()), vec!["adaptive"]);
 
-        super::defs::apply_setting_dispatch("model", "openai-codex/gpt-5.6-sol", &mut rt, &mut app)
-            .unwrap();
+        apply(&mut rt, "openai-codex/gpt-5.6-sol");
         assert_eq!(
             super::reasoning_type_for_model(rt.model()),
             "effort (named)"

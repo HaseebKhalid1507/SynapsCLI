@@ -1871,18 +1871,19 @@ impl SessionActor {
             SessionCommand::Resync { .. } => self.emit(SessionEventWire::SystemNotice(
                 "resync not supported yet".into(),
             )),
-            // Phase-3 stubs: A3 (SubmitPrepared/PluginCommand/Resume), B1
-            // (Checkpoint), B3 (KeepWarm) fill these in.
-            SessionCommand::SubmitPrepared { .. } => self.emit(SessionEventWire::SystemNotice(
-                "submit_prepared: not implemented in this build".into(),
-            )),
-            SessionCommand::PluginCommand { id, .. } => self.emit(SessionEventWire::QueryResult {
+            // A3 bodies live in actor_cmds.rs; B1 (Checkpoint), B3 (KeepWarm)
+            // fill in the rest.
+            SessionCommand::SubmitPrepared {
+                messages,
+                user_text,
+            } => self.submit_prepared(messages, user_text).await,
+            SessionCommand::PluginCommand {
                 id,
-                value: serde_json::json!({ "kind": "error", "text": "plugin_command: not implemented in this build" }),
-            }),
-            SessionCommand::Resume { .. } => self.emit(SessionEventWire::SystemNotice(
-                "resume: not implemented in this build".into(),
-            )),
+                plugin,
+                name,
+                arg,
+            } => self.plugin_command(id, plugin, name, arg).await,
+            SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::Park => self.park().await,
             SessionCommand::KeepWarm { on } => {

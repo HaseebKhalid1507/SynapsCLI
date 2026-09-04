@@ -684,7 +684,8 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
 
 /// The process-global HTTP client for `EngineHost` (same builder as
 /// `Runtime::new`).
-pub(crate) fn build_host_http_client() -> Result<Client> {
+/// The host's HTTP client builder (also used by the attach-TUI client, A4).
+pub fn build_host_http_client() -> Result<Client> {
     build_http_client(HTTP_READ_TIMEOUT)
         .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))
 }

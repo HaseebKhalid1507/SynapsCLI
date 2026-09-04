@@ -191,7 +191,8 @@ fn s9_1_no_frontend_splices_summaries_locally() {
         "src/cmd/chat.rs",
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
-        "crates/agent-tui/src/tui/loop_arms.rs",
+        // The TUI compacts on the SessionActor since phase 3 (A2).
+        "crates/agent-engine/src/session/actor.rs",
     ] {
         let src = std::fs::read_to_string(format!("{root}/{rel}")).unwrap();
         assert!(

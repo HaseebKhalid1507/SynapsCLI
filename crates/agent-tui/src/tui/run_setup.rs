@@ -9,15 +9,42 @@
 
 use super::*;
 
+use std::sync::Arc;
 use std::time::Instant;
-use synaps_cli::{CancellationToken, Result, StreamEvent};
+use synaps_cli::Result;
+
+use agent_engine::host::{EngineHost, HostOpts};
+use agent_engine::session::{
+    AttachMode, AttachSnapshot, ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire,
+    LocalTransport, SessionConfig,
+};
+use session_link::{PromptBridge, SessionLink};
+
+/// How this TUI reaches its session (PLAN-phase3 §3.2).
+pub(crate) enum TransportMode {
+    /// In-process: the `EngineHost` + `SessionActor` live in this process
+    /// (the host is kept alive for the loop's lifetime).
+    Local {
+        #[allow(dead_code)]
+        host: Arc<EngineHost>,
+    },
+    /// Over the daemon socket (A4): no host, no runtime, no extension host.
+    Socket,
+}
 
 /// Everything `run()`'s event loop and teardown consume from the boot
 /// prologue. Fields are handed back by value so `run()` owns them exactly as
 /// it did when they were locals — the loop's `&mut` borrows are unchanged.
 pub(crate) struct RunContext {
     pub app: App,
-    pub runtime: synaps_cli::Runtime,
+    /// The session, behind a transport (in-process `LocalTransport` today;
+    /// `SocketTransport` for `--attach`).
+    pub link: SessionLink,
+    /// Client-local HTTP client for catalog/model-list fetches (the same
+    /// builder the host uses).
+    pub http: reqwest::Client,
+    pub prompt_bridge: PromptBridge,
+    pub mode: TransportMode,
     pub config: synaps_cli::SynapsConfig,
     pub registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     pub keybind_registry:
@@ -32,18 +59,16 @@ pub(crate) struct RunContext {
     pub event_reader: EventStream,
     pub shutdown_signal_rx: tokio::sync::mpsc::UnboundedReceiver<signals::ShutdownSignal>,
     pub shutdown_signal_task: signals::SignalHandle,
-    pub stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>>,
-    pub secret_prompt_handle: synaps_cli::tools::SecretPromptHandle,
     pub secret_prompt_rx: std::sync::Arc<
         std::sync::Mutex<
             tokio::sync::mpsc::UnboundedReceiver<synaps_cli::tools::SecretPromptRequest>,
         >,
     >,
-    pub cancel_token: Option<CancellationToken>,
-    pub steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    pub background: synaps_cli::engine::setup::BackgroundTasks,
-    pub ext_mgr_shared:
+    /// In-process only (`Some` under `TransportMode::Local`): the host's
+    /// extension manager, for `/extensions` and interactive plugin commands.
+    pub ext_mgr_shared: Option<
         std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    >,
     pub boot_fx_sent: bool,
     pub exit_fx_sent: bool,
     pub last_draw: Instant,
@@ -57,60 +82,42 @@ pub(crate) async fn run_setup(
     profile: Option<String>,
     no_extensions: bool,
 ) -> Result<RunContext> {
-    // ── Engine boot ──
-    let boot = synaps_cli::engine::setup::boot(synaps_cli::engine::setup::EngineOpts {
-        continue_session: continue_session.clone(),
-        system,
-        prompt_manifest,
+    // ── Engine boot: host + one session on the actor, attached in-process ──
+    let host = EngineHost::boot_and_install(HostOpts {
         profile,
         no_extensions,
     })
     .await?;
+    let handle = host
+        .create_session(SessionConfig {
+            continue_session,
+            system,
+            prompt_manifest,
+            cwd: None,
+            auto_approve_confirms: false,
+            model_override: None,
+            persist: true,
+            auto_compact: false,
+            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+            await_extensions: false,
+            keep_warm: false,
+        })
+        .await?;
+    let (transport, snapshot) =
+        LocalTransport::attach_with(handle, ClientMeta::new(ClientKind::Tui), AttachMode::Mirror)
+            .await
+            .map_err(|e| synaps_cli::RuntimeError::Config(format!("attach: {e}")))?;
 
-    let runtime = boot.runtime;
-    let config = boot.config;
-    let registry = boot.registry;
-    let keybind_registry = boot.keybind_registry;
-    let mcp_server_count = boot.mcp_server_count;
-    let system_prompt_path = boot.system_prompt_path;
+    let config: synaps_cli::SynapsConfig = (**host.config()).clone();
+    let registry = Arc::clone(host.command_registry());
+    let keybind_registry = Arc::clone(host.keybind_registry());
+    let mcp_server_count = host.mcp_server_count();
+    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
+    let http = host.parts().client.clone();
+    let ext_mgr_shared = Arc::clone(host.ext_manager());
 
-    // Build App from engine boot results
-    let mut app = if boot.continued {
-        let mut app = App::new_with_clock(boot.session.clone(), clock::TuiClock::real());
-        app.api_messages = boot.api_messages;
-        app.total_input_tokens = boot.total_input_tokens;
-        app.total_output_tokens = boot.total_output_tokens;
-        app.session_cost = boot.session_cost;
-        app.abort_context = boot.abort_context;
-        // mem::take avoids deep-cloning the full history just to satisfy
-        // the borrow checker (P5 in REVIEW.md).
-        let msgs = std::mem::take(&mut app.api_messages);
-        rebuild_display_messages(&msgs, &mut app);
-        app.api_messages = msgs;
-        app.push_msg(ChatMessage::System(format!(
-            "resumed session {}",
-            boot.session.id
-        )));
-        if let Some(ref info) = boot.continue_info {
-            if let Some(ref via) = info.resolved_via {
-                app.push_msg(ChatMessage::System(format!(
-                    "  ↳ resolved via {} '{}'",
-                    via, info.query
-                )));
-            }
-        }
-        if app.abort_context.is_some() {
-            app.push_msg(ChatMessage::System(
-                "⚠ abort context from previous session will be injected into next message"
-                    .to_string(),
-            ));
-        }
-        app
-    } else {
-        App::new_with_clock(boot.session, clock::TuiClock::real())
-    };
+    let mut app = app_from_snapshot(&snapshot);
     app.keybinds = Some(keybind_registry.clone());
-    app.last_turn_context_window = runtime.context_window();
 
     // Surface config parse warnings once at startup (unknown keys, bad values).
     for w in &config.warnings {
@@ -139,6 +146,103 @@ pub(crate) async fn run_setup(
         );
     }
 
+    let mut ctx = finish_setup(
+        app,
+        Box::new(transport),
+        http,
+        TransportMode::Local { host },
+        config,
+        registry,
+        keybind_registry,
+        system_prompt_path,
+        Some(ext_mgr_shared),
+    )
+    .await?;
+
+    // Legacy sidecar key migration
+    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&ctx.registry.lifecycle_claims());
+
+    if !no_extensions {
+        let session_id_for_hook = ctx.app.session.id.clone();
+        ctx.app.extension_loader_running = true;
+        ctx.app.toasts.upsert(
+            toast::Toast::new("extension-loader", "Discovering extensions…")
+                .titled("Extensions")
+                .at(toast::ToastPosition::TOP_CENTER)
+                .ttl(None),
+        );
+        // on_session_start is emitted by the extension loader once
+        // subscribers exist — same moment, same bus as before the port.
+        // (When the actor's `await_extensions=false` waiter lands (B1) this
+        // becomes `None` — the actor emits it.)
+        synaps_cli::extensions::loader::spawn_discover_and_load(
+            std::sync::Arc::clone(ctx.ext_mgr_shared.as_ref().expect("local mode")),
+            ctx.app.extension_loader_tx.clone(),
+            Some(session_id_for_hook),
+        );
+    }
+    Ok(ctx)
+}
+
+/// Build `App` from the attach snapshot — the same lines and texts the
+/// `EngineBoot`-based construction produced (`continued` branch included).
+pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
+    let conv = &snapshot.conversation;
+    let session = app::session_from_header(&conv.header);
+    let mut app = if snapshot.meta.continued {
+        let mut app = App::new_with_clock(session, clock::TuiClock::real());
+        app.apply_conversation(conv);
+        // mem::take avoids deep-cloning the full history just to satisfy
+        // the borrow checker (P5 in REVIEW.md).
+        let msgs = std::mem::take(&mut app.api_messages);
+        rebuild_display_messages(&msgs, &mut app);
+        app.api_messages = msgs;
+        app.push_msg(ChatMessage::System(format!(
+            "resumed session {}",
+            conv.header.id
+        )));
+        if let Some(ref info) = snapshot.meta.continue_info {
+            if let Some(ref via) = info.resolved_via {
+                app.push_msg(ChatMessage::System(format!(
+                    "  ↳ resolved via {} '{}'",
+                    via, info.query
+                )));
+            }
+        }
+        if app.abort_context.is_some() {
+            app.push_msg(ChatMessage::System(
+                "⚠ abort context from previous session will be injected into next message"
+                    .to_string(),
+            ));
+        }
+        app
+    } else {
+        App::new_with_clock(session, clock::TuiClock::real())
+    };
+    app.last_turn_context_window = snapshot.view.context_window;
+    app
+}
+
+/// Terminal + render thread + channels — shared by the in-process boot and
+/// the socket attach (`run_attached`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish_setup(
+    mut app: App,
+    transport: Box<dyn ClientTransport>,
+    http: reqwest::Client,
+    mode: TransportMode,
+    config: synaps_cli::SynapsConfig,
+    registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    keybind_registry: std::sync::Arc<
+        std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>,
+    >,
+    system_prompt_path: std::path::PathBuf,
+    ext_mgr_shared: Option<
+        std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    >,
+) -> Result<RunContext> {
+    let link = SessionLink::new(transport);
+    app.keybinds = Some(keybind_registry.clone());
     // ── Terminal setup + render thread ──
     //
     // The Terminal is moved into the render thread immediately after creation.
@@ -188,42 +292,12 @@ pub(crate) async fn run_setup(
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
-    let stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-    let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
+    let prompt_bridge = PromptBridge::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
     // P7.8: the secret-prompt queue now lives on `app.secret_prompts` (§5).
     // The mpsc channel wiring above is unchanged; only the queue moved onto
     // App so the pane handler / harness share production state.
-    let cancel_token: Option<CancellationToken> = None;
-    let steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
-
-    // ── Engine-managed background tasks (inbox watcher, socket, extensions) ──
-    let background = boot.background;
-    let ext_mgr_shared = boot.ext_manager;
-    let session_id_for_hook = app.session.id.clone();
-
-    // Legacy sidecar key migration
-    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
-
-    if !boot.no_extensions {
-        app.extension_loader_running = true;
-        app.toasts.upsert(
-            toast::Toast::new("extension-loader", "Discovering extensions…")
-                .titled("Extensions")
-                .at(toast::ToastPosition::TOP_CENTER)
-                .ttl(None),
-        );
-        synaps_cli::extensions::loader::spawn_discover_and_load(
-            std::sync::Arc::clone(&ext_mgr_shared),
-            app.extension_loader_tx.clone(),
-            Some(session_id_for_hook.clone()),
-        );
-    }
-
-    // on_session_start is emitted by the extension loader once subscribers
-    // exist — not at engine boot, where it reached nobody. See loader.rs.
-
     // ── Event loop ──
     // Track whether the render thread currently has an active boot or exit
     // effect.  The render thread owns the actual Effect values; we track
@@ -234,7 +308,10 @@ pub(crate) async fn run_setup(
 
     Ok(RunContext {
         app,
-        runtime,
+        link,
+        http,
+        prompt_bridge,
+        mode,
         config,
         registry,
         keybind_registry,
@@ -246,15 +323,54 @@ pub(crate) async fn run_setup(
         event_reader,
         shutdown_signal_rx,
         shutdown_signal_task,
-        stream,
-        secret_prompt_handle,
         secret_prompt_rx,
-        cancel_token,
-        steer_tx,
-        background,
         ext_mgr_shared,
         boot_fx_sent,
         exit_fx_sent,
         last_draw,
     })
+}
+
+/// The session envelope stream ended. In-process: the actor is gone — leave.
+/// Socket (A4): reconnect with backoff and re-mirror; `false` = give up.
+pub(crate) async fn try_reconnect(
+    app: &mut App,
+    link: &mut SessionLink,
+    mode: &TransportMode,
+) -> bool {
+    match mode {
+        TransportMode::Local { .. } => false,
+        TransportMode::Socket => {
+            let attach_mode = link.mode();
+            match link.transport_mut().reconnect(attach_mode).await {
+                Ok(snapshot) => {
+                    link.refresh_view();
+                    remirror(app, &snapshot);
+                    app.toasts.upsert(
+                        toast::Toast::new("reload", "reconnected").titled("Daemon"),
+                    );
+                    app.request_redraw();
+                    true
+                }
+                Err(e) => {
+                    app.push_msg(ChatMessage::Error(format!("connection lost: {e}")));
+                    app.request_redraw();
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Rebuild the transcript from an `AttachSnapshot` (reconnect / re-attach):
+/// the cancelled turn's partial text is gone by design (§2.8 step 7).
+pub(crate) fn remirror(app: &mut App, snapshot: &AttachSnapshot) {
+    app.transcript.clear();
+    app.invalidate();
+    app.apply_conversation(&snapshot.conversation);
+    let msgs = std::mem::take(&mut app.api_messages);
+    rebuild_display_messages(&msgs, &mut *app);
+    app.api_messages = msgs;
+    app.streaming = snapshot.streaming;
+    app.last_turn_context_window = snapshot.view.context_window;
 }
