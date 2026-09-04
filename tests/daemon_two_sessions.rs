@@ -20,12 +20,12 @@ async fn next(t: &mut SocketTransport) -> Envelope {
     tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("timely").expect("open")
 }
 
-/// Everything up to and including the next `Conversation`.
+/// Everything up to and including `Idle` (stream ended, no auto-turn followed).
 async fn turn(t: &mut SocketTransport) -> Vec<Envelope> {
     let mut seen = Vec::new();
     loop {
         let e = next(t).await;
-        let done = matches!(e.event, SessionEventWire::Conversation(_));
+        let done = matches!(e.event, SessionEventWire::Idle);
         seen.push(e);
         if done {
             return seen;
@@ -97,8 +97,6 @@ async fn two_sessions_one_daemon_isolated() {
     let sb = turn(&mut b).await;
 
     for (s, who) in [(&sa, "a"), (&sb, "b")] {
-        let kinds: Vec<String> = s.iter().map(|e| format!("{:?}", e.event).chars().take(60).collect()).collect();
-        eprintln!("{who}: {kinds:#?}");
         assert!(matches!(s[0].event, SessionEventWire::TurnStarted { .. }), "{who}: {:?}", s[0].event);
         assert_eq!(text_of(s), "hi", "{who}");
         assert!(s.iter().any(|e| matches!(e.event, SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done)))), "{who}");
@@ -109,9 +107,14 @@ async fn two_sessions_one_daemon_isolated() {
     assert!(sa.iter().all(|e| &e.session_id == a.session_id()));
     assert!(sb.iter().all(|e| &e.session_id == b.session_id()));
     // the Conversation snapshot is per session: one user turn each
-    let conv = |s: &[Envelope]| match &s.last().unwrap().event {
-        SessionEventWire::Conversation(c) => c.api_messages.clone(),
-        o => panic!("{o:?}"),
+    let conv = |s: &[Envelope]| {
+        s.iter()
+            .rev()
+            .find_map(|e| match &e.event {
+                SessionEventWire::Conversation(c) => Some(c.api_messages.clone()),
+                _ => None,
+            })
+            .expect("Conversation snapshot")
     };
     let ma = conv(&sa);
     let mb = conv(&sb);
