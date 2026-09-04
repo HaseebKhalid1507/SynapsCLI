@@ -580,6 +580,7 @@ mod tests {
             serde_json::json!({"command": "cat huge.log"}),
             "RAW 10k lines".to_string(),
             30_000,
+            None,
         )
         .await;
 
@@ -597,6 +598,7 @@ mod tests {
             serde_json::json!({}),
             "RAW".to_string(),
             30_000,
+            None,
         )
         .await;
 
@@ -679,6 +681,7 @@ mod tests {
             serde_json::json!({}),
             "ORIGINAL".to_string(),
             30_000,
+            None,
         )
         .await;
 
@@ -1137,6 +1140,7 @@ mod tests {
             serde_json::json!({"command": "yes hello | head -c 150000"}),
             output,
             30_000,
+            None,
         )
         .await;
 
@@ -1173,6 +1177,7 @@ mod tests {
             serde_json::json!({}),
             "tiny original".to_string(),
             30_000,
+            None,
         )
         .await;
 
@@ -1197,6 +1202,7 @@ mod tests {
             serde_json::json!({}),
             huge.clone(),
             30_000,
+            None,
         )
         .await;
 
@@ -1223,6 +1229,7 @@ mod tests {
             serde_json::json!({}),
             multibyte,
             30_000,
+            None,
         )
         .await;
         assert!(result.is_char_boundary(result.len()));
@@ -1249,6 +1256,7 @@ mod tests {
             serde_json::json!({}),
             "orig".to_string(),
             30_000,
+            None,
         )
         .await;
         assert!(result2.is_char_boundary(result2.len()));

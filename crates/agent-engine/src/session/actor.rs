@@ -26,7 +26,6 @@ use crate::engine::reactor::{
 };
 use crate::engine::session::ConversationState;
 use crate::engine::setup::BackgroundTasks;
-use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
@@ -185,22 +184,10 @@ impl SessionActor {
             cfg.cwd.clone(),
         );
 
-        // C2 replaces — keyed on_session_start injection, inlined from
-        // extensions/loader.rs (spawn_discover_and_load's post-discovery block).
-        {
-            let hook_bus = Arc::clone(runtime.hook_bus());
-            let event = HookEvent::on_session_start(&sb.session.id);
-            if let HookResult::Inject { content } = hook_bus.emit(&event).await {
-                tracing::debug!(
-                    len = content.len(),
-                    "on_session_start injected session-scoped context"
-                );
-                hook_bus
-                    .set_session_injection_for(&sb.session.id, content)
-                    .await;
-            }
-        }
-        // C2 replaces — end
+        // C2: per-session on_session_start (keyed injection) once the
+        // process-level discovery is known-finished. Never re-runs discovery.
+        host.extensions_ready().await;
+        crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id).await;
 
         let id = SessionId::from(sb.session.id.clone());
         let meta = SessionMeta {
@@ -1050,20 +1037,15 @@ impl SessionActor {
             );
         }
 
-        // STEP 2: on_session_end — concurrent, fail-open, own budget.
-        let hook_event = HookEvent::on_session_end(&session_id, Some(api_messages));
-        if tokio::time::timeout(
+        // STEP 2 (C2): on_session_end — per session, concurrent, fail-open,
+        // own budget; clears this session's keyed injection.
+        crate::extensions::loader::emit_session_end(
+            self.runtime.hook_bus(),
+            &session_id,
+            Some(api_messages),
             budgets::HOOKS_TIMEOUT,
-            self.runtime.hook_bus().emit_concurrent(&hook_event),
         )
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                budget_secs = budgets::HOOKS_TIMEOUT_SECS,
-                "on_session_end hooks timed out — extensions may not have flushed"
-            );
-        }
+        .await;
 
         // STEP 3: bounded observability flush.
         if let Some(outcome) = self

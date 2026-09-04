@@ -40,6 +40,7 @@ fn spy_config(marker: &Path) -> McpServerConfig {
             format!("echo spawned >> {}", marker.display()),
         ],
         env: HashMap::new(),
+        shared: false,
     }
 }
 
@@ -614,4 +615,69 @@ fn batch_rejects_collision_with_existing_registry_tool() {
     assert_eq!(registry_snapshot(&registry), before);
     // The live builtin is untouched.
     assert!(registry.get("bash").is_some());
+}
+
+// ── daemon-mode phase 2 (C4): record_server_listing (write-back) ────────────
+
+#[test]
+fn record_server_listing_merges_sanitizes_and_locks() {
+    use agent_engine::mcp::descriptors::record_server_listing;
+
+    let dir = tmp_dir("writeback-merge");
+    let path = dir.join("mcp-descriptors.json");
+
+    // Fresh file.
+    let listing = vec![
+        CachedToolDescriptor {
+            name: "echo_tool".to_string(),
+            description: "x".repeat(TOOL_DESCRIPTION_MAX_BYTES + 50),
+            input_schema: sample_schema(),
+        },
+        CachedToolDescriptor {
+            name: "bad\u{0}name".to_string(),
+            description: String::new(),
+            input_schema: sample_schema(),
+        },
+        CachedToolDescriptor {
+            name: "not_object".to_string(),
+            description: String::new(),
+            input_schema: json!("string schema"),
+        },
+    ];
+    let recorded = record_server_listing(&path, "srv", "fp-1", &listing).unwrap();
+    assert_eq!(recorded, 1, "hostile entries dropped exactly as a load would");
+    let loaded = load_cache_from(&path).unwrap();
+    assert_eq!(loaded.servers["srv"].fingerprint, "fp-1");
+    assert_eq!(loaded.servers["srv"].tools.len(), 1);
+    assert!(loaded.servers["srv"].tools[0].description.len() <= TOOL_DESCRIPTION_MAX_BYTES);
+    assert!(path.with_file_name("mcp-descriptors.json.lock").exists());
+
+    // Merge: a second server does not clobber the first; same server replaces.
+    record_server_listing(&path, "other", "fp-o", &listing[..1]).unwrap();
+    record_server_listing(&path, "srv", "fp-2", &listing[..1]).unwrap();
+    let loaded = load_cache_from(&path).unwrap();
+    assert_eq!(loaded.servers.len(), 2);
+    assert_eq!(loaded.servers["srv"].fingerprint, "fp-2");
+    assert_eq!(loaded.servers["other"].fingerprint, "fp-o");
+
+    // Corrupt cache is replaced, not propagated.
+    std::fs::write(&path, b"{ not json").unwrap();
+    record_server_listing(&path, "srv", "fp-3", &listing[..1]).unwrap();
+    let loaded = load_cache_from(&path).unwrap();
+    assert_eq!(loaded.servers.len(), 1);
+    assert_eq!(loaded.servers["srv"].fingerprint, "fp-3");
+
+    // Invalid server name is refused typed.
+    assert!(matches!(
+        record_server_listing(&path, "bad\nname", "fp", &listing[..1]),
+        Err(DescriptorCacheError::Parse(_))
+    ));
+
+    // `shared` is excluded from the fingerprint.
+    let mut cfg = spy_config(&dir.join("marker"));
+    let fp_a = server_config_fingerprint(&cfg);
+    cfg.shared = true;
+    assert_eq!(server_config_fingerprint(&cfg), fp_a);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
