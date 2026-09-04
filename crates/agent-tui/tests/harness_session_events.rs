@@ -225,7 +225,7 @@ fn session_compaction_digest_matches_full() {
     use agent_engine::session::wire::ConversationDigest;
     use agent_engine::session::{ConversationSnapshot, SessionEventWire as S, SessionHeader};
 
-    let history: Vec<synaps_cli::SharedMessage> = vec![
+    let history: Vec<agent_engine::SharedMessage> = vec![
         std::sync::Arc::new(serde_json::json!({"role": "user", "content": "<context-summary>old</context-summary>"})),
         std::sync::Arc::new(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "after compaction text"}]})),
         std::sync::Arc::new(serde_json::json!({"role": "user", "content": "follow-up question"})),
