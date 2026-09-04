@@ -1023,6 +1023,7 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .set_session_id(Some(self.conv.session.id.clone()));
+                self.journal_id.store(Arc::new(self.conv.session.id.clone()));
                 self.emit(SessionEventWire::SystemNotice(format!(
                     "session cleared → {}",
                     &self.conv.session.id[..8.min(self.conv.session.id.len())]
