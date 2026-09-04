@@ -262,6 +262,9 @@ pub async fn execute_provider_tool_use(
             &tool_name,
             Some(&runtime_name),
             input.clone(),
+            // Extension-originated tool.invoke: no owning conversation on this
+            // path (ToolContext carries none) → `null`, as before.
+            None,
         )
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
@@ -293,6 +296,7 @@ pub async fn execute_provider_tool_use(
         input_for_hook,
         result,
         max_tool_output,
+        None,
     )
     .await;
 

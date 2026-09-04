@@ -184,6 +184,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         "bash",
         None,
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
+        None,
     )
     .await;
     let decision = synaps_cli::runtime::resolve_before_tool_call_decision(
@@ -244,6 +245,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         input,
         output,
         256 * 1024,
+        None,
     )
     .await;
     // No after_tool_call transform handler registered → output unchanged.
@@ -300,6 +302,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         json!({"command": "echo big"}),
         raw,
         256 * 1024,
+        None,
     )
     .await;
 
@@ -1667,4 +1670,139 @@ async fn on_session_start_injection_reaches_the_session() {
 
     manager.shutdown_all().await;
     std::env::remove_var("SYNAPS_SESSION_START_LOG");
+}
+
+// ── daemon-mode phase 2 (C1): session_id on tool/message hook events ─────────
+
+/// Installs the `session_id_echo_extension.py` fixture as a user plugin under
+/// `home` subscribed to every hook kind; returns the JSONL log path.
+fn install_session_id_echo_plugin(home: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let plugin_dir = home.join("plugins").join(name);
+    let log_path = plugin_dir.join("session-id.jsonl");
+    fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
+    fs::copy(
+        std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/session_id_echo_extension.py"),
+        plugin_dir.join("extensions/session_id_echo_extension.py"),
+    )
+    .unwrap();
+    fs::write(
+        plugin_dir.join(".synaps-plugin/plugin.json"),
+        format!(
+            r#"{{
+  "name": "{name}",
+  "version": "0.1.0",
+  "extension": {{
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/session_id_echo_extension.py"],
+    "permissions": ["tools.intercept", "privacy.llm_content", "session.lifecycle"],
+    "hooks": [
+      {{"hook": "before_tool_call"}},
+      {{"hook": "after_tool_call"}},
+      {{"hook": "before_message"}},
+      {{"hook": "on_message_complete"}},
+      {{"hook": "on_session_start"}},
+      {{"hook": "on_session_end"}}
+    ]
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    log_path
+}
+
+fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hook_json_carries_session_id() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let log_path = install_session_id_echo_plugin(home.path(), "session-id-test");
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    assert_eq!(loaded, vec!["session-id-test".to_string()]);
+    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+
+    // Two sessions in one process → distinct ids on the wire.
+    let _ = synaps_cli::runtime::emit_before_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        json!({"command": "true"}),
+        Some("sess-A"),
+    )
+    .await;
+    let _ = synaps_cli::runtime::emit_after_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        json!({"command": "true"}),
+        "ok".to_string(),
+        1024,
+        Some("sess-B"),
+    )
+    .await;
+    let _ = hook_bus
+        .emit(&HookEvent::before_message("hi").with_session(Some("sess-A")))
+        .await;
+    let _ = hook_bus
+        .emit(&HookEvent::on_message_complete("done", json!({})).with_session(Some("sess-B")))
+        .await;
+    // Worker path: no owning conversation → still null.
+    let _ = synaps_cli::runtime::emit_before_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        json!({"command": "true"}),
+        None,
+    )
+    .await;
+
+    // Kill-switch: SYNAPS_HOOK_SESSION_ID=0 → null even when the caller has an id.
+    std::env::set_var("SYNAPS_HOOK_SESSION_ID", "0");
+    let killed = HookEvent::before_tool_call("bash", json!({})).with_session(Some("sess-A"));
+    std::env::remove_var("SYNAPS_HOOK_SESSION_ID");
+    assert_eq!(killed.session_id, None, "kill-switch must force null");
+    let _ = hook_bus.emit(&killed).await;
+
+    let seen = read_jsonl(&log_path);
+    let ids: Vec<(String, Option<String>)> = seen
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_string(),
+                e["session_id"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("before_tool_call".into(), Some("sess-A".into())),
+            ("after_tool_call".into(), Some("sess-B".into())),
+            ("before_message".into(), Some("sess-A".into())),
+            ("on_message_complete".into(), Some("sess-B".into())),
+            ("before_tool_call".into(), None),
+            ("before_tool_call".into(), None),
+        ],
+        "hook JSON must carry the owning session id (log: {seen:?})"
+    );
+
+    manager.shutdown_all().await;
 }

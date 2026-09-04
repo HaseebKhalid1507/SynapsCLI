@@ -548,7 +548,8 @@ impl StreamMethods {
                 });
             let turn_injected_context: Option<String> = if let Some(ref msg_text) = last_user_msg {
                 let hook_event =
-                    crate::extensions::hooks::events::HookEvent::before_message(msg_text);
+                    crate::extensions::hooks::events::HookEvent::before_message(msg_text)
+                        .with_session(session_id.as_deref());
                 if let crate::extensions::hooks::events::HookResult::Inject { content } =
                     hook_bus.emit(&hook_event).await
                 {
@@ -726,7 +727,8 @@ impl StreamMethods {
                         "content_block_count": content.len(),
                         "has_tool_use": !tool_uses.is_empty(),
                     }),
-                );
+                )
+                .with_session(session_id.as_deref());
                 let _ = hook_bus.emit(&hook_event).await;
 
                 // If no tool uses, check for steering messages before finishing.
@@ -925,6 +927,7 @@ impl StreamMethods {
                                         &tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
+                                        session_id.as_deref(),
                                     )
                                     .await,
                                     secret_prompt.as_ref(),
@@ -956,6 +959,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
+                                                session_id.as_deref(),
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
@@ -1187,6 +1191,7 @@ impl StreamMethods {
                         let hook_bus_inner = hook_bus.clone();
                         let prompt_inner = secret_prompt.clone();
                         let cwd_inner = cwd.clone();
+                        let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
@@ -1228,6 +1233,7 @@ impl StreamMethods {
                                             &tool_name_for_hook,
                                             Some(&runtime_name_for_hook),
                                             input.clone(),
+                                            session_id_inner.as_deref(),
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
@@ -1278,6 +1284,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
+                                                session_id_inner.as_deref(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
