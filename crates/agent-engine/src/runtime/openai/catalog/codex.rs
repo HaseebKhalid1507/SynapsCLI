@@ -9,7 +9,22 @@ pub const PROVIDER_NAME: &str = "OpenAI Codex";
 /// Pinned ChatGPT backend host for Codex model catalog discovery.
 pub const MODELS_BASE_URL: &str = "https://chatgpt.com/backend-api";
 /// Relative path allowlisted on the broker for catalog discovery.
-pub const MODELS_PATH: &str = "/models";
+///
+/// This is the Codex-specific catalog (`/codex/models`), which publishes
+/// `display_name` / `visibility` / `supported_reasoning_levels` per model.
+/// The sibling `/models` path serves the ChatGPT web picker (different
+/// schema, `-wm` slugs, no `visibility`) and must not be used here.
+pub const MODELS_PATH: &str = "/codex/models";
+/// Codex client protocol version advertised on catalog discovery.
+///
+/// The ChatGPT backend filters `/codex/models` by `client_version` against
+/// each model's `minimal_client_version`: an unknown or too-old version
+/// (e.g. SynapsCLI's own crate version) yields an empty catalog. This value
+/// is therefore decoupled from `CARGO_PKG_VERSION` and pinned to the lowest
+/// official Codex CLI release that exposes the newest generation
+/// (`gpt-6-astra` requires >= 0.153.0). Bump deliberately when a new model
+/// raises the floor; never derive it from SynapsCLI's version.
+pub const CODEX_CLIENT_VERSION: &str = "0.153.3";
 
 // ─── Static capability table ─────────────────────────────────────────────────
 //
@@ -29,6 +44,13 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
         ReasoningLevel,
         Option<CodexMultiAgentVersion>,
     ) = match model_id {
+        // GPT-6 generation. Live row (2026-09): default medium, full ladder
+        // through Ultra, multi-agent v2 (delegated workers run at xhigh).
+        "gpt-6-astra" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Medium,
+            Some(CodexMultiAgentVersion::V2),
+        ),
         "gpt-5.6-sol" => (
             &[Low, Medium, High, XHigh, Max, Ultra],
             Low,
@@ -58,6 +80,7 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
 /// Build the static catalog models with static capability data attached.
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
+        ("gpt-6-astra", "GPT-6-Astra"),
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
         ("gpt-5.6-terra", "GPT-5.6-Terra"),
         ("gpt-5.6-luna", "GPT-5.6-Luna"),
@@ -78,11 +101,14 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     .collect()
 }
 
-/// Build the broker-relative path for the ChatGPT backend models endpoint,
-/// including the required `client_version` query (matches official Codex).
+/// Build the broker-relative path for the ChatGPT backend Codex catalog
+/// endpoint, including the required `client_version` query (matches
+/// official Codex). An empty `client_version` falls back to the pinned
+/// [`CODEX_CLIENT_VERSION`] — never SynapsCLI's own crate version, which
+/// the backend would reject with an empty catalog.
 pub fn codex_models_path(client_version: &str) -> String {
     let version = if client_version.trim().is_empty() {
-        env!("CARGO_PKG_VERSION")
+        CODEX_CLIENT_VERSION
     } else {
         client_version.trim()
     };
@@ -636,6 +662,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -677,6 +704,7 @@ mod tests {
                 .find(|model| model.id == id)
                 .and_then(CatalogModel::codex_multi_agent_version)
         };
+        assert_eq!(version("gpt-6-astra"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-sol"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-terra"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-luna"), Some(CodexMultiAgentVersion::V1));
@@ -860,6 +888,36 @@ mod tests {
     // ── Reasoning level parsing from fixture ──────────────────────────────────
 
     #[test]
+    fn parse_fixture_astra_is_first_with_full_ladder_and_v2() {
+        let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
+        let astra = &models[0];
+        assert_eq!(
+            astra.id, "gpt-6-astra",
+            "astra is priority 1 in the live catalog"
+        );
+        assert_eq!(astra.label.as_deref(), Some("GPT-6-Astra"));
+        assert_eq!(astra.context_tokens, Some(272_000));
+        for level in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(
+                astra.codex_supports_level(level),
+                "astra must support {level}"
+            );
+        }
+        assert_eq!(
+            astra.codex_multi_agent_version(),
+            Some(CodexMultiAgentVersion::V2)
+        );
+        assert_eq!(astra.runtime_id(), "openai-codex/gpt-6-astra");
+    }
+
+    #[test]
     fn parse_fixture_sol_has_ultra() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let sol = models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
@@ -930,6 +988,11 @@ mod tests {
             ReasoningSupport::CodexNamed { default_level, .. } => *default_level,
             other => panic!("{id}: expected CodexNamed, got {other:?}"),
         };
+        assert_eq!(
+            default_of("gpt-6-astra"),
+            Some(ReasoningLevel::Medium),
+            "astra"
+        );
         assert_eq!(default_of("gpt-5.6-sol"), Some(ReasoningLevel::Low), "sol");
         assert_eq!(
             default_of("gpt-5.6-terra"),
@@ -1002,6 +1065,64 @@ mod tests {
     }
 
     // ── Static capability table ───────────────────────────────────────────────
+
+    #[test]
+    fn static_astra_has_ultra_v2_and_default_medium() {
+        let cap = codex_static_capability("gpt-6-astra").expect("astra");
+        match cap {
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+                multi_agent_version,
+            } => {
+                assert_eq!(
+                    supported,
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                        ReasoningLevel::Max,
+                        ReasoningLevel::Ultra,
+                    ],
+                    "astra ladder matches the live catalog exactly"
+                );
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::Medium),
+                    "astra default is Medium (unlike Sol's Low)"
+                );
+                assert_eq!(
+                    multi_agent_version,
+                    Some(CodexMultiAgentVersion::V2),
+                    "astra advertises multi-agent v2 so Ultra is authorizable offline"
+                );
+            }
+            _ => panic!("expected CodexNamed"),
+        }
+    }
+
+    #[test]
+    fn static_astra_matches_fixture_row_exactly() {
+        // Guard against the static seed drifting from the live/fixture row.
+        let live = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
+        let live_astra = live.iter().find(|m| m.id == "gpt-6-astra").unwrap();
+        let static_astra = codex_static_catalog_models()
+            .into_iter()
+            .find(|m| m.id == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(static_astra.label, live_astra.label);
+        assert_eq!(
+            static_astra.codex_supported_levels(),
+            live_astra.codex_supported_levels()
+        );
+        assert_eq!(
+            static_astra.codex_multi_agent_version(),
+            live_astra.codex_multi_agent_version()
+        );
+        assert_eq!(static_astra.source, CatalogSource::StaticFallback);
+        assert_eq!(live_astra.source, CatalogSource::Live);
+    }
 
     #[test]
     fn static_sol_has_ultra_and_default_low() {
@@ -1137,6 +1258,39 @@ mod tests {
     // ── validate_codex_level ──────────────────────────────────────────────────
 
     #[test]
+    fn validate_astra_full_ladder_ok() {
+        for level in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(
+                validate_codex_level("gpt-6-astra", level, None).is_ok(),
+                "astra must accept {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_plan_astra_ultra_is_proactive_foreground_max_wire() {
+        let plan = plan_codex_execution(
+            "openai-codex/gpt-6-astra",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("astra ultra plan");
+        assert_eq!(plan.mode, CodexExecutionMode::Ultra);
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::Max));
+        assert_eq!(plan.multi_agent_version, Some(CodexMultiAgentVersion::V2));
+        assert_eq!(plan.multi_agent_mode, Some(CodexMultiAgentMode::Proactive));
+        assert!(plan.automatic_delegation());
+    }
+
+    #[test]
     fn validate_sol_ultra_ok() {
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, None).is_ok());
     }
@@ -1249,11 +1403,33 @@ mod tests {
 
     #[test]
     fn models_path_includes_client_version_query() {
-        assert_eq!(codex_models_path("0.6.0"), "/models?client_version=0.6.0");
         assert_eq!(
-            codex_models_url("0.6.0"),
-            "https://chatgpt.com/backend-api/models?client_version=0.6.0"
+            codex_models_path("0.153.3"),
+            "/codex/models?client_version=0.153.3"
         );
+        assert_eq!(
+            codex_models_url("0.153.3"),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.153.3"
+        );
+    }
+
+    #[test]
+    fn models_path_empty_version_falls_back_to_pinned_protocol_version() {
+        // Never the crate version: the backend returns an empty catalog for
+        // unknown client versions, which would silently hide every model.
+        assert_eq!(
+            codex_models_path(""),
+            format!("/codex/models?client_version={CODEX_CLIENT_VERSION}")
+        );
+        assert_eq!(codex_models_path("   "), codex_models_path(""));
+    }
+
+    #[test]
+    fn models_path_targets_codex_catalog_not_chatgpt_web_picker() {
+        // `/models` is the ChatGPT web picker (different schema, `-wm` slugs,
+        // no `visibility`); the Codex catalog lives under `/codex/models`.
+        assert_eq!(MODELS_PATH, "/codex/models");
+        assert!(codex_models_path("0.153.3").starts_with("/codex/models?"));
     }
 
     #[test]
@@ -1274,6 +1450,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -1283,7 +1460,14 @@ mod tests {
                 "gpt-5.3-codex-spark",
             ]
         );
-        for api_only in ["gpt-5.6-sol-wm", "gpt-5.6-pro", "gpt-5.5-pro"] {
+        // ChatGPT-web-only / API-only slugs never appear in the Codex picker.
+        for api_only in [
+            "gpt-6-astra-wm",
+            "gpt-6-pro",
+            "gpt-5.6-sol-wm",
+            "gpt-5.6-pro",
+            "gpt-5.5-pro",
+        ] {
             assert!(!ids.contains(&api_only));
         }
         assert!(models
