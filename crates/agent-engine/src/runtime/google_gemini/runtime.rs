@@ -120,6 +120,14 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
                                         let text = arr
                                             .iter()
                                             .filter_map(|b| {
+                                                if b["type"] == "image" {
+                                                    let mt = b["source"]["media_type"]
+                                                        .as_str()
+                                                        .unwrap_or("image");
+                                                    return Some(format!(
+                                                        "\n[image omitted: {mt} — this provider does not accept images in tool results]"
+                                                    ));
+                                                }
                                                 b.get("text")
                                                     .and_then(|t| t.as_str())
                                                     .map(String::from)

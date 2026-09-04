@@ -49,6 +49,14 @@ pub const SAFETY_MARGIN_PERCENT: u64 = 15;
 /// is what prevents recompaction loops without frontend-local bookkeeping.
 pub const MIN_COMPACTION_MESSAGES: usize = 4;
 
+/// Flat charge per base64 image block. Anthropic bills ≈ w·h/750 tokens
+/// AFTER its 1568-px / ~1.15 MP downscale, so 1,600 is the per-image
+/// ceiling (Goose uses the same figure; gemini-cli uses 3,000; Codex
+/// subtracts the payload and adds a ~7 KB estimate). Serialized base64 at
+/// 2.5 chars/token would charge ~1.9 M tokens for a 3.5 MiB image and trip
+/// compaction every turn.
+pub const IMAGE_TOKEN_ESTIMATE: u64 = 1_600;
+
 /// Provider-side per-message framing charge (role tags, message boundaries)
 /// on top of the serialized content itself.
 const PER_MESSAGE_FRAMING_TOKENS: u64 = 4;
@@ -266,7 +274,7 @@ pub fn assess(inputs: &ContextBudgetInputs<'_>) -> ContextAssessment {
     let history_tokens: u64 = inputs
         .messages
         .iter()
-        .map(|msg| estimate_serialized(&estimator, msg))
+        .map(|msg| estimate_message(&estimator, msg))
         .sum();
     let framing_tokens = PER_MESSAGE_FRAMING_TOKENS * inputs.messages.len() as u64;
 
@@ -327,11 +335,123 @@ fn estimate_serialized(estimator: &TokenEstimator, value: &Value) -> u64 {
     }
 }
 
+/// Like `estimate_serialized` but charges base64 image blocks at a flat
+/// `IMAGE_TOKEN_ESTIMATE` instead of by payload length. Walks
+/// `content[]` and nested `tool_result.content[]`; every other block is
+/// still charged on its serialized form.
+fn estimate_message(estimator: &TokenEstimator, msg: &Value) -> u64 {
+    let Some(blocks) = msg["content"].as_array() else {
+        return estimate_serialized(estimator, msg);
+    };
+    let mut total = 0u64;
+    for block in blocks {
+        if is_base64_image(block) {
+            total += IMAGE_TOKEN_ESTIMATE;
+            continue;
+        }
+        if block["type"] == "tool_result" {
+            if let Some(inner) = block["content"].as_array() {
+                total += 8; // wrapper keys: type, tool_use_id
+                for b in inner {
+                    total += if is_base64_image(b) {
+                        IMAGE_TOKEN_ESTIMATE
+                    } else {
+                        estimate_serialized(estimator, b)
+                    };
+                }
+                continue;
+            }
+        }
+        total += estimate_serialized(estimator, block);
+    }
+    total
+}
+
+fn is_base64_image(b: &Value) -> bool {
+    b["type"] == "image" && b["source"]["type"] == "base64"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    fn history_tokens_of(messages: &[SharedMessage]) -> u64 {
+        let inputs = ContextBudgetInputs {
+            model: "claude-sonnet-4-6",
+            provider_window: 200_000,
+            system_prompt: None,
+            tools_schema: &[],
+            messages,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: 0,
+            next_tool_result_bytes: 0,
+            output_reserve_tokens: 0,
+        };
+        assess(&inputs).breakdown.history_tokens
+    }
+
+    fn image_block(len: usize) -> Value {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(len)}
+        })
+    }
+
+    #[test]
+    fn image_block_in_tool_result_charged_flat() {
+        let messages: Vec<SharedMessage> = vec![Arc::new(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [
+                    {"type": "text", "text": "Image: /tmp/x.png (1024x1536, image/png, 2292 KB)"},
+                    image_block(3_000_000),
+                ]
+            }]
+        }))];
+        let tokens = history_tokens_of(&messages);
+        assert!(tokens >= IMAGE_TOKEN_ESTIMATE, "{tokens}");
+        assert!(tokens <= IMAGE_TOKEN_ESTIMATE + 200, "{tokens}");
+        assert!(tokens < 10_000, "{tokens}");
+    }
+
+    #[test]
+    fn user_message_image_charged_flat() {
+        let messages: Vec<SharedMessage> = vec![Arc::new(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                image_block(3_000_000),
+            ]
+        }))];
+        let tokens = history_tokens_of(&messages);
+        assert!(tokens >= IMAGE_TOKEN_ESTIMATE, "{tokens}");
+        assert!(tokens <= IMAGE_TOKEN_ESTIMATE + 200, "{tokens}");
+    }
+
+    #[test]
+    fn string_content_unchanged() {
+        let msg = json!({"role": "user", "content": "plain string content, no blocks here"});
+        let estimator = estimator_for_model("claude-sonnet-4-6");
+        assert_eq!(
+            estimate_message(&estimator, &msg),
+            estimate_serialized(&estimator, &msg)
+        );
+    }
+
+    #[test]
+    fn non_image_blocks_still_charged_by_payload() {
+        // A big text block must NOT get the flat image discount.
+        let msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "A".repeat(100_000)}
+        ]});
+        let estimator = estimator_for_model("claude-sonnet-4-6");
+        assert!(estimate_message(&estimator, &msg) > 10_000);
+    }
 
     #[test]
     fn ascii_is_charged_at_the_dense_bpe_rate() {
