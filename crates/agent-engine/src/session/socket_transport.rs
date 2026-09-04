@@ -7,7 +7,7 @@
 //!
 //! Tracing here logs frame *types* only (`ClientFrame`'s redacting `Debug`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,9 @@ pub struct Connected {
     writer: mpsc::Sender<ClientFrame>,
     writer_task: tokio::task::JoinHandle<()>,
     pub welcome: Welcome,
+    /// Remembered for `reconnect`.
+    path: PathBuf,
+    hello: Hello,
 }
 
 pub struct Pong {
@@ -98,6 +101,7 @@ impl Connected {
         let mut reader = BufReader::new(r);
         let (writer, writer_task) = spawn_writer(w);
         let client_version = hello.protocol_version;
+        let hello_copy = hello.clone();
         writer
             .send(ClientFrame::Hello(hello))
             .await
@@ -110,7 +114,7 @@ impl Connected {
                 if welcome.protocol_version != client_version {
                     return Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version });
                 }
-                Ok(Self { reader, writer, writer_task, welcome })
+                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy })
             }
             Some(DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version, .. }, .. }) => {
                 Err(TransportError::Version { client: client_version, daemon: daemon_version })
@@ -181,6 +185,8 @@ pub struct SocketTransport {
     mode: AttachMode,
     input_owner: Option<ClientId>,
     ended: bool,
+    path: PathBuf,
+    hello: Hello,
     /// `Reloading` seen; the next EOF is a reload, not a death.
     reload_pending: Option<u64>,
     /// Why `next_event` returned `None` (`Reloading{generation}` after a
@@ -252,6 +258,8 @@ impl SocketTransport {
                 mode,
                 input_owner: snapshot.input_owner,
                 ended: false,
+                path: conn.path,
+                hello: conn.hello,
                 reload_pending: None,
                 last_error: None,
                 messages: snapshot.conversation.api_messages.clone(),
@@ -292,6 +300,30 @@ impl SocketTransport {
         let p = c.purge().await;
         c.bye().await;
         p
+    }
+
+    /// `Reload{..}` on a control connection. `Ok(generation)` once the daemon
+    /// answered `Bye{Reloading{generation}}` (it is about to exec);
+    /// `Refused{ReloadRefused}` / `Error` → `Err`.
+    pub async fn reload(path: &Path, now: bool, drain_secs: Option<u64>, exe: Option<PathBuf>) -> Result<u64, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        c.writer
+            .send(ClientFrame::Reload { now, drain_secs, exe })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        // Drain + checkpoint can take a while: wait up to drain + 60 s.
+        let budget = Duration::from_secs(drain_secs.unwrap_or(30) + 60);
+        let frame = tokio::time::timeout(budget, read_frame(&mut c.reader))
+            .await
+            .map_err(|_| TransportError::Protocol("reload reply timed out".into()))??;
+        match frame {
+            Some(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, .. }) }) => Ok(generation),
+            Some(DaemonFrame::Bye { .. }) => Err(TransportError::Protocol("daemon said bye without a reload reason".into())),
+            Some(DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why }, .. }) => Err(TransportError::Refused(why)),
+            Some(DaemonFrame::Refused { message, .. }) | Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Refused(message)),
+            Some(other) => Err(TransportError::Protocol(format!("expected bye, got {other:?}"))),
+            None => Err(TransportError::Closed),
+        }
     }
 
     /// Detach cleanly: `Detach` + `Bye`. The turn keeps running in the daemon.
@@ -460,9 +492,54 @@ impl ClientTransport for SocketTransport {
         self.input_owner
     }
 
-    /// C3 fills the body (backoff, `Hello{reconnect_of}`, re-attach).
-    async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
-        Err(TransportError::Unsupported("reconnect: not implemented in this build"))
+    /// C3: after `Reloading`/EOF — backoff 100 ms ×2 → cap 5 s, total ≤
+    /// `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (60); `Hello{reconnect_of}` →
+    /// `Attach::Existing{alias-resolved id, mode}` where `mode = Takeover`
+    /// iff this client was the input owner (§2.7: two reconnecting mirrors
+    /// cannot both take over). On success `self` IS the new connection; the
+    /// returned snapshot is a full re-mirror.
+    async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        let was_owner = self.input_owner == Some(self.client);
+        let generation = self.reload_pending.unwrap_or(self.welcome.generation);
+        let mut hello = self.hello.clone();
+        hello.reconnect_of = Some(ClientReconnect {
+            previous_client: self.client,
+            session_id: self.session.clone(),
+            was_owner,
+            generation,
+        });
+        let mode = if was_owner { AttachMode::Takeover } else { mode };
+        let total = std::env::var("SYNAPS_TUI_ATTACH_RECONNECT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60));
+        let deadline = tokio::time::Instant::now() + total;
+        let mut backoff = Duration::from_millis(100);
+        let mut last;
+        loop {
+            match Connected::connect(&self.path, hello.clone()).await {
+                Ok(conn) => {
+                    match Self::attach(conn, Attach::Existing { session_id: self.session.clone(), mode }).await {
+                        Ok((t, snap)) => {
+                            *self = t;
+                            return Ok(snap);
+                        }
+                        Err(TransportError::Refused(m)) => return Err(TransportError::Refused(m)),
+                        Err(e) => last = e,
+                    }
+                }
+                Err(TransportError::Version { client, daemon }) => {
+                    return Err(TransportError::Version { client, daemon })
+                }
+                Err(e) => last = e,
+            }
+            if tokio::time::Instant::now() + backoff > deadline {
+                return Err(last);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
     }
 }
 
@@ -699,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reloading_then_bye_sets_last_error_and_reconnect_is_a_stub() {
+    async fn reloading_then_bye_sets_last_error_and_reconnect_gives_up_on_a_dead_socket() {
         let (_d, path) = sock();
         let l = UnixListener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
@@ -714,8 +791,12 @@ mod tests {
         assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
         assert!(t.next_event().await.is_none());
         assert!(matches!(t.last_error(), Some(TransportError::Reloading { generation: 2 })));
-        assert!(matches!(t.reconnect(AttachMode::Observe).await, Err(TransportError::Unsupported(_))));
         srv.await.unwrap();
+        // Nobody listens any more: the backoff loop gives up at the budget.
+        std::env::set_var("SYNAPS_TUI_ATTACH_RECONNECT_SECS", "1");
+        let r = t.reconnect(AttachMode::Observe).await;
+        std::env::remove_var("SYNAPS_TUI_ATTACH_RECONNECT_SECS");
+        assert!(r.is_err());
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 //! `Answer`/`Submit`/`Steer`); `Answer` values are forwarded to the actor
 //! and nowhere else.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,7 +175,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         profile: state.profile.clone(),
         sessions: state.session_metas(),
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
-        generation: 1,
+        generation: state.generation,
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -185,6 +186,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let attach = loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
+            _ = state.reload_announce.cancelled() => {
+                let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
+                let _ = writer.await;
+                return;
+            }
             r = read_frame(&mut reader, &mut line) => r,
         };
         match frame {
@@ -203,18 +209,41 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 state.request_shutdown(force);
                 return;
             }
-            Ok(Read::Frame(ClientFrame::Attach(a))) => break a,
+            Ok(Read::Frame(ClientFrame::Attach(a))) => {
+                if matches!(a, Attach::Create { .. }) && state.reloading.load(Ordering::SeqCst) {
+                    let _ = tx
+                        .send(DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() })
+                        .await;
+                    continue;
+                }
+                break a;
+            }
             Ok(Read::Frame(ClientFrame::Cmd { session_id, .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached".into() }).await;
             }
-            // C3 / C2 serve these; until then they are honest refusals.
-            Ok(Read::Frame(ClientFrame::Reload { .. })) => {
-                let _ = tx
-                    .send(DaemonFrame::Refused {
-                        reason: RefuseReason::ReloadRefused { why: "reload not implemented in this build".into() },
-                        message: "reload not implemented in this build".into(),
-                    })
-                    .await;
+            // C3: the whole §2.8 sequence runs on this connection's task;
+            // on success the process is replaced and this never returns.
+            Ok(Read::Frame(ref f @ ClientFrame::Reload { .. })) => {
+                let req = super::reload::ReloadRequest::from_frame(f).expect("reload frame");
+                match super::reload::prepare(&state, &state.paths, req).await {
+                    Err(super::reload::ReloadError::Refused(why)) => {
+                        let _ = tx
+                            .send(DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: why.clone() }, message: why })
+                            .await;
+                    }
+                    Err(super::reload::ReloadError::ExecFailed(e)) => {
+                        let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("reload: {e}") }).await;
+                    }
+                    Ok(prepared) => {
+                        // Tell the requester, flush, close — then exec.
+                        let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
+                        drop(tx);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+                        let e = super::reload::exec(&state, &state.paths, prepared).await;
+                        tracing::error!(error = %e, "daemon: reload did not exec");
+                        return;
+                    }
+                }
             }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
@@ -332,10 +361,29 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let sid = handle.id.clone();
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
+    let fwd_announce = state.reload_announce.clone();
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
-            match rx.recv().await {
+            let next = tokio::select! {
+                biased;
+                r = rx.recv() => r,
+                // C3: reload announced — the checkpoint's events (abort
+                // notice, Conversation with abort_context) are already in
+                // the broadcast; drain what is there, then stop.
+                _ = fwd_announce.cancelled() => {
+                    while let Ok(env) = rx.try_recv() {
+                        if matches!(env.event, SessionEventWire::Attached { .. }) {
+                            continue;
+                        }
+                        if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            };
+            match next {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
                     if matches!(env.event, SessionEventWire::Attached { .. }) {
@@ -368,9 +416,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
 
     let mut ended = false;
     let mut stopping = false;
+    let mut reloading = false;
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
+            _ = state.reload_announce.cancelled() => { reloading = true; break; }
             _ = handle.closed() => { ended = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
         };
@@ -382,6 +432,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 }
                 if let Err(why) = client_may_send(&cmd, client) {
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
+                    continue;
+                }
+                if state.reloading.load(Ordering::SeqCst)
+                    && matches!(cmd, SessionCommand::Submit { .. } | SessionCommand::SubmitPrepared { .. } | SessionCommand::Compact { .. })
+                {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "daemon reloading; retry in a moment".into() }).await;
                     continue;
                 }
                 match handle.send_from(client, cmd).await {
@@ -428,6 +484,30 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         }
     }
 
+    // C3: reload — the session is checkpointed and will be rehydrated by
+    // the next image; tell the client to reconnect and stop forwarding.
+    if reloading {
+        // The forwarder drains and exits on the announce; bound it anyway.
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward).await.is_err() {
+            forward.abort();
+            let _ = forward.await;
+        }
+        let (generation, retry_after_ms) = match reload_bye(&state) {
+            ByeReason::Reloading { generation, retry_after_ms } => (generation, retry_after_ms),
+            _ => unreachable!(),
+        };
+        let env = crate::session::Envelope {
+            session_id: sid.clone(),
+            seq: u64::MAX,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Reloading { generation, retry_after_ms },
+        };
+        let _ = tx.send(DaemonFrame::Event(env.into())).await;
+        let _ = tx.send(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, retry_after_ms }) }).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        return;
+    }
+
     // Socket gone / Bye = Detach. The turn keeps running (§8).
     if stopping {
         // Daemon stop: let the forwarder deliver Ended inside the lifecycle budget.
@@ -452,4 +532,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
+}
+
+fn reload_bye(state: &DaemonState) -> ByeReason {
+    ByeReason::Reloading {
+        generation: state.reload_generation.load(Ordering::SeqCst),
+        retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
 }

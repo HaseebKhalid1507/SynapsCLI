@@ -305,6 +305,8 @@ async fn stale_socket_reaped_and_second_daemon_refused() {
             profile: None,
             started_at: chrono::Utc::now(),
             socket: paths.sock.to_string_lossy().into_owned(),
+            exe: None,
+            generation: 1,
         },
     )
     .unwrap();

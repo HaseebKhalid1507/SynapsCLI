@@ -33,6 +33,10 @@ pub(crate) struct StartArgs {
     /// Allow legacy (non-progressive) MCP with servers configured.
     #[arg(long)]
     pub allow_legacy_mcp: bool,
+    /// Print `{"binary_version","protocol_version"}` and exit 0 (the reload
+    /// version gate probes the NEW binary with this).
+    #[arg(long, hide = true)]
+    pub print_version: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -57,6 +61,22 @@ pub(crate) enum DaemonAction {
     /// Ask the daemon to return jemalloc dirty pages to the OS (bench hygiene:
     /// run before sampling RssAnon).
     Purge,
+    /// Re-exec the daemon in place (same pid): checkpoint every session,
+    /// exec the (newer-or-equal) binary, rehydrate, clients reconnect.
+    Reload {
+        /// Skip the drain wait (in-flight turns are checkpointed immediately).
+        #[arg(long)]
+        now: bool,
+        /// Seconds to wait for turns to finish before checkpointing
+        /// (default SYNAPS_DAEMON_RELOAD_DRAIN_SECS or 30).
+        #[arg(long, value_name = "N")]
+        drain_secs: Option<u64>,
+        /// Binary to exec (default: the one recorded in daemon.json).
+        #[arg(long, value_name = "PATH")]
+        exe: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
@@ -87,6 +107,74 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Stop { force }) => stop(profile, force).await,
         Some(DaemonAction::Sessions { json }) => sessions(profile, json).await,
         Some(DaemonAction::Purge) => purge(profile).await,
+        Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
+    }
+}
+
+async fn reload(
+    profile: Option<String>,
+    now: bool,
+    drain_secs: Option<u64>,
+    exe: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        anyhow::bail!("daemon not running");
+    }
+    let before = registry::read_daemon_json(&paths);
+    let exe = exe.map(|p| p.canonicalize().unwrap_or(p));
+    let outcome = SocketTransport::reload(&paths.sock, now, drain_secs, exe).await;
+    match outcome {
+        Ok(gen) => {
+            // Wait for the new image to answer (≤ 15 s).
+            let t0 = std::time::Instant::now();
+            let mut pong = None;
+            while t0.elapsed() < Duration::from_secs(15) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if let Ok(p) = SocketTransport::ping(&paths.sock).await {
+                    pong = Some(p);
+                    break;
+                }
+            }
+            let after = registry::read_daemon_json(&paths);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": pong.is_some(),
+                        "pid": pong.as_ref().map(|p| p.pid),
+                        "generation": after.as_ref().map(|i| i.generation),
+                        "announced_generation": gen,
+                        "sessions": pong.as_ref().map(|p| p.sessions),
+                        "exe": after.as_ref().and_then(|i| i.exe.clone()),
+                        "previous_version": before.as_ref().map(|i| i.daemon_version.clone()),
+                        "version": after.as_ref().map(|i| i.daemon_version.clone()),
+                    })
+                );
+            } else if let Some(p) = &pong {
+                println!(
+                    "reloaded (pid {}, generation {}, sessions {})",
+                    p.pid,
+                    after.as_ref().map_or(gen, |i| i.generation),
+                    p.sessions
+                );
+            } else {
+                anyhow::bail!("reload announced (generation {gen}) but the daemon did not answer within 15 s");
+            }
+            if pong.is_none() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "error": e.to_string()}));
+            } else {
+                eprintln!("reload refused: {e}");
+            }
+            std::process::exit(EXIT_REFUSED);
+        }
     }
 }
 
@@ -101,6 +189,10 @@ async fn purge(profile: Option<String>) -> anyhow::Result<()> {
 }
 
 async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
+    if a.print_version {
+        println!("{}", serde_json::to_string(&daemon::reload::PrintVersion::current())?);
+        return Ok(());
+    }
     if let Err(code) = require_enabled("synaps daemon") {
         std::process::exit(code);
     }
