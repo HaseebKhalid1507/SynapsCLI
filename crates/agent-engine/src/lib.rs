@@ -36,7 +36,7 @@ pub use session::{
     resolve_session, validate_name, Session, SessionInfo,
 };
 pub use tokio_util::sync::CancellationToken;
-pub use tools::{Tool, ToolContext, ToolRegistry};
+pub use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 pub use watcher_types::{
     AgentConfig, AgentStatusInfo, ExitReason, HandoffState, SessionLimits, SessionStats,
     WatcherCommand, WatcherResponse,

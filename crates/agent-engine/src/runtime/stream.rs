@@ -560,6 +560,21 @@ impl StreamMethods {
                 None => &messages,
             };
 
+            // History image byte cap: the per-turn byte budget resets every
+            // turn but base64 images live in history forever. Bound the wire
+            // by degrading the OLDEST image blocks to a text label once the
+            // total crosses `HISTORY_IMAGE_BYTE_CAP`. Request-local like the
+            // injection above — durable history is untouched.
+            let capped_messages: Vec<SharedMessage>;
+            let request_messages: &[SharedMessage] =
+                match cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP) {
+                    Some(capped) => {
+                        capped_messages = capped;
+                        &capped_messages
+                    }
+                    None => request_messages,
+                };
+
             // Flag-off: borrow the turn's options untouched — no per-round
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
@@ -832,7 +847,7 @@ impl StreamMethods {
                         let mut production_output: Option<crate::tools::output::OutputHandle> =
                             None;
                         let mut execution_identity = None;
-                        let result = match gate_outcome {
+                        let (result, rich_blocks) = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
                                 execution_identity = Some((
@@ -889,7 +904,7 @@ impl StreamMethods {
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
-                                    format!("Tool call blocked by extension: {}", reason)
+                                    (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
                                     else {
@@ -897,24 +912,28 @@ impl StreamMethods {
                                     };
                                     let input_for_hook = input.clone();
                                     tokio::select! {
-                                        res = tool.execute(input, crate::ToolContext {
+                                        res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */ },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
-                                            let output = match res {
-                                                Ok(output) => output,
-                                                Err(e) => e.to_string(),
+                                            let (output, rich_blocks) = match res {
+                                                Ok(o) => o.into_parts(),
+                                                Err(e) => (e.to_string(), None),
                                             };
-                                            let output = emit_after_tool_call(
+                                            let hooked_output = emit_after_tool_call(
                                                 &hook_bus,
                                                 &tool_name,
                                                 Some(&runtime_name),
                                                 input_for_hook,
-                                                output,
+                                                output.clone(),
                                                 max_tool_output,
                                             ).await;
-                                            output
+                                            // Hook policy: a Replace transform wins over the rich
+                                            // blocks — the hook saw only the summary, so keeping
+                                            // the image would desync text and image.
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
+                                            (hooked_output, rich_blocks)
                                         }
                                         _ = cancel.cancelled() => {
                                             canceled = true;
@@ -933,14 +952,14 @@ impl StreamMethods {
                                             {
                                                 interrupted_side_effect = Some(tool_id.clone());
                                             }
-                                            "Canceled by user".to_string()
+                                            ("Canceled by user".to_string(), None)
                                         }
                                     }
                                 }
                             }
                             // Typed, bounded, metadata-only gate denial — no
                             // implementation was looked up, no hook emitted.
-                            Err(denial) => denial.to_string(),
+                            Err(denial) => (denial.to_string(), None),
                         };
 
                         let history_result = production_output
@@ -979,10 +998,18 @@ impl StreamMethods {
                             result: ui_result,
                         }));
 
+                        // Rich blocks bypass `truncate_tool_result` by construction:
+                        // the image cap is the image's own budget.
+                        let content = select_tool_result_content(
+                            rich_blocks,
+                            history_result.map(|bounded| bounded.text),
+                            &result,
+                            max_tool_output,
+                        );
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": history_result.map(|bounded| bounded.text).unwrap_or_else(|| HelperMethods::truncate_tool_result(&result, max_tool_output))
+                            "content": content
                         }));
                     }
                 } else {
@@ -1142,7 +1169,7 @@ impl StreamMethods {
                         );
 
                         join_set.spawn(async move {
-                            let mut lane_results: Vec<(String, bool, Option<String>, String)> = Vec::new();
+                            let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
                             for (model_order, tool_id, tool_name, prepared) in lane {
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
@@ -1150,7 +1177,7 @@ impl StreamMethods {
                                         tool_id: tool_id.clone(),
                                         result: err.clone(),
                                     }));
-                                    lane_results.push((tool_id, false, None, err));
+                                    lane_results.push((tool_id, false, None, Value::String(err)));
                                     continue;
                                 }
                                 PreparedCall::Gate(gate_outcome) => gate_outcome,
@@ -1177,7 +1204,7 @@ impl StreamMethods {
                                         auto_approve_inner,
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
-                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None)
+                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
@@ -1206,34 +1233,36 @@ impl StreamMethods {
                                     let tx_d = delta_channel.sender;
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext {
+                                        res = t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */ },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
-                                            let output = match res {
-                                                Ok(output) => output,
-                                                Err(e) => e.to_string(),
+                                            let (output, rich_blocks) = match res {
+                                                Ok(o) => o.into_parts(),
+                                                Err(e) => (e.to_string(), None),
                                             };
-                                            let output = emit_after_tool_call(
+                                            let hooked_output = emit_after_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
                                                 input_for_hook,
-                                                output,
+                                                output.clone(),
                                                 max_tool_output,
                                             ).await;
-                                            (false, Some(call_effect), output, Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)))
+                                            // Hook Replace wins over rich blocks (see single-tool site).
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
+                                            (false, Some(call_effect), hooked_output, Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         _ = cancel_token.cancelled() => {
-                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)))
+                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
                                     } // close else from Block check
                                 }
                                 // Typed, bounded, metadata-only gate denial —
                                 // no implementation lookup, no hook emission.
-                                Err(denial) => (false, None, denial.to_string(), None, None),
+                                Err(denial) => (false, None, denial.to_string(), None, None, None),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -1264,9 +1293,12 @@ impl StreamMethods {
                             let history_bounded = result.3.as_ref()
                                 .map(crate::tools::output::OutputHandle::model_history)
                                 .filter(|bounded| bounded.original_bytes > 0);
-                            let history = history_bounded.as_ref()
-                                .map(|bounded| bounded.text.clone())
-                                .unwrap_or_else(|| HelperMethods::truncate_tool_result(&result.2, max_tool_output));
+                            let history: Value = select_tool_result_content(
+                                result.5,
+                                history_bounded.as_ref().map(|bounded| bounded.text.clone()),
+                                &result.2,
+                                max_tool_output,
+                            );
                             if let (Some(request), Some((stable_tool_id, activation_basis, tool_call_started)), Some(call_effect)) = (request_correlation_inner.as_ref(), result.4, result.1) {
                                 let correlation =
                                     crate::runtime::trace::ExecutionCorrelation::from_request(
@@ -1317,7 +1349,8 @@ impl StreamMethods {
                     }
 
                     // Collect results
-                    let mut results_map = std::collections::HashMap::new();
+                    let mut results_map: std::collections::HashMap<String, Value> =
+                        std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
                         match res {
                             Ok(lane_results) => {
@@ -1340,13 +1373,15 @@ impl StreamMethods {
                     // Build tool_results in original order
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map
+                            // Strings were already truncated at lane time; arrays
+                            // never pass through `truncate_tool_result`.
+                            let content = results_map
                                 .remove(tool_id)
-                                .unwrap_or_else(|| "Canceled by user".to_string());
+                                .unwrap_or_else(|| Value::String("Canceled by user".to_string()));
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result, max_tool_output)
+                                "content": content
                             }));
                         }
                     }
@@ -1425,10 +1460,7 @@ impl StreamMethods {
                 if tool_call_budget_hit {
                     finish_budget_exceeded!(agent_core::BudgetDimension::ToolCalls);
                 }
-                let round_result_bytes: usize = tool_results
-                    .iter()
-                    .map(|r| r["content"].as_str().map(str::len).unwrap_or(0))
-                    .sum();
+                let round_result_bytes: usize = tool_results.iter().map(tool_result_bytes).sum();
                 if let Err(dimension) = budget_meter.charge_tool_result_bytes(round_result_bytes) {
                     finish_budget_exceeded!(dimension);
                 }
@@ -1444,6 +1476,129 @@ impl StreamMethods {
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }
+    }
+}
+
+/// Hook policy: a `Replace` transform wins over rich blocks — the hook saw
+/// only the summary, so keeping the image would desync text and image.
+/// Note `emit_after_tool_call` also runs `truncate_tool_result`, so a
+/// summary longer than `max_tool_output` trips this too; log it so the
+/// dropped image isn't a silent mystery.
+fn drop_rich_if_rewritten(
+    rich_blocks: Option<Vec<Value>>,
+    hooked_output: &str,
+    output: &str,
+) -> Option<Vec<Value>> {
+    if hooked_output == output {
+        return rich_blocks;
+    }
+    if rich_blocks.is_some() {
+        tracing::debug!(
+            summary_len = output.len(),
+            hooked_len = hooked_output.len(),
+            "rich tool blocks dropped: after_tool_call rewrote (or truncated) the summary"
+        );
+    }
+    None
+}
+
+/// Pick the `tool_result.content` value. Rich blocks win outright (they
+/// carry their own budget and never see `truncate_tool_result`); otherwise
+/// the bounded delta-lane text, otherwise the truncated summary.
+fn select_tool_result_content(
+    rich_blocks: Option<Vec<Value>>,
+    history_text: Option<String>,
+    result: &str,
+    max_tool_output: usize,
+) -> Value {
+    match (rich_blocks, history_text) {
+        (Some(blocks), _) => Value::Array(blocks),
+        (None, Some(text)) => Value::String(text),
+        (None, None) => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
+/// Total base64 image payload bytes allowed across the whole request
+/// history. Anthropic caps a request at 32 MB; leave headroom for text.
+pub(crate) const HISTORY_IMAGE_BYTE_CAP: usize = 20 * 1024 * 1024;
+
+/// Label left in place of an image block dropped by the history byte cap.
+pub(crate) const IMAGE_DROPPED_LABEL: &str =
+    "[image dropped: history byte cap — re-read the file if needed]";
+
+fn is_base64_image(b: &Value) -> bool {
+    b["type"] == "image" && b["source"]["type"] == "base64"
+}
+
+fn base64_image_len(b: &Value) -> usize {
+    b["source"]["data"].as_str().map_or(0, str::len)
+}
+
+/// Enforce `cap` on the sum of base64 image payload bytes across `messages`.
+/// Returns `None` when nothing needs to change (no allocation). Otherwise a
+/// request-local copy where the OLDEST image blocks — top-level `content[]`
+/// or nested in `tool_result.content[]` — are replaced with a text block
+/// carrying `IMAGE_DROPPED_LABEL`, until the remainder fits. Only touched
+/// messages are cloned (`Arc::make_mut`); `tool_result.content[0]` (the
+/// text summary) is never an image, so the text-first invariant holds.
+fn cap_history_image_bytes(
+    messages: &[SharedMessage],
+    cap: usize,
+) -> Option<Vec<SharedMessage>> {
+    // (msg index, outer block index, Option<inner block index>, len), oldest first.
+    let mut images: Vec<(usize, usize, Option<usize>, usize)> = Vec::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        let Some(blocks) = msg["content"].as_array() else {
+            continue;
+        };
+        for (bi, block) in blocks.iter().enumerate() {
+            if is_base64_image(block) {
+                images.push((mi, bi, None, base64_image_len(block)));
+            } else if let Some(inner) = block["content"].as_array() {
+                for (ii, b) in inner.iter().enumerate() {
+                    if is_base64_image(b) {
+                        images.push((mi, bi, Some(ii), base64_image_len(b)));
+                    }
+                }
+            }
+        }
+    }
+    let mut total: usize = images.iter().map(|i| i.3).sum();
+    if total <= cap {
+        return None;
+    }
+    let mut out = messages.to_vec();
+    let mut dropped = 0usize;
+    for (mi, bi, ii, len) in images {
+        if total <= cap {
+            break;
+        }
+        let label = json!({"type": "text", "text": IMAGE_DROPPED_LABEL});
+        let msg = Arc::make_mut(&mut out[mi]);
+        let slot = match ii {
+            Some(ii) => &mut msg["content"][bi]["content"][ii],
+            None => &mut msg["content"][bi],
+        };
+        *slot = label;
+        total -= len;
+        dropped += 1;
+    }
+    tracing::info!(
+        dropped,
+        remaining_bytes = total,
+        cap,
+        "history image byte cap: oldest image blocks degraded to text labels"
+    );
+    Some(out)
+}
+
+/// Wire bytes a single `tool_result` charges against the turn byte budget.
+/// Array content (image blocks) is charged on its serialized form — the
+/// base64 *is* re-sent every round.
+fn tool_result_bytes(r: &Value) -> usize {
+    match &r["content"] {
+        Value::String(s) => s.len(),
+        other => serde_json::to_vec(other).map(|v| v.len()).unwrap_or(0),
     }
 }
 
@@ -1707,6 +1862,595 @@ mod tests {
         assert_eq!(
             entry1, prefix2,
             "durable prefix must be byte-identical across turns or the cache entry is dead"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rich tool output through the REAL stream loop (image-read feature).
+//
+// A tiny axum server plays Anthropic: round 1 answers with scripted
+// `tool_use` blocks, round 2 with `end_turn`. Every request body is recorded
+// so the assertions run against the bytes that would have hit the wire —
+// `tool_result.content` as an ARRAY for rich tools, a STRING for legacy ones.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod rich_output_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookKind, HookResult};
+    use crate::extensions::permissions::PermissionSet;
+    use crate::runtime::api::ApiOptions;
+    use crate::runtime::types::AuthState;
+    use crate::tools::{Tool, ToolContext, ToolOutput};
+    use agent_core::{LlmEvent, SessionEvent, StreamEvent};
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PNG_B64_PREFIX: &str = "iVBORw0KGgo";
+
+    fn fake_b64(len: usize) -> String {
+        let mut s = String::with_capacity(len);
+        while s.len() < len {
+            s.push_str(PNG_B64_PREFIX);
+        }
+        s.truncate(len);
+        s
+    }
+
+    /// Rich stub: `[text, image]` blocks + summary, like `read` on a PNG.
+    struct RichTool;
+    #[async_trait::async_trait]
+    impl Tool for RichTool {
+        fn name(&self) -> &str {
+            "rich_stub"
+        }
+        fn description(&self) -> &str {
+            "returns an image"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+            self.execute_rich(params, ctx)
+                .await
+                .map(ToolOutput::into_summary)
+        }
+        async fn execute_rich(&self, _params: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+            let summary = "Image: /tmp/x.png (1x1, image/png, 1 KB)".to_string();
+            Ok(ToolOutput::Blocks {
+                blocks: vec![
+                    json!({"type":"text","text":summary}),
+                    json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(2_000)}}),
+                ],
+                summary,
+            })
+        }
+    }
+
+    /// Legacy stub: plain `execute` only.
+    struct TextTool;
+    #[async_trait::async_trait]
+    impl Tool for TextTool {
+        fn name(&self) -> &str {
+            "text_stub"
+        }
+        fn description(&self) -> &str {
+            "returns text"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("plain text result".to_string())
+        }
+    }
+
+    /// after_tool_call hook that replaces every output.
+    struct ReplaceHook;
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for ReplaceHook {
+        fn id(&self) -> &str {
+            "replace-hook"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Replace {
+                output: "REPLACED BY HOOK".to_string(),
+            }
+        }
+        async fn shutdown(&self) {}
+    }
+
+    fn sse_tool_use_round(tool_uses: &[(&str, &str)]) -> String {
+        let mut s = String::new();
+        s.push_str(r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#);
+        s.push_str("\n\n");
+        for (i, (id, name)) in tool_uses.iter().enumerate() {
+            s.push_str(&format!(
+                r#"data: {{"type":"content_block_start","index":{i},"content_block":{{"type":"tool_use","id":"{id}","name":"{name}"}}}}"#
+            ));
+            s.push_str("\n\n");
+            s.push_str(&format!(
+                r#"data: {{"type":"content_block_delta","index":{i},"delta":{{"type":"input_json_delta","partial_json":"{{}}"}}}}"#
+            ));
+            s.push_str("\n\n");
+            s.push_str(&format!(
+                r#"data: {{"type":"content_block_stop","index":{i}}}"#
+            ));
+            s.push_str("\n\n");
+        }
+        s.push_str(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#);
+        s.push_str("\n\ndata: {\"type\":\"message_stop\"}\n\n");
+        s
+    }
+
+    const SSE_END_TURN: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_02\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[derive(Clone)]
+    struct MockState {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<Mutex<Vec<Value>>>,
+        first_round: Arc<String>,
+    }
+
+    async fn spawn_mock(first_round: String) -> (String, MockState) {
+        let state = MockState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+            first_round: Arc::new(first_round),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|State(st): State<MockState>, body: String| async move {
+                    let n = st.calls.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        st.bodies.lock().unwrap().push(v);
+                    }
+                    let sse = if n == 0 {
+                        st.first_round.as_str().to_string()
+                    } else {
+                        SSE_END_TURN.to_string()
+                    };
+                    (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+                }),
+            )
+            // Axum defaults to a 2 MB body limit (413) — image histories are bigger.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), state)
+    }
+
+    struct Driven {
+        /// Final durable history (from the last `MessageHistory` event).
+        history: Vec<SharedMessage>,
+        /// Every `ToolResult` UI preview string.
+        ui_results: Vec<String>,
+        /// Request bodies the mock saw, in order.
+        bodies: Vec<Value>,
+    }
+
+    async fn drive(
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        drive_with_history(initial, tools_to_register, tool_uses, hook_bus).await
+    }
+
+    async fn drive_with_history(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
+
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+
+        let session = StreamSession {
+            auth: Arc::new(RwLock::new(AuthState {
+                auth_token: "test-token".into(),
+                auth_type: "api_key".into(),
+                refresh_token: None,
+                token_expires: Some(9_999_999_999_999),
+            })),
+            client: Client::new(),
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
+            options: ApiOptions {
+                anthropic_base_url: Some(base_url),
+                ..Default::default()
+            },
+            api_retries: 0,
+            refusal_retries: 0,
+            model: "claude-haiku-4-5".into(),
+            tools,
+            system_prompt: None,
+            thinking_budget: 0,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            tx,
+            cancel: CancellationToken::new(),
+            steering_rx: None,
+            watcher_exit_path: None,
+            max_tool_output: 30_000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            session_manager,
+            subagent_registry: Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
+            event_queue: Arc::new(crate::events::EventQueue::new(100)),
+            hook_bus,
+            secret_prompt: None,
+            auto_approve_confirms: true,
+            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            orchestration: None,
+            delegation_parent: None,
+            turn_correlation_id: "turn-test".into(),
+            progressive_tool_disclosure: false,
+            tool_session_id,
+            mcp_runtime: None,
+            mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
+        };
+
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, messages),
+        )
+        .await
+        .expect("stream loop must finish");
+        run.expect("stream loop ok");
+
+        let mut history = Vec::new();
+        let mut ui_results = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                _ => {}
+            }
+        }
+        // Give the mock a beat to finish recording the last body.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        Driven {
+            history,
+            ui_results,
+            bodies,
+        }
+    }
+
+    /// The user message carrying tool results, from the round-2 request body.
+    fn tool_result_message(body: &Value) -> &Value {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+            .expect("tool_result user message on the wire")
+    }
+
+    #[tokio::test]
+    async fn rich_tool_output_lands_as_array_content() {
+        let d = drive(
+            vec![Arc::new(RichTool)],
+            &[("toolu_1", "rich_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+
+        // On the wire (round-2 body).
+        let msg = tool_result_message(&d.bodies[1]);
+        let tr = &msg["content"][0];
+        assert_eq!(tr["tool_use_id"], "toolu_1");
+        let blocks = tr["content"].as_array().expect("array content");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(
+            blocks[0]["text"],
+            "Image: /tmp/x.png (1x1, image/png, 1 KB)"
+        );
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert!(blocks[1]["source"]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with(PNG_B64_PREFIX));
+
+        // In durable history too.
+        let hist_msg = d
+            .history
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+            .expect("history tool_result");
+        assert!(hist_msg["content"][0]["content"].is_array());
+    }
+
+    #[tokio::test]
+    async fn rich_output_and_hook_replace() {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+        bus.subscribe(
+            HookKind::AfterToolCall,
+            Arc::new(ReplaceHook),
+            None,
+            None,
+            perms,
+        )
+        .await
+        .unwrap();
+
+        let d = drive(vec![Arc::new(RichTool)], &[("toolu_1", "rich_stub")], bus).await;
+        let tr = &tool_result_message(&d.bodies[1])["content"][0];
+        assert!(
+            tr["content"].is_string(),
+            "Replace wins; rich blocks dropped"
+        );
+        assert_eq!(tr["content"], Value::String("REPLACED BY HOOK".into()));
+    }
+
+    #[tokio::test]
+    async fn parallel_lane_preserves_rich_content() {
+        let d = drive(
+            vec![Arc::new(RichTool), Arc::new(TextTool)],
+            &[("toolu_a", "rich_stub"), ("toolu_b", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let msg = tool_result_message(&d.bodies[1]);
+        let results = msg["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "toolu_a");
+        assert!(results[0]["content"].is_array(), "{}", results[0]);
+        assert_eq!(results[0]["content"][1]["type"], "image");
+        assert_eq!(results[1]["tool_use_id"], "toolu_b");
+        assert_eq!(
+            results[1]["content"],
+            Value::String("plain text result".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_preview_never_contains_base64() {
+        let d = drive(
+            vec![Arc::new(RichTool), Arc::new(TextTool)],
+            &[("toolu_a", "rich_stub"), ("toolu_b", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert_eq!(d.ui_results.len(), 2);
+        let rich = d
+            .ui_results
+            .iter()
+            .find(|r| r.starts_with("Image: "))
+            .expect("rich preview");
+        assert_eq!(rich, "Image: /tmp/x.png (1x1, image/png, 1 KB)");
+        for r in &d.ui_results {
+            assert!(r.len() < 512);
+            assert!(!r.contains(PNG_B64_PREFIX));
+        }
+    }
+
+    #[tokio::test]
+    async fn round_result_bytes_counts_array_content() {
+        assert_eq!(
+            tool_result_bytes(&json!({"type":"tool_result","tool_use_id":"x","content":"ok"})),
+            2
+        );
+        let arr = json!({"type":"tool_result","tool_use_id":"x","content":[
+            {"type":"text","text":"Image: x"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(1_000)}}
+        ]});
+        assert!(tool_result_bytes(&arr) >= 1_000);
+        // Legacy behaviour would have been 0 for arrays.
+        assert_ne!(tool_result_bytes(&arr), 0);
+    }
+
+    // ── S1: history image byte cap ─────────────────────────────────────────
+
+    fn user_msg(content: Value) -> SharedMessage {
+        Arc::new(json!({"role": "user", "content": content}))
+    }
+
+    fn assistant_msg(text: &str) -> SharedMessage {
+        Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": text}]}))
+    }
+
+    fn image_tool_result_msg(id: &str, b64_len: usize) -> SharedMessage {
+        user_msg(json!([{
+            "type": "tool_result", "tool_use_id": id,
+            "content": [
+                {"type": "text", "text": format!("Image: /tmp/{id}.png")},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": fake_b64(b64_len)}}
+            ]
+        }]))
+    }
+
+    fn image_history(n: usize, b64_len: usize) -> Vec<SharedMessage> {
+        let mut h = vec![user_msg(json!("look at these"))];
+        for i in 0..n {
+            let id = format!("toolu_{i}");
+            h.push(Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":id,"name":"read","input":{"path":format!("/tmp/{id}.png")}}
+            ]})));
+            h.push(image_tool_result_msg(&id, b64_len));
+        }
+        h
+    }
+
+    #[test]
+    fn history_cap_noop_under_cap() {
+        let h = image_history(3, 1_000);
+        assert!(cap_history_image_bytes(&h, 10_000).is_none());
+        assert!(cap_history_image_bytes(&h, 3_000).is_none());
+    }
+
+    #[test]
+    fn history_cap_drops_oldest_first_keeps_text_and_durable_history() {
+        // 5 images × 1000 bytes, cap 2500 → drop the 3 oldest, keep 2 newest.
+        let h = image_history(5, 1_000);
+        let out = cap_history_image_bytes(&h, 2_500).expect("over cap");
+        assert_eq!(out.len(), h.len());
+        let images: Vec<&Value> = out
+            .iter()
+            .filter(|m| m["content"][0]["type"] == "tool_result")
+            .map(|m| &m["content"][0]["content"][1])
+            .collect();
+        assert_eq!(images.len(), 5);
+        for (i, b) in images.iter().enumerate() {
+            if i < 3 {
+                assert_eq!(b["type"], "text", "image {i} should be dropped");
+                assert_eq!(b["text"], IMAGE_DROPPED_LABEL);
+            } else {
+                assert_eq!(b["type"], "image", "image {i} should survive");
+            }
+        }
+        // Text-first summary untouched on every message.
+        for m in &out {
+            if m["content"][0]["type"] == "tool_result" {
+                assert_eq!(m["content"][0]["content"][0]["type"], "text");
+                assert!(m["content"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Image: "));
+            }
+        }
+        // Durable history untouched; untouched messages share the Arc.
+        for m in &h {
+            if m["content"][0]["type"] == "tool_result" {
+                assert_eq!(m["content"][0]["content"][1]["type"], "image");
+            }
+        }
+        assert!(Arc::ptr_eq(&h[0], &out[0]));
+        assert!(Arc::ptr_eq(&h[h.len() - 1], &out[out.len() - 1]));
+        assert!(!Arc::ptr_eq(&h[2], &out[2]));
+    }
+
+    #[test]
+    fn history_cap_handles_top_level_user_images() {
+        let h = vec![
+            user_msg(json!([{"type":"text","text":"a"}, {"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(600)}}])),
+            assistant_msg("ok"),
+            user_msg(json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(600)}}])),
+        ];
+        let out = cap_history_image_bytes(&h, 1_000).unwrap();
+        assert_eq!(out[0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+        assert_eq!(out[2]["content"][0]["type"], "image");
+    }
+
+    /// Wire-level: history carrying N images over the cap → the request body
+    /// that hits the provider holds only the newest images under the cap.
+    #[tokio::test]
+    async fn history_cap_applied_to_request_body() {
+        // 7 × 3.5 MiB = 24.5 MiB > 20 MiB → 2 oldest dropped, 5 newest kept.
+        let per = 3_670_016usize;
+        let d = drive_with_history(
+            image_history(7, per),
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        for body in &d.bodies {
+            let msgs = body["messages"].as_array().unwrap();
+            let mut kept = 0usize;
+            let mut dropped = 0usize;
+            let mut bytes = 0usize;
+            for m in msgs {
+                let Some(blocks) = m["content"].as_array() else { continue };
+                for b in blocks {
+                    if let Some(inner) = b["content"].as_array() {
+                        for x in inner {
+                            if is_base64_image(x) {
+                                kept += 1;
+                                bytes += base64_image_len(x);
+                            } else if x["text"] == IMAGE_DROPPED_LABEL {
+                                dropped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!((dropped, kept), (2, 5), "{}", body["messages"].as_array().unwrap().len());
+            assert!(bytes <= HISTORY_IMAGE_BYTE_CAP, "{bytes}");
+            // Oldest two are the dropped ones.
+            let first = msgs.iter().find(|m| m["content"][0]["type"] == "tool_result").unwrap();
+            assert_eq!(first["content"][0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+        }
+        // Durable history (what gets saved) still carries every image.
+        let images_in_history = d
+            .history
+            .iter()
+            .filter(|m| m["content"][0]["content"][1]["type"] == "image")
+            .count();
+        assert_eq!(images_in_history, 7);
+    }
+
+    #[test]
+    fn select_content_prefers_rich_then_bounded_then_truncated() {
+        let blocks = vec![json!({"type":"text","text":"s"})];
+        assert!(select_tool_result_content(Some(blocks), Some("b".into()), "s", 10).is_array());
+        assert_eq!(
+            select_tool_result_content(None, Some("bounded".into()), "s", 10),
+            Value::String("bounded".into())
+        );
+        assert_eq!(
+            select_tool_result_content(None, None, "short", 10),
+            Value::String("short".into())
         );
     }
 }

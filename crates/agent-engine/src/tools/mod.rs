@@ -181,6 +181,49 @@ pub enum ConcurrencyKey {
     Serialize,
 }
 
+/// Structured tool output. `Text` is the legacy contract (what `execute`
+/// returns). `Blocks` carries Anthropic-shaped content blocks destined for
+/// `tool_result.content`, plus a plain-text `summary` used everywhere a
+/// `String` is expected today: UI preview, `after_tool_call` hooks, trace
+/// ledger byte counts, headless logs, and providers that cannot carry the
+/// blocks. INVARIANT: `blocks[0]` MUST be a `{"type":"text"}` block whose
+/// `text` == `summary` (compaction reads `blocks[0].text`; non-Anthropic
+/// translators join only text sub-blocks).
+#[derive(Debug, Clone)]
+pub enum ToolOutput {
+    Text(String),
+    Blocks { blocks: Vec<Value>, summary: String },
+}
+
+impl ToolOutput {
+    pub fn summary(&self) -> &str {
+        match self {
+            Self::Text(s) => s,
+            Self::Blocks { summary, .. } => summary,
+        }
+    }
+
+    /// `(summary, Some(blocks))` for rich output, `(text, None)` for plain.
+    /// Debug builds assert the `blocks[0]` text-first invariant here — this
+    /// is the one choke point every rich result passes through.
+    pub fn into_parts(self) -> (String, Option<Vec<Value>>) {
+        match self {
+            Self::Text(s) => (s, None),
+            Self::Blocks { blocks, summary } => {
+                debug_assert!(
+                    blocks.first().is_some_and(|b| b["type"] == "text" && b["text"] == summary),
+                    "ToolOutput::Blocks invariant: blocks[0] must be a text block equal to summary"
+                );
+                (summary, Some(blocks))
+            }
+        }
+    }
+
+    pub fn into_summary(self) -> String {
+        self.into_parts().0
+    }
+}
+
 /// The core trait for all tools. Implement this to add a new tool.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -195,6 +238,18 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given parameters.
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
+
+    /// Structured variant of [`Tool::execute`]. DEFAULTED — existing tools
+    /// keep returning `String` via `execute` and never see this. Tools that
+    /// need to place non-text content blocks (images) into the model history
+    /// override this and make `execute` delegate to it.
+    ///
+    /// RECURSION TRAP: the default delegates to `execute`. If you make
+    /// `execute` delegate here (as `ReadTool` does) you MUST override this
+    /// method too, or the pair recurses until the stack blows.
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        self.execute(params, ctx).await.map(ToolOutput::Text)
+    }
 
     /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
     fn extension_id(&self) -> Option<&str> {

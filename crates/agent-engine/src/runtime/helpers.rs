@@ -320,6 +320,8 @@ impl HelperMethods {
     /// shared [`agent_core::BoundedText`] helper (T2; the legacy code applied
     /// a char budget, so multibyte output could exceed the byte cap). Marker
     /// format intentionally changed from "total chars" to "total bytes".
+    // Rich (array) tool_result content never passes through here — see
+    // stream.rs `select_tool_result_content`.
     pub(crate) fn truncate_tool_result(result: &str, max_bytes: usize) -> String {
         let bounded = agent_core::BoundedText::new(result, max_bytes);
         if !bounded.truncated {
