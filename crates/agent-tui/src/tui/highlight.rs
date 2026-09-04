@@ -661,7 +661,10 @@ mod tests {
     /// `cargo test -p synaps-tui --release --lib -- --ignored measure_hl_first --nocapture`
     /// and again with `SYNAPS_TUI_SYNTECT=full`. Prints RssAnon before the
     /// first highlight, after it (`hl_first` step), after eviction, and after
-    /// the reload, with `load_ms` for both loads.
+    /// the reload, with `load_ms` for both loads. The lib test binary runs on
+    /// the system allocator, so RssAnon does not come back after eviction here
+    /// (glibc keeps the free lists) — `tests/highlight_mem.rs` has the
+    /// jemalloc-accounted heap numbers; this one is for the two latencies.
     #[test]
     #[ignore]
     #[serial_test::serial(highlight_cache)]
