@@ -23,6 +23,34 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 type Reader = BufReader<OwnedReadHalf>;
 
+/// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
+/// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
+/// anything that drives the actor's *own* bookkeeping (`Attach`, `Detach`
+/// for another client, `Resync`, `HostEvent`) or ends the session for every
+/// other client (`End`) is refused with an `Error` frame. Ending a session
+/// is `daemon stop`'s job today.
+fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static str> {
+    use SessionCommand as C;
+    match cmd {
+        C::Submit { .. }
+        | C::Steer { .. }
+        | C::Cancel
+        | C::Answer { .. }
+        | C::Set(_)
+        | C::Compact { .. }
+        | C::NewSession
+        | C::Save
+        | C::Query { .. }
+        | C::EngineCommand { .. } => Ok(()),
+        C::Detach { client } if *client == own => Ok(()),
+        C::Detach { .. } => Err("detach: not your client id"),
+        C::Attach { .. } => Err("attach: already attached (one session per connection)"),
+        C::End { .. } => Err("end: sessions are ended by `synaps daemon stop`, not by clients"),
+        C::Resync { .. } => Err("resync: not a client command"),
+        C::HostEvent(_) => Err("host_event: not a client command"),
+    }
+}
+
 enum Read {
     Frame(ClientFrame),
     Eof,
@@ -323,7 +351,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached to that session".into() }).await;
                     continue;
                 }
-                if matches!(cmd, SessionCommand::HostEvent(_)) {
+                if let Err(why) = client_may_send(&cmd, client) {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
                 match handle.send(cmd).await {

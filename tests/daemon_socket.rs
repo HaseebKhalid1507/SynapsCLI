@@ -221,6 +221,70 @@ async fn attach_to_session_with_history_over_1mib() {
     d.wait().await;
 }
 
+/// §4 MED: a client may only send the user-facing subset; `Detach` only for
+/// its own id; `End`/`Attach`/`Resync` are refused with an `Error` frame and
+/// the session stays alive for everyone else.
+#[tokio::test]
+#[serial]
+async fn client_commands_are_whitelisted() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut a, _) = SocketTransport::attach(
+        conn,
+        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next(&mut a).await.event, SessionEventWire::ClientJoined { .. }));
+    let conn2 = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Attach)).await.unwrap();
+    let (mut b, _) = SocketTransport::attach(conn2, Attach::Existing { session_id: a.session_id().clone(), mode: AttachMode::Mirror }).await.unwrap();
+    assert!(matches!(next(&mut a).await.event, SessionEventWire::ClientJoined { .. }));
+    assert!(matches!(next(&mut b).await.event, SessionEventWire::ClientJoined { .. }));
+    let other = a.client_id();
+    assert_ne!(other, b.client_id());
+
+    // Errors surface as SystemNotice("refused: …") on the sender only.
+    async fn refused(t: &mut SocketTransport) -> String {
+        match next(t).await.event {
+            SessionEventWire::SystemNotice(m) => {
+                assert!(m.starts_with("refused:"), "{m}");
+                m
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+    b.send(SessionCommand::Detach { client: other }).await.unwrap();
+    assert!(refused(&mut b).await.contains("not your client id"));
+    b.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.unwrap();
+    assert!(refused(&mut b).await.contains("end:"));
+    b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror }).await.unwrap();
+    assert!(refused(&mut b).await.contains("attach:"));
+    b.send(SessionCommand::Resync { client: other, since_seq: 0 }).await.unwrap();
+    assert!(refused(&mut b).await.contains("resync:"));
+    assert_eq!(d.state.live_sessions().len(), 1, "session survives refused End");
+
+    // a is untouched: nothing was forwarded to the actor (Save round-trips as an echo notice)
+    a.send(SessionCommand::Save).await.unwrap();
+    match next(&mut a).await.event {
+        SessionEventWire::SystemNotice(m) => assert!(m.starts_with("echo:"), "{m}"),
+        o => panic!("{o:?}"),
+    }
+    // whitelisted command from b reaches the actor and fans out to both
+    b.send(SessionCommand::Steer { text: "ok".into() }).await.unwrap();
+    assert!(matches!(next(&mut a).await.event, SessionEventWire::Steered { .. }));
+    assert!(matches!(next(&mut b).await.event, SessionEventWire::Steered { .. }));
+    // Detach{own} is allowed and only b leaves
+    b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
+    assert!(matches!(next(&mut a).await.event, SessionEventWire::ClientLeft { client } if client == b.client_id()));
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn stale_socket_reaped_and_second_daemon_refused() {
