@@ -1305,6 +1305,22 @@ impl Runtime {
     pub fn http_client(&self) -> &Client {
         &self.client
     }
+
+    /// Whether this runtime projects a progressive (core-only) tool schema.
+    pub fn progressive_tool_disclosure(&self) -> bool {
+        self.progressive_tool_disclosure
+    }
+
+    /// Identity of the underlying connection pool: two `Client` handles that
+    /// clone the same `Arc` share one pool. `reqwest::Client` is a single
+    /// `Arc<ClientRef>`, so its bytes ARE the pool pointer.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn http_client_pool_id(&self) -> usize {
+        const _: () = assert!(std::mem::size_of::<Client>() == std::mem::size_of::<usize>());
+        // SAFETY: size asserted above; only the bit pattern is read, no
+        // ownership is taken (transmute_copy does not move out of `self`).
+        unsafe { std::mem::transmute_copy::<Client, usize>(&self.client) }
+    }
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
         // Sync named_level from budget so the two fields stay consistent.

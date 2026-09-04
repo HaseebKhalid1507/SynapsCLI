@@ -187,18 +187,29 @@ impl EngineHost {
         Ok(runtime)
     }
 
-    /// A worker (subagent) runtime. Shares client, credential source and
-    /// token cache (so NO broker re-install and NO cache eviction) and takes
-    /// a CLONE of the cached worker registry template. Does NOT share:
-    /// hook_bus (fresh, empty — hooks do not fire for subagent tool calls),
-    /// session_manager (fresh + reaper), mcp_runtime/extension_runtime
-    /// (`None`, as `Runtime::new()`).
+    /// A worker (subagent) runtime. Shares credential source and token cache
+    /// (so NO broker re-install and NO cache eviction) and takes a CLONE of
+    /// the cached worker registry template. Does NOT share: the HTTP client
+    /// (fresh — see below), hook_bus (fresh, empty — hooks do not fire for
+    /// subagent tool calls), session_manager (fresh + reaper),
+    /// mcp_runtime/extension_runtime (`None`, as `Runtime::new()`).
+    ///
+    /// Own client: workers `block_on` a throwaway `current_thread` runtime
+    /// and hyper parks each connection's I/O driver on the runtime that
+    /// opened it. A pooled connection born on a worker would be handed to
+    /// the foreground (LIFO checkout) and die mid-stream when that worker's
+    /// runtime dropped. A per-worker pool dies with its runtime, as before.
     pub async fn worker_runtime(&self) -> Result<Runtime> {
         let mut host = self.parts.clone();
         host.hook_bus = Arc::new(HookBus::new());
         host.tools = Arc::new(RwLock::new(self.worker_registry().await));
         host.mcp_runtime = None;
         host.extension_runtime = None;
+        // `Runtime::new()` value. Workers never ran `apply_config`, so they
+        // never had disclosure on; their registry has no discovery/activation
+        // tools, so a projected schema would silently drop every extension
+        // tool.
+        host.progressive_tool_disclosure = false;
         Ok(Runtime::from_parts(RuntimeParts::with_reaper(host)))
     }
 
