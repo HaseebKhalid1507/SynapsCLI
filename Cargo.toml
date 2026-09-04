@@ -71,6 +71,8 @@ tempfile = "3"
 clap_complete = "4.5.67"
 
 [dev-dependencies]
+# Unlocks `Runtime::new_headless()` for bin tests (feature-unified in test builds).
+agent-engine = { path = "crates/agent-engine", version = "0.9.0", package = "synaps-engine", features = ["testing"] }
 serial_test = "3.4.0"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = true }

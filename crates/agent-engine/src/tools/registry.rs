@@ -640,6 +640,27 @@ impl ToolRegistry {
             }
             projected.push(entry.clone());
         }
+        // Post-pass: a pinned member that vanished ENTIRELY (extension
+        // unload → `try_disable` rebuilds `cached_schema` without it) never
+        // appears in the loop above, so it would be silently omitted from
+        // `dropped` and the audit signal lost. Walk the session's own
+        // core + activated pins and report any id the catalog no longer
+        // knows and that the loop did not already account for.
+        let seen: HashSet<&crate::tools::catalog::ToolId> =
+            dropped.iter().map(|(id, _)| id).collect();
+        let vanished: Vec<crate::tools::catalog::ToolId> = session
+            .core_ids()
+            .chain(session.activated().map(|a| a.grant().tool_id()))
+            .filter(|id| !seen.contains(id) && self.catalog.get(id).is_none())
+            .cloned()
+            .collect();
+        for id in vanished {
+            tracing::warn!(
+                tool = %id,
+                "session schema projection drops uncataloged session member                  (removed from the registry since the session pinned it)"
+            );
+            dropped.push((id, DroppedSessionMember::Uncataloged));
+        }
         SessionSchemaProjection {
             schema: projected,
             dropped,

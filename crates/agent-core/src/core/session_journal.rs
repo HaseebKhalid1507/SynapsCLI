@@ -19,6 +19,7 @@
 //! 0600 files, symlink-refusing, atomic snapshot replacement, synced appends.
 
 use crate::core::session::Session;
+use crate::core::stream_types::SharedMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -508,15 +509,12 @@ pub fn save_session_in_dir(
     // ONE strict resolution per save (fix2); every artifact operation below
     // is relative to this handle.
     let handle = create_sessions_dir(dir)?;
-    // Refresh the persisted listing hint at the single save choke point so
-    // the header always carries the current count (messages are Arc-shared;
-    // the clone is cheap).
-    let mut session = session.clone();
-    session.message_count = session.api_messages.len();
-    let session = &session;
+    // The persisted listing hint (`message_count`) is refreshed at write
+    // time by `snapshot_json` / `SessionMeta::of` — no `Session` clone, so
+    // the journal delta path stays O(delta) rather than O(history).
     match mode {
         SessionPersistence::Json => {
-            let json = serde_json::to_string(session).map_err(std::io::Error::other)?;
+            let json = snapshot_json(session)?;
             handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
             // Rollback fold: the snapshot now holds everything; a stale
             // journal must not shadow future legacy-only readers.
@@ -607,11 +605,75 @@ fn save_journal_mode(
 /// Atomic full snapshot (unchanged legacy schema) followed by an atomic
 /// journal reset to a lone `open` record. Snapshot strictly first: a crash
 /// between the two leaves a stale-but-idempotent journal, never data loss.
+/// Borrowing mirror of [`Session`] used ONLY for snapshot serialization:
+/// identical field order and serde attributes, with `message_count`
+/// computed from `api_messages.len()` at write time instead of read from
+/// the (non-authoritative) in-memory field. Field order matters —
+/// `message_count` must precede `api_messages` for `read_session_header`.
+/// The `snapshot_json_matches_session_schema` test guards drift.
+#[derive(Serialize)]
+struct SessionSnapshotRef<'a> {
+    id: &'a str,
+    title: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: &'a Option<String>,
+    model: &'a str,
+    thinking_level: &'a str,
+    system_prompt: &'a Option<String>,
+    created_at: &'a DateTime<Utc>,
+    updated_at: &'a DateTime<Utc>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    session_cost: f64,
+    message_count: usize,
+    api_messages: &'a [SharedMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    abort_context: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compacted_into: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_provenance: &'a Option<crate::prompt::PromptProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction: &'a Option<crate::core::compaction::CompactionRecord>,
+}
+
+impl<'a> SessionSnapshotRef<'a> {
+    fn of(s: &'a Session) -> Self {
+        Self {
+            id: &s.id,
+            title: &s.title,
+            name: &s.name,
+            model: &s.model,
+            thinking_level: &s.thinking_level,
+            system_prompt: &s.system_prompt,
+            created_at: &s.created_at,
+            updated_at: &s.updated_at,
+            total_input_tokens: s.total_input_tokens,
+            total_output_tokens: s.total_output_tokens,
+            session_cost: s.session_cost,
+            message_count: s.api_messages.len(),
+            api_messages: &s.api_messages,
+            abort_context: &s.abort_context,
+            parent_session: &s.parent_session,
+            compacted_into: &s.compacted_into,
+            prompt_provenance: &s.prompt_provenance,
+            compaction: &s.compaction,
+        }
+    }
+}
+
+/// Full-snapshot JSON with a fresh `message_count`, without cloning.
+fn snapshot_json(session: &Session) -> std::io::Result<String> {
+    serde_json::to_string(&SessionSnapshotRef::of(session)).map_err(std::io::Error::other)
+}
+
 fn full_snapshot_reset(
     handle: &SessionsDirHandle,
     session: &Session,
 ) -> std::io::Result<SaveReceipt> {
-    let json = serde_json::to_string(session).map_err(std::io::Error::other)?;
+    let json = snapshot_json(session)?;
     handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
 
     let open = JournalRecord::Open {
@@ -756,6 +818,34 @@ mod tests {
     /// field. Serializing a full `Session`, dropping `api_messages`, and
     /// parsing the rest as `SessionMeta` (deny_unknown_fields) fails the
     /// moment `Session` grows a field this module does not journal.
+    #[test]
+    fn snapshot_json_matches_session_schema() {
+        let mut s = Session::new("model-x", "medium", Some("prompt"));
+        s.name = Some("named".into());
+        s.abort_context = Some("ctx".into());
+        s.parent_session = Some("parent".into());
+        s.compacted_into = Some("child".into());
+        s.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ));
+        s.message_count = 0; // stale in memory — snapshot must not trust it
+                             // Expected = the old clone-and-refresh path, byte for byte.
+        let mut expected = s.clone();
+        expected.message_count = expected.api_messages.len();
+        let expected = serde_json::to_string(&expected).unwrap();
+        assert_eq!(snapshot_json(&s).unwrap(), expected);
+        let back: Session = serde_json::from_str(&snapshot_json(&s).unwrap()).unwrap();
+        assert_eq!(back.message_count, 1);
+        // Same check with every optional absent.
+        let s = Session::new("model-x", "medium", None);
+        let mut expected = s.clone();
+        expected.message_count = 0;
+        assert_eq!(
+            snapshot_json(&s).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
     #[test]
     fn session_meta_stays_in_sync_with_session_schema() {
         let mut s = Session::new("model-x", "medium", Some("prompt"));
