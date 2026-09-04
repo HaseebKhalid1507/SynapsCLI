@@ -369,11 +369,39 @@ impl Drop for Pane {
 /// on both. Nothing else is dropped.
 fn normalise_socket(frame: &str) -> String {
     let attached = regex::Regex::new(r"^\s*attached to <id> as client #\d+ \([A-Za-z]+\).*$").unwrap();
-    normalise(frame)
-        .lines()
-        .filter(|l| !attached.is_match(l))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let norm = normalise(frame);
+    let lines: Vec<&str> = norm.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if attached.is_match(lines[i]) {
+            // The banner is a System card: its text row + the blank
+            // separator row after it.
+            i += 1;
+            if i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    out.join("\n")
+}
+
+/// Copy a pane's sessions dir under `target/tui-e2e/<scenario>.<tag>.sessions/`
+/// so a journal diff can be inspected after the temp HOME is gone.
+fn keep_sessions(out_dir: &Path, scenario: &str, tag: &str, home: &Path) {
+    let dst = out_dir.join(format!("{scenario}.{tag}.sessions"));
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::create_dir_all(&dst);
+    if let Ok(rd) = std::fs::read_dir(home.join(".synaps-cli/sessions")) {
+        for e in rd.flatten() {
+            if e.path().is_file() {
+                let _ = std::fs::copy(e.path(), dst.join(e.file_name()));
+            }
+        }
+    }
 }
 
 fn pane_env(home: &Path, base: &Path, base_url: &str) -> String {
@@ -599,6 +627,8 @@ async fn tui_reference_binary_differential() {
                 failures.push(d);
             }
         }
+        keep_sessions(&out_dir, sc.name, "ref", r.home.path());
+        keep_sessions(&out_dir, sc.name, "new", l.home.path());
         let jr = normalise_journal(&r.home.path().join(".synaps-cli/sessions"));
         let jl = normalise_journal(&l.home.path().join(".synaps-cli/sessions"));
         if let Some(d) = diff_report(&format!("{}/journal", sc.name), &jr, &jl) {
@@ -617,6 +647,7 @@ async fn tui_reference_binary_differential() {
             }
             // The daemon writes S's journal; give the detach a beat, then stop it.
             std::thread::sleep(Duration::from_millis(500));
+            keep_sessions(&out_dir, sc.name, "sock", s.home.path());
             let js = normalise_journal(&s.home.path().join(".synaps-cli/sessions"));
             if let Some(d) = diff_report_named(&format!("{}/journal", sc.name), ("L", &jl), ("S", &js)) {
                 socket_failures.push(d);
