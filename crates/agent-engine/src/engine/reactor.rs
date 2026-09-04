@@ -779,6 +779,102 @@ mod tests {
         assert!(!claim_auto_turn(&mut c));
         assert_eq!(c, AUTO_TURN_CAP);
     }
+
+    // ── configurable cap (events.auto_turn_cap) ─────────────────────────
+
+    #[test]
+    fn cap_reached_zero_is_unlimited() {
+        assert!(!auto_turn_cap_reached(0, AUTO_TURN_UNLIMITED));
+        assert!(!auto_turn_cap_reached(u32::MAX, AUTO_TURN_UNLIMITED));
+        assert!(auto_turn_cap_reached(5, 5));
+        assert!(!auto_turn_cap_reached(4, 5));
+    }
+
+    #[test]
+    fn claim_with_cap_zero_never_trips_across_100_turns() {
+        let mut counter: u32 = 0;
+        for i in 1..=100u32 {
+            assert!(
+                claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED),
+                "unlimited: turn {i} must be allowed"
+            );
+        }
+        assert_eq!(counter, 100);
+    }
+
+    #[test]
+    fn claim_with_cap_two_trips_on_third() {
+        let mut counter: u32 = 0;
+        assert!(claim_auto_turn_with_cap(&mut counter, 2));
+        assert!(claim_auto_turn_with_cap(&mut counter, 2));
+        assert!(!claim_auto_turn_with_cap(&mut counter, 2), "3rd must be denied");
+        assert_eq!(counter, 2);
+    }
+
+    #[test]
+    fn claim_with_cap_unlimited_saturates_instead_of_overflowing() {
+        let mut counter: u32 = u32::MAX;
+        assert!(claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED));
+        assert_eq!(counter, u32::MAX);
+    }
+
+    #[test]
+    fn wake_with_cap_zero_never_parks_across_100_turns() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        for consecutive in 0..100u32 {
+            assert_eq!(
+                wake_action_with_cap(&drained, &messages, false, true, consecutive, 0),
+                WakeAction::RunTurn,
+                "unlimited: consecutive={consecutive} must still RunTurn"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_with_cap_two_forwards_on_third() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        assert_eq!(
+            wake_action_with_cap(&drained, &messages, false, true, 1, 2),
+            WakeAction::RunTurn
+        );
+        assert_eq!(
+            wake_action_with_cap(&drained, &messages, false, true, 2, 2),
+            WakeAction::Forward
+        );
+    }
+
+    #[test]
+    fn wake_default_wrapper_matches_default_cap() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        assert_eq!(
+            wake_action(&drained, &messages, false, true, AUTO_TURN_CAP),
+            wake_action_with_cap(&drained, &messages, false, true, AUTO_TURN_CAP, AUTO_TURN_CAP)
+        );
+    }
+
+    #[test]
+    fn terminal_flush_seam_with_cap_zero_reserves_at_high_counter() {
+        let mut pending = false;
+        let mut events = vec!["<event>x</event>".to_string()];
+        let mut msgs: Vec<SharedMessage> = Vec::new();
+        let mut counter: u32 = 1_000;
+        let r = terminal_flush_seam_with_cap(
+            true, &mut pending, &mut events, &mut msgs, true, &mut counter, 0,
+        );
+        assert_eq!(r.as_deref(), Some("auto:seam"));
+        assert!(pending);
+        assert_eq!(counter, 1_001);
+    }
+
+    #[test]
+    fn describe_cap_renders_unlimited_and_numbers() {
+        assert_eq!(describe_auto_turn_cap(0), "unlimited");
+        assert_eq!(describe_auto_turn_cap(12), "12");
+    }
+
 }
 
 #[cfg(test)]
@@ -919,99 +1015,5 @@ mod disclosure_persistence_tests {
         let drained = drain_event_queue(&queue, &mut messages, &mut pending, false, None);
         let payload = event_payload_from_drained(&drained[0]);
         assert_eq!(payload.disclosure, None, "absent class stays absent");
-    }
-    // ── configurable cap (events.auto_turn_cap) ─────────────────────────
-
-    #[test]
-    fn cap_reached_zero_is_unlimited() {
-        assert!(!auto_turn_cap_reached(0, AUTO_TURN_UNLIMITED));
-        assert!(!auto_turn_cap_reached(u32::MAX, AUTO_TURN_UNLIMITED));
-        assert!(auto_turn_cap_reached(5, 5));
-        assert!(!auto_turn_cap_reached(4, 5));
-    }
-
-    #[test]
-    fn claim_with_cap_zero_never_trips_across_100_turns() {
-        let mut counter: u32 = 0;
-        for i in 1..=100u32 {
-            assert!(
-                claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED),
-                "unlimited: turn {i} must be allowed"
-            );
-        }
-        assert_eq!(counter, 100);
-    }
-
-    #[test]
-    fn claim_with_cap_two_trips_on_third() {
-        let mut counter: u32 = 0;
-        assert!(claim_auto_turn_with_cap(&mut counter, 2));
-        assert!(claim_auto_turn_with_cap(&mut counter, 2));
-        assert!(!claim_auto_turn_with_cap(&mut counter, 2), "3rd must be denied");
-        assert_eq!(counter, 2);
-    }
-
-    #[test]
-    fn claim_with_cap_unlimited_saturates_instead_of_overflowing() {
-        let mut counter: u32 = u32::MAX;
-        assert!(claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED));
-        assert_eq!(counter, u32::MAX);
-    }
-
-    #[test]
-    fn wake_with_cap_zero_never_parks_across_100_turns() {
-        let drained = vec![injected_event()];
-        let messages = vec![user_msg("ev")];
-        for consecutive in 0..100u32 {
-            assert_eq!(
-                wake_action_with_cap(&drained, &messages, false, true, consecutive, 0),
-                WakeAction::RunTurn,
-                "unlimited: consecutive={consecutive} must still RunTurn"
-            );
-        }
-    }
-
-    #[test]
-    fn wake_with_cap_two_forwards_on_third() {
-        let drained = vec![injected_event()];
-        let messages = vec![user_msg("ev")];
-        assert_eq!(
-            wake_action_with_cap(&drained, &messages, false, true, 1, 2),
-            WakeAction::RunTurn
-        );
-        assert_eq!(
-            wake_action_with_cap(&drained, &messages, false, true, 2, 2),
-            WakeAction::Forward
-        );
-    }
-
-    #[test]
-    fn wake_default_wrapper_matches_default_cap() {
-        let drained = vec![injected_event()];
-        let messages = vec![user_msg("ev")];
-        assert_eq!(
-            wake_action(&drained, &messages, false, true, AUTO_TURN_CAP),
-            wake_action_with_cap(&drained, &messages, false, true, AUTO_TURN_CAP, AUTO_TURN_CAP)
-        );
-    }
-
-    #[test]
-    fn terminal_flush_seam_with_cap_zero_reserves_at_high_counter() {
-        let mut pending = false;
-        let mut events = vec!["<event>x</event>".to_string()];
-        let mut msgs: Vec<SharedMessage> = Vec::new();
-        let mut counter: u32 = 1_000;
-        let r = terminal_flush_seam_with_cap(
-            true, &mut pending, &mut events, &mut msgs, true, &mut counter, 0,
-        );
-        assert_eq!(r.as_deref(), Some("auto:seam"));
-        assert!(pending);
-        assert_eq!(counter, 1_001);
-    }
-
-    #[test]
-    fn describe_cap_renders_unlimited_and_numbers() {
-        assert_eq!(describe_auto_turn_cap(0), "unlimited");
-        assert_eq!(describe_auto_turn_cap(12), "12");
     }
 }
