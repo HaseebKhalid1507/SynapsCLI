@@ -103,6 +103,11 @@ impl SessionHandle {
         !self.cmd_tx.is_closed()
     }
 
+    /// Resolves once the actor is gone (command receiver dropped).
+    pub async fn closed(&self) {
+        self.cmd_tx.closed().await
+    }
+
     /// EchoActor: `Submit{text}` → `TurnStarted`, `Stream(Text(text))`,
     /// `Stream(Done)`, `Conversation` — for B's socket tests before A1 lands.
     #[cfg(any(test, feature = "testing"))]

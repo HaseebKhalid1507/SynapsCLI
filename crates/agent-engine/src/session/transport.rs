@@ -51,6 +51,8 @@ pub struct LocalTransport {
     rx: broadcast::Receiver<Envelope>,
     client: ClientId,
     meta: SessionMeta,
+    /// Set after `Ended` (or actor gone): `next_event` returns `None` from then on.
+    ended: bool,
 }
 
 impl LocalTransport {
@@ -97,6 +99,7 @@ impl LocalTransport {
                 rx,
                 client,
                 meta,
+                ended: false,
             },
             snapshot,
         ))
@@ -122,8 +125,30 @@ impl ClientTransport for LocalTransport {
     }
 
     async fn next_event(&mut self) -> Option<Envelope> {
-        match self.rx.recv().await {
-            Ok(env) => Some(env),
+        if self.ended {
+            return None;
+        }
+        // The handle itself holds a broadcast sender, so `Closed` never
+        // fires on its own: end-of-stream is `Ended` or the actor going away
+        // (drain what it left behind first).
+        let recv = tokio::select! {
+            biased;
+            r = self.rx.recv() => r,
+            _ = self.handle.closed() => match self.rx.try_recv() {
+                Ok(env) => Ok(env),
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    Err(broadcast::error::RecvError::Lagged(n))
+                }
+                Err(_) => Err(broadcast::error::RecvError::Closed),
+            },
+        };
+        match recv {
+            Ok(env) => {
+                if matches!(env.event, SessionEventWire::Ended { .. }) {
+                    self.ended = true;
+                }
+                Some(env)
+            }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // server.rs Lagged pattern: warn, tell the client once, keep going.
                 tracing::warn!(session = %self.handle.id, dropped = n, "session event stream lagged");
@@ -136,7 +161,10 @@ impl ClientTransport for LocalTransport {
                     )),
                 })
             }
-            Err(broadcast::error::RecvError::Closed) => None,
+            Err(broadcast::error::RecvError::Closed) => {
+                self.ended = true;
+                None
+            }
         }
     }
 
