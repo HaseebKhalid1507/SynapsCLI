@@ -39,6 +39,11 @@ impl Raw {
         self.w.write_all(s.as_bytes()).await.unwrap();
         self.w.write_all(b"\n").await.unwrap();
     }
+    /// For oversize probes: the daemon may close before the tail is written.
+    async fn send_line_lossy(&mut self, s: &str) {
+        let _ = self.w.write_all(s.as_bytes()).await;
+        let _ = self.w.write_all(b"\n").await;
+    }
     async fn send(&mut self, f: &ClientFrame) {
         self.w.write_all(encode_line(f).unwrap().as_bytes()).await.unwrap();
     }
@@ -85,14 +90,19 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     c.send_line("{not json").await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Refused { reason: RefuseReason::Protocol, .. })));
 
-    // oversize frame (> 1 MiB) → Error + close
+    // > rpc's 1 MiB but under DAEMON_MAX_FRAME_BYTES → accepted (Pong)
     let mut c = Raw::connect(&sock).await;
     c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
-    let big = format!("{{\"type\":\"ping\",\"pad\":\"{}\"}}", "x".repeat(MAX_FRAME_BYTES + 10));
-    c.send_line(&big).await;
+    let mid = format!("{{\"type\":\"ping\",\"pad\":\"{}\"}}", "x".repeat(RPC_MAX_FRAME_BYTES * 2));
+    c.send_line(&mid).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Pong { .. })));
+
+    // oversize frame (> DAEMON_MAX_FRAME_BYTES = 64 MiB) → Error + close
+    let big = format!("{{\"type\":\"ping\",\"pad\":\"{}\"}}", "x".repeat(DAEMON_MAX_FRAME_BYTES + 10));
+    c.send_line_lossy(&big).await;
     match c.recv().await {
-        Some(DaemonFrame::Error { message, .. }) => assert!(message.contains("1 MiB"), "{message}"),
+        Some(DaemonFrame::Error { message, .. }) => assert!(message.contains("64 MiB"), "{message}"),
         other => panic!("{other:?}"),
     }
     assert!(c.recv().await.is_none());

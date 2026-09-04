@@ -156,6 +156,71 @@ async fn socket_roundtrip_real_uds() {
     assert!(ended, "attached client sees Ended on daemon stop");
 }
 
+/// §4 HIGH: a session whose history is past rpc's 1 MiB cap must still
+/// attach (`Attached` carries the whole history) and stream (`Conversation`
+/// is a digest, so the per-event cost is O(1) regardless of history size).
+#[tokio::test]
+#[serial]
+async fn attach_to_session_with_history_over_1mib() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut t, _) = SocketTransport::attach(
+        conn,
+        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next(&mut t).await.event, SessionEventWire::ClientJoined { .. }));
+
+    // echo: user + assistant both carry the text → history ≈ 2 × 700 KiB > 1 MiB
+    let big = "z".repeat(700 * 1024);
+    t.send(SessionCommand::Submit { text: big.clone(), attachments: vec![] }).await.unwrap();
+    let mut conv = None;
+    let mut saw_history = false;
+    loop {
+        let e = next(&mut t).await;
+        match e.event {
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(m))) => saw_history = m.len() == 2,
+            SessionEventWire::Conversation(c) => {
+                conv = Some(c);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_history, "MessageHistory (> 1 MiB) delivered over the daemon wire");
+    let conv = conv.unwrap();
+    assert_eq!(conv.api_messages.len(), 2, "digest matched the MessageHistory mirror");
+    assert_eq!(conv.api_messages[1]["content"], big);
+    let bytes: usize = conv.api_messages.iter().map(|m| serde_json::to_vec(&**m).unwrap().len()).sum();
+    assert!(bytes > RPC_MAX_FRAME_BYTES, "history is {bytes} B, must exceed rpc's cap for this test to mean anything");
+
+    // a fresh client attaches to that session: Attached > 1 MiB
+    let conn2 = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Attach)).await.unwrap();
+    let (mut t2, snap2) = SocketTransport::attach(conn2, Attach::Existing { session_id: t.session_id().clone(), mode: AttachMode::Mirror })
+        .await
+        .expect("attach to a > 1 MiB session");
+    assert_eq!(snap2.conversation.api_messages.len(), 2);
+    assert_eq!(snap2.conversation.api_messages[1]["content"], big);
+    assert_eq!(t2.messages().len(), 2);
+    assert!(matches!(next(&mut t2).await.event, SessionEventWire::ClientJoined { .. }));
+
+    // the second client's mirror also survives a Cancel (echo re-emits Conversation, digest-only)
+    t2.send(SessionCommand::Cancel).await.unwrap();
+    let e = next(&mut t2).await;
+    match e.event {
+        SessionEventWire::Conversation(c) => assert_eq!(c.api_messages.len(), 2),
+        other => panic!("{other:?}"),
+    }
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn stale_socket_reaped_and_second_daemon_refused() {

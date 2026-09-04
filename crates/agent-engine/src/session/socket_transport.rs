@@ -51,7 +51,7 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Daem
             return Ok(None);
         }
         if n > MAX_FRAME_BYTES {
-            return Err(TransportError::Protocol("frame exceeds 1 MiB limit".into()));
+            return Err(TransportError::Protocol(frame_limit_msg()));
         }
         let t = line.trim_end();
         if t.is_empty() {
@@ -170,6 +170,12 @@ pub struct SocketTransport {
     view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub welcome: Welcome,
     ended: bool,
+    /// Local `api_messages` mirror: seeded by `Attached`, updated by
+    /// `Stream(MessageHistory)` and `QueryResult{DIGEST_RESYNC_QUERY_ID}`.
+    /// `Conversation` arrives as a digest; the mirror fills it in.
+    messages: Vec<crate::SharedMessage>,
+    /// Digest awaiting a `Messages` re-query (hash miss).
+    pending_digest: Option<ConversationDigest>,
 }
 
 impl SocketTransport {
@@ -207,6 +213,8 @@ impl SocketTransport {
                 view,
                 welcome: conn.welcome,
                 ended: false,
+                messages: snapshot.conversation.api_messages.clone(),
+                pending_digest: None,
             },
             snapshot,
         ))
@@ -245,6 +253,66 @@ impl SocketTransport {
     fn notice(&self, text: String) -> Envelope {
         Envelope { session_id: self.session.clone(), seq: u64::MAX, ts: chrono::Utc::now(), event: SessionEventWire::SystemNotice(text) }
     }
+
+    /// The client's view of `api_messages` (kept current by the digest protocol).
+    pub fn messages(&self) -> &[crate::SharedMessage] {
+        &self.messages
+    }
+
+    /// Turn a wire envelope into the in-process one, keeping the message
+    /// mirror honest. `None` = swallowed (reserved query id, or a digest that
+    /// needs a re-query first — the `Conversation` is re-emitted once the
+    /// `Messages` result lands).
+    fn absorb(&mut self, w: WireEnvelope) -> Option<Envelope> {
+        match w.event {
+            WireSessionEvent::Conversation { digest } => {
+                if digest.matches(&self.messages) {
+                    let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
+                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                }
+                if digest.messages_len == 0 {
+                    self.messages.clear();
+                    let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
+                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                }
+                // Mirror drifted (compaction, abort repair, flushed events): re-fetch.
+                let first = self.pending_digest.is_none();
+                self.pending_digest = Some(digest);
+                if first {
+                    let _ = self.writer.try_send(ClientFrame::Cmd {
+                        session_id: self.session.clone(),
+                        cmd: SessionCommand::Query { id: DIGEST_RESYNC_QUERY_ID, query: SessionQuery::Messages },
+                    });
+                }
+                None
+            }
+            WireSessionEvent::QueryResult { id, value } if id == DIGEST_RESYNC_QUERY_ID => {
+                if let Ok(msgs) = serde_json::from_value::<Vec<serde_json::Value>>(value) {
+                    self.messages = msgs.into_iter().map(Arc::new).collect();
+                }
+                let digest = self.pending_digest.take()?;
+                if !digest.matches(&self.messages) {
+                    tracing::debug!("socket_transport: messages re-query still disagrees with digest; using fetched history");
+                }
+                let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
+                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+            }
+            WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
+            event => {
+                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                match &env.event {
+                    SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(m))) => {
+                        self.messages = m.clone();
+                    }
+                    SessionEventWire::Attached { snapshot, .. } => {
+                        self.messages = snapshot.conversation.api_messages.clone();
+                    }
+                    _ => {}
+                }
+                Some(env)
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -272,7 +340,7 @@ impl ClientTransport for SocketTransport {
         loop {
             match read_frame(&mut self.reader).await {
                 Ok(Some(DaemonFrame::Event(w))) => {
-                    let env: Envelope = w.into();
+                    let Some(env) = self.absorb(w) else { continue };
                     match &env.event {
                         SessionEventWire::SettingChanged(applied) => {
                             self.view.store(Arc::new(applied.view.clone()));
@@ -382,6 +450,33 @@ mod tests {
                         event: SessionEventWire::SettingChanged(SettingApplied { setting: "model".into(), ok: true, message: None, view }).into(),
                     })
                 }
+                // Steer = "the daemon's history drifted": digest for [user:text] without a MessageHistory.
+                ClientFrame::Cmd { cmd: SessionCommand::Steer { text }, .. } => {
+                    seq += 1;
+                    let snap = ConversationSnapshot {
+                        api_messages: vec![Arc::new(serde_json::json!({"role":"user","content":text}))],
+                        cost: 1.5,
+                        ..Default::default()
+                    };
+                    DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: SessionEventWire::Conversation(snap).into(),
+                    })
+                }
+                ClientFrame::Cmd { cmd: SessionCommand::Query { id, query: SessionQuery::Messages }, .. } => {
+                    seq += 1;
+                    DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: WireSessionEvent::QueryResult {
+                            id,
+                            value: serde_json::json!([{"role":"user","content":"drifted"}]),
+                        },
+                    })
+                }
                 ClientFrame::Bye => {
                     let _ = w.write_all(encode_line(&DaemonFrame::Bye).unwrap().as_bytes()).await;
                     break;
@@ -432,6 +527,38 @@ mod tests {
         assert!(matches!(t.next_event().await.unwrap().event, SessionEventWire::SystemNotice(_)));
         t.detach().await;
         assert!(t.next_event().await.is_none());
+        assert!(t.next_event().await.is_none());
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_digest_miss_requeries_messages() {
+        let (_d, path) = sock();
+        let l = UnixListener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        assert!(t.messages().is_empty());
+        t.send(SessionCommand::Steer { text: "drifted".into() }).await.unwrap();
+        // The digest misses the (empty) mirror → transport re-queries → one
+        // Conversation with the fetched history and the digest's cost.
+        let e = t.next_event().await.unwrap();
+        match e.event {
+            SessionEventWire::Conversation(c) => {
+                assert_eq!(c.api_messages.len(), 1);
+                assert_eq!(c.api_messages[0]["content"], "drifted");
+                assert_eq!(c.cost, 1.5);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.messages().len(), 1);
+        // Same digest again now matches the mirror: no re-query, served locally.
+        t.send(SessionCommand::Steer { text: "drifted".into() }).await.unwrap();
+        let e = t.next_event().await.unwrap();
+        assert!(matches!(e.event, SessionEventWire::Conversation(ref c) if c.api_messages.len() == 1));
+        t.detach().await;
         assert!(t.next_event().await.is_none());
         srv.await.unwrap();
     }

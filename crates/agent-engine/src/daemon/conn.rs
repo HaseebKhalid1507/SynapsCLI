@@ -65,7 +65,17 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
                         break;
                     }
                 }
-                Err(e) => tracing::warn!("daemon: encode failed: {e}"),
+                Err(e) => {
+                    // Symmetric cap: an outbound frame we cannot legally send
+                    // becomes an Error frame and the connection closes.
+                    tracing::warn!("daemon: encode failed: {e}");
+                    let err = DaemonFrame::Error { session_id: None, message: format!("daemon could not encode a frame: {e}") };
+                    if let Ok(line) = encode_line(&err) {
+                        let _ = w.write_all(line.as_bytes()).await;
+                    }
+                    let _ = w.shutdown().await;
+                    break;
+                }
             }
             if bye {
                 let _ = w.shutdown().await;
@@ -93,7 +103,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
         Ok(Ok(Read::Oversize)) => {
-            let _ = tx.send(DaemonFrame::Error { session_id: None, message: "frame exceeds 1 MiB limit".into() }).await;
+            let _ = tx.send(DaemonFrame::Error { session_id: None, message: frame_limit_msg() }).await;
             drop(tx);
             let _ = writer.await;
             return;
@@ -172,7 +182,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 return;
             }
             Ok(Read::Oversize) => {
-                let _ = tx.send(DaemonFrame::Error { session_id: None, message: "frame exceeds 1 MiB limit".into() }).await;
+                let _ = tx.send(DaemonFrame::Error { session_id: None, message: frame_limit_msg() }).await;
                 drop(tx);
                 let _ = writer.await;
                 return;
@@ -348,7 +358,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
             Ok(Read::Oversize) => {
-                let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "frame exceeds 1 MiB limit".into() }).await;
+                let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: frame_limit_msg() }).await;
                 break;
             }
             Ok(Read::Bad(e)) => {

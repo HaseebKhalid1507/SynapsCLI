@@ -1,11 +1,20 @@
 //! Wire frames for the daemon UDS (PLAN-phase2 §2.9, S289 D-2 amended).
 //!
 //! Framing is `synaps rpc`'s: one JSON object per `\n`, at most
-//! [`MAX_FRAME_BYTES`]. `WireSessionEvent` is a *lossless* serde mirror of
+//! [`DAEMON_MAX_FRAME_BYTES`] (64 MiB — distinct from rpc's 1 MiB because
+//! `Attached` carries the whole `api_messages`). Enforced symmetrically:
+//! `encode_line` refuses to build an oversize frame, `decode_line` and both
+//! readers refuse to accept one. `WireSessionEvent` is a serde mirror of
 //! `SessionEventWire` — `StreamEvent`/`TurnError`/`ExtensionLoaderEvent` are
 //! not `Serialize`, so they are mirrored variant-for-variant here and
 //! converted only at the socket boundary. In-process transports never touch
 //! this module.
+//!
+//! The one *lossy* mirror is `Conversation`: on the wire it is a
+//! [`ConversationDigest`] (len + hash + tokens/cost), never the messages.
+//! Full history travels only in `Attached` and `QueryResult{Messages}`;
+//! `SocketTransport` rebuilds the snapshot from its local mirror
+//! (`Attached` + `Stream(MessageHistory)`) and re-queries on a hash miss.
 //!
 //! Security: nothing in here carries a credential. `Welcome`/`Attached` are
 //! summaries; `ClientFrame`'s `Debug` redacts `Answer.value` and
@@ -24,7 +33,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
 pub const PROTOCOL_MAX: u32 = PROTOCOL_VERSION;
-pub const MAX_FRAME_BYTES: usize = agent_core::core::rpc_dispatch::MAX_FRAME_BYTES;
+/// rpc's cap, kept for reference; daemon frames use [`DAEMON_MAX_FRAME_BYTES`].
+pub const RPC_MAX_FRAME_BYTES: usize = agent_core::core::rpc_dispatch::MAX_FRAME_BYTES;
+/// Hard cap on one daemon frame, both directions (`Attached` ships the
+/// whole conversation; 64 MiB is well past any context window's JSON).
+pub const DAEMON_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Alias used by the readers/writers of this protocol.
+pub const MAX_FRAME_BYTES: usize = DAEMON_MAX_FRAME_BYTES;
+/// Query ids at or above this are reserved for the transport/daemon and
+/// never surfaced to a client as `QueryResult`.
+pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
+/// `SocketTransport` re-fetches `api_messages` under this id on a digest miss.
+pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
+/// The daemon's idle monitor probes `Status` under this id.
+pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
@@ -264,7 +286,75 @@ impl AttachedWire {
     }
 }
 
-// ── lossless mirror of SessionEventWire ───────────────────────────────────────
+// ── conversation digest ───────────────────────────────────────────────────────
+
+/// `ConversationSnapshot` minus `api_messages`: what `Conversation` carries
+/// on the wire. `messages_hash` is FNV-1a over each message's JSON so a
+/// client can tell whether its local mirror is current.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConversationDigest {
+    pub messages_len: usize,
+    pub messages_hash: u64,
+    pub tokens: ConversationTokens,
+    pub cost: f64,
+    pub abort_context: Option<String>,
+    pub queued_message: Option<String>,
+    pub pending_events_len: usize,
+    pub consecutive_auto_turns: u32,
+}
+
+/// FNV-1a 64 over the canonical JSON of every message (stable across
+/// binaries, unlike `DefaultHasher`).
+pub fn messages_hash(messages: &[crate::SharedMessage]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for m in messages {
+        if let Ok(bytes) = serde_json::to_vec(&**m) {
+            for b in bytes {
+                feed(b);
+            }
+        }
+        feed(0x1f);
+    }
+    h
+}
+
+impl ConversationDigest {
+    pub fn of(s: &ConversationSnapshot) -> Self {
+        Self {
+            messages_len: s.api_messages.len(),
+            messages_hash: messages_hash(&s.api_messages),
+            tokens: s.tokens.clone(),
+            cost: s.cost,
+            abort_context: s.abort_context.clone(),
+            queued_message: s.queued_message.clone(),
+            pending_events_len: s.pending_events_len,
+            consecutive_auto_turns: s.consecutive_auto_turns,
+        }
+    }
+
+    pub fn matches(&self, messages: &[crate::SharedMessage]) -> bool {
+        self.messages_len == messages.len() && self.messages_hash == messages_hash(messages)
+    }
+
+    /// Rebuild a snapshot around `messages` (the caller's mirror).
+    pub fn into_snapshot(self, api_messages: Vec<crate::SharedMessage>) -> ConversationSnapshot {
+        ConversationSnapshot {
+            api_messages,
+            tokens: self.tokens,
+            cost: self.cost,
+            abort_context: self.abort_context,
+            queued_message: self.queued_message,
+            pending_events_len: self.pending_events_len,
+            consecutive_auto_turns: self.consecutive_auto_turns,
+        }
+    }
+}
+
+// ── mirror of SessionEventWire (lossless except Conversation → digest) ────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
@@ -272,7 +362,8 @@ impl AttachedWire {
 pub enum WireSessionEvent {
     Stream { event: WireStreamEvent },
     TurnStarted { turn_baseline: usize, trigger: TurnTrigger },
-    Conversation { snapshot: ConversationSnapshot },
+    /// Digest only — see module docs.
+    Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
     PromptResolved { prompt_id: u64 },
     External { event: crate::events::types::Event },
@@ -510,7 +601,7 @@ impl From<SessionEventWire> for WireSessionEvent {
         match e {
             S::Stream(ev) => Self::Stream { event: ev.into() },
             S::TurnStarted { turn_baseline, trigger } => Self::TurnStarted { turn_baseline, trigger },
-            S::Conversation(snapshot) => Self::Conversation { snapshot },
+            S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
             S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
             S::External(event) => Self::External { event },
@@ -539,7 +630,9 @@ impl From<WireSessionEvent> for SessionEventWire {
         match e {
             W::Stream { event } => Self::Stream(event.into()),
             W::TurnStarted { turn_baseline, trigger } => Self::TurnStarted { turn_baseline, trigger },
-            W::Conversation { snapshot } => Self::Conversation(snapshot),
+            // Messages are not on the wire; `SocketTransport` fills them from
+            // its mirror before handing the envelope up.
+            W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
             W::Prompt { request } => Self::Prompt(request),
             W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
             W::External { event } => Self::External(event),
@@ -568,17 +661,26 @@ impl From<WireSessionEvent> for SessionEventWire {
 
 // ── framing helpers ───────────────────────────────────────────────────────────
 
-/// Encode one frame as a single line (no embedded newline: serde_json escapes them).
-pub fn encode_line<T: Serialize>(frame: &T) -> Result<String, serde_json::Error> {
-    let mut s = serde_json::to_string(frame)?;
+/// Human-readable form of the cap for error frames.
+pub fn frame_limit_msg() -> String {
+    format!("frame exceeds {} MiB limit", DAEMON_MAX_FRAME_BYTES / (1024 * 1024))
+}
+
+/// Encode one frame as a single line (no embedded newline: serde_json
+/// escapes them). Refuses to produce a line over [`DAEMON_MAX_FRAME_BYTES`].
+pub fn encode_line<T: Serialize>(frame: &T) -> Result<String, String> {
+    let mut s = serde_json::to_string(frame).map_err(|e| e.to_string())?;
+    if s.len() + 1 > DAEMON_MAX_FRAME_BYTES {
+        return Err(frame_limit_msg());
+    }
     s.push('\n');
     Ok(s)
 }
 
-/// Decode one line, enforcing [`MAX_FRAME_BYTES`].
+/// Decode one line, enforcing [`DAEMON_MAX_FRAME_BYTES`].
 pub fn decode_line<'a, T: Deserialize<'a>>(line: &'a str) -> Result<T, String> {
-    if line.len() > MAX_FRAME_BYTES {
-        return Err(format!("frame exceeds {} byte limit", MAX_FRAME_BYTES));
+    if line.len() > DAEMON_MAX_FRAME_BYTES {
+        return Err(frame_limit_msg());
     }
     serde_json::from_str(line).map_err(|e| e.to_string())
 }
@@ -715,6 +817,7 @@ mod tests {
         // Every SessionEventWire variant (19) + every StreamEvent leaf (18; Stream counted once).
         assert_eq!(all.len(), 18 + 18);
         for ev in all {
+            let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
             let before = format!("{e:?}");
             let wire: WireEnvelope = e.into();
@@ -722,8 +825,32 @@ mod tests {
             assert_eq!(line.matches('\n').count(), 1, "one line per frame");
             let back: WireEnvelope = decode_line(line.trim_end()).unwrap();
             let after = format!("{:?}", Envelope::from(back));
-            assert_eq!(before, after);
+            if is_conv {
+                // Digest on the wire: everything but the messages survives.
+                assert!(!line.contains("api_messages"), "{line}");
+                assert!(after.contains("api_messages: []"), "{after}");
+                assert_eq!(before.replace("api_messages: [Object {\"content\": String(\"hi\"), \"role\": String(\"user\")}]", "api_messages: []"), after);
+            } else {
+                assert_eq!(before, after);
+            }
         }
+    }
+
+    #[test]
+    fn conversation_digest_roundtrips_and_detects_drift() {
+        let c = conv();
+        let d = ConversationDigest::of(&c);
+        assert_eq!(d.messages_len, 1);
+        assert!(d.matches(&c.api_messages));
+        assert!(!d.matches(&[]));
+        let mut other = c.api_messages.clone();
+        other.push(Arc::new(serde_json::json!({"role":"assistant","content":"x"})));
+        assert!(!d.matches(&other));
+        let back = d.clone().into_snapshot(c.api_messages.clone());
+        assert_eq!(ConversationDigest::of(&back), d);
+        // stable across runs/binaries: FNV-1a offset basis for the empty list
+        assert_eq!(messages_hash(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_ne!(messages_hash(&c.api_messages), messages_hash(&[]));
     }
 
     #[test]
@@ -818,9 +945,17 @@ mod tests {
     }
 
     #[test]
-    fn oversize_frame_rejected() {
-        let big = "x".repeat(MAX_FRAME_BYTES + 1);
-        assert!(decode_line::<ClientFrame>(&big).is_err());
+    fn oversize_frame_rejected_both_directions() {
+        assert!(DAEMON_MAX_FRAME_BYTES > RPC_MAX_FRAME_BYTES);
+        let big = "x".repeat(DAEMON_MAX_FRAME_BYTES + 1);
+        assert!(decode_line::<ClientFrame>(&big).unwrap_err().contains("64 MiB"));
+        // encode side: a frame that would serialise past the cap is refused
+        let f = DaemonFrame::Error { session_id: None, message: big };
+        assert!(encode_line(&f).unwrap_err().contains("64 MiB"));
+        // a > 1 MiB (rpc cap) frame is fine on the daemon wire
+        let f = DaemonFrame::Error { session_id: None, message: "y".repeat(RPC_MAX_FRAME_BYTES * 2) };
+        let line = encode_line(&f).unwrap();
+        assert!(decode_line::<DaemonFrame>(line.trim_end()).is_ok());
     }
 
     #[test]
