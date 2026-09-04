@@ -296,10 +296,9 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
         &e.event,
         SessionEventWire::SystemNotice(n) if n.contains("daemon reloading")
     )));
-    assert!(seen.iter().any(|e| matches!(
-        &e.event,
-        SessionEventWire::SystemNotice(n) if n.starts_with("aborted")
-    )));
+    assert!(seen
+        .iter()
+        .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })));
     let conv = last_conversation(&seen);
     assert!(
         conv.abort_context.as_deref().unwrap_or("").contains("[response]: hi"),

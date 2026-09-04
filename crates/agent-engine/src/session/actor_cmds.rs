@@ -41,7 +41,6 @@ impl SessionActor {
             Some(CommandResult::Compact {
                 custom_instructions,
             }) => {
-                self.emit(SessionEventWire::SystemNotice("compacting...".into()));
                 self.compact(custom_instructions, "manual").await;
                 serde_json::json!({ "kind": "none" })
             }

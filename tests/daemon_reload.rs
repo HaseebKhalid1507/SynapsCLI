@@ -227,12 +227,15 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     // abort context itself is asserted from the reconnect snapshot, i.e.
     // from the journal), then Reloading, then EOF.
     let mut notices = Vec::new();
+    let mut aborted = false;
     while let Some(env) = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce") {
-        if let SessionEventWire::SystemNotice(n) = env.event {
-            notices.push(n);
+        match env.event {
+            SessionEventWire::SystemNotice(n) => notices.push(n),
+            SessionEventWire::Aborted { .. } => aborted = true,
+            _ => {}
         }
     }
-    assert!(notices.iter().any(|n| n.starts_with("aborted")), "{notices:?}");
+    assert!(aborted, "typed Aborted expected; notices: {notices:?}");
     assert!(notices.iter().any(|n| n.contains("daemon reloading")), "{notices:?}");
 
     let snap = tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.unwrap().expect("reconnected");

@@ -862,7 +862,7 @@ impl SessionActor {
     /// dispatch.rs Abort (:134-192) verbatim minus presentation, behind the
     /// TUI's `if streaming` guard (input.rs:350): a `Cancel` while idle is a
     /// no-op that only re-announces `Idle` — it must never touch
-    /// `abort_context`, save, or emit "aborted".
+    /// `abort_context`, save, or emit `Aborted`.
     pub(crate) async fn cancel_turn(&mut self) {
         if !self.streaming {
             if self.compact.is_some() {
@@ -912,12 +912,10 @@ impl SessionActor {
                 }
             }
         }
-        let abort_msg = if self.conv.abort_context.is_some() {
-            "aborted — context saved for next message"
-        } else {
-            "aborted"
-        };
-        self.emit(SessionEventWire::SystemNotice(abort_msg.to_string()));
+        // Typed event; clients render "aborted[ — context saved …]".
+        self.emit(SessionEventWire::Aborted {
+            context_saved: self.conv.abort_context.is_some(),
+        });
         self.save().await;
         self.emit_conversation();
         self.emit(SessionEventWire::Idle);
@@ -1774,8 +1772,8 @@ impl SessionActor {
             SessionCommand::Cancel => self.cancel_turn().await,
             SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
+            // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {
-                self.emit(SessionEventWire::SystemNotice("compacting...".into()));
                 self.compact(instructions, "manual").await;
             }
             SessionCommand::NewSession => {
@@ -1783,10 +1781,9 @@ impl SessionActor {
                 self.runtime
                     .set_session_id(Some(self.conv.session.id.clone()));
                 self.journal_id.store(Arc::new(self.conv.session.id.clone()));
-                self.emit(SessionEventWire::SystemNotice(format!(
-                    "session cleared → {}",
-                    &self.conv.session.id[..8.min(self.conv.session.id.len())]
-                )));
+                self.emit(SessionEventWire::Cleared {
+                    session_id: self.conv.session.id.clone(),
+                });
                 self.emit_conversation();
             }
             SessionCommand::Save => self.save().await,

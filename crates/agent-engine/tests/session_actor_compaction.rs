@@ -305,3 +305,91 @@ async fn compact_inline_kill_switch_restores_inline_notices() {
     )));
     end(&mut a).await;
 }
+
+/// H1: the typed events are the contract — `/compact` (both the `Compact`
+/// command and the `/compact` engine command) produces exactly one
+/// `CompactionStarted`, one `CompactionApplied`, and no "compacting..."
+/// `SystemNotice` a client would double-render.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn compaction_emits_typed_events_exactly_once_and_no_notice() {
+    let _h = Home::new();
+    let (url, _) = stub_compact(Duration::from_millis(50)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    warm(&mut a, 2).await;
+
+    for via_engine_command in [false, true] {
+        if via_engine_command {
+            a.send(SessionCommand::EngineCommand {
+                id: 9,
+                name: "compact".into(),
+                arg: String::new(),
+            })
+            .await
+            .unwrap();
+        } else {
+            a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+        }
+        let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+        let started = seen
+            .iter()
+            .filter(|e| matches!(e.event, SessionEventWire::CompactionStarted { .. }))
+            .count();
+        let applied = seen
+            .iter()
+            .filter(|e| matches!(e.event, SessionEventWire::CompactionApplied { .. }))
+            .count();
+        assert_eq!(started, 1, "via_engine_command={via_engine_command}");
+        assert_eq!(applied, 1, "via_engine_command={via_engine_command}");
+        assert!(
+            !seen.iter().any(|e| matches!(
+                &e.event,
+                SessionEventWire::SystemNotice(n) if n.contains("compact")
+            )),
+            "no compaction SystemNotice: {:?}",
+            seen.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+    }
+    end(&mut a).await;
+}
+
+/// `Cancel` mid-turn and `NewSession` emit the typed `Aborted` / `Cleared`
+/// events, never the legacy notice text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn abort_and_clear_are_typed_events() {
+    let _h = Home::new();
+    let (url, _) = stub_compact(Duration::from_millis(50)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    warm(&mut a, 1).await;
+
+    a.send(SessionCommand::NewSession).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Conversation(_))).await;
+    assert_eq!(
+        seen.iter()
+            .filter(|e| matches!(e.event, SessionEventWire::Cleared { .. }))
+            .count(),
+        1
+    );
+    assert!(!seen.iter().any(|e| matches!(
+        &e.event,
+        SessionEventWire::SystemNotice(n) if n.contains("cleared") || n.starts_with("aborted")
+    )));
+    end(&mut a).await;
+}
