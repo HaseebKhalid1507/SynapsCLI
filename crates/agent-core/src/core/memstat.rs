@@ -25,6 +25,9 @@ pub enum ProcRole {
 pub struct ProcMem {
     pub pid: u32,
     pub ppid: u32,
+    /// Redacted cmdline — see [`redact_cmdline`]. Never the raw argv: MCP
+    /// servers take API keys as arguments and this struct is serialized by
+    /// `synaps status --memory --json`.
     pub cmd: String,
     pub role: ProcRole,
     pub rss_kb: u64,
@@ -158,6 +161,83 @@ pub fn log_turn_memory() {
         threads = s.threads,
         "turn memory"
     );
+}
+
+/// Scrub credentials out of a space-joined argv before it leaves the
+/// process. Redacted: the value of any `--flag value` / `--flag=value` whose
+/// flag name mentions key/token/secret/password/bearer/auth/credential, any
+/// `KEY=value` env-style arg with such a key, and any bare arg that looks
+/// like a key (`sk-…`, `ghp_…`, `xox…`, `Bearer …`, or ≥ 32 chars of
+/// base64/hex with no path separator).
+pub fn redact_cmdline(cmd: &str) -> String {
+    const SENSITIVE: &[&str] = &[
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "bearer",
+        "auth",
+        "credential",
+    ];
+    fn sensitive(name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        SENSITIVE.iter().any(|s| n.contains(s))
+    }
+    fn looks_like_key(arg: &str) -> bool {
+        let a = arg.trim_matches(|c| c == '"' || c == '\'');
+        if a.starts_with("sk-")
+            || a.starts_with("ghp_")
+            || a.starts_with("github_pat_")
+            || a.starts_with("xox")
+            || a.starts_with("AKIA")
+            || a.eq_ignore_ascii_case("bearer")
+        {
+            return true;
+        }
+        a.len() >= 32
+            && !a.contains('/')
+            && !a.contains('.')
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=')
+    }
+    let mut out = Vec::new();
+    let mut redact_next = false;
+    for arg in cmd.split(' ').filter(|s| !s.is_empty()) {
+        if redact_next {
+            out.push("***".to_string());
+            redact_next = false;
+            continue;
+        }
+        if let Some(flag) = arg.strip_prefix('-') {
+            let flag = flag.trim_start_matches('-');
+            match flag.split_once('=') {
+                Some((name, _)) if sensitive(name) => {
+                    out.push(format!("{}=***", &arg[..arg.len() - flag.len() + name.len()]));
+                }
+                Some(_) => out.push(arg.to_string()),
+                None => {
+                    if sensitive(flag) {
+                        redact_next = true;
+                    }
+                    out.push(arg.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some((name, _)) = arg.split_once('=') {
+            if sensitive(name) {
+                out.push(format!("{name}=***"));
+                continue;
+            }
+        }
+        if looks_like_key(arg) {
+            out.push("***".to_string());
+            continue;
+        }
+        out.push(arg.to_string());
+    }
+    out.join(" ")
 }
 
 /// Classify a process from its cmdline (argv joined by spaces) and, when
@@ -295,8 +375,9 @@ mod linux {
             pss_kb: 0,
             uss_kb: 0,
         });
-        let cmd = read_cmdline(&dir.join("cmdline"));
-        let role = classify(&cmd);
+        let raw = read_cmdline(&dir.join("cmdline"));
+        let role = classify(&raw);
+        let cmd = redact_cmdline(&raw);
         Ok(ProcMem {
             pid,
             ppid: status.ppid,
@@ -385,6 +466,55 @@ mod tests {
             ProcRole::McpServer { name: "npx".into() }
         );
         assert_eq!(classify(""), ProcRole::Other);
+    }
+
+    #[test]
+    fn redact_cmdline_scrubs_keys_and_flag_values() {
+        let raw = "npx -y some-mcp --api-key sk-abc123 --token=tok_zzz --port 8080 \
+                   OPENAI_API_KEY=sk-live-1 /home/u/.synaps-cli/plugins/x/main.py";
+        let red = redact_cmdline(raw);
+        assert!(!red.contains("sk-abc123"), "{red}");
+        assert!(!red.contains("tok_zzz"), "{red}");
+        assert!(!red.contains("sk-live-1"), "{red}");
+        assert!(red.contains("--api-key ***"), "{red}");
+        assert!(red.contains("--token=***"), "{red}");
+        assert!(red.contains("OPENAI_API_KEY=***"), "{red}");
+        assert!(red.contains("--port 8080"), "{red}");
+        assert!(red.contains("/home/u/.synaps-cli/plugins/x/main.py"), "{red}");
+        // Bare long opaque tokens go too; ordinary args survive.
+        let red = redact_cmdline("node bridge.cjs ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd");
+        assert_eq!(red, "node bridge.cjs ***");
+        assert_eq!(redact_cmdline("bash -c ls"), "bash -c ls");
+        // Classification still sees the raw argv; the row carries the scrubbed one.
+        assert_eq!(classify(raw), ProcRole::ExtensionSidecar { name: "x".into() });
+    }
+
+    /// Fake `/proc/<pid>` with an MCP child carrying `--api-key sk-abc`:
+    /// the serialized row must not contain the key.
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    #[test]
+    fn proc_row_json_never_carries_api_key() {
+        let root = std::env::temp_dir().join(format!("memstat-fakeproc-{}", std::process::id()));
+        let dir = root.join("4242");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cmdline"),
+            b"npx\0-y\0my-mcp-server\0--api-key\0sk-abc\0--verbose\0",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("status"),
+            "Name:\tnpx\nPPid:\t1\nVmRSS:\t100 kB\nRssAnon:\t50 kB\nThreads:\t2\n",
+        )
+        .unwrap();
+        let row = linux::read_proc(&root, 4242).unwrap();
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(!json.contains("sk-abc"), "{json}");
+        assert!(json.contains("--api-key ***"), "{json}");
+        assert!(json.contains("--verbose"), "{json}");
+        assert_eq!(row.role, ProcRole::McpServer { name: "npx".into() });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
