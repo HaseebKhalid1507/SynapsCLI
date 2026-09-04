@@ -204,8 +204,9 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
 
     let (t, snap) = SocketTransport::attach(conn, attach).await.map_err(|e| anyhow::anyhow!("attach: {e}"))?;
     let mut c = Client { t, streaming: snap.streaming, pending: snap.pending_prompts.clone(), stdout: std::io::stdout() };
+    // "○ ready" is the marker scripts/memprof/launch.sh polls for.
     c.out(&format!(
-        "[attached {} as client #{}  model={}  messages={}{}]\n",
+        "[attached {} as client #{}  model={}  messages={}{}] ○ ready\n",
         snap.meta.id,
         c.t.client_id().0,
         snap.view.model,
