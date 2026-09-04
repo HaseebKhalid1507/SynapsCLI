@@ -1296,12 +1296,11 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 // T30 (spec §9.2): server compaction routes through the ONE
                 // engine transition with the in-place policy. Snapshot under
                 // brief locks; the LLM round-trip runs with no lock held.
+                // Lock order: `runtime` → `conv` (file-wide invariant).
                 let (msgs, session, rt) = {
+                    let rt = state.runtime.lock().await;
                     let conv = state.conv.read().await;
-                    (conv.api_messages.clone(), conv.session.clone(), {
-                        let rt = state.runtime.lock().await;
-                        rt.clone()
-                    })
+                    (conv.api_messages.clone(), conv.session.clone(), rt.clone())
                 };
                 if msgs.len() < 4 {
                     let _ = broadcast.send(ServerMessage::System {
