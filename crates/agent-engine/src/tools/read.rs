@@ -283,6 +283,14 @@ fn image_output(path: &std::path::Path, mime: &'static str, bytes: &[u8]) -> Res
             path.display()
         )));
     };
+    // Zero-sized images are invalid for every supported format and are
+    // rejected by providers — same poison-pill class as unknown dims.
+    if w == 0 || h == 0 {
+        return Err(RuntimeError::Tool(format!(
+            "Image '{}' ({mime}, {kb} KB) declares invalid dimensions {w}x{h} (zero-sized).              Not sent to the model. Re-export it and read the new file.",
+            path.display()
+        )));
+    }
     if w > MAX_IMAGE_SIDE_PX || h > MAX_IMAGE_SIDE_PX {
         return Err(RuntimeError::Tool(format!(
             "Image '{}' is {w}x{h}; the provider rejects images with any side over {MAX_IMAGE_SIDE_PX} px. \
@@ -803,6 +811,22 @@ mod tests {
         assert!(err.contains("could not parse dimensions"), "{err}");
         assert!(err.contains("Not sent to the model"), "{err}");
         let _ = std::fs::remove_file(p);
+    }
+
+    #[tokio::test]
+    async fn zero_dimension_images_rejected_not_shipped() {
+        for (name, w, h) in [("w0.png", 0u32, 7u32), ("h0.png", 7, 0), ("both0.png", 0, 0)] {
+            let p = tmp(name, &png_with_dims(w, h));
+            let err = ReadTool
+                .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("zero-sized"), "{name}: {err}");
+            assert!(err.contains(&format!("{w}x{h}")), "{name}: {err}");
+            assert!(err.contains("Not sent to the model"), "{name}: {err}");
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[tokio::test]
