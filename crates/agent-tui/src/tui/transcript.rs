@@ -477,6 +477,16 @@ pub(crate) struct ScrollAnchor {
     pub(crate) row_in_msg: usize,
 }
 
+/// Scrollback cap hysteresis: drain only once `max_msgs + 64` messages /
+/// `max_bytes + 256 KiB` are held, so a long session drains in batches
+/// instead of on every push (phase 4 §2.3).
+pub(crate) const SCROLLBACK_HYSTERESIS_MSGS: usize = 64;
+pub(crate) const SCROLLBACK_HYSTERESIS_BYTES: usize = 256 * 1024;
+/// Prefix of the sentinel `System` line the cap prepends (replaced, never
+/// stacked, on the next drain).
+pub(crate) const SCROLLBACK_SENTINEL_PREFIX: &str = "… ";
+pub(crate) const SCROLLBACK_SENTINEL_MARK: &str = "(scrollback cap ";
+
 /// Shell for the transcript store.
 ///
 /// Slice (a): `messages`.
@@ -539,13 +549,16 @@ pub(crate) struct TranscriptStore {
     /// [`Self::set_show_full_output`], which invalidates internally.
     show_full_output: bool,
 
-    // ── Scrollback cap (P4-0 stub; enforcement lands with phase-4 B6) ─────────
+    // ── Scrollback cap (phase 4 B6) ──────────────────────────────────────────
     /// Max retained messages (0 = unbounded).
-    #[allow(dead_code)]
     max_msgs: usize,
     /// Max retained source bytes (0 = unbounded).
-    #[allow(dead_code)]
     max_bytes: usize,
+    /// Pushes since the last byte audit (the byte cap is checked every
+    /// `SCROLLBACK_HYSTERESIS_MSGS` pushes — O(n) over ≤ ~500 messages).
+    pushes_since_audit: usize,
+    /// Messages dropped by the cap so far (the sentinel line reports it).
+    scrollback_dropped: usize,
 
     // ── Tool timing (moved in slice b′; locked decision #2) ──────────────────
     /// Tracks when the current tool started executing (for elapsed time display)
@@ -630,6 +643,8 @@ impl TranscriptStore {
             show_full_output: false,
             max_msgs: 0,
             max_bytes: 0,
+            pushes_since_audit: 0,
+            scrollback_dropped: 0,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
             viewport: None,
@@ -642,12 +657,92 @@ impl TranscriptStore {
     }
 
     /// Scrollback cap: `msgs` messages / `bytes` source bytes, 0 = unbounded.
-    /// **P4-0 stub** — stores the fields only; enforcement (front drain +
-    /// sentinel + cache/selection fixups) is phase-4 B6. In-process stays
-    /// 0/0, so the reference differential cannot move.
+    /// Enforced with hysteresis from `push_msg`/`push_tool_result` (never
+    /// mid-render): a front drain + sentinel + full invalidate + selection/
+    /// anchor fixups. In-process stays 0/0, so the reference differential
+    /// cannot move (§8.6).
     pub(crate) fn set_scrollback(&mut self, msgs: usize, bytes: usize) {
         self.max_msgs = msgs;
         self.max_bytes = bytes;
+    }
+
+    /// Messages the scrollback cap has dropped so far.
+    #[allow(dead_code)]
+    pub(crate) fn scrollback_dropped(&self) -> usize {
+        self.scrollback_dropped
+    }
+
+    fn source_bytes(&self) -> usize {
+        self.messages.iter().map(|m| m.msg.source_text().len()).sum()
+    }
+
+    /// The cap check. Cheap path: nothing to do unless the message count is
+    /// past `max_msgs + HYSTERESIS` or a byte audit is due.
+    fn enforce_scrollback(&mut self) {
+        if self.max_msgs == 0 && self.max_bytes == 0 {
+            return;
+        }
+        self.pushes_since_audit += 1;
+        let over_msgs = self.max_msgs > 0 && self.messages.len() > self.max_msgs + SCROLLBACK_HYSTERESIS_MSGS;
+        let audit_due = self.max_bytes > 0 && self.pushes_since_audit >= SCROLLBACK_HYSTERESIS_MSGS;
+        if !over_msgs && !audit_due {
+            return;
+        }
+        self.pushes_since_audit = 0;
+        // Target: at most max_msgs messages AND at most max_bytes bytes
+        // (byte drain only once past max_bytes + HYSTERESIS_BYTES).
+        let mut drop = 0usize;
+        if self.max_msgs > 0 && self.messages.len() > self.max_msgs {
+            drop = self.messages.len() - self.max_msgs;
+        }
+        if self.max_bytes > 0 {
+            let total = self.source_bytes();
+            if total > self.max_bytes + SCROLLBACK_HYSTERESIS_BYTES {
+                let mut running = total;
+                let mut i = 0;
+                while running > self.max_bytes && i < self.messages.len() {
+                    running -= self.messages[i].msg.source_text().len();
+                    i += 1;
+                }
+                drop = drop.max(i);
+            }
+        }
+        // Never drain the whole transcript: keep at least the newest message.
+        let drop = drop.min(self.messages.len().saturating_sub(1));
+        if drop == 0 {
+            return;
+        }
+        self.drain_front(drop);
+    }
+
+    /// Drop `n` messages from the front (plus a previous sentinel) and
+    /// prepend the sentinel. Message indices shift, so: selection cleared,
+    /// anchor shifted (or dropped when it pointed into the drained range),
+    /// full invalidate (the cache is message-indexed).
+    fn drain_front(&mut self, n: usize) {
+        let had_sentinel = matches!(
+            self.messages.first().map(|m| &m.msg),
+            Some(ChatMessage::System(t)) if t.starts_with(SCROLLBACK_SENTINEL_PREFIX) && t.contains(SCROLLBACK_SENTINEL_MARK)
+        );
+        let n = if had_sentinel { n.max(1) } else { n };
+        let dropped_real = if had_sentinel { n - 1 } else { n };
+        self.messages.drain(0..n);
+        self.scrollback_dropped += dropped_real;
+        let sentinel = TimestampedMsg {
+            msg: ChatMessage::System(format!(
+                "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; /resync reloads from the daemon)",
+                self.scrollback_dropped, self.max_msgs
+            )),
+            time: chrono::Local::now().format("%H:%M").to_string(),
+        };
+        self.messages.insert(0, sentinel);
+        // Net index shift: −n (drained) +1 (sentinel).
+        self.scroll_anchor = match self.scroll_anchor.take() {
+            Some(a) if a.msg_idx >= n => Some(ScrollAnchor { msg_idx: a.msg_idx - n + 1, row_in_msg: a.row_in_msg }),
+            _ => None,
+        };
+        self.clear_selection();
+        self.cache = CacheState::Missing;
     }
 
     /// The configured cap (`msgs`, `bytes`); 0 = unbounded.
@@ -925,6 +1020,7 @@ impl TranscriptStore {
         }
         // New tail message — mark last slot dirty (append to per_msg on next rebuild).
         self.invalidate_last();
+        self.enforce_scrollback();
     }
 
     /// Insert a freshly created `ToolResult` directly beneath its matching
@@ -999,6 +1095,7 @@ impl TranscriptStore {
                 // writes identical content rows into the shifted slots; the
                 // use's own change is header chrome, not content).
                 self.invalidate_watermark(i);
+                self.enforce_scrollback();
             }
             None => self.push_msg(msg),
         }
@@ -4139,5 +4236,186 @@ mod slice5_copy_promote_on_touch {
              output byte-identical: {}",
             first == second
         );
+    }
+}
+
+// ── Phase 4 B6: scrollback cap ────────────────────────────────────────────────
+#[cfg(test)]
+mod scrollback_cap_tests {
+    use super::*;
+
+    fn ctx() -> RenderCtx<'static> {
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
+    }
+
+    fn store(msgs: usize, bytes: usize) -> TranscriptStore {
+        let mut s = TranscriptStore::new(super::super::clock::TuiClock::real());
+        s.set_scrollback(msgs, bytes);
+        s
+    }
+
+    fn is_sentinel(m: &TimestampedMsg) -> bool {
+        matches!(&m.msg, ChatMessage::System(t) if t.contains(SCROLLBACK_SENTINEL_MARK))
+    }
+
+    /// Local default (0/0) never drains — the reference differential cannot move.
+    #[test]
+    fn unbounded_never_drains() {
+        let mut s = store(0, 0);
+        for i in 0..1000 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        assert_eq!(s.message_count(), 1000);
+        assert_eq!(s.scrollback_dropped(), 0);
+    }
+
+    /// Hysteresis: nothing happens until max_msgs + 64, then a drain to max_msgs
+    /// (+ sentinel), the sentinel names the cap and is replaced, never stacked.
+    #[test]
+    fn msg_cap_drains_with_hysteresis_and_single_sentinel() {
+        let mut s = store(100, 0);
+        for i in 0..164 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        assert_eq!(s.message_count(), 164, "at the threshold: untouched");
+        s.push_msg(ChatMessage::Text("m164".into()));
+        assert_eq!(s.message_count(), 101, "drained to cap + sentinel");
+        assert!(is_sentinel(&s.messages()[0]));
+        assert_eq!(s.scrollback_dropped(), 65);
+        match &s.messages()[0].msg {
+            ChatMessage::System(t) => {
+                assert!(t.contains("65 earlier message(s)"), "{t}");
+                assert!(t.contains("scrollback cap 100"), "{t}");
+                assert!(t.contains("/resync"), "{t}");
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(&s.messages()[1].msg, ChatMessage::Text(t) if t == "m65"));
+        // Second drain: the sentinel is replaced, count accumulates.
+        for i in 165..300 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        let sentinels = s.messages().iter().filter(|m| is_sentinel(m)).count();
+        assert_eq!(sentinels, 1);
+        assert!(s.message_count() <= 101 + SCROLLBACK_HYSTERESIS_MSGS);
+        let last = match &s.messages().last().unwrap().msg {
+            ChatMessage::Text(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(last, "m299");
+        // Everything retained is a contiguous tail.
+        let texts: Vec<usize> = s
+            .messages()
+            .iter()
+            .filter_map(|m| match &m.msg {
+                ChatMessage::Text(t) => t[1..].parse().ok(),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.windows(2).all(|w| w[1] == w[0] + 1), "{texts:?}");
+        assert_eq!(s.scrollback_dropped() + texts.len(), 300);
+    }
+
+    /// Byte cap: audited every 64 pushes; drains from the front until under max_bytes.
+    #[test]
+    fn byte_cap_drains_on_audit() {
+        let mut s = store(0, 10 * 1024);
+        let big = "x".repeat(8 * 1024);
+        for _ in 0..70 {
+            s.push_msg(ChatMessage::Text(big.clone()));
+        }
+        // 70 × 8 KiB = 560 KiB > 10 KiB + 256 KiB → drained at the 64th push.
+        assert!(s.message_count() < 70, "{}", s.message_count());
+        assert!(is_sentinel(&s.messages()[0]));
+        let bytes: usize = s.messages().iter().map(|m| m.msg.source_text().len()).sum();
+        assert!(bytes <= 10 * 1024 + 8 * 1024 * 7, "{bytes}");
+        assert!(s.message_count() >= 1);
+    }
+
+    /// The render cache stays parallel to `messages` after a drain: the
+    /// drain is a full invalidate, so the next sync rebuilds per_msg with
+    /// exactly `messages.len()` slots.
+    #[test]
+    fn cache_stays_parallel_after_drain() {
+        let mut s = store(20, 0);
+        for i in 0..50 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        s.sync_cache(80, &ctx());
+        assert_eq!(s.line_cache().unwrap().per_msg.len(), 50);
+        for i in 50..90 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        assert!(s.message_count() < 90);
+        assert!(s.line_cache().is_none(), "drain = full invalidate");
+        s.sync_cache(80, &ctx());
+        assert_eq!(s.line_cache().unwrap().per_msg.len(), s.message_count());
+        // Keep pushing under the threshold: incremental path stays parallel.
+        s.push_msg(ChatMessage::Text("tail".into()));
+        s.sync_cache(80, &ctx());
+        assert_eq!(s.line_cache().unwrap().per_msg.len(), s.message_count());
+    }
+
+    /// A selection is cleared by the drain (indices shifted); the scroll
+    /// anchor is shifted when it survives and dropped when it pointed into
+    /// the drained range.
+    #[test]
+    fn selection_cleared_and_anchor_fixed_on_drain() {
+        let mut s = store(10, 0);
+        for i in 0..74 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        s.selection_anchor = Some(SelPos { msg_idx: 70, line_in_msg: 0, col: 0, src_byte: Some(0) });
+        s.selection_end = Some(SelPos { msg_idx: 72, line_in_msg: 0, col: 1, src_byte: Some(1) });
+        s.test_set_scroll_anchor(Some(ScrollAnchor { msg_idx: 70, row_in_msg: 0 }));
+        s.push_msg(ChatMessage::Text("m74".into()));
+        // drained 65 (75 - 10): m65.. survive; anchor m70 → index 70 - 65 + 1 = 6
+        assert_eq!(s.message_count(), 11);
+        assert!(s.selection_anchor.is_none() && s.selection_end.is_none());
+        assert_eq!(s.scroll_anchor().map(|a| a.msg_idx), Some(6));
+        assert!(matches!(&s.messages()[6].msg, ChatMessage::Text(t) if t == "m70"));
+
+        // Anchor into the drained range → None.
+        s.test_set_scroll_anchor(Some(ScrollAnchor { msg_idx: 2, row_in_msg: 0 }));
+        for i in 75..150 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        assert!(s.scroll_anchor().is_none());
+    }
+
+    /// A tool result whose `tool_use` was drained appends at the end (the
+    /// legacy no-match fallback) instead of panicking or landing at index 0.
+    #[test]
+    fn tool_result_after_drained_tool_use_appends() {
+        let mut s = store(10, 0);
+        s.push_msg(ChatMessage::ToolUse { tool_id: "t0".into(), tool_name: "bash".into(), input: "{}".into() });
+        for i in 0..80 {
+            s.push_msg(ChatMessage::Text(format!("m{i}")));
+        }
+        assert!(!s.messages().iter().any(|m| matches!(&m.msg, ChatMessage::ToolUse { tool_id, .. } if tool_id == "t0")));
+        s.push_tool_result("t0".into(), "late".into(), None);
+        assert!(matches!(&s.messages().last().unwrap().msg, ChatMessage::ToolResult { content, .. } if content == "late"));
+        // And a result for a live tool_use still lands right under it.
+        s.push_msg(ChatMessage::ToolUse { tool_id: "t1".into(), tool_name: "bash".into(), input: "{}".into() });
+        s.push_msg(ChatMessage::Text("after".into()));
+        s.push_tool_result("t1".into(), "out".into(), None);
+        let n = s.message_count();
+        assert!(matches!(&s.messages()[n - 3].msg, ChatMessage::ToolUse { .. }));
+        assert!(matches!(&s.messages()[n - 2].msg, ChatMessage::ToolResult { .. }));
+    }
+
+    /// `scrollback_from_env`: Socket defaults 400 / 2 MiB, Local 0 / 0.
+    #[test]
+    fn scrollback_defaults_by_transport() {
+        use super::super::app::scrollback_from_env;
+        use super::super::run_setup::TransportMode;
+        for k in ["SYNAPS_TUI_SCROLLBACK", "SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_MSGS", "SYNAPS_CLIENT_SCROLLBACK_BYTES"] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 2 * 1024 * 1024));
     }
 }
