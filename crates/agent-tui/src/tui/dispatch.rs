@@ -27,9 +27,9 @@ use super::*;
 
 use std::ops::ControlFlow;
 
-fn spawn_auto_catalog_refreshes(app: &App, runtime: &synaps_cli::Runtime) {
+fn spawn_auto_catalog_refreshes(app: &App, http: &reqwest::Client) {
     for &provider_key in models::auto_refresh_catalog_providers() {
-        let client = runtime.http_client().clone();
+        let client = http.clone();
         let tx = app.model_list_tx.clone();
         let key = provider_key.to_string();
         tokio::spawn(async move {
@@ -76,7 +76,10 @@ fn spawn_auto_catalog_refreshes(app: &App, runtime: &synaps_cli::Runtime) {
 /// site and consumed by value, so no borrow outlives the arm.
 pub(crate) struct LoopState<'a> {
     pub app: &'a mut App,
-    pub runtime: &'a mut synaps_cli::Runtime,
+    /// The session behind its transport (+ the published `RuntimeView`).
+    pub link: &'a mut session_link::SessionLink,
+    /// Client-local HTTP client for catalog/model-list fetches.
+    pub http: &'a reqwest::Client,
     pub config: &'a mut synaps_cli::SynapsConfig,
     pub registry: &'a std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     pub keybind_registry:
@@ -87,15 +90,54 @@ pub(crate) struct LoopState<'a> {
     /// reader early through a `&mut` without moving it; always `Some` on
     /// entry and on return.
     pub event_reader: &'a mut Option<EventStream>,
-    pub stream: &'a mut Option<
-        std::pin::Pin<Box<dyn futures::Stream<Item = synaps_cli::StreamEvent> + Send>>,
-    >,
-    pub secret_prompt_handle: &'a synaps_cli::tools::SecretPromptHandle,
-    pub cancel_token: &'a mut Option<CancellationToken>,
-    pub steer_tx: &'a mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    pub ext_mgr_shared:
+    /// `Some` in-process; `None` over the socket (an empty manager stands
+    /// in so `/extensions` & friends answer "nothing loaded").
+    pub ext_mgr_shared: Option<
         &'a std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    >,
     pub exit_fx_sent: &'a mut bool,
+}
+
+/// Stand-in extension manager for the socket client (no extension host in
+/// this process).
+fn empty_ext_manager(
+) -> &'static std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>
+{
+    static EMPTY: std::sync::OnceLock<
+        std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    > = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            synaps_cli::extensions::manager::ExtensionManager::new(std::sync::Arc::new(
+                synaps_cli::extensions::hooks::HookBus::new(),
+            )),
+        ))
+    })
+}
+
+/// Pre-send presentation shared by Submit / LoadSkill (dispatch.rs Submit
+/// :1257-1272): "connecting…", streaming, spinner, one published frame.
+fn begin_turn_presentation(
+    app: &mut App,
+    view: &agent_engine::session::RuntimeView,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &render_thread::RenderHandle,
+) {
+    app.status_text = Some("connecting…".to_string());
+    app.streaming = true;
+    app.turn_baseline = app.api_messages.len();
+    app.spinner_frame = 0;
+    let term_size = crossterm::terminal::size()
+        .map(|(w, h)| ratatui::layout::Size {
+            width: w,
+            height: h,
+        })
+        .unwrap_or_default();
+    let built = build_render_model(&mut ViewInputs::from_app(app), view, registry, term_size);
+    if let Some((model, patch)) = built {
+        patch.apply(app);
+        render_handle.publish(model);
+    }
 }
 
 /// Dispatch one decoded [`InputAction`]. `ControlFlow::Continue(())` means
@@ -108,20 +150,23 @@ pub(crate) async fn handle_input_action(
 ) -> ControlFlow<()> {
     let LoopState {
         app,
-        runtime,
+        link,
+        http,
         config,
         registry,
         keybind_registry,
         system_prompt_path,
         render_handle,
         event_reader,
-        stream,
-        secret_prompt_handle,
-        cancel_token,
-        steer_tx,
         ext_mgr_shared,
         exit_fx_sent,
     } = state;
+    let ext_mgr_shared: &std::sync::Arc<
+        tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
+    > = match ext_mgr_shared {
+        Some(m) => m,
+        None => empty_ext_manager(),
+    };
     // Body verbatim from mod.rs:486-1796 (original indentation preserved for
     // diff-ability of the motion; see module header for the mechanical edits).
     match action {
@@ -132,58 +177,11 @@ pub(crate) async fn handle_input_action(
             *exit_fx_sent = true;
         }
         InputAction::Abort => {
-            if let Some(ref ct) = *cancel_token {
-                ct.cancel();
-            }
-            app.capture_abort_context();
-            if let Some(ref q) = app.queued_message.take() {
-                app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
-            }
-            // Flush any events that arrived during streaming
-            for formatted in app.pending_events.drain(..) {
-                app.api_messages
-                    .push(std::sync::Arc::new(serde_json::json!({
-                        "role": "user",
-                        "content": formatted
-                    })));
-            }
-            *stream = None;
-            *cancel_token = None;
-            *steer_tx = None;
-            app.streaming = false;
-            app.subagents.clear();
-            // Cancel all running reactive subagents. A poisoned
-            // registry mutex must not turn a user abort into a
-            // panic (the old `.unwrap()`), but nor should it
-            // silently skip cancellation and leave orphaned
-            // subagents burning tokens — recover the guard and
-            // cancel anyway, logging the poison. Scoped in its
-            // own block so the guard drops before any `.await`
-            // below (clippy::await_holding_lock).
-            {
-                let mut registry = match runtime.subagent_registry().lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                                                "subagent registry mutex poisoned during abort; recovering to cancel running handles"
-                                            );
-                        poisoned.into_inner()
-                    }
-                };
-                for handle in registry.iter_mut_handles() {
-                    if handle.status() == synaps_cli::runtime::subagent::SubagentStatus::Running {
-                        handle.cancel();
-                    }
-                }
-            }
-            let abort_msg = if app.abort_context.is_some() {
-                "aborted — context saved for next message"
-            } else {
-                "aborted"
-            };
-            app.drop_empty_thinking();
-            app.push_msg(ChatMessage::Error(abort_msg.to_string()));
-            app.save_session().await;
+            // The actor cancels the turn, captures abort context, dequeues,
+            // flushes pending events, cancels subagents and saves; the
+            // presentation ("dequeued: …", the aborted line, HUD clear)
+            // follows on `Dequeued` / `Aborted` (stream_handler).
+            let _ = link.send(agent_engine::session::SessionCommand::Cancel).await;
         }
         InputAction::SlashCommand(cmd, arg) => {
             let kb_snapshot = {
@@ -194,7 +192,7 @@ pub(crate) async fn handle_input_action(
                 &cmd,
                 &arg,
                 app,
-                runtime,
+                link,
                 system_prompt_path,
                 registry,
                 &kb_snapshot,
@@ -237,21 +235,21 @@ pub(crate) async fn handle_input_action(
                     app.modal_stack.push(focus::PaneId::Models);
                     #[cfg(debug_assertions)]
                     focus::debug_assert_stack_sync(app);
-                    spawn_auto_catalog_refreshes(app, runtime);
+                    spawn_auto_catalog_refreshes(app, http);
                 }
                 CommandAction::OpenEffort => {
                     // Defense in depth: the streaming-input path already
                     // refuses /effort while streaming; this guard covers any
                     // future action source. Never open mid-stream.
-                    if app.streaming || stream.is_some() {
+                    if app.streaming {
                         app.push_msg(ChatMessage::System(
                             "/effort can't run while streaming — press Esc to cancel first"
                                 .to_string(),
                         ));
                     } else {
                         app.effort = Some(effort::EffortModalState::new(
-                            runtime.model(),
-                            runtime.thinking_level(),
+                            &link.view().model,
+                            &link.view().thinking_level,
                         ));
                         app.modal_stack.push(focus::PaneId::Effort);
                         #[cfg(debug_assertions)]
@@ -269,7 +267,7 @@ pub(crate) async fn handle_input_action(
                     focus::debug_assert_stack_sync(app);
                     // Same live-catalog refresh the /models modal runs: the
                     // settings model picker feeds off app.catalog_overrides.
-                    spawn_auto_catalog_refreshes(app, runtime);
+                    spawn_auto_catalog_refreshes(app, http);
                 }
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
@@ -327,7 +325,8 @@ pub(crate) async fn handle_input_action(
                             app.push_msg(ChatMessage::System(reason));
                         }
                         Ok(body) => {
-                            app.api_messages.push(std::sync::Arc::new(json!({
+                            let mut messages: Vec<synaps_cli::SharedMessage> = Vec::new();
+                            messages.push(std::sync::Arc::new(json!({
                                 "role": "assistant",
                                 "content": [{
                                     "type": "tool_use",
@@ -336,7 +335,7 @@ pub(crate) async fn handle_input_action(
                                     "input": {"skill": skill.name.clone()}
                                 }]
                             })));
-                            app.api_messages.push(std::sync::Arc::new(json!({
+                            messages.push(std::sync::Arc::new(json!({
                                 "role": "user",
                                 "content": [{
                                     "type": "tool_result",
@@ -353,50 +352,21 @@ pub(crate) async fn handle_input_action(
                                 display_name
                             )));
 
-                            if !arg.is_empty() {
-                                app.api_messages.push(std::sync::Arc::new(
-                                    json!({"role": "user", "content": arg.clone()}),
-                                ));
-                                app.push_msg(ChatMessage::User(arg));
-                            }
+                            let user_text = if !arg.is_empty() {
+                                app.push_msg(ChatMessage::User(arg.clone()));
+                                Some(arg)
+                            } else {
+                                None
+                            };
                             // Start stream — mirror InputAction::Submit stream-start pattern.
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.status_text = Some("connecting…".to_string());
-                            app.streaming = true;
-                            app.turn_baseline = app.api_messages.len();
-                            app.spinner_frame = 0;
-                            let term_size = crossterm::terminal::size()
-                                .map(|(w, h)| ratatui::layout::Size {
-                                    width: w,
-                                    height: h,
+                            let view = std::sync::Arc::clone(link.view());
+                            begin_turn_presentation(app, &view, registry, render_handle);
+                            let _ = link
+                                .send(agent_engine::session::SessionCommand::SubmitPrepared {
+                                    messages,
+                                    user_text,
                                 })
-                                .unwrap_or_default();
-                            let built = build_render_model(
-                                &mut ViewInputs::from_app(app),
-                                runtime,
-                                registry,
-                                term_size,
-                            );
-                            if let Some((model, patch)) = built {
-                                patch.apply(app);
-                                render_handle.publish(model);
-                            }
-                            *stream = Some(
-                                runtime
-                                    .run_stream_with_messages(
-                                        app.api_messages.clone(),
-                                        ct.clone(),
-                                        Some(s_rx),
-                                        Some(secret_prompt_handle.clone()),
-                                        false,
-                                    )
-                                    .await,
-                            );
-                            app.status_text = None;
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
+                                .await;
                         }
                     }
                 }
@@ -414,7 +384,7 @@ pub(crate) async fn handle_input_action(
                         commands::execute_command_action(
                             CommandAction::PluginCommand { command, arg },
                             app,
-                            runtime,
+                            link,
                         )
                         .await;
                     }
@@ -427,32 +397,18 @@ pub(crate) async fn handle_input_action(
                         app.push_msg(ChatMessage::System(
                             "nothing to compact (need at least 2 turns)".to_string(),
                         ));
-                    } else if app.compact_task.is_some() {
+                    } else if app.compacting {
                         app.push_msg(ChatMessage::System(
                             "compaction already in progress".to_string(),
                         ));
                     } else {
-                        // Spec §9.4: surface provider/model and approximate
-                        // disclosure BEFORE the summarization dispatch.
-                        let disclosure =
-                            synaps_cli::runtime::compaction::preview_compaction_disclosure(
-                                runtime,
-                                &app.api_messages,
-                            );
-                        app.push_msg(ChatMessage::System(disclosure.render_line()));
-                        app.push_msg(ChatMessage::System(
-                            "compacting conversation...".to_string(),
-                        ));
-                        app.status_text = Some("compacting…".to_string());
-                        app.spinner_frame = 0;
-
-                        let msgs = app.api_messages.clone();
-                        let rt = runtime.clone();
-                        let instr = custom_instructions.clone();
-                        let handle = tokio::spawn(async move {
-                            compact_conversation(&msgs, &rt, instr.as_deref()).await
-                        });
-                        app.compact_task = Some(handle);
+                        // Disclosure + "compacting conversation..." +
+                        // status arrive on `CompactionStarted` (§2.4).
+                        let _ = link
+                            .send(agent_engine::session::SessionCommand::Compact {
+                                instructions: custom_instructions.clone(),
+                            })
+                            .await;
                     }
                 }
                 CommandAction::Chain => {
@@ -575,7 +531,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::Status => {
-                    if runtime.model().contains('/') {
+                    if link.view().model.contains('/') {
                         app.push_msg(ChatMessage::System(
                             "Usage stats are only available for Anthropic models.".to_string(),
                         ));
@@ -1229,62 +1185,34 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::Submit(input) => {
-            // Queue input during compaction — will be sent after session swap
-            if app.compact_task.is_some() {
-                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                app.queued_message = Some(input);
+            // Queue input during compaction — the actor queues it (B2) and
+            // answers `Steered{delivered:false}` → "queued: …".
+            if app.compacting {
+                let _ = link
+                    .send(agent_engine::session::SessionCommand::Submit {
+                        text: input,
+                        attachments: Vec::new(),
+                    })
+                    .await;
                 return ControlFlow::Continue(());
             }
             let display_text = app.user_display_text_for_submission(&input);
             app.push_msg(ChatMessage::User(display_text));
             app.input_before_paste = None;
             app.pasted_char_count = 0;
-            // Real user send — reset auto-turn counter.
+            // Real user send — reset auto-turn counter (mirrored back by
+            // `Conversation`; abort-context fold + history push are the
+            // actor's).
             app.consecutive_auto_turns = 0;
-            // Inject abort context if previous response was interrupted
-            let api_content = if let Some(ref ctx) = app.abort_context {
-                let combined = format!("{}\n\n{}", ctx, input);
-                app.abort_context = None;
-                combined
-            } else {
-                input
-            };
-            app.api_messages.push(std::sync::Arc::new(
-                json!({"role": "user", "content": api_content}),
-            ));
-            let ct = CancellationToken::new();
-            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            app.status_text = Some("connecting…".to_string());
-            app.streaming = true;
-            app.turn_baseline = app.api_messages.len();
-            app.spinner_frame = 0;
-            let term_size = crossterm::terminal::size()
-                .map(|(w, h)| ratatui::layout::Size {
-                    width: w,
-                    height: h,
+            let view = std::sync::Arc::clone(link.view());
+            begin_turn_presentation(app, &view, registry, render_handle);
+            app.last_submitted = Some(input.clone());
+            let _ = link
+                .send(agent_engine::session::SessionCommand::Submit {
+                    text: input,
+                    attachments: Vec::new(),
                 })
-                .unwrap_or_default();
-            let built =
-                build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
-            if let Some((model, patch)) = built {
-                patch.apply(app);
-                render_handle.publish(model);
-            }
-            *stream = Some(
-                runtime
-                    .run_stream_with_messages(
-                        app.api_messages.clone(),
-                        ct.clone(),
-                        Some(s_rx),
-                        Some(secret_prompt_handle.clone()),
-                        false,
-                    )
-                    .await,
-            );
-            app.status_text = None;
-            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-            *cancel_token = Some(ct);
-            *steer_tx = Some(s_tx);
+                .await;
         }
         InputAction::StreamingInput(input) => {
             // Check for streaming slash commands
@@ -1307,16 +1235,10 @@ pub(crate) async fn handle_input_action(
                             )));
                         } else {
                             // Unknown slash text — treat as steering
-                            let steered = steer_tx
-                                .as_ref()
-                                .map(|tx| tx.send(input.clone()).is_ok())
-                                .unwrap_or(false);
-                            if steered {
-                                app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                            } else {
-                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                            }
-                            app.queued_message = Some(input);
+                            // ("→ steering:" / "queued:" on `Steered`).
+                            let _ = link
+                                .send(agent_engine::session::SessionCommand::Steer { text: input })
+                                .await;
                         }
                     }
                     CommandAction::Quit => {
@@ -1366,41 +1288,44 @@ pub(crate) async fn handle_input_action(
                 }
             } else {
                 // Normal text during streaming — steer/queue
-                let steered = steer_tx
-                    .as_ref()
-                    .map(|tx| tx.send(input.clone()).is_ok())
-                    .unwrap_or(false);
-                if steered {
-                    app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                } else {
-                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                }
-                app.queued_message = Some(input);
+                // ("→ steering:" / "queued:" on `Steered`).
+                let _ = link
+                    .send(agent_engine::session::SessionCommand::Steer { text: input })
+                    .await;
             }
         }
-        InputAction::ModelsApply(model) => match runtime.try_set_model(model.clone()) {
-            Ok(clamp) => {
-                let applied = runtime.model().to_string();
-                let status = synaps_cli::engine::commands::persist_to_config("model", &applied);
-                app.session.model = applied.clone();
-                app.push_msg(ChatMessage::System(format!(
-                    "model set to: {} {}",
-                    applied, status
-                )));
-                // Session-only: the user's configured thinking value stays theirs.
-                if let Some(clamp) = clamp {
-                    app.session.thinking_level = runtime.thinking_level().to_string();
-                    app.push_msg(ChatMessage::System(
-                        crate::tui::commands::reasoning_clamp_notice(&clamp, &applied),
-                    ));
+        InputAction::ModelsApply(model) => {
+            match link
+                .set_checked(agent_engine::session::SessionSetting::Model { model })
+                .await
+            {
+                Ok(applied) => {
+                    let model_applied = applied.view.model.clone();
+                    let status =
+                        synaps_cli::engine::commands::persist_to_config("model", &model_applied);
+                    app.session.model = model_applied.clone();
+                    app.push_msg(ChatMessage::System(format!(
+                        "model set to: {} {}",
+                        model_applied, status
+                    )));
+                    // Session-only: the user's configured thinking value stays theirs.
+                    if let Some(clamp) = applied.clamp {
+                        app.session.thinking_level = applied.view.thinking_level.clone();
+                        app.push_msg(ChatMessage::System(
+                            crate::tui::commands::reasoning_clamp_notice_wire(
+                                &clamp,
+                                &model_applied,
+                            ),
+                        ));
+                    }
                 }
+                Err(error) => app.push_msg(ChatMessage::Error(error)),
             }
-            Err(error) => app.push_msg(ChatMessage::Error(error)),
-        },
+        }
         InputAction::EffortApply(apply) => {
             // Reject a selection derived from a different exact model or from
             // an older capability snapshot before mutation or persistence.
-            if runtime.model() != apply.model
+            if link.view().model != apply.model
                 || agent_engine::runtime::openai::catalog::capability_cache::generation()
                     != apply.generation
             {
@@ -1413,9 +1338,12 @@ pub(crate) async fn handle_input_action(
             // Reject without ANY state/config mutation; otherwise reuse the
             // existing checked mutation + persistence path (identical to
             // /thinking: set_reasoning_level_checked → persist → session).
-            match effort::apply_guard(app.streaming || stream.is_some(), &value, runtime.model()) {
-                Ok(level) => match runtime.set_reasoning_level_checked(level) {
-                    Ok(()) => {
+            match effort::apply_guard(app.streaming, &value, &link.view().model) {
+                Ok(level) => match link
+                    .set_checked(agent_engine::session::SessionSetting::ReasoningLevel { level })
+                    .await
+                {
+                    Ok(_) => {
                         let canonical = level.as_str();
                         app.session.thinking_level = canonical.to_string();
                         let status =
@@ -1486,7 +1414,7 @@ pub(crate) async fn handle_input_action(
                 });
                 return ControlFlow::Continue(());
             }
-            let client = runtime.http_client().clone();
+            let client = http.clone();
             let tx = app.model_list_tx.clone();
             tokio::spawn(async move {
                 if let Ok(provider) = provider_key.parse::<synaps_cli::auth::CloudProviderId>() {
@@ -1567,7 +1495,13 @@ pub(crate) async fn handle_input_action(
             });
         }
         InputAction::SettingsApply(key, value) => {
-            apply_setting(key, &value, app, runtime);
+            apply_setting(key, &value, app, link).await;
+        }
+        InputAction::GrantWorkerModel(model) => {
+            // input.rs route_models: result ignored as before.
+            let _ = link
+                .set(agent_engine::session::SessionSetting::GrantWorkerModel { model })
+                .await;
         }
         InputAction::PluginEditorOpen {
             plugin_id,

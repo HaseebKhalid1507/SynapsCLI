@@ -2,6 +2,8 @@
 mod transcript;
 
 mod app;
+/// A4: the TUI over `SocketTransport` (`synaps --attach`).
+pub mod attach;
 mod clock;
 mod commands;
 mod dispatch;
@@ -23,6 +25,7 @@ mod render;
 mod render_model;
 mod render_thread;
 mod run_setup;
+mod session_link;
 mod settings;
 mod sidecar;
 mod signals;
@@ -47,7 +50,7 @@ mod viewport;
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use app::{App, ChatMessage, THINKING_PLACEHOLDER};
+use app::{App, ChatMessage};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages, should_draw};
@@ -60,9 +63,9 @@ use futures::StreamExt;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use synaps_cli::core::session_index::SessionIndexRecord;
-use synaps_cli::runtime::compaction::compact_conversation;
-use synaps_cli::{CancellationToken, Result, Runtime};
+use synaps_cli::Result;
+
+use agent_engine::session::{EndReason, SessionCommand};
 
 pub async fn run(
     continue_session: Option<Option<String>>,
@@ -76,9 +79,26 @@ pub async fn run(
     // resumed-session branch), channel/handle setup, render-thread spawn,
     // and tick-throttle init. Behavior byte-identical; the loop below owns
     // every field by value exactly as it did when they were locals.
+    let ctx = run_setup::run_setup(
+        continue_session,
+        system,
+        prompt_manifest,
+        profile,
+        no_extensions,
+    )
+    .await?;
+    run_loop(ctx).await
+}
+
+/// The event loop + teardown, shared by the in-process boot and the socket
+/// attach (`run_attached`).
+pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     let run_setup::RunContext {
         mut app,
-        mut runtime,
+        mut link,
+        http,
+        mut prompt_bridge,
+        mode,
         mut config,
         registry,
         keybind_registry,
@@ -90,24 +110,12 @@ pub async fn run(
         event_reader,
         mut shutdown_signal_rx,
         shutdown_signal_task,
-        mut stream,
-        secret_prompt_handle,
         secret_prompt_rx,
-        mut cancel_token,
-        mut steer_tx,
-        background,
         ext_mgr_shared,
         mut boot_fx_sent,
         mut exit_fx_sent,
         mut last_draw,
-    } = run_setup::run_setup(
-        continue_session,
-        system,
-        prompt_manifest,
-        profile,
-        no_extensions,
-    )
-    .await?;
+    } = ctx;
     // P16.1+P16.2: terminal capabilities — env detection merged with the
     // DA1-fenced query burst run inside run_setup() (after raw-mode enable,
     // BEFORE the EventStream above was created; see run_setup.rs). Still
@@ -167,7 +175,7 @@ pub async fn run(
             last_draw = Instant::now();
             let built = build_render_model(
                 &mut view_model::ViewInputs::from_app(&mut app),
-                &runtime,
+                &**link.view(),
                 &registry,
                 term_size,
             );
@@ -189,12 +197,7 @@ pub async fn run(
                     // from signals does not affect interactive quit.
                     let signals::ShutdownAction::ImmediateExit = signals::shutdown_action(signal);
                     tracing::info!("immediate exit on {:?}", signal);
-                    // Cancel any in-flight stream so the tool/subagent is not
-                    // orphaned for the full watchdog window.
-                    if let Some(ref ct) = cancel_token { ct.cancel(); }
-                    // Abort any in-flight compaction so it doesn't hold state
-                    // open past the teardown budget.
-                    if let Some(ref h) = app.compact_task { h.abort(); }
+                    // The actor cancels the in-flight turn/compaction on End.
                     // Fall through to unified bounded-teardown below the loop.
                     break;
                 }
@@ -212,7 +215,7 @@ pub async fn run(
 
             // ── Async extension loader progress ──
             event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
-                loop_arms::handle_extension_loader_arm(&mut app, &runtime, event, &ext_mgr_shared).await;
+                loop_arms::handle_extension_loader_arm(&mut app, link.view(), event, ext_mgr_shared.as_ref()).await;
             }
 
             // ── Widget events from background extension notification watchers ──
@@ -251,19 +254,16 @@ pub async fn run(
                 }
             }
 
-            // ── Event bus wake — fires instantly when an event is pushed to the queue.
-            // P12.4: arm body moved verbatim to stream_handler::handle_event_queue_arm.
-            _ = runtime.event_queue().notified() => {
-                stream_handler::handle_event_queue_arm(
-                    &mut app, &runtime, &secret_prompt_handle,
-                    &mut stream, &mut cancel_token, &mut steer_tx,
-                ).await;
+            // ── Secret-prompt answers from the pane (PromptBridge) → Answer ──
+            Some((prompt_id, value)) = prompt_bridge.answers_rx.recv() => {
+                prompt_bridge.on_local_answer(prompt_id);
+                let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compacting || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
                 if loop_arms::handle_animation_tick(
-                    &mut app, &runtime, &config, &registry, &render_handle,
+                    &mut app, &config, &registry, &render_handle,
                     &secret_prompt_rx, &boot_done, &exit_done,
                     &mut boot_fx_sent, exit_fx_sent,
                     &mut last_subagent_reconcile,
@@ -288,7 +288,7 @@ pub async fn run(
                         // yield point.
                         let action = {
                             let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
-                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard, config.scroll_lines.unwrap_or(3))
+                            input::handle_event(event, &mut app, &**link.view(), is_streaming, &registry, &kb_guard, config.scroll_lines.unwrap_or(3))
                         };
                         // Input events (keys, mouse, paste, resize) almost always
                         // change visible state (cursor, input buffer, scroll) and
@@ -301,18 +301,15 @@ pub async fn run(
                         // honored anyway), Continue to the old fall-through.
                         let state = dispatch::LoopState {
                             app: &mut app,
-                            runtime: &mut runtime,
+                            link: &mut link,
+                            http: &http,
                             config: &mut config,
                             registry: &registry,
                             keybind_registry: &keybind_registry,
                             system_prompt_path: &system_prompt_path,
                             render_handle: &render_handle,
                             event_reader: &mut event_reader,
-                            stream: &mut stream,
-                            secret_prompt_handle: &secret_prompt_handle,
-                            cancel_token: &mut cancel_token,
-                            steer_tx: &mut steer_tx,
-                            ext_mgr_shared: &ext_mgr_shared,
+                            ext_mgr_shared: ext_mgr_shared.as_ref(),
                             exit_fx_sent: &mut exit_fx_sent,
                         };
                         if dispatch::handle_input_action(action, state).await.is_break() {
@@ -330,21 +327,25 @@ pub async fn run(
                 }
             }
 
-            // ── Stream events from runtime. P12.4: the polling future stays
-            // inline (it borrows `stream`); the arm body moved verbatim to
-            // stream_handler::handle_stream_arm — delta/tool_use/done/abort
-            // lifecycle is preserved exactly (hot path).
-            maybe_event = async {
-                if let Some(ref mut s) = stream {
-                    s.next().await
-                } else {
-                    std::future::pending().await
+            // ── Session envelopes: stream events + every actor notification
+            // (PLAN-phase3 §2.4). `None` = the actor is gone (in-process) or
+            // the socket closed (reconnect flow, A4).
+            maybe_env = link.next_event() => {
+                match maybe_env {
+                    Some(env) => {
+                        if let stream_handler::ArmFlow::Ended = stream_handler::handle_session_event_arm(
+                            env, &mut app, &mut link, &registry, &render_handle,
+                            &mut prompt_bridge, ext_mgr_shared.as_ref(),
+                        ).await {
+                            break;
+                        }
+                    }
+                    None => {
+                        if !run_setup::try_reconnect(&mut app, &mut link, &mode).await {
+                            break;
+                        }
+                    }
                 }
-            } => {
-                stream_handler::handle_stream_arm(
-                    maybe_event, &mut app, &runtime, &registry, &render_handle,
-                    &secret_prompt_handle, &mut stream, &mut cancel_token, &mut steer_tx,
-                ).await;
             }
         }
     }
@@ -352,100 +353,45 @@ pub async fn run(
     // Stop the live-MXC subscriber FIRST — no background task writes past here.
     loop_arms::abort_myx_live(&mut app);
 
-    // ── PART 2: Bounded teardown — two sequential budgets.
-    //
-    // All timing constants are defined in signals.rs (single source of truth):
-    //   SAVE_TIMEOUT_SECS  — session save + index record (data safety first)
-    //   HOOKS_TIMEOUT_SECS — on_session_end hook emit (concurrent, fail-open)
-    //   TEARDOWN_TIMEOUT_SECS = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
-    //
-    // Session save ALWAYS runs first in its own timeout so slow extension
-    // handlers cannot starve it.  Even if the hook budget is exhausted, the
-    // session data on disk is already safe before hooks are attempted.
-    {
-        let session_id = app.session.id.clone();
-        let api_messages = app.api_messages.clone();
-
-        // ── STEP 1: Save session data — own bounded timeout, highest priority ──
-        let save_fut = async {
-            app.save_session().await;
-
-            let mut index_record = SessionIndexRecord::end(&session_id);
-            index_record.turns = Some(api_messages.len());
-            if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
-                tracing::warn!("failed to append session end index record: {}", err);
-            }
+    // ── PART 2: Bounded teardown — the actor saves, fires on_session_end
+    // and flushes observability under its own budgets (`SessionActor::
+    // finish`); we ask for it and wait for `Ended` within the combined
+    // SAVE + HOOKS budget. Over the socket the session lives on: Detach.
+    let teardown = std::time::Duration::from_secs(signals::TEARDOWN_TIMEOUT_SECS);
+    if !link.is_closed() {
+        let cmd = match mode {
+            run_setup::TransportMode::Local { .. } => SessionCommand::End {
+                reason: EndReason::ClientQuit,
+            },
+            run_setup::TransportMode::Socket => SessionCommand::Detach {
+                client: link.client_id(),
+            },
         };
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(signals::SAVE_TIMEOUT_SECS),
-            save_fut,
-        )
-        .await
-        {
-            Ok(()) => tracing::debug!("session save completed"),
-            Err(_elapsed) => {
-                tracing::warn!(
-                    budget_secs = signals::SAVE_TIMEOUT_SECS,
-                    "session save timed out — data may be incomplete"
-                );
-                // Task 11: bounded observability flush precedes the emergency exit.
-                lifecycle::emergency_flush_and_exit(&runtime).await;
+        let _ = link.send(cmd).await;
+        if let run_setup::TransportMode::Local { .. } = mode {
+            match tokio::time::timeout(teardown, link.wait_ended()).await {
+                Ok(true) => tracing::debug!("clean teardown completed"),
+                Ok(false) => tracing::debug!("session task gone before Ended"),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        budget_secs = signals::TEARDOWN_TIMEOUT_SECS,
+                        "session end timed out — data may be incomplete"
+                    );
+                    lifecycle::emergency_exit();
+                }
             }
         }
-
-        // ── STEP 2: Fire on_session_end hook — own bounded timeout, after save ──
-        //
-        // emit_concurrent() dispatches all on_session_end handlers simultaneously
-        // under one shared timeout window instead of N×5 s serial.  This is safe
-        // because on_session_end only allows `Continue` results — handlers are
-        // independent fire-and-forget notification calls (deck, d20, jawz-widget,
-        // synaps-tasks each write to their own stores; no ordering dependency).
-        //
-        // Ordering-safety evidence: HookKind::OnSessionEnd::allowed_action_names()
-        // returns &["continue"] exclusively; allows_result() permits only Continue;
-        // emit_concurrent() merges injections (N/A here) and treats timeouts as
-        // continue (fail-open).  Serial ordering cannot matter when the return
-        // value is always Continue and handlers touch disjoint state.
-        let transcript = Some(api_messages);
-        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
-            &session_id,
-            transcript,
-        );
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(signals::HOOKS_TIMEOUT_SECS),
-            runtime.hook_bus().emit_concurrent(&hook_event),
-        )
-        .await
-        {
-            Ok(_) => tracing::debug!("on_session_end hooks completed"),
-            Err(_elapsed) => {
-                tracing::warn!(
-                    budget_secs = signals::HOOKS_TIMEOUT_SECS,
-                    "on_session_end hooks timed out — extensions may not have flushed"
-                );
-                // Session is already saved above — no data loss here.
-                // Fall through to normal teardown.
-            }
-        }
-
-        // STEP 3 (Task 11): bounded observability flush after save + hooks —
-        // Off/no-fsync/timeout semantics on lifecycle::flush_observability.
-        lifecycle::flush_observability(&runtime).await;
-        tracing::debug!("clean teardown completed");
     }
 
     // Let extension shutdown continue in the background; exit should not hang on
     // extension post/session-end cleanup or slow child-process teardown.
-    let _extension_shutdown =
+    let _extension_shutdown = ext_mgr_shared.as_ref().map(|m| {
         synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
-            std::sync::Arc::clone(&ext_mgr_shared),
-        );
+            std::sync::Arc::clone(m),
+        )
+    });
     // Stop the signal-listener thread (signal-hook handle, not a JoinHandle).
     shutdown_signal_task.close();
-
-    // Shut down background tasks (inbox watcher, socket, session registry)
-    background.shutdown();
 
     // ── Render-thread teardown ───────────────────────────────────────────────
     //

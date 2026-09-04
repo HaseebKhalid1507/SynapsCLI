@@ -7,7 +7,7 @@
 
 use super::*;
 
-fn handle_widget_event(
+pub(crate) fn handle_widget_event(
     app: &mut App,
     event: synaps_cli::extensions::widgets::ExtensionWidgetEvent,
 ) -> bool {
@@ -112,12 +112,14 @@ fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>,
     app.invalidate();
 }
 
-async fn handle_extension_loader_event(
+/// `ext_mgr` is `Some` in-process (widget watchers + live handler count);
+/// `None` over the socket (`view.hook_handler_count`, frames via envelopes).
+pub(crate) async fn handle_extension_loader_event(
     app: &mut App,
-    runtime: &Runtime,
+    view: &agent_engine::session::RuntimeView,
     event: synaps_cli::extensions::loader::ExtensionLoaderEvent,
-    ext_mgr: &std::sync::Arc<
-        tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
+    ext_mgr: Option<
+        &std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
     >,
 ) {
     use synaps_cli::extensions::loader::ExtensionLoaderEvent;
@@ -171,7 +173,10 @@ async fn handle_extension_loader_event(
         }
         ExtensionLoaderEvent::Finished { loaded, failed } => {
             app.extension_loader_running = false;
-            let handler_count = runtime.hook_bus().handler_count().await;
+            let handler_count = match ext_mgr {
+                Some(m) => m.read().await.hook_bus().handler_count().await,
+                None => view.hook_handler_count,
+            };
             tracing::info!(
                 extensions = loaded.len(),
                 failures = failed.len(),
@@ -201,7 +206,10 @@ async fn handle_extension_loader_event(
             // `ext.<id>.<token>` overrides still win — they live inside the
             // Theme value and are checked first by `Theme::ext_token`.
             // Extensions with no `theme_tokens` contribute nothing here.
-            let ext_theme_tokens = ext_mgr.read().await.theme_tokens();
+            let ext_theme_tokens = match ext_mgr {
+                Some(m) => m.read().await.theme_tokens(),
+                None => Default::default(),
+            };
             if !ext_theme_tokens.is_empty() {
                 for (ext_id, tokens) in &ext_theme_tokens {
                     theme::register_ext_theme_tokens(
@@ -223,7 +231,10 @@ async fn handle_extension_loader_event(
             // warn instead: widget upserts are idempotent last-writer-wins
             // UI state, so the first event after the TUI loop resumes
             // consuming restores the display.
-            let handlers = ext_mgr.read().await.handlers();
+            let handlers = match ext_mgr {
+                Some(m) => m.read().await.handlers(),
+                None => Vec::new(),
+            };
             for (ext_id, handler) in handlers {
                 let widget_tx = app.widget_tx.clone();
                 tokio::spawn(async move {
@@ -586,14 +597,14 @@ pub(crate) fn handle_model_list_arm(
 /// Async extension-loader progress arm.
 pub(crate) async fn handle_extension_loader_arm(
     app: &mut App,
-    runtime: &Runtime,
+    view: &agent_engine::session::RuntimeView,
     event: Option<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
-    ext_mgr: &std::sync::Arc<
-        tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
+    ext_mgr: Option<
+        &std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
     >,
 ) {
     if let Some(event) = event {
-        handle_extension_loader_event(app, runtime, event, ext_mgr).await;
+        handle_extension_loader_event(app, view, event, ext_mgr).await;
     } else {
         app.extension_loader_running = false;
         app.toasts.dismiss("extension-loader");
@@ -623,7 +634,6 @@ pub(crate) fn handle_widget_arm(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_animation_tick(
     app: &mut App,
-    runtime: &Runtime,
     config: &synaps_cli::SynapsConfig,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     render_handle: &render_thread::RenderHandle,
@@ -684,12 +694,8 @@ pub(crate) async fn handle_animation_tick(
         let should_reconcile =
             last_subagent_reconcile.map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
         if should_reconcile {
-            let rows = runtime
-                .subagent_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .display_rows();
-            super::stream_handler::reconcile_subagents(&mut app.subagents, &rows, now);
+            // From the `SubagentRows` cache the actor refreshes at 1 Hz.
+            super::stream_handler::reconcile_subagents(&mut app.subagents, &app.subagent_rows, now);
             *last_subagent_reconcile = Some(now);
             app.request_redraw();
         }
@@ -756,80 +762,8 @@ pub(crate) async fn handle_animation_tick(
         app.push_msg(ChatMessage::System(msg));
         app.invalidate(); // invalidate already sets needs_redraw
     }
-    // Poll background compaction task
-    if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
-        let handle = app.compact_task.take().unwrap();
-        let msg_count = app.api_messages.len();
-        match handle.await {
-            Ok(Ok(outcome)) => {
-                // T30 (spec §9.2): apply through the ONE engine
-                // transition — successor policy, chain advancement,
-                // provenance, pending events/queued message, hooks,
-                // and save ordering all live in the engine now.
-                let pending: Vec<String> = app.pending_events.clone();
-                let queued = app.queued_message.clone();
-                match synaps_cli::runtime::compaction::apply_compaction(
-                    runtime,
-                    &app.session,
-                    &app.api_messages,
-                    &outcome,
-                    synaps_cli::runtime::compaction::CompactionTransition {
-                        policy: synaps_cli::runtime::compaction::CompactionPolicy::LinkedSuccessor,
-                        pending_events: pending,
-                        queued_message: queued.clone(),
-                        hook_source: "manual".to_string(),
-                    },
-                )
-                .await
-                {
-                    Ok(applied) => {
-                        let old_id = applied.previous_session_id.clone();
-                        app.pending_events.clear();
-                        app.queued_message = None;
-                        app.session = applied.session;
-                        app.api_messages = applied.api_messages;
-                        app.total_input_tokens = 0;
-                        app.total_output_tokens = 0;
-                        app.session_cost = 0.0;
-                        let msgs = app.api_messages.clone();
-                        rebuild_display_messages(&msgs, app);
-                        for name in &applied.chains_advanced {
-                            app.push_msg(ChatMessage::System(format!(
-                                "chain '{}' advanced: {} → {}",
-                                name, old_id, app.session.id
-                            )));
-                        }
-                        if let Some(q) = queued {
-                            app.push_msg(ChatMessage::System(format!(
-                                "queued message restored: {}",
-                                q
-                            )));
-                        }
-                        app.push_msg(ChatMessage::System(format!(
-                            "✓ compacted {} messages → new session {} (from {})",
-                            msg_count, app.session.id, old_id
-                        )));
-                    }
-                    Err(e) => {
-                        // Prior session state (including pending
-                        // events and the queued message) is intact.
-                        app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
-            }
-            Err(e) => {
-                app.push_msg(ChatMessage::Error(format!(
-                    "compaction task panicked: {}",
-                    e
-                )));
-            }
-        }
-        app.status_text = None;
-        app.invalidate();
-    }
+    // Compaction outcome: `CompactionApplied`/`Failed`/`Cancelled` envelopes
+    // (stream_handler::handle_session_event_arm).
     if exit_done.load(Ordering::Acquire) {
         return true;
     }

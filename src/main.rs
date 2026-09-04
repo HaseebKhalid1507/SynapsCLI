@@ -87,11 +87,23 @@ struct Cli {
     #[arg(long)]
     no_extensions: bool,
 
-    /// EXPERIMENTAL (SYNAPS_DAEMON=1): attach to a daemon session instead of
-    /// running in-process. Optionally a session ID. Today routes to
-    /// `synaps attach` (the daemon-attached TUI lands in phase 2 day 2).
+    /// EXPERIMENTAL (SYNAPS_DAEMON=1): run the TUI attached to a daemon
+    /// session instead of in-process. Optionally a session ID (prefix ok);
+    /// with no live session a new one is created (`--continue` continues).
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
+
+    /// With --attach: mirror without input (read-only).
+    #[arg(long, global = true, conflicts_with = "takeover")]
+    observe: bool,
+
+    /// With --attach: steal input ownership from the current owner.
+    #[arg(long, global = true)]
+    takeover: bool,
+
+    /// With --attach: pin the session live (never parked).
+    #[arg(long = "keep-warm", global = true)]
+    keep_warm: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -359,17 +371,16 @@ async fn async_main() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                eprintln!("daemon-attached TUI lands in phase 2 day 2; using `synaps attach`");
                 let id = cli.attach.flatten();
-                cmd::attach::run(
-                    cli.profile,
-                    cmd::attach::AttachArgs {
-                        id,
-                        create: false,
-                        continue_session: cli.continue_session.flatten(),
-                        system: cli.system,
-                    },
-                )
+                tui::attach::run_attached(tui::attach::AttachOpts {
+                    profile: cli.profile,
+                    id,
+                    continue_session: cli.continue_session.flatten(),
+                    system: cli.system,
+                    prompt_manifest: cli.prompt_manifest,
+                    mode: tui::attach::attach_mode(cli.observe, cli.takeover),
+                    keep_warm: cli.keep_warm,
+                })
                 .await?;
             }
         }

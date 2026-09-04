@@ -26,7 +26,9 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
         "src/cmd/chat.rs",
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
-        "crates/agent-tui/src/tui/dispatch.rs",
+        // The TUI compacts on the SessionActor since phase 3 (A2): the
+        // disclosure is computed there and shipped as `CompactionStarted`.
+        "crates/agent-engine/src/session/actor.rs",
     ] {
         let src = read(rel);
         assert!(
