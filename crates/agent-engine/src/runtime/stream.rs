@@ -2293,6 +2293,14 @@ mod rich_output_tests {
 
     // ── S1: history image byte cap ─────────────────────────────────────────
 
+    fn user_msg(content: Value) -> SharedMessage {
+        Arc::new(json!({"role": "user", "content": content}))
+    }
+
+    fn assistant_msg(text: &str) -> SharedMessage {
+        Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": text}]}))
+    }
+
     fn image_tool_result_msg(id: &str, b64_len: usize) -> SharedMessage {
         user_msg(json!([{
             "type": "tool_result", "tool_use_id": id,
