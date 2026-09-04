@@ -17,7 +17,8 @@ use serde_json::json;
 use std::io::{self, Write};
 use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::reactor::{
-    claim_auto_turn, drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP,
+    claim_auto_turn_with_cap, drain_event_queue, wake_action_with_cap, WakeAction,
+    AUTO_TURN_CAP_CONFIG_KEY,
 };
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, EngineOpts};
@@ -120,6 +121,8 @@ pub async fn run(
     // Initial value doesn't matter — always reset before first turn.
     #[allow(unused_assignments)]
     let mut consecutive_auto_turns: u32 = 0;
+    // Configured `events.auto_turn_cap` (default 5; 0 = unlimited).
+    let auto_turn_cap = synaps_cli::core::config::load_config().events.auto_turn_cap;
 
     // C4b: async tokio stdin — lets us select! against event_queue.notified()
     // while idle at the prompt so runtime events can wake us immediately.
@@ -162,12 +165,13 @@ pub async fn run(
                     for d in &drained {
                         eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
                     }
-                    let action = wake_action(
+                    let action = wake_action_with_cap(
                         &drained,
                         &conv.api_messages,
                         false,
                         true,  // auto_turn_enabled in chat mode
                         consecutive_auto_turns,
+                        auto_turn_cap,
                     );
                     PromptRead::EventWake { run_turn: action == WakeAction::RunTurn }
                 }
@@ -196,7 +200,7 @@ pub async fn run(
                 // claim_auto_turn: increment only if allowed; if denied (cap) we
                 // got run_turn=true from wake_action which already checked < cap,
                 // so this should always succeed here — but use the gate for safety.
-                let _ = claim_auto_turn(&mut consecutive_auto_turns);
+                let _ = claim_auto_turn_with_cap(&mut consecutive_auto_turns, auto_turn_cap);
             }
 
             PromptRead::Line(raw_line) => {
@@ -560,23 +564,25 @@ pub async fn run(
                     for d in &drained {
                         eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
                     }
-                    let action = wake_action(
+                    let action = wake_action_with_cap(
                         &drained,
                         &conv.api_messages,
                         false,
                         true, // auto_turn_enabled
                         consecutive_auto_turns,
+                        auto_turn_cap,
                     );
                     match action {
                         WakeAction::RunTurn => {
-                            if claim_auto_turn(&mut consecutive_auto_turns) {
+                            if claim_auto_turn_with_cap(&mut consecutive_auto_turns, auto_turn_cap)
+                            {
                                 continue 'turn_loop;
                             } else {
                                 // claim denied: counter was already at cap.
                                 // fall through to park (treated as Forward).
                                 eprintln!(
-                                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
-                                    AUTO_TURN_CAP
+                                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input; raise with `{} = N`, 0 = unlimited]\x1b[0m",
+                                    auto_turn_cap, AUTO_TURN_CAP_CONFIG_KEY
                                 );
                                 break 'turn_loop;
                             }

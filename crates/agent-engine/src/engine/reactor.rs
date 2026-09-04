@@ -15,9 +15,36 @@ use crate::SharedMessage;
 // Re-export the shared wire payload so callers can use `engine::reactor::EventPayload`.
 pub use agent_core::core::rpc_protocol::EventPayload;
 
-/// Hard cap: how many consecutive auto-triggered model turns can fire before
+/// Default cap: how many consecutive auto-triggered model turns can fire before
 /// the engine parks and waits for real user input.
+///
+/// Configurable via `events.auto_turn_cap` (see `EventsConfig::auto_turn_cap`).
+/// A cap of `0` means **unlimited** — the engine never parks.
 pub const AUTO_TURN_CAP: u32 = 5;
+
+/// Sentinel: `events.auto_turn_cap = 0` disables the cap entirely.
+pub const AUTO_TURN_UNLIMITED: u32 = 0;
+
+/// The config key users should raise when the cap trips (used in messages).
+pub const AUTO_TURN_CAP_CONFIG_KEY: &str = "events.auto_turn_cap";
+
+/// Single source of truth for "has the consecutive auto-turn cap been hit?"
+///
+/// * `cap == 0` (`AUTO_TURN_UNLIMITED`) → never reached.
+/// * otherwise → `consecutive >= cap`.
+#[inline]
+pub fn auto_turn_cap_reached(consecutive: u32, cap: u32) -> bool {
+    cap != AUTO_TURN_UNLIMITED && consecutive >= cap
+}
+
+/// Human-readable rendering of a cap value for user-facing messages.
+pub fn describe_auto_turn_cap(cap: u32) -> String {
+    if cap == AUTO_TURN_UNLIMITED {
+        "unlimited".to_string()
+    } else {
+        cap.to_string()
+    }
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -131,12 +158,35 @@ pub fn drain_event_queue(
 /// 2. Any `Injected` event + idle + auto-turn enabled + last message is
 ///    `role=user` + consecutive cap not reached → `RunTurn`.
 /// 3. Otherwise → `Forward` (show events; caller may still steer/display).
+///
+/// Convenience wrapper over [`wake_action_with_cap`] using the default
+/// [`AUTO_TURN_CAP`]. Production callers should pass the configured cap.
 pub fn wake_action(
     drained: &[DrainedEvent],
     messages: &[SharedMessage],
     busy: bool,
     auto_turn_enabled: bool,
     consecutive_auto_turns: u32,
+) -> WakeAction {
+    wake_action_with_cap(
+        drained,
+        messages,
+        busy,
+        auto_turn_enabled,
+        consecutive_auto_turns,
+        AUTO_TURN_CAP,
+    )
+}
+
+/// [`wake_action`] with an explicit cap (`events.auto_turn_cap`); `cap == 0`
+/// means unlimited.
+pub fn wake_action_with_cap(
+    drained: &[DrainedEvent],
+    messages: &[SharedMessage],
+    busy: bool,
+    auto_turn_enabled: bool,
+    consecutive_auto_turns: u32,
+    cap: u32,
 ) -> WakeAction {
     if drained.is_empty() {
         return WakeAction::Nothing;
@@ -149,7 +199,7 @@ pub fn wake_action(
     if has_injected
         && !busy
         && auto_turn_enabled
-        && consecutive_auto_turns < AUTO_TURN_CAP
+        && !auto_turn_cap_reached(consecutive_auto_turns, cap)
         && messages
             .last()
             .map(|m| m["role"].as_str() == Some("user"))
@@ -195,9 +245,14 @@ pub fn event_payload_from_drained(drained: &DrainedEvent) -> EventPayload {
 /// Centralised auto-turn claim gate.
 ///
 /// **Semantics (single source of truth):**
-/// * `counter < AUTO_TURN_CAP` → allowed: increment `counter` and return `true`.
-/// * `counter >= AUTO_TURN_CAP` → denied: leave `counter` unchanged, return `false`.
+/// * `cap == 0` → always allowed (unlimited): increment `counter`, return `true`.
+/// * `counter < cap` → allowed: increment `counter` and return `true`.
+/// * `counter >= cap` → denied: leave `counter` unchanged, return `false`.
 /// * User input resets `counter` to 0 (caller responsibility — not this function).
+///
+/// `claim_auto_turn` uses the default [`AUTO_TURN_CAP`]; production callers
+/// should use [`claim_auto_turn_with_cap`] with the configured
+/// `events.auto_turn_cap`.
 ///
 /// All paths that may fire an auto-triggered model turn (TUI event arm, TUI
 /// stream arm, chat EventWake, chat AutoTriggerEvents, server idle wake, server
@@ -211,11 +266,17 @@ pub fn event_payload_from_drained(drained: &DrainedEvent) -> EventPayload {
 /// `true` if a turn is allowed (counter was incremented), `false` if parked.
 #[inline]
 pub fn claim_auto_turn(counter: &mut u32) -> bool {
-    if *counter < AUTO_TURN_CAP {
-        *counter += 1;
-        true
-    } else {
+    claim_auto_turn_with_cap(counter, AUTO_TURN_CAP)
+}
+
+/// [`claim_auto_turn`] with an explicit cap; `cap == 0` means unlimited.
+#[inline]
+pub fn claim_auto_turn_with_cap(counter: &mut u32, cap: u32) -> bool {
+    if auto_turn_cap_reached(*counter, cap) {
         false
+    } else {
+        *counter = counter.saturating_add(1);
+        true
     }
 }
 
@@ -257,6 +318,27 @@ pub fn terminal_flush_seam(
     events_auto_turn: bool,
     consecutive_auto_turns: &mut u32,
 ) -> Option<String> {
+    terminal_flush_seam_with_cap(
+        allow_chain,
+        auto_turn_pending,
+        pending_events,
+        api_messages,
+        events_auto_turn,
+        consecutive_auto_turns,
+        AUTO_TURN_CAP,
+    )
+}
+
+/// [`terminal_flush_seam`] with an explicit cap; `cap == 0` means unlimited.
+pub fn terminal_flush_seam_with_cap(
+    allow_chain: bool,
+    auto_turn_pending: &mut bool,
+    pending_events: &mut Vec<String>,
+    api_messages: &mut Vec<crate::SharedMessage>,
+    events_auto_turn: bool,
+    consecutive_auto_turns: &mut u32,
+    cap: u32,
+) -> Option<String> {
     *auto_turn_pending = false;
     let to_inject = std::mem::take(pending_events);
     let had_buffered = !to_inject.is_empty();
@@ -268,12 +350,12 @@ pub fn terminal_flush_seam(
     if allow_chain
         && had_buffered
         && events_auto_turn
-        && *consecutive_auto_turns < AUTO_TURN_CAP
+        && !auto_turn_cap_reached(*consecutive_auto_turns, cap)
         && api_messages
             .last()
             .map(|m| m["role"].as_str() == Some("user"))
             .unwrap_or(false)
-        && claim_auto_turn(consecutive_auto_turns)
+        && claim_auto_turn_with_cap(consecutive_auto_turns, cap)
     {
         *auto_turn_pending = true;
         return Some("auto:seam".to_string());
@@ -837,5 +919,99 @@ mod disclosure_persistence_tests {
         let drained = drain_event_queue(&queue, &mut messages, &mut pending, false, None);
         let payload = event_payload_from_drained(&drained[0]);
         assert_eq!(payload.disclosure, None, "absent class stays absent");
+    }
+    // ── configurable cap (events.auto_turn_cap) ─────────────────────────
+
+    #[test]
+    fn cap_reached_zero_is_unlimited() {
+        assert!(!auto_turn_cap_reached(0, AUTO_TURN_UNLIMITED));
+        assert!(!auto_turn_cap_reached(u32::MAX, AUTO_TURN_UNLIMITED));
+        assert!(auto_turn_cap_reached(5, 5));
+        assert!(!auto_turn_cap_reached(4, 5));
+    }
+
+    #[test]
+    fn claim_with_cap_zero_never_trips_across_100_turns() {
+        let mut counter: u32 = 0;
+        for i in 1..=100u32 {
+            assert!(
+                claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED),
+                "unlimited: turn {i} must be allowed"
+            );
+        }
+        assert_eq!(counter, 100);
+    }
+
+    #[test]
+    fn claim_with_cap_two_trips_on_third() {
+        let mut counter: u32 = 0;
+        assert!(claim_auto_turn_with_cap(&mut counter, 2));
+        assert!(claim_auto_turn_with_cap(&mut counter, 2));
+        assert!(!claim_auto_turn_with_cap(&mut counter, 2), "3rd must be denied");
+        assert_eq!(counter, 2);
+    }
+
+    #[test]
+    fn claim_with_cap_unlimited_saturates_instead_of_overflowing() {
+        let mut counter: u32 = u32::MAX;
+        assert!(claim_auto_turn_with_cap(&mut counter, AUTO_TURN_UNLIMITED));
+        assert_eq!(counter, u32::MAX);
+    }
+
+    #[test]
+    fn wake_with_cap_zero_never_parks_across_100_turns() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        for consecutive in 0..100u32 {
+            assert_eq!(
+                wake_action_with_cap(&drained, &messages, false, true, consecutive, 0),
+                WakeAction::RunTurn,
+                "unlimited: consecutive={consecutive} must still RunTurn"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_with_cap_two_forwards_on_third() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        assert_eq!(
+            wake_action_with_cap(&drained, &messages, false, true, 1, 2),
+            WakeAction::RunTurn
+        );
+        assert_eq!(
+            wake_action_with_cap(&drained, &messages, false, true, 2, 2),
+            WakeAction::Forward
+        );
+    }
+
+    #[test]
+    fn wake_default_wrapper_matches_default_cap() {
+        let drained = vec![injected_event()];
+        let messages = vec![user_msg("ev")];
+        assert_eq!(
+            wake_action(&drained, &messages, false, true, AUTO_TURN_CAP),
+            wake_action_with_cap(&drained, &messages, false, true, AUTO_TURN_CAP, AUTO_TURN_CAP)
+        );
+    }
+
+    #[test]
+    fn terminal_flush_seam_with_cap_zero_reserves_at_high_counter() {
+        let mut pending = false;
+        let mut events = vec!["<event>x</event>".to_string()];
+        let mut msgs: Vec<SharedMessage> = Vec::new();
+        let mut counter: u32 = 1_000;
+        let r = terminal_flush_seam_with_cap(
+            true, &mut pending, &mut events, &mut msgs, true, &mut counter, 0,
+        );
+        assert_eq!(r.as_deref(), Some("auto:seam"));
+        assert!(pending);
+        assert_eq!(counter, 1_001);
+    }
+
+    #[test]
+    fn describe_cap_renders_unlimited_and_numbers() {
+        assert_eq!(describe_auto_turn_cap(0), "unlimited");
+        assert_eq!(describe_auto_turn_cap(12), "12");
     }
 }
