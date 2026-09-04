@@ -371,7 +371,7 @@ fn resolve_or_create_session(
                 let resolved_via = if *q != session.id {
                     if crate::chain::load_chain(q).is_ok() {
                         Some("chain".to_string())
-                    } else if crate::session::find_session_by_name(q).is_ok() {
+                    } else if agent_core::session::find_session_by_name(q).is_ok() {
                         Some("name".to_string())
                     } else {
                         None

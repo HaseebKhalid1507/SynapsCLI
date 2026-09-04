@@ -1,0 +1,17 @@
+//! Session actor surface (Phase 2 daemon mode).
+//!
+//! One `SessionActor` (A1) owns THE `Runtime` + `ConversationState` for a
+//! conversation and runs its turn machine; clients talk to it through a
+//! `ClientTransport` — `LocalTransport` in-process (same `StreamEvent`
+//! values, never serialised = byte-identical), `SocketTransport` (B2) over
+//! the daemon UDS. `agent-tui` must never be a dependency of anything here.
+
+pub mod handle;
+pub mod transport;
+pub mod types;
+pub mod view;
+
+pub use handle::SessionHandle;
+pub use transport::{ClientTransport, LocalTransport, TransportError};
+pub use types::*;
+pub use view::{RuntimeRead, RuntimeView};

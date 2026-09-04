@@ -8,6 +8,7 @@ use crate::SharedMessage;
 use crate::{Runtime, Session};
 
 /// Conversation state tracked by the engine.
+#[derive(Clone)]
 pub struct ConversationState {
     pub session: Session,
     pub api_messages: Vec<SharedMessage>,
@@ -90,6 +91,29 @@ impl ConversationState {
             runtime.thinking_level(),
             runtime.system_prompt(),
         );
+    }
+
+    /// Serializable mirror for clients (`SessionEventWire::Conversation`).
+    /// `consecutive_auto_turns` is actor/App-side state, not conversation
+    /// state, so the caller supplies it.
+    pub fn snapshot(
+        &self,
+        consecutive_auto_turns: u32,
+    ) -> crate::session::ConversationSnapshot {
+        crate::session::ConversationSnapshot {
+            api_messages: self.api_messages.clone(),
+            tokens: crate::session::ConversationTokens {
+                input: self.total_input_tokens,
+                output: self.total_output_tokens,
+                cache_read: self.total_cache_read_tokens,
+                cache_creation: self.total_cache_creation_tokens,
+            },
+            cost: self.session_cost,
+            abort_context: self.abort_context.clone(),
+            queued_message: self.queued_message.clone(),
+            pending_events_len: self.pending_events.len(),
+            consecutive_auto_turns,
+        }
     }
 
     /// Add usage from a model turn.
