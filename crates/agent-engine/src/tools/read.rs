@@ -667,7 +667,10 @@ mod tests {
         };
         let p = std::path::PathBuf::from(home).join("Jawz/media/jawz-avatar-v1.png");
         if !p.exists() {
-            eprintln!("SKIPPED real_avatar_png_round_trips_as_image_blocks: {} absent", p.display());
+            eprintln!(
+                "SKIPPED real_avatar_png_round_trips_as_image_blocks: {} absent",
+                p.display()
+            );
             return;
         }
         let out = ReadTool
@@ -703,7 +706,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolOutput::Text(text) = out else { panic!("expected Text") };
+        let ToolOutput::Text(text) = out else {
+            panic!("expected Text")
+        };
         assert!(text.starts_with("1\tuse super::"), "{text}");
 
         let Ok(big) = std::env::var("SYNAPS_TEST_BIG_IMAGE") else {
@@ -732,10 +737,16 @@ mod tests {
         assert!(image_integrity_error("image/png", &bad_chunk).is_some());
         assert!(image_integrity_error("image/png", &PNG_SIG).is_some());
         // JPEG
-        assert_eq!(image_integrity_error("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xD9]), None);
+        assert_eq!(
+            image_integrity_error("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xD9]),
+            None
+        );
         assert!(image_integrity_error("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]).is_some());
         // GIF
-        assert_eq!(image_integrity_error("image/gif", b"GIF89a\x01\x00\x01\x00\x3B"), None);
+        assert_eq!(
+            image_integrity_error("image/gif", b"GIF89a\x01\x00\x01\x00\x3B"),
+            None
+        );
         assert!(image_integrity_error("image/gif", b"GIF89a\x01\x00\x01\x00").is_some());
         // WebP: RIFF size must equal len - 8.
         let mut webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ".to_vec();
@@ -777,7 +788,10 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_jpeg_and_gif_rejected() {
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0];
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0,
+            0,
+        ];
         let p = tmp("trunc.jpg", &jpeg);
         let err = ReadTool
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
@@ -801,7 +815,9 @@ mod tests {
     async fn unparseable_dims_rejected_not_shipped() {
         // Structurally complete JPEG (SOI … EOI) but SOS before any SOF →
         // dims None → must NOT become an image block.
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0xFF, 0xD9];
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0xFF, 0xD9,
+        ];
         let p = tmp("nodims.jpg", &jpeg);
         let err = ReadTool
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
@@ -815,7 +831,11 @@ mod tests {
 
     #[tokio::test]
     async fn zero_dimension_images_rejected_not_shipped() {
-        for (name, w, h) in [("w0.png", 0u32, 7u32), ("h0.png", 7, 0), ("both0.png", 0, 0)] {
+        for (name, w, h) in [
+            ("w0.png", 0u32, 7u32),
+            ("h0.png", 7, 0),
+            ("both0.png", 0, 0),
+        ] {
             let p = tmp(name, &png_with_dims(w, h));
             let err = ReadTool
                 .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
@@ -836,7 +856,11 @@ mod tests {
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
             .await
             .unwrap();
-        assert!(out.summary().contains("(2x3, image/gif, 1 KB)"), "{}", out.summary());
+        assert!(
+            out.summary().contains("(2x3, image/gif, 1 KB)"),
+            "{}",
+            out.summary()
+        );
         assert!(matches!(out, ToolOutput::Blocks { .. }));
         let _ = std::fs::remove_file(p);
 
@@ -849,7 +873,11 @@ mod tests {
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
             .await
             .unwrap();
-        assert!(out.summary().contains("(640x480, image/jpeg, 1 KB)"), "{}", out.summary());
+        assert!(
+            out.summary().contains("(640x480, image/jpeg, 1 KB)"),
+            "{}",
+            out.summary()
+        );
         let _ = std::fs::remove_file(p);
     }
 

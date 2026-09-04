@@ -329,7 +329,10 @@ mod tool_output_tests {
 
     #[test]
     fn into_parts_leaves_well_formed_blocks_alone() {
-        let blocks = vec![json!({"type": "text", "text": "ok"}), json!({"type": "image"})];
+        let blocks = vec![
+            json!({"type": "text", "text": "ok"}),
+            json!({"type": "image"}),
+        ];
         let out = ToolOutput::Blocks {
             blocks: blocks.clone(),
             summary: "ok".into(),

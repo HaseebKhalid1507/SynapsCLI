@@ -825,10 +825,11 @@ mod tests {
         s.abort_context = Some("ctx".into());
         s.parent_session = Some("parent".into());
         s.compacted_into = Some("child".into());
-        s.api_messages
-            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": "hi"})));
+        s.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ));
         s.message_count = 0; // stale in memory — snapshot must not trust it
-        // Expected = the old clone-and-refresh path, byte for byte.
+                             // Expected = the old clone-and-refresh path, byte for byte.
         let mut expected = s.clone();
         expected.message_count = expected.api_messages.len();
         let expected = serde_json::to_string(&expected).unwrap();
@@ -839,7 +840,10 @@ mod tests {
         let s = Session::new("model-x", "medium", None);
         let mut expected = s.clone();
         expected.message_count = 0;
-        assert_eq!(snapshot_json(&s).unwrap(), serde_json::to_string(&expected).unwrap());
+        assert_eq!(
+            snapshot_json(&s).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
     }
 
     #[test]

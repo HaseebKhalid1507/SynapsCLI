@@ -325,19 +325,29 @@ fn projection_reports_vanished_pinned_member_as_uncataloged() {
     )
     .expect("core resolves");
     // Pin one exact activation on top of the core set so both pin kinds are covered.
-    activate_exact_for_user(&mut set, registry.catalog(), &ToolId::builtin("deferred_tool"))
-        .expect("activates");
+    activate_exact_for_user(
+        &mut set,
+        registry.catalog(),
+        &ToolId::builtin("deferred_tool"),
+    )
+    .expect("activates");
     assert!(registry.session_tools_schema(&set).dropped.is_empty());
 
     registry
         .try_disable(&["core_tool".to_string(), "deferred_tool".to_string()])
         .expect("disable");
-    assert!(registry.catalog().get(&ToolId::builtin("core_tool")).is_none());
+    assert!(registry
+        .catalog()
+        .get(&ToolId::builtin("core_tool"))
+        .is_none());
 
     let report = registry.session_tools_schema(&set);
     assert!(
         !report.schema.iter().any(|s| {
-            matches!(s["name"].as_str(), Some("core_tool") | Some("deferred_tool"))
+            matches!(
+                s["name"].as_str(),
+                Some("core_tool") | Some("deferred_tool")
+            )
         }),
         "a vanished member's schema must never be served"
     );
@@ -346,8 +356,14 @@ fn projection_reports_vanished_pinned_member_as_uncataloged() {
     assert_eq!(
         dropped,
         vec![
-            (ToolId::builtin("core_tool"), DroppedSessionMember::Uncataloged),
-            (ToolId::builtin("deferred_tool"), DroppedSessionMember::Uncataloged),
+            (
+                ToolId::builtin("core_tool"),
+                DroppedSessionMember::Uncataloged
+            ),
+            (
+                ToolId::builtin("deferred_tool"),
+                DroppedSessionMember::Uncataloged
+            ),
         ]
     );
 }

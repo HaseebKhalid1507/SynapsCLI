@@ -1278,8 +1278,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     // The engine result is applied to `conv` while `runtime` is still held
     // so concurrent clients can't interleave between the runtime mutation
     // and the conv mirror (runtime → conv is the legal order).
-    let engine_result =
-        run_engine_command_synced(name, args, &state.runtime, &state.conv).await;
+    let engine_result = run_engine_command_synced(name, args, &state.runtime, &state.conv).await;
 
     if let Some(result) = engine_result {
         match result {
@@ -1564,7 +1563,10 @@ mod tests {
             None,
         )));
         let res = run_engine_command_synced("thinking", "high", &runtime, &conv).await;
-        assert!(matches!(res, Some(CommandResult::ThinkingChanged { .. })), "{res:?}");
+        assert!(
+            matches!(res, Some(CommandResult::ThinkingChanged { .. })),
+            "{res:?}"
+        );
         assert_eq!(conv.read().await.session.thinking_level, "high");
         assert_eq!(runtime.lock().await.thinking_level(), "high");
     }

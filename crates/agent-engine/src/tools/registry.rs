@@ -646,7 +646,8 @@ impl ToolRegistry {
         // `dropped` and the audit signal lost. Walk the session's own
         // core + activated pins and report any id the catalog no longer
         // knows and that the loop did not already account for.
-        let seen: HashSet<&crate::tools::catalog::ToolId> = dropped.iter().map(|(id, _)| id).collect();
+        let seen: HashSet<&crate::tools::catalog::ToolId> =
+            dropped.iter().map(|(id, _)| id).collect();
         let vanished: Vec<crate::tools::catalog::ToolId> = session
             .core_ids()
             .chain(session.activated().map(|a| a.grant().tool_id()))
