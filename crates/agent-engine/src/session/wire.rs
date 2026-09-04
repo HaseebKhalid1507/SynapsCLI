@@ -1209,3 +1209,23 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod float_roundtrip_tests {
+    use super::*;
+
+    /// L≡S (phase 4 G9): the session cost crosses the wire as an f64. Without
+    /// serde_json's `float_roundtrip` the parse is one ulp short for values
+    /// like `0.000105 + 0.000045` and the footer rounds `$0.0002` → `$0.0001`.
+    #[test]
+    fn conversation_digest_cost_survives_the_wire_exactly() {
+        let cost = (10f64 / 1_000_000.0) * 3.0 + (5f64 / 1_000_000.0) * 15.0
+            + ((10f64 / 1_000_000.0) * 3.0 + (1f64 / 1_000_000.0) * 15.0);
+        let snap = ConversationSnapshot { cost, ..Default::default() };
+        let d = ConversationDigest::of(&snap);
+        let line = encode_line(&d).unwrap();
+        let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
+        assert_eq!(back.cost.to_bits(), cost.to_bits(), "{line}");
+        assert_eq!(format!("{:.4}", back.cost), format!("{:.4}", cost));
+    }
+}
