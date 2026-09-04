@@ -129,12 +129,15 @@ impl SessionLink {
     }
 
     /// Send `cmd` and pull envelopes until `pick` accepts one; everything
-    /// else is buffered for the loop in arrival order.
+    /// else is buffered for the loop in arrival order. A `Refused` addressed
+    /// to this client (B1 ownership: a non-owner's setter) IS the reply —
+    /// `Err(reason)` immediately, never the 30 s timeout.
     async fn roundtrip<T>(
         &mut self,
         cmd: SessionCommand,
         mut pick: impl FnMut(&SessionEventWire) -> Option<T>,
     ) -> Result<T, String> {
+        let me = self.client_id();
         self.send(cmd).await.map_err(|e| e.to_string())?;
         let deadline = tokio::time::Instant::now() + ROUNDTRIP_TIMEOUT;
         loop {
@@ -149,6 +152,16 @@ impl SessionLink {
             self.note(&env);
             if let Some(t) = pick(&env.event) {
                 return Ok(t);
+            }
+            if let SessionEventWire::Refused {
+                client,
+                command,
+                reason,
+            } = &env.event
+            {
+                if *client == me {
+                    return Err(format!("{command} refused: {reason}"));
+                }
             }
             self.buffered.push_back(env);
         }
@@ -368,5 +381,75 @@ impl PromptBridge {
         }
         self.order.retain(|x| *x != id);
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::testing::scripted::ScriptedTransport;
+    use synaps_cli::Runtime;
+
+    fn refusing_link() -> SessionLink {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.set_refuse_input(Some("input owned by client #2".to_string()));
+        SessionLink::new(Box::new(t))
+    }
+
+    /// M2: a non-owner's setter is answered `Refused{client: me}`; the
+    /// round-trip must return that reason at once, not block until
+    /// `ROUNDTRIP_TIMEOUT`.
+    #[tokio::test]
+    async fn roundtrip_returns_refused_reason_immediately() {
+        let mut link = refusing_link();
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            link.set(SessionSetting::Model {
+                model: "claude-opus-4-1".into(),
+            }),
+        )
+        .await
+        .expect("must not hit the round-trip timeout");
+        assert_eq!(
+            res.unwrap_err(),
+            "set refused: input owned by client #2"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Same for every correlated verb.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            link.engine_command("model", "claude-opus-4-1"),
+        )
+        .await
+        .unwrap();
+        assert!(r.unwrap_err().ends_with("input owned by client #2"));
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), link.resume("x"))
+            .await
+            .unwrap();
+        assert!(r.unwrap_err().ends_with("input owned by client #2"));
+        // Nothing leaked into the loop's buffer.
+        assert!(link.buffered.is_empty());
+    }
+
+    /// A `Refused` addressed to ANOTHER client is not our reply: buffered
+    /// for the loop, the real reply still picked.
+    #[tokio::test]
+    async fn roundtrip_ignores_refused_for_other_clients() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::Refused {
+            client: ClientId(7),
+            command: "set".into(),
+            reason: "not you".into(),
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        let applied = link
+            .set(SessionSetting::ContextWindow {
+                tokens: Some(1_000_000),
+            })
+            .await
+            .expect("real reply picked");
+        assert!(applied.ok, "{applied:?}");
+        assert_eq!(link.buffered.len(), 1);
     }
 }

@@ -35,6 +35,9 @@ pub struct ScriptedTransport {
     pub log: Arc<Mutex<ScriptedLog>>,
     /// Commands sent through `&self`, handled at the next `next_event`.
     pending: Mutex<VecDeque<SessionCommand>>,
+    /// When set, every input command is answered `Refused{client: me,
+    /// reason}` with no side effect (B1 ownership, non-owner client).
+    refuse_input: Option<String>,
 }
 
 impl ScriptedTransport {
@@ -72,7 +75,14 @@ impl ScriptedTransport {
             seq: 0,
             log: Arc::new(Mutex::new(ScriptedLog::default())),
             pending: Mutex::new(VecDeque::new()),
+            refuse_input: None,
         }
+    }
+
+    /// Behave as the actor does for a non-owner: input commands are
+    /// `Refused` with `reason` (None = owner, normal handling).
+    pub fn set_refuse_input(&mut self, reason: Option<String>) {
+        self.refuse_input = reason;
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -204,6 +214,27 @@ impl ScriptedTransport {
     }
 
     async fn handle(&mut self, cmd: SessionCommand) {
+        if let Some(reason) = self.refuse_input.clone() {
+            let command = match &cmd {
+                SessionCommand::Submit { .. } => Some("submit"),
+                SessionCommand::Steer { .. } => Some("steer"),
+                SessionCommand::Set { .. } => Some("set"),
+                SessionCommand::EngineCommand { .. } => Some("engine_command"),
+                SessionCommand::PluginCommand { .. } => Some("plugin_command"),
+                SessionCommand::Resume { .. } => Some("resume"),
+                SessionCommand::Compact { .. } => Some("compact"),
+                SessionCommand::NewSession => Some("new_session"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.push_event(SessionEventWire::Refused {
+                    client: ClientId(1),
+                    command: command.to_string(),
+                    reason,
+                });
+                return;
+            }
+        }
         match cmd {
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting),
             SessionCommand::EngineCommand { id, name, arg } => {
