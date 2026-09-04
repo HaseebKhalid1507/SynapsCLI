@@ -159,6 +159,69 @@ impl TurnLog {
     }
 }
 
+/// One attached client: its meta + the mode it attached with (B1 ownership
+/// needs the mode to pick the next owner when the owner detaches).
+pub(crate) struct AttachedClient {
+    pub(crate) meta: ClientMeta,
+    pub(crate) mode: AttachMode,
+}
+
+/// B2: a spawned `compact_conversation` (§2.5).
+pub(crate) struct CompactionJob {
+    pub(crate) task: tokio::task::JoinHandle<Result<crate::runtime::compaction::CompactionOutcome>>,
+    pub(crate) source: String,
+    #[allow(dead_code)]
+    pub(crate) started: tokio::time::Instant,
+}
+
+/// Commands that only the input owner may send (B1). Everything else
+/// (`Answer`, `Query`, `Save`, `Detach`, `Attach`, `Resync`, `HostEvent`)
+/// is open to every attached client.
+fn is_input_command(cmd: &SessionCommand) -> bool {
+    matches!(
+        cmd,
+        SessionCommand::Submit { .. }
+            | SessionCommand::SubmitPrepared { .. }
+            | SessionCommand::Steer { .. }
+            | SessionCommand::Cancel
+            | SessionCommand::Set { .. }
+            | SessionCommand::Compact { .. }
+            | SessionCommand::NewSession
+            | SessionCommand::EngineCommand { .. }
+            | SessionCommand::PluginCommand { .. }
+            | SessionCommand::Resume { .. }
+            | SessionCommand::KeepWarm { .. }
+            | SessionCommand::End {
+                reason: EndReason::ClientQuit
+            }
+    )
+}
+
+fn command_name(cmd: &SessionCommand) -> &'static str {
+    match cmd {
+        SessionCommand::Submit { .. } => "submit",
+        SessionCommand::SubmitPrepared { .. } => "submit_prepared",
+        SessionCommand::Steer { .. } => "steer",
+        SessionCommand::Cancel => "cancel",
+        SessionCommand::Answer { .. } => "answer",
+        SessionCommand::Set { .. } => "set",
+        SessionCommand::Compact { .. } => "compact",
+        SessionCommand::NewSession => "new_session",
+        SessionCommand::Save => "save",
+        SessionCommand::Query { .. } => "query",
+        SessionCommand::Attach { .. } => "attach",
+        SessionCommand::Detach { .. } => "detach",
+        SessionCommand::End { .. } => "end",
+        SessionCommand::Resync { .. } => "resync",
+        SessionCommand::EngineCommand { .. } => "engine_command",
+        SessionCommand::PluginCommand { .. } => "plugin_command",
+        SessionCommand::Resume { .. } => "resume",
+        SessionCommand::Checkpoint { .. } => "checkpoint",
+        SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::HostEvent(_) => "host_event",
+    }
+}
+
 pub struct SessionActor {
     pub(crate) id: SessionId,
     pub(crate) meta: SessionMeta,
@@ -184,12 +247,22 @@ pub struct SessionActor {
     pub(crate) cmd_rx: mpsc::Receiver<Addressed>,
     pub(crate) events: broadcast::Sender<Envelope>,
     pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
-    pub(crate) attached: HashMap<ClientId, ClientMeta>,
+    pub(crate) attached: HashMap<ClientId, AttachedClient>,
+    /// B1: the one client whose input commands are honoured (`None` = any
+    /// host-originated sender only).
+    pub(crate) input_owner: Option<ClientId>,
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
     pub(crate) state: AttachState,
     pub(crate) background: BackgroundTasks,
+    /// B2: spawned compaction in flight (`busy` while `Some`).
+    pub(crate) compact: Option<CompactionJob>,
+    /// `await_extensions=false`: fires when process-level discovery is done;
+    /// the actor then emits `on_session_start` without having blocked boot.
+    pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
+    /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
+    pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
     /// Mirrors `handle.journal_id()` (B2 stores the successor id).
@@ -232,16 +305,34 @@ impl SessionActor {
 
         // C2: per-session on_session_start (keyed injection) once the
         // process-level discovery is known-finished. Never re-runs discovery.
-        if tokio::time::timeout(budgets::EXTENSIONS_READY_TIMEOUT, host.extensions_ready())
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                budget_secs = budgets::EXTENSIONS_READY_TIMEOUT_SECS,
-                "extensions_ready timed out — on_session_start may miss late extensions"
-            );
+        // `await_extensions=false` (TUI): a spawned waiter fires the
+        // `ext_ready` arm instead, so boot never blocks on discovery.
+        let mut ext_ready = None;
+        if cfg.await_extensions {
+            if tokio::time::timeout(budgets::EXTENSIONS_READY_TIMEOUT, host.extensions_ready())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    budget_secs = budgets::EXTENSIONS_READY_TIMEOUT_SECS,
+                    "extensions_ready timed out — on_session_start may miss late extensions"
+                );
+            }
+            crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id)
+                .await;
+        } else {
+            let (tx, rx) = oneshot::channel();
+            let waiter_host = Arc::clone(host);
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    budgets::EXTENSIONS_READY_TIMEOUT,
+                    waiter_host.extensions_ready(),
+                )
+                .await;
+                let _ = tx.send(());
+            });
+            ext_ready = Some(rx);
         }
-        crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id).await;
 
         let id = SessionId::from(sb.session.id.clone());
         let meta = SessionMeta {
@@ -304,11 +395,15 @@ impl SessionActor {
             events,
             view,
             attached: HashMap::new(),
+            input_owner: None,
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
             state: AttachState::Detached { running: false },
             background,
+            compact: None,
+            ext_ready,
+            subagent_tick: None,
             lifecycle,
             journal_id,
         };
@@ -371,6 +466,26 @@ impl SessionActor {
         };
     }
 
+    /// `stream_handler.rs:264`: a turn OR a compaction blocks auto-turns.
+    pub(crate) fn busy(&self) -> bool {
+        self.streaming || self.compact.is_some()
+    }
+
+    /// `runtime.subagent_registry().display_rows()` → `SubagentRows`, only
+    /// when there is something to show (the TUI's reconcile is a no-op on
+    /// an empty registry).
+    pub(crate) fn publish_subagent_rows(&mut self) {
+        let rows = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows();
+        if !rows.is_empty() {
+            self.emit(SessionEventWire::SubagentRows(rows));
+        }
+    }
+
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
@@ -400,6 +515,10 @@ impl SessionActor {
         self.stream = Some(stream);
         self.cancel = Some(ct);
         self.steer_tx = Some(s_tx);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.reset();
+        self.subagent_tick = Some(tick);
     }
 
     /// Every turn-end path (Done/Error/Cancel/stream EOF). Clears `turn_log`
@@ -410,6 +529,7 @@ impl SessionActor {
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
+        self.subagent_tick = None;
         self.turn_log.clear();
         self.update_attach_state();
     }
@@ -509,7 +629,7 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
-        let busy = self.streaming;
+        let busy = self.busy();
         let drained = drain_event_queue(
             self.runtime.event_queue(),
             &mut self.conv.api_messages,
@@ -631,6 +751,7 @@ impl SessionActor {
             StreamEvent::Session(SessionEvent::Notice(_)) => {}
             StreamEvent::Session(SessionEvent::Done) => {
                 self.clear_stream();
+                self.publish_subagent_rows();
                 // Flush events that arrived during streaming into api_messages
                 let had_pending = !self.conv.pending_events.is_empty();
                 for formatted in self.conv.pending_events.drain(..) {
@@ -657,6 +778,7 @@ impl SessionActor {
             }
             StreamEvent::Session(SessionEvent::Error(_)) => {
                 self.clear_stream();
+                self.publish_subagent_rows();
                 // Remove only invalid messages appended by the ACTIVE turn.
                 crate::engine::stream::repair_history_after_failure(
                     &mut self.conv.api_messages,
@@ -963,21 +1085,55 @@ impl SessionActor {
             streaming: self.streaming,
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
-            clients: self.attached.iter().map(|(c, m)| (*c, m.kind)).collect(),
-            input_owner: None,
+            clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
+            input_owner: self.input_owner,
         }
     }
 
+    /// B1 ownership: `Observe` never owns; `Mirror` owns iff nobody does
+    /// (else read-only + notice); `Takeover` steals with
+    /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
+    /// client renders the toast).
     fn attach(&mut self, client: ClientMeta, mode: AttachMode) {
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
-        self.attached.insert(cid, client);
+        self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
-        if mode != AttachMode::Mirror {
-            self.emit(SessionEventWire::SystemNotice(format!(
-                "attach mode {mode:?} not supported yet; using mirror"
-            )));
+        let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
+        let mut notice: Option<String> = None;
+        match mode {
+            AttachMode::Observe => {}
+            AttachMode::Mirror => match self.input_owner {
+                None => owner_change = Some((None, OwnerChangeReason::Attach)),
+                Some(owner) => {
+                    let owner_kind = self
+                        .attached
+                        .get(&owner)
+                        .map(|a| format!("{:?}", a.meta.kind).to_lowercase())
+                        .unwrap_or_else(|| "?".into());
+                    notice = Some(format!(
+                        "input is owned by client #{} ({}); attach with --takeover to steal it",
+                        owner.0, owner_kind
+                    ));
+                }
+            },
+            AttachMode::Takeover => {
+                let reason = if self.input_owner.is_some() {
+                    OwnerChangeReason::Takeover
+                } else {
+                    OwnerChangeReason::Attach
+                };
+                owner_change = Some((self.input_owner, reason));
+            }
+        }
+        if let Some((from, reason)) = owner_change {
+            self.input_owner = Some(cid);
+            self.emit(SessionEventWire::InputOwnerChanged {
+                from,
+                to: Some(cid),
+                reason,
+            });
         }
         let snapshot = self.snapshot();
         self.emit(SessionEventWire::Attached {
@@ -985,24 +1141,100 @@ impl SessionActor {
             snapshot,
         });
         self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+        if let Some(n) = notice {
+            self.emit(SessionEventWire::SystemNotice(n));
+        }
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
-    /// events buffer in the broadcast (§8 detach-without-abort).
+    /// events buffer in the broadcast (§8 detach-without-abort). The owner
+    /// leaving passes input to the oldest attached non-`Observe` client.
     fn detach(&mut self, client: ClientId) {
-        if self.attached.remove(&client).is_some() {
-            self.update_attach_state();
-            self.emit(SessionEventWire::ClientLeft { client });
+        if self.attached.remove(&client).is_none() {
+            return;
+        }
+        self.update_attach_state();
+        self.emit(SessionEventWire::ClientLeft { client });
+        if self.input_owner == Some(client) {
+            let next = self
+                .attached
+                .iter()
+                .filter(|(_, a)| a.mode != AttachMode::Observe)
+                .map(|(c, _)| *c)
+                .min_by_key(|c| c.0);
+            self.input_owner = next;
+            self.emit(SessionEventWire::InputOwnerChanged {
+                from: Some(client),
+                to: next,
+                reason: OwnerChangeReason::OwnerDetached,
+            });
+        }
+    }
+
+    /// B1 (used by C3 reload): checkpoint the session without ending it —
+    /// cancel any turn (abort_context captured), abort compaction, answer
+    /// pending prompts `None`, save, close PTYs. Replies on
+    /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
+    pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
+        if self.streaming {
+            self.cancel_turn().await;
+        }
+        self.abort_compaction();
+        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
+            let _ = tx.send(None);
+            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        }
+        if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+            .await
+            .is_err()
+        {
+            tracing::warn!("checkpoint: save timed out");
+        }
+        let notice = match reason {
+            CheckpointReason::Reload => {
+                "daemon reloading — background shells/PTYs will be closed; the turn was checkpointed"
+            }
+            CheckpointReason::HostRequest => {
+                "checkpoint — background shells/PTYs closed; the turn was checkpointed"
+            }
+        };
+        self.emit(SessionEventWire::SystemNotice(notice.to_string()));
+        self.runtime.session_manager().shutdown_all();
+        self.emit(SessionEventWire::QueryResult {
+            id: super::wire::CHECKPOINT_QUERY_ID,
+            value: serde_json::json!({ "ok": true }),
+        });
+    }
+
+    /// B2 fills this in (abort the spawned task + `CompactionCancelled`).
+    pub(crate) fn abort_compaction(&mut self) {
+        if let Some(job) = self.compact.take() {
+            job.task.abort();
+            self.emit(SessionEventWire::CompactionCancelled);
         }
     }
 
     // ── command dispatch ─────────────────────────────────────────────────
 
-    /// `from` is carried for B1 (input ownership); today every sender is
-    /// honoured.
+    /// B1: a client-stamped input command from anyone but the owner is
+    /// `Refused` with no side effect; `from: None` (host) bypasses.
     async fn handle(&mut self, addressed: Addressed) -> std::ops::ControlFlow<EndReason> {
         use std::ops::ControlFlow;
-        let Addressed { from: _from, cmd } = addressed;
+        let Addressed { from, cmd } = addressed;
+        if let Some(c) = from {
+            if is_input_command(&cmd) && self.input_owner != Some(c) {
+                let reason = match self.input_owner {
+                    Some(o) => format!("input owned by client #{}", o.0),
+                    None => "input has no owner; attach with --takeover".to_string(),
+                };
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason,
+                });
+                return ControlFlow::Continue(());
+            }
+        }
         match cmd {
             SessionCommand::Submit { text, .. } => self.submit(text).await,
             SessionCommand::Steer { text } => {
@@ -1053,9 +1285,7 @@ impl SessionActor {
             SessionCommand::Resume { .. } => self.emit(SessionEventWire::SystemNotice(
                 "resume: not implemented in this build".into(),
             )),
-            SessionCommand::Checkpoint { .. } => self.emit(SessionEventWire::SystemNotice(
-                "checkpoint: not implemented in this build".into(),
-            )),
+            SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::KeepWarm { .. } => self.emit(SessionEventWire::SystemNotice(
                 "keep_warm: not implemented in this build".into(),
             )),
@@ -1085,6 +1315,7 @@ impl SessionActor {
         if self.streaming {
             self.cancel_turn().await;
         }
+        self.abort_compaction();
         // Outstanding prompts are cancelled (tool sees `None`).
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
             let _ = tx.send(None);
@@ -1161,6 +1392,24 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
+async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
+    match rx {
+        Some(r) => {
+            let _ = r.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 impl SessionTask {
     pub fn id(&self) -> &SessionId {
         self.0.id()
@@ -1183,6 +1432,13 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
+                _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
+                _ = ext_ready(&mut actor.ext_ready) => {
+                    actor.ext_ready = None;
+                    let id = actor.conv.session.id.clone();
+                    crate::extensions::loader::emit_session_start(actor.runtime.hook_bus(), &id).await;
+                    actor.publish_view().await;
+                },
                 ev = next_stream_event(&mut actor.stream) => match ev {
                     Some(ev) => actor.on_stream_event(ev).await,
                     None => {
