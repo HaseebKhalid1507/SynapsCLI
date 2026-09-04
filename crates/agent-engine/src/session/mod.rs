@@ -6,11 +6,14 @@
 //! values, never serialised = byte-identical), `SocketTransport` (B2) over
 //! the daemon UDS. `agent-tui` must never be a dependency of anything here.
 
+pub mod actor;
+pub mod budgets;
 pub mod handle;
 pub mod transport;
 pub mod types;
 pub mod view;
 
+pub use actor::{SessionActor, SessionTask};
 pub use handle::SessionHandle;
 pub use transport::{ClientTransport, LocalTransport, TransportError};
 pub use types::*;
