@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::extensions::hooks::HookBus;
 use crate::runtime::RuntimeParts;
+use crate::session::{SessionActor, SessionConfig, SessionHandle, SessionId, SessionMeta};
 use crate::tools::catalog::CatalogGeneration;
 use crate::{Result, Runtime, ToolRegistry};
 
@@ -60,6 +61,11 @@ pub struct EngineHost {
     /// process exit — otherwise the tail of the log dies with the writer
     /// thread.
     log_guard: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+    /// Live sessions (Phase 2): id → handle. The map holds one handle per
+    /// actor so the actor outlives any single client; the actor task removes
+    /// itself here when it finishes.
+    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
+    // C: extensions_ready goes here
 }
 
 static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
@@ -140,6 +146,7 @@ impl EngineHost {
             mcp_server_count,
             worker_registry: std::sync::Mutex::new(None),
             log_guard: std::sync::Mutex::new(log_guard),
+            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -284,5 +291,53 @@ impl EngineHost {
     pub fn reload_config(&self) {
         self.config
             .store(Arc::new(crate::config::load_config()));
+    }
+
+    // ── sessions (Phase 2) ────────────────────────────────────────────────
+
+    /// Create a session on this host: builds the `SessionActor` (the one
+    /// `Runtime` + `ConversationState`), spawns its task, registers the
+    /// handle. The task removes itself from the map when it ends.
+    pub async fn create_session(self: &Arc<Self>, cfg: SessionConfig) -> Result<SessionHandle> {
+        let (handle, task) = SessionActor::create(self, cfg).await?;
+        let id = handle.id.clone();
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), handle.clone());
+        let host = Arc::clone(self);
+        tokio::spawn(async move {
+            task.run().await;
+            host.remove_session(&id);
+        });
+        Ok(handle)
+    }
+
+    /// Handle for a live session, if any.
+    pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// Metadata of every live session.
+    pub fn sessions(&self) -> Vec<SessionMeta> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|h| h.meta().clone())
+            .collect()
+    }
+
+    /// Drop the host's handle for a session (the actor keeps running until
+    /// its command queue closes or it receives `End`).
+    pub fn remove_session(&self, id: &SessionId) -> Option<SessionHandle> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
     }
 }

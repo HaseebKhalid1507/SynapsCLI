@@ -73,6 +73,11 @@ pub struct SessionConfig {
     /// may disable. Default `true`.
     #[serde(default = "default_true")]
     pub persist: bool,
+    /// Headless-chat policy: after every turn, save + `assess_context` and
+    /// auto-compact when the engine budget says so (chat.rs post-turn block).
+    /// The TUI does its own compaction; default `false`.
+    #[serde(default)]
+    pub auto_compact: bool,
 }
 
 fn default_true() -> bool {
@@ -89,6 +94,7 @@ impl Default for SessionConfig {
             auto_approve_confirms: false,
             model_override: None,
             persist: true,
+            auto_compact: false,
         }
     }
 }
@@ -248,6 +254,10 @@ pub enum SessionCommand {
     End { reason: EndReason },
     /// Resync after Lagged (B, day 3): actor re-sends history + turn_replay.
     Resync { client: ClientId, since_seq: u64 },
+    /// Runtime-backed slash command (`engine::commands::handle_engine_command`:
+    /// /model /thinking /context /trace /memory /compact …). Reply =
+    /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
+    EngineCommand { id: u64, name: String, arg: String },
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -350,6 +360,10 @@ pub enum SessionEventWire {
     /// Drained event card — presentation only.
     External(crate::events::types::Event),
     AutoTurnCapReached { cap: u32 },
+    /// The turn machine is idle: a stream ended (Done/Error/Cancel) and NO
+    /// auto-turn followed. Headless hosts gate stdin on this so a queued
+    /// auto-turn is never raced by the next line.
+    Idle,
     /// "→ steering:" vs "queued:".
     Steered { text: String, delivered: bool },
     Dequeued { text: String },
