@@ -337,7 +337,10 @@ pub(crate) async fn finish_setup(
 
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
+    let shutdown_signal_task = signals::spawn_shutdown_signal_task_with(
+        shutdown_signal_tx,
+        signals::SignalBackend::for_socket(matches!(mode, TransportMode::Socket)),
+    );
     ladder_stage("event_stream", &"");
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let prompt_bridge = PromptBridge::new(secret_prompt_tx);
