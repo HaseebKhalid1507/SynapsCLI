@@ -2155,6 +2155,7 @@ mod rich_output_tests {
             event_queue: Arc::new(crate::events::EventQueue::new(100)),
             hook_bus,
             session_id: None,
+            cwd: None,
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
