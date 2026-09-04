@@ -559,6 +559,21 @@ impl StreamMethods {
                 None => &messages,
             };
 
+            // History image byte cap: the per-turn byte budget resets every
+            // turn but base64 images live in history forever. Bound the wire
+            // by degrading the OLDEST image blocks to a text label once the
+            // total crosses `HISTORY_IMAGE_BYTE_CAP`. Request-local like the
+            // injection above — durable history is untouched.
+            let capped_messages: Vec<SharedMessage>;
+            let request_messages: &[SharedMessage] =
+                match cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP) {
+                    Some(capped) => {
+                        capped_messages = capped;
+                        &capped_messages
+                    }
+                    None => request_messages,
+                };
+
             // Flag-off: borrow the turn's options untouched — no per-round
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
@@ -910,7 +925,7 @@ impl StreamMethods {
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
                                             // the image would desync text and image.
-                                            let rich_blocks = if hooked_output == output { rich_blocks } else { None };
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
                                             (hooked_output, rich_blocks)
                                         }
                                         _ = cancel.cancelled() => {
@@ -1229,7 +1244,7 @@ impl StreamMethods {
                                                 max_tool_output,
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
-                                            let rich_blocks = if hooked_output == output { rich_blocks } else { None };
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
                                             (false, Some(call_effect), hooked_output, Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         _ = cancel_token.cancelled() => {
@@ -1457,6 +1472,29 @@ impl StreamMethods {
     }
 }
 
+/// Hook policy: a `Replace` transform wins over rich blocks — the hook saw
+/// only the summary, so keeping the image would desync text and image.
+/// Note `emit_after_tool_call` also runs `truncate_tool_result`, so a
+/// summary longer than `max_tool_output` trips this too; log it so the
+/// dropped image isn't a silent mystery.
+fn drop_rich_if_rewritten(
+    rich_blocks: Option<Vec<Value>>,
+    hooked_output: &str,
+    output: &str,
+) -> Option<Vec<Value>> {
+    if hooked_output == output {
+        return rich_blocks;
+    }
+    if rich_blocks.is_some() {
+        tracing::debug!(
+            summary_len = output.len(),
+            hooked_len = hooked_output.len(),
+            "rich tool blocks dropped: after_tool_call rewrote (or truncated) the summary"
+        );
+    }
+    None
+}
+
 /// Pick the `tool_result.content` value. Rich blocks win outright (they
 /// carry their own budget and never see `truncate_tool_result`); otherwise
 /// the bounded delta-lane text, otherwise the truncated summary.
@@ -1471,6 +1509,80 @@ fn select_tool_result_content(
         (None, Some(text)) => Value::String(text),
         (None, None) => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
     }
+}
+
+/// Total base64 image payload bytes allowed across the whole request
+/// history. Anthropic caps a request at 32 MB; leave headroom for text.
+pub(crate) const HISTORY_IMAGE_BYTE_CAP: usize = 20 * 1024 * 1024;
+
+/// Label left in place of an image block dropped by the history byte cap.
+pub(crate) const IMAGE_DROPPED_LABEL: &str =
+    "[image dropped: history byte cap — re-read the file if needed]";
+
+fn is_base64_image(b: &Value) -> bool {
+    b["type"] == "image" && b["source"]["type"] == "base64"
+}
+
+fn base64_image_len(b: &Value) -> usize {
+    b["source"]["data"].as_str().map_or(0, str::len)
+}
+
+/// Enforce `cap` on the sum of base64 image payload bytes across `messages`.
+/// Returns `None` when nothing needs to change (no allocation). Otherwise a
+/// request-local copy where the OLDEST image blocks — top-level `content[]`
+/// or nested in `tool_result.content[]` — are replaced with a text block
+/// carrying `IMAGE_DROPPED_LABEL`, until the remainder fits. Only touched
+/// messages are cloned (`Arc::make_mut`); `tool_result.content[0]` (the
+/// text summary) is never an image, so the text-first invariant holds.
+fn cap_history_image_bytes(
+    messages: &[SharedMessage],
+    cap: usize,
+) -> Option<Vec<SharedMessage>> {
+    // (msg index, outer block index, Option<inner block index>, len), oldest first.
+    let mut images: Vec<(usize, usize, Option<usize>, usize)> = Vec::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        let Some(blocks) = msg["content"].as_array() else {
+            continue;
+        };
+        for (bi, block) in blocks.iter().enumerate() {
+            if is_base64_image(block) {
+                images.push((mi, bi, None, base64_image_len(block)));
+            } else if let Some(inner) = block["content"].as_array() {
+                for (ii, b) in inner.iter().enumerate() {
+                    if is_base64_image(b) {
+                        images.push((mi, bi, Some(ii), base64_image_len(b)));
+                    }
+                }
+            }
+        }
+    }
+    let mut total: usize = images.iter().map(|i| i.3).sum();
+    if total <= cap {
+        return None;
+    }
+    let mut out = messages.to_vec();
+    let mut dropped = 0usize;
+    for (mi, bi, ii, len) in images {
+        if total <= cap {
+            break;
+        }
+        let label = json!({"type": "text", "text": IMAGE_DROPPED_LABEL});
+        let msg = Arc::make_mut(&mut out[mi]);
+        let slot = match ii {
+            Some(ii) => &mut msg["content"][bi]["content"][ii],
+            None => &mut msg["content"][bi],
+        };
+        *slot = label;
+        total -= len;
+        dropped += 1;
+    }
+    tracing::info!(
+        dropped,
+        remaining_bytes = total,
+        cap,
+        "history image byte cap: oldest image blocks degraded to text labels"
+    );
+    Some(out)
 }
 
 /// Wire bytes a single `tool_result` charges against the turn byte budget.
@@ -1942,6 +2054,16 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        drive_with_history(initial, tools_to_register, tool_uses, hook_bus).await
+    }
+
+    async fn drive_with_history(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -2011,7 +2133,6 @@ mod rich_output_tests {
             ),
         };
 
-        let messages = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             StreamMethods::run_stream_internal(session, messages),
@@ -2168,6 +2289,138 @@ mod rich_output_tests {
         assert!(tool_result_bytes(&arr) >= 1_000);
         // Legacy behaviour would have been 0 for arrays.
         assert_ne!(tool_result_bytes(&arr), 0);
+    }
+
+    // ── S1: history image byte cap ─────────────────────────────────────────
+
+    fn image_tool_result_msg(id: &str, b64_len: usize) -> SharedMessage {
+        user_msg(json!([{
+            "type": "tool_result", "tool_use_id": id,
+            "content": [
+                {"type": "text", "text": format!("Image: /tmp/{id}.png")},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": fake_b64(b64_len)}}
+            ]
+        }]))
+    }
+
+    fn image_history(n: usize, b64_len: usize) -> Vec<SharedMessage> {
+        let mut h = vec![user_msg(json!("look at these"))];
+        for i in 0..n {
+            let id = format!("toolu_{i}");
+            h.push(Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":id,"name":"read","input":{"path":format!("/tmp/{id}.png")}}
+            ]})));
+            h.push(image_tool_result_msg(&id, b64_len));
+        }
+        h
+    }
+
+    #[test]
+    fn history_cap_noop_under_cap() {
+        let h = image_history(3, 1_000);
+        assert!(cap_history_image_bytes(&h, 10_000).is_none());
+        assert!(cap_history_image_bytes(&h, 3_000).is_none());
+    }
+
+    #[test]
+    fn history_cap_drops_oldest_first_keeps_text_and_durable_history() {
+        // 5 images × 1000 bytes, cap 2500 → drop the 3 oldest, keep 2 newest.
+        let h = image_history(5, 1_000);
+        let out = cap_history_image_bytes(&h, 2_500).expect("over cap");
+        assert_eq!(out.len(), h.len());
+        let images: Vec<&Value> = out
+            .iter()
+            .filter(|m| m["content"][0]["type"] == "tool_result")
+            .map(|m| &m["content"][0]["content"][1])
+            .collect();
+        assert_eq!(images.len(), 5);
+        for (i, b) in images.iter().enumerate() {
+            if i < 3 {
+                assert_eq!(b["type"], "text", "image {i} should be dropped");
+                assert_eq!(b["text"], IMAGE_DROPPED_LABEL);
+            } else {
+                assert_eq!(b["type"], "image", "image {i} should survive");
+            }
+        }
+        // Text-first summary untouched on every message.
+        for m in &out {
+            if m["content"][0]["type"] == "tool_result" {
+                assert_eq!(m["content"][0]["content"][0]["type"], "text");
+                assert!(m["content"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Image: "));
+            }
+        }
+        // Durable history untouched; untouched messages share the Arc.
+        for m in &h {
+            if m["content"][0]["type"] == "tool_result" {
+                assert_eq!(m["content"][0]["content"][1]["type"], "image");
+            }
+        }
+        assert!(Arc::ptr_eq(&h[0], &out[0]));
+        assert!(Arc::ptr_eq(&h[h.len() - 1], &out[out.len() - 1]));
+        assert!(!Arc::ptr_eq(&h[2], &out[2]));
+    }
+
+    #[test]
+    fn history_cap_handles_top_level_user_images() {
+        let h = vec![
+            user_msg(json!([{"type":"text","text":"a"}, {"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(600)}}])),
+            assistant_msg("ok"),
+            user_msg(json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(600)}}])),
+        ];
+        let out = cap_history_image_bytes(&h, 1_000).unwrap();
+        assert_eq!(out[0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+        assert_eq!(out[2]["content"][0]["type"], "image");
+    }
+
+    /// Wire-level: history carrying N images over the cap → the request body
+    /// that hits the provider holds only the newest images under the cap.
+    #[tokio::test]
+    async fn history_cap_applied_to_request_body() {
+        // 7 × 3.5 MiB = 24.5 MiB > 20 MiB → 2 oldest dropped, 5 newest kept.
+        let per = 3_670_016usize;
+        let d = drive_with_history(
+            image_history(7, per),
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        for body in &d.bodies {
+            let msgs = body["messages"].as_array().unwrap();
+            let mut kept = 0usize;
+            let mut dropped = 0usize;
+            let mut bytes = 0usize;
+            for m in msgs {
+                let Some(blocks) = m["content"].as_array() else { continue };
+                for b in blocks {
+                    if let Some(inner) = b["content"].as_array() {
+                        for x in inner {
+                            if is_base64_image(x) {
+                                kept += 1;
+                                bytes += base64_image_len(x);
+                            } else if x["text"] == IMAGE_DROPPED_LABEL {
+                                dropped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!((dropped, kept), (2, 5), "{}", body["messages"].as_array().unwrap().len());
+            assert!(bytes <= HISTORY_IMAGE_BYTE_CAP, "{bytes}");
+            // Oldest two are the dropped ones.
+            let first = msgs.iter().find(|m| m["content"][0]["type"] == "tool_result").unwrap();
+            assert_eq!(first["content"][0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+        }
+        // Durable history (what gets saved) still carries every image.
+        let images_in_history = d
+            .history
+            .iter()
+            .filter(|m| m["content"][0]["content"][1]["type"] == "image")
+            .count();
+        assert_eq!(images_in_history, 7);
     }
 
     #[test]

@@ -204,10 +204,18 @@ impl ToolOutput {
     }
 
     /// `(summary, Some(blocks))` for rich output, `(text, None)` for plain.
+    /// Debug builds assert the `blocks[0]` text-first invariant here — this
+    /// is the one choke point every rich result passes through.
     pub fn into_parts(self) -> (String, Option<Vec<Value>>) {
         match self {
             Self::Text(s) => (s, None),
-            Self::Blocks { blocks, summary } => (summary, Some(blocks)),
+            Self::Blocks { blocks, summary } => {
+                debug_assert!(
+                    blocks.first().is_some_and(|b| b["type"] == "text" && b["text"] == summary),
+                    "ToolOutput::Blocks invariant: blocks[0] must be a text block equal to summary"
+                );
+                (summary, Some(blocks))
+            }
         }
     }
 
@@ -235,6 +243,10 @@ pub trait Tool: Send + Sync {
     /// keep returning `String` via `execute` and never see this. Tools that
     /// need to place non-text content blocks (images) into the model history
     /// override this and make `execute` delegate to it.
+    ///
+    /// RECURSION TRAP: the default delegates to `execute`. If you make
+    /// `execute` delegate here (as `ReadTool` does) you MUST override this
+    /// method too, or the pair recurses until the stack blows.
     async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
         self.execute(params, ctx).await.map(ToolOutput::Text)
     }

@@ -8,6 +8,10 @@ pub(crate) const MAX_IMAGE_BYTES: usize = 3_670_016;
 const MAX_IMAGE_SIDE_PX: u32 = 8000;
 /// Above this long edge Anthropic downscales server-side (coordinate caveat).
 const PROVIDER_DOWNSCALE_LONG_EDGE: u32 = 1568;
+/// Seatbelt: refuse to load anything larger than this into memory at all.
+/// Checked via `fs::metadata` BEFORE the read, so a 200 MB `.tif` or a
+/// device file never gets pulled in.
+pub(crate) const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct ReadTool;
 
@@ -61,6 +65,25 @@ impl Tool for ReadTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
         let path = expand_path(raw_path);
+
+        // Size guard BEFORE reading: one stat, no bytes loaded.
+        let meta = tokio::fs::metadata(&path).await.map_err(|e| {
+            RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
+        })?;
+        if !meta.is_file() {
+            return Err(RuntimeError::Tool(format!(
+                "'{}' is not a regular file. Use `bash` (ls, file, head) to inspect it.",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_READ_BYTES {
+            return Err(RuntimeError::Tool(format!(
+                "File '{}' is {} KB; the read tool refuses files over {} KB. Use `bash` with `head`, `tail`, `xxd`, or `sed -n` to read a slice, or shrink an image with `convert`.",
+                path.display(),
+                meta.len().div_ceil(1024),
+                MAX_READ_BYTES / 1024
+            )));
+        }
 
         // Read raw bytes first to detect binary files
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
@@ -121,8 +144,8 @@ pub(crate) fn sniff_image_mime(b: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Header-only dimension parse. Best effort: `None` → label shows `?x?`.
-/// Never a hard failure — dims are for the label and the 8000px guard only.
+/// Header-only dimension parse. `None` → `image_output` rejects the file
+/// (an unsized image bypasses the 8000 px guard → provider 400 → poison pill).
 pub(crate) fn image_dimensions(mime: &str, b: &[u8]) -> Option<(u32, u32)> {
     match mime {
         "image/png" if b.len() >= 24 => Some((be32(&b[16..20]), be32(&b[20..24]))),
@@ -193,6 +216,45 @@ fn le16(b: &[u8]) -> u16 {
 fn le24(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], 0])
 }
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Cheap structural integrity check — trailer/size sanity only, no decode.
+/// A truncated or corrupt image shipped to the provider is a poison pill:
+/// the 400 repeats on every request until the session is cleared, because
+/// a `tool_result` user message always survives history repair. Reject here.
+pub(crate) fn image_integrity_error(mime: &str, b: &[u8]) -> Option<&'static str> {
+    match mime {
+        "image/png" => {
+            if b.len() < 16 || &b[12..16] != b"IHDR" {
+                return Some("first chunk is not IHDR");
+            }
+            if !b.ends_with(b"IEND\xAE\x42\x60\x82") {
+                return Some("missing IEND trailer (truncated?)");
+            }
+        }
+        "image/jpeg" => {
+            if !b.ends_with(&[0xFF, 0xD9]) {
+                return Some("missing EOI marker (truncated?)");
+            }
+        }
+        "image/gif" => {
+            if !b.ends_with(&[0x3B]) {
+                return Some("missing GIF trailer (truncated?)");
+            }
+        }
+        "image/webp" => {
+            let riff = le32(&b[4..8]) as usize;
+            // RIFF size = file length − 8; allow a single pad byte of slack.
+            if riff + 8 != b.len() && riff + 9 != b.len() {
+                return Some("RIFF size does not match file length (truncated?)");
+            }
+        }
+        _ => {}
+    }
+    None
+}
 
 fn image_output(path: &std::path::Path, mime: &'static str, bytes: &[u8]) -> Result<ToolOutput> {
     use base64::Engine as _;
@@ -208,24 +270,33 @@ fn image_output(path: &std::path::Path, mime: &'static str, bytes: &[u8]) -> Res
             cap = MAX_IMAGE_BYTES / 1024
         )));
     }
-    let dims = image_dimensions(mime, bytes);
-    if let Some((w, h)) = dims {
-        if w > MAX_IMAGE_SIDE_PX || h > MAX_IMAGE_SIDE_PX {
-            return Err(RuntimeError::Tool(format!(
-                "Image '{}' is {w}x{h}; the provider rejects images with any side over {MAX_IMAGE_SIDE_PX} px. \
-                 Downscale it with bash (e.g. `convert ... -resize 1568x1568\\>`) and read the new file.",
-                path.display()
-            )));
-        }
+    if let Some(why) = image_integrity_error(mime, bytes) {
+        return Err(RuntimeError::Tool(format!(
+            "Image '{}' ({mime}, {kb} KB) appears truncated or corrupt: {why}. \
+             Not sent to the model. Verify with `file` / `identify`, or re-export it and read the new file.",
+            path.display()
+        )));
     }
-    let dims_label = dims
-        .map(|(w, h)| format!("{w}x{h}"))
-        .unwrap_or_else(|| "?x?".into());
-    let mut summary = format!("Image: {} ({dims_label}, {mime}, {kb} KB)", path.display());
-    if let Some((w, h)) = dims {
-        if w.max(h) > PROVIDER_DOWNSCALE_LONG_EDGE {
-            summary.push_str("\nNote: long edge exceeds 1568 px; the provider downscales before viewing, so pixel coordinates read from the image are approximate.");
-        }
+    // Unknown dims → reject. Shipping an image we cannot size means the
+    // 8000 px guard is bypassed and a provider 400 poisons the session.
+    let Some((w, h)) = image_dimensions(mime, bytes) else {
+        return Err(RuntimeError::Tool(format!(
+            "Image '{}' ({mime}, {kb} KB): could not parse dimensions from the header. \
+             Not sent to the model. Re-export it (e.g. `convert '{}' /tmp/fixed.png`) and read the new file.",
+            path.display(),
+            path.display()
+        )));
+    };
+    if w > MAX_IMAGE_SIDE_PX || h > MAX_IMAGE_SIDE_PX {
+        return Err(RuntimeError::Tool(format!(
+            "Image '{}' is {w}x{h}; the provider rejects images with any side over {MAX_IMAGE_SIDE_PX} px. \
+             Downscale it with bash (e.g. `convert ... -resize 1568x1568\\>`) and read the new file.",
+            path.display()
+        )));
+    }
+    let mut summary = format!("Image: {} ({w}x{h}, {mime}, {kb} KB)", path.display());
+    if w.max(h) > PROVIDER_DOWNSCALE_LONG_EDGE {
+        summary.push_str("\nNote: long edge exceeds 1568 px; the provider downscales before viewing, so pixel coordinates read from the image are approximate.");
     }
     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(ToolOutput::Blocks {
@@ -343,12 +414,20 @@ mod tests {
         v
     }
 
-    /// Minimal 1×1 PNG: header + IHDR body tail + (fake) CRC.
-    fn tiny_png() -> Vec<u8> {
-        let mut v = png_header(1, 1);
+    const PNG_IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+
+    /// Structurally complete PNG with the given dims: IHDR + IEND, no IDAT.
+    fn png_with_dims(w: u32, h: u32) -> Vec<u8> {
+        let mut v = png_header(w, h);
         v.extend_from_slice(&[8, 6, 0, 0, 0]); // depth, color, comp, filter, interlace
         v.extend_from_slice(&[0, 0, 0, 0]); // crc (not validated)
+        v.extend_from_slice(&PNG_IEND);
         v
+    }
+
+    /// Minimal 1×1 PNG.
+    fn tiny_png() -> Vec<u8> {
+        png_with_dims(1, 1)
     }
 
     fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -528,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_over_8000px_rejected() {
-        let p = tmp("wide.png", &png_header(8001, 10));
+        let p = tmp("wide.png", &png_with_dims(8001, 10));
         let err = ReadTool
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
             .await
@@ -562,7 +641,7 @@ mod tests {
         );
         let _ = std::fs::remove_file(p);
 
-        let p = tmp("wide2.png", &png_header(2000, 100));
+        let p = tmp("wide2.png", &png_with_dims(2000, 100));
         let out = ReadTool
             .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
             .await
@@ -584,7 +663,7 @@ mod tests {
         };
         let p = std::path::PathBuf::from(home).join("Jawz/media/jawz-avatar-v1.png");
         if !p.exists() {
-            eprintln!("skip: {} absent", p.display());
+            eprintln!("SKIPPED real_avatar_png_round_trips_as_image_blocks: {} absent", p.display());
             return;
         }
         let out = ReadTool
@@ -606,10 +685,6 @@ mod tests {
         let data = blocks[1]["source"]["data"].as_str().unwrap();
         assert!(data.starts_with("iVBORw0KGgo"));
         assert!(serde_json::to_vec(&blocks[1]).unwrap().len() < 5_000_000);
-        eprintln!(
-            "INTEGRATION summary={summary:?} base64[..40]={}",
-            &data[..40]
-        );
     }
 
     /// Integration evidence: a real .rs file still reads as numbered text,
@@ -626,18 +701,182 @@ mod tests {
             .unwrap();
         let ToolOutput::Text(text) = out else { panic!("expected Text") };
         assert!(text.starts_with("1\tuse super::"), "{text}");
-        eprintln!("INTEGRATION rs_read_first_line={:?}", text.lines().next().unwrap());
 
-        if let Ok(big) = std::env::var("SYNAPS_TEST_BIG_IMAGE") {
+        let Ok(big) = std::env::var("SYNAPS_TEST_BIG_IMAGE") else {
+            eprintln!("SKIPPED big-image half of real_rs_file_and_optional_big_image: SYNAPS_TEST_BIG_IMAGE unset");
+            return;
+        };
+        let err = ReadTool
+            .execute_rich(json!({"path": big}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("accepts images up to 3584 KB"), "{err}");
+        assert!(err.contains("convert"));
+        assert!(err.len() < 1024);
+    }
+
+    // ── S2: poison-pill integrity checks ────────────────────────────────────
+
+    #[test]
+    fn integrity_check_per_format() {
+        // PNG
+        assert_eq!(image_integrity_error("image/png", &tiny_png()), None);
+        assert!(image_integrity_error("image/png", &png_header(1, 1)).is_some()); // no IEND
+        let mut bad_chunk = tiny_png();
+        bad_chunk[12..16].copy_from_slice(b"iTXt");
+        assert!(image_integrity_error("image/png", &bad_chunk).is_some());
+        assert!(image_integrity_error("image/png", &PNG_SIG).is_some());
+        // JPEG
+        assert_eq!(image_integrity_error("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xD9]), None);
+        assert!(image_integrity_error("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]).is_some());
+        // GIF
+        assert_eq!(image_integrity_error("image/gif", b"GIF89a\x01\x00\x01\x00\x3B"), None);
+        assert!(image_integrity_error("image/gif", b"GIF89a\x01\x00\x01\x00").is_some());
+        // WebP: RIFF size must equal len - 8.
+        let mut webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ".to_vec();
+        webp.extend_from_slice(&[0u8; 20]);
+        assert!(image_integrity_error("image/webp", &webp).is_some());
+        let riff = (webp.len() - 8) as u32;
+        webp[4..8].copy_from_slice(&riff.to_le_bytes());
+        assert_eq!(image_integrity_error("image/webp", &webp), None);
+        webp.pop();
+        assert!(image_integrity_error("image/webp", &webp).is_some());
+    }
+
+    #[tokio::test]
+    async fn truncated_png_rejected_no_image_block() {
+        // Header + 3 KB of zeros, no IEND — the "half-written screenshot" case.
+        let mut bytes = png_header(10, 10);
+        bytes.resize(3_000, 0);
+        let p = tmp("trunc.png", &bytes);
+        let err = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err();
+        let RuntimeError::Tool(msg) = err else {
+            panic!("expected Tool error, got {err:?}");
+        };
+        assert!(msg.contains("truncated or corrupt"), "{msg}");
+        assert!(msg.contains("IEND"), "{msg}");
+        assert!(!msg.contains("iVBORw0KGgo"), "no base64 in error");
+        assert!(msg.len() < 1024);
+        // Legacy path: same rejection, plain string, no image anywhere.
+        let s = ReadTool
+            .execute(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(s.contains("truncated or corrupt"), "{s}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[tokio::test]
+    async fn truncated_jpeg_and_gif_rejected() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0];
+        let p = tmp("trunc.jpg", &jpeg);
+        let err = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("EOI"), "{err}");
+        let _ = std::fs::remove_file(p);
+
+        let p = tmp("trunc.gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00");
+        let err = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("GIF trailer"), "{err}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[tokio::test]
+    async fn unparseable_dims_rejected_not_shipped() {
+        // Structurally complete JPEG (SOI … EOI) but SOS before any SOF →
+        // dims None → must NOT become an image block.
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0xFF, 0xD9];
+        let p = tmp("nodims.jpg", &jpeg);
+        let err = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not parse dimensions"), "{err}");
+        assert!(err.contains("Not sent to the model"), "{err}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[tokio::test]
+    async fn complete_gif_and_jpeg_round_trip_through_execute_rich() {
+        let p = tmp("ok.gif", b"GIF89a\x02\x00\x03\x00\x00\x00\x00\x3B");
+        let out = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(out.summary().contains("(2x3, image/gif, 1 KB)"), "{}", out.summary());
+        assert!(matches!(out, ToolOutput::Blocks { .. }));
+        let _ = std::fs::remove_file(p);
+
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        j.extend_from_slice(&480u16.to_be_bytes());
+        j.extend_from_slice(&640u16.to_be_bytes());
+        j.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xFF, 0xD9]);
+        let p = tmp("ok.jpg", &j);
+        let out = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(out.summary().contains("(640x480, image/jpeg, 1 KB)"), "{}", out.summary());
+        let _ = std::fs::remove_file(p);
+    }
+
+    // ── S4: metadata guard before the read ──────────────────────────────────
+
+    #[tokio::test]
+    async fn oversize_file_rejected_by_metadata_without_reading() {
+        // Sparse file: set_len allocates no blocks, so this is instant on
+        // disk but would be a 65 MiB read if the guard ran after the read.
+        let p = std::env::temp_dir().join(format!("read_sparse_{}.bin", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+        drop(f);
+        let start = std::time::Instant::now();
+        let err = ReadTool
+            .execute_rich(json!({"path": p.to_string_lossy()}), create_tool_context())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refuses files over"), "{err}");
+        assert!(err.contains("head"), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[tokio::test]
+    async fn directory_and_device_rejected_as_not_regular_file() {
+        let err = ReadTool
+            .execute_rich(
+                json!({"path": std::env::temp_dir().to_string_lossy()}),
+                create_tool_context(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        #[cfg(unix)]
+        if std::path::Path::new("/dev/zero").exists() {
+            let start = std::time::Instant::now();
             let err = ReadTool
-                .execute_rich(json!({"path": big}), create_tool_context())
+                .execute_rich(json!({"path": "/dev/zero"}), create_tool_context())
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("accepts images up to 3584 KB"), "{err}");
-            assert!(err.contains("convert"));
-            assert!(err.len() < 1024);
-            eprintln!("INTEGRATION big_image_rejected={err:?}");
+            assert!(err.contains("not a regular file"), "{err}");
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
         }
     }
 

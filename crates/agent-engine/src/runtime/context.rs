@@ -343,6 +343,12 @@ fn estimate_message(estimator: &TokenEstimator, msg: &Value) -> u64 {
     let Some(blocks) = msg["content"].as_array() else {
         return estimate_serialized(estimator, msg);
     };
+    // Zero drift for messages without images: charge exactly as before.
+    if !blocks.iter().any(|b| {
+        is_base64_image(b) || b["content"].as_array().is_some_and(|a| a.iter().any(is_base64_image))
+    }) {
+        return estimate_serialized(estimator, msg);
+    }
     let mut total = 0u64;
     for block in blocks {
         if is_base64_image(block) {
@@ -441,6 +447,31 @@ mod tests {
             estimate_message(&estimator, &msg),
             estimate_serialized(&estimator, &msg)
         );
+    }
+
+    #[test]
+    fn array_content_without_images_unchanged() {
+        let estimator = estimator_for_model("claude-sonnet-4-6");
+        for msg in [
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text": "let me look"},
+                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "x"}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "1\tfoo\n2\tbar"}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "nested text only"}
+                ]}
+            ]}),
+        ] {
+            assert_eq!(
+                estimate_message(&estimator, &msg),
+                estimate_serialized(&estimator, &msg),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
