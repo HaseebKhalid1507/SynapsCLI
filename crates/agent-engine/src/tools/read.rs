@@ -234,15 +234,11 @@ pub(crate) fn image_integrity_error(mime: &str, b: &[u8]) -> Option<&'static str
                 return Some("missing IEND trailer (truncated?)");
             }
         }
-        "image/jpeg" => {
-            if !b.ends_with(&[0xFF, 0xD9]) {
-                return Some("missing EOI marker (truncated?)");
-            }
+        "image/jpeg" if !b.ends_with(&[0xFF, 0xD9]) => {
+            return Some("missing EOI marker (truncated?)");
         }
-        "image/gif" => {
-            if !b.ends_with(&[0x3B]) {
-                return Some("missing GIF trailer (truncated?)");
-            }
+        "image/gif" if !b.ends_with(&[0x3B]) => {
+            return Some("missing GIF trailer (truncated?)");
         }
         "image/webp" => {
             let riff = le32(&b[4..8]) as usize;
