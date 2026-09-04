@@ -762,6 +762,19 @@ mod actor {
                     );
                 }
                 SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
+                // B2: spawned compaction reports through typed events.
+                SessionEventWire::CompactionStarted { disclosure, .. } => {
+                    eprintln!("\x1b[2m[{}]\x1b[0m", disclosure)
+                }
+                SessionEventWire::CompactionApplied { msg_count, .. } => {
+                    eprintln!("\x1b[2m[compacted {} messages]\x1b[0m", msg_count)
+                }
+                SessionEventWire::CompactionFailed { message, .. } => {
+                    eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
+                }
+                SessionEventWire::CompactionCancelled => {
+                    eprintln!("\x1b[2m[compaction cancelled]\x1b[0m")
+                }
                 SessionEventWire::Ended { .. } => self.ended = true,
                 _ => {}
             }

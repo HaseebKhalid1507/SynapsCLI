@@ -803,6 +803,15 @@ impl SessionActor {
             self.steer(text);
             return;
         }
+        if self.compact.is_some() {
+            // dispatch.rs:1233-1237: queued until the compaction lands.
+            self.emit(SessionEventWire::Steered {
+                text: text.clone(),
+                delivered: false,
+            });
+            self.conv.queued_message = Some(text);
+            return;
+        }
         // Real user send — reset auto-turn counter.
         self.consecutive_auto_turns = 0;
         // Inject abort context if previous response was interrupted
@@ -839,6 +848,13 @@ impl SessionActor {
     /// `abort_context`, save, or emit "aborted".
     pub(crate) async fn cancel_turn(&mut self) {
         if !self.streaming {
+            if self.compact.is_some() {
+                self.abort_compaction();
+                if let Some(q) = self.conv.queued_message.take() {
+                    self.emit(SessionEventWire::Dequeued { text: q });
+                }
+                self.update_attach_state();
+            }
             self.emit(SessionEventWire::Idle);
             return;
         }
@@ -1049,7 +1065,10 @@ impl SessionActor {
                     if self.config.auto_compact {
                         self.post_turn_chat().await;
                     }
-                    self.emit(SessionEventWire::Idle);
+                    // A spawned compaction emits Idle when it lands.
+                    if self.compact.is_none() {
+                        self.emit(SessionEventWire::Idle);
+                    }
                 }
             }
             StreamEvent::Session(SessionEvent::Error(_)) => {
@@ -1071,11 +1090,19 @@ impl SessionActor {
                 if self.config.auto_compact {
                     self.post_turn_chat().await;
                 }
-                self.emit(SessionEventWire::Idle);
+                if self.compact.is_none() {
+                    self.emit(SessionEventWire::Idle);
+                }
             }
             After::AutoSendQueued(queued) => {
                 if self.config.auto_compact {
                     self.post_turn_chat().await;
+                }
+                if self.compact.is_some() {
+                    // Rides the compaction transition (queued_message
+                    // restored last); the TUI reports it, never re-sends.
+                    self.conv.queued_message = Some(queued);
+                    return;
                 }
                 // Auto-send the queued message (user-authored — reset counter)
                 self.consecutive_auto_turns = 0;
@@ -1095,6 +1122,9 @@ impl SessionActor {
             After::AutoTriggerEvents => {
                 if self.config.auto_compact {
                     self.post_turn_chat().await;
+                }
+                if self.compact.is_some() {
+                    return;
                 }
                 // Central claim gate: allows turns 1-5, denies the 6th.
                 if claim_auto_turn(&mut self.consecutive_auto_turns) {
@@ -1120,9 +1150,136 @@ impl SessionActor {
         }
     }
 
-    /// chat.rs `/compact` + auto-compaction body (inline; the TUI's spawned
-    /// compaction task is day 2).
+    /// `SYNAPS_SESSION_COMPACT_INLINE=1`: one-release kill-switch back to the
+    /// #107 inline body (deleted in phase 4).
+    fn compact_inline_env() -> bool {
+        matches!(
+            std::env::var("SYNAPS_SESSION_COMPACT_INLINE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    }
+
+    /// `/compact` + auto-compaction entry (B2): spawns `compact_conversation`
+    /// on a `Runtime::clone()` (the same clone the TUI makes at
+    /// dispatch.rs:450 — the clone never runs turns) and returns; the
+    /// `select!` arm `on_compaction_done` applies the outcome. While a job
+    /// is in flight Attach/Detach/Cancel/Query are serviced, `Submit` is
+    /// queued (`Steered{delivered:false}`), auto-turns see `busy`.
     pub(crate) async fn compact(&mut self, instructions: Option<String>, source: &str) {
+        if Self::compact_inline_env() {
+            return self.compact_inline(instructions, source).await;
+        }
+        if self.compact.is_some() {
+            self.emit(SessionEventWire::SystemNotice(
+                "compaction already in progress".into(),
+            ));
+            return;
+        }
+        if self.streaming {
+            self.emit(SessionEventWire::SystemNotice(
+                "cannot compact while a turn is running".into(),
+            ));
+            return;
+        }
+        let disclosure =
+            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line();
+        self.emit(SessionEventWire::CompactionStarted {
+            source: source.to_string(),
+            disclosure,
+        });
+        let msgs = self.conv.api_messages.clone();
+        let rt: Runtime = (*self.runtime).clone();
+        let task = tokio::spawn(async move {
+            compact_conversation(&msgs, &rt, instructions.as_deref()).await
+        });
+        self.compact = Some(CompactionJob {
+            task,
+            source: source.to_string(),
+            started: tokio::time::Instant::now(),
+        });
+        self.update_attach_state();
+    }
+
+    /// `select!` arm: the spawned job finished (or was aborted). Applies via
+    /// the ONE engine transition with the configured policy; pending events
+    /// and the queued message ride the transition (loop_arms.rs:761-836).
+    async fn on_compaction_done(
+        &mut self,
+        res: std::result::Result<
+            Result<crate::runtime::compaction::CompactionOutcome>,
+            tokio::task::JoinError,
+        >,
+    ) {
+        let Some(job) = self.compact.take() else {
+            return;
+        };
+        let msg_count = self.conv.api_messages.len();
+        match res {
+            Err(join) => {
+                if !join.is_cancelled() {
+                    self.emit(SessionEventWire::CompactionFailed {
+                        message: join.to_string(),
+                        panicked: true,
+                    });
+                }
+            }
+            Ok(Err(e)) => self.emit(SessionEventWire::CompactionFailed {
+                message: e.to_string(),
+                panicked: false,
+            }),
+            Ok(Ok(outcome)) => {
+                let policy: CompactionPolicy = self.config.compaction_policy.into();
+                let queued = self.conv.queued_message.clone();
+                let applied = apply_compaction(
+                    &self.runtime,
+                    &self.conv.session,
+                    &self.conv.api_messages,
+                    &outcome,
+                    CompactionTransition {
+                        policy,
+                        pending_events: self.conv.pending_events.clone(),
+                        queued_message: queued.clone(),
+                        hook_source: job.source.clone(),
+                    },
+                )
+                .await;
+                match applied {
+                    Ok(applied) => {
+                        let previous = applied.previous_session_id.clone();
+                        self.conv.session = applied.session;
+                        self.conv.api_messages = applied.api_messages;
+                        self.conv.pending_events.clear();
+                        self.conv.queued_message = None;
+                        if policy == CompactionPolicy::LinkedSuccessor {
+                            self.conv.total_input_tokens = 0;
+                            self.conv.total_output_tokens = 0;
+                            self.conv.session_cost = 0.0;
+                        }
+                        let new_id = self.conv.session.id.clone();
+                        self.runtime.set_session_id(Some(new_id.clone()));
+                        self.journal_id.store(Arc::new(new_id.clone()));
+                        self.emit(SessionEventWire::CompactionApplied {
+                            previous_session_id: previous,
+                            session_id: new_id,
+                            chains_advanced: applied.chains_advanced,
+                            queued_restored: queued,
+                            msg_count,
+                        });
+                    }
+                    Err(e) => self.emit(SessionEventWire::CompactionFailed {
+                        message: e.to_string(),
+                        panicked: false,
+                    }),
+                }
+            }
+        }
+        self.emit_conversation();
+        self.update_attach_state();
+        self.emit(SessionEventWire::Idle);
+    }
+
+    /// #107 inline body (kill-switch only).
+    async fn compact_inline(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
             preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
@@ -1514,7 +1671,7 @@ impl SessionActor {
         });
     }
 
-    /// B2 fills this in (abort the spawned task + `CompactionCancelled`).
+    /// Abort the spawned job (`CompactionCancelled`); prior state intact.
     pub(crate) fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
             job.task.abort();
@@ -1768,6 +1925,15 @@ async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
     }
 }
 
+async fn poll_compaction(
+    job: &mut Option<CompactionJob>,
+) -> std::result::Result<Result<crate::runtime::compaction::CompactionOutcome>, tokio::task::JoinError> {
+    match job {
+        Some(j) => (&mut j.task).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn park_timer(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(t) => tokio::time::sleep_until(t).await,
@@ -1808,6 +1974,7 @@ impl SessionTask {
                 _ = queue.notified() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
                 _ = park_timer(actor.park_deadline) => actor.park().await,
+                res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
                 _ = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;
                     let id = (**actor.journal_id.load()).clone();
