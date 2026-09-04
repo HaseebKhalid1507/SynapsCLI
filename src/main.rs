@@ -305,12 +305,22 @@ fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
     }
 }
 
+/// `synaps attach` / `--attach` is a thin line client: one socket, one stdin.
+/// A current-thread runtime saves the worker pool (client diet, day 2 §9).
+fn is_thin_client() -> bool {
+    std::env::args().skip(1).any(|a| a == "attach" || a == "--attach" || a.starts_with("--attach="))
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(n) = worker_threads() {
-        builder.worker_threads(n);
-    }
-    let rt = builder.enable_all().thread_name("synaps-rt").build()?;
+    let rt = if is_thin_client() {
+        tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(n) = worker_threads() {
+            builder.worker_threads(n);
+        }
+        builder.enable_all().thread_name("synaps-rt").build()?
+    };
     // The log-appender guard lives on the process `EngineHost` (a static —
     // never dropped by Rust). Flush it on every exit path so the teardown
     // burst (session save, hooks, extension shutdown) reaches disk.
