@@ -44,8 +44,7 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Daem
     loop {
         line.clear();
         // `take` bounds the read so an oversize frame cannot grow memory.
-        let n = (&mut *reader)
-            .take(MAX_FRAME_BYTES as u64 + 1)
+        let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
             .read_line(&mut line)
             .await?;
         if n == 0 {
