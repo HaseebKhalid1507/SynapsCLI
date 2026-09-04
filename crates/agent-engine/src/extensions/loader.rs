@@ -77,7 +77,9 @@ pub fn spawn_discover_and_load(
                     len = content.len(),
                     "on_session_start injected session-scoped context"
                 );
-                hook_bus.set_session_injection(content).await;
+                hook_bus
+                    .set_session_injection_for(&session_id, content)
+                    .await;
             }
         }
 

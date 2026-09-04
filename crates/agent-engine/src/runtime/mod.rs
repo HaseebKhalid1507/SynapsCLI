@@ -429,6 +429,10 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// Conversation/session identity this runtime serves. Keys the
+    /// `on_session_start` hook injection (Phase 2 keys everything).
+    /// `None` = unkeyed (workers, tests) — reads no injection.
+    session_id: Option<String>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -785,6 +789,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            session_id: None,
         })
     }
 
@@ -882,6 +887,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            session_id: None,
         }
     }
 
@@ -1258,6 +1264,16 @@ impl Runtime {
     /// fresh per independently constructed `Runtime`.
     pub fn host_tool_session_id(&self) -> &crate::tools::activation::SessionId {
         &self.host_tool_session
+    }
+
+    /// Conversation/session identity this runtime serves (keys hook
+    /// injection). `None` = unkeyed (workers).
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -3468,6 +3484,7 @@ impl Runtime {
             event_queue,
             secret_prompt,
             hook_bus: self.hook_bus.clone(),
+            session_id: self.session_id.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3627,6 +3644,8 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            // Clones serve the same conversation (see memory_context_state).
+            session_id: self.session_id.clone(),
         }
     }
 }

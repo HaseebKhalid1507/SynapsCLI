@@ -27,6 +27,9 @@ pub struct BackgroundTasks {
     #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
+    /// Hook bus the session's `on_session_start` injection lives on; cleared
+    /// at shutdown so a long-lived process does not accumulate stale keys.
+    hook_bus: Arc<crate::extensions::hooks::HookBus>,
     /// File-appender flush guard. Holding this for the lifetime of the
     /// renderer keeps the non-blocking log writer's background thread
     /// alive — without it, log lines emitted after `boot()` returns can
@@ -44,6 +47,14 @@ impl BackgroundTasks {
         self.socket_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         crate::events::registry::unregister_session(&self.session_id);
+        // Cleanup only — fail-soft when no tokio runtime is current.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let hook_bus = Arc::clone(&self.hook_bus);
+            let session_id = self.session_id.clone();
+            handle.spawn(async move {
+                hook_bus.clear_session_injection(&session_id).await;
+            });
+        }
     }
 }
 
@@ -120,6 +131,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
     let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    runtime.set_session_id(Some(sb.session.id.clone()));
 
     // Validate and compile an opted-in manifest before any session/network work.
     let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
@@ -304,6 +316,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     }
 
     let session_id = sb.session.id.clone();
+    let hook_bus = Arc::clone(runtime.hook_bus());
 
     Ok(EngineBoot {
         runtime,
@@ -329,6 +342,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             socket_task,
             session_socket_path,
             session_id,
+            hook_bus,
             log_guard,
         },
     })

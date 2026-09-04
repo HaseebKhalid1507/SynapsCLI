@@ -51,6 +51,9 @@ pub(super) struct StreamSession {
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    /// Conversation id keying the `on_session_start` injection. `None`
+    /// (workers) reads nothing.
+    pub(super) session_id: Option<String>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -256,6 +259,7 @@ impl StreamMethods {
             subagent_registry,
             event_queue,
             hook_bus,
+            session_id,
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
@@ -489,7 +493,11 @@ impl StreamMethods {
 
             // Session-scoped context in system: byte-identical across the
             // whole session, cache-safe by construction.
-            let injected_system: Option<String> = match hook_bus.session_injection().await {
+            let session_injection = match session_id.as_deref() {
+                Some(id) => hook_bus.session_injection_for(id).await,
+                None => None,
+            };
+            let injected_system: Option<String> = match session_injection {
                 Some(content) => Some(wrap_extension_context(
                     system_prompt.as_deref().unwrap_or_default(),
                     &content,
@@ -2125,6 +2133,7 @@ mod rich_output_tests {
             )),
             event_queue: Arc::new(crate::events::EventQueue::new(100)),
             hook_bus,
+            session_id: None,
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
