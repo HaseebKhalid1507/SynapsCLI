@@ -371,11 +371,27 @@ impl Drop for Pane {
 ///    its rows while the input box/footer stay bottom-anchored, so the
 ///    empty region between them differs in height. Content rows, their
 ///    order and the chrome (header, box, footer) are all compared.
+/// 3. the boot logo (L's transcript is empty before the first turn; S's
+///    never is — it holds the banner) and the in-process extension-loader
+///    toast (`Extensions / ✓ Loaded N extension`): the attach client has no
+///    extension host — the daemon loads them (documented phase-3 limitation).
 fn normalise_socket(frame: &str) -> String {
     let attached = regex::Regex::new(r"^\s*attached to <id> as client #\d+ \([A-Za-z]+\).*$").unwrap();
+    let toast_box = regex::Regex::new(r"^\s+[╭╰]─+[╮╯]\s*$").unwrap();
+    let toast_in_rule = regex::Regex::new(r"^─+╭─+╮─+$").unwrap();
+    let rule: String = "─".repeat(COLS as usize);
     normalise(frame)
         .lines()
-        .filter(|l| !attached.is_match(l) && !l.trim().is_empty())
+        .map(|l| if toast_in_rule.is_match(l) { rule.clone() } else { l.to_string() })
+        .filter(|l| {
+            !attached.is_match(l)
+                && !l.trim().is_empty()
+                && !l.contains('█')
+                && !l.contains("neural interface ready")
+                && !l.contains("│Extensions")
+                && !l.contains("Loaded 1 extension")
+                && !toast_box.is_match(l)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
