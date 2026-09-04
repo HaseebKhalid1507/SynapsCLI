@@ -2033,6 +2033,8 @@ mod rich_output_tests {
                     (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
                 }),
             )
+            // Axum defaults to a 2 MB body limit (413) — image histories are bigger.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
