@@ -21,6 +21,8 @@ mod powershell;
 mod read;
 mod secret_prompt;
 mod subagent;
+#[doc(hidden)]
+pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
 
 pub mod activation;

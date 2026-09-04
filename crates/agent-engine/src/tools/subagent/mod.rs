@@ -35,10 +35,9 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime: &mut crate::Runtime,
     config: &crate::config::SynapsConfig,
 ) {
-    // Inherit credential source / token cache from the parent session's
-    // resolved config — Remote broker endpoints must be reachable from
-    // the subagent thread. (#158 A3)
-    runtime.apply_auth_config(config);
+    // Credential source / token cache: host-built workers already share the
+    // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
+    // path re-applies auth config there. (#158 A3 → engine-host B2)
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
@@ -54,6 +53,35 @@ pub(crate) fn apply_subagent_runtime_policy(
         crate::runtime::budget::TurnRole::Worker,
         &config.turn_budgets,
     ));
+}
+
+/// Kill-switch: `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` restores the pre-engine-host
+/// spawn path (fresh `Runtime::new()`, fresh HTTP client, registry rebuilt,
+/// global broker re-installed with a fresh token cache on every spawn).
+pub fn legacy_fresh_runtime() -> bool {
+    std::env::var("SYNAPS_SUBAGENT_FRESH_RUNTIME").is_ok_and(|v| v == "1")
+}
+
+/// Build the runtime a subagent runs on. Preferred: `EngineHost::worker_runtime()`
+/// — shares the host HTTP client, credential source and token cache (so NO
+/// `set_global_broker` re-install and NO token-cache eviction per spawn) and
+/// takes a clone of the cached worker registry template. Legacy path (no host
+/// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +
+/// `apply_auth_config`, verbatim.
+///
+/// Called from the subagent's own OS thread / current-thread tokio runtime:
+/// `EngineHost::current()` is a `OnceLock` read and `worker_runtime()` only
+/// touches `tokio::sync` primitives, so this is runtime-agnostic.
+pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
+    if !legacy_fresh_runtime() {
+        if let Some(host) = crate::EngineHost::current() {
+            return host.worker_runtime().await;
+        }
+    }
+    let mut rt = crate::Runtime::new().await?;
+    rt.set_tools(subagent_tools().await);
+    rt.apply_auth_config(&crate::config::load_config());
+    Ok(rt)
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
