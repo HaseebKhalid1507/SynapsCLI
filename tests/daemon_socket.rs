@@ -115,8 +115,10 @@ async fn socket_roundtrip_real_uds() {
         SocketTransport::attach(conn2, Attach::Existing { session_id: list[0].id.clone(), mode: AttachMode::Mirror }).await.unwrap();
     assert_eq!(snap2.conversation.api_messages.len(), 2);
     assert_ne!(t2.client_id(), t.client_id());
-    // t sees t2 join
+    // both see t2 join
     let j = next(&mut t).await;
+    assert!(matches!(j.event, SessionEventWire::ClientJoined { .. }));
+    let j = next(&mut t2).await;
     assert!(matches!(j.event, SessionEventWire::ClientJoined { .. }));
 
     // detach t without ending the session
