@@ -612,6 +612,35 @@ mod tests {
         );
     }
 
+    /// Integration evidence: a real .rs file still reads as numbered text,
+    /// and (when `SYNAPS_TEST_BIG_IMAGE` points at a >3.5 MiB image) the
+    /// oversize path rejects in-slot with the shrink hint and no base64.
+    #[tokio::test]
+    async fn real_rs_file_and_optional_big_image() {
+        let out = ReadTool
+            .execute_rich(
+                json!({"path": concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/read.rs"), "limit": 3}),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(text) = out else { panic!("expected Text") };
+        assert!(text.starts_with("1\tuse super::"), "{text}");
+        eprintln!("INTEGRATION rs_read_first_line={:?}", text.lines().next().unwrap());
+
+        if let Ok(big) = std::env::var("SYNAPS_TEST_BIG_IMAGE") {
+            let err = ReadTool
+                .execute_rich(json!({"path": big}), create_tool_context())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("accepts images up to 3584 KB"), "{err}");
+            assert!(err.contains("convert"));
+            assert!(err.len() < 1024);
+            eprintln!("INTEGRATION big_image_rejected={err:?}");
+        }
+    }
+
     #[tokio::test]
     async fn non_image_binary_mentions_image_support() {
         let p = tmp("blob.bin", &[0xFF, 0xFE, 0x00, 0x80, 0x81]);
