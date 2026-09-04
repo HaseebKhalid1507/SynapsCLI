@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
@@ -72,13 +72,27 @@ fn load_syntax_set() -> SyntaxSet {
 /// together (PLAN-phase4 §3 C2).
 struct Loaded {
     set: SyntaxSet,
-    themes: ThemeSet,
+    theme: Theme,
 }
 
 impl Loaded {
-    fn theme(&self) -> &syntect::highlighting::Theme {
-        &self.themes.themes["base16-ocean.dark"]
+    fn theme(&self) -> &Theme {
+        &self.theme
     }
+}
+
+/// The one syntect theme the palette maps code colours from. Only this theme
+/// is kept (PLAN-phase4 §3 C3); the rest of `ThemeSet::load_defaults()` is
+/// dropped on the spot. Falls back to the first default theme if the name
+/// ever disappears from syntect's bundle — never panics.
+const CODE_THEME: &str = "base16-ocean.dark";
+
+fn load_theme() -> Theme {
+    let mut themes = ThemeSet::load_defaults().themes;
+    themes
+        .remove(CODE_THEME)
+        .or_else(|| themes.into_values().next())
+        .unwrap_or_default()
 }
 
 /// Lazily loaded, idle-evictable syntect state. Rendered `Line<'static>`s own
@@ -115,7 +129,7 @@ fn syntax_set() -> Arc<Loaded> {
     let t0 = Instant::now();
     let loaded = Arc::new(Loaded {
         set: load_syntax_set(),
-        themes: ThemeSet::load_defaults(),
+        theme: load_theme(),
     });
     let loads = CACHE.loads.fetch_add(1, Ordering::Relaxed) + 1;
     agent_core::core::memstat::ladder(
@@ -145,7 +159,7 @@ fn idle_override() -> Option<Option<Duration>> {
 #[allow(dead_code)]
 pub(crate) const SYNTECT_IDLE_DEFAULT: Duration = Duration::from_secs(120);
 
-/// Drop the syntect `SyntaxSet`/`ThemeSet` when no highlight call has used
+/// Drop the syntect `SyntaxSet`/`Theme` when no highlight call has used
 /// them for `idle` (PLAN-phase4 §3 C2). `SYNAPS_TUI_SYNTECT_IDLE_SECS`
 /// overrides `idle` when set (`0` = never evict). Returns `true` only when
 /// something was actually dropped; a set that is currently borrowed by a
@@ -172,6 +186,7 @@ pub(crate) fn evict_if_idle(idle: Duration) -> bool {
 
 /// Whether the syntect state is currently resident.
 #[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
 pub(crate) fn is_loaded() -> bool {
     CACHE
         .loaded
@@ -640,6 +655,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         false
+    }
+
+    #[test]
+    fn single_code_theme_is_the_palette_theme() {
+        let full = ThemeSet::load_defaults();
+        assert_eq!(load_theme(), full.themes[CODE_THEME]);
     }
 
     #[test]
