@@ -181,7 +181,7 @@ fn scenarios() -> Vec<Scenario> {
             script: Script::SseOrJson {
                 sse: ANTHROPIC_SSE,
                 json: ANTHROPIC_MESSAGES_JSON,
-                json_delay: Duration::from_millis(0),
+                json_delay: Duration::from_millis(1500),
             },
             steps: vec![
                 Type("hello"),
@@ -192,6 +192,10 @@ fn scenarios() -> Vec<Scenario> {
                 Wait(1500),
                 Type("/compact"),
                 Key("Enter"),
+                Wait(300),
+                // The transcript is rebuilt after the swap, so the lines
+                // pushed at dispatch are only visible DURING the summary.
+                Capture("during_compact"),
                 Wait(2500),
                 Capture("after_compact"),
             ],
@@ -308,7 +312,24 @@ fn normalise(frame: &str) -> String {
         .join("\n")
 }
 
+/// Journal normalisation: session ids and RFC 3339 timestamps are allowed
+/// to differ (§5.1) — wherever they appear (top level and inside the
+/// compaction metadata block). Everything else must be byte-equal.
 fn normalise_journal(dir: &Path) -> String {
+    let id_re = regex::Regex::new(r"\d{8}-\d{6}-[0-9a-f]{4}").unwrap();
+    let ts_re = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z").unwrap();
+    fn walk(v: &mut serde_json::Value, id_re: &regex::Regex, ts_re: &regex::Regex) {
+        match v {
+            serde_json::Value::String(s) => {
+                let t = id_re.replace_all(s, "<id>");
+                let t = ts_re.replace_all(&t, "<ts>");
+                *s = t.into_owned();
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, id_re, ts_re)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|x| walk(x, id_re, ts_re)),
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
@@ -316,11 +337,7 @@ fn normalise_journal(dir: &Path) -> String {
         for f in files {
             let raw = std::fs::read_to_string(&f).unwrap_or_default();
             let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-            if let Some(o) = v.as_object_mut() {
-                for k in ["id", "created_at", "updated_at", "parent_session", "compacted_into"] {
-                    o.remove(k);
-                }
-            }
+            walk(&mut v, &id_re, &ts_re);
             out.push(serde_json::to_string_pretty(&v).unwrap_or_default());
         }
     }
