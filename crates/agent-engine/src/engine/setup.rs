@@ -5,7 +5,7 @@
 
 use crate::skills::keybinds::KeybindRegistry;
 use crate::skills::registry::CommandRegistry;
-use crate::{latest_session, resolve_session, Result, Runtime, Session};
+use crate::{latest_session, resolve_session, EngineHost, HostOpts, Result, Runtime, Session};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -27,6 +27,9 @@ pub struct BackgroundTasks {
     #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
+    /// Hook bus the session's `on_session_start` injection lives on; cleared
+    /// at shutdown so a long-lived process does not accumulate stale keys.
+    hook_bus: Arc<crate::extensions::hooks::HookBus>,
     /// File-appender flush guard. Holding this for the lifetime of the
     /// renderer keeps the non-blocking log writer's background thread
     /// alive — without it, log lines emitted after `boot()` returns can
@@ -44,6 +47,14 @@ impl BackgroundTasks {
         self.socket_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         crate::events::registry::unregister_session(&self.session_id);
+        // Cleanup only — fail-soft when no tokio runtime is current.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let hook_bus = Arc::clone(&self.hook_bus);
+            let session_id = self.session_id.clone();
+            handle.spawn(async move {
+                hook_bus.clear_session_injection(&session_id).await;
+            });
+        }
     }
 }
 
@@ -96,30 +107,32 @@ pub struct ContinueInfo {
 /// Run the full engine boot sequence:
 /// config → system prompt → skills → MCP → session → sockets → extensions
 pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
-    if let Some(ref prof) = opts.profile {
-        crate::config::set_profile(Some(prof.clone()));
-    }
-
-    // Capture the WorkerGuard from the file appender. tracing-appender's
-    // non-blocking writer uses a background flush thread; the guard is
-    // an RAII handle that stops that thread on drop. The previous code
-    // dropped it at the end of boot() with a comment claiming "this is
-    // fine because tracing-subscriber uses a global subscriber" — which
-    // is true for the subscriber, but NOT for the file appender's
-    // background thread. With the guard dropped, log lines emitted after
-    // boot() returned (Extension loaded, hook traces, etc.) could be
-    // silently lost. We hand the guard down through EngineBoot so the
-    // renderer (TUI / chat / server) keeps it alive for its lifetime.
-    let log_guard = crate::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
-
-    // Load config and apply
-    let config = crate::config::load_config();
-    runtime.apply_config(&config);
+    // Process-global parts (profile, logging, HTTP client, registry, skills,
+    // MCP, extension manager) are built ONCE per process by `EngineHost`
+    // and reused by every later boot in the same process. The log-appender
+    // guard lives on the host — process lifetime ≥ renderer lifetime — so
+    // log lines emitted after boot() returns are never silently dropped.
+    let host = match EngineHost::current() {
+        Some(h) => h,
+        None => {
+            let h = EngineHost::boot(HostOpts {
+                profile: opts.profile.clone(),
+                no_extensions: opts.no_extensions,
+            })
+            .await?;
+            let _ = EngineHost::install(Arc::clone(&h));
+            h
+        }
+    };
+    // `apply_config` is applied inside `foreground_runtime()` — before
+    // session resolution, same relative order as before.
+    let mut runtime = host.foreground_runtime().await?;
+    let config: crate::SynapsConfig = (**host.config()).clone();
 
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
     let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    runtime.set_session_id(Some(sb.session.id.clone()));
 
     // Validate and compile an opted-in manifest before any session/network work.
     let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
@@ -181,25 +194,11 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime.set_system_prompt(legacy_prompt);
     }
 
-    // Discover plugins/skills, build command registry, register load_skill tool.
-    let tools_shared = runtime.tools_shared();
-    let (registry, keybind_registry) = crate::skills::register(&tools_shared, &config).await;
-
-    // Set up MCP loading (if configured in ~/.synaps-cli/mcp.json). Flag-off
-    // keeps the legacy connect gateway; progressive disclosure switches to
-    // exact descriptor-backed dormant tools (Task 19) with no gateway.
-    let mcp_server_count =
-        crate::mcp::setup_lazy_mcp(&runtime.tools_shared(), config.progressive_tool_disclosure)
-            .await;
-    if config.progressive_tool_disclosure {
-        // Exact MCP mode: one shared lease manager for the runtime. Streams
-        // mint session capabilities/guards from it; children die with the
-        // session (RAII) or on runtime drop.
-        runtime.install_mcp_runtime(std::sync::Arc::new(crate::mcp::McpRuntimeManager::new(
-            crate::mcp::lease::config_source_from_disk(),
-            crate::mcp::lease::DEFAULT_IDLE_MAX,
-        )));
-    }
+    // Skills, command registry, MCP setup and the MCP lease manager are
+    // host-owned (see `EngineHost::boot`); the runtime already holds them.
+    let registry = Arc::clone(host.command_registry());
+    let keybind_registry = Arc::clone(host.keybind_registry());
+    let mcp_server_count = host.mcp_server_count();
 
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
@@ -260,22 +259,10 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         &config.turn_budgets,
     ));
 
-    // Extension manager
-    let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
-        Arc::clone(runtime.hook_bus()),
-        runtime.tools_shared(),
-    );
-    // Task 20: progressive disclosure defers tool-only extension spawns
-    // (dormant descriptors only); flag-off keeps the legacy eager loads.
-    ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
-    if config.progressive_tool_disclosure {
-        // ONE shared extension runtime lease manager: the manager uses it
-        // for unload revocation; the runtime mints per-session capabilities
-        // and the durable session-end scope from the SAME instance.
-        runtime.install_extension_runtime(ext_mgr.extension_runtime());
-    }
-    let ext_manager = Arc::new(RwLock::new(ext_mgr));
-    crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
+    // Extension manager: host-owned (progressive deferral + the shared
+    // extension lease manager were wired in `EngineHost::boot` /
+    // `foreground_runtime`).
+    let ext_manager = Arc::clone(host.ext_manager());
 
     // Session start index record.
     //
@@ -304,6 +291,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     }
 
     let session_id = sb.session.id.clone();
+    let hook_bus = Arc::clone(runtime.hook_bus());
 
     Ok(EngineBoot {
         runtime,
@@ -329,7 +317,9 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             socket_task,
             session_socket_path,
             session_id,
-            log_guard,
+            hook_bus,
+            // The appender guard lives on the `EngineHost` now.
+            log_guard: None,
         },
     })
 }

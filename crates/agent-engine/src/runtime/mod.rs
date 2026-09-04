@@ -429,6 +429,10 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// Conversation/session identity this runtime serves. Keys the
+    /// `on_session_start` hook injection (Phase 2 keys everything).
+    /// `None` = unkeyed (workers, tests) — reads no injection.
+    session_id: Option<String>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -669,6 +673,75 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .build()
 }
 
+/// The process-global HTTP client for `EngineHost` (same builder as
+/// `Runtime::new`).
+pub(crate) fn build_host_http_client() -> Result<Client> {
+    build_http_client(HTTP_READ_TIMEOUT)
+        .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))
+}
+
+/// Internal: every field of `Runtime` in one place so `new()`,
+/// `new_headless()`, `foreground_runtime()` and `worker_runtime()` cannot
+/// drift. `Runtime::new()` is: build fresh parts → `from_parts`.
+pub(crate) struct RuntimeParts {
+    pub host: crate::host::HostParts,
+    pub session_manager: Arc<crate::tools::shell::SessionManager>,
+    pub reaper: Option<(tokio::task::JoinHandle<()>, CancellationToken)>,
+}
+
+impl RuntimeParts {
+    /// Fresh shell session manager + idle reaper (needs a tokio runtime).
+    pub(crate) fn with_reaper(host: crate::host::HostParts) -> Self {
+        let session_manager = fresh_session_manager();
+        let cancel = CancellationToken::new();
+        let handle =
+            crate::tools::shell::session::start_reaper(session_manager.clone(), cancel.clone());
+        Self {
+            host,
+            session_manager,
+            reaper: Some((handle, cancel)),
+        }
+    }
+
+    /// Fresh shell session manager, no reaper (offline / headless).
+    pub(crate) fn without_reaper(host: crate::host::HostParts) -> Self {
+        Self {
+            host,
+            session_manager: fresh_session_manager(),
+            reaper: None,
+        }
+    }
+}
+
+fn fresh_session_manager() -> Arc<crate::tools::shell::SessionManager> {
+    let config = crate::tools::shell::ShellConfig::default();
+    crate::tools::shell::SessionManager::new(config)
+}
+
+/// Fresh, process-local host parts — exactly what `Runtime::new()` used to
+/// construct inline: new client, new registry, new hook bus, Local creds,
+/// new token cache, no lease managers.
+fn fresh_host_parts() -> Result<crate::host::HostParts> {
+    let client = build_host_http_client()?;
+    // Operational retention (Task 12): physically remove expired
+    // content-capture bundles at session startup — bounded, fail-soft,
+    // confined to the private capture dir. The root resolved here is
+    // the SAME value bound into `capture_dir` (fix1 I2b).
+    let capture_dir = trace::default_capture_dir();
+    let _ = trace::sweep_expired_captures(&capture_dir);
+    Ok(crate::host::HostParts {
+        client,
+        tools: Arc::new(RwLock::new(ToolRegistry::new())),
+        hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
+        credential_source: crate::auth::CredentialSource::Local,
+        token_cache: crate::auth::TokenCache::new(),
+        mcp_runtime: None,
+        extension_runtime: None,
+        capture_dir,
+        progressive_tool_disclosure: false,
+    })
+}
+
 /// Preserve compatibility with favorite IDs written before Anthropic used its
 /// runtime-qualified provider name. Authorization always stores the canonical
 /// exact identity; unrelated bare values remain invalid and are ignored.
@@ -685,34 +758,34 @@ fn canonical_trusted_worker_model(model: &str) -> String {
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
+        // UNCHANGED semantics: fresh everything (tests, `synaps agent`).
+        Ok(Self::from_parts(RuntimeParts::with_reaper(
+            fresh_host_parts()?,
+        )))
+    }
+
+    /// The single struct-literal site for `Runtime`. Host-owned parts come
+    /// from `parts.host`; everything else is fresh.
+    pub(crate) fn from_parts(parts: RuntimeParts) -> Self {
         // Runtime construction is credential-blind. Credentials are acquired
         // lazily through the broker abstraction after configuration is applied;
         // this layer never opens auth.json or consults a secret environment var.
         let (auth_token, auth_type, refresh_token, token_expires) =
             (String::new(), "oauth".to_string(), None, Some(0));
-
-        let client = build_http_client(HTTP_READ_TIMEOUT)
-            .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
-
-        // Operational retention (Task 12): physically remove expired
-        // content-capture bundles at session startup — bounded, fail-soft,
-        // confined to the private capture dir. The root resolved here is
-        // the SAME value bound into `capture_dir` below (fix1 I2b).
-        let capture_dir = trace::default_capture_dir();
-        let _ = trace::sweep_expired_captures(&capture_dir);
-
-        let session_manager = {
-            let config = crate::tools::shell::ShellConfig::default();
-            crate::tools::shell::SessionManager::new(config)
+        let RuntimeParts {
+            host,
+            session_manager,
+            reaper,
+        } = parts;
+        let (reaper_handle, reaper_cancel) = match reaper {
+            Some((h, c)) => (Some(h), Some(c)),
+            None => (None, None),
         };
+        let mcp_runtime = host.mcp_runtime;
+        let extension_runtime = host.extension_runtime;
 
-        // Start the idle session reaper
-        let mgr = session_manager.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let reaper_handle = crate::tools::shell::session::start_reaper(mgr, cancel.clone());
-
-        Ok(Runtime {
-            client,
+        let mut runtime = Runtime {
+            client: host.client,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
                 auth_type,
@@ -720,7 +793,7 @@ impl Runtime {
                 token_expires,
             })),
             model: crate::models::default_model().to_string(),
-            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            tools: host.tools,
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
@@ -762,20 +835,20 @@ impl Runtime {
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
             retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            capture_dir,
+            capture_dir: host.capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
-            hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
-            reaper_handle: Some(reaper_handle),
-            reaper_cancel: Some(cancel),
-            credential_source: crate::auth::CredentialSource::Local,
-            token_cache: crate::auth::TokenCache::new(),
+            hook_bus: host.hook_bus,
+            reaper_handle,
+            reaper_cancel,
+            credential_source: host.credential_source,
+            token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
-            progressive_tool_disclosure: false,
+            progressive_tool_disclosure: host.progressive_tool_disclosure,
             delegation_parent: None,
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -785,8 +858,20 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
-        })
+            session_id: None,
+        };
+        // Lease managers are installed through the same seams boot used, so
+        // the per-runtime durable session-scope guards are minted exactly as
+        // before (keyed by this runtime's fresh host tool session).
+        if let Some(m) = mcp_runtime {
+            runtime.install_mcp_runtime(m);
+        }
+        if let Some(m) = extension_runtime {
+            runtime.install_extension_runtime(m);
+        }
+        runtime
     }
+
 
     /// Offline construction seam for headless test harnesses (P4).
     ///
@@ -802,87 +887,25 @@ impl Runtime {
     pub fn new_headless() -> Self {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
-
-        let session_manager = {
-            let config = crate::tools::shell::ShellConfig::default();
-            crate::tools::shell::SessionManager::new(config)
-        };
-
-        Runtime {
+        let host = crate::host::HostParts {
             client,
-            auth: Arc::new(RwLock::new(AuthState {
-                auth_token: "test-token".to_string(),
-                auth_type: "api_key".to_string(),
-                refresh_token: None,
-                token_expires: None,
-            })),
-            model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
-            system_prompt: None,
-            effective_prompt: None,
-            prompt_generation: 0,
-            prompt_reload_source: None,
-            thinking_budget: 4096,
-            named_level: None,
-            explicit_reasoning: false,
-            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
-            context_window_override: None,
-            compaction_model: None,
-            compaction_mode: agent_core::compaction::CompactionMode::default(),
-            compaction_exclusions: Vec::new(),
-            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            subagent_registry: Arc::new(Mutex::new(
-                crate::runtime::subagent::SubagentRegistry::new(),
-            )),
-            orchestration: None,
-            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
-            watcher_exit_path: None,
-            max_tool_output: 30000,
-            bash_timeout: 30,
-            bash_max_timeout: 300,
-            subagent_timeout: 300,
-            api_retries: 3,
-            refusal_retries: 2,
-            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
-            telemetry_writer: None,
-            trace_ctx: trace::TraceContext::disabled(),
-            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
-            // Off/no-lease default — subagents get a FRESH construction of
-            // this state (task A5 invariant), never a copy of the parent's.
-            memory_context_state: fresh_memory_context_state(),
-            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(any(test, feature = "testing"))]
-            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            // Empty per construction — a held recall segment is turn-scoped
-            // session state and is never copied into a fresh runtime.
-            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            capture_dir: trace::default_capture_dir(),
-            cache_diagnostics: false,
-            cache_ttl: crate::core::config::CacheTtl::default(),
-            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_msg_id: Arc::new(Mutex::new(None)),
-            session_manager,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
-            reaper_handle: None,
-            reaper_cancel: None,
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
-            trusted_worker_models: Vec::new(),
-            progressive_tool_disclosure: false,
-            delegation_parent: None,
             mcp_runtime: None,
-            mcp_session_scope: None,
             extension_runtime: None,
-            extension_session_scope: None,
-            turn_budget: crate::runtime::budget::TurnBudget::for_role(
-                crate::runtime::budget::TurnRole::Foreground,
-            ),
-            host_tool_session: fresh_host_tool_session(),
-        }
+            capture_dir: trace::default_capture_dir(),
+            progressive_tool_disclosure: false,
+        };
+        let mut runtime = Self::from_parts(RuntimeParts::without_reaper(host));
+        runtime.auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "test-token".to_string(),
+            auth_type: "api_key".to_string(),
+            refresh_token: None,
+            token_expires: None,
+        }));
+        runtime
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -1258,6 +1281,16 @@ impl Runtime {
     /// fresh per independently constructed `Runtime`.
     pub fn host_tool_session_id(&self) -> &crate::tools::activation::SessionId {
         &self.host_tool_session
+    }
+
+    /// Conversation/session identity this runtime serves (keys hook
+    /// injection). `None` = unkeyed (workers).
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -3468,6 +3501,7 @@ impl Runtime {
             event_queue,
             secret_prompt,
             hook_bus: self.hook_bus.clone(),
+            session_id: self.session_id.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3627,6 +3661,8 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            // Clones serve the same conversation (see memory_context_state).
+            session_id: self.session_id.clone(),
         }
     }
 }

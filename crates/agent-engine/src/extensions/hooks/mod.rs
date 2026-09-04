@@ -68,7 +68,10 @@ pub struct HookBus {
     /// extension that wants to hand the model a session handoff should not
     /// have to fake it by tracking "have I injected yet?" across every
     /// message, and should not pay to re-send it each turn.
-    session_injection: RwLock<Option<String>>,
+    ///
+    /// Keyed by conversation session id: one process may host N sessions
+    /// (Phase 2 daemon), and each must read only its own injection.
+    session_injection: RwLock<HashMap<String, String>>,
 }
 
 impl HookBus {
@@ -76,22 +79,44 @@ impl HookBus {
     pub fn new() -> Self {
         Self {
             handlers: RwLock::new(HashMap::new()),
-            session_injection: RwLock::new(None),
+            session_injection: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Record context injected by an `on_session_start` handler.
+    /// Record context injected by an `on_session_start` handler for
+    /// `session_id`.
     ///
-    /// Called once, by whoever emits the session-start event, after
-    /// extensions have loaded. Later calls replace the stored value.
-    pub async fn set_session_injection(&self, content: String) {
-        *self.session_injection.write().await = Some(content);
+    /// Called once per session, by whoever emits the session-start event,
+    /// after extensions have loaded. Later calls for the same id replace the
+    /// stored value.
+    pub async fn set_session_injection_for(&self, session_id: &str, content: String) {
+        self.session_injection
+            .write()
+            .await
+            .insert(session_id.to_string(), content);
     }
 
-    /// Context injected at session start, if any. Read on every turn while
-    /// composing the system prompt.
+    /// Context injected at session start for `session_id`, if any. Read on
+    /// every turn while composing the system prompt.
+    pub async fn session_injection_for(&self, session_id: &str) -> Option<String> {
+        self.session_injection.read().await.get(session_id).cloned()
+    }
+
+    /// Drop the injection recorded for `session_id` (session teardown).
+    pub async fn clear_session_injection(&self, session_id: &str) {
+        self.session_injection.write().await.remove(session_id);
+    }
+
+    /// Compatibility shim: writes under the empty key.
+    #[deprecated(note = "use set_session_injection_for")]
+    pub async fn set_session_injection(&self, content: String) {
+        self.set_session_injection_for("", content).await;
+    }
+
+    /// Compatibility shim: reads the empty key.
+    #[deprecated(note = "use session_injection_for")]
     pub async fn session_injection(&self) -> Option<String> {
-        self.session_injection.read().await.clone()
+        self.session_injection_for("").await
     }
 
     /// Register a handler for a specific hook kind.
@@ -1227,5 +1252,35 @@ mod tests {
         )
         .await;
         assert!(result2.is_char_boundary(result2.len()));
+    }
+
+    #[tokio::test]
+    async fn keyed_injection_isolated_per_session() {
+        let bus = HookBus::new();
+        bus.set_session_injection_for("s1", "one".into()).await;
+        bus.set_session_injection_for("s2", "two".into()).await;
+        assert_eq!(bus.session_injection_for("s1").await.as_deref(), Some("one"));
+        assert_eq!(bus.session_injection_for("s2").await.as_deref(), Some("two"));
+        assert_eq!(bus.session_injection_for("s3").await, None);
+    }
+
+    #[tokio::test]
+    async fn clear_removes_only_that_session() {
+        let bus = HookBus::new();
+        bus.set_session_injection_for("s1", "one".into()).await;
+        bus.set_session_injection_for("s2", "two".into()).await;
+        bus.clear_session_injection("s1").await;
+        assert_eq!(bus.session_injection_for("s1").await, None);
+        assert_eq!(bus.session_injection_for("s2").await.as_deref(), Some("two"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn deprecated_shims_use_empty_key() {
+        let bus = HookBus::new();
+        bus.set_session_injection("legacy".into()).await;
+        assert_eq!(bus.session_injection().await.as_deref(), Some("legacy"));
+        assert_eq!(bus.session_injection_for("").await.as_deref(), Some("legacy"));
+        assert_eq!(bus.session_injection_for("s1").await, None);
     }
 }

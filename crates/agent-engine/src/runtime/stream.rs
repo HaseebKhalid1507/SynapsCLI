@@ -51,6 +51,9 @@ pub(super) struct StreamSession {
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    /// Conversation id keying the `on_session_start` injection. `None`
+    /// (workers) reads nothing.
+    pub(super) session_id: Option<String>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -256,6 +259,7 @@ impl StreamMethods {
             subagent_registry,
             event_queue,
             hook_bus,
+            session_id,
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
@@ -444,11 +448,14 @@ impl StreamMethods {
             // the catalog generation since the retained set was built (e.g.
             // `connect_mcp_server` drained after the previous round),
             // rebuild it here — explicitly, deterministically, from the
-            // currently verified capabilities, with ZERO inherited
-            // activations (catalog drift invalidates exact activations by
-            // design). This is the ONLY rebuild site; individual calls
-            // never refresh it. The catalog snapshot cloned here feeds the
-            // passive discovery/activation capability context this round.
+            // currently verified capabilities. Exact activations whose
+            // record still matches its pinned digest+provenance are carried
+            // forward (re-issued at the new generation); drifted/removed
+            // ones are dropped. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores
+            // the zero-inherit rebuild. This is the ONLY rebuild site;
+            // individual calls never refresh it. The catalog snapshot cloned
+            // here feeds the passive discovery/activation capability context
+            // this round.
             let (tools_snapshot, catalog_snapshot) = {
                 let registry = tools.read().await;
                 {
@@ -456,7 +463,19 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = if progressive_tool_disclosure {
+                        if crate::tools::activation::carry_forward_enabled() {
+                            let (next, dropped) = set
+                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
+                            for d in &dropped {
+                                tracing::warn!(
+                                    tool = %d.id,
+                                    reason = ?d.reason,
+                                    "activation dropped at round-top rebuild"
+                                );
+                            }
+                            *set = next;
+                        } else {
+                            *set = if progressive_tool_disclosure {
                             crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
                                 tool_session_id.clone(),
                                 registry.catalog(),
@@ -467,6 +486,7 @@ impl StreamMethods {
                                 registry.catalog(),
                             )
                         };
+                        }
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -489,7 +509,11 @@ impl StreamMethods {
 
             // Session-scoped context in system: byte-identical across the
             // whole session, cache-safe by construction.
-            let injected_system: Option<String> = match hook_bus.session_injection().await {
+            let session_injection = match session_id.as_deref() {
+                Some(id) => hook_bus.session_injection_for(id).await,
+                None => None,
+            };
+            let injected_system: Option<String> = match session_injection {
                 Some(content) => Some(wrap_extension_context(
                     system_prompt.as_deref().unwrap_or_default(),
                     &content,
@@ -2125,6 +2149,7 @@ mod rich_output_tests {
             )),
             event_queue: Arc::new(crate::events::EventQueue::new(100)),
             hook_bus,
+            session_id: None,
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
