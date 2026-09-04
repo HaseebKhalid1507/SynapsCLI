@@ -325,3 +325,69 @@ async fn stale_socket_reaped_and_second_daemon_refused() {
     d.shutdown_token().cancel();
     d.wait().await;
 }
+
+/// §5 / §11.8c: `--idle-exit` is no longer inert once a session exists —
+/// a client-less session between turns is idle-eligible; a session that
+/// reports `streaming` (or does not answer the probe) pins the daemon up.
+#[tokio::test]
+#[serial]
+async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
+    use agent_engine::session::wire::IDLE_PROBE_QUERY_ID;
+
+    // 1. probe semantics against a hand-rolled actor
+    let meta = agent_engine::session::handle::echo::meta_for(&SessionId::from("probe"));
+    let view = agent_engine::session::handle::echo::view_for();
+    let (h, mut ep) = SessionHandle::new(meta, view);
+    let events = ep.events.clone();
+    let sid = h.id.clone();
+    let streaming = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let s2 = Arc::clone(&streaming);
+    let actor = tokio::spawn(async move {
+        while let Some(cmd) = ep.cmd_rx.recv().await {
+            if let SessionCommand::Query { id, query: SessionQuery::Status } = cmd {
+                assert_eq!(id, IDLE_PROBE_QUERY_ID);
+                let value = serde_json::json!({ "streaming": s2.load(std::sync::atomic::Ordering::SeqCst), "pending_prompts": 0 });
+                let _ = events.send(Envelope { session_id: sid.clone(), seq: 0, ts: chrono::Utc::now(), event: SessionEventWire::QueryResult { id, value } });
+            }
+        }
+    });
+    assert!(!daemon::session_is_idle(&h).await, "streaming → busy");
+    streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(daemon::session_is_idle(&h).await, "between turns → idle");
+    actor.abort();
+    let _ = actor.await;
+
+    // 2. end to end: a created-then-detached echo session lets the daemon exit
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = Daemon::start(
+        host().await,
+        DaemonOpts {
+            runtime_dir: Some(run.clone()),
+            factory: Some(daemon::echo_factory()),
+            idle_exit: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let paths = d.paths.clone();
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut t, _) = SocketTransport::attach(
+        conn,
+        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next(&mut t).await.event, SessionEventWire::ClientJoined { .. }));
+    // attached client pins the daemon regardless of session state
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!d.state.shutdown.is_cancelled(), "a connected client blocks idle-exit");
+    assert!(!daemon::daemon_is_idle(&d.state).await);
+    t.detach().await;
+    assert!(t.next_event().await.is_none());
+    assert_eq!(d.state.live_sessions().len(), 1, "session outlives the client");
+    // now: zero connections + one client-less idle session → exits
+    tokio::time::timeout(Duration::from_secs(5), d.wait()).await.expect("idle-exit fired with a live idle session");
+    assert!(!paths.sock.exists());
+}

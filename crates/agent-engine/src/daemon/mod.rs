@@ -84,7 +84,9 @@ pub struct DaemonOpts {
     /// Override the socket path (the lock/json/pid stay under `registry_dir()`).
     pub socket: Option<PathBuf>,
     pub profile: Option<String>,
-    /// Exit after this long with zero connections and zero live sessions.
+    /// Exit after this long with zero connections and no session running a
+    /// turn (idle, client-less sessions are saved on exit; `--continue`
+    /// brings them back). A turn in flight always blocks the exit.
     pub idle_exit: Option<Duration>,
     pub allow_legacy_mcp: bool,
     /// Test seam: `registry_dir()` replacement.
@@ -266,6 +268,58 @@ impl Daemon {
     }
 }
 
+/// How long a `Status` probe may take before the session counts as busy.
+const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether `handle`'s actor is between turns. Asks `Query{Status}` under the
+/// reserved [`crate::session::wire::IDLE_PROBE_QUERY_ID`] (transports swallow
+/// it) and reads `streaming`. A no-answer inside [`IDLE_PROBE_TIMEOUT`] —
+/// the actor is inside `compact()`/preflight, or its queue is full — counts
+/// as busy: the daemon never exits under a running turn (jcode mistake #1).
+pub async fn session_is_idle(handle: &SessionHandle) -> bool {
+    use crate::session::wire::IDLE_PROBE_QUERY_ID;
+    use crate::session::{SessionCommand, SessionEventWire, SessionQuery};
+    let mut rx = handle.subscribe();
+    if handle.send(SessionCommand::Query { id: IDLE_PROBE_QUERY_ID, query: SessionQuery::Status }).await.is_err() {
+        return false;
+    }
+    let probe = async {
+        loop {
+            match rx.recv().await {
+                Ok(env) => {
+                    if let SessionEventWire::QueryResult { id, value } = env.event {
+                        if id == IDLE_PROBE_QUERY_ID {
+                            // Real actor: {"streaming": bool, "pending_prompts": n}. A backend that
+                            // does not implement Status (echo) has no turns to protect.
+                            let streaming = value.get("streaming").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let prompts = value.get("pending_prompts").and_then(|v| v.as_u64()).unwrap_or(0);
+                            return !streaming && prompts == 0;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
+            }
+        }
+    };
+    tokio::time::timeout(IDLE_PROBE_TIMEOUT, probe).await.unwrap_or(false)
+}
+
+/// Idle = zero connections AND every live session between turns, held for
+/// `idle` continuously. Clients count first so a probe is never sent while
+/// someone is attached.
+pub async fn daemon_is_idle(state: &DaemonState) -> bool {
+    if state.connections.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    for h in state.live_sessions() {
+        if !session_is_idle(&h).await {
+            return false;
+        }
+    }
+    true
+}
+
 async fn idle_monitor(state: Arc<DaemonState>, idle: Duration) {
     let mut idle_since: Option<Instant> = None;
     let tick = Duration::from_secs(5).min(idle.max(Duration::from_millis(100)));
@@ -274,8 +328,7 @@ async fn idle_monitor(state: Arc<DaemonState>, idle: Duration) {
             _ = state.shutdown.cancelled() => return,
             _ = tokio::time::sleep(tick) => {}
         }
-        let busy = state.connections.load(Ordering::SeqCst) > 0 || !state.live_sessions().is_empty();
-        if busy {
+        if !daemon_is_idle(&state).await {
             idle_since = None;
             continue;
         }
@@ -431,6 +484,9 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
         tracing::warn!("daemon: extension discovery still running after 10 s; accepting anyway");
     }
+    // C3 router: widget.* frames from every sidecar fan out to every live
+    // session (daemon-global widgets today — frames carry no session id).
+    let _router = crate::extensions::notify_router::spawn_notification_router(Arc::clone(&host));
 
     let mut opts = opts;
     if opts.factory.is_none() {
