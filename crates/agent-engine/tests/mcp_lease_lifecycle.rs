@@ -75,6 +75,7 @@ fn fixture(tag: &str, mode: &str, tools: Value) -> Fixture {
         command: "python3".to_string(),
         args: vec![fixture_script().display().to_string()],
         env,
+        shared: false,
     };
     Fixture { dir, spy, config }
 }
@@ -195,7 +196,10 @@ async fn zero_spawn_before_leased_execution() {
     let fx = fixture("zero-spawn", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
 
     let mut registry = ToolRegistry::new();
     registry
@@ -225,7 +229,10 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     let fx = fixture("exact-once", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
@@ -259,7 +266,10 @@ async fn concurrent_first_calls_are_single_flight() {
     let fx = fixture("single-flight", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let digest = SchemaDigest::of_schema(&echo_schema());
 
     let session = sid();
@@ -296,7 +306,10 @@ async fn sibling_stays_gate_denied_and_is_never_called() {
     let fx = fixture("sibling", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let mut registry = ToolRegistry::new();
@@ -336,7 +349,10 @@ async fn fingerprint_drift_invalidates_lease_and_gracefully_kills_child() {
     let fx = fixture("drift", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, map) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
@@ -393,7 +409,10 @@ async fn name_and_schema_mismatch_deny_before_any_call() {
     let fx = fixture("mismatch", "ok", hostile);
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
 
     let digest = SchemaDigest::of_schema(&echo_schema());
     let err = manager
@@ -431,7 +450,10 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
     // idle_max ZERO: any pre-existing lease is idle by the next acquisition.
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::ZERO));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::ZERO)
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
     let digest = SchemaDigest::of_schema(&echo_schema());
 
@@ -506,7 +528,10 @@ async fn hostile_and_oversized_provider_data_is_bounded_and_withheld() {
     let fx = fixture("huge", "huge", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let digest = SchemaDigest::of_schema(&echo_schema());
     let err = manager
         .call_exact(
@@ -529,7 +554,10 @@ async fn hostile_and_oversized_provider_data_is_bounded_and_withheld() {
     let fx = fixture("hostile-err", "error", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let err = manager
         .call_exact(
             &sid(),
@@ -553,7 +581,10 @@ async fn lease_lifecycle_never_mutates_the_catalog() {
     let fx = fixture("no-drift", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let mut registry = ToolRegistry::new();
@@ -583,7 +614,10 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     let fx = fixture("durable-scope", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let digest = SchemaDigest::of_schema(&echo_schema());
     let session = sid();
 
@@ -696,7 +730,10 @@ async fn fingerprint_drift_revokes_exact_grant_but_not_siblings_or_core() {
     let fx = fixture("grant-drift", "ok", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, map) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let mut registry = ToolRegistry::new();
@@ -781,7 +818,10 @@ async fn schema_mismatch_revokes_grant_but_transport_errors_do_not() {
     let fx = fixture("grant-mismatch", "ok", hostile);
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
 
     let mut registry = ToolRegistry::new();
@@ -813,7 +853,10 @@ async fn schema_mismatch_revokes_grant_but_transport_errors_do_not() {
     let fx = fixture("grant-transport", "huge", advertised_tools());
     let fp = server_config_fingerprint(&fx.config);
     let (source, _) = shared_source(fx.config.clone());
-    let manager = Arc::new(McpRuntimeManager::new(source, Duration::from_secs(300)));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
     let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
     let mut registry = ToolRegistry::new();
     let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
@@ -885,5 +928,275 @@ fn revoke_exact_is_typed_and_reap_scan_covers_full_cap() {
         Err(ExactRevocationError::NotActivated(echo_id.clone()))
     );
     assert_eq!(set.schema_generation(), generation + 1);
+    fx.cleanup();
+}
+
+// ── daemon-mode phase 2 (C4): shared leases + descriptor-cache write-back ───
+
+/// The kill-switch test mutates a process-global env var; the write-back
+/// test must not observe it mid-flight.
+static WRITEBACK_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn sid_named(name: &str) -> SessionId {
+    SessionId::parse(name).unwrap()
+}
+
+fn shared_fixture(tag: &str) -> Fixture {
+    let mut fx = fixture(tag, "ok", advertised_tools());
+    fx.config.shared = true;
+    fx
+}
+
+#[tokio::test]
+async fn mcp_shared_lease_key_is_star() {
+    let fx = shared_fixture("shared-key");
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let digest = SchemaDigest::of_schema(&echo_schema());
+
+    // `shared` is launch-irrelevant: the fingerprint must not move.
+    let mut unshared = fx.config.clone();
+    unshared.shared = false;
+    assert_eq!(server_config_fingerprint(&unshared), fp);
+
+    for session in ["sess-A", "sess-B"] {
+        manager
+            .call_exact(
+                &sid_named(session),
+                "srv",
+                &fp,
+                "echo_tool",
+                &digest,
+                json!({"text": session}),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        manager.lease_keys_for_tests(),
+        vec![(agent_engine::mcp::lease::SHARED_SESSION_KEY.to_string(), "srv".to_string())]
+    );
+    assert_eq!(fx.count("spawn"), 1, "two sessions, ONE shared child");
+    assert_eq!(fx.count("request:tools/call:echo_tool"), 2);
+    // Liveness seam resolves through the shared key for either session.
+    assert!(manager.lease_liveness_for_tests(&sid_named("sess-B"), "srv").is_some());
+    manager.terminate_all();
+    assert_eq!(manager.lease_count(), 0);
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn terminate_session_spares_shared() {
+    let fx = shared_fixture("shared-spare");
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let digest = SchemaDigest::of_schema(&echo_schema());
+    manager
+        .call_exact(
+            &sid_named("sess-A"),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "a"}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(manager.terminate_session(&sid_named("sess-A")), 0);
+    drop(McpSessionEndGuard::new(
+        sid_named("sess-A"),
+        Arc::clone(&manager),
+    ));
+    assert_eq!(manager.lease_count(), 1, "session end must not kill a shared child");
+    assert_eq!(fx.count("eof"), 0);
+
+    // Another session keeps using the same child.
+    manager
+        .call_exact(
+            &sid_named("sess-B"),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "b"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fx.count("spawn"), 1);
+
+    // Explicit revocation (poisoned lease) still works through the shared key.
+    manager.revoke_server_lease(&sid_named("sess-B"), "srv");
+    assert_eq!(manager.lease_count(), 0);
+    assert!(wait_until(|| fx.count("eof") == 1).await);
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn reap_idle_reaps_shared() {
+    let fx = shared_fixture("shared-reap");
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::ZERO)
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let digest = SchemaDigest::of_schema(&echo_schema());
+    manager
+        .call_exact(
+            &sid_named("sess-A"),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "a"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manager.lease_count(), 1);
+    manager.reap_idle();
+    assert_eq!(manager.lease_count(), 0, "idle reap applies to shared leases");
+    assert!(wait_until(|| fx.count("eof") == 1).await);
+
+    // terminate_all covers shared too.
+    manager
+        .call_exact(
+            &sid_named("sess-A"),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "b"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fx.count("spawn"), 2);
+    manager.terminate_all();
+    assert_eq!(manager.lease_count(), 0);
+    assert!(wait_until(|| fx.count("eof") == 2).await);
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn descriptor_cache_written_after_list_tools() {
+    use agent_engine::mcp::descriptors::load_cache_from;
+
+    let _env = WRITEBACK_ENV_LOCK.lock().await;
+    let fx = fixture("writeback", "ok", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let cache_path = fx.dir.join("mcp-descriptors.json");
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(cache_path.clone()),
+    );
+    let digest = SchemaDigest::of_schema(&echo_schema());
+    assert!(!cache_path.exists());
+
+    manager
+        .call_exact(
+            &sid(),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "a"}),
+        )
+        .await
+        .unwrap();
+
+    // File exists, fingerprint matches, digests match the live listing.
+    let cache = load_cache_from(&cache_path).expect("cache written after tools/list");
+    let srv = cache.servers.get("srv").expect("server entry recorded");
+    assert_eq!(srv.fingerprint, fp);
+    assert_eq!(srv.tools.len(), 2);
+    let echo = srv.tools.iter().find(|t| t.name == "echo_tool").unwrap();
+    assert_eq!(SchemaDigest::of_schema(&echo.input_schema), digest);
+    assert_eq!(echo.description, "echoes text back");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // Second boot: dormant tools come from the written cache — no spawn.
+    let spawns_before = fx.count("spawn");
+    let mut registry = ToolRegistry::new();
+    let registered = registry
+        .try_register_batch(dormant_tools_for_config(
+            &config_with(fx.config.clone()),
+            &cache,
+        ))
+        .unwrap();
+    assert_eq!(registered, 2, "second boot advertises the cached tools");
+    assert_eq!(fx.count("spawn"), spawns_before, "cache hit spawns nothing");
+
+    // Merge, don't clobber: an entry for another server survives a write-back.
+    let mut other = load_cache_from(&cache_path).unwrap();
+    other.servers.insert(
+        "other".to_string(),
+        CachedServerDescriptors {
+            fingerprint: "fp-other".to_string(),
+            tools: vec![],
+        },
+    );
+    agent_engine::mcp::descriptors::store_cache_at(&cache_path, &other).unwrap();
+    manager.terminate_all();
+    manager
+        .call_exact(
+            &sid(),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "b"}),
+        )
+        .await
+        .unwrap();
+    let merged = load_cache_from(&cache_path).unwrap();
+    assert!(merged.servers.contains_key("other"), "write-back merges");
+    assert_eq!(merged.servers["srv"].fingerprint, fp);
+
+    manager.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn descriptor_cache_writeback_kill_switch() {
+    let _env = WRITEBACK_ENV_LOCK.lock().await;
+    let fx = fixture("writeback-off", "ok", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let cache_path = fx.dir.join("mcp-descriptors.json");
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(cache_path.clone()),
+    );
+    let digest = SchemaDigest::of_schema(&echo_schema());
+
+    std::env::set_var("SYNAPS_MCP_CACHE_WRITEBACK", "0");
+    let result = manager
+        .call_exact(
+            &sid(),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text": "a"}),
+        )
+        .await;
+    std::env::remove_var("SYNAPS_MCP_CACHE_WRITEBACK");
+    result.unwrap();
+    assert!(!cache_path.exists(), "SYNAPS_MCP_CACHE_WRITEBACK=0 writes nothing");
+    manager.terminate_all();
     fx.cleanup();
 }
