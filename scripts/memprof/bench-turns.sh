@@ -65,9 +65,12 @@ subagents)
     sleep 1
   done
   installs=$(( $(count 'global broker installed') - installs0 ))
+  # Per-process truth: the last `turn memory` line carries this process'
+  # running set_global_broker count (the log file accumulates across runs).
+  in_proc=$(grep 'turn memory' "$(logfile)" | tail -1 | grep -oE 'broker_installs=[0-9]+' | cut -d= -f2)
   echo "subagent_start calls: $(count 'subagent_start') ; turns done: $(( $(count 'turn memory') - turns0 ))"
-  echo "peak: RSS=${peak_rss} kB threads=${peak_thr}"
-  echo "BROKER_INSTALLS_DURING_TURN=$installs total_in_log=$(count 'global broker installed') (gate: total == 1) $([ "$(count 'global broker installed')" -eq 1 ] && echo PASS || echo FAIL)"
+  echo "peak: RSS=${peak_rss} kB threads=${peak_thr}; after: RssAnon=$(anon_kb "$pid") kB threads=$(threads "$pid")"
+  echo "BROKER_INSTALLS this process=${in_proc:-?} (new log lines during turn: $installs) (gate: == 1) $([ "${in_proc:-0}" -eq 1 ] && echo PASS || echo FAIL)"
   ;;
 *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
