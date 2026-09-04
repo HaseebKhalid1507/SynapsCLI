@@ -67,6 +67,12 @@ testing = ["agent-engine/testing"]
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", features = ["iterator"] }
 
+[target.'cfg(all(unix, not(target_env = "musl")))'.dev-dependencies]
+# tests/highlight_mem.rs: same allocator as the synaps binary so the C1/C2
+# syntect heap numbers come from jemalloc's own accounting, not glibc's
+# never-returned free lists.
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
 [dev-dependencies]
 serial_test = "3.4.0"
 # P5 spike: escape-level render verification — parses the ANSI byte stream a
