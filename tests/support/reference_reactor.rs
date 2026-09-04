@@ -1,16 +1,29 @@
 //! FROZEN reference reactor — the oracle for `tests/session_actor_differential.rs`.
 //!
-//! A verbatim copy of today's engine-half reactor logic driving a `Runtime`
-//! directly, exactly as the inline TUI/chat hosts do @ e640cafb:
+//! A frozen RE-DERIVATION (not a verbatim copy) of the engine-half reactor
+//! logic that the inline TUI/chat hosts run against a `Runtime` @ e640cafb,
+//! written from these sites:
 //!   - `crates/agent-tui/src/tui/dispatch.rs:1231-1288`  Submit
-//!   - `crates/agent-tui/src/tui/dispatch.rs:134-192`    Abort
 //!   - `crates/agent-tui/src/tui/dispatch.rs:1369-1378`  StreamingInput (steer/queue)
 //!   - `crates/agent-tui/src/tui/stream_handler.rs:40-248`  handle_stream_event (engine half)
 //!   - `crates/agent-tui/src/tui/stream_handler.rs:256-391` handle_event_queue_arm
 //!   - `crates/agent-tui/src/tui/stream_handler.rs:393-545` handle_stream_arm
 //!
-//! It is an oracle, not shared code. NEVER edit after A5 — the differential
-//! test asserts this file's sha256 against a constant.
+//! What it deliberately OMITS (so the differential cannot cover them):
+//!   - Abort (`dispatch.rs:134-192`): there is no cancel path; `abort_context`
+//!     is only consumed on Submit, never produced.
+//!   - Secret prompts: `run_stream_with_messages` is called with `None` for
+//!     the prompt handle (the actor passes `Some(handle)`).
+//!   - Save: nothing is persisted; save cadence is not compared.
+//!
+//! Because it was written by the same author from the same reading of the
+//! TUI as `SessionActor`, it is a regression guard against drift between
+//! the two — NOT an independent oracle: a misreading shared by both passes.
+//!
+//! It is an oracle, not shared code. NEVER edit the code below this header
+//! — the differential test asserts this file's sha256 against a constant
+//! (re-pinned once for this header rewrite; see the SHA in
+//! `session_actor_differential.rs`).
 
 #![allow(dead_code, clippy::collapsible_match)]
 

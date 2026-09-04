@@ -121,11 +121,11 @@ pub fn spawn_discover_and_load(
     // a walk is in flight BEFORE the task runs, and flip `extensions_ready`
     // at Finished so `SessionActor::create` fires `on_session_start` only
     // once extensions are subscribed.
-    let host = crate::host::EngineHost::current()
-        .filter(|host| Arc::ptr_eq(host.ext_manager(), &manager));
-    if let Some(host) = &host {
-        host.note_extensions_loading();
-    }
+    // The guard marks ready on ANY task exit (incl. panic) so
+    // `extensions_ready()` waiters are never stranded.
+    let ready_guard = crate::host::EngineHost::current()
+        .filter(|host| Arc::ptr_eq(host.ext_manager(), &manager))
+        .map(|host| host.extensions_loading_guard());
     tokio::spawn(async move {
         let _ = tx.send(ExtensionLoaderEvent::Started);
         let (loaded, failed) = manager
@@ -142,9 +142,8 @@ pub fn spawn_discover_and_load(
             emit_session_start(&hook_bus, &session_id).await;
         }
 
-        if let Some(host) = &host {
-            host.mark_extensions_ready();
-        }
+        // Ready BEFORE Finished, as before.
+        drop(ready_guard);
         let _ = tx.send(ExtensionLoaderEvent::Finished { loaded, failed });
     })
 }

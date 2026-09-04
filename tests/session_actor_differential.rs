@@ -30,7 +30,7 @@ fn reference_reactor_is_frozen() {
     let src = include_str!("support/reference_reactor.rs");
     let hex = format!("{:x}", Sha256::digest(src.as_bytes()));
     assert_eq!(
-        hex, "b76c57a9543aaac7749af602e44e9209db99d83a3dcebaf30b9e040c35feaa71",
+        hex, "080bbdd63a5b141cb0cc2ab8d360aec8276c75956ef5cd364548d017ce162c87",
         "tests/support/reference_reactor.rs is a frozen oracle — do not edit"
     );
 }
