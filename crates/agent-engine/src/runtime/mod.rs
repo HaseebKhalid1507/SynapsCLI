@@ -3252,6 +3252,7 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let cwd_inner = cfg_cwd.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -3302,7 +3303,7 @@ impl Runtime {
                                                     mcp_leases: None,
                                                     extension_leases: None,
                                                     memory_context: None,
-                                                    cwd: cfg_cwd.clone(),
+                                                    cwd: cwd_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
