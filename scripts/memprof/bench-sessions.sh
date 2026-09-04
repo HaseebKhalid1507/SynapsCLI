@@ -31,7 +31,7 @@ run_once() { # N i -> prints "pss_kb rss_anon_kb_of_first_engine procs startup_m
   done
   sleep "$SETTLE"
   local pids
-  pids=$(for s in $(seq 1 "$n"); do tmux -L bench list-panes -t "s$s" -F '#{pane_pid}'; done | xargs -I{} pgrep -P {} -x synaps | tr '\n' ' ')
+  pids=$(for s in $(seq 1 "$n"); do tmux -L bench list-panes -t "s$s" -F '#{pane_pid}'; done | xargs -I{} pgrep -P {} -x "$TAG" | tr '\n' ' ')
   {
     echo "== $BIN N=$n run=$i startup_ms=${starts[*]}"
     "$HERE/mem.sh" $pids
