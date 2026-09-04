@@ -392,3 +392,19 @@ async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
     tokio::time::timeout(Duration::from_secs(5), d.wait()).await.expect("idle-exit fired with a live idle session");
     assert!(!paths.sock.exists());
 }
+
+/// C2: `Purge` is a control fast path — answered with `Pong`, no session
+/// allocated.
+#[tokio::test]
+#[serial]
+async fn purge_frame_answers_pong() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+    let pong = SocketTransport::purge(&paths.sock).await.unwrap();
+    assert_eq!(pong.pid, std::process::id());
+    assert_eq!(pong.sessions, 0);
+    assert!(d.state.live_sessions().is_empty());
+    d.state.request_shutdown(false);
+}

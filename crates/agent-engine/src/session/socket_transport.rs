@@ -145,6 +145,15 @@ impl Connected {
         }
     }
 
+    /// `Purge` → the daemon runs `memstat::purge_arenas()`; replies `Pong`.
+    pub async fn purge(&mut self) -> Result<Pong, TransportError> {
+        match self.request(ClientFrame::Purge).await? {
+            DaemonFrame::Pong { pid, uptime_s, sessions } => Ok(Pong { pid, uptime_s, sessions }),
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
+        }
+    }
+
     pub async fn shutdown(&mut self, force: bool) -> Result<(), TransportError> {
         match self.request(ClientFrame::Shutdown { force }).await? {
             DaemonFrame::Bye { .. } => Ok(()),
@@ -276,6 +285,13 @@ impl SocketTransport {
     pub async fn shutdown(path: &Path, force: bool) -> Result<(), TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         c.shutdown(force).await
+    }
+
+    pub async fn purge(path: &Path) -> Result<Pong, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let p = c.purge().await;
+        c.bye().await;
+        p
     }
 
     /// Detach cleanly: `Detach` + `Bye`. The turn keeps running in the daemon.

@@ -12,6 +12,7 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Allow start with `progressive_tool_disclosure=false` **and** MCP servers configured (legacy `McpTool` connections would be shared across sessions). Same as `--allow-legacy-mcp`. |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
+| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` for attach clients is not wired yet (A4/C4 client diet). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 
 ## CLI
@@ -21,6 +22,7 @@ synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--allo
 synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
 synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s)
 synaps daemon sessions [--json]
+synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT]
 synaps --attach [ID]                 # today: notice + routes to `synaps attach` (daemon-attached TUI is day 2)
 ```
@@ -115,11 +117,10 @@ C: bye | socket close = Detach (turn keeps running)
   through the normal `End{HostShutdown}` path (saved to `sessions/<id>.json`; `synaps attach --continue`
   brings them back). Tested: `idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn`.
 - **Extension notification router** (`extensions::notify_router`) is spawned by `run_foreground` after
-  discovery: every sidecar's `widget.*` frames fan out to **every** live session as
-  `ExtensionNotification`. Frames carry no session id, so **widgets are daemon-global under
-  `SYNAPS_DAEMON=1`** (a widget upsert from work in session A shows in session B's client). Per-session
-  routing needs `params.session_id` from the extension contract — day 2; `heartbeat`/`jawz-widget` are
-  last-writer-wins until then (`docs/extensions/session-id.md`).
+  discovery: a sidecar's `widget.*` frame goes to the session named by `params.session_id` (dropped with
+  a `debug!` if that session is not live), or to **every** live session when the frame carries none
+  (daemon-global — the pre-phase-3 behaviour). Plugin contract: `docs/extensions/session-id.md`;
+  `heartbeat`/`jawz-widget` stay last-writer-wins until their own repos adopt it.
 - **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
   `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
   Spawned compaction is day 2.

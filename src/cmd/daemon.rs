@@ -1,4 +1,5 @@
-//! `synaps daemon {start,status,stop,sessions}` (PLAN-phase2 §2.11, B4).
+//! `synaps daemon {start,status,stop,sessions,purge}` (PLAN-phase2 §2.11, B4;
+//! phase 3 C2 `purge`).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,6 +54,9 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// Ask the daemon to return jemalloc dirty pages to the OS (bench hygiene:
+    /// run before sampling RssAnon).
+    Purge,
 }
 
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
@@ -82,7 +86,18 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Status { json }) => status(profile, json).await,
         Some(DaemonAction::Stop { force }) => stop(profile, force).await,
         Some(DaemonAction::Sessions { json }) => sessions(profile, json).await,
+        Some(DaemonAction::Purge) => purge(profile).await,
     }
+}
+
+async fn purge(profile: Option<String>) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        anyhow::bail!("daemon not running");
+    }
+    let pong = SocketTransport::purge(&paths.sock).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("purged (pid {}, sessions {})", pong.pid, pong.sessions);
+    Ok(())
 }
 
 async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {

@@ -216,8 +216,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     })
                     .await;
             }
+            // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
-                let _ = tx.send(DaemonFrame::Error { session_id: None, message: "purge not implemented in this build".into() }).await;
+                agent_core::core::memstat::purge_arenas();
+                let _ = tx
+                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
+                    .await;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
