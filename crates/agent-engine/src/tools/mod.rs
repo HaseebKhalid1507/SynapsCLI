@@ -123,6 +123,10 @@ pub struct ToolCapabilities {
     /// while `status`/`disable` still answer deterministically `Off`
     /// (memory off requires no infrastructure).
     pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
+    /// Per-session working directory (Phase 2 daemons serve sessions from N
+    /// directories in one process). `None` = inherit the process cwd — the
+    /// only value Phase 1 ever sets, so behaviour is byte-identical.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Configuration limits and timeouts.
