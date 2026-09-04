@@ -329,9 +329,54 @@ fn is_thin_client() -> bool {
     std::env::args().skip(1).any(|a| a == "attach" || a == "--attach" || a.starts_with("--attach="))
 }
 
+/// Thin-client re-exec (PLAN-phase4 §4.5, extended): `PR_SET_THP_DISABLE`
+/// is inherited across `execve`, so re-exec'ing ourselves once means the
+/// **whole** image — `.bss`, the main stack, jemalloc's first chunks — is
+/// mapped at 4 KiB granularity instead of the three 2 MiB huge pages the A1
+/// ladder found already resident at `main` (6 of the 7.4 MB). The same exec
+/// carries `_RJEM_MALLOC_CONF` so jemalloc boots with one arena and no
+/// background thread. `SYNAPS_CLIENT_REEXEC=0` disables; cost ≈ 3–5 ms
+/// (the `reexec` ladder stage is the pre-exec process' last line).
+#[cfg(target_os = "linux")]
+fn thin_client_reexec() {
+    use agent_core::core::memstat;
+    if std::env::var("SYNAPS_CLIENT_REEXEC").is_ok_and(|v| v == "0")
+        || std::env::var_os("SYNAPS_CLIENT_REEXECED").is_some()
+        || tui::client_diet::allocator_tuning_disabled()
+        || memstat::thp_disabled() == Some(true)
+    {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    if memstat::disable_thp().is_err() {
+        return;
+    }
+    memstat::ladder("reexec", &"");
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SYNAPS_CLIENT_REEXECED", "1")
+        .env(
+            "_RJEM_MALLOC_CONF",
+            std::env::var("SYNAPS_CLIENT_MALLOC_CONF").unwrap_or_else(|_| {
+                "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0".into()
+            }),
+        )
+        .exec();
+    // exec only returns on failure: carry on in this image.
+    let _ = err;
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thin_client_reexec() {}
+
 fn main() -> anyhow::Result<()> {
     let thin = is_thin_client();
     if thin {
+        thin_client_reexec();
+        // Consumed (jemalloc read it at load); keep them out of children.
+        std::env::remove_var("SYNAPS_CLIENT_REEXECED");
+        std::env::remove_var("_RJEM_MALLOC_CONF");
         // Ladder START pins on the first call — `main` must be first (§7.1).
         agent_core::core::memstat::ladder("main", &"");
         tui::client_diet::tune_allocator();

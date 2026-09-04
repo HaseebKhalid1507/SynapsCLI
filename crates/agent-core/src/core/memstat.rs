@@ -208,10 +208,18 @@ pub fn set_decay_ms(dirty_ms: i64, muzzy_ms: i64) -> MallctlResult {
                 .map_err(|e| mallctl_err("arenas.dirty_decay_ms", e))?;
             raw::write(b"arenas.muzzy_decay_ms\0", m)
                 .map_err(|e| mallctl_err("arenas.muzzy_decay_ms", e))?;
-            raw::write(b"arena.4096.dirty_decay_ms\0", d)
-                .map_err(|e| mallctl_err("arena.4096.dirty_decay_ms", e))?;
-            raw::write(b"arena.4096.muzzy_decay_ms\0", m)
-                .map_err(|e| mallctl_err("arena.4096.muzzy_decay_ms", e))?;
+            // `arena.<i>.*_decay_ms` rejects MALLCTL_ARENAS_ALL (EFAULT);
+            // walk the initialised arenas instead. Uninitialised ones take
+            // the `arenas.*` default above when created.
+            let n: u32 = raw::read(b"arenas.narenas\0")
+                .map_err(|e| mallctl_err("arenas.narenas", e))?;
+            for i in 0..n {
+                let dk = format!("arena.{i}.dirty_decay_ms\0");
+                let mk = format!("arena.{i}.muzzy_decay_ms\0");
+                if raw::write(dk.as_bytes(), d).is_ok() {
+                    let _ = raw::write(mk.as_bytes(), m);
+                }
+            }
         }
         Ok(())
     }
@@ -219,6 +227,21 @@ pub fn set_decay_ms(dirty_ms: i64, muzzy_ms: i64) -> MallctlResult {
     {
         let _ = (dirty_ms, muzzy_ms);
         Ok(())
+    }
+}
+
+/// `prctl(PR_GET_THP_DISABLE)` — is THP already off for this process
+/// (inherited across `execve`, so a re-exec'd client sees `Some(true)`)?
+pub fn thp_disabled() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain prctl with integer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0u64, 0u64, 0u64, 0u64) };
+        (rc >= 0).then_some(rc == 1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
