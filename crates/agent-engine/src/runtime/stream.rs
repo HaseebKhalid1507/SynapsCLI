@@ -448,11 +448,14 @@ impl StreamMethods {
             // the catalog generation since the retained set was built (e.g.
             // `connect_mcp_server` drained after the previous round),
             // rebuild it here — explicitly, deterministically, from the
-            // currently verified capabilities, with ZERO inherited
-            // activations (catalog drift invalidates exact activations by
-            // design). This is the ONLY rebuild site; individual calls
-            // never refresh it. The catalog snapshot cloned here feeds the
-            // passive discovery/activation capability context this round.
+            // currently verified capabilities. Exact activations whose
+            // record still matches its pinned digest+provenance are carried
+            // forward (re-issued at the new generation); drifted/removed
+            // ones are dropped. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores
+            // the zero-inherit rebuild. This is the ONLY rebuild site;
+            // individual calls never refresh it. The catalog snapshot cloned
+            // here feeds the passive discovery/activation capability context
+            // this round.
             let (tools_snapshot, catalog_snapshot) = {
                 let registry = tools.read().await;
                 {
@@ -460,7 +463,19 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = if progressive_tool_disclosure {
+                        if crate::tools::activation::carry_forward_enabled() {
+                            let (next, dropped) = set
+                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
+                            for d in &dropped {
+                                tracing::warn!(
+                                    tool = %d.id,
+                                    reason = ?d.reason,
+                                    "activation dropped at round-top rebuild"
+                                );
+                            }
+                            *set = next;
+                        } else {
+                            *set = if progressive_tool_disclosure {
                             crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
                                 tool_session_id.clone(),
                                 registry.catalog(),
@@ -471,6 +486,7 @@ impl StreamMethods {
                                 registry.catalog(),
                             )
                         };
+                        }
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
