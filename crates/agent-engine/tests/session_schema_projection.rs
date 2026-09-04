@@ -308,3 +308,46 @@ fn projection_reports_coherent_provenance_imposter_as_dropped() {
         vec![(id, DroppedSessionMember::ProvenanceMismatch)]
     );
 }
+
+/// A pinned member that vanishes ENTIRELY from the registry (extension
+/// unload → `try_disable` rebuilds the cached schema without it) has no
+/// `cached_schema` entry to iterate, so the primary loop never sees it.
+/// The post-pass over the session's own pins must still report it as
+/// `Uncataloged` — otherwise the round-level dropped-member log is blind
+/// to exactly the removal it exists to surface.
+#[test]
+fn projection_reports_vanished_pinned_member_as_uncataloged() {
+    let mut registry = collision_registry();
+    let mut set = SessionToolSet::new(
+        session_id(),
+        [ToolId::builtin("core_tool")],
+        registry.catalog(),
+    )
+    .expect("core resolves");
+    // Pin one exact activation on top of the core set so both pin kinds are covered.
+    activate_exact_for_user(&mut set, registry.catalog(), &ToolId::builtin("deferred_tool"))
+        .expect("activates");
+    assert!(registry.session_tools_schema(&set).dropped.is_empty());
+
+    registry
+        .try_disable(&["core_tool".to_string(), "deferred_tool".to_string()])
+        .expect("disable");
+    assert!(registry.catalog().get(&ToolId::builtin("core_tool")).is_none());
+
+    let report = registry.session_tools_schema(&set);
+    assert!(
+        !report.schema.iter().any(|s| {
+            matches!(s["name"].as_str(), Some("core_tool") | Some("deferred_tool"))
+        }),
+        "a vanished member's schema must never be served"
+    );
+    let mut dropped = report.dropped.clone();
+    dropped.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        dropped,
+        vec![
+            (ToolId::builtin("core_tool"), DroppedSessionMember::Uncataloged),
+            (ToolId::builtin("deferred_tool"), DroppedSessionMember::Uncataloged),
+        ]
+    );
+}
