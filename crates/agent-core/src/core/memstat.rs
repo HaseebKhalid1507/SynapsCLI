@@ -149,16 +149,28 @@ pub fn purge_arenas() {
     }
 }
 
-/// One `synaps::mem` info line — call at turn end so `synaps.log` carries a
-/// greppable per-turn memory trace.
+/// `SYNAPS_MEM_TRACE=1` turns on the per-turn memory trace and the broker
+/// install log line. Read once; one atomic load per call afterwards.
+pub fn mem_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYNAPS_MEM_TRACE").is_ok_and(|v| v == "1"))
+}
+
+/// One `agent_core::memstat` info line ("turn memory") — called at
+/// `SessionEvent::Done` so `synaps.log` carries a greppable per-turn memory
+/// trace. No-op (one atomic load) unless `SYNAPS_MEM_TRACE=1`.
 pub fn log_turn_memory() {
+    if !mem_trace_enabled() {
+        return;
+    }
     let s = self_snapshot();
     tracing::info!(
-        target: "synaps::mem",
+        target: "agent_core::memstat",
         rss_anon_kb = s.rss_anon_kb,
         jemalloc_allocated_kb = s.jemalloc_allocated_kb,
         jemalloc_resident_kb = s.jemalloc_resident_kb,
         threads = s.threads,
+        broker_installs = crate::auth::global_broker_install_count(),
         "turn memory"
     );
 }

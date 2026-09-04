@@ -42,6 +42,7 @@ async fn three_spawns_share_broker_and_cached_registry() {
     // The foreground runtime is where the broker is installed — exactly once.
     let _fg = host.foreground_runtime().await.expect("foreground runtime");
     let broker_before = agent_core::auth::global_broker();
+    let installs_before = agent_core::auth::global_broker_install_count();
     let template = host.worker_registry().await;
 
     let mut workers = Vec::new();
@@ -58,6 +59,11 @@ async fn three_spawns_share_broker_and_cached_registry() {
     assert!(
         Arc::ptr_eq(&broker_before, &broker_after),
         "global broker must not be re-installed by subagent spawns"
+    );
+    assert_eq!(
+        agent_core::auth::global_broker_install_count(),
+        installs_before,
+        "set_global_broker count unchanged across 3 spawns (S7 gate)"
     );
 
     // Registry cache hit: no rebuild while the shared catalog generation is

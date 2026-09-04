@@ -3597,6 +3597,7 @@ impl Runtime {
                 &reaper_registry,
                 reaper_orchestration.as_deref(),
             );
+            agent_core::core::memstat::log_turn_memory();
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 

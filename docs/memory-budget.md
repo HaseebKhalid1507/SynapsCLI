@@ -83,9 +83,11 @@ SYNAPS_CONFIG_LOCK=0               skip fs4 lock in write_config_value
   and totals; reads the run registry (`~/.synaps-cli/run/*.json`). Linux only.
 - `agent_core::memstat::self_snapshot()` — in-process RssAnon + jemalloc
   `allocated/active/resident/retained`; `purge_arenas()` is the manual purge.
-- `agent_core::memstat::log_turn_memory()` — emits one
-  `target: "synaps::mem"` info line ("turn memory") for `synaps.log`; call it
-  at `SessionEvent::Done`.
+- `SYNAPS_MEM_TRACE=1` — `agent_core::memstat::log_turn_memory()` emits one
+  `agent_core::memstat` info line ("turn memory": RssAnon, jemalloc, threads,
+  `broker_installs`) at every `SessionEvent::Done`, and `set_global_broker`
+  logs "global broker installed" with its running count. Off: one atomic
+  load per turn.
 - `tests/memory_baseline.rs` (`cargo test --test memory_baseline -- --ignored`)
   prints the current process' numbers; informational, never gates.
 

@@ -2357,9 +2357,23 @@ pub fn broker_from_source(
 static GLOBAL_BROKER: std::sync::RwLock<Option<Arc<dyn CredentialBroker>>> =
     std::sync::RwLock::new(None);
 
+static GLOBAL_BROKER_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Install the process-wide broker (called once from runtime configuration).
+/// Every call is counted ([`global_broker_install_count`]) and, when
+/// `SYNAPS_MEM_TRACE=1`, logged — the daemon-mode S7 gate asserts the count
+/// stays at 1 across subagent spawns.
 pub fn set_global_broker(broker: Arc<dyn CredentialBroker>) {
     *GLOBAL_BROKER.write().expect("broker registry poisoned") = Some(broker);
+    let n = GLOBAL_BROKER_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if crate::core::memstat::mem_trace_enabled() {
+        tracing::info!(target: "agent_core::memstat", installs = n, "global broker installed");
+    }
+}
+
+/// How many times [`set_global_broker`] has run in this process.
+pub fn global_broker_install_count() -> u64 {
+    GLOBAL_BROKER_INSTALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The process-wide broker. Defaults to the in-process [`LocalBroker`] so
