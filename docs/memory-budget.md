@@ -55,6 +55,32 @@ compare the columns, not the historical gate constants.
 | Startup to `○ ready` | 49 ms | 50 ms | +1 | ≤ 80 | ✓ |
 | `status --memory` vs `mem.sh` PSS (N=1) | — | 108.8 vs 111.5 MB | 2.4 % (sampled ~3 s apart) | ≤ 2 % | ≈ |
 
+### Measured — bella, 2026-09-04 (fix round), `bench-sessions.sh` REPEAT=3 SETTLE=10, base `8113e5cf` vs `feat/engine-host` post-review
+
+Same fixture for both columns (this run's bridge/chronos set is lighter than
+the B2 run above; compare columns, not history). N=2 was not re-run; marginal
+is `(N=3 − N=1) / 2`.
+
+| Metric | Base | New | Δ | Gate | ✓ |
+|---|---:|---:|---:|---|---|
+| `synaps` RssAnon (N=1) | 25.6 MB | **20.1 MB** | −5.5 | ≤ 24.5 | ✓ |
+| PSS (N=1) | 84.1 | **78.7** | −5.4 | ≤ 73 (old fixture) / base −4.8 | ✓ (relative) |
+| PSS (N=3) | 165.6 | **148.8** | −16.8 | ≤ 160 | ✓ |
+| Marginal PSS ((N=3 − N=1)/2) | 40.8 | **35.1** | −5.7 | ≤ 40 | ✓ |
+| procs / session | 3 | 3 | 0 | == 3 | ✓ |
+| `synaps` threads idle | 36 | **16** | −20 | ≤ 20 | ✓ |
+| Startup to `○ ready` | 49 ms | 50 ms | +1 | ≤ 80 | ✓ |
+| `status --memory` vs `mem.sh` PSS (N=1, 3 runs) | — | 1.8 / 1.9 / 1.9 % | | ≤ 2 % | ✓ |
+
+Live-model gates (`scripts/memprof/bench-turns.sh`, profile `bench` =
+`claude-haiku-4-5`, `SYNAPS_MEM_TRACE=1`, new binary only):
+
+| Scenario | Measured | Gate | ✓ |
+|---|---|---|---|
+| Turn growth: RssAnon after boot → after 5 × "reply ok" (+10 s settle) | 22.56 → 23.17 MB = **+0.60 MB** (per-turn: 23.3 / 23.1 / 23.5 / 24.0 / 23.3) | ≤ +4.5 MB | ✓ |
+| S7: 3 × `subagent_start` in parallel — `set_global_broker` calls in-process | **1** (`broker_installs=1` on every `turn memory` line; 0 new install lines during the turn) | == 1 | ✓ |
+| S7: `synaps` peak RSS / threads during the subagent turn | 44.3 MB / 22 threads → back to RssAnon 21.0 MB / 16 threads | informational | |
+
 ## Where the budget comes from (Phase 1 changes)
 
 | Change | Expected | Switch |
