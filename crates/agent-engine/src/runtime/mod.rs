@@ -2,7 +2,7 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use futures::stream::Stream;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -52,14 +52,17 @@ pub enum BeforeToolCallDecision {
 }
 
 /// Emit a `before_tool_call` event and include the runtime tool name when it
-/// differs from the API-safe name.
+/// differs from the API-safe name. `session_id` is the owning conversation
+/// (`None` for workers → JSON `null`, unchanged).
 pub async fn emit_before_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
+    session_id: Option<&str>,
 ) -> crate::extensions::hooks::events::HookResult {
-    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input);
+    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
+        .with_session(session_id);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -164,12 +167,14 @@ pub async fn emit_after_tool_call(
     input: Value,
     output: String,
     max_tool_output: usize,
+    session_id: Option<&str>,
 ) -> String {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
     let mut event =
-        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output);
+        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
+            .with_session(session_id);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -433,6 +438,10 @@ pub struct Runtime {
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
     session_id: Option<String>,
+    /// Per-session working directory (Phase 2 daemon mode). `None` = process
+    /// cwd — every in-process host leaves it `None`, so `ToolCapabilities.cwd`
+    /// stays `None` exactly as before. The daemon sets it per session.
+    cwd: Option<PathBuf>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -704,6 +713,7 @@ impl RuntimeParts {
     }
 
     /// Fresh shell session manager, no reaper (offline / headless).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     pub(crate) fn without_reaper(host: crate::host::HostParts) -> Self {
         Self {
             host,
@@ -859,6 +869,7 @@ impl Runtime {
             ),
             host_tool_session: fresh_host_tool_session(),
             session_id: None,
+            cwd: None,
         };
         // Lease managers are installed through the same seams boot used, so
         // the per-runtime durable session-scope guards are minted exactly as
@@ -1291,6 +1302,16 @@ impl Runtime {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Per-session working directory handed to tools via
+    /// `ToolCapabilities.cwd`. `None` = process cwd.
+    pub fn set_cwd(&mut self, cwd: Option<PathBuf>) {
+        self.cwd = cwd;
+    }
+
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -3147,7 +3168,7 @@ impl Runtime {
                                         mcp_leases: None,
                                         extension_leases: None,
                                         memory_context: None,
-                                        cwd: None,
+                                        cwd: self.cwd.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3164,6 +3185,7 @@ impl Runtime {
                                         tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
+                                        self.session_id.as_deref(),
                                     )
                                     .await,
                                     None,
@@ -3189,6 +3211,7 @@ impl Runtime {
                                         input_for_hook,
                                         output,
                                         self.max_tool_output,
+                                        self.session_id.as_deref(),
                                     )
                                     .await;
                                     output
@@ -3216,6 +3239,8 @@ impl Runtime {
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
                     let cfg_orchestration = self.orchestration.clone();
+                    let cfg_cwd = self.cwd.clone();
+                    let cfg_session_id = self.session_id.clone();
 
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -3236,6 +3261,8 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let cwd_inner = cfg_cwd.clone();
+                            let session_id_inner = cfg_session_id.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -3250,6 +3277,7 @@ impl Runtime {
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input.clone(),
+                                                    session_id_inner.as_deref(),
                                                 )
                                                 .await,
                                                 None,
@@ -3286,7 +3314,7 @@ impl Runtime {
                                                     mcp_leases: None,
                                                     extension_leases: None,
                                                     memory_context: None,
-                                                    cwd: None,
+                                                    cwd: cwd_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3308,6 +3336,7 @@ impl Runtime {
                                                 input_for_hook,
                                                 output,
                                                 cfg_max_tool_output,
+                                                session_id_inner.as_deref(),
                                             )
                                             .await;
                                             output
@@ -3534,6 +3563,7 @@ impl Runtime {
             secret_prompt,
             hook_bus: self.hook_bus.clone(),
             session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3696,6 +3726,7 @@ impl Clone for Runtime {
             host_tool_session: self.host_tool_session.clone(),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
         }
     }
 }

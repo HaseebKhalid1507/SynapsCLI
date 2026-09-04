@@ -124,14 +124,75 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let mut runtime = host.foreground_runtime().await?;
     let config: crate::SynapsConfig = (**host.config()).clone();
 
+    let sb = resolve_session_and_prompt(
+        &mut runtime,
+        &opts.continue_session,
+        opts.system.as_deref(),
+        opts.prompt_manifest.as_deref(),
+    )?;
+
+    // Skills, command registry, MCP setup and the MCP lease manager are
+    // host-owned (see `EngineHost::boot`); the runtime already holds them.
+    let registry = Arc::clone(host.command_registry());
+    let keybind_registry = Arc::clone(host.keybind_registry());
+    let mcp_server_count = host.mcp_server_count();
+
+    let system_prompt_path = crate::config::resolve_read_path("system.md");
+
+    // Session was resolved before policy compilation so its model is the immutable
+    // foreground identity used by worker inheritance and authorization.
+
+    let background = spawn_session_background(&runtime, &sb.session)?;
+
+    finish_session_setup(&mut runtime, &config, &sb.session, None);
+
+    // Extension manager: host-owned.
+    let ext_manager = Arc::clone(host.ext_manager());
+
+    if mcp_server_count > 0 {
+        tracing::info!(
+            "{} MCP servers available (use connect_mcp_server to activate)",
+            mcp_server_count
+        );
+    }
+
+    Ok(EngineBoot {
+        runtime,
+        config,
+        no_extensions: opts.no_extensions,
+        session: sb.session,
+        api_messages: sb.api_messages,
+        total_input_tokens: sb.total_input_tokens,
+        total_output_tokens: sb.total_output_tokens,
+        session_cost: sb.session_cost,
+        abort_context: sb.abort_context,
+        continued: sb.continued,
+        continue_info: sb.continue_info,
+        registry,
+        keybind_registry,
+        mcp_server_count,
+        system_prompt_path,
+        ext_manager,
+        background,
+    })
+}
+
+/// Session resolution + prompt/orchestration install (code motion from
+/// `boot()`; called per session by `SessionActor::create` too).
+pub(crate) fn resolve_session_and_prompt(
+    runtime: &mut Runtime,
+    continue_session: &Option<Option<String>>,
+    system: Option<&str>,
+    prompt_manifest: Option<&std::path::Path>,
+) -> Result<SessionBootResult> {
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
-    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    let sb = resolve_or_create_session(runtime, continue_session)?;
     runtime.set_session_id(Some(sb.session.id.clone()));
 
     // Validate and compile an opted-in manifest before any session/network work.
-    let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
-    if let Some(path) = &opts.prompt_manifest {
+    let legacy_prompt = crate::config::resolve_system_prompt(system);
+    if let Some(path) = prompt_manifest {
         let raw = std::fs::read_to_string(path)
             .map_err(|_| crate::RuntimeError::Config("prompt manifest is unavailable".into()))?;
         let manifest = agent_core::prompt::PromptManifest::parse(&raw)
@@ -162,9 +223,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
                     .map_err(|error| crate::RuntimeError::Config(error.into()))?,
             ));
         }
-        let user = opts
-            .system
-            .as_ref()
+        let user = system
             .map(|_| {
                 agent_core::prompt::resolved_system_prompt_as_user_module(legacy_prompt.clone())
             })
@@ -178,7 +237,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime
             .apply_prompt_stack(stack)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
-        runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
+        runtime.retain_prompt_reload_source(
+            path.to_path_buf(),
+            context,
+            user,
+            delegation_policy_digest,
+        );
     } else {
         let foreground = crate::orchestration::canonical_foreground_identity(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
@@ -189,17 +253,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime.set_system_prompt(legacy_prompt);
     }
 
-    // Skills, command registry, MCP setup and the MCP lease manager are
-    // host-owned (see `EngineHost::boot`); the runtime already holds them.
-    let registry = Arc::clone(host.command_registry());
-    let keybind_registry = Arc::clone(host.keybind_registry());
-    let mcp_server_count = host.mcp_server_count();
+    Ok(sb)
+}
 
-    let system_prompt_path = crate::config::resolve_read_path("system.md");
-
-    // Session was resolved before policy compilation so its model is the immutable
-    // foreground identity used by worker inheritance and authorization.
-
+/// Inbox watcher + per-session UDS listener + registry registration (code
+/// motion from `boot()`). Fails loudly when registration fails.
+pub(crate) fn spawn_session_background(
+    runtime: &Runtime,
+    session: &Session,
+) -> Result<BackgroundTasks> {
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher_task = {
@@ -220,15 +282,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Start per-session Unix socket listener + register in session registry
     let socket_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_socket_path = crate::events::registry::socket_path_for_session(&sb.session.id);
+    let session_socket_path = crate::events::registry::socket_path_for_session(&session.id);
     let socket_task = crate::events::socket::listen_session_socket(
         session_socket_path.clone(),
         runtime.event_queue().clone(),
         socket_shutdown.clone(),
     );
     let session_registration = crate::events::registry::SessionRegistration {
-        session_id: sb.session.id.clone(),
-        name: sb.session.name.clone(),
+        session_id: session.id.clone(),
+        name: session.name.clone(),
         socket_path: session_socket_path.clone(),
         pid: std::process::id(),
         started_at: chrono::Utc::now(),
@@ -247,17 +309,33 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         )));
     }
 
+    Ok(BackgroundTasks {
+        watcher_shutdown,
+        watcher_task,
+        socket_shutdown,
+        socket_task,
+        session_socket_path,
+        session_id: session.id.clone(),
+        hook_bus: Arc::clone(runtime.hook_bus()),
+        // The appender guard lives on the `EngineHost` now.
+        log_guard: None,
+    })
+}
+
+/// Foreground turn budget + session start index record (code motion from
+/// `boot()`). `cwd` = the session's configured cwd (`None` → process cwd).
+pub(crate) fn finish_session_setup(
+    runtime: &mut Runtime,
+    config: &crate::SynapsConfig,
+    session: &Session,
+    cwd: Option<std::path::PathBuf>,
+) {
     // Task 23: the engine's interactive session runs under the FOREGROUND
     // turn budget with typed per-role config overrides applied.
     runtime.set_turn_budget(crate::runtime::budget::TurnBudget::from_config(
         crate::runtime::budget::TurnRole::Foreground,
         &config.turn_budgets,
     ));
-
-    // Extension manager: host-owned (progressive deferral + the shared
-    // extension lease manager were wired in `EngineHost::boot` /
-    // `foreground_runtime`).
-    let ext_manager = Arc::clone(host.ext_manager());
 
     // Session start index record.
     //
@@ -269,67 +347,27 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // subscribers exist.
     {
         let mut index_record =
-            crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
-        index_record.model = Some(sb.session.model.clone());
+            crate::core::session_index::SessionIndexRecord::start(&session.id);
+        index_record.model = Some(session.model.clone());
         index_record.profile = crate::core::config::get_profile();
-        index_record.cwd = std::env::current_dir().ok();
+        index_record.cwd = cwd.or_else(|| std::env::current_dir().ok());
         if let Err(err) = crate::core::session_index::append_record(&index_record) {
             tracing::warn!("failed to append session start index record: {}", err);
         }
     }
 
-    if mcp_server_count > 0 {
-        tracing::info!(
-            "{} MCP servers available (use connect_mcp_server to activate)",
-            mcp_server_count
-        );
-    }
-
-    let session_id = sb.session.id.clone();
-    let hook_bus = Arc::clone(runtime.hook_bus());
-
-    Ok(EngineBoot {
-        runtime,
-        config,
-        no_extensions: opts.no_extensions,
-        session: sb.session,
-        api_messages: sb.api_messages,
-        total_input_tokens: sb.total_input_tokens,
-        total_output_tokens: sb.total_output_tokens,
-        session_cost: sb.session_cost,
-        abort_context: sb.abort_context,
-        continued: sb.continued,
-        continue_info: sb.continue_info,
-        registry,
-        keybind_registry,
-        mcp_server_count,
-        system_prompt_path,
-        ext_manager,
-        background: BackgroundTasks {
-            watcher_shutdown,
-            watcher_task,
-            socket_shutdown,
-            socket_task,
-            session_socket_path,
-            session_id,
-            hook_bus,
-            // The appender guard lives on the `EngineHost` now.
-            log_guard: None,
-        },
-    })
 }
 
-/// Resolve a session to continue, or create a new one.
 /// Result of session resolution.
-struct SessionBootResult {
-    session: Session,
-    api_messages: Vec<crate::SharedMessage>,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    session_cost: f64,
-    abort_context: Option<String>,
-    continued: bool,
-    continue_info: Option<ContinueInfo>,
+pub(crate) struct SessionBootResult {
+    pub(crate) session: Session,
+    pub(crate) api_messages: Vec<crate::SharedMessage>,
+    pub(crate) total_input_tokens: u64,
+    pub(crate) total_output_tokens: u64,
+    pub(crate) session_cost: f64,
+    pub(crate) abort_context: Option<String>,
+    pub(crate) continued: bool,
+    pub(crate) continue_info: Option<ContinueInfo>,
 }
 
 fn resolve_or_create_session(
@@ -371,7 +409,7 @@ fn resolve_or_create_session(
                 let resolved_via = if *q != session.id {
                     if crate::chain::load_chain(q).is_ok() {
                         Some("chain".to_string())
-                    } else if crate::session::find_session_by_name(q).is_ok() {
+                    } else if agent_core::session::find_session_by_name(q).is_ok() {
                         Some("name".to_string())
                     } else {
                         None

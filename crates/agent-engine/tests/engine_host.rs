@@ -121,3 +121,79 @@ async fn runtime_new_is_still_fully_fresh() {
     assert!(!Arc::ptr_eq(&r.tools_shared(), &h.parts().tools));
     assert!(!Arc::ptr_eq(r.hook_bus(), &h.parts().hook_bus));
 }
+
+/// C2: `extensions_ready()` resolves immediately when no loader was
+/// dispatched, waits for a dispatched loader's `Finished`, and is immediate
+/// afterwards. Uses the installed host (no plugins under the temp home, so
+/// the walk itself is trivial) — the seam is the loader↔host handshake.
+#[tokio::test]
+async fn extensions_ready_tracks_the_loader() {
+    let h = host().await;
+    // No loader dispatched → immediate.
+    tokio::time::timeout(std::time::Duration::from_millis(200), h.extensions_ready())
+        .await
+        .expect("no loader → immediate");
+
+    // Hold the manager write lock so the dispatched loader cannot finish;
+    // a waiter must now block until we release it.
+    let guard = h.ext_manager().write().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let loader = agent_engine::extensions::loader::spawn_discover_and_load(
+        Arc::clone(h.ext_manager()),
+        tx,
+        Some("sess-ready".to_string()),
+    );
+    let waiter = {
+        let h = Arc::clone(&h);
+        tokio::spawn(async move {
+            h.extensions_ready().await;
+            std::time::Instant::now()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "waiter must block while discovery is pending");
+    let released = std::time::Instant::now();
+    drop(guard);
+    loader.await.unwrap();
+    let woke = waiter.await.unwrap();
+    assert!(woke >= released, "woke only after the loader finished");
+    assert!(matches!(
+        rx.recv().await,
+        Some(agent_engine::extensions::loader::ExtensionLoaderEvent::Started)
+    ));
+    // Afterwards: immediate, and the manager records discovery as done.
+    tokio::time::timeout(std::time::Duration::from_millis(200), h.extensions_ready())
+        .await
+        .expect("ready → immediate");
+    assert!(h.ext_manager().read().await.discovery_done().is_some());
+}
+
+/// §11 #6: a loader task that dies (panic) between `note_extensions_loading`
+/// and `mark_extensions_ready` must not strand `extensions_ready()` waiters.
+/// Fresh, uninstalled host so the installed one's state is untouched.
+#[tokio::test]
+async fn extensions_ready_returns_when_loader_panics() {
+    let _ = host().await; // base dir configured
+    let h = EngineHost::boot(HostOpts {
+        profile: None,
+        no_extensions: true,
+    })
+    .await
+    .unwrap();
+    let guard = h.extensions_loading_guard();
+    let waiter = {
+        let h = Arc::clone(&h);
+        tokio::spawn(async move { h.extensions_ready().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "loader dispatched → waiter blocks");
+    let loader = tokio::spawn(async move {
+        let _guard = guard;
+        panic!("discovery blew up");
+    });
+    assert!(loader.await.is_err(), "loader panicked");
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("waiter released by the guard drop")
+        .unwrap();
+}

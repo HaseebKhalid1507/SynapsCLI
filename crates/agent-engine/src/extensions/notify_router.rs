@@ -1,0 +1,87 @@
+//! Daemon-mode phase 2 (C3): extension notification router.
+//!
+//! One subscriber per loaded extension (`ProcessExtension::subscribe_notifications`),
+//! started ONCE by the host after discovery; forwards `widget.*` frames
+//! ([`super::widgets::is_widget_method`]) to every live session as
+//! `SessionEventWire::ExtensionNotification` via
+//! [`crate::host::EngineHost::broadcast_extension_notification`].
+//!
+//! Frames carry no session id today, so every session receives every frame
+//! (documented; per-session routing arrives when the extension contract adds
+//! `params.session_id`, day 2). Delivery is non-blocking: a session whose
+//! command queue is full drops the frame with a `warn!` — widget upserts are
+//! idempotent last-writer-wins UI state (`loop_arms.rs` semantics), and
+//! blocking would backpressure the extension's lossless fan-out and stall
+//! `command.invoke` / `provider.stream` subscribers on the same queue.
+//!
+//! The inline TUI keeps its own watcher (`loop_arms.rs`) today; this router
+//! serves actor-hosted sessions (daemon, `synaps chat` on the actor).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::host::EngineHost;
+
+/// Resubscribe delay after an extension's notification channel closes
+/// (EOF / restart) — mirrors the TUI watcher.
+const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
+
+/// Start one forwarding task per loaded extension. Idempotent per call
+/// site by construction — the host calls it once after
+/// `extensions_ready()`; call it again only after a genuine re-discovery.
+/// The returned handle completes once every per-extension task has been
+/// spawned (the tasks themselves run for the host's lifetime and end when
+/// their extension is gone and stays gone).
+pub fn spawn_notification_router(host: Arc<EngineHost>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let handlers = host.ext_manager().read().await.handlers();
+        for (ext_id, handler) in handlers {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move {
+                forward_extension_notifications(host, ext_id, handler).await;
+            });
+        }
+    })
+}
+
+/// Forward loop for ONE extension. Exits when the extension has been
+/// unloaded from the manager (its channel closed and it is no longer
+/// listed); otherwise resubscribes after [`RESUBSCRIBE_DELAY`].
+pub async fn forward_extension_notifications(
+    host: Arc<EngineHost>,
+    ext_id: String,
+    handler: Arc<dyn super::runtime::ExtensionHandler>,
+) {
+    loop {
+        let (_sub_id, mut rx) = handler.subscribe_notifications().await;
+        while let Some(frame) = rx.recv().await {
+            if !super::widgets::is_widget_method(&frame.method) {
+                continue;
+            }
+            if super::widgets::parse_widget_event(&frame.method, &frame.params).is_err() {
+                tracing::debug!(extension = %ext_id, method = %frame.method,
+                    "ignoring malformed widget frame");
+                continue;
+            }
+            let delivered = host
+                .broadcast_extension_notification(&ext_id, &frame.method, frame.params)
+                .await;
+            tracing::trace!(extension = %ext_id, method = %frame.method, sessions = delivered,
+                "extension notification broadcast");
+        }
+        // Channel closed (EOF/restart). Stop if the extension is gone for
+        // good; otherwise wait and resubscribe.
+        tokio::time::sleep(RESUBSCRIBE_DELAY).await;
+        let still_loaded = host
+            .ext_manager()
+            .read()
+            .await
+            .handlers()
+            .iter()
+            .any(|(id, h)| id == &ext_id && Arc::ptr_eq(h, &handler));
+        if !still_loaded {
+            tracing::debug!(extension = %ext_id, "notification router: extension unloaded; stopping");
+            return;
+        }
+    }
+}

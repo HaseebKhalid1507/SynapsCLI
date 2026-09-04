@@ -87,6 +87,12 @@ struct Cli {
     #[arg(long)]
     no_extensions: bool,
 
+    /// EXPERIMENTAL (SYNAPS_DAEMON=1): attach to a daemon session instead of
+    /// running in-process. Optionally a session ID. Today routes to
+    /// `synaps attach` (the daemon-attached TUI lands in phase 2 day 2).
+    #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
+    attach: Option<Option<String>>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -203,6 +209,10 @@ enum Command {
         #[arg(long)]
         insecure_http: bool,
     },
+    /// EXPERIMENTAL: session daemon (SYNAPS_DAEMON=1) — start/status/stop/sessions
+    Daemon(cmd::daemon::DaemonArgs),
+    /// EXPERIMENTAL: thin line client attached to a daemon session (SYNAPS_DAEMON=1)
+    Attach(cmd::attach::AttachArgs),
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
     Rpc {
         /// Resume an existing session by ID, name, or prefix.
@@ -295,12 +305,22 @@ fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
     }
 }
 
+/// `synaps attach` / `--attach` is a thin line client: one socket, one stdin.
+/// A current-thread runtime saves the worker pool (client diet, day 2 §9).
+fn is_thin_client() -> bool {
+    std::env::args().skip(1).any(|a| a == "attach" || a == "--attach" || a.starts_with("--attach="))
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(n) = worker_threads() {
-        builder.worker_threads(n);
-    }
-    let rt = builder.enable_all().thread_name("synaps-rt").build()?;
+    let rt = if is_thin_client() {
+        tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(n) = worker_threads() {
+            builder.worker_threads(n);
+        }
+        builder.enable_all().thread_name("synaps-rt").build()?
+    };
     // The log-appender guard lives on the process `EngineHost` (a static —
     // never dropped by Rust). Flush it on every exit path so the teardown
     // burst (session save, hooks, extension shutdown) reaches disk.
@@ -327,6 +347,32 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        None if cli.attach.is_some() => {
+            if !agent_engine::daemon::enabled() {
+                eprintln!("--attach ignored: set SYNAPS_DAEMON=1 to enable daemon mode");
+                tui::run(
+                    cli.continue_session,
+                    cli.system,
+                    cli.prompt_manifest,
+                    cli.profile,
+                    cli.no_extensions,
+                )
+                .await?;
+            } else {
+                eprintln!("daemon-attached TUI lands in phase 2 day 2; using `synaps attach`");
+                let id = cli.attach.flatten();
+                cmd::attach::run(
+                    cli.profile,
+                    cmd::attach::AttachArgs {
+                        id,
+                        create: false,
+                        continue_session: cli.continue_session.flatten(),
+                        system: cli.system,
+                    },
+                )
+                .await?;
+            }
+        }
         None => {
             tui::run(
                 cli.continue_session,
@@ -432,6 +478,12 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Retention { action }) => {
             cmd::retention::run(action)?;
+        }
+        Some(Command::Daemon(args)) => {
+            cmd::daemon::run(cli.profile, args).await?;
+        }
+        Some(Command::Attach(args)) => {
+            cmd::attach::run(cli.profile, args).await?;
         }
         Some(Command::Rpc {
             continue_id,

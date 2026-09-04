@@ -501,7 +501,7 @@ use super::render_model::{
 /// terminal, same semantics as the old early-return in `draw()`).
 pub(crate) fn build_render_model(
     inputs: &mut ViewInputs<'_>,
-    runtime: &synaps_cli::Runtime,
+    runtime: &impl agent_engine::session::RuntimeRead,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     term_size: ratatui::layout::Size,
 ) -> Option<(std::sync::Arc<RenderModel>, RenderPatch)> {

@@ -131,14 +131,14 @@ pub(crate) struct RuntimeSnapshot {
 impl RuntimeSnapshot {
     #[allow(dead_code)]
     pub fn from_runtime(
-        runtime: &synaps_cli::Runtime,
+        runtime: &impl agent_engine::session::RuntimeRead,
         registry: &synaps_cli::skills::registry::CommandRegistry,
     ) -> Self {
         Self::from_runtime_with_health(runtime, registry, Default::default())
     }
 
     pub fn from_runtime_with_health(
-        runtime: &synaps_cli::Runtime,
+        runtime: &impl agent_engine::session::RuntimeRead,
         registry: &synaps_cli::skills::registry::CommandRegistry,
         model_health: std::collections::HashMap<
             String,

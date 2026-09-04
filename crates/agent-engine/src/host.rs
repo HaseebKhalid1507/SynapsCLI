@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::extensions::hooks::HookBus;
 use crate::runtime::RuntimeParts;
+use crate::session::{SessionActor, SessionConfig, SessionHandle, SessionId, SessionMeta};
 use crate::tools::catalog::CatalogGeneration;
 use crate::{Result, Runtime, ToolRegistry};
 
@@ -60,9 +61,35 @@ pub struct EngineHost {
     /// process exit — otherwise the tail of the log dies with the writer
     /// thread.
     log_guard: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+    /// Live sessions (Phase 2): id → handle. The map holds one handle per
+    /// actor so the actor outlives any single client; the actor task removes
+    /// itself here when it finishes.
+    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
+    /// Serialises `create_session`'s resolve-then-insert so two concurrent
+    /// `--continue X` cannot both miss the live check and build two actors
+    /// on one session id.
+    create_lock: tokio::sync::Mutex<()>,
+    /// C2: flips to `true` when extension discovery on `ext_manager` has
+    /// finished (the loader sets it; `extensions_ready()` awaits it). The
+    /// paired flag records that a loader was DISPATCHED, so a session
+    /// created between `spawn_discover_and_load` and its first lock
+    /// acquisition still waits instead of racing the walk.
+    extensions_ready: tokio::sync::watch::Sender<bool>,
+    extensions_loading: std::sync::atomic::AtomicBool,
 }
 
 static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
+
+/// See [`EngineHost::extensions_loading_guard`].
+pub struct ExtensionsLoadingGuard {
+    host: Arc<EngineHost>,
+}
+
+impl Drop for ExtensionsLoadingGuard {
+    fn drop(&mut self) {
+        self.host.mark_extensions_ready();
+    }
+}
 
 impl EngineHost {
     /// Every step of the old `setup::boot()` that does NOT mention a session:
@@ -140,6 +167,10 @@ impl EngineHost {
             mcp_server_count,
             worker_registry: std::sync::Mutex::new(None),
             log_guard: std::sync::Mutex::new(log_guard),
+            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            create_lock: tokio::sync::Mutex::new(()),
+            extensions_ready: tokio::sync::watch::channel(false).0,
+            extensions_loading: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -284,5 +315,199 @@ impl EngineHost {
     pub fn reload_config(&self) {
         self.config
             .store(Arc::new(crate::config::load_config()));
+    }
+
+    // ── sessions (Phase 2) ────────────────────────────────────────────────
+
+    /// Create a session on this host: builds the `SessionActor` (the one
+    /// `Runtime` + `ConversationState`), spawns its task, registers the
+    /// handle. The task removes itself from the map when it ends.
+    ///
+    /// **Attach-if-live:** when `cfg.continue_session` resolves to a session
+    /// that is already running on this host (`--continue X` twice,
+    /// `Attach::Create` twice, `--continue` latest while latest is live),
+    /// the existing handle is returned and NO second actor is built. Two
+    /// actors on one id would share the session file, and the second's
+    /// `spawn_session_background` would unlink the first's per-session UDS
+    /// and overwrite its registry entry. `cfg`'s other fields (cwd, model
+    /// override, …) are ignored in that case — the live session wins.
+    pub async fn create_session(self: &Arc<Self>, cfg: SessionConfig) -> Result<SessionHandle> {
+        let _serial = self.create_lock.lock().await;
+        if let Some(live) = self.live_continue_target(&cfg.continue_session) {
+            tracing::info!(session = %live.id, "create_session: target is live — attaching");
+            return Ok(live);
+        }
+        let (handle, task) = SessionActor::create(self, cfg).await?;
+        let id = handle.id.clone();
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), handle.clone());
+        let host = Arc::clone(self);
+        tokio::spawn(async move {
+            task.run().await;
+            host.remove_session(&id);
+        });
+        Ok(handle)
+    }
+
+    /// Resolve a `continue_session` request the same way
+    /// `setup::resolve_or_create_session` will (chain → name → partial id;
+    /// `Some(None)` = latest by mtime) and return the live handle if that
+    /// session is already running here. Resolution failures return `None`
+    /// so the real boot path reports the error.
+    fn live_continue_target(
+        &self,
+        continue_session: &Option<Option<String>>,
+    ) -> Option<SessionHandle> {
+        let query = continue_session.as_ref()?;
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if sessions.is_empty() {
+            return None;
+        }
+        let id = match query {
+            Some(q) => {
+                if let Some(h) = sessions.get(&SessionId::from(q.clone())) {
+                    return Some(h.clone());
+                }
+                crate::core::session::resolve_session(q).ok()?.id
+            }
+            None => crate::core::session::latest_session().ok()?.id,
+        };
+        sessions.get(&SessionId::from(id)).cloned()
+    }
+
+    /// Handle for a live session, if any.
+    pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// Metadata of every live session.
+    pub fn sessions(&self) -> Vec<SessionMeta> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|h| h.meta().clone())
+            .collect()
+    }
+
+    /// Drop the host's handle for a session (the actor keeps running until
+    /// its command queue closes or it receives `End`).
+    pub fn remove_session(&self, id: &SessionId) -> Option<SessionHandle> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+    }
+
+    // ── shared extension host (Phase 2, C) ────────────────────────────────
+
+    /// Loader seam (C2): a discovery pass for this host's manager has been
+    /// dispatched. Called synchronously by `spawn_discover_and_load` before
+    /// its task runs, so `extensions_ready()` cannot slip through the gap.
+    pub fn note_extensions_loading(&self) {
+        self.extensions_loading
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Loader seam (C2): discovery finished — every `extensions_ready()`
+    /// waiter proceeds. Idempotent.
+    pub fn mark_extensions_ready(&self) {
+        self.extensions_ready.send_replace(true);
+    }
+
+    /// Loader seam (C2): `note_extensions_loading()` now, and
+    /// `mark_extensions_ready()` when the guard drops — however the loader
+    /// task ends (return, cancel, panic). Hold it inside the task so a
+    /// panicking walk cannot strand `extensions_ready()` waiters.
+    pub fn extensions_loading_guard(self: &Arc<Self>) -> ExtensionsLoadingGuard {
+        self.note_extensions_loading();
+        ExtensionsLoadingGuard {
+            host: Arc::clone(self),
+        }
+    }
+
+    /// Resolve once extension discovery on this host is known-finished, so a
+    /// session's `on_session_start` lands on subscribed extensions. Resolves
+    /// IMMEDIATELY when no loader was dispatched (hosts that never load
+    /// extensions, `--no-extensions`, tests) or discovery already completed
+    /// on the manager (in-process `discover_and_load()` callers such as
+    /// `synaps chat`); otherwise awaits `mark_extensions_ready()`.
+    ///
+    /// The watch sender is a field of the host, so "sender dropped" is NOT a
+    /// wake-up path while the host lives. Liveness comes from
+    /// [`ExtensionsLoadingGuard`] (the loader task marks ready on any exit,
+    /// including panic); callers that must not trust the loader at all
+    /// (`SessionActor::create`) additionally bound the await with
+    /// `budgets::EXTENSIONS_READY_TIMEOUT`.
+    pub async fn extensions_ready(&self) {
+        let mut rx = self.extensions_ready.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        // A running walk holds the manager write lock; this read waits it out.
+        if self.ext_manager.read().await.discovery_done().is_some() {
+            return;
+        }
+        if !self
+            .extensions_loading
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// C3: push one extension notification frame to every live session
+    /// (non-blocking; a session whose command queue is full drops it with a
+    /// warning — widget upserts are idempotent last-writer-wins). Frames
+    /// carry no session id today, hence broadcast. Returns how many
+    /// sessions accepted it.
+    pub async fn broadcast_extension_notification(
+        &self,
+        ext_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> usize {
+        let handles: Vec<SessionHandle> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut delivered = 0;
+        for handle in handles {
+            let cmd = crate::session::SessionCommand::HostEvent(
+                crate::session::HostEvent::ExtensionNotification {
+                    extension_id: ext_id.to_string(),
+                    method: method.to_string(),
+                    params: params.clone(),
+                },
+            );
+            match handle.send(cmd).await {
+                Ok(()) => delivered += 1,
+                Err(err) => tracing::warn!(
+                    session = %handle.id,
+                    extension = %ext_id,
+                    method = %method,
+                    error = %err,
+                    "dropping extension notification for session"
+                ),
+            }
+        }
+        delivered
     }
 }

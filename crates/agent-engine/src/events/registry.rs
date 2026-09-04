@@ -402,3 +402,53 @@ mod tests {
         assert_eq!(perms.mode() & 0o777, 0o600, "registry file should be 0600");
     }
 }
+
+// ── daemon paths (Phase 2 B) ──────────────────────────────────────────────────
+
+/// Files the `synaps daemon` keeps under `registry_dir()` (0700). One daemon
+/// per profile: `daemon.{sock,lock,json,pid}` or `daemon-<P>.{…}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonPaths {
+    pub dir: PathBuf,
+    pub sock: PathBuf,
+    pub lock: PathBuf,
+    pub json: PathBuf,
+    pub pid: PathBuf,
+}
+
+/// Daemon file paths for a profile, under `registry_dir()`.
+pub fn daemon_paths(profile: Option<&str>) -> DaemonPaths {
+    daemon_paths_in(&registry_dir(), profile)
+}
+
+/// Same, rooted at an explicit dir (tests; `--socket` overrides only `.sock`).
+pub fn daemon_paths_in(dir: &std::path::Path, profile: Option<&str>) -> DaemonPaths {
+    let stem = match profile.map(sanitize_session_id).filter(|p| !p.is_empty()) {
+        Some(p) => format!("daemon-{p}"),
+        None => "daemon".to_string(),
+    };
+    DaemonPaths {
+        dir: dir.to_path_buf(),
+        sock: dir.join(format!("{stem}.sock")),
+        lock: dir.join(format!("{stem}.lock")),
+        json: dir.join(format!("{stem}.json")),
+        pid: dir.join(format!("{stem}.pid")),
+    }
+}
+
+#[cfg(test)]
+mod daemon_paths_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_paths_are_profile_scoped_and_sanitised() {
+        let d = std::path::Path::new("/run/x");
+        let p = daemon_paths_in(d, None);
+        assert_eq!(p.sock, d.join("daemon.sock"));
+        assert_eq!(p.lock, d.join("daemon.lock"));
+        assert_eq!(p.json, d.join("daemon.json"));
+        assert_eq!(p.pid, d.join("daemon.pid"));
+        let p = daemon_paths_in(d, Some("work/../evil"));
+        assert_eq!(p.sock, d.join("daemon-work____evil.sock"));
+    }
+}

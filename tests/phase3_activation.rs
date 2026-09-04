@@ -233,6 +233,7 @@ fn mcp_fixture(tag: &str, tools: Value) -> McpFixture {
                 .display()
                 .to_string()],
             env,
+            shared: false,
         },
     }
 }
@@ -294,10 +295,15 @@ fn mcp_config_with(cfg: McpServerConfig) -> McpConfig {
 
 fn mcp_manager(cfg: &McpServerConfig) -> Arc<McpRuntimeManager> {
     let cfg = cfg.clone();
-    Arc::new(McpRuntimeManager::new(
-        Arc::new(move |server: &str| (server == "srv").then(|| cfg.clone())),
-        Duration::from_secs(300),
-    ))
+    // Descriptor write-back (daemon-mode C4) must not touch the real cache.
+    let cache = tmp_dir("mcp-cache").join("descriptors.json");
+    Arc::new(
+        McpRuntimeManager::new(
+            Arc::new(move |server: &str| (server == "srv").then(|| cfg.clone())),
+            Duration::from_secs(300),
+        )
+        .with_cache_path(cache),
+    )
 }
 
 /// Extension fixture plumbing (mirrors extension_lease_lifecycle).
