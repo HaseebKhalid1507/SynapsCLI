@@ -152,7 +152,12 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
    inheritable (`SYNAPS_DAEMON_LOCK_FD`), `execv(exe, original argv)`. The listener is CLOEXEC (asserted in
    `listener::bind`) — closed at exec; the new image rebinds. **Exec failure**: `daemon.json`/reload-state
-   restored, `reloading` cleared, old image keeps serving (sessions checkpointed but alive).
+   restored, `reloading` cleared, the reload-announce token re-armed (new connections are served again),
+   extension discovery re-spawned (the sidecars were stopped for the exec — bounded 10 s like boot), old
+   image keeps serving (sessions checkpointed but alive; the requester already got `Bye{Reloading}` and
+   reconnects to the same generation). `--exe` is validated **before** the probe: canonical path, regular
+   file, executable, owned by our uid or root, not group/world-writable; then `--print-version` must parse
+   and pass the gate. Tested: `exe_validation_refuses_and_exec_failure_keeps_serving`.
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
