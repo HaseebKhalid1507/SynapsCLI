@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use super::actor::SessionActor;
+use super::actor::{Live, SessionActor};
 use super::types::*;
 
 /// `/compact [instructions]` as the engine parses it (no runtime mutation).
@@ -246,7 +246,7 @@ impl SessionActor {
         } else {
             None
         };
-        self.conv = crate::engine::session::ConversationState::from_resumed(session);
+        self.conv = Live::new(crate::engine::session::ConversationState::from_resumed(session));
         if clamp_notice.is_some() {
             // Keep the session file in sync with the clamped runtime.
             self.conv.session.thinking_level = self.runtime.thinking_level().to_string();
