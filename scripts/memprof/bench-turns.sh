@@ -24,7 +24,7 @@ S=bt
 anon_kb() { awk '/^RssAnon:/{print $2}' "/proc/$1/status"; }
 threads() { awk '/^Threads:/{print $2}' "/proc/$1/status"; }
 logfile() { ls -t "$LOG_DIR"/synaps.log.* 2>/dev/null | head -1; }
-count() { local f; f=$(logfile); [ -n "$f" ] && grep -c "$1" "$f" || echo 0; }
+count() { local f; f=$(logfile); if [ -n "$f" ]; then grep -c "$1" "$f" || true; else echo 0; fi; }
 wait_count() { # pattern n -> waits until count(pattern) >= n
   local i; for i in $(seq 1 "$TURN_TIMEOUT"); do [ "$(count "$1")" -ge "$2" ] && return 0; sleep 1; done
   echo "timeout waiting for $2 × '$1'" >&2; return 1
