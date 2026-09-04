@@ -10,6 +10,7 @@ pub mod handle;
 pub mod transport;
 pub mod types;
 pub mod view;
+pub mod wire;
 
 pub use handle::SessionHandle;
 pub use transport::{ClientTransport, LocalTransport, TransportError};
