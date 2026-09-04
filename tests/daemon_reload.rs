@@ -330,7 +330,7 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
 
     // A: model/context/system survived.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (mut a2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: a_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    let (a2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: a_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
     assert_eq!(snap.view.model, "claude-opus-4-6", "/model survived reload");
     assert_eq!(snap.view.context_window, 1_000_000, "settings_replay survived reload");
     assert_eq!(snap.view.system_prompt.as_deref(), Some("reload-me"), "/system survived reload");
@@ -339,7 +339,7 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
 
     // B: attach unparks with its history.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (mut b2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: b_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    let (b2, snap) = SocketTransport::attach(conn, Attach::Existing { session_id: b_id.clone(), mode: AttachMode::Mirror }).await.unwrap();
     assert_eq!(snap.conversation.api_messages.len(), 2, "parked session's history survived reload");
     b2.detach().await;
 
