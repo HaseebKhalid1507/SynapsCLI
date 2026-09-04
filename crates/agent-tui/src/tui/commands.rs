@@ -600,7 +600,7 @@ pub(super) async fn handle_command(
                         .unwrap_or_default();
                     let age = {
                         let secs = chrono::Utc::now()
-                            .signed_duration_since(s.created_at)
+                            .signed_duration_since(s.updated_at)
                             .num_seconds();
                         if secs < 3600 {
                             format!("{}m ago", secs / 60)
