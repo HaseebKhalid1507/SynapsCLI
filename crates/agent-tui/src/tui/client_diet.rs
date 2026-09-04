@@ -179,15 +179,23 @@ impl IdlePurge {
 mod tests {
     use super::*;
 
+    /// Other tests in this binary spawn threads concurrently, so the count
+    /// is not ours to assert; the *kind* is — no `jemalloc_bg_thd` after.
     #[test]
     fn tune_allocator_spawns_nothing_and_purge_returns() {
-        let before = memstat::self_snapshot().threads;
         tune_allocator();
         purge_arenas("test");
-        let after = memstat::self_snapshot().threads;
-        assert!(after <= before, "threads {before} -> {after}");
         if !allocator_tuning_disabled() {
             assert_ne!(memstat::background_threads_enabled(), Some(true));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let bg = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("comm")).ok())
+                .filter(|c| c.starts_with("jemalloc_bg"))
+                .count();
+            assert_eq!(bg, 0, "jemalloc background threads still alive");
         }
     }
 
