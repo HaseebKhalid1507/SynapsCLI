@@ -65,6 +65,10 @@ pub struct EngineHost {
     /// actor so the actor outlives any single client; the actor task removes
     /// itself here when it finishes.
     sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
+    /// Serialises `create_session`'s resolve-then-insert so two concurrent
+    /// `--continue X` cannot both miss the live check and build two actors
+    /// on one session id.
+    create_lock: tokio::sync::Mutex<()>,
     /// C2: flips to `true` when extension discovery on `ext_manager` has
     /// finished (the loader sets it; `extensions_ready()` awaits it). The
     /// paired flag records that a loader was DISPATCHED, so a session
@@ -153,6 +157,7 @@ impl EngineHost {
             worker_registry: std::sync::Mutex::new(None),
             log_guard: std::sync::Mutex::new(log_guard),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            create_lock: tokio::sync::Mutex::new(()),
             extensions_ready: tokio::sync::watch::channel(false).0,
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
         }))
@@ -306,7 +311,21 @@ impl EngineHost {
     /// Create a session on this host: builds the `SessionActor` (the one
     /// `Runtime` + `ConversationState`), spawns its task, registers the
     /// handle. The task removes itself from the map when it ends.
+    ///
+    /// **Attach-if-live:** when `cfg.continue_session` resolves to a session
+    /// that is already running on this host (`--continue X` twice,
+    /// `Attach::Create` twice, `--continue` latest while latest is live),
+    /// the existing handle is returned and NO second actor is built. Two
+    /// actors on one id would share the session file, and the second's
+    /// `spawn_session_background` would unlink the first's per-session UDS
+    /// and overwrite its registry entry. `cfg`'s other fields (cwd, model
+    /// override, …) are ignored in that case — the live session wins.
     pub async fn create_session(self: &Arc<Self>, cfg: SessionConfig) -> Result<SessionHandle> {
+        let _serial = self.create_lock.lock().await;
+        if let Some(live) = self.live_continue_target(&cfg.continue_session) {
+            tracing::info!(session = %live.id, "create_session: target is live — attaching");
+            return Ok(live);
+        }
         let (handle, task) = SessionActor::create(self, cfg).await?;
         let id = handle.id.clone();
         self.sessions
@@ -319,6 +338,35 @@ impl EngineHost {
             host.remove_session(&id);
         });
         Ok(handle)
+    }
+
+    /// Resolve a `continue_session` request the same way
+    /// `setup::resolve_or_create_session` will (chain → name → partial id;
+    /// `Some(None)` = latest by mtime) and return the live handle if that
+    /// session is already running here. Resolution failures return `None`
+    /// so the real boot path reports the error.
+    fn live_continue_target(
+        &self,
+        continue_session: &Option<Option<String>>,
+    ) -> Option<SessionHandle> {
+        let query = continue_session.as_ref()?;
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if sessions.is_empty() {
+            return None;
+        }
+        let id = match query {
+            Some(q) => {
+                if let Some(h) = sessions.get(&SessionId::from(q.clone())) {
+                    return Some(h.clone());
+                }
+                crate::core::session::resolve_session(q).ok()?.id
+            }
+            None => crate::core::session::latest_session().ok()?.id,
+        };
+        sessions.get(&SessionId::from(id)).cloned()
     }
 
     /// Handle for a live session, if any.

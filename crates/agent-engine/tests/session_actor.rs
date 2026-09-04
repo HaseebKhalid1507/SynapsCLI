@@ -485,3 +485,78 @@ async fn cancel_after_done_does_not_scrape_previous_turn() {
         .contains("ABORT CONTEXT"));
     end(&mut a).await;
 }
+
+/// §11 #2: `--continue X` while X is live on this host attaches to the
+/// running actor instead of building a second one on the same session
+/// file / per-session UDS / registry entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn duplicate_continue_attaches_to_live_session() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    // A persisted session on disk, then ended.
+    let persisted = SessionConfig {
+        persist: true,
+        ..cfg()
+    };
+    let h0 = host.create_session(persisted.clone()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(h0.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut a).await;
+    h0.closed().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(host.sessions().len(), 0);
+    let id = h0.id.clone();
+
+    // --continue X, twice, plus --continue latest: one actor.
+    let cont = SessionConfig {
+        continue_session: Some(Some(id.as_str().to_string())),
+        ..persisted.clone()
+    };
+    let h1 = host.create_session(cont.clone()).await.unwrap();
+    assert_eq!(h1.id, id);
+    let reg1 = agent_engine::events::registry::find_session_registration(id.as_str())
+        .expect("registered");
+    let h2 = host.create_session(cont.clone()).await.unwrap();
+    let h3 = host
+        .create_session(SessionConfig {
+            continue_session: Some(None),
+            ..persisted.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(h2.id, id);
+    assert_eq!(h3.id, id);
+    assert_eq!(host.sessions().len(), 1, "one actor");
+    let reg2 = agent_engine::events::registry::find_session_registration(id.as_str())
+        .expect("still registered");
+    assert_eq!(reg1.socket_path, reg2.socket_path);
+    assert!(
+        tokio::net::UnixStream::connect(&reg1.socket_path).await.is_ok(),
+        "first actor's UDS still bound"
+    );
+
+    // Same actor: a client on h2 sees the turn started via h1.
+    let (mut b, snap) = LocalTransport::attach(h2.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    assert_eq!(snap.conversation.api_messages.len(), 2, "continued history");
+    let (mut c, _) = LocalTransport::attach(h1.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    c.send(submit("again")).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(last_conversation(&seen).api_messages.len(), 4);
+
+    end(&mut c).await;
+    h1.closed().await;
+    assert!(!h2.is_alive());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(host.sessions().len(), 0);
+}
