@@ -97,6 +97,8 @@ async fn two_sessions_one_daemon_isolated() {
     let sb = turn(&mut b).await;
 
     for (s, who) in [(&sa, "a"), (&sb, "b")] {
+        let kinds: Vec<String> = s.iter().map(|e| format!("{:?}", e.event).chars().take(60).collect()).collect();
+        eprintln!("{who}: {kinds:#?}");
         assert!(matches!(s[0].event, SessionEventWire::TurnStarted { .. }), "{who}: {:?}", s[0].event);
         assert_eq!(text_of(s), "hi", "{who}");
         assert!(s.iter().any(|e| matches!(e.event, SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done)))), "{who}");
