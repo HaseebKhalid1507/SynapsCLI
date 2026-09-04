@@ -1242,9 +1242,18 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
 
     // Try engine-level command (model with args, thinking with engine-known
     // levels, quit, compact).
-    let engine_result = {
+    //
+    // Lock order in this file is `runtime` → `conv` (see `/clear` below).
+    // Snapshot everything the ModelChanged arm needs while `rt` is held here
+    // so that arm only ever takes `conv` and never both.
+    let (engine_result, post_thinking, post_model) = {
         let mut rt = state.runtime.lock().await;
-        engine_commands::handle_engine_command(name, args, &mut rt)
+        let result = engine_commands::handle_engine_command(name, args, &mut rt);
+        (
+            result,
+            rt.thinking_level().to_string(),
+            rt.model().to_string(),
+        )
     };
 
     if let Some(result) = engine_result {
@@ -1258,13 +1267,12 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                     let mut conv = state.conv.write().await;
                     conv.session.model = model.clone();
                     if let Some(clamp) = reasoning_clamped {
-                        let rt = state.runtime.lock().await;
-                        conv.session.thinking_level = rt.thinking_level().to_string();
+                        conv.session.thinking_level = post_thinking;
                         message.push_str(&format!(
                             "; thinking → {} (clamped from {}: not supported by {})",
                             clamp.to.as_str(),
                             clamp.from.as_str(),
-                            rt.model()
+                            post_model
                         ));
                     }
                 }
