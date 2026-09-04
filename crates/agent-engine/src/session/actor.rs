@@ -596,16 +596,28 @@ impl SessionActor {
         matches!(self.state, AttachState::Parked)
     }
 
+    /// A session with nothing to save (`ConversationState::save` skips an
+    /// empty `api_messages`, so no journal ever exists) never parks: it
+    /// costs nothing warm and could not be unparked from disk (H2).
     pub(crate) fn can_park(&self) -> bool {
         self.attached.is_empty()
             && !self.streaming
             && self.compact.is_none()
             && self.pending_prompts.is_empty()
             && self.conv.is_live()
+            && !self.conv.api_messages.is_empty()
             && self.conv.queued_message.is_none()
             && !self.keep_warm
             && self.config.persist
             && !self.is_parked()
+    }
+
+    /// `<sessions>/<id>.json` — written by both persistence modes.
+    fn journal_exists(&self) -> bool {
+        let id = (**self.journal_id.load()).clone();
+        crate::config::resolve_write_path("sessions")
+            .join(format!("{id}.json"))
+            .is_file()
     }
 
     fn rearm_park(&mut self) {
@@ -648,6 +660,13 @@ impl SessionActor {
             self.set_lifecycle(SessionLifecycle::Live);
             return;
         }
+        if !self.journal_exists() {
+            // Never park what cannot be restored (H2).
+            tracing::warn!(session = %self.id, "park: no journal on disk — staying live");
+            self.state = AttachState::Detached { running: false };
+            self.set_lifecycle(SessionLifecycle::Live);
+            return;
+        }
         if self.runtime.session_manager().active_count() > 0 {
             self.emit(SessionEventWire::SystemNotice(
                 "parked: background shells closed".into(),
@@ -681,20 +700,44 @@ impl SessionActor {
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
         let replay = self.settings_replay.clone();
+        let journal_present = self.journal_exists();
+        let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
             let mut runtime = host.foreground_runtime().await?;
             runtime.set_event_queue(queue);
-            let sb = crate::engine::setup::resolve_session_and_prompt(
-                &mut runtime,
-                &Some(Some(journal_id)),
-                cfg.system.as_deref(),
-                cfg.prompt_manifest.as_deref(),
-            )?;
+            let mut sb = if journal_present {
+                crate::engine::setup::resolve_session_and_prompt(
+                    &mut runtime,
+                    &Some(Some(journal_id)),
+                    cfg.system.as_deref(),
+                    cfg.prompt_manifest.as_deref(),
+                )?
+            } else {
+                // The journal vanished under us (H2): rebuild an empty
+                // conversation under the SAME id with the last-published
+                // model/thinking rather than leaving a zombie Parked session.
+                tracing::warn!(
+                    session = %journal_id,
+                    "unpark: journal missing — restoring as a fresh conversation"
+                );
+                let mut sb = crate::engine::setup::resolve_session_and_prompt(
+                    &mut runtime,
+                    &None,
+                    cfg.system.as_deref(),
+                    cfg.prompt_manifest.as_deref(),
+                )?;
+                sb.session.id = journal_id.clone();
+                runtime.set_session_id(Some(journal_id));
+                sb
+            };
             runtime.set_cwd(cfg.cwd.clone());
-            if let Some(ref m) = cfg.model_override {
-                runtime.set_model(m.clone());
-            }
+            // The CURRENT model/thinking (the last published view), not
+            // `cfg.model_override` frozen at create: `/model` survives park.
+            runtime.set_model(view.model.clone());
+            let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            sb.session.model = view.model.clone();
+            sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
                 &mut runtime,
                 &config,
