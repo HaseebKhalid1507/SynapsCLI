@@ -338,6 +338,7 @@ pub(super) async fn handle_session_event_arm(
                 // Pre-send presentation (User card, "connecting…",
                 // streaming=true, spinner, frame) already happened in the
                 // dispatch arm; this is the tail after the stream opened.
+                app.last_submitted = None;
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.status_text = None;
@@ -546,6 +547,12 @@ pub(super) async fn handle_session_event_arm(
         } => {
             if client == me {
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
+                // The pre-send presentation assumed a turn: undo it.
+                if app.streaming && app.turn_baseline == app.api_messages.len() {
+                    app.streaming = false;
+                    app.status_text = None;
+                    app.drop_empty_thinking();
+                }
                 // §6 #9: a Submit refused after the editor was cleared —
                 // give the text back.
                 if let Some(text) = app.last_submitted.take() {
