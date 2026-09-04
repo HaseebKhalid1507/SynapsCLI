@@ -265,14 +265,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let sid = handle.id.clone();
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
-    let fwd_shutdown = shutdown.clone();
-    let forward = tokio::spawn(async move {
+    // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
+    let mut forward = tokio::spawn(async move {
         loop {
-            let recv = tokio::select! {
-                _ = fwd_shutdown.cancelled() => break,
-                r = rx.recv() => r,
-            };
-            match recv {
+            match rx.recv().await {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
                     if matches!(env.event, SessionEventWire::Attached { .. }) {
@@ -304,9 +300,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     });
 
     let mut ended = false;
+    let mut stopping = false;
     loop {
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => { stopping = true; break; }
             _ = handle.closed() => { ended = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
         };
@@ -361,8 +358,19 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     }
 
     // Socket gone / Bye = Detach. The turn keeps running (§8).
-    forward.abort();
-    let _ = forward.await;
+    if stopping {
+        // Daemon stop: let the forwarder deliver Ended inside the lifecycle budget.
+        match tokio::time::timeout(super::lifecycle::SESSION_END_BUDGET + Duration::from_secs(1), &mut forward).await {
+            Ok(_) => {}
+            Err(_) => {
+                forward.abort();
+                let _ = forward.await;
+            }
+        }
+    } else {
+        forward.abort();
+        let _ = forward.await;
+    }
     if !ended && handle.is_alive() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
     }
