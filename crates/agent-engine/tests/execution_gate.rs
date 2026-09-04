@@ -120,6 +120,31 @@ fn mcp_spy_record(id: &str, spy: Arc<AtomicUsize>) -> CapabilityRecord {
     )
 }
 
+/// Same MCP-shaped fixture identity/provenance, but a caller-chosen inline
+/// schema — for exercising in-place record replacement (digest change).
+fn spy_record_with_schema(id: &ToolId, schema: Value, spy: Arc<AtomicUsize>) -> CapabilityRecord {
+    CapabilityRecord::new(
+        id.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-1".to_string(),
+            server_tool_name: "deferred".to_string(),
+        },
+        "gate fixture capability",
+        Vec::new(),
+        SchemaLocator::Inline(schema),
+        {
+            let spy = Arc::clone(&spy);
+            Arc::new(move || -> Arc<dyn Tool> {
+                spy.fetch_add(1, Ordering::SeqCst);
+                Arc::new(FixtureTool::unknown("spy-implementation"))
+            })
+        },
+        TrustProvenance::McpConfig {
+            server_id: "server-1".to_string(),
+        },
+    )
+}
+
 fn session(raw: &str) -> SessionId {
     SessionId::parse(raw).expect("fixture session id is valid")
 }
@@ -181,15 +206,16 @@ fn default_session_set_core_is_exactly_verified_registered_tools() {
 
 // ── Deferred (non-core) denial and exact activation ─────────────────────────
 
-/// Retained-set semantics the stream loop relies on (Task 16 review fix):
-/// ONE set snapshot judges every sibling call of a model response at ONE
-/// generation; a catalog mutation makes that retained set stale for ALL
-/// subsequent calls (typed denial, never a silent per-call refresh); only
-/// an explicit deterministic rebuild — the stream's round-top step —
-/// recovers, and it exposes newly registered verified tools as default
-/// core with zero inherited activations.
+/// Retained-set semantics the stream loop relies on (per-tool digest
+/// validation fix): ONE set snapshot judges every sibling call of a model
+/// response; an UNRELATED catalog mutation (background plugin load) no
+/// longer kills the in-flight round — tools whose current record is
+/// schema-identical to the session's pins keep authorizing WITHOUT a rebuild.
+/// Tools the session never pinned (registered after the snapshot) stay
+/// denied until the explicit round-top rebuild, which exposes them as
+/// default core with zero inherited activations.
 #[test]
-fn retained_set_judges_siblings_at_one_generation_and_denies_after_mutation_until_rebuild() {
+fn retained_set_survives_unrelated_catalog_mutation_without_rebuild() {
     let mut registry = ToolRegistry::new();
     let set = SessionToolSet::default_core_for_catalog(session("s-retained"), registry.catalog());
     let built_at = set.catalog_generation();
@@ -205,28 +231,29 @@ fn retained_set_judges_siblings_at_one_generation_and_denies_after_mutation_unti
 
     // Dynamic registration advances the catalog generation.
     registry.register(Arc::new(FixtureTool::builtin("late-registered")));
+    assert!(set.is_stale(registry.catalog()), "generation drifted");
 
-    // The retained set is now stale for EVERY call — including tools that
-    // authorized moments ago — until the explicit rebuild.
-    for wire in ["bash", "ls", "late-registered"] {
-        let err = ExecutionGate::authorize_wire_call(&registry, &set, wire)
-            .expect_err("stale retained set must deny, not silently refresh");
-        assert_eq!(
-            err,
-            ToolAuthorizationError::StaleSessionSet {
-                set: built_at,
-                catalog: registry.catalog().generation(),
-            },
-            "denial must carry the exact stale/current generation pair"
-        );
-    }
+    // Unchanged builtins survive: their current catalog records still match
+    // the pinned digests exactly. Generation drift alone denies nothing.
+    ExecutionGate::authorize_wire_call(&registry, &set, "bash")
+        .expect("unchanged builtin must authorize across unrelated drift");
+    ExecutionGate::authorize_wire_call(&registry, &set, "ls")
+        .expect("unchanged builtin must authorize across unrelated drift");
+
+    // The late tool was never pinned by this session: denied until rebuild.
+    let err = ExecutionGate::authorize_wire_call(&registry, &set, "late-registered")
+        .expect_err("unpinned late registration must not authorize");
+    assert_eq!(
+        err,
+        ToolAuthorizationError::NotActivated(ToolId::builtin("late-registered"))
+    );
 
     // Explicit deterministic rebuild (the stream's round-top step): fresh
     // default core from currently verified tools, zero activations.
     let rebuilt =
         SessionToolSet::default_core_for_catalog(session("s-retained"), registry.catalog());
     assert_eq!(rebuilt.activated().count(), 0, "no inherited activations");
-    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "bash").expect("rebuild recovers");
+    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "bash").expect("still authorizes");
     ExecutionGate::authorize_wire_call(&registry, &rebuilt, "late-registered")
         .expect("newly registered verified tool becomes default core after rebuild");
 }
@@ -299,7 +326,7 @@ fn foreign_session_set_has_no_grant_and_is_denied() {
 // ── Staleness and digest pinning ────────────────────────────────────────────
 
 #[test]
-fn catalog_mutation_stales_session_set_and_denies() {
+fn catalog_mutation_denies_only_when_the_called_tools_record_changed() {
     let spy = Arc::new(AtomicUsize::new(0));
     let mut catalog = ToolCatalog::empty();
     let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
@@ -309,18 +336,36 @@ fn catalog_mutation_stales_session_set_and_denies() {
     let set = SessionToolSet::new(session("s-stale"), vec![id.clone()], &catalog)
         .expect("core set builds");
 
-    // Registry/catalog mutation after the snapshot: generation advances.
+    // UNRELATED registry/catalog mutation: generation advances, but the
+    // called tool's record is untouched — authorization must survive.
     catalog
         .insert(mcp_spy_record("mcp.server-1:later", Arc::clone(&spy)))
         .expect("mutation advances generation");
+    assert!(set.is_stale(&catalog), "generation drifted");
+    ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect("unchanged tool must authorize across unrelated catalog drift");
+    assert_eq!(spy.load(Ordering::SeqCst), 1, "acquired exactly once");
 
-    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
-        .expect_err("stale session snapshot must deny, not silently bless");
-    assert!(
-        matches!(err, ToolAuthorizationError::StaleSessionSet { .. }),
-        "expected StaleSessionSet, got: {err:?}"
+    // A mutation that CHANGES the called tool's record (same id, different
+    // schema) must still deny — real drift is never silently blessed.
+    let changed = spy_record_with_schema(
+        &id,
+        serde_json::json!({
+            "type": "object",
+            "properties": {"changed": {"type": "string"}}
+        }),
+        Arc::clone(&spy),
     );
-    assert_eq!(spy.load(Ordering::SeqCst), 0);
+    catalog
+        .upsert(Some(&id), changed)
+        .expect("replace in place");
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("changed record must deny under drift");
+    assert_eq!(
+        err,
+        ToolAuthorizationError::SchemaDigestMismatch(id.clone())
+    );
+    assert_eq!(spy.load(Ordering::SeqCst), 1, "denial acquires nothing");
 
     // Explicit deterministic rebuild against the current catalog recovers.
     let rebuilt = SessionToolSet::new(session("s-stale"), vec![id.clone()], &catalog)
@@ -376,6 +421,268 @@ fn changed_schema_digest_invalidates_pinned_core_snapshot() {
         .expect_err("changed schema digest must never be silently blessed");
     assert_eq!(err, ToolAuthorizationError::SchemaDigestMismatch(id));
     assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+// ── Per-tool digest validation under generation drift ───────────────────────
+
+/// (1) Unchanged digest survives generation drift — CORE pin.
+#[test]
+fn unchanged_core_digest_survives_generation_drift() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let set = SessionToolSet::new(session("s-drift-core"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+    catalog
+        .insert(mcp_spy_record("mcp.server-1:unrelated", Arc::clone(&spy)))
+        .expect("unrelated mutation advances generation");
+    assert!(set.is_stale(&catalog));
+
+    ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect("schema-identical core tool must survive unrelated drift");
+    assert_eq!(spy.load(Ordering::SeqCst), 1);
+}
+
+/// (1) Unchanged digest survives generation drift — ACTIVATED grant. The
+/// grant's pinned generation is now behind the catalog, but the
+/// (session, tool, digest) tuple still covers execution.
+#[test]
+fn unchanged_activated_digest_survives_generation_drift() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let sid = session("s-drift-act");
+    let mut set = SessionToolSet::new(sid.clone(), Vec::new(), &catalog).expect("empty core");
+    set.activate(grant_for(&sid, &catalog, &id), &catalog)
+        .expect("exact grant activates");
+
+    catalog
+        .insert(mcp_spy_record("mcp.server-1:unrelated", Arc::clone(&spy)))
+        .expect("unrelated mutation advances generation");
+    assert!(set.is_stale(&catalog));
+
+    ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect("schema-identical activated tool must survive unrelated drift");
+    assert_eq!(spy.load(Ordering::SeqCst), 1);
+}
+
+/// (2) Changed digest denies under drift — for both core and activated pins.
+#[test]
+fn changed_digest_denies_under_generation_drift() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let core_set = SessionToolSet::new(session("s-drift-chg"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+    let sid = session("s-drift-chg-act");
+    let mut activated_set = SessionToolSet::new(sid.clone(), Vec::new(), &catalog).expect("empty");
+    activated_set
+        .activate(grant_for(&sid, &catalog, &id), &catalog)
+        .expect("exact grant activates");
+
+    // Replace the record in place with a different schema (digest change),
+    // then also drift the generation further with an unrelated insert.
+    let changed = spy_record_with_schema(
+        &id,
+        serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+        Arc::clone(&spy),
+    );
+    catalog.upsert(Some(&id), changed).expect("replace");
+    catalog
+        .insert(mcp_spy_record("mcp.server-1:unrelated", Arc::clone(&spy)))
+        .expect("unrelated mutation");
+
+    for set in [&core_set, &activated_set] {
+        let err = ExecutionGate::authorize(&catalog, set, resolved(&id))
+            .expect_err("changed digest must deny under drift");
+        assert_eq!(
+            err,
+            ToolAuthorizationError::SchemaDigestMismatch(id.clone())
+        );
+    }
+    assert_eq!(spy.load(Ordering::SeqCst), 0, "denials acquire nothing");
+}
+
+/// (3) A tool removed from the catalog denies `NotCataloged` under drift.
+#[test]
+fn removed_tool_denies_not_cataloged_under_generation_drift() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let set = SessionToolSet::new(session("s-drift-rm"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+
+    // Registry replacement by runtime name: the old identity is dropped and
+    // a different identity takes its place — the old id is gone.
+    catalog
+        .upsert(
+            Some(&id),
+            mcp_spy_record("mcp.server-1:replacement", Arc::clone(&spy)),
+        )
+        .expect("replacement removes the old identity");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("removed tool must deny");
+    assert_eq!(err, ToolAuthorizationError::NotCataloged(id));
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+/// (4) A tool removed and re-added under different provenance denies via
+/// the unconditional source-trust re-check even though its schema digest is
+/// unchanged (same bytes, different origin — never silently blessed).
+#[test]
+fn re_added_tool_with_different_provenance_denies_source_trust_under_drift() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let set = SessionToolSet::new(session("s-drift-prov"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+
+    // Re-add in place: same id, same schema (digest identical), but the
+    // trust provenance now names a DIFFERENT MCP server than the source.
+    let imposter = CapabilityRecord::new(
+        id.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-1".to_string(),
+            server_tool_name: "deferred".to_string(),
+        },
+        "gate fixture capability",
+        Vec::new(),
+        SchemaLocator::Inline(serde_json::json!({"type": "object"})),
+        {
+            let spy = Arc::clone(&spy);
+            Arc::new(move || -> Arc<dyn Tool> {
+                spy.fetch_add(1, Ordering::SeqCst);
+                Arc::new(FixtureTool::unknown("spy-implementation"))
+            })
+        },
+        TrustProvenance::McpConfig {
+            server_id: "server-2".to_string(),
+        },
+    );
+    catalog
+        .upsert(Some(&id), imposter)
+        .expect("re-add in place");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("provenance drift must deny even with an identical digest");
+    assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+/// A COHERENT imposter: same `ToolId`, byte-identical schema JSON (equal
+/// digest), but source AND provenance both moved to "server-2" — the record
+/// is internally consistent, so `check_source_trust` alone would pass it.
+/// Only the pinned-provenance equality check can deny it.
+fn coherent_imposter_record(id: &ToolId, spy: Arc<AtomicUsize>) -> CapabilityRecord {
+    CapabilityRecord::new(
+        id.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-2".to_string(),
+            server_tool_name: "deferred".to_string(),
+        },
+        "gate fixture capability",
+        Vec::new(),
+        // Identical schema bytes to the mcp_spy_record fixture → equal digest.
+        SchemaLocator::Inline(serde_json::json!({"type": "object"})),
+        {
+            let spy = Arc::clone(&spy);
+            Arc::new(move || -> Arc<dyn Tool> {
+                spy.fetch_add(1, Ordering::SeqCst);
+                Arc::new(FixtureTool::unknown("spy-implementation"))
+            })
+        },
+        TrustProvenance::McpConfig {
+            server_id: "server-2".to_string(),
+        },
+    )
+}
+
+/// (5, BLOCKER fix) Coherent imposter vs a CORE pin: remove the tool and
+/// re-add the SAME `ToolId` with an identical schema but a different,
+/// internally CONSISTENT source+provenance pair. Presence passes, the digest
+/// passes, self-consistency passes — the pinned-provenance check must be
+/// what denies, with zero factory acquisitions.
+#[test]
+fn coherent_imposter_same_digest_denies_pinned_provenance_core() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let set = SessionToolSet::new(session("s-imposter-core"), vec![id.clone()], &catalog)
+        .expect("core set builds");
+
+    let imposter = coherent_imposter_record(&id, Arc::clone(&spy));
+    assert_eq!(
+        imposter.schema_digest(),
+        catalog.get(&id).expect("present").schema_digest(),
+        "imposter fixture must be schema-identical (equal digest) for the test to bite"
+    );
+    catalog
+        .upsert(Some(&id), imposter)
+        .expect("remove + re-add under the same id");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("coherent imposter must be denied on the core path");
+    assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
+    assert_eq!(
+        spy.load(Ordering::SeqCst),
+        0,
+        "denial must never invoke the implementation factory"
+    );
+}
+
+/// (5, BLOCKER fix) Coherent imposter vs an ACTIVATED grant: the grant's
+/// (session, tool, digest) tuple still covers the imposter, so the
+/// engine-side provenance pinned at activation time must be what denies.
+#[test]
+fn coherent_imposter_same_digest_denies_pinned_provenance_activated() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    let record = mcp_spy_record("mcp.server-1:deferred", Arc::clone(&spy));
+    let id = record.id().clone();
+    catalog.insert(record).expect("insert fixture record");
+
+    let sid = session("s-imposter-act");
+    let mut set = SessionToolSet::new(sid.clone(), Vec::new(), &catalog).expect("empty core");
+    set.activate(grant_for(&sid, &catalog, &id), &catalog)
+        .expect("exact grant activates");
+
+    let imposter = coherent_imposter_record(&id, Arc::clone(&spy));
+    assert_eq!(
+        imposter.schema_digest(),
+        catalog.get(&id).expect("present").schema_digest(),
+        "imposter fixture must be schema-identical (equal digest) for the test to bite"
+    );
+    catalog
+        .upsert(Some(&id), imposter)
+        .expect("remove + re-add under the same id");
+
+    let err = ExecutionGate::authorize(&catalog, &set, resolved(&id))
+        .expect_err("coherent imposter must be denied on the activated path");
+    assert_eq!(err, ToolAuthorizationError::SourceProvenanceMismatch(id));
+    assert_eq!(
+        spy.load(Ordering::SeqCst),
+        0,
+        "denial must never invoke the implementation factory"
+    );
 }
 
 // ── Source/trust re-check ───────────────────────────────────────────────────

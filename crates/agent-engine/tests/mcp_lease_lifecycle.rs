@@ -757,7 +757,7 @@ async fn fingerprint_drift_revokes_exact_grant_but_not_siblings_or_core() {
     // Next projection excludes exactly the revoked schema.
     let names: Vec<String> = registry
         .session_tools_schema(&shared.read().unwrap())
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();

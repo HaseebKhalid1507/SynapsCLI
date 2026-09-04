@@ -279,7 +279,8 @@ impl StreamMethods {
         // and the extension-provider route. Built once here, rebuilt only
         // at the top of a provider round when the catalog generation
         // advanced (dynamic registration). Mid-round catalog drift is
-        // DENIED (`StaleSessionSet`), never silently absorbed.
+        // validated PER TOOL at the execution gate (digest + provenance
+        // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
             let set = if progressive_tool_disclosure {
@@ -570,13 +571,18 @@ impl StreamMethods {
                     let session_set = session_tool_set
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    tools_snapshot
-                        .session_tools_schema(&session_set)
-                        .map_err(|err| {
-                            RuntimeError::Tool(format!(
-                                "failed to project the authorized session tool set: {err}"
-                            ))
-                        })?
+                    let report = tools_snapshot.session_tools_schema(&session_set);
+                    // Fail-closed drop report: every pinned member excluded
+                    // from this round's schema is surfaced here (typed),
+                    // not just buried in per-tool log lines.
+                    for (tool_id, reason) in &report.dropped {
+                        tracing::warn!(
+                            tool = %tool_id,
+                            reason = ?reason,
+                            "session schema projection dropped a pinned member for this round"
+                        );
+                    }
+                    report.schema
                 };
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
@@ -789,13 +795,14 @@ impl StreamMethods {
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
                         // Resolve wire name → exact ToolId, verify the
-                        // RETAINED session set's snapshot generation + pinned
-                        // schema digest, require core/exact-grant status,
-                        // re-check source trust, and only then acquire the
-                        // implementation — all under ONE registry read guard
-                        // (one consistent snapshot, no TOCTOU). The set is
-                        // never rebuilt here: post-round-top catalog drift
-                        // denies typed (`StaleSessionSet`). Denials are
+                        // RETAINED session set's pinned schema digest and
+                        // pinned trust provenance, require core/exact-grant
+                        // status, re-check source trust, and only then
+                        // acquire the implementation — all under ONE
+                        // registry read guard (one consistent snapshot, no
+                        // TOCTOU). The set is never rebuilt here:
+                        // post-round-top drift of the CALLED tool's record
+                        // denies typed per tool. Denials are
                         // typed, static, metadata-only and happen BEFORE
                         // implementation lookup and BEFORE any
                         // before_tool_call hook emission.

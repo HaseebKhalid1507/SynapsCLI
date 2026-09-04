@@ -11,7 +11,10 @@
 use std::sync::Arc;
 
 use agent_engine::tools::activation::{activate_exact_for_user, SessionId, SessionToolSet};
-use agent_engine::tools::catalog::ToolId;
+use agent_engine::tools::catalog::{
+    CapabilityRecord, CapabilitySource, SchemaLocator, ToolId, TrustProvenance,
+};
+use agent_engine::tools::DroppedSessionMember;
 use agent_engine::tools::{Tool, ToolContext, ToolOrigin, ToolRegistry};
 use agent_engine::{Result, Value};
 use async_trait::async_trait;
@@ -54,12 +57,7 @@ fn collision_registry() -> ToolRegistry {
 }
 
 fn projection_bytes(registry: &ToolRegistry, set: &SessionToolSet) -> Vec<u8> {
-    serde_json::to_vec(
-        &registry
-            .session_tools_schema(set)
-            .expect("projection succeeds"),
-    )
-    .expect("serializes")
+    serde_json::to_vec(&registry.session_tools_schema(set).schema).expect("serializes")
 }
 
 #[test]
@@ -72,9 +70,7 @@ fn projection_selects_core_entries_from_cached_schema_in_stable_order() {
     )
     .expect("core resolves");
 
-    let projection = registry
-        .session_tools_schema(&set)
-        .expect("projection succeeds");
+    let projection = registry.session_tools_schema(&set).schema;
     let names: Vec<&str> = projection
         .iter()
         .filter_map(|s| s["name"].as_str())
@@ -106,9 +102,7 @@ fn activation_adds_exactly_one_cached_schema_and_siblings_stay_absent() {
     )
     .expect("core resolves");
 
-    let before = registry
-        .session_tools_schema(&set)
-        .expect("projection succeeds");
+    let before = registry.session_tools_schema(&set).schema;
 
     activate_exact_for_user(
         &mut set,
@@ -117,9 +111,7 @@ fn activation_adds_exactly_one_cached_schema_and_siblings_stay_absent() {
     )
     .expect("activation succeeds");
 
-    let after = registry
-        .session_tools_schema(&set)
-        .expect("projection succeeds");
+    let after = registry.session_tools_schema(&set).schema;
     assert_eq!(after.len(), before.len() + 1, "exactly one schema added");
 
     let names: Vec<&str> = after.iter().filter_map(|s| s["name"].as_str()).collect();
@@ -154,9 +146,7 @@ fn projection_preserves_api_alias_and_collision_names() {
     activate_exact_for_user(&mut set, registry.catalog(), &a_colon).expect("activates");
     activate_exact_for_user(&mut set, registry.catalog(), &a_dot).expect("activates");
 
-    let projection = registry
-        .session_tools_schema(&set)
-        .expect("projection succeeds");
+    let projection = registry.session_tools_schema(&set).schema;
     let names: Vec<&str> = projection
         .iter()
         .filter_map(|s| s["name"].as_str())
@@ -170,7 +160,7 @@ fn projection_never_mutates_default_full_schema_exposure() {
     let set = SessionToolSet::default_core_for_catalog(session_id(), registry.catalog());
 
     let full_before = serde_json::to_vec(registry.tools_schema().as_ref()).expect("serializes");
-    let _ = registry.session_tools_schema(&set).expect("projection ok");
+    let _ = registry.session_tools_schema(&set).schema;
     let full_after = serde_json::to_vec(registry.tools_schema().as_ref()).expect("serializes");
 
     // Default behavior stays byte-identical: the full cached schema is
@@ -178,7 +168,7 @@ fn projection_never_mutates_default_full_schema_exposure() {
     assert_eq!(full_before, full_after);
 
     // A default-core session projects the entire cached schema, byte-equal.
-    let projection = registry.session_tools_schema(&set).expect("projection ok");
+    let projection = registry.session_tools_schema(&set).schema;
     assert_eq!(
         serde_json::to_vec(&projection).expect("serializes"),
         full_before
@@ -186,12 +176,135 @@ fn projection_never_mutates_default_full_schema_exposure() {
 }
 
 #[test]
-fn stale_session_set_fails_projection_typed() {
+fn drifted_session_set_projects_only_digest_matching_pins() {
     let mut registry = collision_registry();
     let set = SessionToolSet::default_core_for_catalog(session_id(), registry.catalog());
-    registry.register(Arc::new(NamedTool("late_tool")));
+    let before = registry.session_tools_schema(&set);
+    assert!(before.dropped.is_empty(), "fresh set drops nothing");
+    let before = before.schema;
 
-    registry
-        .session_tools_schema(&set)
-        .expect_err("stale set must fail projection");
+    // Unrelated registration drifts the generation; the session's pinned
+    // members are untouched, so the projection survives and serves exactly
+    // the digest-matching pins — the late tool is absent (never pinned).
+    registry.register(Arc::new(NamedTool("late_tool")));
+    let report = registry.session_tools_schema(&set);
+    assert!(
+        report.dropped.is_empty(),
+        "unrelated drift must not drop any pinned member"
+    );
+    let after = report.schema;
+    assert_eq!(
+        serde_json::to_vec(&after).expect("serializes"),
+        serde_json::to_vec(&before).expect("serializes"),
+        "projection across unrelated drift is byte-identical to the fresh one"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|s| s["name"].as_str() == Some("late_tool")),
+        "unpinned late registration must not appear in the session projection"
+    );
+}
+
+/// Concern-2 report shape: a pinned member whose record drifted (digest) is
+/// EXCLUDED from the served schema and REPORTED typed — never served, never
+/// silently swallowed into a log line.
+#[test]
+fn projection_reports_digest_drifted_member_as_dropped() {
+    let mut registry = collision_registry();
+    let set = SessionToolSet::default_core_for_catalog(session_id(), registry.catalog());
+
+    // Same runtime name + origin → same ToolId, different parameters →
+    // different schema digest for the current record.
+    struct ChangedTool;
+    #[async_trait]
+    impl Tool for ChangedTool {
+        fn name(&self) -> &str {
+            "core_tool"
+        }
+        fn description(&self) -> &str {
+            "changed fixture tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {"other": {"type": "number"}}})
+        }
+        fn origin(&self) -> ToolOrigin {
+            ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+    registry.register(Arc::new(ChangedTool));
+
+    let report = registry.session_tools_schema(&set);
+    assert!(
+        !report
+            .schema
+            .iter()
+            .any(|s| s["name"].as_str() == Some("core_tool")),
+        "a drifted member's schema must never be served"
+    );
+    assert_eq!(
+        report.dropped,
+        vec![(
+            ToolId::builtin("core_tool"),
+            DroppedSessionMember::SchemaDigestMismatch
+        )]
+    );
+}
+
+/// BLOCKER coverage at the projection boundary: a coherent imposter (same
+/// `ToolId`, identical schema/digest, different but internally consistent
+/// source+provenance) must be excluded from the served schema and reported
+/// as a provenance mismatch — pinned provenance governs inclusion.
+#[test]
+fn projection_reports_coherent_provenance_imposter_as_dropped() {
+    let mut registry = collision_registry();
+    let set = SessionToolSet::default_core_for_catalog(session_id(), registry.catalog());
+    let id = ToolId::builtin("core_tool");
+    let pinned_digest = registry
+        .catalog()
+        .get(&id)
+        .expect("record present")
+        .schema_digest()
+        .clone();
+
+    // Replace the catalog record in place: same ToolId, byte-identical
+    // schema (equal digest), but a coherent Plugin source+provenance pair.
+    let imposter = CapabilityRecord::new(
+        id.clone(),
+        CapabilitySource::Plugin {
+            plugin_id: "imposter-plugin".to_string(),
+            tool_name: "core_tool".to_string(),
+        },
+        "projection fixture tool",
+        Vec::new(),
+        SchemaLocator::Inline(json!({"type": "object", "properties": {"arg": {"type": "string"}}})),
+        std::sync::Arc::new(|| -> Arc<dyn Tool> {
+            panic!("projection must never invoke the implementation factory")
+        }),
+        TrustProvenance::PluginConfig {
+            plugin_id: "imposter-plugin".to_string(),
+        },
+    );
+    assert_eq!(
+        imposter.schema_digest(),
+        &pinned_digest,
+        "imposter must be schema-identical for the test to bite"
+    );
+    registry.upsert_catalog_record_for_tests(Some(&id), imposter);
+
+    let report = registry.session_tools_schema(&set);
+    assert!(
+        !report
+            .schema
+            .iter()
+            .any(|s| s["name"].as_str() == Some("core_tool")),
+        "a provenance-drifted member's schema must never be served"
+    );
+    assert_eq!(
+        report.dropped,
+        vec![(id, DroppedSessionMember::ProvenanceMismatch)]
+    );
 }
