@@ -165,6 +165,37 @@ fn provenance_drift_drops_the_activation() {
     assert!(next.activation(&b).is_some());
 }
 
+/// Source drifts while the pinned provenance stays: a re-activation would
+/// fail `check_source_trust`, so carry-forward drops it too (was: carried
+/// into the schema, then denied at the gate — same security, wrong report).
+#[test]
+fn source_provenance_mismatch_drops_the_activation() {
+    let (mut catalog, set, _core, a, b) = fixture();
+    let mismatched = CapabilityRecord::new(
+        a.clone(),
+        CapabilitySource::Mcp {
+            server_id: "server-2".to_string(),
+            server_tool_name: "alpha".to_string(),
+        },
+        "carry-forward fixture capability",
+        Vec::new(),
+        SchemaLocator::Inline(serde_json::json!({"type": "object"})),
+        Arc::new(|| -> Arc<dyn Tool> { Arc::new(FixtureTool) }),
+        // Provenance unchanged from the pinned record.
+        TrustProvenance::McpConfig {
+            server_id: "server-1".to_string(),
+        },
+    );
+    catalog.upsert(Some(&a), mismatched).unwrap();
+
+    let (next, dropped) = set.rebuilt_for_catalog(&catalog, true);
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].id, a);
+    assert_eq!(dropped[0].reason, DropReason::Drifted);
+    assert!(next.activation(&a).is_none(), "not exposed in the schema");
+    assert!(next.activation(&b).is_some());
+}
+
 #[test]
 fn removed_tool_is_reported_removed() {
     let (catalog, set, _core, a, b) = fixture();

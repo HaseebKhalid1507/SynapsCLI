@@ -299,9 +299,15 @@ impl SessionToolSet {
             match catalog.get(&id) {
                 // Promoted to core by the new catalog — nothing to carry.
                 Some(_) if next.core.contains_key(&id) => {}
+                // Same checks a re-activation runs (`activate_many`): pinned
+                // digest + provenance unchanged AND the record's source still
+                // agrees with its provenance (`check_source_trust`). A record
+                // whose source drifted under a stable provenance is dropped
+                // as `Drifted` rather than carried into the schema.
                 Some(rec)
                     if rec.schema_digest() == old.schema_digest()
-                        && rec.provenance() == old.provenance() =>
+                        && rec.provenance() == old.provenance()
+                        && check_source_trust(rec).is_ok() =>
                 {
                     let grant = SessionActivationGrant::new(
                         self.session.as_str(),
