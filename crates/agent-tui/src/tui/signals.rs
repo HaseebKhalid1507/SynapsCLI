@@ -114,21 +114,92 @@ pub(crate) fn signal_label(signal: ShutdownSignal) -> &'static str {
     }
 }
 
-/// A handle that can stop the signal-listener thread.
+/// Where the signal listener runs (PLAN-phase4 §6 #4).
 ///
-/// Dropping or calling `.close()` unregisters the signal hooks and causes the
+/// `Thread` is the historical signal-hook std thread (see the module doc for
+/// why the in-process TUI keeps it). `Tokio` is `tokio::signal::unix` on the
+/// runtime's own driver — no thread; used by the socket client, whose
+/// current-thread runtime has no history with the resolution problem above
+/// (covered by `tokio_backend_delivers_sigterm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalBackend {
+    Thread,
+    Tokio,
+}
+
+impl SignalBackend {
+    /// Socket client → `Tokio` unless `SYNAPS_CLIENT_SIGNAL_THREAD=1`;
+    /// in-process → `Thread`.
+    pub(crate) fn for_socket(socket: bool) -> Self {
+        if socket && !std::env::var("SYNAPS_CLIENT_SIGNAL_THREAD").is_ok_and(|v| v == "1") {
+            Self::Tokio
+        } else {
+            Self::Thread
+        }
+    }
+}
+
+/// A handle that can stop the signal listener.
+///
+/// Thread backend: `.close()` unregisters the signal hooks and causes the
 /// blocking `Signals::forever()` iterator to return, letting the thread exit
-/// cleanly.
+/// cleanly. Tokio backend: aborts the listener task.
 pub(crate) struct SignalHandle {
     #[cfg(unix)]
-    inner: signal_hook::iterator::Handle,
+    inner: SignalHandleInner,
+}
+
+#[cfg(unix)]
+enum SignalHandleInner {
+    Thread(signal_hook::iterator::Handle),
+    Tokio(tokio::task::JoinHandle<()>),
 }
 
 impl SignalHandle {
     pub(crate) fn close(self) {
         #[cfg(unix)]
-        self.inner.close();
+        match self.inner {
+            SignalHandleInner::Thread(h) => h.close(),
+            SignalHandleInner::Tokio(t) => t.abort(),
+        }
     }
+}
+
+/// `tokio::signal::unix` listener on the current runtime (no thread).
+#[cfg(unix)]
+pub(crate) fn spawn_shutdown_signal_task_with(
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+    backend: SignalBackend,
+) -> SignalHandle {
+    if backend == SignalBackend::Thread {
+        return spawn_shutdown_signal_task(tx);
+    }
+    use tokio::signal::unix::{signal, SignalKind};
+    let task = tokio::spawn(async move {
+        let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!("signals: tokio backend unavailable; no OS signal handling");
+            return;
+        };
+        let shutdown = tokio::select! {
+            _ = term.recv() => ShutdownSignal::Terminate,
+            _ = hup.recv() => ShutdownSignal::Hangup,
+            _ = int.recv() => ShutdownSignal::Interrupt,
+        };
+        let _ = tx.send(shutdown);
+    });
+    SignalHandle { inner: SignalHandleInner::Tokio(task) }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_shutdown_signal_task_with(
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+    _backend: SignalBackend,
+) -> SignalHandle {
+    spawn_shutdown_signal_task(tx)
 }
 
 /// Spawn a **std::thread** that delivers OS signals over the existing tokio
@@ -178,7 +249,7 @@ pub(crate) fn spawn_shutdown_signal_task(
         })
         .expect("failed to spawn signal-listener thread");
 
-    SignalHandle { inner: handle }
+    SignalHandle { inner: SignalHandleInner::Thread(handle) }
 }
 
 #[cfg(not(unix))]
@@ -233,6 +304,38 @@ mod tests {
             ShutdownSignal::Hangup,
         ] {
             assert!(!signal_label(sig).is_empty());
+        }
+    }
+
+    /// A3: SIGTERM to self under a current-thread runtime reaches the
+    /// channel through the tokio backend (no signal-listener thread).
+    #[cfg(unix)]
+    #[test]
+    fn tokio_backend_delivers_sigterm() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = spawn_shutdown_signal_task_with(tx, SignalBackend::Tokio);
+            // Let the listener register before raising.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            signal_hook::low_level::raise(signal_hook::consts::signal::SIGTERM).unwrap();
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("SIGTERM never delivered");
+            assert_eq!(got, Some(ShutdownSignal::Terminate));
+            handle.close();
+        });
+    }
+
+    #[test]
+    fn backend_selection() {
+        assert_eq!(SignalBackend::for_socket(false), SignalBackend::Thread);
+        if std::env::var("SYNAPS_CLIENT_SIGNAL_THREAD").is_err() {
+            assert_eq!(SignalBackend::for_socket(true), SignalBackend::Tokio);
         }
     }
 

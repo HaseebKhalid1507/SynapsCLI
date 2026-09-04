@@ -40,6 +40,8 @@ pub(crate) enum TransportMode {
 /// actually asks (`SYNAPS_CLIENT_HTTP=eager` builds it at boot — bisect aid).
 pub(crate) struct LazyHttp(std::cell::OnceCell<reqwest::Client>);
 
+use agent_core::core::memstat::ladder as ladder_stage;
+
 impl LazyHttp {
     /// Empty; the first `get()` builds via `build_host_http_client`.
     pub(crate) fn new() -> Self {
@@ -294,6 +296,7 @@ pub(crate) async fn finish_setup(
     // Pass `None` ⇒ blind best-effort push, byte-identical with today. See the
     // `setup_terminal` doc for why the push can't be fact-gated at this site.
     let terminal = setup_terminal(None)?;
+    ladder_stage("terminal", &{ let (c, r) = crossterm::terminal::size().unwrap_or((0, 0)); format!("cols={c} rows={r}") });
 
     // ── P16.2: DA1-fenced terminal capability query burst ──
     //
@@ -313,13 +316,16 @@ pub(crate) async fn finish_setup(
     // Timeout / partial replies ⇒ env-detected caps unchanged (= today's
     // behavior) ⇒ boot proceeds normally. NEVER move this below
     // `EventStream::new()`; NEVER add a second stdin reader for it.
+    let t_caps = Instant::now();
     let term_caps =
         termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
+    ladder_stage("termcaps", &format_args!("burst_ms={}", t_caps.elapsed().as_millis()));
 
     // P16.3: hand the negotiated caps to the render thread so `render_frame`
     // can gate edge-scrub (tmux provenance) and synchronized-output (mode 2026)
     // on facts. Cloned because `term_caps` is also returned in `RunContext`.
     let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal, term_caps.clone());
+    ladder_stage("render_thread", &"");
     // Boot effect is sent via the command channel so the render thread owns it.
     // SYNAPS_NO_BOOT_FX=1 skips it (slow/high-latency links, screen readers).
     if std::env::var("SYNAPS_NO_BOOT_FX").map_or(true, |v| v != "1") {
@@ -328,7 +334,11 @@ pub(crate) async fn finish_setup(
 
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
+    let shutdown_signal_task = signals::spawn_shutdown_signal_task_with(
+        shutdown_signal_tx,
+        signals::SignalBackend::for_socket(matches!(mode, TransportMode::Socket)),
+    );
+    ladder_stage("event_stream", &"");
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let prompt_bridge = PromptBridge::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));

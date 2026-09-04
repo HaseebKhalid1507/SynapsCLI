@@ -18,6 +18,8 @@ use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
 use synaps_cli::Result;
 
+use agent_core::core::memstat::ladder;
+
 use super::app::ChatMessage;
 use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp, TransportMode};
 
@@ -71,6 +73,7 @@ pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -
 }
 
 pub async fn run_attached(opts: AttachOpts) -> Result<()> {
+    ladder("attach:enter", &"");
     let paths = agent_engine::daemon::registry::daemon_paths(opts.profile.as_deref());
     if !agent_engine::daemon::registry::is_alive(&paths) {
         return Err(cfg_err(daemon_not_running_message(
@@ -97,6 +100,10 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
         }
         Err(e) => return Err(cfg_err(format!("connect: {e}"))),
     };
+    ladder(
+        "connect",
+        &format_args!("sessions={}", conn.welcome.sessions.len()),
+    );
 
     let cwd = std::env::current_dir().ok();
     let create = |continue_session: Option<Option<String>>| Attach::Create {
@@ -144,6 +151,20 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     let (transport, snapshot) = SocketTransport::attach(conn, attach)
         .await
         .map_err(|e| cfg_err(format!("attach: {e}")))?;
+    // `frame_bytes` is filled once the transport records its last frame
+    // length (B4 `last_frame_bytes()`); until then the wire size is not known here.
+    ladder(
+        "attached",
+        &format_args!(
+            "frame_bytes=n/a messages_len={} api_messages={} replay={} tail_items={}",
+            snapshot.conversation.messages_len,
+            snapshot.conversation.api_messages.len(),
+            snapshot.replay.len(),
+            agent_engine::session::DEFAULT_TAIL_ITEMS
+        ),
+    );
+    // The decode transient of `Attached` is garbage now — give it back (§4.4).
+    super::client_diet::purge_arenas("purge:attached");
 
     // ── Client diet: config + builtin commands + keybinds, nothing else ──
     let config = synaps_cli::load_config();
@@ -154,6 +175,7 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     }
     let keybind_registry = Arc::new(std::sync::RwLock::new(keybinds));
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
+    ladder("config", &"");
     let http = LazyHttp::new();
     if std::env::var("SYNAPS_CLIENT_HTTP").is_ok_and(|v| v == "eager") {
         http.get()?;
@@ -162,6 +184,7 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     let mut app = app_from_snapshot(&snapshot);
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
+    ladder("app", &"");
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }
@@ -212,6 +235,7 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     for pr in pending {
         ctx.prompt_bridge.on_prompt(pr);
     }
+    ladder("replay", &"");
     if opts.keep_warm {
         let _ = ctx.link.send(SessionCommand::KeepWarm { on: true }).await;
     }

@@ -52,6 +52,10 @@ pub struct SelfMem {
     pub jemalloc_retained_kb: u64,
     #[serde(default)]
     pub jemalloc_metadata_kb: u64,
+    /// `AnonHugePages` from `smaps_rollup` — THP-backed anon (a 2 MiB huge
+    /// page per touched thread stack / bss / arena chunk when THP=always).
+    #[serde(default)]
+    pub anon_huge_kb: u64,
 }
 
 /// Totals over a set of [`ProcMem`] rows.
@@ -126,6 +130,7 @@ pub fn self_snapshot() -> SelfMem {
             snap.rss_anon_kb = s.anon_kb;
             snap.threads = s.threads;
         }
+        snap.anon_huge_kb = linux::anon_huge_kb(Path::new("/proc/self/smaps_rollup"));
     }
     #[cfg(all(unix, not(target_env = "musl")))]
     {
@@ -149,6 +154,129 @@ pub fn purge_arenas() {
         // MALLCTL_ARENAS_ALL = 4096; `arena.<i>.purge` is a void mallctl
         // (jemalloc rejects a non-null newp), so issue it as a zero-length read.
         let _ = unsafe { tikv_jemalloc_ctl::raw::read::<()>(b"arena.4096.purge\0") };
+    }
+}
+
+/// Outcome of one mallctl write, for the ladder line (never fatal).
+pub type MallctlResult = std::result::Result<(), String>;
+
+#[cfg(all(unix, not(target_env = "musl")))]
+fn mallctl_err(name: &str, e: impl std::fmt::Display) -> String {
+    format!("{name}: {e}")
+}
+
+/// `background_thread` on/off. Turning it off joins every `jemalloc_bg_thd`
+/// (PLAN-phase4 §4.1) — call before spawning threads so none are created for
+/// the arenas they touch. No-op `Ok` without jemalloc.
+pub fn set_background_threads(on: bool) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        tikv_jemalloc_ctl::background_thread::write(on)
+            .map_err(|e| mallctl_err("background_thread", e))
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = on;
+        Ok(())
+    }
+}
+
+/// Current `background_thread` setting (`None` without jemalloc).
+pub fn background_threads_enabled() -> Option<bool> {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        tikv_jemalloc_ctl::background_thread::read().ok()
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        None
+    }
+}
+
+/// Decay times for **existing** arenas (`arena.<ALL>.*_decay_ms`) and the
+/// default for future ones (`arenas.*_decay_ms`). `0` = purge a freed run
+/// on the next decay tick; `-1` = never. §4.2.
+pub fn set_decay_ms(dirty_ms: i64, muzzy_ms: i64) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        use tikv_jemalloc_ctl::raw;
+        // ssize_t on every supported target.
+        let d = dirty_ms as libc::ssize_t;
+        let m = muzzy_ms as libc::ssize_t;
+        unsafe {
+            raw::write(b"arenas.dirty_decay_ms\0", d)
+                .map_err(|e| mallctl_err("arenas.dirty_decay_ms", e))?;
+            raw::write(b"arenas.muzzy_decay_ms\0", m)
+                .map_err(|e| mallctl_err("arenas.muzzy_decay_ms", e))?;
+            // `arena.<i>.*_decay_ms` rejects MALLCTL_ARENAS_ALL (EFAULT);
+            // walk the initialised arenas instead. Uninitialised ones take
+            // the `arenas.*` default above when created.
+            let n: u32 = raw::read(b"arenas.narenas\0")
+                .map_err(|e| mallctl_err("arenas.narenas", e))?;
+            for i in 0..n {
+                let dk = format!("arena.{i}.dirty_decay_ms\0");
+                let mk = format!("arena.{i}.muzzy_decay_ms\0");
+                if raw::write(dk.as_bytes(), d).is_ok() {
+                    let _ = raw::write(mk.as_bytes(), m);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = (dirty_ms, muzzy_ms);
+        Ok(())
+    }
+}
+
+/// `prctl(PR_GET_THP_DISABLE)` — is THP already off for this process
+/// (inherited across `execve`, so a re-exec'd client sees `Some(true)`)?
+pub fn thp_disabled() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain prctl with integer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0u64, 0u64, 0u64, 0u64) };
+        (rc >= 0).then_some(rc == 1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `prctl(PR_SET_THP_DISABLE)` — no transparent huge pages for this process
+/// from now on. With `THP=always` every touched thread stack, the `.bss` and
+/// each jemalloc chunk costs a 2 MiB page; the thin client wants 4 KiB
+/// granularity. Inherited by threads created afterwards. Linux only.
+pub fn disable_thp() -> MallctlResult {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain prctl with integer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("prctl(PR_SET_THP_DISABLE): {}", std::io::Error::last_os_error()))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+/// `thread.tcache.enabled` for the **calling** thread (§4.3 fallback).
+pub fn set_thread_tcache(on: bool) -> MallctlResult {
+    #[cfg(all(unix, not(target_env = "musl")))]
+    {
+        unsafe { tikv_jemalloc_ctl::raw::write(b"thread.tcache.enabled\0", on) }
+            .map_err(|e| mallctl_err("thread.tcache.enabled", e))
+    }
+    #[cfg(not(all(unix, not(target_env = "musl"))))]
+    {
+        let _ = on;
+        Ok(())
     }
 }
 
@@ -234,7 +362,7 @@ fn ladder_line(t_ms: u128, stage: &str, s: &SelfMem, extra: &dyn std::fmt::Displ
     let extra = extra.to_string();
     let sep = if extra.is_empty() { "" } else { " " };
     format!(
-        "t_ms={t_ms} stage={stage} rss_anon_kb={} jemalloc_allocated_kb={} active_kb={} resident_kb={} retained_kb={} metadata_kb={} threads={}{sep}{extra}\n",
+        "t_ms={t_ms} stage={stage} rss_anon_kb={} jemalloc_allocated_kb={} active_kb={} resident_kb={} retained_kb={} metadata_kb={} threads={} anon_huge_kb={}{sep}{extra}\n",
         s.rss_anon_kb,
         s.jemalloc_allocated_kb,
         s.jemalloc_active_kb,
@@ -242,6 +370,7 @@ fn ladder_line(t_ms: u128, stage: &str, s: &SelfMem, extra: &dyn std::fmt::Displ
         s.jemalloc_retained_kb,
         s.jemalloc_metadata_kb,
         s.threads,
+        s.anon_huge_kb,
     )
 }
 
@@ -410,6 +539,14 @@ mod linux {
         Ok(s)
     }
 
+    /// `AnonHugePages:` line of a `smaps_rollup` (0 when unreadable).
+    pub(super) fn anon_huge_kb(path: &Path) -> u64 {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.lines().find(|l| l.starts_with("AnonHugePages:")).map(kb))
+            .unwrap_or(0)
+    }
+
     struct Rollup {
         rss_kb: u64,
         pss_kb: u64,
@@ -540,11 +677,11 @@ mod tests {
         };
         assert_eq!(
             ladder_line(42, "http", &s, &"build_ms=3"),
-            "t_ms=42 stage=http rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7 build_ms=3\n"
+            "t_ms=42 stage=http rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7 anon_huge_kb=0 build_ms=3\n"
         );
         assert_eq!(
             ladder_line(0, "main", &s, &""),
-            "t_ms=0 stage=main rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7\n"
+            "t_ms=0 stage=main rss_anon_kb=1 jemalloc_allocated_kb=2 active_kb=3 resident_kb=4 retained_kb=5 metadata_kb=6 threads=7 anon_huge_kb=0\n"
         );
         // `mem_trace_enabled()` is cached per process and the test binary
         // does not set SYNAPS_MEM_TRACE: `ladder` must be a no-op and must
