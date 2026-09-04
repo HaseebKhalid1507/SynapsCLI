@@ -123,13 +123,42 @@ use futures::StreamExt;
 
 /// Sequenced stub: hit `i` serves `bodies[min(i, len-1)]` (all terminal).
 pub async fn stub_seq(bodies: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
+    stub_seq_with(bodies, false).await
+}
+
+/// `stub_seq` whose LAST body is served endless (keep-alives forever).
+pub async fn stub_seq_endless_last(
+    bodies: &'static [&'static str],
+) -> (String, Arc<AtomicUsize>) {
+    stub_seq_with(bodies, true).await
+}
+
+async fn stub_seq_with(
+    bodies: &'static [&'static str],
+    endless_last: bool,
+) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_c = Arc::clone(&hits);
     let app = axum::Router::new().fallback(move || {
         let hits = Arc::clone(&hits_c);
         async move {
             let i = hits.fetch_add(1, Ordering::SeqCst);
-            let body = bodies[i.min(bodies.len() - 1)];
+            let idx = i.min(bodies.len() - 1);
+            let body = bodies[idx];
+            if endless_last && idx == bodies.len() - 1 {
+                let stream = futures::stream::once(async move {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(body))
+                })
+                .chain(futures::stream::unfold((), |()| async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some((Ok(axum::body::Bytes::from(": keep-alive\n\n")), ()))
+                }));
+                return axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap();
+            }
             (
                 axum::http::StatusCode::OK,
                 [("content-type", "text/event-stream")],

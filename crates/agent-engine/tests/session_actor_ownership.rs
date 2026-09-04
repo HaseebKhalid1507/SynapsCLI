@@ -250,7 +250,7 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     let _h = Home::new();
     // Round 1: shell_start; round 2+: an endless stream so Checkpoint has a
     // turn to cancel.
-    let (url, _) = stub_seq(&[SSE_SHELL_START, SSE_PREFIX]).await;
+    let (url, _) = stub_seq_endless_last(&[SSE_SHELL_START, SSE_PREFIX]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
     let handle = host
