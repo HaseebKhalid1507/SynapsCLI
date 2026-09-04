@@ -411,3 +411,73 @@ async fn purge_frame_answers_pong() {
     assert!(d.state.live_sessions().is_empty());
     d.state.request_shutdown(false);
 }
+
+/// Phase 4 §2.3 (B3): the conn forwarder drops `Stream(MessageHistory)` for
+/// `HistoryMode::Digest` clients — they key on the `Conversation` digest
+/// that follows — while a Full client on the same session still gets it.
+#[tokio::test]
+#[serial]
+async fn digest_client_never_receives_message_history() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut full, _) = SocketTransport::attach(
+        conn,
+        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next(&mut full).await.event, SessionEventWire::ClientJoined { .. }));
+
+    let conn2 = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test).with_history(HistoryMode::Digest))
+        .await
+        .unwrap();
+    let (mut digest, snap) =
+        SocketTransport::attach(conn2, Attach::Existing { session_id: full.session_id().clone(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+    assert!(snap.display_tail.is_some(), "Digest attach carries a display_tail");
+    assert!(snap.conversation.api_messages.is_empty());
+    assert!(matches!(next(&mut full).await.event, SessionEventWire::ClientJoined { .. }));
+    assert!(matches!(next(&mut digest).await.event, SessionEventWire::ClientJoined { .. }));
+
+    full.send(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+
+    let mut full_saw_history = false;
+    loop {
+        let e = next(&mut full).await;
+        match e.event {
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(m))) => full_saw_history = m.len() == 2,
+            SessionEventWire::Conversation(_) => break,
+            _ => {}
+        }
+    }
+    assert!(full_saw_history, "Full client still receives MessageHistory");
+
+    let mut digest_events = Vec::new();
+    loop {
+        let e = next(&mut digest).await;
+        let done = matches!(e.event, SessionEventWire::Conversation(_));
+        digest_events.push(e);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !digest_events
+            .iter()
+            .any(|e| matches!(e.event, SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_))))),
+        "Digest client must never see MessageHistory: {digest_events:?}"
+    );
+    assert!(digest_events.iter().any(|e| matches!(e.event, SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done)))));
+    match &digest_events.last().unwrap().event {
+        SessionEventWire::Conversation(c) => assert_eq!(c.messages_len, 2),
+        o => panic!("{o:?}"),
+    }
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}

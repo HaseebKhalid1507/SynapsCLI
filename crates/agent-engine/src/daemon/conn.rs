@@ -19,6 +19,7 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
+use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -367,6 +368,17 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
     let fwd_announce = state.announce();
+    // Phase 4 §2.3: Digest clients never receive the per-round full history;
+    // the `Conversation` digest the actor emits right after is what they key on.
+    let history = hello.client.history;
+    let skip = move |env: &Envelope| -> bool {
+        matches!(env.event, SessionEventWire::Attached { .. })
+            || (history == HistoryMode::Digest
+                && matches!(
+                    env.event,
+                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+                ))
+    };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -378,7 +390,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
                     while let Ok(env) = rx.try_recv() {
-                        if matches!(env.event, SessionEventWire::Attached { .. }) {
+                        if skip(&env) {
                             continue;
                         }
                         if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
@@ -391,7 +403,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             match next {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
-                    if matches!(env.event, SessionEventWire::Attached { .. }) {
+                    if skip(&env) {
                         continue;
                     }
                     let ended = matches!(env.event, SessionEventWire::Ended { .. });

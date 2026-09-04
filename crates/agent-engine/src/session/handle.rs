@@ -264,17 +264,31 @@ pub mod echo {
             let _ = self.events.send(env);
         }
 
-        fn snapshot(&self) -> AttachSnapshot {
+        fn conv_snapshot(&self) -> ConversationSnapshot {
+            let mut c = self.conv.clone();
+            c.messages_len = c.api_messages.len();
+            c
+        }
+
+        /// Mirrors `SessionActor::snapshot_for`: Digest clients get the
+        /// tail, not the history.
+        fn snapshot_for(&self, client: &ClientMeta) -> AttachSnapshot {
+            let mut conversation = self.conv_snapshot();
+            let display_tail = (client.history == HistoryMode::Digest).then(|| {
+                let t = crate::session::display::display_tail(&conversation.api_messages, client.tail_items);
+                conversation.api_messages = Vec::new();
+                t
+            });
             AttachSnapshot {
                 meta: meta_for(&self.id),
                 view: (**self.view.load()).clone(),
-                conversation: self.conv.clone(),
+                conversation,
                 streaming: false,
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
                 input_owner: None,
-                display_tail: None,
+                display_tail,
             }
         }
 
@@ -284,13 +298,14 @@ pub mod echo {
                     let cid = ClientId(self.next_client);
                     self.next_client += 1;
                     let kind = client.kind;
+                    let snapshot_meta = client.clone();
                     self.clients.insert(cid, client);
                     if mode != AttachMode::Mirror {
                         self.emit(SessionEventWire::SystemNotice(format!(
                             "attach mode {mode:?} not supported yet; using mirror"
                         )));
                     }
-                    let snapshot = self.snapshot();
+                    let snapshot = self.snapshot_for(&snapshot_meta);
                     self.emit(SessionEventWire::Attached {
                         client: cid,
                         snapshot,
@@ -324,7 +339,7 @@ pub mod echo {
                     self.emit(SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::Done,
                     )));
-                    let snap = self.conv.clone();
+                    let snap = self.conv_snapshot();
                     self.emit(SessionEventWire::Conversation(snap));
                 }
                 SessionCommand::Steer { text } => {
@@ -335,7 +350,7 @@ pub mod echo {
                     });
                 }
                 SessionCommand::Cancel => {
-                    let snap = self.conv.clone();
+                    let snap = self.conv_snapshot();
                     self.emit(SessionEventWire::Conversation(snap));
                 }
                 SessionCommand::Query { id, query } => {
