@@ -17,6 +17,11 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
 | `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` for attach clients is not wired yet (A4/C4 client diet). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
+| `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
+| `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
+| `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does. |
+| `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
+| `synaps daemon reload` / `stop` / `purge` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs. `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
@@ -27,7 +32,7 @@ synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for
 synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
-synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT]
+synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
 synaps --attach [ID]                 # today: notice + routes to `synaps attach` (daemon-attached TUI is day 2)
 ```
 
@@ -37,7 +42,9 @@ stderr tail). Measured on bella: ready in ~75 ms.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
-`/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query).
+`/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);
+`/keep-warm on|off`. Typed events render as `[aborted…]`, `[session cleared → id]`, `[compacting: …]`,
+`[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
 
@@ -128,9 +135,12 @@ C: bye | socket close = Detach (turn keeps running)
 - **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
   `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
   Spawned compaction is day 2.
-- `daemon stop` while a turn is streaming cancels it **and captures an abort context** (`finish()` →
-  `cancel_turn()`), so the session is "aborted" on disk; the TUI's quit-mid-turn only cancels the token.
-  Defensible (the next `--continue` tells the model the previous answer was cut), documented here.
+- **Quit mid-turn saves an abort context — default path, every host.** `End{ClientQuit}` (chat's
+  stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which only detaches) and `daemon stop` while a turn
+  is streaming run `finish()` → `cancel_turn()`: the turn is cancelled **and** the partial output is
+  captured as `abort_context` and saved, so the next `--continue` prepends `[ABORT CONTEXT…]` — where the
+  pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
+  `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 
 ## Reload (`synaps daemon reload`, phase 3 C3)
@@ -212,6 +222,10 @@ Honest list of behaviour changes on this branch with `SYNAPS_DAEMON` **unset**:
    finally has a writer), but it is a default-path change. `SYNAPS_MCP_CACHE_WRITEBACK=0` restores the
    old read-only behaviour.
 3. Hook events carry `session_id` (additive; `SYNAPS_HOOK_SESSION_ID=0`).
+4. **`synaps chat` renders typed events**: `/compact` prints `compacting...`, the disclosure line and
+   `[compacted → ~N tokens]` (one each — the actor emits `CompactionStarted/Applied/Failed/Cancelled`,
+   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}`, `/clear` renders
+   `Cleared{session_id}`. Quit mid-turn saves an abort context (§Lifecycle above).
 
 ## Memory acceptance — `DAEMON=1 SYNAPS_DAEMON=1 scripts/memprof/bench-sessions.sh BIN 1 2 3`
 

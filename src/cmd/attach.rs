@@ -28,6 +28,29 @@ pub(crate) struct AttachArgs {
     /// System prompt for a created session.
     #[arg(long = "system", short = 's')]
     pub system: Option<String>,
+    /// Read-only mirror: never owns input (B1).
+    #[arg(long, conflicts_with = "takeover")]
+    pub observe: bool,
+    /// Steal input ownership from the current owner (B1).
+    #[arg(long)]
+    pub takeover: bool,
+    /// Never park this session (B3); also sent to an existing session.
+    #[arg(long = "keep-warm")]
+    pub keep_warm: bool,
+}
+
+impl AttachArgs {
+    /// `--observe` → `Observe`, `--takeover` → `Takeover`, else `Mirror`
+    /// (owner iff nobody owns input yet).
+    pub(crate) fn attach_mode(&self) -> AttachMode {
+        if self.observe {
+            AttachMode::Observe
+        } else if self.takeover {
+            AttachMode::Takeover
+        } else {
+            AttachMode::Mirror
+        }
+    }
 }
 
 struct Client {
@@ -91,20 +114,25 @@ impl Client {
             | SessionEventWire::LoaderProgress(_)
             | SessionEventWire::ExtensionNotification { .. }
             | SessionEventWire::Attached { .. } => {}
-            // Phase-3 envelopes: rendered by C4/A4; ignored by the line client today.
-            SessionEventWire::Aborted { .. }
-            | SessionEventWire::Cleared { .. }
-            | SessionEventWire::CompactionStarted { .. }
-            | SessionEventWire::CompactionApplied { .. }
-            | SessionEventWire::CompactionFailed { .. }
-            | SessionEventWire::CompactionCancelled
-            | SessionEventWire::SubagentRows(_)
-            | SessionEventWire::Resumed { .. }
-            | SessionEventWire::InputOwnerChanged { .. }
-            | SessionEventWire::Refused { .. }
-            | SessionEventWire::AttachRefused { .. }
-            | SessionEventWire::Lifecycle(_)
-            | SessionEventWire::Reloading { .. } => {}
+            SessionEventWire::Aborted { context_saved } => {
+                self.streaming = false;
+                self.out(if *context_saved { "[aborted — context saved for next message]\n" } else { "[aborted]\n" })
+            }
+            SessionEventWire::Cleared { session_id } => {
+                self.out(&format!("[session cleared → {}]\n", &session_id[..8.min(session_id.len())]))
+            }
+            SessionEventWire::CompactionStarted { disclosure, .. } => self.out(&format!("[compacting: {disclosure}]\n")),
+            SessionEventWire::CompactionApplied { msg_count, .. } => self.out(&format!("[compacted {msg_count} messages]\n")),
+            SessionEventWire::CompactionFailed { message, .. } => self.out(&format!("[compaction failed: {message}]\n")),
+            SessionEventWire::CompactionCancelled => self.out("[compaction cancelled]\n"),
+            SessionEventWire::InputOwnerChanged { to, reason, .. } => {
+                self.out(&format!("[input owner → {} ({reason:?})]\n", to.map(|c| format!("client #{}", c.0)).unwrap_or_else(|| "nobody".into())))
+            }
+            SessionEventWire::Refused { command, reason, .. } => self.out(&format!("[refused {command}: {reason}]\n")),
+            SessionEventWire::AttachRefused { message } => self.out(&format!("[attach refused: {message}]\n")),
+            SessionEventWire::Lifecycle(l) => self.out(&format!("[session {l:?}]\n")),
+            SessionEventWire::Reloading { generation, .. } => self.out(&format!("[daemon reloading → generation {generation}]\n")),
+            SessionEventWire::SubagentRows(_) | SessionEventWire::Resumed { .. } => {}
         }
     }
 
@@ -136,7 +164,10 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG]\n"),
+            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /keep-warm on|off\n"),
+            "/keep-warm on" | "/keep-warm off" => {
+                let _ = self.t.send(SessionCommand::KeepWarm { on: line.ends_with("on") }).await;
+            }
             _ if line.starts_with("/cmd ") => {
                 let rest = line["/cmd ".len()..].trim();
                 let (name, arg) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -196,25 +227,27 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         eprintln!("[notice] daemon binary {} differs from client {} (same protocol)", conn.welcome.daemon_version, binary_version());
     }
 
+    let mode = args.attach_mode();
     let attach = if args.create || args.continue_session.is_some() {
         Attach::Create {
             config: SessionConfig {
                 continue_session: args.continue_session.clone().map(Some),
                 system: args.system.clone(),
                 cwd: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+                keep_warm: args.keep_warm,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
+            mode,
         }
     } else if let Some(id) = &args.id {
         let id = resolve_id(&conn.welcome.sessions, id).unwrap_or_else(|| SessionId::from(id.as_str()));
-        Attach::Existing { session_id: id, mode: AttachMode::Mirror }
+        Attach::Existing { session_id: id, mode }
     } else if conn.welcome.sessions.len() == 1 {
-        Attach::Existing { session_id: conn.welcome.sessions[0].id.clone(), mode: AttachMode::Mirror }
+        Attach::Existing { session_id: conn.welcome.sessions[0].id.clone(), mode }
     } else if conn.welcome.sessions.is_empty() {
         Attach::Create {
-            config: SessionConfig { cwd: std::env::current_dir().ok(), ..Default::default() },
-            mode: AttachMode::Mirror,
+            config: SessionConfig { cwd: std::env::current_dir().ok(), keep_warm: args.keep_warm, ..Default::default() },
+            mode,
         }
     } else {
         eprintln!("several sessions; pick one:");
@@ -224,8 +257,12 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         std::process::exit(1);
     };
 
+    let existing = matches!(attach, Attach::Existing { .. });
     let (t, snap) = SocketTransport::attach(conn, attach).await.map_err(|e| anyhow::anyhow!("attach: {e}"))?;
     let mut c = Client { t, streaming: snap.streaming, pending: snap.pending_prompts.clone(), stdout: std::io::stdout() };
+    if args.keep_warm && existing {
+        let _ = c.t.send(SessionCommand::KeepWarm { on: true }).await;
+    }
     // "○ ready" is the marker scripts/memprof/launch.sh polls for.
     c.out(&format!(
         "[attached {} as client #{}  model={}  messages={}{}] ○ ready\n",
@@ -284,4 +321,30 @@ fn resolve_id(sessions: &[SessionMeta], q: &str) -> Option<SessionId> {
         .find(|m| m.id.as_str() == q || m.name.as_deref() == Some(q))
         .or_else(|| sessions.iter().find(|m| m.id.as_str().starts_with(q)))
         .map(|m| m.id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: AttachArgs,
+    }
+
+    #[test]
+    fn flags_plumb_to_attach_mode() {
+        let a = Cli::parse_from(["attach"]).args;
+        assert_eq!(a.attach_mode(), AttachMode::Mirror);
+        assert!(!a.keep_warm);
+        let a = Cli::parse_from(["attach", "--observe"]).args;
+        assert_eq!(a.attach_mode(), AttachMode::Observe);
+        let a = Cli::parse_from(["attach", "abc", "--takeover", "--keep-warm"]).args;
+        assert_eq!(a.attach_mode(), AttachMode::Takeover);
+        assert!(a.keep_warm);
+        assert_eq!(a.id.as_deref(), Some("abc"));
+        assert!(Cli::try_parse_from(["attach", "--observe", "--takeover"]).is_err());
+    }
 }

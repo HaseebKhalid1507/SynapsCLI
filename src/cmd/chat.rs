@@ -1107,6 +1107,7 @@ mod actor {
                         }
                         "help" => {
                             eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                            eprintln!("quitting (or EOF) mid-turn cancels the turn and saves an abort context for the next --continue");
                         }
                         _ => eprintln!("unknown command: /{} (try /help)", cmd),
                     },
