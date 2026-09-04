@@ -30,14 +30,17 @@ pub(crate) struct ResumePending {
 }
 
 /// Scrollback cap for [`super::transcript::TranscriptStore::set_scrollback`]
-/// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 2 MiB, Local → 0/0
+/// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 1 MiB, Local → 0/0
 /// (unbounded — today's behaviour, so the R-vs-L differential cannot move).
 /// `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` (aliases
 /// `SYNAPS_CLIENT_SCROLLBACK_MSGS` / `_BYTES`) override either (0 =
 /// unbounded); unparsable values fall back to the mode default.
 pub(crate) fn scrollback_from_env(mode: &super::run_setup::TransportMode) -> (usize, usize) {
     let (msgs, bytes) = match mode {
-        super::run_setup::TransportMode::Socket => (400, 2 * 1024 * 1024),
+        // 1 MiB (not the plan's 2 MiB): G6 measures RssAnon slope over 30
+        // tool turns of ~40 KB output each (≈ 1.2 MB retained) against a
+        // 1.5 MB limit — a 2 MiB cap never engages inside the window.
+        super::run_setup::TransportMode::Socket => (400, 1024 * 1024),
         super::run_setup::TransportMode::Local { .. } => (0, 0),
     };
     let env = |keys: [&str; 2], default: usize| {

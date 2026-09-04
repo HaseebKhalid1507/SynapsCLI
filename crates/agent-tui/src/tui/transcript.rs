@@ -85,6 +85,24 @@ pub(crate) enum ChatMessage {
 }
 
 impl ChatMessage {
+    /// Bytes this message holds (sum of its string fields) — the scrollback
+    /// cap's accounting unit. Cheap: no JSON re-parse, unlike `source_text`.
+    pub(crate) fn approx_len(&self) -> usize {
+        match self {
+            ChatMessage::User(t)
+            | ChatMessage::Text(t)
+            | ChatMessage::Thinking(t)
+            | ChatMessage::Error(t)
+            | ChatMessage::System(t) => t.len(),
+            ChatMessage::ToolUseStart { tool_id, tool_name, partial_input } => {
+                tool_id.len() + tool_name.len() + partial_input.len()
+            }
+            ChatMessage::ToolUse { tool_id, tool_name, input } => tool_id.len() + tool_name.len() + input.len(),
+            ChatMessage::ToolResult { tool_id, content, .. } => tool_id.len() + content.len(),
+            ChatMessage::Event { source, severity, text } => source.len() + severity.len() + text.len(),
+        }
+    }
+
     /// The canonical "source" string this message contributes to copy — what
     /// the model/user actually wrote, per the P10 decision lock (design §2
     /// table). [`LineMeta`] ranges and `src_line` indices index into THIS
@@ -555,8 +573,10 @@ pub(crate) struct TranscriptStore {
     /// Max retained source bytes (0 = unbounded).
     max_bytes: usize,
     /// Pushes since the last byte audit (the byte cap is checked every
-    /// `SCROLLBACK_HYSTERESIS_MSGS` pushes — O(n) over ≤ ~500 messages).
+    /// `SCROLLBACK_HYSTERESIS_MSGS` pushes or `SCROLLBACK_HYSTERESIS_BYTES`
+    /// pushed bytes — O(n) over ≤ ~500 messages).
     pushes_since_audit: usize,
+    bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
 
@@ -644,6 +664,7 @@ impl TranscriptStore {
             max_msgs: 0,
             max_bytes: 0,
             pushes_since_audit: 0,
+            bytes_since_audit: 0,
             scrollback_dropped: 0,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
@@ -673,22 +694,27 @@ impl TranscriptStore {
     }
 
     fn source_bytes(&self) -> usize {
-        self.messages.iter().map(|m| m.msg.source_text().len()).sum()
+        self.messages.iter().map(|m| m.msg.approx_len()).sum()
     }
 
     /// The cap check. Cheap path: nothing to do unless the message count is
-    /// past `max_msgs + HYSTERESIS` or a byte audit is due.
-    fn enforce_scrollback(&mut self) {
+    /// past `max_msgs + HYSTERESIS` or a byte audit is due (every
+    /// `HYSTERESIS_MSGS` pushes or `HYSTERESIS_BYTES` pushed bytes).
+    fn enforce_scrollback(&mut self, pushed: usize) {
         if self.max_msgs == 0 && self.max_bytes == 0 {
             return;
         }
         self.pushes_since_audit += 1;
+        self.bytes_since_audit += pushed;
         let over_msgs = self.max_msgs > 0 && self.messages.len() > self.max_msgs + SCROLLBACK_HYSTERESIS_MSGS;
-        let audit_due = self.max_bytes > 0 && self.pushes_since_audit >= SCROLLBACK_HYSTERESIS_MSGS;
+        let audit_due = self.max_bytes > 0
+            && (self.pushes_since_audit >= SCROLLBACK_HYSTERESIS_MSGS
+                || self.bytes_since_audit >= SCROLLBACK_HYSTERESIS_BYTES);
         if !over_msgs && !audit_due {
             return;
         }
         self.pushes_since_audit = 0;
+        self.bytes_since_audit = 0;
         // Target: at most max_msgs messages AND at most max_bytes bytes
         // (byte drain only once past max_bytes + HYSTERESIS_BYTES).
         let mut drop = 0usize;
@@ -701,7 +727,7 @@ impl TranscriptStore {
                 let mut running = total;
                 let mut i = 0;
                 while running > self.max_bytes && i < self.messages.len() {
-                    running -= self.messages[i].msg.source_text().len();
+                    running -= self.messages[i].msg.approx_len();
                     i += 1;
                 }
                 drop = drop.max(i);
@@ -1020,7 +1046,8 @@ impl TranscriptStore {
         }
         // New tail message — mark last slot dirty (append to per_msg on next rebuild).
         self.invalidate_last();
-        self.enforce_scrollback();
+        let pushed = self.messages.last().map(|m| m.msg.approx_len()).unwrap_or(0);
+        self.enforce_scrollback(pushed);
     }
 
     /// Insert a freshly created `ToolResult` directly beneath its matching
@@ -1066,6 +1093,7 @@ impl TranscriptStore {
             content,
             elapsed_ms,
         };
+        let pushed = msg.approx_len();
         match use_idx {
             Some(i) => {
                 let at = (i + 1).min(self.messages.len());
@@ -1095,7 +1123,7 @@ impl TranscriptStore {
                 // writes identical content rows into the shifted slots; the
                 // use's own change is header chrome, not content).
                 self.invalidate_watermark(i);
-                self.enforce_scrollback();
+                self.enforce_scrollback(pushed);
             }
             None => self.push_msg(msg),
         }
@@ -4331,8 +4359,8 @@ mod scrollback_cap_tests {
         // 70 × 8 KiB = 560 KiB > 10 KiB + 256 KiB → drained at the 64th push.
         assert!(s.message_count() < 70, "{}", s.message_count());
         assert!(is_sentinel(&s.messages()[0]));
-        let bytes: usize = s.messages().iter().map(|m| m.msg.source_text().len()).sum();
-        assert!(bytes <= 10 * 1024 + 8 * 1024 * 7, "{bytes}");
+        let bytes: usize = s.messages().iter().map(|m| m.msg.approx_len()).sum();
+        assert!(bytes <= 10 * 1024 + SCROLLBACK_HYSTERESIS_BYTES + 8 * 1024, "{bytes}");
         assert!(s.message_count() >= 1);
     }
 
@@ -4416,6 +4444,6 @@ mod scrollback_cap_tests {
         for k in ["SYNAPS_TUI_SCROLLBACK", "SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_MSGS", "SYNAPS_CLIENT_SCROLLBACK_BYTES"] {
             std::env::remove_var(k);
         }
-        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 2 * 1024 * 1024));
+        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 1024 * 1024));
     }
 }
