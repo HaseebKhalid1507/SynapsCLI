@@ -392,7 +392,8 @@ mod tests {
             e0.event,
             SessionEventWire::TurnStarted {
                 turn_baseline: 0,
-                trigger: TurnTrigger::User
+                trigger: TurnTrigger::User,
+                user_text: None,
             }
         ));
         let e1 = next(&mut rx).await;
