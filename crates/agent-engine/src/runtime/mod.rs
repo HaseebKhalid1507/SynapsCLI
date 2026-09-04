@@ -1282,6 +1282,13 @@ impl Runtime {
         &self.event_queue
     }
 
+    /// Install a session-lifetime queue (B3 unpark: the queue outlives the
+    /// `Runtime` so `synaps send` keeps resolving while parked). Must be
+    /// called before the first turn — in-flight streams hold a clone.
+    pub fn set_event_queue(&mut self, queue: Arc<crate::events::EventQueue>) {
+        self.event_queue = queue;
+    }
+
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus

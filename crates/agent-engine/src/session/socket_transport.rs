@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::handle::CMD_CHAN_CAP;
-use super::transport::{ClientTransport, TransportError, ATTACH_TIMEOUT};
+use super::transport::{ClientTransport, TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use super::types::*;
 use super::view::RuntimeView;
 use super::wire::*;
@@ -147,7 +147,7 @@ impl Connected {
 
     pub async fn shutdown(&mut self, force: bool) -> Result<(), TransportError> {
         match self.request(ClientFrame::Shutdown { force }).await? {
-            DaemonFrame::Bye => Ok(()),
+            DaemonFrame::Bye { .. } => Ok(()),
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected bye, got {other:?}"))),
         }
@@ -169,7 +169,14 @@ pub struct SocketTransport {
     client: ClientId,
     view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub welcome: Welcome,
+    mode: AttachMode,
+    input_owner: Option<ClientId>,
     ended: bool,
+    /// `Reloading` seen; the next EOF is a reload, not a death.
+    reload_pending: Option<u64>,
+    /// Why `next_event` returned `None` (`Reloading{generation}` after a
+    /// reload announcement) — the TUI branches to `reconnect` on it.
+    last_error: Option<TransportError>,
     /// Local `api_messages` mirror: seeded by `Attached`, updated by
     /// `Stream(MessageHistory)` and `QueryResult{DIGEST_RESYNC_QUERY_ID}`.
     /// `Conversation` arrives as a digest; the mirror fills it in.
@@ -184,20 +191,41 @@ impl SocketTransport {
         Connected::connect(path, hello).await
     }
 
-    /// Attach (existing or create) on a handshaken connection.
+    /// Attach (existing or create) on a handshaken connection. `AttachRefused`
+    /// and `DaemonFrame::Error` alike → `TransportError::Refused`. Waits
+    /// `ATTACH_TIMEOUT_PARKED` when the daemon lists the session as `Parked`.
     pub async fn attach(mut conn: Connected, attach: Attach) -> Result<(Self, AttachSnapshot), TransportError> {
+        let (mode, parked) = match &attach {
+            Attach::Existing { session_id, mode } => (
+                *mode,
+                conn.welcome
+                    .sessions
+                    .iter()
+                    .any(|m| &m.id == session_id && m.lifecycle == SessionLifecycle::Parked),
+            ),
+            Attach::Create { mode, .. } => (*mode, false),
+        };
         conn.writer
             .send(ClientFrame::Attach(attach))
             .await
             .map_err(|_| TransportError::Closed)?;
-        let frame = tokio::time::timeout(ATTACH_TIMEOUT, read_frame(&mut conn.reader))
-            .await
-            .map_err(|_| TransportError::Protocol("attach timed out".into()))??;
-        let attached = match frame {
-            Some(DaemonFrame::Attached(a)) => a,
-            Some(DaemonFrame::Error { message, .. }) => return Err(TransportError::Protocol(message)),
-            Some(other) => return Err(TransportError::Protocol(format!("expected attached, got {other:?}"))),
-            None => return Err(TransportError::Closed),
+        let budget = if parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
+        let deadline = tokio::time::Instant::now() + budget;
+        let attached = loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut conn.reader))
+                .await
+                .map_err(|_| TransportError::Protocol("attach timed out".into()))??;
+            match frame {
+                Some(DaemonFrame::Attached(a)) => break a,
+                Some(DaemonFrame::Error { message, .. }) => return Err(TransportError::Refused(message)),
+                Some(DaemonFrame::Event(w)) => match w.event {
+                    WireSessionEvent::AttachRefused { message } => return Err(TransportError::Refused(message)),
+                    // Notices/lifecycle chatter may precede `Attached` (unpark).
+                    _ => continue,
+                },
+                Some(DaemonFrame::Bye { .. }) | None => return Err(TransportError::Closed),
+                Some(other) => return Err(TransportError::Protocol(format!("expected attached, got {other:?}"))),
+            }
         };
         let (client, snapshot) = attached.into_snapshot();
         let meta = snapshot.meta.clone();
@@ -212,12 +240,21 @@ impl SocketTransport {
                 client,
                 view,
                 welcome: conn.welcome,
+                mode,
+                input_owner: snapshot.input_owner,
                 ended: false,
+                reload_pending: None,
+                last_error: None,
                 messages: snapshot.conversation.api_messages.clone(),
                 pending_digest: None,
             },
             snapshot,
         ))
+    }
+
+    /// Why the last `next_event` returned `None` (if it was not a plain end).
+    pub fn last_error(&self) -> Option<&TransportError> {
+        self.last_error.as_ref()
     }
 
     // ── control fast path helpers (fresh connection each) ──
@@ -333,6 +370,12 @@ impl ClientTransport for SocketTransport {
         }
     }
 
+    /// The daemon's conn stamps `from` with this connection's client id, so
+    /// on the wire `send` and `send_from_self` are the same frame.
+    async fn send_from_self(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        self.send(cmd).await
+    }
+
     async fn next_event(&mut self) -> Option<Envelope> {
         if self.ended {
             return None;
@@ -346,13 +389,30 @@ impl ClientTransport for SocketTransport {
                             self.view.store(Arc::new(applied.view.clone()));
                         }
                         SessionEventWire::Ended { .. } => self.ended = true,
+                        SessionEventWire::InputOwnerChanged { to, .. } => self.input_owner = *to,
+                        SessionEventWire::Reloading { generation, .. } => {
+                            self.reload_pending = Some(*generation);
+                        }
                         _ => {}
                     }
                     return Some(env);
                 }
                 Ok(Some(DaemonFrame::Error { message, .. })) => return Some(self.notice(message)),
-                Ok(Some(DaemonFrame::Bye)) | Ok(None) => {
+                Ok(Some(DaemonFrame::Bye { reason })) => {
+                    if let Some(ByeReason::Reloading { generation, .. }) = reason {
+                        self.reload_pending = Some(generation);
+                    }
                     self.ended = true;
+                    if let Some(generation) = self.reload_pending {
+                        self.last_error = Some(TransportError::Reloading { generation });
+                    }
+                    return None;
+                }
+                Ok(None) => {
+                    self.ended = true;
+                    if let Some(generation) = self.reload_pending {
+                        self.last_error = Some(TransportError::Reloading { generation });
+                    }
                     return None;
                 }
                 Ok(Some(other)) => {
@@ -374,6 +434,19 @@ impl ClientTransport for SocketTransport {
 
     fn client_id(&self) -> ClientId {
         self.client
+    }
+
+    fn mode(&self) -> AttachMode {
+        self.mode
+    }
+
+    fn input_owner(&self) -> Option<ClientId> {
+        self.input_owner
+    }
+
+    /// C3 fills the body (backoff, `Hello{reconnect_of}`, re-attach).
+    async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        Err(TransportError::Unsupported("reconnect: not implemented in this build"))
     }
 }
 
@@ -415,6 +488,7 @@ mod tests {
                         profile: None,
                         sessions: vec![],
                         progressive_tool_disclosure: true,
+                        generation: 1,
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -428,6 +502,7 @@ mod tests {
                         replay: vec![],
                         pending_prompts: vec![],
                         clients: vec![],
+                        input_owner: Some(ClientId(7)),
                     },
                 )),
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {
@@ -439,7 +514,7 @@ mod tests {
                         event: SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(text))).into(),
                     })
                 }
-                ClientFrame::Cmd { cmd: SessionCommand::Set(_), .. } => {
+                ClientFrame::Cmd { cmd: SessionCommand::Set { id, .. }, .. } => {
                     seq += 1;
                     let mut view = crate::session::handle::echo::view_for();
                     view.model = "changed".into();
@@ -447,7 +522,43 @@ mod tests {
                         session_id: sid.clone(),
                         seq,
                         ts: chrono::Utc::now(),
-                        event: SessionEventWire::SettingChanged(SettingApplied { setting: "model".into(), ok: true, message: None, view }).into(),
+                        event: SessionEventWire::SettingChanged(SettingApplied {
+                            id,
+                            setting: "model".into(),
+                            ok: true,
+                            message: None,
+                            view,
+                            clamp: None,
+                        })
+                        .into(),
+                    })
+                }
+                // Checkpoint = "the daemon is about to reload": Reloading event, then Bye{Reloading}.
+                ClientFrame::Cmd { cmd: SessionCommand::Checkpoint { .. }, .. } => {
+                    seq += 1;
+                    let ev = DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: WireSessionEvent::Reloading { generation: 2, retry_after_ms: 500 },
+                    });
+                    w.write_all(encode_line(&ev).unwrap().as_bytes()).await.unwrap();
+                    let bye = DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) };
+                    w.write_all(encode_line(&bye).unwrap().as_bytes()).await.unwrap();
+                    break;
+                }
+                // KeepWarm = ownership change notice.
+                ClientFrame::Cmd { cmd: SessionCommand::KeepWarm { .. }, .. } => {
+                    seq += 1;
+                    DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: WireSessionEvent::InputOwnerChanged {
+                            from: Some(ClientId(7)),
+                            to: Some(ClientId(9)),
+                            reason: OwnerChangeReason::Takeover,
+                        },
                     })
                 }
                 // Steer = "the daemon's history drifted": digest for [user:text] without a MessageHistory.
@@ -478,7 +589,7 @@ mod tests {
                     })
                 }
                 ClientFrame::Bye => {
-                    let _ = w.write_all(encode_line(&DaemonFrame::Bye).unwrap().as_bytes()).await;
+                    let _ = w.write_all(encode_line(&DaemonFrame::Bye { reason: None }).unwrap().as_bytes()).await;
                     break;
                 }
                 ClientFrame::Cmd { cmd: SessionCommand::Detach { .. }, .. } => continue,
@@ -507,6 +618,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.client_id(), ClientId(7));
+        assert_eq!(t.mode(), AttachMode::Mirror);
+        assert_eq!(t.input_owner(), Some(ClientId(7)));
         assert_eq!(snap.meta.id.as_str(), "fake-1");
         assert_eq!(t.session_id().as_str(), "fake-1");
         assert_eq!(t.view().model, "echo");
@@ -517,10 +630,16 @@ mod tests {
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s))) => assert_eq!(s, "hello"),
             other => panic!("{other:?}"),
         }
-        t.send(SessionCommand::Set(SessionSetting::Model { model: "changed".into() })).await.unwrap();
+        t.send_from_self(SessionCommand::Set { id: 11, setting: SessionSetting::Model { model: "changed".into() } })
+            .await
+            .unwrap();
         let e = t.next_event().await.unwrap();
-        assert!(matches!(e.event, SessionEventWire::SettingChanged(_)));
+        assert!(matches!(e.event, SessionEventWire::SettingChanged(SettingApplied { id: 11, .. })));
         assert_eq!(t.view().model, "changed");
+        t.send(SessionCommand::KeepWarm { on: true }).await.unwrap();
+        let e = t.next_event().await.unwrap();
+        assert!(matches!(e.event, SessionEventWire::InputOwnerChanged { .. }));
+        assert_eq!(t.input_owner(), Some(ClientId(9)));
 
         // Error → SystemNotice; Bye → None.
         t.send(SessionCommand::Save).await.unwrap();
@@ -564,12 +683,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reloading_then_bye_sets_last_error_and_reconnect_is_a_stub() {
+        let (_d, path) = sock();
+        let l = UnixListener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Observe })
+            .await
+            .unwrap();
+        assert_eq!(t.mode(), AttachMode::Observe);
+        assert!(t.last_error().is_none());
+        t.send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload }).await.unwrap();
+        let e = t.next_event().await.unwrap();
+        assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
+        assert!(t.next_event().await.is_none());
+        assert!(matches!(t.last_error(), Some(TransportError::Reloading { generation: 2 })));
+        assert!(matches!(t.reconnect(AttachMode::Observe).await, Err(TransportError::Unsupported(_))));
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_error_frame_is_refused() {
+        let (_d, path) = sock();
+        let l = UnixListener::bind(&path).unwrap();
+        // A daemon that welcomes, then answers the Attach with an Error frame.
+        let srv = tokio::spawn(async move {
+            let (stream, _) = l.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let welcome = DaemonFrame::Welcome(Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "t".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![],
+                progressive_tool_disclosure: true,
+                generation: 1,
+            });
+            w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let err = DaemonFrame::Error { session_id: None, message: "unknown session".into() };
+            w.write_all(encode_line(&err).unwrap().as_bytes()).await.unwrap();
+        });
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let err = SocketTransport::attach(conn, Attach::Existing { session_id: "nope".into(), mode: AttachMode::Mirror })
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, TransportError::Refused(ref m) if m == "unknown session"), "{err}");
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn socket_transport_refuses_version_mismatch() {
         let (_d, path) = sock();
         let l = UnixListener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, 99));
         let err = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.err().unwrap();
-        assert!(matches!(err, TransportError::Version { client: 1, daemon: 99 }), "{err}");
+        assert!(matches!(err, TransportError::Version { client: PROTOCOL_VERSION, daemon: 99 }), "{err}");
         srv.await.unwrap();
     }
 

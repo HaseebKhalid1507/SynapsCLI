@@ -905,7 +905,9 @@ mod actor {
             .await
             .map_err(|e| synaps_cli::RuntimeError::Session(e.to_string()))?;
         if let Some(p) = agent_prompt {
-            let _ = t.send(SessionCommand::Set(SessionSetting::SystemPrompt { text: p })).await;
+            let _ = t
+                .send(SessionCommand::Set { id: 0, setting: SessionSetting::SystemPrompt { text: p } })
+                .await;
         }
 
         let session_id = snap.meta.id.as_str().to_string();

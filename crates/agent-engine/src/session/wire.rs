@@ -29,7 +29,10 @@ use super::view::RuntimeView;
 use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutcome};
 
 /// Separate from `RPC_PROTOCOL_VERSION`; bump on any non-additive change.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 (phase 3): `Set` became a struct variant, `Bye` gained a reason.
+/// Protocol stays exact-match; only *binary* versions compare directionally
+/// (reload, §2.8).
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
 pub const PROTOCOL_MAX: u32 = PROTOCOL_VERSION;
@@ -47,6 +50,9 @@ pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
 pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
 /// The daemon's idle monitor probes `Status` under this id.
 pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
+/// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
+/// so `reload.rs` can await it per session.
+pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
@@ -73,11 +79,26 @@ pub enum ClientFrame {
         session_id: SessionId,
         cmd: SessionCommand,
     },
+    /// Control fast path (no session): checkpoint every session, write
+    /// reload-state, execv self. Reply: `Reloading` to every attached
+    /// client, `Bye` to this one. (C3)
+    Reload {
+        #[serde(default)]
+        now: bool,
+        #[serde(default)]
+        drain_secs: Option<u64>,
+        #[serde(default)]
+        exe: Option<PathBuf>,
+    },
+    /// Control fast path: `memstat::purge_arenas()` in the daemon (bench
+    /// hygiene). Reply: `Pong`. (C2)
+    Purge,
     Bye,
 }
 
 impl std::fmt::Debug for ClientFrame {
-    /// Frame *types* only for anything that can carry user text or a secret.
+    /// Frame *types* only for anything that can carry user text or a secret
+    /// (`SessionCommand`'s own `Debug` redacts bodies without lengths).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Hello(h) => f.debug_tuple("Hello").field(h).finish(),
@@ -86,32 +107,15 @@ impl std::fmt::Debug for ClientFrame {
             Self::Shutdown { force } => f.debug_struct("Shutdown").field("force", force).finish(),
             Self::Attach(a) => f.debug_tuple("Attach").field(a).finish(),
             Self::Cmd { session_id, cmd } => {
-                let cmd: &dyn std::fmt::Debug = match cmd {
-                    SessionCommand::Answer { prompt_id, value } => {
-                        return f
-                            .debug_struct("Cmd")
-                            .field("session_id", session_id)
-                            .field("cmd", &format_args!("Answer {{ prompt_id: {prompt_id}, value: <redacted {} chars> }}", value.as_ref().map_or(0, |v| v.chars().count())))
-                            .finish();
-                    }
-                    SessionCommand::Submit { text, attachments } => {
-                        return f
-                            .debug_struct("Cmd")
-                            .field("session_id", session_id)
-                            .field("cmd", &format_args!("Submit {{ text: <{} chars>, attachments: {} }}", text.chars().count(), attachments.len()))
-                            .finish();
-                    }
-                    SessionCommand::Steer { text } => {
-                        return f
-                            .debug_struct("Cmd")
-                            .field("session_id", session_id)
-                            .field("cmd", &format_args!("Steer {{ text: <{} chars> }}", text.chars().count()))
-                            .finish();
-                    }
-                    other => other,
-                };
                 f.debug_struct("Cmd").field("session_id", session_id).field("cmd", cmd).finish()
             }
+            Self::Reload { now, drain_secs, exe } => f
+                .debug_struct("Reload")
+                .field("now", now)
+                .field("drain_secs", drain_secs)
+                .field("exe", exe)
+                .finish(),
+            Self::Purge => f.write_str("Purge"),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -123,6 +127,19 @@ pub struct Hello {
     pub client: ClientMeta,
     pub cwd: PathBuf,
     pub client_version: String,
+    /// Set when re-connecting after `Reloading`/EOF (C3/A4).
+    #[serde(default)]
+    pub reconnect_of: Option<ClientReconnect>,
+}
+
+/// Who this connection used to be, so the daemon can restore ownership by
+/// reconnect order + `was_owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientReconnect {
+    pub previous_client: ClientId,
+    pub session_id: SessionId,
+    pub was_owner: bool,
+    pub generation: u64,
 }
 
 impl Hello {
@@ -135,6 +152,7 @@ impl Hello {
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             client_version: binary_version(),
+            reconnect_of: None,
         }
     }
 }
@@ -185,7 +203,19 @@ pub enum DaemonFrame {
         session_id: Option<SessionId>,
         message: String,
     },
-    Bye,
+    /// `Some(Reloading{..})` before exec; `None` otherwise (today).
+    Bye {
+        #[serde(default)]
+        reason: Option<ByeReason>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "bye", rename_all = "snake_case")]
+pub enum ByeReason {
+    Reloading { generation: u64, retry_after_ms: u64 },
+    Shutdown,
+    Detached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +230,8 @@ pub enum RefuseReason {
     Busy,
     UnknownSession,
     Config,
+    /// `synaps daemon reload` version gate failed (C3).
+    ReloadRefused { why: String },
 }
 
 /// Auth-status *summary* only — never key material.
@@ -211,6 +243,13 @@ pub struct Welcome {
     pub profile: Option<String>,
     pub sessions: Vec<SessionMeta>,
     pub progressive_tool_disclosure: bool,
+    /// Reload counter (starts at 1).
+    #[serde(default = "one")]
+    pub generation: u64,
+}
+
+fn one() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +293,8 @@ pub struct AttachedWire {
     pub replay: Vec<WireEnvelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    #[serde(default)]
+    pub input_owner: Option<ClientId>,
 }
 
 impl AttachedWire {
@@ -267,6 +308,7 @@ impl AttachedWire {
             replay: s.replay.into_iter().map(Into::into).collect(),
             pending_prompts: s.pending_prompts,
             clients: s.clients,
+            input_owner: s.input_owner,
         }
     }
 
@@ -281,6 +323,7 @@ impl AttachedWire {
                 replay: self.replay.into_iter().map(Into::into).collect(),
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
+                input_owner: self.input_owner,
             },
         )
     }
@@ -293,6 +336,8 @@ impl AttachedWire {
 /// client can tell whether its local mirror is current.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationDigest {
+    #[serde(default)]
+    pub header: SessionHeader,
     pub messages_len: usize,
     pub messages_hash: u64,
     pub tokens: ConversationTokens,
@@ -325,6 +370,7 @@ pub fn messages_hash(messages: &[crate::SharedMessage]) -> u64 {
 impl ConversationDigest {
     pub fn of(s: &ConversationSnapshot) -> Self {
         Self {
+            header: s.header.clone(),
             messages_len: s.api_messages.len(),
             messages_hash: messages_hash(&s.api_messages),
             tokens: s.tokens.clone(),
@@ -343,6 +389,7 @@ impl ConversationDigest {
     /// Rebuild a snapshot around `messages` (the caller's mirror).
     pub fn into_snapshot(self, api_messages: Vec<crate::SharedMessage>) -> ConversationSnapshot {
         ConversationSnapshot {
+            header: self.header,
             api_messages,
             tokens: self.tokens,
             cost: self.cost,
@@ -361,7 +408,12 @@ impl ConversationDigest {
 #[allow(clippy::large_enum_variant)] // mirrors SessionEventWire by design
 pub enum WireSessionEvent {
     Stream { event: WireStreamEvent },
-    TurnStarted { turn_baseline: usize, trigger: TurnTrigger },
+    TurnStarted {
+        turn_baseline: usize,
+        trigger: TurnTrigger,
+        #[serde(default)]
+        user_text: Option<String>,
+    },
     /// Digest only — see module docs.
     Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
@@ -380,6 +432,31 @@ pub enum WireSessionEvent {
     ClientJoined { client: ClientId, kind: ClientKind },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
+    Aborted { context_saved: bool },
+    Cleared { session_id: String },
+    CompactionStarted { source: String, disclosure: String },
+    CompactionApplied {
+        previous_session_id: String,
+        session_id: String,
+        chains_advanced: Vec<String>,
+        queued_restored: Option<String>,
+        msg_count: usize,
+    },
+    CompactionFailed { message: String, panicked: bool },
+    CompactionCancelled,
+    SubagentRows { rows: Vec<crate::runtime::subagent::SubagentDisplayRow> },
+    Resumed {
+        id: u64,
+        old_id: String,
+        new_id: String,
+        via: Option<String>,
+        clamp_notice: Option<String>,
+    },
+    InputOwnerChanged { from: Option<ClientId>, to: Option<ClientId>, reason: OwnerChangeReason },
+    Refused { client: ClientId, command: String, reason: String },
+    AttachRefused { message: String },
+    Lifecycle { lifecycle: SessionLifecycle },
+    Reloading { generation: u64, retry_after_ms: u64 },
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
     Unknown,
@@ -600,7 +677,9 @@ impl From<SessionEventWire> for WireSessionEvent {
         use SessionEventWire as S;
         match e {
             S::Stream(ev) => Self::Stream { event: ev.into() },
-            S::TurnStarted { turn_baseline, trigger } => Self::TurnStarted { turn_baseline, trigger },
+            S::TurnStarted { turn_baseline, trigger, user_text } => {
+                Self::TurnStarted { turn_baseline, trigger, user_text }
+            }
             S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
             S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
@@ -620,6 +699,23 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
             S::ClientLeft { client } => Self::ClientLeft { client },
             S::Ended { reason } => Self::Ended { reason },
+            S::Aborted { context_saved } => Self::Aborted { context_saved },
+            S::Cleared { session_id } => Self::Cleared { session_id },
+            S::CompactionStarted { source, disclosure } => Self::CompactionStarted { source, disclosure },
+            S::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count } => {
+                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count }
+            }
+            S::CompactionFailed { message, panicked } => Self::CompactionFailed { message, panicked },
+            S::CompactionCancelled => Self::CompactionCancelled,
+            S::SubagentRows(rows) => Self::SubagentRows { rows },
+            S::Resumed { id, old_id, new_id, via, clamp_notice } => {
+                Self::Resumed { id, old_id, new_id, via, clamp_notice }
+            }
+            S::InputOwnerChanged { from, to, reason } => Self::InputOwnerChanged { from, to, reason },
+            S::Refused { client, command, reason } => Self::Refused { client, command, reason },
+            S::AttachRefused { message } => Self::AttachRefused { message },
+            S::Lifecycle(lifecycle) => Self::Lifecycle { lifecycle },
+            S::Reloading { generation, retry_after_ms } => Self::Reloading { generation, retry_after_ms },
         }
     }
 }
@@ -629,7 +725,9 @@ impl From<WireSessionEvent> for SessionEventWire {
         use WireSessionEvent as W;
         match e {
             W::Stream { event } => Self::Stream(event.into()),
-            W::TurnStarted { turn_baseline, trigger } => Self::TurnStarted { turn_baseline, trigger },
+            W::TurnStarted { turn_baseline, trigger, user_text } => {
+                Self::TurnStarted { turn_baseline, trigger, user_text }
+            }
             // Messages are not on the wire; `SocketTransport` fills them from
             // its mirror before handing the envelope up.
             W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
@@ -654,6 +752,23 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
             W::ClientLeft { client } => Self::ClientLeft { client },
             W::Ended { reason } => Self::Ended { reason },
+            W::Aborted { context_saved } => Self::Aborted { context_saved },
+            W::Cleared { session_id } => Self::Cleared { session_id },
+            W::CompactionStarted { source, disclosure } => Self::CompactionStarted { source, disclosure },
+            W::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count } => {
+                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count }
+            }
+            W::CompactionFailed { message, panicked } => Self::CompactionFailed { message, panicked },
+            W::CompactionCancelled => Self::CompactionCancelled,
+            W::SubagentRows { rows } => Self::SubagentRows(rows),
+            W::Resumed { id, old_id, new_id, via, clamp_notice } => {
+                Self::Resumed { id, old_id, new_id, via, clamp_notice }
+            }
+            W::InputOwnerChanged { from, to, reason } => Self::InputOwnerChanged { from, to, reason },
+            W::Refused { client, command, reason } => Self::Refused { client, command, reason },
+            W::AttachRefused { message } => Self::AttachRefused { message },
+            W::Lifecycle { lifecycle } => Self::Lifecycle(lifecycle),
+            W::Reloading { generation, retry_after_ms } => Self::Reloading { generation, retry_after_ms },
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
     }
@@ -711,6 +826,17 @@ mod tests {
 
     fn conv() -> ConversationSnapshot {
         ConversationSnapshot {
+            header: SessionHeader {
+                id: "wire-1".into(),
+                title: "t".into(),
+                name: None,
+                model: "m".into(),
+                thinking_level: "off".into(),
+                system_prompt: Some("sys".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                parent_session: Some("p".into()),
+            },
             api_messages: vec![Arc::new(serde_json::json!({"role":"user","content":"hi"}))],
             tokens: ConversationTokens { input: 1, output: 2, cache_read: 3, cache_creation: 4 },
             cost: 0.5,
@@ -778,7 +904,8 @@ mod tests {
         };
         let mut v: Vec<S> = stream_fixtures().into_iter().map(S::Stream).collect();
         v.extend([
-            S::TurnStarted { turn_baseline: 4, trigger: TurnTrigger::EventAuto },
+            S::TurnStarted { turn_baseline: 4, trigger: TurnTrigger::EventAuto, user_text: None },
+            S::TurnStarted { turn_baseline: 5, trigger: TurnTrigger::QueuedAuto, user_text: Some("q".into()) },
             S::Conversation(conv()),
             S::Prompt(prompt()),
             S::PromptResolved { prompt_id: 3 },
@@ -790,7 +917,14 @@ mod tests {
             S::SystemNotice("sys".into()),
             S::LoaderProgress(loader),
             S::ExtensionNotification { extension_id: "e".into(), method: "widget.upsert".into(), params: serde_json::json!({"a":1}) },
-            S::SettingChanged(SettingApplied { setting: "model".into(), ok: true, message: None, view: view() }),
+            S::SettingChanged(SettingApplied {
+                id: 3,
+                setting: "model".into(),
+                ok: true,
+                message: None,
+                view: view(),
+                clamp: Some(ReasoningClampWire { from: "ultra".into(), to: "high".into() }),
+            }),
             S::QueryResult { id: 1, value: serde_json::json!([1, 2]) },
             S::Attached {
                 client: ClientId(2),
@@ -802,11 +936,38 @@ mod tests {
                     replay: vec![env(S::Stream(StreamEvent::Llm(LlmEvent::Text("partial".into()))))],
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
+                    input_owner: Some(ClientId(1)),
                 },
             },
             S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
             S::ClientLeft { client: ClientId(1) },
             S::Ended { reason: EndReason::HostShutdown },
+            S::Aborted { context_saved: true },
+            S::Cleared { session_id: "new-1".into() },
+            S::CompactionStarted { source: "manual".into(), disclosure: "disc".into() },
+            S::CompactionApplied {
+                previous_session_id: "old".into(),
+                session_id: "new".into(),
+                chains_advanced: vec!["c1".into()],
+                queued_restored: Some("q".into()),
+                msg_count: 12,
+            },
+            S::CompactionFailed { message: "boom".into(), panicked: false },
+            S::CompactionCancelled,
+            S::SubagentRows(vec![crate::runtime::subagent::SubagentDisplayRow {
+                subagent_id: 1,
+                agent_name: "a".into(),
+                status: crate::runtime::subagent::SubagentStatus::Failed("x".into()),
+                cancel_requested: false,
+                elapsed_secs: 1.25,
+                finished_elapsed: Some(std::time::Duration::from_millis(1250)),
+            }]),
+            S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
+            S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },
+            S::Refused { client: ClientId(2), command: "submit".into(), reason: "input owned by client #1".into() },
+            S::AttachRefused { message: "parked".into() },
+            S::Lifecycle(SessionLifecycle::Parked),
+            S::Reloading { generation: 2, retry_after_ms: 500 },
         ]);
         v
     }
@@ -814,8 +975,8 @@ mod tests {
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // Every SessionEventWire variant (19) + every StreamEvent leaf (18; Stream counted once).
-        assert_eq!(all.len(), 18 + 18);
+        // Every non-Stream SessionEventWire variant (31; TurnStarted twice = 32) + every StreamEvent leaf (18).
+        assert_eq!(all.len(), 32 + 18);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -873,6 +1034,11 @@ mod tests {
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Set { id: 6, setting: SessionSetting::ReloadPrompt } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Checkpoint { reason: CheckpointReason::Reload } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::KeepWarm { on: true } },
+            ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
+            ClientFrame::Purge,
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -882,14 +1048,16 @@ mod tests {
         }
         let frames = vec![
             DaemonFrame::Welcome(Welcome {
-                protocol_version: 1,
+                protocol_version: 2,
                 daemon_version: "0.9.0".into(),
                 pid: 1,
                 profile: None,
                 sessions: vec![meta()],
                 progressive_tool_disclosure: true,
+                generation: 1,
             }),
-            DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 1, min: 1, max: 1 }, message: "no".into() },
+            DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
+            DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
             DaemonFrame::Pong { pid: 1, uptime_s: 2, sessions: 0 },
             DaemonFrame::SessionList { sessions: vec![meta()] },
             DaemonFrame::Attached(AttachedWire::new(
@@ -902,11 +1070,14 @@ mod tests {
                     replay: vec![],
                     pending_prompts: vec![],
                     clients: vec![],
+                    input_owner: None,
                 },
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
             DaemonFrame::Error { session_id: None, message: "e".into() },
-            DaemonFrame::Bye,
+            DaemonFrame::Bye { reason: None },
+            DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
+            DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -922,6 +1093,15 @@ mod tests {
         assert_eq!(PROTOCOL_MIN, PROTOCOL_MAX);
         let json = serde_json::to_string(&ClientFrame::Hello(h)).unwrap();
         assert!(json.starts_with(r#"{"type":"hello""#));
+        assert_eq!(PROTOCOL_VERSION, 2);
+        // v1 frames (no `reconnect_of`, bare `bye`) still parse — the refusal is by version, not by shape.
+        let h: Hello = serde_json::from_str(
+            r#"{"protocol_version":1,"client":{"kind":"tui","terminal":null,"instance":"i"},"cwd":"/","client_version":"0"}"#,
+        )
+        .unwrap();
+        assert!(h.reconnect_of.is_none());
+        let b: DaemonFrame = serde_json::from_str(r#"{"type":"bye"}"#).unwrap();
+        assert!(matches!(b, DaemonFrame::Bye { reason: None }));
     }
 
     #[test]
@@ -941,7 +1121,11 @@ mod tests {
         let d = format!("{f:?}");
         assert!(!d.contains("private"), "{d}");
         let f = ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Steer { text: "steer me".into() } };
-        assert!(!format!("{f:?}").contains("steer me"));
+        let d = format!("{f:?}");
+        assert!(!d.contains("steer me"));
+        // No lengths either: a char count is a side channel.
+        assert!(!d.contains("chars"), "{d}");
+        assert!(!d.contains('8'), "{d}");
     }
 
     #[test]
@@ -968,6 +1152,7 @@ mod tests {
             profile: Some("p".into()),
             sessions: vec![meta()],
             progressive_tool_disclosure: false,
+            generation: 1,
         })
         .unwrap()
         .to_lowercase();

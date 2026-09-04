@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::DaemonState;
 use crate::session::handle::CMD_CHAN_CAP;
-use crate::session::transport::{TransportError, ATTACH_TIMEOUT};
+use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
 
@@ -36,12 +36,17 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::Steer { .. }
         | C::Cancel
         | C::Answer { .. }
-        | C::Set(_)
+        | C::Set { .. }
         | C::Compact { .. }
         | C::NewSession
         | C::Save
         | C::Query { .. }
-        | C::EngineCommand { .. } => Ok(()),
+        | C::EngineCommand { .. }
+        | C::SubmitPrepared { .. }
+        | C::PluginCommand { .. }
+        | C::Resume { .. }
+        | C::Checkpoint { .. }
+        | C::KeepWarm { .. } => Ok(()),
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
@@ -86,7 +91,7 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            let bye = matches!(frame, DaemonFrame::Bye | DaemonFrame::Refused { .. });
+            let bye = matches!(frame, DaemonFrame::Bye { .. } | DaemonFrame::Refused { .. });
             match encode_line(&frame) {
                 Ok(line) => {
                     if w.write_all(line.as_bytes()).await.is_err() {
@@ -169,6 +174,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         profile: state.profile.clone(),
         sessions: state.session_metas(),
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
+        generation: 1,
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -178,7 +184,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // ── control loop (no session allocated) ──
     let attach = loop {
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye).await; let _ = writer.await; return; }
+            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
             r = read_frame(&mut reader, &mut line) => r,
         };
         match frame {
@@ -192,7 +198,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 state.request_shutdown(force);
                 return;
@@ -201,11 +207,23 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Cmd { session_id, .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached".into() }).await;
             }
+            // C3 / C2 serve these; until then they are honest refusals.
+            Ok(Read::Frame(ClientFrame::Reload { .. })) => {
+                let _ = tx
+                    .send(DaemonFrame::Refused {
+                        reason: RefuseReason::ReloadRefused { why: "reload not implemented in this build".into() },
+                        message: "reload not implemented in this build".into(),
+                    })
+                    .await;
+            }
+            Ok(Read::Frame(ClientFrame::Purge)) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: None, message: "purge not implemented in this build".into() }).await;
+            }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
@@ -229,7 +247,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx
                     .send(DaemonFrame::Error { session_id: Some(session_id), message: "unknown session".into() })
                     .await;
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
@@ -246,7 +264,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                             message: format!("cwd must be an absolute existing directory: {}", cwd.display()),
                         })
                         .await;
-                    let _ = tx.send(DaemonFrame::Bye).await;
+                    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                     let _ = writer.await;
                     return;
                 }
@@ -255,7 +273,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 Ok(h) => (h, mode),
                 Err(e) => {
                     let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("create session: {e}") }).await;
-                    let _ = tx.send(DaemonFrame::Bye).await;
+                    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                     let _ = writer.await;
                     return;
                 }
@@ -266,18 +284,19 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let mut rx = handle.subscribe();
     if let Err(e) = handle.send(SessionCommand::Attach { client: hello.client.clone(), mode }).await {
         let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: format!("attach: {e}") }).await;
-        let _ = tx.send(DaemonFrame::Bye).await;
+        let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
         let _ = writer.await;
         return;
     }
-    let attached = tokio::time::timeout(ATTACH_TIMEOUT, async {
+    let attach_budget = if handle.lifecycle() == SessionLifecycle::Parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
+    let attached = tokio::time::timeout(attach_budget, async {
         loop {
             match rx.recv().await {
-                Ok(env) => {
-                    if let SessionEventWire::Attached { client, snapshot } = env.event {
-                        return Some((client, snapshot));
-                    }
-                }
+                Ok(env) => match env.event {
+                    SessionEventWire::Attached { client, snapshot } => return Some(Ok((client, snapshot))),
+                    SessionEventWire::AttachRefused { message } => return Some(Err(message)),
+                    _ => {}
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -285,10 +304,16 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     })
     .await;
     let (client, snapshot) = match attached {
-        Ok(Some(x)) => x,
+        Ok(Some(Ok(x))) => x,
+        Ok(Some(Err(message))) => {
+            let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message }).await;
+            let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+            let _ = writer.await;
+            return;
+        }
         _ => {
             let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: "attach timed out".into() }).await;
-            let _ = tx.send(DaemonFrame::Bye).await;
+            let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
             let _ = writer.await;
             return;
         }
@@ -355,7 +380,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
-                match handle.send(cmd).await {
+                match handle.send_from(client, cmd).await {
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
                         let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "backpressure: command queue full".into() }).await;
@@ -378,12 +403,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
-                let _ = tx.send(DaemonFrame::Bye).await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
                 break;
             }
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
+            }
+            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
             Ok(Read::Oversize) => {
@@ -416,7 +444,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     if !handle.is_alive() {
         state.remove(&sid);
     }
-    let _ = tx.send(DaemonFrame::Bye).await;
+    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");

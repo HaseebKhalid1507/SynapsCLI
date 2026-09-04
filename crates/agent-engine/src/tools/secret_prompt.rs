@@ -120,4 +120,44 @@ impl SecretPromptQueue {
         }
         self.activate_next();
     }
+
+    /// Drop the active prompt WITHOUT answering (the oneshot is dropped, not
+    /// sent): another client resolved it (`PromptResolved` for a prompt this
+    /// client did not answer). The next pending prompt activates.
+    pub fn dismiss(&mut self) {
+        if let Some(mut active) = self.active.take() {
+            active.buffer.clear();
+            drop(active.response_tx);
+        }
+        self.activate_next();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dismiss_drops_without_answering_and_activates_next() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest { title: "a".into(), prompt: "p".into(), response_tx: tx1 }).unwrap();
+        tx.send(SecretPromptRequest { title: "b".into(), prompt: "p".into(), response_tx: tx2 }).unwrap();
+        let mut q = SecretPromptQueue::new();
+        q.poll_requests(&rx);
+        assert_eq!(q.active().unwrap().title, "a");
+        q.push_char('z');
+        q.dismiss();
+        // Dropped, never sent: the waiter sees a closed channel (== cancelled).
+        assert!(matches!(rx1.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        // The next prompt is active with a fresh buffer.
+        assert_eq!(q.active().unwrap().title, "b");
+        assert_eq!(q.active().unwrap().buffer, "");
+        q.push_char('x');
+        q.submit();
+        assert_eq!(rx2.try_recv().unwrap(), Some("x".to_string()));
+        assert!(!q.is_active());
+    }
 }

@@ -91,6 +91,20 @@ impl Client {
             | SessionEventWire::LoaderProgress(_)
             | SessionEventWire::ExtensionNotification { .. }
             | SessionEventWire::Attached { .. } => {}
+            // Phase-3 envelopes: rendered by C4/A4; ignored by the line client today.
+            SessionEventWire::Aborted { .. }
+            | SessionEventWire::Cleared { .. }
+            | SessionEventWire::CompactionStarted { .. }
+            | SessionEventWire::CompactionApplied { .. }
+            | SessionEventWire::CompactionFailed { .. }
+            | SessionEventWire::CompactionCancelled
+            | SessionEventWire::SubagentRows(_)
+            | SessionEventWire::Resumed { .. }
+            | SessionEventWire::InputOwnerChanged { .. }
+            | SessionEventWire::Refused { .. }
+            | SessionEventWire::AttachRefused { .. }
+            | SessionEventWire::Lifecycle(_)
+            | SessionEventWire::Reloading { .. } => {}
         }
     }
 
@@ -133,7 +147,7 @@ impl Client {
             }
             _ if line.starts_with("/model ") => {
                 let model = line["/model ".len()..].trim().to_string();
-                let _ = self.t.send(SessionCommand::Set(SessionSetting::Model { model })).await;
+                let _ = self.t.send(SessionCommand::Set { id: 0, setting: SessionSetting::Model { model } }).await;
             }
             text => {
                 let cmd = if self.streaming {

@@ -134,7 +134,7 @@ async fn socket_roundtrip_real_uds() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, TransportError::Protocol(ref m) if m.contains("unknown session")), "{err}");
+    assert!(matches!(err, TransportError::Refused(ref m) if m.contains("unknown session")), "{err}");
 
     // shutdown over the socket: sessions ended, files unlinked, lock released
     SocketTransport::shutdown(&paths.sock, false).await.unwrap();

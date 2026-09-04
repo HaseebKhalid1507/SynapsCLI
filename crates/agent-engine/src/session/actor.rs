@@ -63,11 +63,11 @@ const TURN_REPLAY_CAP: usize = 4096;
 /// `start_turn` and holds the current turn only. The actor's content is
 /// the narrower, arguably correct one.
 #[derive(Default)]
-struct TurnLog {
+pub(crate) struct TurnLog {
     parts: Vec<TurnPart>,
 }
 
-enum TurnPart {
+pub(crate) enum TurnPart {
     Thinking(String),
     Text(String),
     ToolUse { name: String, input: String },
@@ -160,36 +160,40 @@ impl TurnLog {
 }
 
 pub struct SessionActor {
-    id: SessionId,
-    meta: SessionMeta,
-    config: SessionConfig,
+    pub(crate) id: SessionId,
+    pub(crate) meta: SessionMeta,
+    pub(crate) config: SessionConfig,
     /// THE runtime; `session_id` + `cwd` set by `create`.
-    runtime: Runtime,
-    conv: ConversationState,
+    pub(crate) runtime: Runtime,
+    pub(crate) conv: ConversationState,
     // ── turn machine: the run() loop locals + App fields ──
-    stream: Option<ActiveStream>,
-    cancel: Option<CancellationToken>,
-    steer_tx: Option<mpsc::UnboundedSender<String>>,
-    streaming: bool,
-    turn_baseline: usize,
-    consecutive_auto_turns: u32,
-    turn_log: TurnLog,
+    pub(crate) stream: Option<ActiveStream>,
+    pub(crate) cancel: Option<CancellationToken>,
+    pub(crate) steer_tx: Option<mpsc::UnboundedSender<String>>,
+    pub(crate) streaming: bool,
+    pub(crate) turn_baseline: usize,
+    pub(crate) consecutive_auto_turns: u32,
+    pub(crate) turn_log: TurnLog,
     // ── prompts ──
-    secret_prompt_handle: SecretPromptHandle,
-    secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
+    pub(crate) secret_prompt_handle: SecretPromptHandle,
+    pub(crate) secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
     /// Held across detach; replayed in `AttachSnapshot.pending_prompts`.
-    pending_prompts: VecDeque<(PromptRequest, oneshot::Sender<Option<String>>)>,
-    next_prompt_id: u64,
+    pub(crate) pending_prompts: VecDeque<(PromptRequest, oneshot::Sender<Option<String>>)>,
+    pub(crate) next_prompt_id: u64,
     // ── clients ──
-    cmd_rx: mpsc::Receiver<SessionCommand>,
-    events: broadcast::Sender<Envelope>,
-    view: Arc<arc_swap::ArcSwap<RuntimeView>>,
-    attached: HashMap<ClientId, ClientMeta>,
-    next_client_id: u64,
-    seq: u64,
-    turn_replay: VecDeque<Envelope>,
-    state: AttachState,
-    background: BackgroundTasks,
+    pub(crate) cmd_rx: mpsc::Receiver<Addressed>,
+    pub(crate) events: broadcast::Sender<Envelope>,
+    pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
+    pub(crate) attached: HashMap<ClientId, ClientMeta>,
+    pub(crate) next_client_id: u64,
+    pub(crate) seq: u64,
+    pub(crate) turn_replay: VecDeque<Envelope>,
+    pub(crate) state: AttachState,
+    pub(crate) background: BackgroundTasks,
+    /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
+    pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
+    /// Mirrors `handle.journal_id()` (B2 stores the successor id).
+    pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
 }
 
 impl SessionActor {
@@ -223,6 +227,7 @@ impl SessionActor {
             &config,
             &sb.session,
             cfg.cwd.clone(),
+            crate::engine::setup::IndexRecord::Start,
         );
 
         // C2: per-session on_session_start (keyed injection) once the
@@ -248,6 +253,11 @@ impl SessionActor {
             continued: sb.continued,
             continue_info: sb.continue_info.as_ref().map(ContinueInfoWire::from),
             host_pid: std::process::id(),
+            lifecycle: SessionLifecycle::Live,
+            clients: 0,
+            input_owner: None,
+            awaiting_input: 0,
+            journal_id: sb.session.id.clone(),
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -261,8 +271,16 @@ impl SessionActor {
         conv.abort_context = sb.abort_context;
 
         let view = RuntimeView::from_runtime(&runtime).await;
-        let (handle, SessionEndpoints { cmd_rx, events, view }) =
-            SessionHandle::new(meta.clone(), view);
+        let (
+            handle,
+            SessionEndpoints {
+                cmd_rx,
+                events,
+                view,
+                lifecycle,
+                journal_id,
+            },
+        ) = SessionHandle::new(meta.clone(), view);
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
 
         let actor = SessionActor {
@@ -291,6 +309,8 @@ impl SessionActor {
             turn_replay: VecDeque::new(),
             state: AttachState::Detached { running: false },
             background,
+            lifecycle,
+            journal_id,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -299,7 +319,7 @@ impl SessionActor {
 
     /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
     /// prompt traffic (never replayed) and per-client replies.
-    fn emit(&mut self, event: SessionEventWire) {
+    pub(crate) fn emit(&mut self, event: SessionEventWire) {
         let replay = self.streaming
             && !matches!(
                 event,
@@ -325,23 +345,23 @@ impl SessionActor {
         let _ = self.events.send(env);
     }
 
-    fn emit_conversation(&mut self) {
+    pub(crate) fn emit_conversation(&mut self) {
         let snap = self.conv.snapshot(self.consecutive_auto_turns);
         self.emit(SessionEventWire::Conversation(snap));
     }
 
-    async fn publish_view(&mut self) {
+    pub(crate) async fn publish_view(&mut self) {
         let v = RuntimeView::from_runtime(&self.runtime).await;
         self.view.store(Arc::new(v));
     }
 
-    async fn save(&mut self) {
+    pub(crate) async fn save(&mut self) {
         if self.config.persist {
             self.conv.save().await;
         }
     }
 
-    fn update_attach_state(&mut self) {
+    pub(crate) fn update_attach_state(&mut self) {
         self.state = if self.attached.is_empty() {
             AttachState::Detached {
                 running: self.streaming,
@@ -353,7 +373,7 @@ impl SessionActor {
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
-    async fn start_turn(&mut self, trigger: TurnTrigger) {
+    pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
@@ -364,6 +384,7 @@ impl SessionActor {
         self.emit(SessionEventWire::TurnStarted {
             turn_baseline: self.turn_baseline,
             trigger,
+            user_text,
         });
         // Blocks command processing during setup exactly like the TUI loop.
         let stream = self
@@ -384,7 +405,7 @@ impl SessionActor {
     /// Every turn-end path (Done/Error/Cancel/stream EOF). Clears `turn_log`
     /// too: a `Cancel` racing a `Done` must not scrape the finished turn into
     /// `abort_context`.
-    fn clear_stream(&mut self) {
+    pub(crate) fn clear_stream(&mut self) {
         self.stream = None;
         self.cancel = None;
         self.steer_tx = None;
@@ -394,7 +415,7 @@ impl SessionActor {
     }
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
-    async fn submit(&mut self, text: String) {
+    pub(crate) async fn submit(&mut self, text: String) {
         if self.streaming {
             // A Submit while streaming is what the TUI calls StreamingInput.
             self.steer(text);
@@ -413,11 +434,11 @@ impl SessionActor {
         self.conv.api_messages.push(std::sync::Arc::new(
             serde_json::json!({"role": "user", "content": api_content}),
         ));
-        self.start_turn(TurnTrigger::User).await;
+        self.start_turn(TurnTrigger::User, None).await;
     }
 
     /// dispatch.rs StreamingInput plain-text branch (:1369-1378).
-    fn steer(&mut self, text: String) {
+    pub(crate) fn steer(&mut self, text: String) {
         let delivered = self
             .steer_tx
             .as_ref()
@@ -434,7 +455,7 @@ impl SessionActor {
     /// TUI's `if streaming` guard (input.rs:350): a `Cancel` while idle is a
     /// no-op that only re-announces `Idle` — it must never touch
     /// `abort_context`, save, or emit "aborted".
-    async fn cancel_turn(&mut self) {
+    pub(crate) async fn cancel_turn(&mut self) {
         if !self.streaming {
             self.emit(SessionEventWire::Idle);
             return;
@@ -523,7 +544,7 @@ impl SessionActor {
                     tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
                 } else {
                     self.consecutive_auto_turns += 1;
-                    self.start_turn(TurnTrigger::EventAuto).await;
+                    self.start_turn(TurnTrigger::EventAuto, None).await;
                 }
             }
             WakeAction::Forward => {
@@ -660,6 +681,7 @@ impl SessionActor {
                 }
                 // Auto-send the queued message (user-authored — reset counter)
                 self.consecutive_auto_turns = 0;
+                let user_text = queued.clone();
                 let api_content = if let Some(ref ctx) = self.conv.abort_context {
                     let combined = format!("{}\n\n{}", ctx, queued);
                     self.conv.abort_context = None;
@@ -670,7 +692,7 @@ impl SessionActor {
                 self.conv.api_messages.push(std::sync::Arc::new(
                     serde_json::json!({"role": "user", "content": api_content}),
                 ));
-                self.start_turn(TurnTrigger::QueuedAuto).await;
+                self.start_turn(TurnTrigger::QueuedAuto, Some(user_text)).await;
             }
             After::AutoTriggerEvents => {
                 if self.config.auto_compact {
@@ -678,7 +700,7 @@ impl SessionActor {
                 }
                 // Central claim gate: allows turns 1-5, denies the 6th.
                 if claim_auto_turn(&mut self.consecutive_auto_turns) {
-                    self.start_turn(TurnTrigger::EventAuto).await;
+                    self.start_turn(TurnTrigger::EventAuto, None).await;
                 } else {
                     self.emit(SessionEventWire::AutoTurnCapReached { cap: AUTO_TURN_CAP });
                     self.emit(SessionEventWire::Idle);
@@ -702,7 +724,7 @@ impl SessionActor {
 
     /// chat.rs `/compact` + auto-compaction body (inline; the TUI's spawned
     /// compaction task is day 2).
-    async fn compact(&mut self, instructions: Option<String>, source: &str) {
+    pub(crate) async fn compact(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
             preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
@@ -773,7 +795,7 @@ impl SessionActor {
 
     // ── settings / queries / engine commands ─────────────────────────────
 
-    async fn apply_setting(&mut self, setting: SessionSetting) {
+    pub(crate) async fn apply_setting(&mut self, id: u64, setting: SessionSetting) {
         let name = match &setting {
             SessionSetting::Model { .. } => "model",
             SessionSetting::ReasoningLevel { .. } => "reasoning_level",
@@ -789,11 +811,16 @@ impl SessionActor {
             SessionSetting::GrantWorkerModel { .. } => "grant_worker_model",
         };
         let rt = &mut self.runtime;
+        let mut clamp_wire = None;
         let result: std::result::Result<Option<String>, String> = match setting {
             SessionSetting::Model { model } => rt.try_set_model(model).map(|clamp| {
                 self.conv.session.model = rt.model().to_string();
                 clamp.map(|c| {
                     self.conv.session.thinking_level = rt.thinking_level().to_string();
+                    clamp_wire = Some(ReasoningClampWire {
+                        from: c.from.as_str().to_string(),
+                        to: c.to.as_str().to_string(),
+                    });
                     format!(
                         "thinking → {} (clamped from {}: not supported by {})",
                         c.to.as_str(),
@@ -855,14 +882,16 @@ impl SessionActor {
             Err(e) => (false, Some(e)),
         };
         self.emit(SessionEventWire::SettingChanged(SettingApplied {
+            id,
             setting: name.to_string(),
             ok,
             message,
             view,
+            clamp: clamp_wire,
         }));
     }
 
-    async fn query(&mut self, id: u64, query: SessionQuery) {
+    pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
         let value = match query {
             SessionQuery::Status => serde_json::json!({
                 "session": self.conv.session.id,
@@ -913,59 +942,20 @@ impl SessionActor {
                     "should_compact": a.should_compact(),
                 })
             }
-        };
-        self.emit(SessionEventWire::QueryResult { id, value });
-    }
-
-    /// `engine::commands::handle_engine_command` on THE runtime; reply as a
-    /// `QueryResult` the client renders (chat.rs slash-command branch).
-    async fn engine_command(&mut self, id: u64, cmd: String, arg: String) {
-        use crate::engine::commands::{handle_engine_command, CommandResult};
-        let value = match handle_engine_command(&cmd, &arg, &mut self.runtime) {
-            None => serde_json::json!({ "kind": "unhandled" }),
-            Some(CommandResult::Quit) => serde_json::json!({ "kind": "quit" }),
-            Some(CommandResult::ModelChanged {
-                model,
-                reasoning_clamped,
-            }) => {
-                self.conv.session.model = self.runtime.model().to_string();
-                let mut text = format!("model → {}", model);
-                if let Some(clamp) = reasoning_clamped {
-                    self.conv.session.thinking_level = self.runtime.thinking_level().to_string();
-                    text.push_str(&format!(
-                        "\nthinking → {} (clamped from {}: not supported by {})",
-                        clamp.to.as_str(),
-                        clamp.from.as_str(),
-                        self.runtime.model()
-                    ));
+            SessionQuery::ContextReport => {
+                use crate::engine::commands::{context_command, CommandResult};
+                match context_command(&self.runtime, Some(&self.conv.api_messages)) {
+                    CommandResult::Output(text) => serde_json::json!({ "text": text }),
+                    other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
-                self.publish_view().await;
-                serde_json::json!({ "kind": "notice", "text": text })
             }
-            Some(CommandResult::ThinkingChanged { spec }) => {
-                self.conv.session.thinking_level = spec.config_value();
-                self.publish_view().await;
-                serde_json::json!({ "kind": "notice", "text": format!("thinking → {}", spec.level()) })
-            }
-            Some(CommandResult::Compact {
-                custom_instructions,
-            }) => {
-                self.emit(SessionEventWire::SystemNotice("compacting...".into()));
-                self.compact(custom_instructions, "manual").await;
-                serde_json::json!({ "kind": "none" })
-            }
-            Some(CommandResult::Error(e)) => serde_json::json!({ "kind": "error", "text": e }),
-            Some(CommandResult::Output(text)) => {
-                serde_json::json!({ "kind": "output", "text": text })
-            }
-            Some(_) => serde_json::json!({ "kind": "none" }),
         };
         self.emit(SessionEventWire::QueryResult { id, value });
     }
 
     // ── attach / detach ──────────────────────────────────────────────────
 
-    fn snapshot(&self) -> AttachSnapshot {
+    pub(crate) fn snapshot(&self) -> AttachSnapshot {
         AttachSnapshot {
             meta: self.meta.clone(),
             view: (**self.view.load()).clone(),
@@ -974,6 +964,7 @@ impl SessionActor {
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, m)| (*c, m.kind)).collect(),
+            input_owner: None,
         }
     }
 
@@ -1007,8 +998,11 @@ impl SessionActor {
 
     // ── command dispatch ─────────────────────────────────────────────────
 
-    async fn handle(&mut self, cmd: SessionCommand) -> std::ops::ControlFlow<EndReason> {
+    /// `from` is carried for B1 (input ownership); today every sender is
+    /// honoured.
+    async fn handle(&mut self, addressed: Addressed) -> std::ops::ControlFlow<EndReason> {
         use std::ops::ControlFlow;
+        let Addressed { from: _from, cmd } = addressed;
         match cmd {
             SessionCommand::Submit { text, .. } => self.submit(text).await,
             SessionCommand::Steer { text } => {
@@ -1020,7 +1014,7 @@ impl SessionActor {
             }
             SessionCommand::Cancel => self.cancel_turn().await,
             SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
-            SessionCommand::Set(setting) => self.apply_setting(setting).await,
+            SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
             SessionCommand::Compact { instructions } => {
                 self.emit(SessionEventWire::SystemNotice("compacting...".into()));
                 self.compact(instructions, "manual").await;
@@ -1046,6 +1040,24 @@ impl SessionActor {
             SessionCommand::Resync { .. } => self.emit(SessionEventWire::SystemNotice(
                 "resync not supported yet".into(),
             )),
+            // Phase-3 stubs: A3 (SubmitPrepared/PluginCommand/Resume), B1
+            // (Checkpoint), B3 (KeepWarm) fill these in.
+            SessionCommand::SubmitPrepared { .. } => self.emit(SessionEventWire::SystemNotice(
+                "submit_prepared: not implemented in this build".into(),
+            )),
+            SessionCommand::PluginCommand { id, .. } => self.emit(SessionEventWire::QueryResult {
+                id,
+                value: serde_json::json!({ "kind": "error", "text": "plugin_command: not implemented in this build" }),
+            }),
+            SessionCommand::Resume { .. } => self.emit(SessionEventWire::SystemNotice(
+                "resume: not implemented in this build".into(),
+            )),
+            SessionCommand::Checkpoint { .. } => self.emit(SessionEventWire::SystemNotice(
+                "checkpoint: not implemented in this build".into(),
+            )),
+            SessionCommand::KeepWarm { .. } => self.emit(SessionEventWire::SystemNotice(
+                "keep_warm: not implemented in this build".into(),
+            )),
             SessionCommand::HostEvent(ev) => match ev {
                 HostEvent::ExtensionNotification {
                     extension_id,
@@ -1065,6 +1077,10 @@ impl SessionActor {
     // ── teardown (tui/mod.rs:352-432 + chat.rs shutdown) ─────────────────
 
     async fn finish(&mut self, reason: EndReason) {
+        self.lifecycle.store(
+            SessionLifecycle::Ending as u8,
+            std::sync::atomic::Ordering::Release,
+        );
         if self.streaming {
             self.cancel_turn().await;
         }

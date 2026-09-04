@@ -78,10 +78,40 @@ pub struct SessionConfig {
     /// The TUI does its own compaction; default `false`.
     #[serde(default)]
     pub auto_compact: bool,
+    /// Compaction transition policy: `InPlace` (default; chat, today's
+    /// actor) or `LinkedSuccessor` (the TUI's successor-session chain).
+    #[serde(default)]
+    pub compaction_policy: CompactionPolicyWire,
+    /// Block `create` on process-level extension discovery before emitting
+    /// `on_session_start` (chat/daemon). The TUI passes `false`: the actor
+    /// emits it from a spawned waiter so boot never blocks on discovery.
+    #[serde(default = "default_true")]
+    pub await_extensions: bool,
+    /// Never `Park` this session (`--keep-warm`). Default `false`.
+    #[serde(default)]
+    pub keep_warm: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Serializable mirror of `runtime::compaction::CompactionPolicy`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPolicyWire {
+    #[default]
+    InPlace,
+    LinkedSuccessor,
+}
+
+impl From<CompactionPolicyWire> for crate::runtime::compaction::CompactionPolicy {
+    fn from(p: CompactionPolicyWire) -> Self {
+        match p {
+            CompactionPolicyWire::InPlace => Self::InPlace,
+            CompactionPolicyWire::LinkedSuccessor => Self::LinkedSuccessor,
+        }
+    }
 }
 
 impl Default for SessionConfig {
@@ -95,6 +125,9 @@ impl Default for SessionConfig {
             model_override: None,
             persist: true,
             auto_compact: false,
+            compaction_policy: CompactionPolicyWire::InPlace,
+            await_extensions: true,
+            keep_warm: false,
         }
     }
 }
@@ -129,6 +162,41 @@ pub struct SessionMeta {
     pub continue_info: Option<ContinueInfoWire>,
     /// Daemon pid (in-process: this process).
     pub host_pid: u32,
+    // ── filled at list time from the handle's cells (meta itself is frozen) ──
+    #[serde(default)]
+    pub lifecycle: SessionLifecycle,
+    #[serde(default)]
+    pub clients: usize,
+    #[serde(default)]
+    pub input_owner: Option<ClientId>,
+    #[serde(default)]
+    pub awaiting_input: usize,
+    /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
+    #[serde(default)]
+    pub journal_id: String,
+}
+
+/// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycle {
+    #[default]
+    Live = 0,
+    Parking = 1,
+    Parked = 2,
+    Ending = 3,
+}
+
+impl SessionLifecycle {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Parking,
+            2 => Self::Parked,
+            3 => Self::Ending,
+            _ => Self::Live,
+        }
+    }
 }
 
 /// Minted by the actor per Attach.
@@ -167,8 +235,8 @@ pub enum ClientKind {
     Test,
 }
 
-/// Today: Mirror only is honoured; Takeover/Observe parse and map to Mirror
-/// with a Notice.
+/// Attach mode. Ownership (B1): `Mirror` owns input iff nobody does,
+/// `Takeover` steals it, `Observe` never owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachMode {
@@ -182,6 +250,10 @@ pub enum AttachMode {
 pub enum AttachState {
     Attached(usize),
     Detached { running: bool },
+    /// Save + PTY teardown in progress (B3).
+    Parking,
+    /// `runtime`/`conv` dropped; `background` alive; unpark on Attach/wake (B3).
+    Parked,
 }
 
 // ── prompts ───────────────────────────────────────────────────────────────────
@@ -220,8 +292,27 @@ pub struct PromptRequest {
 
 // ── commands, settings, queries ───────────────────────────────────────────────
 
+/// A command with its origin. `from: None` = host-originated (router,
+/// lifecycle, idle probe) and bypasses input ownership (B1).
+#[derive(Debug)]
+pub struct Addressed {
+    pub from: Option<ClientId>,
+    pub cmd: SessionCommand,
+}
+
+/// Why a `Checkpoint` was requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointReason {
+    Reload,
+    HostRequest,
+}
+
 /// The entire client→session control surface (SEAMS §5.2/§5.3).
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Debug` is manual: `Submit`/`Steer`/`SubmitPrepared`/`Answer`/`Resume`
+/// print `<redacted>` (no lengths) so a command can be traced by *type*.
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCommand {
     /// User-authored prompt. Actor: reset auto-turn counter, fold
@@ -240,7 +331,8 @@ pub enum SessionCommand {
     /// Answer to a PromptRequest. `None` = cancelled.
     /// NEVER journaled, NEVER replayed, NEVER traced.
     Answer { prompt_id: u64, value: Option<String> },
-    Set(SessionSetting),
+    /// `id` is client-chosen and echoed in `SettingChanged.id`.
+    Set { id: u64, setting: SessionSetting },
     Compact { instructions: Option<String> },
     /// `/new`: ConversationState::clear.
     NewSession,
@@ -258,9 +350,100 @@ pub enum SessionCommand {
     /// /model /thinking /context /trace /memory /compact …). Reply =
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
+    /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
+    /// (+ optional user text) then a turn. Does NOT fold abort_context and
+    /// does NOT reset consecutive_auto_turns.
+    SubmitPrepared {
+        messages: Vec<crate::SharedMessage>,
+        #[serde(default)]
+        user_text: Option<String>,
+    },
+    /// (A3) tools-backed (non-interactive) plugin command on THE runtime's
+    /// tool set. Reply = `QueryResult{id, {kind:"plugin_output", ..}}`.
+    PluginCommand { id: u64, plugin: String, name: String, arg: String },
+    /// (A3) `/resume`: save current, load `query`, restore model/reasoning/
+    /// system prompt, swap conversation. Reply = `Resumed{id, ..}`.
+    Resume { id: u64, query: String },
+    /// (B1, used by C3 reload) cancel any turn (abort_context captured),
+    /// abort compaction, save, close PTYs, emit Notice. Never ends the
+    /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
+    Checkpoint { reason: CheckpointReason },
+    /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
+    KeepWarm { on: bool },
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
+}
+
+impl std::fmt::Debug for SessionCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Submit { attachments, .. } => f
+                .debug_struct("Submit")
+                .field("text", &format_args!("<redacted>"))
+                .field("attachments", &attachments.len())
+                .finish(),
+            Self::Steer { .. } => f
+                .debug_struct("Steer")
+                .field("text", &format_args!("<redacted>"))
+                .finish(),
+            Self::SubmitPrepared { .. } => f
+                .debug_struct("SubmitPrepared")
+                .field("messages", &format_args!("<redacted>"))
+                .field("user_text", &format_args!("<redacted>"))
+                .finish(),
+            Self::Answer { prompt_id, .. } => f
+                .debug_struct("Answer")
+                .field("prompt_id", prompt_id)
+                .field("value", &format_args!("<redacted>"))
+                .finish(),
+            Self::Resume { id, .. } => f
+                .debug_struct("Resume")
+                .field("id", id)
+                .field("query", &format_args!("<redacted>"))
+                .finish(),
+            Self::Cancel => f.write_str("Cancel"),
+            Self::Set { id, setting } => {
+                f.debug_struct("Set").field("id", id).field("setting", setting).finish()
+            }
+            Self::Compact { instructions } => {
+                f.debug_struct("Compact").field("instructions", instructions).finish()
+            }
+            Self::NewSession => f.write_str("NewSession"),
+            Self::Save => f.write_str("Save"),
+            Self::Query { id, query } => {
+                f.debug_struct("Query").field("id", id).field("query", query).finish()
+            }
+            Self::Attach { client, mode } => {
+                f.debug_struct("Attach").field("client", client).field("mode", mode).finish()
+            }
+            Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
+            Self::End { reason } => f.debug_struct("End").field("reason", reason).finish(),
+            Self::Resync { client, since_seq } => f
+                .debug_struct("Resync")
+                .field("client", client)
+                .field("since_seq", since_seq)
+                .finish(),
+            Self::EngineCommand { id, name, arg } => f
+                .debug_struct("EngineCommand")
+                .field("id", id)
+                .field("name", name)
+                .field("arg", arg)
+                .finish(),
+            Self::PluginCommand { id, plugin, name, arg } => f
+                .debug_struct("PluginCommand")
+                .field("id", id)
+                .field("plugin", plugin)
+                .field("name", name)
+                .field("arg", arg)
+                .finish(),
+            Self::Checkpoint { reason } => {
+                f.debug_struct("Checkpoint").field("reason", reason).finish()
+            }
+            Self::KeepWarm { on } => f.debug_struct("KeepWarm").field("on", on).finish(),
+            Self::HostEvent(ev) => f.debug_tuple("HostEvent").field(ev).finish(),
+        }
+    }
 }
 
 /// Host-originated events pushed into a session (C3 router, loader).
@@ -303,10 +486,23 @@ pub enum SessionSetting {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingApplied {
+    /// Correlates with `Set{id}`.
+    #[serde(default)]
+    pub id: u64,
     pub setting: String,
     pub ok: bool,
     pub message: Option<String>,
     pub view: RuntimeView,
+    /// `{from, to}` when a model change clamped the reasoning level, so the
+    /// TUI renders `reasoning_clamp_notice` byte-for-byte.
+    #[serde(default)]
+    pub clamp: Option<ReasoningClampWire>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningClampWire {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +522,8 @@ pub enum SessionQuery {
     View,
     /// assess_context
     ContextAssessment,
+    /// `engine::commands::context_command(runtime, Some(api_messages))` text.
+    ContextReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,9 +545,12 @@ pub enum EndReason {
 pub enum SessionEventWire {
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
+    /// `user_text` = the queued text on `QueuedAuto` (TUI pushes the User
+    /// card + scroll); `None` otherwise.
     TurnStarted {
         turn_baseline: usize,
         trigger: TurnTrigger,
+        user_text: Option<String>,
     },
     /// Emitted after every MessageHistory / Done / Error / Cancel / Compact so
     /// mirrors never diverge: the actor's api_messages IS the truth.
@@ -385,6 +586,58 @@ pub enum SessionEventWire {
     ClientJoined { client: ClientId, kind: ClientKind },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
+    /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
+    /// subagents.clear(), streaming=false.
+    Aborted { context_saved: bool },
+    /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
+    Cleared { session_id: String },
+    /// (B2) `disclosure` = preview_compaction_disclosure().render_line().
+    CompactionStarted { source: String, disclosure: String },
+    CompactionApplied {
+        previous_session_id: String,
+        session_id: String,
+        chains_advanced: Vec<String>,
+        queued_restored: Option<String>,
+        msg_count: usize,
+    },
+    /// "compaction failed: {e}" vs "compaction task panicked: {e}".
+    CompactionFailed { message: String, panicked: bool },
+    CompactionCancelled,
+    /// `runtime.subagent_registry().display_rows()` — at Done/Error and at
+    /// 1 Hz while any row is non-terminal.
+    SubagentRows(Vec<crate::runtime::subagent::SubagentDisplayRow>),
+    /// `/resume` reply (`Resume{id}`).
+    Resumed {
+        id: u64,
+        old_id: String,
+        new_id: String,
+        via: Option<String>,
+        clamp_notice: Option<String>,
+    },
+    /// (B1) sent to the previous owner on takeover, and to everyone on any
+    /// owner change.
+    InputOwnerChanged {
+        from: Option<ClientId>,
+        to: Option<ClientId>,
+        reason: OwnerChangeReason,
+    },
+    /// (B1) a non-owner sent an input command. Only the sender renders it.
+    Refused { client: ClientId, command: String, reason: String },
+    /// (B3) targeted like `Attached`: the attach could not be honoured.
+    AttachRefused { message: String },
+    /// (B3) lifecycle transitions for mirrors and `sessions` listings.
+    Lifecycle(SessionLifecycle),
+    /// (C3) daemon is about to exec itself; clients reconnect.
+    Reloading { generation: u64, retry_after_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerChangeReason {
+    Attach,
+    Takeover,
+    OwnerDetached,
+    Reload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +672,9 @@ pub struct ConversationTokens {
 /// counter). Clients MUST replace, never merge, on `Conversation(_)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConversationSnapshot {
+    /// The TUI's `App.session` mirror (never `api_messages`).
+    #[serde(default)]
+    pub header: SessionHeader,
     pub api_messages: Vec<crate::SharedMessage>,
     pub tokens: ConversationTokens,
     pub cost: f64,
@@ -426,6 +682,36 @@ pub struct ConversationSnapshot {
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
     pub consecutive_auto_turns: u32,
+}
+
+/// `Session` minus `api_messages` and accounting: what a client mirrors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeader {
+    pub id: String,
+    pub title: String,
+    pub name: Option<String>,
+    pub model: String,
+    pub thinking_level: String,
+    pub system_prompt: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub parent_session: Option<String>,
+}
+
+impl From<&crate::Session> for SessionHeader {
+    fn from(s: &crate::Session) -> Self {
+        Self {
+            id: s.id.clone(),
+            title: s.title.clone(),
+            name: s.name.clone(),
+            model: s.model.clone(),
+            thinking_level: s.thinking_level.clone(),
+            system_prompt: s.system_prompt.clone(),
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            parent_session: s.parent_session.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +725,9 @@ pub struct AttachSnapshot {
     pub replay: Vec<Envelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Who owns input right now (B1) — so a joiner knows immediately
+    /// whether its keystrokes will be honoured.
+    pub input_owner: Option<ClientId>,
 }
 
 /// `ReasoningLevel` has no serde impls in agent-core; go through its
@@ -481,20 +770,26 @@ mod tests {
 
     #[test]
     fn command_json_round_trip() {
-        let cmd = SessionCommand::Set(SessionSetting::ReasoningLevel {
-            level: agent_core::reasoning::ReasoningLevel::Ultra,
-        });
+        let cmd = SessionCommand::Set {
+            id: 7,
+            setting: SessionSetting::ReasoningLevel {
+                level: agent_core::reasoning::ReasoningLevel::Ultra,
+            },
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
             json,
-            r#"{"cmd":"set","setting":"reasoning_level","level":"ultra"}"#
+            r#"{"cmd":"set","id":7,"setting":{"setting":"reasoning_level","level":"ultra"}}"#
         );
         let back: SessionCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             back,
-            SessionCommand::Set(SessionSetting::ReasoningLevel {
-                level: agent_core::reasoning::ReasoningLevel::Ultra
-            })
+            SessionCommand::Set {
+                id: 7,
+                setting: SessionSetting::ReasoningLevel {
+                    level: agent_core::reasoning::ReasoningLevel::Ultra
+                }
+            }
         ));
 
         let submit: SessionCommand = serde_json::from_str(r#"{"cmd":"submit","text":"hi"}"#).unwrap();
@@ -505,6 +800,72 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_commands_round_trip() {
+        let cmds = vec![
+            SessionCommand::SubmitPrepared {
+                messages: vec![std::sync::Arc::new(serde_json::json!({"role":"user","content":"x"}))],
+                user_text: Some("t".into()),
+            },
+            SessionCommand::PluginCommand { id: 1, plugin: "p".into(), name: "n".into(), arg: "a".into() },
+            SessionCommand::Resume { id: 2, query: "q".into() },
+            SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
+            SessionCommand::KeepWarm { on: true },
+            SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
+        ];
+        for cmd in cmds {
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: SessionCommand = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+        let cp: SessionCommand = serde_json::from_str(r#"{"cmd":"checkpoint","reason":"host_request"}"#).unwrap();
+        assert!(matches!(cp, SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest }));
+    }
+
+    #[test]
+    fn command_debug_redacts_bodies_without_lengths() {
+        let secret = "hunter2-very-secret";
+        let cmds = vec![
+            SessionCommand::Submit { text: secret.into(), attachments: vec![] },
+            SessionCommand::Steer { text: secret.into() },
+            SessionCommand::SubmitPrepared {
+                messages: vec![std::sync::Arc::new(serde_json::json!({"content": secret}))],
+                user_text: Some(secret.into()),
+            },
+            SessionCommand::Answer { prompt_id: 1, value: Some(secret.into()) },
+            SessionCommand::Resume { id: 1, query: secret.into() },
+        ];
+        for cmd in cmds {
+            let d = format!("{cmd:?}");
+            assert!(!d.contains(secret), "{d}");
+            assert!(d.contains("<redacted>"), "{d}");
+            assert!(!d.contains("chars"), "{d}");
+            assert!(!d.contains(&secret.len().to_string()), "{d}");
+        }
+        let d = format!("{:?}", SessionCommand::Set { id: 4, setting: SessionSetting::ReloadPrompt });
+        assert_eq!(d, "Set { id: 4, setting: ReloadPrompt }");
+    }
+
+    #[test]
+    fn session_config_new_fields_default() {
+        let cfg: SessionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.compaction_policy, CompactionPolicyWire::InPlace);
+        assert!(cfg.await_extensions);
+        assert!(!cfg.keep_warm);
+        let cfg: SessionConfig =
+            serde_json::from_str(r#"{"compaction_policy":"linked_successor","await_extensions":false}"#).unwrap();
+        assert_eq!(cfg.compaction_policy, CompactionPolicyWire::LinkedSuccessor);
+        assert!(!cfg.await_extensions);
+    }
+
+    #[test]
+    fn session_lifecycle_u8_round_trip() {
+        for l in [SessionLifecycle::Live, SessionLifecycle::Parking, SessionLifecycle::Parked, SessionLifecycle::Ending] {
+            assert_eq!(SessionLifecycle::from_u8(l as u8), l);
+        }
+        assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);
     }
 
     #[test]

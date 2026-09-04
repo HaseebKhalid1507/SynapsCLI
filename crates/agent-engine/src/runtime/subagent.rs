@@ -75,7 +75,8 @@ pub fn safe_failure_message(category: &TerminalCategory) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubagentStatus {
     Running,
     Completed,
@@ -134,7 +135,8 @@ impl Default for SubagentState {
 
 /// Snapshot row produced by SubagentRegistry::display_rows().
 /// Used by the TUI reconcile path as the registry's liveness authority.
-#[derive(Debug, Clone)]
+/// Serde: travels in `SessionEventWire::SubagentRows` (phase 3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubagentDisplayRow {
     pub subagent_id: u64,
     pub agent_name: String,
