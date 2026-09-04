@@ -269,9 +269,11 @@ async fn client_commands_are_whitelisted() {
 
     // a is untouched: nothing was forwarded to the actor (Save round-trips as an echo notice)
     a.send(SessionCommand::Save).await.unwrap();
-    match next(&mut a).await.event {
-        SessionEventWire::SystemNotice(m) => assert!(m.starts_with("echo:"), "{m}"),
-        o => panic!("{o:?}"),
+    for t in [&mut a, &mut b] {
+        match next(t).await.event {
+            SessionEventWire::SystemNotice(m) => assert!(m.starts_with("echo:"), "{m}"),
+            o => panic!("{o:?}"),
+        }
     }
     // whitelisted command from b reaches the actor and fans out to both
     b.send(SessionCommand::Steer { text: "ok".into() }).await.unwrap();
