@@ -44,8 +44,8 @@ pub fn allow_legacy_mcp_env() -> bool {
     matches!(std::env::var("SYNAPS_DAEMON_ALLOW_LEGACY_MCP").as_deref(), Ok("1") | Ok("true"))
 }
 
-/// Builds a session for `Attach::Create`. Today: `EngineHost::create_session`
-/// once A1 lands; `echo_factory` under `testing`.
+/// Builds a session for `Attach::Create`: `host_factory` (real actor) or
+/// `echo_factory` (tests).
 pub type SessionFactory = Arc<
     dyn Fn(SessionConfig) -> Pin<Box<dyn Future<Output = Result<SessionHandle, String>> + Send>>
         + Send
@@ -69,11 +69,13 @@ pub fn echo_factory() -> SessionFactory {
     })
 }
 
-/// The default factory for a booted host. Until A1 (`EngineHost::create_session`)
-/// is merged this refuses with a clear message so nothing is silently stubbed.
-pub fn host_factory(_host: &Arc<EngineHost>) -> SessionFactory {
-    Arc::new(|_cfg: SessionConfig| {
-        Box::pin(async move { Err("real sessions need SessionActor (A1); not merged into this build".to_string()) })
+/// The default factory for a booted host: `EngineHost::create_session` (A1) —
+/// the real `SessionActor` owning one `Runtime` + `ConversationState`.
+pub fn host_factory(host: &Arc<EngineHost>) -> SessionFactory {
+    let host = Arc::clone(host);
+    Arc::new(move |cfg: SessionConfig| {
+        let host = Arc::clone(&host);
+        Box::pin(async move { host.create_session(cfg).await.map_err(|e| e.to_string()) })
     })
 }
 

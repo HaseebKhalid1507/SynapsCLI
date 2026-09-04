@@ -7,9 +7,9 @@ use std::time::Duration;
 use super::DaemonState;
 use crate::session::{EndReason, SessionCommand};
 
-/// `SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS` (tui/signals.rs: 2 + 5); shared
-/// across all sessions, not ×N.
-pub const SESSION_END_BUDGET: Duration = Duration::from_secs(7);
+/// `session::budgets::TEARDOWN_TIMEOUT_SECS` (SAVE + HOOKS); shared across
+/// all sessions, not ×N.
+pub const SESSION_END_BUDGET: Duration = Duration::from_secs(crate::session::budgets::TEARDOWN_TIMEOUT_SECS);
 /// `--force`: give the actors this long, then drop them.
 pub const FORCE_BUDGET: Duration = Duration::from_millis(500);
 
