@@ -355,9 +355,12 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
 
     // ── PART 2: Bounded teardown — the actor saves, fires on_session_end
     // and flushes observability under its own budgets (`SessionActor::
-    // finish`); we ask for it and wait for `Ended` within the combined
-    // SAVE + HOOKS budget. Over the socket the session lives on: Detach.
-    let teardown = std::time::Duration::from_secs(signals::TEARDOWN_TIMEOUT_SECS);
+    // finish`); we ask for it and wait for `Ended` within the sum of those
+    // budgets plus margin (`SESSION_END_TIMEOUT_SECS`). The channel closing
+    // cleanly before `Ended` is observed is a clean exit too (exit 0); only
+    // an actor still running past its whole budget is an emergency exit.
+    // Over the socket the session lives on: Detach.
+    let teardown = std::time::Duration::from_secs(signals::SESSION_END_TIMEOUT_SECS);
     if !link.is_closed() {
         let cmd = match mode {
             run_setup::TransportMode::Local { .. } => SessionCommand::End {
@@ -371,10 +374,12 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
         if let run_setup::TransportMode::Local { .. } = mode {
             match tokio::time::timeout(teardown, link.wait_ended()).await {
                 Ok(true) => tracing::debug!("clean teardown completed"),
-                Ok(false) => tracing::debug!("session task gone before Ended"),
+                Ok(false) => {
+                    tracing::debug!("session channel closed before Ended — clean exit")
+                }
                 Err(_elapsed) => {
                     tracing::warn!(
-                        budget_secs = signals::TEARDOWN_TIMEOUT_SECS,
+                        budget_secs = signals::SESSION_END_TIMEOUT_SECS,
                         "session end timed out — data may be incomplete"
                     );
                     lifecycle::emergency_exit();

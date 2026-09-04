@@ -432,6 +432,28 @@ mod tests {
         assert!(link.buffered.is_empty());
     }
 
+    /// After `End`, a channel that closes without `Ended` is a clean close
+    /// (`false`, not a hang): `run()` exits 0 on it.
+    #[tokio::test]
+    async fn wait_ended_distinguishes_ended_from_clean_close() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::Idle);
+        t.push_event(SessionEventWire::Ended {
+            reason: agent_engine::session::EndReason::ClientQuit,
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        assert!(link.wait_ended().await);
+
+        let t = ScriptedTransport::new(Runtime::new_headless());
+        let mut link = SessionLink::new(Box::new(t));
+        assert!(!tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            link.wait_ended()
+        )
+        .await
+        .expect("closed channel returns at once"));
+    }
+
     /// A `Refused` addressed to ANOTHER client is not our reply: buffered
     /// for the loop, the real reply still picked.
     #[tokio::test]

@@ -28,16 +28,21 @@
 //! `render_thread.rs`).  The main task never blocks on stdout, so the
 //! `select!` is always free to receive a signal, and the bounded teardown in
 //! `mod.rs` always runs.  The watchdog was therefore **removed** — shutdown is
-//! self-bounding via `SAVE_TIMEOUT_SECS` + `HOOKS_TIMEOUT_SECS` (plus the
-//! render thread's own teardown-ack budget).
+//! self-bounding via the actor's budgets (plus the render thread's own
+//! teardown-ack budget).
 //!
 //! # Teardown timeout budgets
 //!
-//! The post-loop teardown in `mod.rs` is split into two sequential budgets:
+//! The session teardown runs inside `SessionActor::finish` under the
+//! engine's budgets (`agent_engine::session::budgets`, re-exported here):
 //!   - `SAVE_TIMEOUT_SECS`  : save_session + append_record (data safety first)
 //!   - `HOOKS_TIMEOUT_SECS` : on_session_end hook emit (concurrent, fail-open)
+//!   - plus the observability flush and, when quitting mid-turn, the
+//!     cancel-turn save.
 //!
-//! `TEARDOWN_TIMEOUT_SECS` = their sum (total teardown budget).
+//! `SESSION_END_TIMEOUT_SECS` is what the TUI waits for `Ended`: the sum of
+//! those plus a margin. `TEARDOWN_TIMEOUT_SECS` (= SAVE + HOOKS) is the
+//! render thread's budget.
 
 // ── Teardown timing constants ────────────────────────────────────────────────
 //
@@ -48,9 +53,29 @@
 //   SAVE_TIMEOUT_SECS  — budget for save_session() + append_record()
 //   HOOKS_TIMEOUT_SECS — budget for concurrent on_session_end hook emit
 //   TEARDOWN_TIMEOUT_SECS — sum of the above; total teardown budget for mod.rs
-pub(crate) const SAVE_TIMEOUT_SECS: u64 = 2;
-pub(crate) const HOOKS_TIMEOUT_SECS: u64 = 5;
-pub(crate) const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
+pub(crate) use agent_engine::session::budgets::{
+    HOOKS_TIMEOUT_SECS, SAVE_TIMEOUT_SECS, TEARDOWN_TIMEOUT_SECS,
+};
+
+/// Bounded observability flush inside `SessionActor::finish` (STEP 3).
+pub(crate) const FLUSH_TIMEOUT_SECS: u64 =
+    agent_engine::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();
+
+/// Slack for `background.shutdown()` + channel delivery of `Ended`.
+pub(crate) const SESSION_END_MARGIN_SECS: u64 = 2;
+
+/// How long the TUI waits for `Ended` after sending `End` (in-process).
+/// `SessionActor::finish` runs, sequentially and each under its own
+/// budget: the cancel-turn save (streaming quit) + the final save
+/// (`SAVE_TIMEOUT` each), `on_session_end` (`HOOKS_TIMEOUT`), the
+/// observability flush (`FLUSH_TIMEOUT`); then `background.shutdown()`.
+/// The wait covers the worst case plus margin so a slow-but-in-budget
+/// teardown never turns into `emergency_exit()` (exit 1).
+pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS
+    + SAVE_TIMEOUT_SECS
+    + HOOKS_TIMEOUT_SECS
+    + FLUSH_TIMEOUT_SECS
+    + SESSION_END_MARGIN_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
@@ -217,5 +242,23 @@ mod tests {
             TEARDOWN_TIMEOUT_SECS,
             SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// M5: the TUI's wait for `Ended` must cover `SessionActor::finish`'s
+    /// worst case (cancel save + save + hooks + flush ≈ 11 s) with margin;
+    /// the old 7 s wait turned a slow-but-in-budget teardown into exit 1.
+    #[test]
+    fn session_end_wait_covers_actor_finish_worst_case() {
+        let actor_worst_case =
+            SAVE_TIMEOUT_SECS + SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS + FLUSH_TIMEOUT_SECS;
+        assert_eq!(actor_worst_case, 11);
+        assert!(SESSION_END_TIMEOUT_SECS > actor_worst_case);
+        assert!(SESSION_END_TIMEOUT_SECS >= actor_worst_case + SESSION_END_MARGIN_SECS);
+        assert!(SESSION_END_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS);
     }
 }
