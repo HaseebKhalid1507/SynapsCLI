@@ -585,21 +585,49 @@ pub(super) async fn handle_command(
                     sessions.len()
                 )));
                 for s in sessions.iter().take(20) {
-                    let title = if s.title.is_empty() {
-                        "(untitled)"
-                    } else {
-                        &s.title
-                    };
-                    let active = if s.id == app.session.id { " *" } else { "" };
+                    let active_marker = if s.id == app.session.id { " ●" } else { "" };
                     let name_tag = s
                         .name
                         .as_deref()
                         .map(|n| format!(" [@{}]", n))
                         .unwrap_or_default();
+                    let age = {
+                        let secs = chrono::Utc::now()
+                            .signed_duration_since(s.created_at)
+                            .num_seconds();
+                        if secs < 3600 {
+                            format!("{}m ago", secs / 60)
+                        } else if secs < 86400 {
+                            format!("{}h ago", secs / 3600)
+                        } else {
+                            format!("{}d ago", secs / 86400)
+                        }
+                    };
+                    let title_display = if s.title.is_empty() {
+                        "(no title)".to_string()
+                    } else {
+                        s.title.chars().take(60).collect::<String>()
+                    };
+                    // Last 4 chars — more recognizable than a prefix
+                    let id_short = &s.id[s.id.len().saturating_sub(4)..];
+                    let msg_str = if s.message_count > 0 {
+                        format!("{} msgs · ", s.message_count)
+                    } else {
+                        String::new()
+                    };
+                    // Line 1: identity + meta
                     app.push_msg(ChatMessage::System(format!(
-                        "  {}{} — {} [{}] ${:.4}{}",
-                        &s.id, name_tag, title, s.model, s.session_cost, active
+                        "  …{}{}{} · {}{}${:.3} · {}",
+                        id_short, active_marker, name_tag,
+                        msg_str, age, s.session_cost, s.model
                     )));
+                    // Line 2: title
+                    app.push_msg(ChatMessage::System(format!(
+                        "     └ {}",
+                        title_display
+                    )));
+                    // Blank separator between entries
+                    app.push_msg(ChatMessage::System(String::new()));
                 }
             }
             Err(e) => {

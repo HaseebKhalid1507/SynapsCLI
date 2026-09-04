@@ -408,6 +408,9 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
     }
     let header = read_session_header(dir, file_name)?;
     let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
+    // Cheap message count: each api_message has exactly one "role" field.
+    // Count occurrences without deserializing the full array.
+    let message_count = header.matches("\"role\":").count();
     let mut info = SessionInfo {
         id: meta.id,
         title: meta.title,
@@ -416,7 +419,7 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         session_cost: meta.session_cost,
-        message_count: 0,
+        message_count,
     };
     // Journal freshness overlay (Task 35): when an opt-in journal exists,
     // its bounded meta tail is newer than the (possibly lagging) snapshot
