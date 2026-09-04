@@ -274,6 +274,7 @@ pub mod echo {
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
                 input_owner: None,
+                display_tail: None,
             }
         }
 
@@ -345,6 +346,10 @@ pub mod echo {
                         SessionQuery::Messages => {
                             serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
                         }
+                        SessionQuery::DisplayTail { items } => serde_json::to_value(
+                            super::super::display::display_tail(&self.conv.api_messages, items),
+                        )
+                        .unwrap_or_default(),
                         other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                     };
                     self.emit(SessionEventWire::QueryResult { id, value });

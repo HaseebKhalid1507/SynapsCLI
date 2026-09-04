@@ -1572,6 +1572,10 @@ impl SessionActor {
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
             }
+            SessionQuery::DisplayTail { items } => {
+                serde_json::to_value(super::display::display_tail(&self.conv.api_messages, items))
+                    .unwrap_or_default()
+            }
             SessionQuery::SubagentRows => {
                 let rows = self
                     .runtime
@@ -1630,7 +1634,30 @@ impl SessionActor {
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
             input_owner: self.input_owner,
+            display_tail: None,
         }
+    }
+
+    /// `snapshot()` shaped for one client (phase 4 §2.3): `Digest` clients
+    /// get an empty `api_messages` (`messages_len` kept), a daemon-projected
+    /// `display_tail`, and a replay without the per-round `MessageHistory`
+    /// envelopes (the trailing `Conversation` digest carries len/hash).
+    pub(crate) fn snapshot_for(&self, client: &ClientMeta) -> AttachSnapshot {
+        let mut snap = self.snapshot();
+        if client.history == HistoryMode::Digest {
+            snap.display_tail = Some(super::display::display_tail(
+                &snap.conversation.api_messages,
+                client.tail_items,
+            ));
+            snap.conversation.api_messages = Vec::new();
+            snap.replay.retain(|e| {
+                !matches!(
+                    e.event,
+                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+                )
+            });
+        }
+        snap
     }
 
     /// B1 ownership: `Observe` never owns; `Mirror` owns iff nobody does
@@ -1645,6 +1672,7 @@ impl SessionActor {
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
+        let snapshot_meta = client.clone();
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
@@ -1683,7 +1711,7 @@ impl SessionActor {
             });
         }
         self.publish_presence();
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for(&snapshot_meta);
         self.emit(SessionEventWire::Attached {
             client: cid,
             snapshot,

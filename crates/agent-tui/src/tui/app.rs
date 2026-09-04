@@ -97,9 +97,11 @@ pub(crate) struct App {
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
     /// soft-wrap render pipeline.
     pub(crate) editor: tui_textarea::TextArea<'static>,
-    pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
+    /// `api_messages.len()` on the engine side (mirrored by `Conversation`).
+    /// The history itself never lives in the client (phase 4 §2.2).
+    pub(crate) api_messages_len: usize,
     pub(crate) streaming: bool,
-    /// `api_messages.len()` at active-turn start. Failure repair may only
+    /// `api_messages_len` at active-turn start. Failure repair may only
     /// remove messages appended at or after this index (spec §5.2).
     pub(crate) turn_baseline: usize,
     pub(crate) input_history: Vec<String>,
@@ -341,7 +343,7 @@ impl App {
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
-            api_messages: Vec::new(),
+            api_messages_len: 0,
             streaming: false,
             turn_baseline: 0,
             input_history: Vec::new(),
@@ -536,7 +538,7 @@ impl App {
     /// `output_tokens`, the TTL-split cache counters and `api_call_count`
     /// are client-side per-turn state and stay as `Stream(Usage)` left them.
     pub(crate) fn apply_conversation(&mut self, conv: &agent_engine::session::ConversationSnapshot) {
-        self.api_messages = conv.api_messages.clone();
+        self.api_messages_len = conv.messages_len.max(conv.api_messages.len());
         self.total_input_tokens = conv.tokens.input;
         self.total_output_tokens = conv.tokens.output;
         self.total_cache_read_tokens = conv.tokens.cache_read;
@@ -608,13 +610,6 @@ impl App {
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
         self.transcript.push_msg(msg);
         self.needs_redraw = true;
-    }
-
-    /// Delegates to [`TranscriptStore::cap_resumed_display`]. Note: does not
-    /// signal a redraw — verbatim-preserves the pre-move behavior (the method
-    /// never invalidated; it runs at resume before any cache exists).
-    pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
-        self.transcript.cap_resumed_display(cap);
     }
 
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.

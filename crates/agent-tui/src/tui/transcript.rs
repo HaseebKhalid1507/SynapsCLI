@@ -1010,6 +1010,7 @@ impl TranscriptStore {
     /// display messages and prepends a notice — the FULL history is untouched in
     /// `api_messages`, so the model still sees everything; only the visible
     /// scrollback is trimmed. (Proper fix is viewport virtualization — #98.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
         if self.messages.len() <= cap {
             return;

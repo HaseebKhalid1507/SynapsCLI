@@ -296,6 +296,10 @@ impl ScriptedTransport {
                     SessionQuery::Messages => {
                         serde_json::to_value(&self.api_messages).unwrap_or_default()
                     }
+                    SessionQuery::DisplayTail { items } => serde_json::to_value(
+                        agent_engine::session::display::display_tail(&self.api_messages, items),
+                    )
+                    .unwrap_or_default(),
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 };
                 self.push_event(SessionEventWire::QueryResult { id, value });

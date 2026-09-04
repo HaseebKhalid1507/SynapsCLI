@@ -9,6 +9,7 @@
 pub mod actor;
 pub mod actor_cmds;
 pub mod budgets;
+pub mod display;
 pub mod handle;
 pub mod socket_transport;
 pub mod transport;
@@ -17,6 +18,7 @@ pub mod view;
 pub mod wire;
 
 pub use actor::{SessionActor, SessionTask};
+pub use display::{DisplayItem, DisplayTail};
 pub use handle::SessionHandle;
 pub use socket_transport::SocketTransport;
 pub use transport::{ClientTransport, LocalTransport, TransportError};

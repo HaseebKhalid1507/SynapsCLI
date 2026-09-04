@@ -596,6 +596,7 @@ mod tests {
                         pending_prompts: vec![],
                         clients: vec![],
                         input_owner: Some(ClientId(7)),
+                        display_tail: None,
                     },
                 )),
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {

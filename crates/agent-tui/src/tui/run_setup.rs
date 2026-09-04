@@ -18,6 +18,7 @@ use agent_engine::session::{
     AttachMode, AttachSnapshot, ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire,
     LocalTransport, SessionConfig,
 };
+use helpers::apply_display_tail;
 use session_link::{PromptBridge, SessionLink};
 
 /// How this TUI reaches its session (PLAN-phase3 §3.2).
@@ -232,11 +233,7 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
     let mut app = if snapshot.meta.continued {
         let mut app = App::new_with_clock(session, clock::TuiClock::real());
         app.apply_conversation(conv);
-        // mem::take avoids deep-cloning the full history just to satisfy
-        // the borrow checker (P5 in REVIEW.md).
-        let msgs = std::mem::take(&mut app.api_messages);
-        rebuild_display_messages(&msgs, &mut app);
-        app.api_messages = msgs;
+        rebuild_display_from_snapshot(&mut app, snapshot);
         app.push_msg(ChatMessage::System(format!(
             "resumed session {}",
             conv.header.id
@@ -402,15 +399,22 @@ pub(crate) async fn try_reconnect(
     }
 }
 
+/// Digest attaches carry a daemon-projected `display_tail`; Full attaches
+/// carry the history and project it locally — same filter either way.
+fn rebuild_display_from_snapshot(app: &mut App, snapshot: &AttachSnapshot) {
+    match &snapshot.display_tail {
+        Some(tail) => apply_display_tail(tail, app),
+        None => rebuild_display_messages(&snapshot.conversation.api_messages, app),
+    }
+}
+
 /// Rebuild the transcript from an `AttachSnapshot` (reconnect / re-attach):
 /// the cancelled turn's partial text is gone by design (§2.8 step 7).
 pub(crate) fn remirror(app: &mut App, snapshot: &AttachSnapshot) {
     app.transcript.clear();
     app.invalidate();
     app.apply_conversation(&snapshot.conversation);
-    let msgs = std::mem::take(&mut app.api_messages);
-    rebuild_display_messages(&msgs, &mut *app);
-    app.api_messages = msgs;
+    rebuild_display_from_snapshot(app, snapshot);
     app.streaming = snapshot.streaming;
     app.last_turn_context_window = snapshot.view.context_window;
 }

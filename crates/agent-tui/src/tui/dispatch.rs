@@ -133,7 +133,7 @@ fn begin_turn_presentation(
 ) {
     app.status_text = Some("connecting…".to_string());
     app.streaming = true;
-    app.turn_baseline = app.api_messages.len();
+    app.turn_baseline = app.api_messages_len;
     app.spinner_frame = 0;
     let term_size = crossterm::terminal::size()
         .map(|(w, h)| ratatui::layout::Size {
@@ -401,7 +401,7 @@ pub(crate) async fn handle_input_action(
                     custom_instructions,
                 } => {
                     // Need at least 2 full turns (user + assistant = 2 messages each).
-                    if app.api_messages.len() < 4 {
+                    if app.api_messages_len < 4 {
                         app.push_msg(ChatMessage::System(
                             "nothing to compact (need at least 2 turns)".to_string(),
                         ));
@@ -431,7 +431,7 @@ pub(crate) async fn handle_input_action(
                         } else {
                             app.session.title.clone()
                         },
-                        app.api_messages.len(),
+                        app.api_messages_len,
                     ));
 
                     // Walk backward through parents

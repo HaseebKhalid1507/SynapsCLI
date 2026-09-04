@@ -307,6 +307,8 @@ pub struct AttachedWire {
     pub clients: Vec<(ClientId, ClientKind)>,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
+    #[serde(default)]
+    pub display_tail: Option<crate::session::display::DisplayTail>,
 }
 
 impl AttachedWire {
@@ -321,6 +323,7 @@ impl AttachedWire {
             pending_prompts: s.pending_prompts,
             clients: s.clients,
             input_owner: s.input_owner,
+            display_tail: s.display_tail,
         }
     }
 
@@ -336,6 +339,7 @@ impl AttachedWire {
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
                 input_owner: self.input_owner,
+                display_tail: self.display_tail,
             },
         )
     }
@@ -951,6 +955,7 @@ mod tests {
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
                     input_owner: Some(ClientId(1)),
+                    display_tail: None,
                 },
             },
             S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
@@ -1113,6 +1118,7 @@ mod tests {
                     pending_prompts: vec![],
                     clients: vec![],
                     input_owner: None,
+                    display_tail: None,
                 },
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),

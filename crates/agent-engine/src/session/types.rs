@@ -588,6 +588,8 @@ pub enum SessionQuery {
     ContextAssessment,
     /// `engine::commands::context_command(runtime, Some(api_messages))` text.
     ContextReport,
+    /// `display::DisplayTail` of the last `items` display items (phase 4).
+    DisplayTail { items: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,7 +797,9 @@ pub struct AttachSnapshot {
     pub clients: Vec<(ClientId, ClientKind)>,
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
-    pub input_owner: Option<ClientId>,
+    pub input_owner: Option<ClientId>,    /// Daemon-projected display tail — `Some` iff the client attached with
+    /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
+    pub display_tail: Option<crate::session::display::DisplayTail>,
 }
 
 /// `ReasoningLevel` has no serde impls in agent-core; go through its
