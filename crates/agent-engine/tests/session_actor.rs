@@ -106,6 +106,29 @@ async fn stub(body: &'static str, endless: bool) -> (String, Arc<AtomicUsize>) {
 
 use futures::StreamExt;
 
+/// Sequenced stub: hit `i` serves `bodies[min(i, len-1)]` (all terminal).
+async fn stub_seq(bodies: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = Arc::clone(&hits);
+    let app = axum::Router::new().fallback(move || {
+        let hits = Arc::clone(&hits_c);
+        async move {
+            let i = hits.fetch_add(1, Ordering::SeqCst);
+            let body = bodies[i.min(bodies.len() - 1)];
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                body.to_string(),
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
 async fn host() -> Arc<EngineHost> {
     EngineHost::boot(HostOpts {
         profile: None,
@@ -348,4 +371,117 @@ async fn create_session_sets_cwd_and_session_id() {
         agent_engine::events::registry::find_session_registration(handle.id.as_str()).is_none(),
         "unregistered at End"
     );
+}
+
+fn last_conversation(seen: &[Envelope]) -> agent_engine::session::ConversationSnapshot {
+    seen.iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            SessionEventWire::Conversation(c) => Some(c.clone()),
+            _ => None,
+        })
+        .expect("a Conversation envelope")
+}
+
+async fn end(t: &mut LocalTransport) {
+    t.send(SessionCommand::End {
+        reason: EndReason::ClientQuit,
+    })
+    .await
+    .unwrap();
+    until(t, |e| matches!(e, SessionEventWire::Ended { .. })).await;
+}
+
+/// §11 #1: `Cancel` while idle is a no-op — at most an `Idle` echo. No
+/// "aborted" notice, no Conversation (= no abort_context, no save), and the
+/// next Submit carries no `[ABORT CONTEXT` prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cancel_while_idle_is_a_noop() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientJoined { .. })).await;
+
+    // Never streamed: Cancel on a fresh session.
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let env = next(&mut a).await;
+    assert!(matches!(env.event, SessionEventWire::Idle), "got {:?}", env.event);
+
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let env = next(&mut a).await;
+    assert!(matches!(env.event, SessionEventWire::Idle), "got {:?}", env.event);
+
+    a.send(submit("again")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(&e.event,
+            SessionEventWire::SystemNotice(n) if n.starts_with("aborted"))),
+        "no abort notice"
+    );
+    let conv = last_conversation(&seen);
+    assert_eq!(conv.api_messages.len(), 4);
+    assert_eq!(conv.api_messages[2]["content"], "again");
+    assert!(conv.abort_context.is_none());
+    end(&mut a).await;
+}
+
+/// §11 #1: a `Cancel` that lands after `Done` must not scrape the finished
+/// turn into `abort_context` (turn_log is cleared with the stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cancel_after_done_does_not_scrape_previous_turn() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+
+    a.send(submit("first")).await.unwrap();
+    // Fire Cancel the moment Done is forwarded; it queues behind the
+    // actor's Done handling and must see streaming=false.
+    until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )
+    })
+    .await;
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(last_conversation(&seen).abort_context.is_none());
+    // Drain the Cancel's own Idle echo if it was not already consumed.
+    let mut idles = seen.iter().filter(|e| matches!(e.event, SessionEventWire::Idle)).count();
+    while idles < 2 {
+        let env = next(&mut a).await;
+        assert!(
+            matches!(env.event, SessionEventWire::Idle),
+            "only Idle may follow an idle Cancel, got {:?}",
+            env.event
+        );
+        idles += 1;
+    }
+
+    a.send(submit("second")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let conv = last_conversation(&seen);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(conv.api_messages[2]["content"], "second");
+    assert!(!conv.api_messages[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("ABORT CONTEXT"));
+    end(&mut a).await;
 }

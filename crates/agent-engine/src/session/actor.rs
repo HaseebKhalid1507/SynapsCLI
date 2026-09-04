@@ -332,11 +332,15 @@ impl SessionActor {
         self.steer_tx = Some(s_tx);
     }
 
+    /// Every turn-end path (Done/Error/Cancel/stream EOF). Clears `turn_log`
+    /// too: a `Cancel` racing a `Done` must not scrape the finished turn into
+    /// `abort_context`.
     fn clear_stream(&mut self) {
         self.stream = None;
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
+        self.turn_log.clear();
         self.update_attach_state();
     }
 
@@ -377,8 +381,15 @@ impl SessionActor {
         self.conv.queued_message = Some(text);
     }
 
-    /// dispatch.rs Abort (:134-192) verbatim minus presentation.
+    /// dispatch.rs Abort (:134-192) verbatim minus presentation, behind the
+    /// TUI's `if streaming` guard (input.rs:350): a `Cancel` while idle is a
+    /// no-op that only re-announces `Idle` — it must never touch
+    /// `abort_context`, save, or emit "aborted".
     async fn cancel_turn(&mut self) {
+        if !self.streaming {
+            self.emit(SessionEventWire::Idle);
+            return;
+        }
         if let Some(ref ct) = self.cancel {
             ct.cancel();
         }
