@@ -427,9 +427,10 @@ async fn cancel_while_idle_is_a_noop() {
     a.send(submit("again")).await.unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(
-        !seen.iter().any(|e| matches!(&e.event,
-            SessionEventWire::SystemNotice(n) if n.starts_with("aborted"))),
-        "no abort notice"
+        !seen
+            .iter()
+            .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })),
+        "no Aborted event"
     );
     let conv = last_conversation(&seen);
     assert_eq!(conv.api_messages.len(), 4);

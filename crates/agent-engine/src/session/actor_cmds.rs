@@ -104,7 +104,6 @@ impl SessionActor {
             custom_instructions,
         }) = compact_request(&cmd, &arg)
         {
-            self.emit(SessionEventWire::SystemNotice("compacting...".into()));
             self.compact(custom_instructions, "manual").await;
         }
         self.emit(SessionEventWire::QueryResult { id, value });

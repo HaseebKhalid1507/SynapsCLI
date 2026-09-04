@@ -211,11 +211,13 @@ pub fn park_grace() -> Option<std::time::Duration> {
 pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Non-persisted runtime knobs replayed after unpark (last-wins per
-/// variant). Model/reasoning/system prompt live in the journal already.
+/// variant). Model/reasoning live in the journal already; `/system` is
+/// runtime-only (never journaled) so it replays too (M7).
 fn replayable(setting: &SessionSetting) -> bool {
     matches!(
         setting,
-        SessionSetting::ContextWindow { .. }
+        SessionSetting::SystemPrompt { .. }
+            | SessionSetting::ContextWindow { .. }
             | SessionSetting::CompactionModel { .. }
             | SessionSetting::ApiRetries { .. }
             | SessionSetting::SubagentTimeout { .. }
@@ -228,6 +230,7 @@ fn replayable(setting: &SessionSetting) -> bool {
 
 fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
     match setting {
+        SessionSetting::SystemPrompt { text } => rt.set_system_prompt(text.clone()),
         SessionSetting::ContextWindow { tokens } => rt.set_context_window(*tokens),
         SessionSetting::CompactionModel { model } => rt.set_compaction_model(model.clone()),
         SessionSetting::ApiRetries { n } => rt.set_api_retries(*n),
@@ -259,11 +262,14 @@ pub(crate) struct CompactionJob {
 
 /// Commands that only the input owner may send (B1). Everything else
 /// (`Answer`, `Query`, `Save`, `Detach`, `Attach`, `Resync`, `HostEvent`)
-/// is open to every attached client.
+/// is open to every attached client. `Checkpoint` cancels the owner's turn
+/// and kills its PTYs, so it is owner-only from a client (M1); the daemon
+/// sends it `from: None`.
 fn is_input_command(cmd: &SessionCommand) -> bool {
     matches!(
         cmd,
-        SessionCommand::Submit { .. }
+        SessionCommand::Checkpoint { .. }
+            | SessionCommand::Submit { .. }
             | SessionCommand::SubmitPrepared { .. }
             | SessionCommand::Steer { .. }
             | SessionCommand::Cancel
@@ -301,6 +307,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Resume { .. } => "resume",
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::Park => "park",
         SessionCommand::HostEvent(_) => "host_event",
     }
 }
@@ -565,6 +572,21 @@ impl SessionActor {
         }
     }
 
+    /// C3: the checkpoint reply payload (`SessionReloadRecord`).
+    pub(crate) fn reload_record(&self) -> SessionReloadRecord {
+        let view = self.view.load();
+        SessionReloadRecord {
+            config: self.config.clone(),
+            keep_warm: self.keep_warm,
+            lifecycle: SessionLifecycle::from_u8(
+                self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
+            ),
+            settings_replay: self.settings_replay.clone(),
+            model: view.model.clone(),
+            thinking_level: view.thinking_level.clone(),
+        }
+    }
+
     pub(crate) fn publish_presence(&self) {
         self.presence.store(Arc::new(super::handle::Presence {
             clients: self.attached.len(),
@@ -596,16 +618,28 @@ impl SessionActor {
         matches!(self.state, AttachState::Parked)
     }
 
+    /// A session with nothing to save (`ConversationState::save` skips an
+    /// empty `api_messages`, so no journal ever exists) never parks: it
+    /// costs nothing warm and could not be unparked from disk (H2).
     pub(crate) fn can_park(&self) -> bool {
         self.attached.is_empty()
             && !self.streaming
             && self.compact.is_none()
             && self.pending_prompts.is_empty()
             && self.conv.is_live()
+            && !self.conv.api_messages.is_empty()
             && self.conv.queued_message.is_none()
             && !self.keep_warm
             && self.config.persist
             && !self.is_parked()
+    }
+
+    /// `<sessions>/<id>.json` — written by both persistence modes.
+    fn journal_exists(&self) -> bool {
+        let id = (**self.journal_id.load()).clone();
+        crate::config::resolve_write_path("sessions")
+            .join(format!("{id}.json"))
+            .is_file()
     }
 
     fn rearm_park(&mut self) {
@@ -648,6 +682,13 @@ impl SessionActor {
             self.set_lifecycle(SessionLifecycle::Live);
             return;
         }
+        if !self.journal_exists() {
+            // Never park what cannot be restored (H2).
+            tracing::warn!(session = %self.id, "park: no journal on disk — staying live");
+            self.state = AttachState::Detached { running: false };
+            self.set_lifecycle(SessionLifecycle::Live);
+            return;
+        }
         if self.runtime.session_manager().active_count() > 0 {
             self.emit(SessionEventWire::SystemNotice(
                 "parked: background shells closed".into(),
@@ -681,20 +722,44 @@ impl SessionActor {
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
         let replay = self.settings_replay.clone();
+        let journal_present = self.journal_exists();
+        let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
             let mut runtime = host.foreground_runtime().await?;
             runtime.set_event_queue(queue);
-            let sb = crate::engine::setup::resolve_session_and_prompt(
-                &mut runtime,
-                &Some(Some(journal_id)),
-                cfg.system.as_deref(),
-                cfg.prompt_manifest.as_deref(),
-            )?;
+            let mut sb = if journal_present {
+                crate::engine::setup::resolve_session_and_prompt(
+                    &mut runtime,
+                    &Some(Some(journal_id)),
+                    cfg.system.as_deref(),
+                    cfg.prompt_manifest.as_deref(),
+                )?
+            } else {
+                // The journal vanished under us (H2): rebuild an empty
+                // conversation under the SAME id with the last-published
+                // model/thinking rather than leaving a zombie Parked session.
+                tracing::warn!(
+                    session = %journal_id,
+                    "unpark: journal missing — restoring as a fresh conversation"
+                );
+                let mut sb = crate::engine::setup::resolve_session_and_prompt(
+                    &mut runtime,
+                    &None,
+                    cfg.system.as_deref(),
+                    cfg.prompt_manifest.as_deref(),
+                )?;
+                sb.session.id = journal_id.clone();
+                runtime.set_session_id(Some(journal_id));
+                sb
+            };
             runtime.set_cwd(cfg.cwd.clone());
-            if let Some(ref m) = cfg.model_override {
-                runtime.set_model(m.clone());
-            }
+            // The CURRENT model/thinking (the last published view), not
+            // `cfg.model_override` frozen at create: `/model` survives park.
+            runtime.set_model(view.model.clone());
+            let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            sb.session.model = view.model.clone();
+            sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
                 &mut runtime,
                 &config,
@@ -862,7 +927,7 @@ impl SessionActor {
     /// dispatch.rs Abort (:134-192) verbatim minus presentation, behind the
     /// TUI's `if streaming` guard (input.rs:350): a `Cancel` while idle is a
     /// no-op that only re-announces `Idle` — it must never touch
-    /// `abort_context`, save, or emit "aborted".
+    /// `abort_context`, save, or emit `Aborted`.
     pub(crate) async fn cancel_turn(&mut self) {
         if !self.streaming {
             if self.compact.is_some() {
@@ -912,12 +977,10 @@ impl SessionActor {
                 }
             }
         }
-        let abort_msg = if self.conv.abort_context.is_some() {
-            "aborted — context saved for next message"
-        } else {
-            "aborted"
-        };
-        self.emit(SessionEventWire::SystemNotice(abort_msg.to_string()));
+        // Typed event; clients render "aborted[ — context saved …]".
+        self.emit(SessionEventWire::Aborted {
+            context_saved: self.conv.abort_context.is_some(),
+        });
         self.save().await;
         self.emit_conversation();
         self.emit(SessionEventWire::Idle);
@@ -1686,9 +1749,10 @@ impl SessionActor {
         };
         self.emit(SessionEventWire::SystemNotice(notice.to_string()));
         self.runtime.session_manager().shutdown_all();
+        let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
         self.emit(SessionEventWire::QueryResult {
             id: super::wire::CHECKPOINT_QUERY_ID,
-            value: serde_json::json!({ "ok": true }),
+            value: serde_json::json!({ "ok": true, "record": record }),
         });
     }
 
@@ -1733,17 +1797,25 @@ impl SessionActor {
                     | SessionCommand::Save
                     | SessionCommand::Cancel
                     | SessionCommand::Checkpoint { .. }
+                    | SessionCommand::Park
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
             );
             if matches!(cmd, SessionCommand::HostEvent(_)) {
                 return ControlFlow::Continue(()); // nobody attached, nothing to render
             }
-            if matches!(cmd, SessionCommand::Save | SessionCommand::Cancel | SessionCommand::Checkpoint { .. }) {
+            if matches!(
+                cmd,
+                SessionCommand::Save
+                    | SessionCommand::Cancel
+                    | SessionCommand::Park
+                    | SessionCommand::Checkpoint { .. }
+            ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
+                    let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
                     self.emit(SessionEventWire::QueryResult {
                         id: super::wire::CHECKPOINT_QUERY_ID,
-                        value: serde_json::json!({ "ok": true, "parked": true }),
+                        value: serde_json::json!({ "ok": true, "parked": true, "record": record }),
                     });
                 }
                 return ControlFlow::Continue(()); // already on disk / idle
@@ -1774,8 +1846,8 @@ impl SessionActor {
             SessionCommand::Cancel => self.cancel_turn().await,
             SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
+            // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {
-                self.emit(SessionEventWire::SystemNotice("compacting...".into()));
                 self.compact(instructions, "manual").await;
             }
             SessionCommand::NewSession => {
@@ -1783,10 +1855,9 @@ impl SessionActor {
                 self.runtime
                     .set_session_id(Some(self.conv.session.id.clone()));
                 self.journal_id.store(Arc::new(self.conv.session.id.clone()));
-                self.emit(SessionEventWire::SystemNotice(format!(
-                    "session cleared → {}",
-                    &self.conv.session.id[..8.min(self.conv.session.id.len())]
-                )));
+                self.emit(SessionEventWire::Cleared {
+                    session_id: self.conv.session.id.clone(),
+                });
                 self.emit_conversation();
             }
             SessionCommand::Save => self.save().await,
@@ -1814,6 +1885,7 @@ impl SessionActor {
             } => self.plugin_command(id, plugin, name, arg).await,
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
+            SessionCommand::Park => self.park().await,
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.rearm_park();

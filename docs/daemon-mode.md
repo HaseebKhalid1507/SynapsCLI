@@ -163,15 +163,22 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 
 **Not preserved** (stated once): in-flight turns (checkpointed = cancelled with abort context), pending
 prompts (`None`), PTY/background shells (closed, announced before exec), `turn_replay`, un-persisted
-`TurnLog`, the prompt-manifest path, and non-persisted runtime settings until B3's `settings_replay`
-lands (only what the journal holds comes back: messages, model, thinking, system prompt, abort context).
-**Preserved**: every journal, session ids, cwd, keep-warm/parked state (recorded; honoured once B3 lands),
-input-owner *kind* (ownership itself is re-established by reconnect order + `was_owner`).
+`TurnLog`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
+**Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
+LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
+back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
+(`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
+worker grants, **`/system`**), and the **current** model/thinking (a `/model` change mid-session
+survives; the create-time `--model` override is not re-applied). A session that never ran a turn has no
+journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
 owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
-checkpointed and its abort context comes back from the journal.
+checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
+keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 
 ## cwd caveats (risk §6.1)
 

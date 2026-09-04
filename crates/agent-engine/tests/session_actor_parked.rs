@@ -10,7 +10,7 @@ use std::time::Duration;
 use agent_engine::session::{
     ClientKind, ClientMeta, ClientTransport, EndReason, LocalTransport, SessionCommand,
     SessionConfig, SessionEventWire, SessionHandle, SessionLifecycle, SessionQuery,
-    SessionSetting, TransportError, TurnTrigger,
+    SessionSetting, TurnTrigger,
 };
 use serial_test::serial;
 
@@ -317,9 +317,12 @@ async fn event_injection_wakes_parked_session_and_runs_turn() {
     handle.closed().await;
 }
 
+/// H2: a session whose journal vanished while Parked is NOT a zombie —
+/// `unpark` rebuilds an empty conversation under the same id (current
+/// model/thinking kept) and the attach succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unpark_failure_yields_attach_refused_and_session_stays_parked() {
+async fn unpark_missing_journal_restores_fresh_conversation() {
     let _h = Home::new();
     let _g = Grace::set("0");
     let (url, _) = stub(SSE_HI, false).await;
@@ -338,43 +341,62 @@ async fn unpark_failure_yields_attach_refused_and_session_stays_parked() {
     assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_ok());
     agent_engine::core::session::delete_session_file(handle.id.as_str()).unwrap();
     assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_err());
-    let err = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
-        .await
-        .err()
-        .expect("attach refused");
-    match err {
-        TransportError::Refused(m) => assert!(m.contains("could not be restored"), "{m}"),
-        other => panic!("unexpected {other:?}"),
-    }
-    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "stays Parked, not corrupted");
-    assert!(handle.is_alive());
-    assert_eq!(host.sessions().len(), 1, "still listed");
 
-    // End while parked: on_session_end + Ended, no save (file stays absent).
-    let mut watch = handle.subscribe();
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .expect("attach restores a fresh conversation");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    assert!(snap.conversation.api_messages.is_empty(), "fresh conversation");
+    assert_eq!(snap.conversation.header.id, handle.id.as_str(), "same session id");
+    assert_eq!(snap.view.model, MODEL);
+    assert_eq!(host.sessions().len(), 1);
+    // Turns work on the rebuilt conversation and the journal comes back.
+    b.send(submit("again")).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(last_conversation(&seen).api_messages.len(), 2);
+    assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_ok());
+    end(&mut b).await;
+}
+
+/// H2: a session that never ran a turn has nothing on disk (`save` skips an
+/// empty conversation) → it must stay Live after the grace, not park into
+/// something that cannot be restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn empty_session_never_parks() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    detach(&mut a).await;
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(2)).await,
+        "never-saved session must not park"
+    );
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_err());
+
+    // Re-attach is a plain attach (no unpark); a turn then parks normally.
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    assert!(snap.conversation.api_messages.is_empty());
+    b.send(submit("hi")).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut b).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
     handle
         .send(SessionCommand::End {
             reason: EndReason::HostShutdown,
         })
         .await
         .unwrap();
-    let mut ended = false;
-    while let Ok(env) = tokio::time::timeout(Duration::from_secs(10), watch.recv()).await {
-        if let Ok(env) = env {
-            if matches!(env.event, SessionEventWire::Ended { .. }) {
-                ended = true;
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    assert!(ended);
     handle.closed().await;
-    assert!(
-        agent_engine::core::session::Session::load(handle.id.as_str()).is_err(),
-        "end while parked never saves"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

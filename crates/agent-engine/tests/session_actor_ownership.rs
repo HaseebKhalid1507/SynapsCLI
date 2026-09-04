@@ -296,10 +296,9 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
         &e.event,
         SessionEventWire::SystemNotice(n) if n.contains("daemon reloading")
     )));
-    assert!(seen.iter().any(|e| matches!(
-        &e.event,
-        SessionEventWire::SystemNotice(n) if n.starts_with("aborted")
-    )));
+    assert!(seen
+        .iter()
+        .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })));
     let conv = last_conversation(&seen);
     assert!(
         conv.abort_context.as_deref().unwrap_or("").contains("[response]: hi"),
@@ -319,5 +318,70 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     assert!(handle.is_alive(), "checkpoint never ends the session");
     let saved = agent_engine::core::session::Session::load(handle.id.as_str()).expect("saved");
     assert!(saved.abort_context.is_some());
+    end(&mut a).await;
+}
+
+/// M1: `Checkpoint` from a non-owner (an `--observe` mirror) is `Refused`
+/// with no side effect — the owner's turn keeps streaming. The host
+/// (`from: None`) still checkpoints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn checkpoint_is_owner_only_from_clients() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+
+    a.send_from_self(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+
+    b.send_from_self(SessionCommand::Checkpoint {
+        reason: CheckpointReason::HostRequest,
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { client, command, .. } => {
+            assert_eq!(*client, b.client_id());
+            assert_eq!(command, "checkpoint");
+        }
+        _ => unreachable!(),
+    }
+    assert!(!seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::Aborted { .. } | SessionEventWire::QueryResult { id: CHECKPOINT_QUERY_ID, .. }
+    )));
+    b.send_from_self(SessionCommand::Query {
+        id: 3,
+        query: SessionQuery::Status,
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::QueryResult { id: 3, .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::QueryResult { value, .. } => {
+            assert_eq!(value["streaming"], true, "turn still running: {value}")
+        }
+        _ => unreachable!(),
+    }
+
+    // Host-originated checkpoint lands.
+    handle
+        .send(SessionCommand::Checkpoint {
+            reason: CheckpointReason::HostRequest,
+        })
+        .await
+        .unwrap();
+    let seen = until(&mut a, |e| {
+        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
+    })
+    .await;
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e.event, SessionEventWire::Aborted { .. })));
     end(&mut a).await;
 }
