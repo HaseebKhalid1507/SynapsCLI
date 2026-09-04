@@ -1,7 +1,9 @@
 #!/bin/bash
 # make-fixture-session.sh ID [MB] — write a legacy-snapshot session file with
 # ~MB megabytes of api_messages (tool_result blobs) into the active sessions
-# dir, so a bench can `synaps attach --continue ID --create` a session that
+# dir. MB=0 (also env MB=0) writes only the two wrapper messages — the
+# "empty session" of the phase-4 client bench.
+# It lets a bench `synaps attach --continue ID --create` a session that
 # actually carries state (PLAN-phase3 §5.5: an empty session is not what
 # Parked buys back).
 #
@@ -9,7 +11,7 @@
 # claude-sonnet-4-5). Prints the file path.
 set -eu
 ID=${1:?usage: make-fixture-session.sh ID [MB]}
-MB=${2:-2}
+MB=${2:-${MB:-2}}
 BASE=${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}
 MODEL=${FIXTURE_MODEL:-claude-sonnet-4-5}
 DIR=$BASE/sessions

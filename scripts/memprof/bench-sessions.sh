@@ -30,6 +30,17 @@
 # attach to a parked session = unpark latency). Gates: parked_marginal
 # <= 1.0 MB and <= 0.25 x live_marginal; daemon procs constant.
 #
+# DAEMON=1 CLIENT=1 mode (PLAN-phase4 §7.2): the thin *TUI* client. Each
+# client is `$BIN --attach --continue <fixture-i>` on its own fixture
+# (FIXTURE_MSGS_MB, default 0 = the two wrapper messages) with
+# SYNAPS_MEM_TRACE=1. Samples every client's RssAnon at SETTLE-5 (pre-purge)
+# and SETTLE (post-purge; the client's idle purge fires at 10 s) so retention
+# is a column. Columns: client_anon_post/pre (median over clients+runs),
+# retention, client_threads, first_frame_ms (from the trace), attach_ms,
+# daemon_anon, anon_marginal, all_in_marginal = anon_marginal +
+# client_anon_post — the number "for millions". BOUNDED=1 runs FIXTURE 0
+# and 20 back-to-back for the largest N and prints bounded_delta.
+#
 # Never touches tmux servers other than `-L bench`. No root needed.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -40,8 +51,11 @@ SETTLE=${SETTLE:-12}
 TAG=$(basename "$BIN")
 DAEMON=${DAEMON:-0}
 PARKED=${PARKED:-0}
+CLIENT=${CLIENT:-0}
+BOUNDED=${BOUNDED:-0}
+[ "$CLIENT" = 1 ] && FIXTURE_MSGS_MB=${FIXTURE_MSGS_MB:-0}
 PARK_GRACE=${PARK_GRACE:-5}
-FIXTURE_MSGS_MB=${FIXTURE_MSGS_MB:-2}
+[ "$CLIENT" = 1 ] || FIXTURE_MSGS_MB=${FIXTURE_MSGS_MB:-2}
 [ "$DAEMON" = 1 ] && export SYNAPS_DAEMON=1
 
 median() { sort -n | awk '{a[NR]=$1} END{ if (NR==0) print "n/a"; else if (NR%2) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }'; }
@@ -159,6 +173,72 @@ run_once_parked() { # N i -> prints "live_anon_kb parked_anon_kb dprocs_live dpr
   echo "${live_anon:-0} ${parked_anon:-0} ${live_procs:-0} ${parked_procs:-0} ${attach_ms:-0} $out"
 }
 
+run_once_client() { # N i -> prints "post_med_kb pre_med_kb threads first_frame_ms attach_ms danon out"
+  local n=$1 i=$2 out=/tmp/memprof-$TAG-client-N$n-f${FIXTURE_MSGS_MB}-r$i.txt
+  tmux -L bench kill-server 2>/dev/null; sleep 1
+  "$BIN" daemon stop >/dev/null 2>&1
+  local ids=() s
+  for s in $(seq 1 "$n"); do
+    local id="memprof-cli-$s-$i-$$"
+    "$HERE/make-fixture-session.sh" "$id" "$FIXTURE_MSGS_MB" >/dev/null
+    ids+=("$id")
+  done
+  tmux -L bench new -d -s d -x 120 -y 40 "exec $BIN daemon --foreground"
+  for _ in $(seq 1 500); do sleep 0.02; "$BIN" daemon status --json 2>/dev/null | grep -q '"ok":true' && break; done
+  local dpid; dpid=$(tmux -L bench list-panes -t d -F '#{pane_pid}')
+  local starts=() traces=()
+  for s in $(seq 1 "$n"); do
+    local tr=/tmp/memprof-$TAG-client-N$n-f${FIXTURE_MSGS_MB}-r$i-s$s.trace; : > "$tr"; traces+=("$tr")
+    starts+=("$("$HERE/launch.sh" "s$s" env SYNAPS_MEM_TRACE=1 SYNAPS_MEM_TRACE_FILE="$tr" SYNAPS_NO_BOOT_FX=1 "$BIN" --attach --continue "${ids[$((s-1))]}" | sed -E 's/.*ready after ([0-9]+) ms.*/\1/')")
+    sleep 0.3
+  done
+  local apids; apids=$(for s in $(seq 1 "$n"); do tmux -L bench list-panes -t "s$s" -F '#{pane_pid}'; done | tr '\n' ' ')
+  sleep $((SETTLE > 5 ? SETTLE - 5 : 1))
+  local pre=(); for p in $apids; do pre+=("$(awk '/^RssAnon:/{print $2}' "/proc/$p/status")"); done
+  sleep $((SETTLE > 5 ? 5 : SETTLE))
+  [ "${PURGE:-0}" = 1 ] && purge
+  {
+    echo "== $BIN CLIENT N=$n run=$i fixture_mb=$FIXTURE_MSGS_MB settle=$SETTLE attach_start_ms=${starts[*]} pre_anon_kb=${pre[*]}"
+    for p in $dpid $apids; do echo -n "pid=$p "; grep -E 'RssAnon|Threads' "/proc/$p/status" | tr '\n' ' '; echo " comms=$(cat /proc/$p/task/*/comm 2>/dev/null | sort | uniq -c | awk '{printf "%s×%s,", $2, $1}')"; done
+    echo "-- daemon tree RssAnon"; tree_anon "$dpid"
+    for tr in "${traces[@]}"; do echo "-- trace $tr"; cat "$tr"; done
+    "$BIN" daemon status --json 2>/dev/null
+  } > "$out"
+  local post=() thr=() ff=()
+  for p in $apids; do
+    post+=("$(awk '/^RssAnon:/{print $2}' "/proc/$p/status")")
+    thr+=("$(awk '/^Threads:/{print $2}' "/proc/$p/status")")
+  done
+  for tr in "${traces[@]}"; do ff+=("$(awk '/stage=first_frame/{for(k=1;k<=NF;k++) if($k ~ /^t_ms=/){sub("t_ms=","",$k); print $k; exit}}' "$tr")"); done
+  local danon; danon=$(awk '/^-- daemon tree RssAnon/{f=1} f&&/^TREE_ANON/{print $2; exit}' "$out")
+  "$BIN" daemon stop >/dev/null 2>&1
+  tmux -L bench kill-server 2>/dev/null
+  for id in "${ids[@]}"; do rm -f "${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}/sessions/$id".json*; done
+  echo "$(printf '%s\n' "${post[@]}" | median) $(printf '%s\n' "${pre[@]}" | median) $(printf '%s\n' "${thr[@]}" | median) $(printf '%s\n' "${ff[@]}" | median) $(printf '%s\n' "${starts[@]}" | median) ${danon:-0} $out"
+}
+
+client_table() { # prints the CLIENT table for $NS at the current FIXTURE_MSGS_MB; sets LAST_POST
+  echo "binary=$BIN repeat=$REPEAT settle=${SETTLE}s mode=DAEMON+CLIENT fixture_mb=$FIXTURE_MSGS_MB"
+  printf "%-4s %-10s %-16s %-16s %-10s %-8s %-14s %-10s %-12s %-14s %-16s\n" N fixture_mb client_anon_post client_anon_pre retention threads first_frame_ms attach_ms daemon_anon anon_marginal all_in_marginal
+  local prev_anon="" n
+  for n in $NS; do
+    local PO=() PR=() TH=() FF=() AT=() AN=() i
+    for i in $(seq 1 "$REPEAT"); do
+      read -r post pre thr ff at danon out < <(run_once_client "$n" "$i")
+      PO+=("$post"); PR+=("$pre"); TH+=("$thr"); FF+=("$ff"); AT+=("$at"); AN+=("$danon")
+    done
+    local po_med pr_med th_med ff_med at_med an_med amarg allin ret
+    po_med=$(printf '%s\n' "${PO[@]}" | median); pr_med=$(printf '%s\n' "${PR[@]}" | median)
+    th_med=$(printf '%s\n' "${TH[@]}" | median); ff_med=$(printf '%s\n' "${FF[@]}" | median)
+    at_med=$(printf '%s\n' "${AT[@]}" | median); an_med=$(printf '%s\n' "${AN[@]}" | median)
+    ret=$(awk -v a="$pr_med" -v b="$po_med" 'BEGIN{printf "%.2f", (a-b)/1024}')
+    amarg=$( [ -n "$prev_anon" ] && awk -v a="$an_med" -v b="$prev_anon" 'BEGIN{printf "%.2f", (a-b)/1024}' || echo "-" )
+    allin=$( [ -n "$prev_anon" ] && awk -v a="$an_med" -v b="$prev_anon" -v c="$po_med" 'BEGIN{printf "%.2f", (a-b)/1024 + c/1024}' || echo "-" )
+    printf "%-4s %-10s %-16.2f %-16.2f %-10s %-8s %-14s %-10s %-12.1f %-14s %-16s\n" "$n" "$FIXTURE_MSGS_MB" "$(awk -v k="$po_med" 'BEGIN{print k/1024}')" "$(awk -v k="$pr_med" 'BEGIN{print k/1024}')" "$ret" "$th_med" "$ff_med" "$at_med" "$(awk -v k="$an_med" 'BEGIN{print k/1024}')" "$amarg" "$allin"
+    prev_anon=$an_med; LAST_POST=$po_med
+  done
+}
+
 # Sum RssAnon (kB) over PID and all descendants; prints per-pid lines + TREE_ANON <kB>.
 tree_anon() {
   local root=$1 tot=0
@@ -171,6 +251,19 @@ tree_anon() {
   done
   echo "TREE_ANON $tot"
 }
+
+if [ "$DAEMON" = 1 ] && [ "$CLIENT" = 1 ]; then
+  LAST_POST=""
+  client_table
+  post0=$LAST_POST
+  if [ "$BOUNDED" = 1 ]; then
+    FIXTURE_MSGS_MB=20; NS=${NS##* }
+    client_table
+    echo "bounded_delta = client_anon_post(20) − client_anon_post(0) = $(awk -v a="$LAST_POST" -v b="$post0" 'BEGIN{printf "%.2f", (a-b)/1024}') MB"
+  fi
+  echo "gates (§7.4): G1 client_anon_post(fixture 0) <= 10 MB; G2 client_anon_post(fixture 20) <= 12 MB and bounded_delta <= 2 MB; G3 threads <= 4; G4 first_frame_ms <= 100; G5 all_in_marginal <= 10 MB; G7 retention <= 0.5 MB"
+  exit 0
+fi
 
 if [ "$DAEMON" = 1 ] && [ "$PARKED" = 1 ]; then
   echo "binary=$BIN repeat=$REPEAT settle=${SETTLE}s mode=DAEMON+PARKED fixture_mb=$FIXTURE_MSGS_MB grace=${PARK_GRACE}s"
