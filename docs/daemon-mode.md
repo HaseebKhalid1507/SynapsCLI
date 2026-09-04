@@ -183,6 +183,47 @@ Reading:
 
 Raw runs: `/tmp/memprof-synaps-b-daemon-N<N>-r<i>.txt` on bella.
 
+### Fix round: daemon-tree RssAnon column (§9 of the phase-2 review)
+
+`bench-sessions.sh` DAEMON=1 now prints `daemon_anon` (Σ RssAnon over the daemon tree) and
+`anon_marginal` (= daemon-side RssAnon cost of one idle session — the number the ≤ 15 MB gate was
+written for; PSS "≈ 0 marginal" above was a sharing artefact). bella, 2026-09-04, release @ fix round,
+REPEAT=1, real actors, same 2 sidecars. `before` = multi-thread attach client, `after` = current-thread
+attach client (commit "attach client diet"):
+
+| binary | settle | N | PSS total | daemon tree PSS | daemon_anon (tree) | daemon proc RssAnon | **anon_marginal / session** | attach client RssAnon | client threads |
+|---|---|---|---|---|---|---|---|---|---|
+| before | 8 s | 1 | 111.1 MB | 85.8 MB | 36.4 MB | 23.6 MB | – | 21.4 MB | 10 |
+| before | 8 s | 3 | 128.9 MB | 82.7 MB | 34.9 MB | 22.0 MB | **−0.7 MB** | 19.1 / 19.1 / 1.7 MB | 10 |
+| before | 15 s | 1 | 82.3 MB | 61.6 MB | 18.5 MB | 7.4 MB | – | 1.7 MB | 10 |
+| before | 15 s | 3 | 70.3 MB | 61.9 MB | 20.6 MB | 7.4 MB | **+1.0 MB** | 1.7 / 1.7 / 1.8 MB | 10 |
+| after | 8 s | 1 | 98.8 MB | 83.9 MB | 34.0 MB | ~21 MB | – | ~11 MB | 4 |
+| after | 8 s | 3 | 77.8 MB | 66.6 MB | 18.6 MB | 5.9 MB | **−7.7 MB** | 1.4 / 1.4 / 1.4 MB | 4 |
+| after | 15 s | 1 | 91.8 MB | 78.2 MB | 33.0 MB | 20.6 MB | – | 11.1 MB | 4 |
+| after | 15 s | 3 | 116.2 MB | 77.4 MB | 33.5 MB | 20.6 MB | **+0.25 MB** | 11.1 / 11.1 / 13.1 MB | 4 |
+
+Reading, honestly:
+- **Daemon-side RssAnon per idle session is ≈ 0–1 MB** (−0.7, +1.0, −7.7, +0.25 MB across the four
+  pairs). A `SessionActor` + `Runtime` + `ConversationState` with no turn is small; the registries are
+  `Arc`-shared. The ≤ 15 MB daemon-side gate passes with a wide margin. This is the number the gate was
+  about; it was simply unmeasured before.
+- **Everything else in this table is jemalloc purge timing, not code.** The daemon process swings
+  7 → 23 MB and the *same* attach binary reads 1.7 MB or 19 MB depending on whether jemalloc's background
+  thread (sleeps up to 10 s when idle) has purged the startup garbage before the sample. An 8 s or 15 s
+  settle lands on either side of that window at random. `bench-turns.sh`-style double settle (> 20 s) or
+  a `mallctl("arena.<i>.purge")` before sampling is the day-2 fix for the *script*.
+- **Client diet**: the current-thread runtime for `synaps attach` cuts threads 10 → 4 and removes the
+  worker pool; its RssAnon effect cannot be resolved under the purge noise above (both binaries bottom
+  out at 1.4–1.8 MB once purged, i.e. the post-purge client is already tiny — the 21 MB PSS headline is
+  mostly shared text of the 22 MB binary). Remaining day-2 diet items: skip `EngineHost`/config/skills
+  statics on the attach path (nothing in `main.rs` boots them before dispatch today — verified), and
+  `narenas:1,background_thread:false` for the client via a per-command `MALLOC_CONF` (needs the static
+  conf to move to a runtime `mallctl`).
+- procs/session == 1.00 and daemon procs == 3 held in all eight runs.
+
+Raw runs: `/tmp/memprof-synaps-fb-{before,after}-daemon-N<N>-r1.txt` on bella (the 15 s runs
+overwrote the 8 s ones for the same N; the 8 s values above are transcribed from the earlier console).
+
 ## Not landed today (day 2/3)
 
 `--attach` driving the TUI over `SocketTransport` (needs A4); `Resync` after
