@@ -1806,3 +1806,228 @@ async fn hook_json_carries_session_id() {
 
     manager.shutdown_all().await;
 }
+
+// ── daemon-mode phase 2 (C2): discovery once per process, sessions per session ─
+
+#[tokio::test(flavor = "current_thread")]
+async fn discover_and_load_twice_is_idempotent() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let log_path = install_session_id_echo_plugin(home.path(), "idem-test");
+
+    let hook_bus = Arc::new(HookBus::new());
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(
+        hook_bus.clone(),
+    )));
+    assert!(manager.read().await.discovery_done().is_none());
+
+    let first = manager.write().await.discover_and_load().await;
+    assert_eq!(first.0, vec!["idem-test".to_string()]);
+    assert!(first.1.is_empty(), "{:?}", first.1);
+    let handlers_first = manager.read().await.handlers();
+
+    // Second host / second loader call in the same process: same result,
+    // no "already loaded" failures, no new process.
+    let second = manager.write().await.discover_and_load().await;
+    assert_eq!(second, first, "second discover must replay the first result");
+    assert_eq!(
+        manager.read().await.discovery_done(),
+        Some(first.clone())
+    );
+    let handlers_second = manager.read().await.handlers();
+    assert_eq!(handlers_first.len(), 1);
+    assert!(
+        Arc::ptr_eq(&handlers_first[0].1, &handlers_second[0].1),
+        "handler must be the same process, not a respawn"
+    );
+
+    // The loader entry point is the same seam: a third call through it also
+    // replays and still fires on_session_start for ITS session.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    synaps_cli::extensions::loader::spawn_discover_and_load(
+        manager.clone(),
+        tx,
+        Some("sess-loader".to_string()),
+    )
+    .await
+    .unwrap();
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(matches!(
+        events.last(),
+        Some(synaps_cli::extensions::loader::ExtensionLoaderEvent::Finished { loaded, failed })
+            if loaded == &first.0 && failed.is_empty()
+    ), "loader replays Finished from the record: {events:?}");
+
+    // Sidecar spawned ONCE: every logged hook came from the same pid.
+    let _ = hook_bus
+        .emit(&HookEvent::before_message("x").with_session(Some("sess-loader")))
+        .await;
+    let seen = read_jsonl(&log_path);
+    let pids: std::collections::HashSet<u64> =
+        seen.iter().map(|e| e["pid"].as_u64().unwrap()).collect();
+    assert_eq!(pids.len(), 1, "one sidecar for three discover calls: {seen:?}");
+    assert!(seen.iter().any(|e| e["kind"] == "on_session_start" && e["session_id"] == "sess-loader"));
+
+    manager.write().await.shutdown_all().await;
+    // Shutdown resets the record so a genuine restart can re-walk.
+    assert!(manager.read().await.discovery_done().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_start_end_per_session() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let log_path = install_session_id_echo_plugin(home.path(), "per-session-test");
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    assert_eq!(loaded, vec!["per-session-test".to_string()]);
+    assert!(failed.is_empty(), "{failed:?}");
+
+    use synaps_cli::extensions::loader::{emit_session_end, emit_session_start};
+    // Two sessions in one host: two starts with distinct ids …
+    assert!(!emit_session_start(&hook_bus, "sess-A").await, "fixture does not inject");
+    assert!(!emit_session_start(&hook_bus, "sess-B").await);
+    // … keyed injections stay isolated (phase 1 keyed injection) …
+    hook_bus.set_session_injection_for("sess-A", "A-only".into()).await;
+    hook_bus.set_session_injection_for("sess-B", "B-only".into()).await;
+    assert_eq!(hook_bus.session_injection_for("sess-A").await.as_deref(), Some("A-only"));
+    assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
+    // … and two ends, each clearing only its own injection.
+    assert!(emit_session_end(&hook_bus, "sess-A", None, Duration::from_secs(5)).await);
+    assert_eq!(hook_bus.session_injection_for("sess-A").await, None);
+    assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
+    assert!(emit_session_end(&hook_bus, "sess-B", None, Duration::from_secs(5)).await);
+    assert_eq!(hook_bus.session_injection_for("sess-B").await, None);
+
+    let seen = read_jsonl(&log_path);
+    let lifecycle: Vec<(String, String)> = seen
+        .iter()
+        .filter(|e| e["kind"] == "on_session_start" || e["kind"] == "on_session_end")
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_string(),
+                e["session_id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lifecycle,
+        vec![
+            ("on_session_start".into(), "sess-A".into()),
+            ("on_session_start".into(), "sess-B".into()),
+            ("on_session_end".into(), "sess-A".into()),
+            ("on_session_end".into(), "sess-B".into()),
+        ],
+        "session lifecycle fires per session, not per process: {seen:?}"
+    );
+    let pids: std::collections::HashSet<u64> =
+        seen.iter().map(|e| e["pid"].as_u64().unwrap()).collect();
+    assert_eq!(pids.len(), 1, "one sidecar served both sessions");
+
+    manager.shutdown_all().await;
+}
+
+/// S310/S311 regression: session A loading a plugin mid-round (a catalog
+/// generation bump on the SHARED registry) must not invalidate session B's
+/// activated tools — phase 1 carry-forward re-pins them at B's next round.
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_load_in_one_session_keeps_other_sessions_activations() {
+    use synaps_cli::mcp::descriptors::{
+        dormant_tools_for_config, server_config_fingerprint, CachedServerDescriptors,
+        CachedToolDescriptor, McpDescriptorCache,
+    };
+    use synaps_cli::mcp::{McpConfig, McpServerConfig};
+    use synaps_cli::tools::activation::{
+        activate_exact_for_user, ExecutionGate, SessionId, SessionToolSet,
+    };
+    use synaps_cli::tools::catalog::ToolId;
+
+    let hook_bus = Arc::new(HookBus::new());
+    let tools = Arc::new(tokio::sync::RwLock::new(
+        synaps_cli::ToolRegistry::without_subagent(),
+    ));
+    let mut manager = ExtensionManager::new_with_tools(hook_bus, tools.clone());
+
+    // Session B's world: a dormant MCP tool it has exactly activated.
+    let srv = McpServerConfig {
+        command: "/bin/true".into(),
+        args: vec![],
+        env: Default::default(),
+        shared: false,
+    };
+    let fp = server_config_fingerprint(&srv);
+    let mut cache = McpDescriptorCache::empty();
+    cache.servers.insert(
+        "srv".into(),
+        CachedServerDescriptors {
+            fingerprint: fp,
+            tools: vec![CachedToolDescriptor {
+                name: "echo_tool".into(),
+                description: "echo".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+            }],
+        },
+    );
+    let config = McpConfig {
+        mcp_servers: [("srv".to_string(), srv)].into_iter().collect(),
+    };
+    tools
+        .write()
+        .await
+        .try_register_batch(dormant_tools_for_config(&config, &cache))
+        .unwrap();
+    let sid_b = SessionId::parse("sess-B").unwrap();
+    let echo_id = ToolId::mcp("srv", "echo_tool");
+    let (mut set_b, gen_before) = {
+        let reg = tools.read().await;
+        let mut set = SessionToolSet::progressive_core_for_catalog(sid_b.clone(), reg.catalog());
+        activate_exact_for_user(&mut set, reg.catalog(), &echo_id).unwrap();
+        ExecutionGate::authorize_wire_call(&reg, &set, "ext__srv__echo_tool").unwrap();
+        (set, reg.catalog().generation())
+    };
+
+    // Session A loads a tool-registering plugin mid-round: catalog bumps.
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
+        deferred: None,
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
+        args: vec![fixture],
+        permissions: vec!["tools.register".to_string()],
+        hooks: vec![],
+        config: vec![],
+    };
+    manager.load("session-a-plugin", &manifest).await.unwrap();
+
+    {
+        let reg = tools.read().await;
+        assert!(reg.get("session-a-plugin:echo").is_some(), "A's tool registered");
+        assert_ne!(reg.catalog().generation(), gen_before, "catalog generation bumped");
+        assert!(set_b.is_stale(reg.catalog()), "B sees the bump …");
+        // … but B's next round-top carry-forward keeps every activation.
+        let (next, dropped) = set_b.rebuilt_for_catalog(reg.catalog(), true);
+        assert!(dropped.is_empty(), "nothing drifted: {dropped:?}");
+        assert!(next.activation(&echo_id).is_some(), "B's activation survives A's plugin load");
+        ExecutionGate::authorize_wire_call(&reg, &next, "ext__srv__echo_tool")
+            .expect("gate still executes B's carried activation");
+        set_b = next;
+    }
+    assert!(!set_b.is_stale(tools.read().await.catalog()));
+
+    manager.shutdown_all().await;
+}
