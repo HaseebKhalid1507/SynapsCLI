@@ -117,6 +117,11 @@ struct Cli {
     #[arg(long = "new", alias = "create", requires = "attach")]
     new_session: bool,
 
+    /// With --attach --new / --continue: name the created session so
+    /// `synaps send --session <NAME>` resolves it immediately.
+    #[arg(long = "name", value_name = "NAME", requires = "attach")]
+    session_name: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -576,6 +581,7 @@ async fn async_main() -> anyhow::Result<()> {
                     mode: tui::attach::attach_mode(cli.observe, cli.takeover),
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
+                    name: cli.session_name,
                 })
                 .await?;
             }
@@ -770,6 +776,10 @@ mod worker_threads_tests {
         assert!(matches!(line.command, Some(super::Command::Attach(ref a)) if a.create));
         // --new without --attach is a clap error
         assert!(super::Cli::try_parse_from(["synaps", "--new"]).is_err());
+        // --name rides on --attach (create or continue)
+        let named = super::Cli::try_parse_from(["synaps", "--attach", "--new", "--name", "ambient"]).unwrap();
+        assert_eq!(named.session_name.as_deref(), Some("ambient"));
+        assert!(super::Cli::try_parse_from(["synaps", "--name", "ambient"]).is_err());
     }
 
     #[test]

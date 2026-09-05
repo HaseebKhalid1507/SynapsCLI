@@ -90,6 +90,11 @@ pub struct SessionConfig {
     /// Never `Park` this session (`--keep-warm`). Default `false`.
     #[serde(default)]
     pub keep_warm: bool,
+    /// `--name`: name the session at create (same rules as `/cmd saveas`;
+    /// must be unique among saved sessions). Applied before the registry
+    /// entry is written so `synaps send --session <name>` resolves at once.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -128,6 +133,7 @@ impl Default for SessionConfig {
             compaction_policy: CompactionPolicyWire::InPlace,
             await_extensions: true,
             keep_warm: false,
+            name: None,
         }
     }
 }

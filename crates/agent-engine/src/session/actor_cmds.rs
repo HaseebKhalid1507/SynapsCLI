@@ -116,6 +116,7 @@ impl SessionActor {
         if trimmed.is_empty() {
             self.conv.session.clear_name();
             let _ = self.conv.session.save().await;
+            self.sync_name();
             self.emit_conversation();
             return serde_json::json!({
                 "kind": "output", "text": "session name cleared", "name": serde_json::Value::Null,
@@ -124,6 +125,7 @@ impl SessionActor {
         match self.conv.session.set_name(trimmed) {
             Ok(()) => {
                 let _ = self.conv.session.save().await;
+                self.sync_name();
                 self.emit_conversation();
                 serde_json::json!({
                     "kind": "output",
