@@ -299,15 +299,17 @@ fn normalise(frame: &str) -> String {
     let id_re = regex::Regex::new(r"\d{8}-\d{6}-[0-9a-f]{4}").unwrap();
     let ms_re = regex::Regex::new(r"\b\d+(\.\d+)?\s?(ms|s)\b").unwrap();
     // The build sha (`GIT_HASH`, `git rev-parse --short`) is rendered
-    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs).
-    let sha_re = regex::Regex::new(r"(?P<pre>· )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
+    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs). The
+    // banner is right-aligned, so the run of spaces before it also depends
+    // on the sha's length (`-dirty` = +6 columns): collapse it too.
+    let sha_re = regex::Regex::new(r"\s+(?P<pre>v[0-9][0-9.]* · )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'];
     frame
         .lines()
         .map(|l| {
             let l = id_re.replace_all(l, "<id>");
             let l = ms_re.replace_all(&l, "<t>");
-            let l = sha_re.replace_all(&l, "${pre}<sha>");
+            let l = sha_re.replace_all(&l, " ${pre}<sha>");
             let l: String = l.chars().map(|c| if spinner.contains(&c) { '·' } else { c }).collect();
             l.trim_end().to_string()
         })
