@@ -2485,6 +2485,10 @@ impl TranscriptStore {
 
     /// Stream a chunk of tool output. Appends to the matching
     /// `ToolResult` if one exists, otherwise creates a new placeholder.
+    /// A delta that lands **after** `on_tool_result` finalised the block
+    /// (the secret-prompt path races stderr deltas against completion) is
+    /// dropped: the finalised content is authoritative and a second block
+    /// under the same `tool_use` doubled the transcript (G9).
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
             if let ChatMessage::ToolResult {
@@ -2499,8 +2503,10 @@ impl TranscriptStore {
                     // only — the matched ToolUse's running header is keyed
                     // on the tool-timer maps, which this path doesn't touch.
                     self.invalidate_from(idx);
-                    return;
+                } else {
+                    tracing::debug!(tool_id, bytes = delta.len(), "late tool_result delta after finalize; dropped");
                 }
+                return;
             }
         }
         self.push_tool_result(tool_id, delta, None);
@@ -4450,5 +4456,34 @@ mod scrollback_cap_tests {
             std::env::remove_var(k);
         }
         assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 2 * 1024 * 1024));
+    }
+}
+
+#[cfg(test)]
+mod late_delta_tests {
+    use super::*;
+
+    #[test]
+    fn late_delta_after_finalize_does_not_add_a_block() {
+        let mut s = TranscriptStore::default();
+        s.on_tool_use_start("t1".into(), "bash".into());
+        s.on_tool_result_delta("t1".into(), "Password: ".into());
+        s.on_tool_result("t1".into(), "Password: \nlen=3".into());
+        let before = s.message_count();
+        s.on_tool_result_delta("t1".into(), "len=3\n".into());
+        assert_eq!(s.message_count(), before, "late delta created a second ToolResult");
+        let results: Vec<_> = s
+            .messages()
+            .iter()
+            .filter(|m| matches!(&m.msg, ChatMessage::ToolResult { tool_id, .. } if tool_id == "t1"))
+            .collect();
+        assert_eq!(results.len(), 1);
+        match &results[0].msg {
+            ChatMessage::ToolResult { content, elapsed_ms, .. } => {
+                assert_eq!(content, "Password: \nlen=3");
+                assert!(elapsed_ms.is_some());
+            }
+            _ => unreachable!(),
+        }
     }
 }
