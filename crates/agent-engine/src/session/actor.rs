@@ -1051,7 +1051,11 @@ impl SessionActor {
             self.emit_conversation();
         }
 
-        let auto_turn_enabled = true;
+        // `events.auto_turn = false` opts the session out of event-driven
+        // turns (events are still injected/forwarded; the spend governor
+        // for an ambient session). Read live from host config, like the
+        // RPC/server hosts do — it used to be hardcoded `true` here.
+        let auto_turn_enabled = self.host.config().events.auto_turn;
         let action = wake_action(
             &drained,
             &self.conv.api_messages,
