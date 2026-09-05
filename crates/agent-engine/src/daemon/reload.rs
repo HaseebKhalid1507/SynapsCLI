@@ -299,6 +299,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             continue_session: Some(Some(journal_id)),
             model_override: Some(model),
             keep_warm,
+            // The journal carries the CURRENT name (saveas after create);
+            // re-applying the create-time `--name` would undo a rename.
+            name: None,
             ..config
         },
         keep_warm,

@@ -157,6 +157,7 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            name: None,
         })
         .await?;
     let (transport, snapshot) =

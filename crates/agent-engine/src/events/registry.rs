@@ -106,6 +106,23 @@ fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Resu
     Ok(())
 }
 
+/// Rewrite `{session_id}.json` with a new `name` (rename / `saveas`). The
+/// rest of the record (socket, pid, started_at) is kept. Errors when there
+/// is no registration to update.
+pub fn update_session_name(session_id: &str, name: Option<&str>) -> Result<(), String> {
+    update_session_name_in(session_id, name, &registry_dir())
+}
+
+fn update_session_name_in(session_id: &str, name: Option<&str>, dir: &std::path::Path) -> Result<(), String> {
+    let safe_id = sanitize_session_id(session_id);
+    let path = dir.join(format!("{}.json", safe_id));
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut reg: SessionRegistration =
+        serde_json::from_str(&content).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    reg.name = name.map(str::to_string);
+    register_session_in(&reg, dir)
+}
+
 /// Remove the registration file. Best-effort — never panics.
 /// Also removes the socket file at `socket_path` if it exists.
 pub fn unregister_session(session_id: &str) {
@@ -385,6 +402,27 @@ mod tests {
             assert!(legacy.exists());
         }
         assert!(std::fs::read_to_string(&daemon).unwrap().contains("0.9.0"));
+    }
+
+    /// Bug: the name was frozen at create — `saveas` never reached the
+    /// registry, so `synaps send --session <name>` missed until a
+    /// `--continue`.
+    #[test]
+    fn update_name_rewrites_registration() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = make_reg("rename-0001", None, std::process::id());
+        register_session_in(&reg, &dir).unwrap();
+        assert!(find_session_registration_in("ambient", &dir).is_none());
+
+        update_session_name_in("rename-0001", Some("ambient"), &dir).unwrap();
+        let found = find_session_registration_in("ambient", &dir).expect("resolves by new name");
+        assert_eq!(found.session_id, "rename-0001");
+        assert_eq!(found.socket_path, reg.socket_path, "rest of the record kept");
+
+        update_session_name_in("rename-0001", None, &dir).unwrap();
+        assert!(find_session_registration_in("ambient", &dir).is_none(), "cleared");
+        assert!(update_session_name_in("ghost", Some("x"), &dir).is_err(), "no reg → error");
     }
 
     #[test]

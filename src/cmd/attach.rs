@@ -37,6 +37,10 @@ pub(crate) struct AttachArgs {
     /// Never park this session (B3); also sent to an existing session.
     #[arg(long = "keep-warm")]
     pub keep_warm: bool,
+    /// Name the created session (`synaps send --session <NAME>` resolves it
+    /// at once). With --create / --continue.
+    #[arg(long = "name", value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 impl AttachArgs {
@@ -237,6 +241,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
                 system: args.system.clone(),
                 cwd: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
                 keep_warm: args.keep_warm,
+                name: args.name.clone(),
                 ..Default::default()
             },
             mode,
@@ -357,5 +362,8 @@ mod tests {
         assert!(a.keep_warm);
         assert_eq!(a.id.as_deref(), Some("abc"));
         assert!(Cli::try_parse_from(["attach", "--observe", "--takeover"]).is_err());
+        let a = Cli::parse_from(["attach", "--create", "--name", "ambient"]).args;
+        assert!(a.create);
+        assert_eq!(a.name.as_deref(), Some("ambient"));
     }
 }

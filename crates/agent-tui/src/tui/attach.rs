@@ -37,6 +37,9 @@ pub struct AttachOpts {
     /// `--new`/`--create`: always create a fresh session even if one is
     /// live. Rejected together with an explicit `id`.
     pub new_session: bool,
+    /// `--name`: name the created session (`synaps send --session <name>`
+    /// resolves it at once).
+    pub name: Option<String>,
 }
 
 /// The slice of `Welcome.sessions` the attach decision needs.
@@ -64,6 +67,7 @@ pub fn choose_attach(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: true,
             keep_warm: opts.keep_warm,
+            name: opts.name.clone(),
             ..Default::default()
         },
         mode: opts.mode,
@@ -319,6 +323,7 @@ mod tests {
             mode: AttachMode::Mirror,
             keep_warm: false,
             new_session,
+            name: None,
         }
     }
 

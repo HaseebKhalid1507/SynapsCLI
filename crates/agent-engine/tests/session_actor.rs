@@ -874,3 +874,80 @@ async fn host_shutdown_saves_every_session() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(host.sessions().len(), 0);
 }
+
+/// Bug: the session name was frozen at create — `SessionMeta.name` and the
+/// `run/<sid>.json` registry entry were written once, so `synaps send
+/// --session <name>` only resolved sessions created via `--continue <name>`.
+/// Now `SessionConfig.name` names the session at create and `saveas` updates
+/// both the handle and the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn name_at_create_and_saveas_reach_registry_and_meta() {
+    use agent_engine::events::registry::find_session_registration;
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    let handle = host
+        .create_session(SessionConfig {
+            name: Some("ambient".into()),
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    // Registry + listing carry the name from the first second (no turn, no --continue).
+    let reg = find_session_registration("ambient").expect("send --session ambient resolves");
+    assert_eq!(reg.session_id, handle.id.as_str());
+    assert_eq!(handle.name().as_deref(), Some("ambient"));
+    assert_eq!(host.sessions()[0].name.as_deref(), Some("ambient"));
+    // ...and it is on disk, so `--continue ambient` resolves via the journal too.
+    let on_disk = agent_engine::core::session::resolve_session("ambient").expect("saved at create");
+    assert_eq!(on_disk.id, handle.id.as_str());
+
+    // A second create with the same name is refused (saveas rules), not silently duplicated.
+    let dup = host
+        .create_session(SessionConfig {
+            name: Some("ambient".into()),
+            persist: true,
+            ..cfg()
+        })
+        .await;
+    assert!(dup.is_err(), "duplicate name must be refused");
+    assert_eq!(host.sessions().len(), 1);
+
+    // Rename via `/cmd saveas` → handle, listing and registry all follow.
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(SessionCommand::EngineCommand {
+        id: 1,
+        name: "saveas".into(),
+        arg: "ambient2".into(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 1, .. })).await;
+    assert_eq!(handle.name().as_deref(), Some("ambient2"));
+    assert_eq!(host.sessions()[0].name.as_deref(), Some("ambient2"));
+    assert!(find_session_registration("ambient").is_none(), "old name gone");
+    assert_eq!(
+        find_session_registration("ambient2").expect("new name resolves").session_id,
+        handle.id.as_str()
+    );
+
+    // Clear: `saveas` with no arg.
+    a.send(SessionCommand::EngineCommand {
+        id: 2,
+        name: "saveas".into(),
+        arg: String::new(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 2, .. })).await;
+    assert_eq!(handle.name(), None);
+    assert!(find_session_registration("ambient2").is_none());
+    assert!(find_session_registration(handle.id.as_str()).is_some(), "still registered by id");
+    end(&mut a).await;
+}

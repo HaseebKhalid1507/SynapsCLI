@@ -49,6 +49,9 @@ pub struct SessionHandle {
     journal_id: Arc<arc_swap::ArcSwap<String>>,
     /// Clients / input owner / pending prompts, written by the actor.
     presence: Arc<arc_swap::ArcSwap<Presence>>,
+    /// Session name — `--name` at create / `/cmd saveas` later. Written by
+    /// the actor so listings and `--continue <name>` see renames live.
+    name: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -68,6 +71,7 @@ pub struct SessionEndpoints {
     pub lifecycle: Arc<AtomicU8>,
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
+    pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl SessionHandle {
@@ -80,6 +84,7 @@ impl SessionHandle {
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
+        let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -89,6 +94,7 @@ impl SessionHandle {
             lifecycle: Arc::clone(&lifecycle),
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
+            name: Arc::clone(&name),
         };
         (
             handle,
@@ -99,6 +105,7 @@ impl SessionHandle {
                 lifecycle,
                 journal_id,
                 presence,
+                name,
             },
         )
     }
@@ -139,6 +146,11 @@ impl SessionHandle {
         **self.presence.load()
     }
 
+    /// Current session name (create `--name` or a later `saveas`).
+    pub fn name(&self) -> Option<String> {
+        (**self.name.load()).clone()
+    }
+
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
     /// awaiting_input, journal_id) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
@@ -149,6 +161,7 @@ impl SessionHandle {
         m.input_owner = p.input_owner;
         m.awaiting_input = p.awaiting_input;
         m.journal_id = self.journal_id();
+        m.name = self.name();
         m
     }
 
