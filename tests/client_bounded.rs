@@ -1,15 +1,17 @@
 //! PLAN-phase4 §7.3 — the growth proof for the thin client.
 //!
 //! One daemon on a scripted provider stub, one `--attach` TUI pane in tmux
-//! with `SYNAPS_MEM_TRACE=1 SYNAPS_MEMPROF_PURGE=1`; 80 turns, each a `bash`
+//! with `SYNAPS_MEM_TRACE=1 SYNAPS_MEMPROF_PURGE=1`; 120 turns, each a `bash`
 //! tool round producing ~30 KB of tool output (≈ 40 KB of history) and a
 //! text reply. The client's idle purge fires after every turn and writes a
 //! `purged` ladder line; RssAnon after every 10th turn comes from those.
 //!
-//! Gates (G6): `RssAnon(80) − RssAnon(30) ≤ 1.5 MB`, `max ≤ 14 MB`. The
+//! Gates (G6): `RssAnon(120) − RssAnon(60) ≤ 1.5 MB`, `max ≤ 14 MB`. The
 //! window is sized for the 2 MiB Socket scrollback cap (+256 KiB
-//! hysteresis): it engages near turn 56, so an uncapped client accrues
-//! ≈ 2 MB over 30→80 and fails; a capped one ≈ 1.1 MB.
+//! hysteresis, audited every 256 KiB pushed): with ~30 KB of tool output
+//! per turn it engages near turn 76 (measured: 40 KB/turn RssAnon, linear
+//! through turn 80 uncapped), so an uncapped client accrues ≈ 2.4 MB over
+//! 60→120 and fails; a capped one ≈ 0.7–0.9 MB.
 //! With the history mirror on (`SYNAPS_CLIENT_HISTORY=full`, the default
 //! until B7) this is expected to FAIL — that output is B's "before".
 //!
@@ -33,8 +35,8 @@ use std::time::{Duration, Instant};
 use phase2::{spawn_stub, Script};
 
 const TMUX: &str = "clientbounded";
-const TURNS: usize = 80;
-const WIN_LO: usize = 30;
+const TURNS: usize = 120;
+const WIN_LO: usize = 60;
 const WIN_HI: usize = TURNS;
 const SLOPE_LIMIT_KB: i64 = 1536;
 const MAX_LIMIT_KB: u64 = 14 * 1024;
