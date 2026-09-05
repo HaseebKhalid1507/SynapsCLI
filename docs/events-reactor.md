@@ -102,18 +102,40 @@ which:
 - Atomically acquires the streaming guard; drops the trigger if already streaming.
 - Does **not** inject a sentinel `[event-reactor auto-turn]` user message.
 - Runs the turn loop against the existing `api_messages` (event already there).
-- Enforces `AUTO_TURN_CAP`.
+- Enforces the auto-turn cap (`events.auto_turn_cap`).
 
 ---
 
-## AUTO_TURN_CAP
+## `events.auto_turn_cap` (AUTO_TURN_CAP)
+
+```toml
+# ~/.config/synaps/config.toml
+events.auto_turn_cap = 5          # default — park after 5 consecutive auto turns
+# events.auto_turn_cap = 12       # allow longer autonomous chains
+# events.auto_turn_cap = 0        # unlimited — "to infinity and beyond"
+# events.auto_turn_cap = unlimited  # alias for 0 (also: inf, infinite)
+```
 
 ```rust
-pub const AUTO_TURN_CAP: u32 = 5;  // reactor.rs
+pub const AUTO_TURN_CAP: u32 = 5;  // reactor.rs — the default only
 ```
 
 Maximum consecutive event-triggered model turns without an intervening real
-client user message. When `consecutive_auto_turns` reaches the cap:
+client user message. Default **5**. **`0` means unlimited** — the engine never
+parks on its own (an agent that wants to keep going, keeps going). Unparseable
+values print a warning and keep the default.
+
+Why it is configurable: a subagent-completion event that lands after the cap has
+tripped sits frozen until a human types something — e.g. finished work arriving
+at 08:45 and nobody noticing until 13:07. Operators running long autonomous
+sessions can raise or remove the cap.
+
+All four reactor loops (TUI, `chat`, `rpc`, `server`) read the same value at
+boot and gate through `reactor::auto_turn_cap_reached(consecutive, cap)` /
+`claim_auto_turn_with_cap`. When a finite cap trips, the TUI/chat notice names
+the cap and the config key to raise it.
+
+When `consecutive_auto_turns` reaches a finite cap:
 
 - `wake_action` returns `WakeAction::Forward` (not `RunTurn`).
 - The server's `run_injected_event_turn` bails and resets the counter to 0.
@@ -132,7 +154,8 @@ This prevents runaway API spending from high-frequency event sources.
 | `Buffered` | Busy + no live `steer_tx` | `pending_events.push(formatted)` |
 
 `wake_action` only returns `RunTurn` when at least one `Injected` event is
-present, the server is idle, `auto_turn_enabled` is true, `consecutive_auto_turns < AUTO_TURN_CAP`,
+present, the server is idle, `auto_turn_enabled` is true, the configured cap
+(`events.auto_turn_cap`) is unlimited or not yet reached,
 and the last `api_messages` entry is `role=user`.
 
 ---

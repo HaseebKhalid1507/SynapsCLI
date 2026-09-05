@@ -22,7 +22,8 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::engine::reactor::{
-    claim_auto_turn, drain_event_queue, wake_action, EventDisposition, WakeAction, AUTO_TURN_CAP,
+    auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue, wake_action_with_cap,
+    EventDisposition, WakeAction,
 };
 use crate::engine::session::ConversationState;
 use crate::engine::setup::BackgroundTasks;
@@ -1021,12 +1022,15 @@ impl SessionActor {
         }
 
         let auto_turn_enabled = true;
-        let action = wake_action(
+        // Integration: cap from `events.auto_turn_cap` (#106); 0 = unlimited.
+        let cap = self.host.config().events.auto_turn_cap;
+        let action = wake_action_with_cap(
             &drained,
             &self.conv.api_messages,
             busy,
             auto_turn_enabled,
             self.consecutive_auto_turns,
+            cap,
         );
         match action {
             WakeAction::RunTurn => {
@@ -1041,9 +1045,9 @@ impl SessionActor {
                 let hit_cap = injected
                     && !busy
                     && auto_turn_enabled
-                    && self.consecutive_auto_turns >= AUTO_TURN_CAP;
+                    && auto_turn_cap_reached(self.consecutive_auto_turns, cap);
                 if hit_cap {
-                    self.emit(SessionEventWire::AutoTurnCapReached { cap: AUTO_TURN_CAP });
+                    self.emit(SessionEventWire::AutoTurnCapReached { cap });
                 }
             }
             WakeAction::Nothing => {}
@@ -1207,10 +1211,11 @@ impl SessionActor {
                     return;
                 }
                 // Central claim gate: allows turns 1-5, denies the 6th.
-                if claim_auto_turn(&mut self.consecutive_auto_turns) {
+                let cap = self.host.config().events.auto_turn_cap;
+                if claim_auto_turn_with_cap(&mut self.consecutive_auto_turns, cap) {
                     self.start_turn(TurnTrigger::EventAuto, None).await;
                 } else {
-                    self.emit(SessionEventWire::AutoTurnCapReached { cap: AUTO_TURN_CAP });
+                    self.emit(SessionEventWire::AutoTurnCapReached { cap });
                     self.emit(SessionEventWire::Idle);
                 }
             }

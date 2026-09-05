@@ -268,8 +268,10 @@ pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Even
 /// The auto-turn cap line (was stream_handler.rs:368-378 / :516-520).
 pub(super) fn on_auto_turn_cap(app: &mut App, cap: u32) {
     app.push_msg(ChatMessage::System(format!(
-        "auto-turn cap reached ({} consecutive) — waiting for your input",
-        cap
+        "auto-turn cap reached ({} consecutive) — waiting for your input \
+         (raise with `{} = N`, 0 = unlimited)",
+        cap,
+        synaps_cli::engine::reactor::AUTO_TURN_CAP_CONFIG_KEY
     )));
     app.invalidate();
 }

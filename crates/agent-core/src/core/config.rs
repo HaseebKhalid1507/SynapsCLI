@@ -275,13 +275,38 @@ pub struct EventsConfig {
     /// model turn when runtime events arrive while idle.  Set
     /// `events.auto_turn = false` (or `0` / `no` / `off`) to opt out.
     /// Unrecognised values fail safe to `false` with a warning.
-    /// The built-in cap (`AUTO_TURN_CAP = 5`) still applies regardless.
+    /// The consecutive-turn cap (`auto_turn_cap`) still applies regardless.
     pub auto_turn: bool,
+    /// Maximum number of consecutive auto-triggered model turns before the
+    /// engine parks and waits for real user input.  Set via
+    /// `events.auto_turn_cap = N`.  Default **5**.
+    ///
+    /// `0` (or `unlimited` / `inf` / `infinite`) disables the cap entirely —
+    /// "to infinity and beyond".  Unparseable values warn and keep the default.
+    pub auto_turn_cap: u32,
 }
+
+/// Default for `events.auto_turn_cap` — mirrors `engine::reactor::AUTO_TURN_CAP`.
+pub const DEFAULT_AUTO_TURN_CAP: u32 = 5;
 
 impl Default for EventsConfig {
     fn default() -> Self {
-        Self { auto_turn: true }
+        Self {
+            auto_turn: true,
+            auto_turn_cap: DEFAULT_AUTO_TURN_CAP,
+        }
+    }
+}
+
+/// Parse a `events.auto_turn_cap` value.  Returns `None` on garbage.
+///
+/// Accepts a non-negative integer (`0` = unlimited) or one of the aliases
+/// `unlimited` / `inf` / `infinite` / `infinity` / `none` (all → `0`).
+pub fn parse_auto_turn_cap(val: &str) -> Option<u32> {
+    let normalised = val.trim().to_lowercase();
+    match normalised.as_str() {
+        "unlimited" | "inf" | "infinite" | "infinity" | "none" => Some(0),
+        n => n.parse::<u32>().ok(),
     }
 }
 
@@ -304,6 +329,19 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
                 false
             }
         };
+    } else if key == "events.auto_turn_cap" {
+        match parse_auto_turn_cap(val) {
+            Some(cap) => cfg.auto_turn_cap = cap,
+            None => {
+                eprintln!(
+                    "warning: config: unrecognised value for events.auto_turn_cap = {:?}; \
+                     expected a non-negative integer or unlimited/inf/infinite (0 = unlimited) \
+                     — keeping default {}",
+                    val.trim(),
+                    DEFAULT_AUTO_TURN_CAP
+                );
+            }
+        }
     } // unknown events.* keys ignored
 }
 
@@ -2328,6 +2366,56 @@ api_retries = 5
             !cfg.events.auto_turn,
             "typo 'fales' must fail safe to false"
         );
+    }
+
+    // ── events.auto_turn_cap parser ──────────────────────────────────────────
+
+    #[test]
+    fn events_auto_turn_cap_default_is_five() {
+        let cfg = load_config_from_str("");
+        assert_eq!(cfg.events.auto_turn_cap, 5);
+        assert_eq!(DEFAULT_AUTO_TURN_CAP, 5);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_zero_is_unlimited() {
+        let cfg = load_config_from_str("events.auto_turn_cap = 0");
+        assert_eq!(cfg.events.auto_turn_cap, 0);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_unlimited_aliases() {
+        for val in ["unlimited", "inf", "infinite", "Infinity", "UNLIMITED", " inf "] {
+            let cfg = load_config_from_str(&format!("events.auto_turn_cap = {val}"));
+            assert_eq!(
+                cfg.events.auto_turn_cap, 0,
+                "expected 0 for events.auto_turn_cap = {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_cap_explicit_number() {
+        let cfg = load_config_from_str("events.auto_turn_cap = 12");
+        assert_eq!(cfg.events.auto_turn_cap, 12);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_garbage_keeps_default() {
+        for val in ["banana", "-3", "5.5", "", "true"] {
+            let cfg = load_config_from_str(&format!("events.auto_turn_cap = {val}"));
+            assert_eq!(
+                cfg.events.auto_turn_cap, 5,
+                "garbage {val:?} must keep default 5"
+            );
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_cap_independent_of_auto_turn() {
+        let cfg = load_config_from_str("events.auto_turn = false\nevents.auto_turn_cap = 0");
+        assert!(!cfg.events.auto_turn);
+        assert_eq!(cfg.events.auto_turn_cap, 0);
     }
 
     #[test]

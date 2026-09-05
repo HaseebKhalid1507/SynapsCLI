@@ -7,7 +7,7 @@
 //! mechanism — the [`TurnBudgetMeter`] consulted by the stream loop.
 //!
 //! Composition note: the chat frontend's reactor auto-turn cap
-//! (`engine::reactor::AUTO_TURN_CAP`) limits consecutive auto-triggered
+//! (`events.auto_turn_cap`, default `engine::reactor::AUTO_TURN_CAP`) limits consecutive auto-triggered
 //! turns ACROSS turns; this budget bounds work WITHIN one turn. They
 //! compose — neither replaces nor duplicates the other.
 
