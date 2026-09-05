@@ -874,3 +874,179 @@ async fn host_shutdown_saves_every_session() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(host.sessions().len(), 0);
 }
+
+/// Bug: the session name was frozen at create — `SessionMeta.name` and the
+/// `run/<sid>.json` registry entry were written once, so `synaps send
+/// --session <name>` only resolved sessions created via `--continue <name>`.
+/// Now `SessionConfig.name` names the session at create and `saveas` updates
+/// both the handle and the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn name_at_create_and_saveas_reach_registry_and_meta() {
+    use agent_engine::events::registry::find_session_registration;
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    let handle = host
+        .create_session(SessionConfig {
+            name: Some("ambient".into()),
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    // Registry + listing carry the name from the first second (no turn, no --continue).
+    let reg = find_session_registration("ambient").expect("send --session ambient resolves");
+    assert_eq!(reg.session_id, handle.id.as_str());
+    assert_eq!(handle.name().as_deref(), Some("ambient"));
+    assert_eq!(host.sessions()[0].name.as_deref(), Some("ambient"));
+    // ...and it is on disk, so `--continue ambient` resolves via the journal too.
+    let on_disk = agent_engine::core::session::resolve_session("ambient").expect("saved at create");
+    assert_eq!(on_disk.id, handle.id.as_str());
+
+    // A second create with the same name is refused (saveas rules), not silently duplicated.
+    let dup = host
+        .create_session(SessionConfig {
+            name: Some("ambient".into()),
+            persist: true,
+            ..cfg()
+        })
+        .await;
+    assert!(dup.is_err(), "duplicate name must be refused");
+    assert_eq!(host.sessions().len(), 1);
+
+    // Rename via `/cmd saveas` → handle, listing and registry all follow.
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(SessionCommand::EngineCommand {
+        id: 1,
+        name: "saveas".into(),
+        arg: "ambient2".into(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 1, .. })).await;
+    assert_eq!(handle.name().as_deref(), Some("ambient2"));
+    assert_eq!(host.sessions()[0].name.as_deref(), Some("ambient2"));
+    assert!(find_session_registration("ambient").is_none(), "old name gone");
+    assert_eq!(
+        find_session_registration("ambient2").expect("new name resolves").session_id,
+        handle.id.as_str()
+    );
+
+    // `--continue ambient2` while live → the same actor (name resolved in
+    // memory first, then disk; either way never a second actor).
+    let again = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some("ambient2".into())),
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.id, handle.id);
+    assert_eq!(host.sessions().len(), 1);
+    // Non-persisted session: its name exists ONLY in memory — still attaches.
+    let eph = host
+        .create_session(SessionConfig {
+            name: Some("ephemeral".into()),
+            persist: false,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert!(agent_engine::core::session::resolve_session("ephemeral").is_err(), "not on disk");
+    let again = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some("ephemeral".into())),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.id, eph.id);
+    assert_eq!(host.sessions().len(), 2);
+    eph.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+    eph.closed().await;
+
+    // Clear: `saveas` with no arg.
+    a.send(SessionCommand::EngineCommand {
+        id: 2,
+        name: "saveas".into(),
+        arg: String::new(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 2, .. })).await;
+    assert_eq!(handle.name(), None);
+    assert!(find_session_registration("ambient2").is_none());
+    assert!(find_session_registration(handle.id.as_str()).is_some(), "still registered by id");
+    end(&mut a).await;
+}
+
+/// Bug: `events.auto_turn = false` was parsed but the actor hardcoded
+/// `auto_turn_enabled = true` — in daemon mode the opt-out did nothing. The
+/// event must still be injected and forwarded; no EventAuto turn may run.
+/// Flipping the key back on (host.reload_config) re-enables auto turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn events_auto_turn_false_injects_without_a_turn() {
+    use tokio::io::AsyncWriteExt;
+    let h = Home::new();
+    let config_path = h._dir.path().join(".synaps-cli").join("config");
+    std::fs::write(&config_path, "events.auto_turn = false\n").unwrap();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    assert!(!host.config().events.auto_turn, "config key read at boot");
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+
+    let push = |text: &'static str| {
+        let reg = agent_engine::events::registry::find_session_registration(handle.id.as_str())
+            .expect("registered");
+        async move {
+            let event = agent_engine::events::types::Event::simple(
+                "test",
+                text,
+                Some(agent_engine::events::types::Severity::High),
+            );
+            let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
+            c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+            c.shutdown().await.unwrap();
+        }
+    };
+
+    push("no turn please").await;
+    // Injected + forwarded, then nothing: no TurnStarted within the window.
+    let external = until(&mut a, |e| matches!(e, SessionEventWire::External(_))).await;
+    assert!(external.iter().all(|e| !matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let e = next(&mut a).await;
+            if matches!(e.event, SessionEventWire::TurnStarted { .. }) {
+                return e.event;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "auto_turn=false must not start a turn: {quiet:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "provider never called");
+
+    // Opt back in without a restart: the actor reads the host config per wake.
+    std::fs::write(&config_path, "events.auto_turn = true\n").unwrap();
+    host.reload_config();
+    assert!(host.config().events.auto_turn);
+    push("now turn").await;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::TurnStarted { trigger: agent_engine::session::TurnTrigger::EventAuto, .. }
+    )));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    end(&mut a).await;
+}

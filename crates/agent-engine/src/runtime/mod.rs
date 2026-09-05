@@ -44,6 +44,7 @@ use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
 pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
 pub enum BeforeToolCallDecision {
@@ -403,6 +404,9 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// `tools.activation_confirm` host policy for model-initiated
+    /// `activate_tools` (auto | prompt | deny). Default `auto`.
+    activation_confirm: agent_core::config::ActivationConfirm,
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
@@ -871,6 +875,7 @@ impl Runtime {
             token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: host.progressive_tool_disclosure,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -1355,6 +1360,17 @@ impl Runtime {
     /// Whether this runtime projects a progressive (core-only) tool schema.
     pub fn progressive_tool_disclosure(&self) -> bool {
         self.progressive_tool_disclosure
+    }
+
+    /// `tools.activation_confirm` policy in force for this runtime.
+    pub fn activation_confirm(&self) -> agent_core::config::ActivationConfirm {
+        self.activation_confirm
+    }
+
+    /// Override the `tools.activation_confirm` policy (hosts/tests that do
+    /// not go through `apply_config`).
+    pub fn set_activation_confirm(&mut self, mode: agent_core::config::ActivationConfirm) {
+        self.activation_confirm = mode;
     }
 
     /// Identity of the underlying connection pool: two `Client` handles that
@@ -2123,6 +2139,12 @@ impl Runtime {
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
+        self.activation_confirm = config.tools_activation_confirm;
+        tracing::info!(
+            mode = config.tools_activation_confirm.as_str(),
+            auto_approve_confirms = config.server.auto_approve_confirms,
+            "tools.activation_confirm: model-initiated activate_tools policy"
+        );
         self.trusted_worker_models = config
             .favorite_models
             .iter()
@@ -3595,6 +3617,7 @@ impl Runtime {
             delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
@@ -3735,6 +3758,7 @@ impl Clone for Runtime {
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or

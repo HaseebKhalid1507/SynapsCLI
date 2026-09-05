@@ -1,6 +1,6 @@
 [
   {
-    "description": "Request session-scoped activation of exact tool ids returned by search_tools. Activation is subject to host confirmation policy; only the exact requested tools are activated for this session.",
+    "description": "Request session-scoped activation of exact tool ids returned by search_tools. Activation is subject to the host's tools.activation_confirm policy (auto: granted; prompt: the user is asked y/n; deny: always refused); only the exact requested tools are activated for this session.",
     "name": "activate_tools",
     "parameters": {
       "properties": {

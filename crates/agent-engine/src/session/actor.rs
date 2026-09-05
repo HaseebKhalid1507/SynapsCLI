@@ -372,6 +372,8 @@ pub struct SessionActor {
     pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
     /// Mirrors `handle.presence()` (clients / owner / pending prompts).
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
+    /// Mirrors `handle.name()`; `sync_name` after any rename.
+    pub(crate) name: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl SessionActor {
@@ -386,12 +388,27 @@ impl SessionActor {
         let mut runtime = host.foreground_runtime().await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
 
-        let sb = crate::engine::setup::resolve_session_and_prompt(
+        let mut sb = crate::engine::setup::resolve_session_and_prompt(
             &mut runtime,
             &cfg.continue_session,
             cfg.system.as_deref(),
             cfg.prompt_manifest.as_deref(),
         )?;
+        // `--name` at create: apply BEFORE the registry entry is written so
+        // `synaps send --session <name>` and `--continue <name>` resolve
+        // from the first second — not only after a later `--continue`.
+        if let Some(name) = cfg.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            sb.session
+                .set_name(name)
+                .map_err(|e| crate::RuntimeError::Session(format!("--name {name:?}: {e}")))?;
+            if cfg.persist {
+                // Persist the name now so disk resolution (chain/name → id)
+                // agrees with the live map even before the first turn.
+                if let Err(e) = sb.session.save().await {
+                    tracing::warn!(session = %sb.session.id, "failed to save named session at create: {e}");
+                }
+            }
+        }
         runtime.set_cwd(cfg.cwd.clone());
         // CLI `--model` overrides whatever was persisted (rpc.rs precedent).
         if let Some(ref m) = cfg.model_override {
@@ -479,6 +496,7 @@ impl SessionActor {
                 lifecycle,
                 journal_id,
                 presence,
+                name,
             },
         ) = SessionHandle::new(meta.clone(), view);
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
@@ -522,8 +540,21 @@ impl SessionActor {
             lifecycle,
             journal_id,
             presence,
+            name,
         };
         Ok((handle, SessionTask(actor)))
+    }
+
+    /// Publish `conv.session.name` to the handle (listings, `--continue
+    /// <name>`) and rewrite this session's registry entry so `synaps send
+    /// --session <name>` resolves the new name. Call after any rename.
+    pub(crate) fn sync_name(&mut self) {
+        let name = self.conv.session.name.clone();
+        self.meta.name = name.clone();
+        self.name.store(Arc::new(name.clone()));
+        if let Err(e) = crate::events::registry::update_session_name(self.id.as_str(), name.as_deref()) {
+            tracing::warn!(session = %self.id, "registry name update failed: {e}");
+        }
     }
 
     // ── emit ─────────────────────────────────────────────────────────────
@@ -1020,7 +1051,11 @@ impl SessionActor {
             self.emit_conversation();
         }
 
-        let auto_turn_enabled = true;
+        // `events.auto_turn = false` opts the session out of event-driven
+        // turns (events are still injected/forwarded; the spend governor
+        // for an ambient session). Read live from host config, like the
+        // RPC/server hosts do — it used to be hardcoded `true` here.
+        let auto_turn_enabled = self.host.config().events.auto_turn;
         let action = wake_action(
             &drained,
             &self.conv.api_messages,
@@ -1572,6 +1607,10 @@ impl SessionActor {
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
             }
+            SessionQuery::DisplayTail { items } => {
+                serde_json::to_value(super::display::display_tail(&self.conv.api_messages, items))
+                    .unwrap_or_default()
+            }
             SessionQuery::SubagentRows => {
                 let rows = self
                     .runtime
@@ -1630,7 +1669,30 @@ impl SessionActor {
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
             input_owner: self.input_owner,
+            display_tail: None,
         }
+    }
+
+    /// `snapshot()` shaped for one client (phase 4 §2.3): `Digest` clients
+    /// get an empty `api_messages` (`messages_len` kept), a daemon-projected
+    /// `display_tail`, and a replay without the per-round `MessageHistory`
+    /// envelopes (the trailing `Conversation` digest carries len/hash).
+    pub(crate) fn snapshot_for(&self, client: &ClientMeta) -> AttachSnapshot {
+        let mut snap = self.snapshot();
+        if client.history == HistoryMode::Digest {
+            snap.display_tail = Some(super::display::display_tail(
+                &snap.conversation.api_messages,
+                client.tail_items,
+            ));
+            snap.conversation.api_messages = Vec::new();
+            snap.replay.retain(|e| {
+                !matches!(
+                    e.event,
+                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+                )
+            });
+        }
+        snap
     }
 
     /// B1 ownership: `Observe` never owns; `Mirror` owns iff nobody does
@@ -1645,6 +1707,7 @@ impl SessionActor {
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
+        let snapshot_meta = client.clone();
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
@@ -1683,7 +1746,7 @@ impl SessionActor {
             });
         }
         self.publish_presence();
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for(&snapshot_meta);
         self.emit(SessionEventWire::Attached {
             client: cid,
             snapshot,

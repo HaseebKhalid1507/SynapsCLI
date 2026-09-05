@@ -103,6 +103,7 @@ impl ConversationState {
         crate::session::ConversationSnapshot {
             header: crate::session::SessionHeader::from(&self.session),
             api_messages: self.api_messages.clone(),
+            messages_len: self.api_messages.len(),
             tokens: crate::session::ConversationTokens {
                 input: self.total_input_tokens,
                 output: self.total_output_tokens,

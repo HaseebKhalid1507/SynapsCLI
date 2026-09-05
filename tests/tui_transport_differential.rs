@@ -7,8 +7,11 @@
 //! (L) this binary in-process. After each step the pane is captured,
 //! normalised and diffed. The journals are diffed too.
 //!
-//! There is NO socket pane here: L≡S (`--attach` against a daemon) is
-//! #111's gate and is not claimed by this file.
+//! Phase 4 (B8): with `SYNAPS_TUI_E2E_SOCKET=1` a third pane (S) runs
+//! `synaps --attach` against a private daemon spawned in the pane's HOME
+//! on the same stub; L≡S is diffed with the socket normaliser (drops the
+//! `attached to … as client #…` line and session ids). Printed as a second
+//! table: `SOCKET DIFF: empty (N)`.
 //!
 //! Scenarios: plain_turn, tool_loop, abort_mid_stream, steer_mid_stream,
 //! settings_model_change, clear, compaction, queued_during_compaction,
@@ -296,15 +299,17 @@ fn normalise(frame: &str) -> String {
     let id_re = regex::Regex::new(r"\d{8}-\d{6}-[0-9a-f]{4}").unwrap();
     let ms_re = regex::Regex::new(r"\b\d+(\.\d+)?\s?(ms|s)\b").unwrap();
     // The build sha (`GIT_HASH`, `git rev-parse --short`) is rendered
-    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs).
-    let sha_re = regex::Regex::new(r"(?P<pre>· )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
+    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs). The
+    // banner is right-aligned, so the run of spaces before it also depends
+    // on the sha's length (`-dirty` = +6 columns): collapse it too.
+    let sha_re = regex::Regex::new(r"\s+(?P<pre>v[0-9][0-9.]* · )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'];
     frame
         .lines()
         .map(|l| {
             let l = id_re.replace_all(l, "<id>");
             let l = ms_re.replace_all(&l, "<t>");
-            let l = sha_re.replace_all(&l, "${pre}<sha>");
+            let l = sha_re.replace_all(&l, " ${pre}<sha>");
             let l: String = l.chars().map(|c| if spinner.contains(&c) { '·' } else { c }).collect();
             l.trim_end().to_string()
         })
@@ -347,6 +352,148 @@ fn normalise_journal(dir: &Path) -> String {
 struct Pane {
     name: String,
     home: tempfile::TempDir,
+    /// The private daemon behind an S pane (killed on drop).
+    daemon: Option<std::process::Child>,
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        if let Some(mut d) = self.daemon.take() {
+            let _ = d.kill();
+            let _ = d.wait();
+        }
+    }
+}
+
+/// Socket-pane normalisation on top of [`normalise`] — the documented L≡S
+/// drops (phase 4 §7.4 G9):
+/// 1. the attach banner (`attached to <id> as client #N (Mirror)`), a
+///    System card that exists only on S;
+/// 2. blank rows — the banner card shifts the top-anchored transcript by
+///    its rows while the input box/footer stay bottom-anchored, so the
+///    empty region between them differs in height. Content rows, their
+///    order and the chrome (header, box, footer) are all compared.
+/// 3. the boot logo (L's transcript is empty before the first turn; S's
+///    never is — it holds the banner) and the in-process extension-loader
+///    toast (`Extensions / ✓ Loaded N extension`): the attach client has no
+///    extension host — the daemon loads them (documented phase-3 limitation).
+fn normalise_socket(frame: &str) -> String {
+    let attached = regex::Regex::new(r"^\s*attached to <id> as client #\d+ \([A-Za-z]+\).*$").unwrap();
+    let toast_box = regex::Regex::new(r"^\s+[╭╰]─+[╮╯]\s*$").unwrap();
+    let toast_in_rule = regex::Regex::new(r"^─+╭─+╮─+$").unwrap();
+    let rule: String = "─".repeat(COLS as usize);
+    normalise(frame)
+        .lines()
+        .map(|l| if toast_in_rule.is_match(l) { rule.clone() } else { l.to_string() })
+        .filter(|l| {
+            !attached.is_match(l)
+                && !l.trim().is_empty()
+                && !l.contains('█')
+                && !l.contains("neural interface ready")
+                && !l.contains("│Extensions")
+                && !l.contains("Loaded 1 extension")
+                && !toast_box.is_match(l)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Journal diff for L≡S: the session `.json` files only. `index.jsonl`
+/// (start/end lifecycle events) is dropped — S's `/quit` is a `Detach`, the
+/// daemon session lives on, so its `end` event is written later (or never
+/// in the test's window). Documented drop.
+fn normalise_journal_socket(dir: &Path) -> String {
+    let tmp = tempfile::TempDir::new().unwrap();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if e.path().is_file() && name.to_string_lossy().ends_with(".json") {
+                let _ = std::fs::copy(e.path(), tmp.path().join(name));
+            }
+        }
+    }
+    normalise_journal(tmp.path())
+}
+
+/// Copy a pane's sessions dir under `target/tui-e2e/<scenario>.<tag>.sessions/`
+/// so a journal diff can be inspected after the temp HOME is gone.
+fn keep_sessions(out_dir: &Path, scenario: &str, tag: &str, home: &Path) {
+    let dst = out_dir.join(format!("{scenario}.{tag}.sessions"));
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::create_dir_all(&dst);
+    if let Ok(rd) = std::fs::read_dir(home.join(".synaps-cli/sessions")) {
+        for e in rd.flatten() {
+            if e.path().is_file() {
+                let _ = std::fs::copy(e.path(), dst.join(e.file_name()));
+            }
+        }
+    }
+}
+
+fn pane_env(home: &Path, base: &Path, base_url: &str) -> String {
+    format!(
+        "HOME={h} SYNAPS_BASE_DIR={b} SYNAPS_ANTHROPIC_BASE_URL={u} SYNAPS_NO_BOOT_FX=1 TERM=xterm-256color COLUMNS={c} LINES={r}",
+        h = home.display(),
+        b = base.display(),
+        u = base_url,
+        c = COLS,
+        r = ROWS,
+    )
+}
+
+fn prepare_home(extensions: bool) -> (tempfile::TempDir, PathBuf) {
+    let home = tempfile::TempDir::new().unwrap();
+    let base = home.path().join(".synaps-cli");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("config"), "theme = \"default\"\n").unwrap();
+    std::fs::write(base.join("auth.json"), phase2::synthetic_auth_json()).unwrap();
+    if extensions {
+        plant_extension(&base);
+    }
+    (home, base)
+}
+
+/// S pane: a daemon (`synaps daemon --foreground`) in a private HOME on
+/// `base_url`, then `synaps --attach` (creates the session) in tmux.
+fn spawn_socket_pane(name: &str, bin: &Path, base_url: &str, extensions: bool) -> Pane {
+    let (home, base) = prepare_home(extensions);
+    let run = home.path().join("run");
+    let mut daemon = Command::new(bin);
+    daemon
+        .args(["daemon", "--foreground"])
+        .env("HOME", home.path())
+        .env("SYNAPS_BASE_DIR", &base)
+        .env("SYNAPS_ANTHROPIC_BASE_URL", base_url)
+        .env("SYNAPS_DAEMON", "1")
+        .env("SYNAPS_RUNTIME_DIR", &run)
+        .env("SYNAPS_DAEMON_PARK_GRACE_SECS", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = daemon.spawn().expect("spawn daemon");
+    let sock = run.join("daemon.sock");
+    for _ in 0..500 {
+        if sock.exists() && run.join("daemon.json").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sock.exists(), "daemon socket never appeared at {}", sock.display());
+    // The listener may exist a beat before the accept loop; give it a moment.
+    std::thread::sleep(Duration::from_millis(150));
+    let env = format!(
+        "{} SYNAPS_DAEMON=1 SYNAPS_RUNTIME_DIR={}",
+        pane_env(home.path(), &base, base_url),
+        run.display()
+    );
+    let cmd = format!(
+        "exec env {env} {} --attach {}",
+        bin.display(),
+        if extensions { "" } else { "--no-extensions" }
+    );
+    tmux(&["new", "-d", "-s", name, "-x", &COLS.to_string(), "-y", &ROWS.to_string(), &cmd]);
+    wait_ready(name);
+    Pane { name: name.to_string(), home, daemon: Some(child) }
 }
 
 fn plant_extension(base: &Path) {
@@ -373,22 +520,8 @@ fn plant_extension(base: &Path) {
 }
 
 fn spawn_pane(name: &str, bin: &Path, base_url: &str, extensions: bool) -> Pane {
-    let home = tempfile::TempDir::new().unwrap();
-    let base = home.path().join(".synaps-cli");
-    std::fs::create_dir_all(&base).unwrap();
-    std::fs::write(base.join("config"), "theme = \"default\"\n").unwrap();
-    std::fs::write(base.join("auth.json"), phase2::synthetic_auth_json()).unwrap();
-    if extensions {
-        plant_extension(&base);
-    }
-    let env = format!(
-        "HOME={h} SYNAPS_BASE_DIR={b} SYNAPS_ANTHROPIC_BASE_URL={u} SYNAPS_NO_BOOT_FX=1 TERM=xterm-256color COLUMNS={c} LINES={r}",
-        h = home.path().display(),
-        b = base.display(),
-        u = base_url,
-        c = COLS,
-        r = ROWS,
-    );
+    let (home, base) = prepare_home(extensions);
+    let env = pane_env(home.path(), &base, base_url);
     let cmd = format!(
         "exec env {env} {} {}",
         bin.display(),
@@ -409,6 +542,7 @@ fn spawn_pane(name: &str, bin: &Path, base_url: &str, extensions: bool) -> Pane 
     Pane {
         name: name.to_string(),
         home,
+        daemon: None,
     }
 }
 
@@ -428,9 +562,10 @@ fn drive(panes: &[&Pane], steps: &[Step], captures: &mut Vec<(String, Vec<String
             Step::Wait(ms) => std::thread::sleep(Duration::from_millis(*ms)),
             Step::Capture(label) => {
                 std::thread::sleep(Duration::from_millis(300));
+                // Raw captures; each diff applies its own normaliser.
                 let frames = panes
                     .iter()
-                    .map(|p| normalise(&tmux(&["capture-pane", "-pt", &p.name])))
+                    .map(|p| tmux(&["capture-pane", "-pt", &p.name]))
                     .collect();
                 captures.push((label.to_string(), frames));
             }
@@ -439,13 +574,21 @@ fn drive(panes: &[&Pane], steps: &[Step], captures: &mut Vec<(String, Vec<String
 }
 
 fn diff_report(label: &str, a: &str, b: &str) -> Option<String> {
+    diff_report_named(label, ("R", a), ("L", b))
+}
+
+fn diff_report_named(label: &str, (na, a): (&str, &str), (nb, b): (&str, &str)) -> Option<String> {
     if a == b {
         return None;
     }
-    let mut out = format!("--- {label}: reference vs new ---\n");
-    for (i, (la, lb)) in a.lines().zip(b.lines()).enumerate() {
-        if la != lb {
-            out.push_str(&format!("{i:3}| R: {la}\n   | L: {lb}\n"));
+    let mut out = format!("--- {label}: {na} vs {nb} ---\n");
+    let la: Vec<&str> = a.lines().collect();
+    let lb: Vec<&str> = b.lines().collect();
+    for i in 0..la.len().max(lb.len()) {
+        let x = la.get(i).copied().unwrap_or("<none>");
+        let y = lb.get(i).copied().unwrap_or("<none>");
+        if x != y {
+            out.push_str(&format!("{i:3}| {na}: {x}\n   | {nb}: {y}\n"));
         }
     }
     Some(out)
@@ -461,8 +604,11 @@ async fn tui_reference_binary_differential() {
     let ref_bin = PathBuf::from(std::env::var("SYNAPS_REF_BIN").expect("SYNAPS_REF_BIN"));
     let new_bin = PathBuf::from(env!("CARGO_BIN_EXE_synaps"));
     let only = std::env::var("SYNAPS_TUI_E2E_ONLY").ok();
+    let socket = std::env::var("SYNAPS_TUI_E2E_SOCKET").ok().as_deref() == Some("1");
     let mut failures = Vec::new();
+    let mut socket_failures = Vec::new();
     let mut table: Vec<(&'static str, bool)> = Vec::new();
+    let mut socket_table: Vec<(&'static str, bool)> = Vec::new();
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tui-e2e");
     let _ = std::fs::create_dir_all(&out_dir);
 
@@ -477,35 +623,77 @@ async fn tui_reference_binary_differential() {
         let (url_l, _h2, _b2) = spawn_stub(sc.script.clone()).await;
         let r = spawn_pane("r", &ref_bin, &url_r, sc.extensions);
         let l = spawn_pane("l", &new_bin, &url_l, sc.extensions);
+        let s_pane = if socket {
+            let (url_s, _h3, _b3) = spawn_stub(sc.script.clone()).await;
+            // Keep the stub alive for the scenario.
+            std::mem::forget((_h3, _b3));
+            Some(spawn_socket_pane("s", &new_bin, &url_s, sc.extensions))
+        } else {
+            None
+        };
         let mut captures = Vec::new();
-        drive(&[&r, &l], &sc.steps, &mut captures);
-        // Quit both so the journals are flushed.
-        for p in [&r, &l] {
+        let mut panes: Vec<&Pane> = vec![&r, &l];
+        if let Some(s) = &s_pane {
+            panes.push(s);
+        }
+        drive(&panes, &sc.steps, &mut captures);
+        // Quit all so the journals are flushed.
+        for p in &panes {
             tmux(&["send-keys", "-t", &p.name, "-l", "/quit"]);
             tmux(&["send-keys", "-t", &p.name, "Enter"]);
         }
         std::thread::sleep(Duration::from_millis(1500));
         let before = failures.len();
         for (label, frames) in &captures {
-            let _ = std::fs::write(
-                out_dir.join(format!("{}.{label}.ref.txt", sc.name)),
-                &frames[0],
-            );
-            let _ = std::fs::write(
-                out_dir.join(format!("{}.{label}.new.txt", sc.name)),
-                &frames[1],
-            );
-            if let Some(d) = diff_report(&format!("{}/{label}", sc.name), &frames[0], &frames[1]) {
+            let fr = normalise(&frames[0]);
+            let fl = normalise(&frames[1]);
+            let _ = std::fs::write(out_dir.join(format!("{}.{label}.ref.txt", sc.name)), &fr);
+            let _ = std::fs::write(out_dir.join(format!("{}.{label}.new.txt", sc.name)), &fl);
+            if let Some(d) = diff_report(&format!("{}/{label}", sc.name), &fr, &fl) {
                 failures.push(d);
             }
         }
+        keep_sessions(&out_dir, sc.name, "ref", r.home.path());
+        keep_sessions(&out_dir, sc.name, "new", l.home.path());
         let jr = normalise_journal(&r.home.path().join(".synaps-cli/sessions"));
         let jl = normalise_journal(&l.home.path().join(".synaps-cli/sessions"));
         if let Some(d) = diff_report(&format!("{}/journal", sc.name), &jr, &jl) {
             failures.push(d);
         }
         table.push((sc.name, failures.len() == before));
+        if let Some(s) = &s_pane {
+            let before = socket_failures.len();
+            for (label, frames) in &captures {
+                let fl = normalise_socket(&frames[1]);
+                let fs = normalise_socket(&frames[2]);
+                let _ = std::fs::write(out_dir.join(format!("{}.{label}.sock.txt", sc.name)), &fs);
+                if let Some(d) = diff_report_named(&format!("{}/{label}", sc.name), ("L", &fl), ("S", &fs)) {
+                    socket_failures.push(d);
+                }
+            }
+            // The daemon writes S's journal; give the detach a beat, then stop it.
+            std::thread::sleep(Duration::from_millis(500));
+            keep_sessions(&out_dir, sc.name, "sock", s.home.path());
+            let jl = normalise_journal_socket(&l.home.path().join(".synaps-cli/sessions"));
+            let js = normalise_journal_socket(&s.home.path().join(".synaps-cli/sessions"));
+            if let Some(d) = diff_report_named(&format!("{}/journal", sc.name), ("L", &jl), ("S", &js)) {
+                socket_failures.push(d);
+            }
+            socket_table.push((sc.name, socket_failures.len() == before));
+        }
+        drop(s_pane);
         tmux(&["kill-server"]);
+    }
+    if socket {
+        println!("scenario                   L≡S?");
+        for (name, ok) in &socket_table {
+            println!("{name:<26} {}", if *ok { "yes" } else { "NO" });
+        }
+        if socket_failures.is_empty() {
+            println!("SOCKET DIFF: empty ({})", socket_table.len());
+        } else {
+            println!("SOCKET DIFF:\n{}", socket_failures.join("\n"));
+        }
     }
     println!("scenario                   diff empty?");
     for (name, ok) in &table {
@@ -516,4 +704,5 @@ async fn tui_reference_binary_differential() {
     } else {
         panic!("REFERENCE DIFF:\n{}", failures.join("\n"));
     }
+    assert!(socket_failures.is_empty(), "SOCKET DIFF not empty (see above)");
 }

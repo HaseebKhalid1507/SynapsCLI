@@ -34,6 +34,7 @@ pub struct Connected {
     /// Remembered for `reconnect`.
     path: PathBuf,
     hello: Hello,
+    buf: FrameBuf,
 }
 
 pub struct Pong {
@@ -42,13 +43,40 @@ pub struct Pong {
     pub sessions: usize,
 }
 
-async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<DaemonFrame>, TransportError> {
-    let mut line = String::new();
+/// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
+/// frame grows it once; after any frame > 1 MiB it shrinks back to 64 KiB so
+/// the peak is not retained for the life of the connection (§2.1 #1).
+pub struct FrameBuf {
+    line: Vec<u8>,
+    /// Length of the last decoded frame (bytes, without the newline).
+    last_frame_bytes: usize,
+}
+
+const FRAME_BUF_KEEP: usize = 64 * 1024;
+const FRAME_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
+
+impl Default for FrameBuf {
+    fn default() -> Self {
+        Self { line: Vec::new(), last_frame_bytes: 0 }
+    }
+}
+
+impl FrameBuf {
+    fn after_frame(&mut self, n: usize) {
+        self.last_frame_bytes = n;
+        if self.line.capacity() > FRAME_BUF_SHRINK_ABOVE {
+            self.line = Vec::new();
+            self.line.reserve(FRAME_BUF_KEEP);
+        }
+    }
+}
+
+async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
     loop {
-        line.clear();
+        buf.line.clear();
         // `take` bounds the read so an oversize frame cannot grow memory.
         let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
-            .read_line(&mut line)
+            .read_until(b'\n', &mut buf.line)
             .await?;
         if n == 0 {
             return Ok(None);
@@ -56,13 +84,16 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Daem
         if n > MAX_FRAME_BYTES {
             return Err(TransportError::Protocol(frame_limit_msg()));
         }
-        let t = line.trim_end();
+        let t = std::str::from_utf8(&buf.line)
+            .map_err(|e| TransportError::Protocol(format!("frame is not utf-8: {e}")))?
+            .trim_end();
         if t.is_empty() {
             continue;
         }
-        return decode_line::<DaemonFrame>(t)
-            .map(Some)
-            .map_err(TransportError::Protocol);
+        let decoded = decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol);
+        let len = t.len();
+        buf.after_frame(len);
+        return decoded;
     }
 }
 
@@ -102,11 +133,12 @@ impl Connected {
         let (writer, writer_task) = spawn_writer(w);
         let client_version = hello.protocol_version;
         let hello_copy = hello.clone();
+        let mut buf = FrameBuf::default();
         writer
             .send(ClientFrame::Hello(hello))
             .await
             .map_err(|_| TransportError::Closed)?;
-        let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut reader))
+        let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut reader, &mut buf))
             .await
             .map_err(|_| TransportError::Protocol("handshake timed out".into()))??;
         match frame {
@@ -114,7 +146,7 @@ impl Connected {
                 if welcome.protocol_version != client_version {
                     return Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version });
                 }
-                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy })
+                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf })
             }
             Some(DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version, .. }, .. }) => {
                 Err(TransportError::Version { client: client_version, daemon: daemon_version })
@@ -129,7 +161,7 @@ impl Connected {
 
     async fn request(&mut self, frame: ClientFrame) -> Result<DaemonFrame, TransportError> {
         self.writer.send(frame).await.map_err(|_| TransportError::Closed)?;
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut self.reader))
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
             .await
             .map_err(|_| TransportError::Protocol("reply timed out".into()))??
             .ok_or(TransportError::Closed)
@@ -192,12 +224,16 @@ pub struct SocketTransport {
     /// Why `next_event` returned `None` (`Reloading{generation}` after a
     /// reload announcement) — the TUI branches to `reconnect` on it.
     last_error: Option<TransportError>,
-    /// Local `api_messages` mirror: seeded by `Attached`, updated by
-    /// `Stream(MessageHistory)` and `QueryResult{DIGEST_RESYNC_QUERY_ID}`.
-    /// `Conversation` arrives as a digest; the mirror fills it in.
+    /// Local `api_messages` mirror (`HistoryMode::Full` only): seeded by
+    /// `Attached`, updated by `Stream(MessageHistory)` and
+    /// `QueryResult{DIGEST_RESYNC_QUERY_ID}`. `Conversation` arrives as a
+    /// digest; the mirror fills it in. Empty forever in `Digest` mode.
     messages: Vec<crate::SharedMessage>,
-    /// Digest awaiting a `Messages` re-query (hash miss).
+    /// Digest awaiting a `Messages` re-query (hash miss; Full mode only).
     pending_digest: Option<ConversationDigest>,
+    /// What we asked for in `Hello` (phase 4 §2.3).
+    history: HistoryMode,
+    buf: FrameBuf,
 }
 
 impl SocketTransport {
@@ -227,7 +263,7 @@ impl SocketTransport {
         let budget = if parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
         let deadline = tokio::time::Instant::now() + budget;
         let attached = loop {
-            let frame = tokio::time::timeout_at(deadline, read_frame(&mut conn.reader))
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut conn.reader, &mut conn.buf))
                 .await
                 .map_err(|_| TransportError::Protocol("attach timed out".into()))??;
             match frame {
@@ -245,6 +281,11 @@ impl SocketTransport {
         let (client, snapshot) = attached.into_snapshot();
         let meta = snapshot.meta.clone();
         let view = Arc::new(arc_swap::ArcSwap::from_pointee(snapshot.view.clone()));
+        let history = conn.hello.client.history;
+        let messages = match history {
+            HistoryMode::Full => snapshot.conversation.api_messages.clone(),
+            HistoryMode::Digest => Vec::new(),
+        };
         Ok((
             Self {
                 reader: conn.reader,
@@ -262,8 +303,10 @@ impl SocketTransport {
                 hello: conn.hello,
                 reload_pending: None,
                 last_error: None,
-                messages: snapshot.conversation.api_messages.clone(),
+                messages,
                 pending_digest: None,
+                history,
+                buf: conn.buf,
             },
             snapshot,
         ))
@@ -313,7 +356,7 @@ impl SocketTransport {
             .map_err(|_| TransportError::Closed)?;
         // Drain + checkpoint can take a while: wait up to drain + 60 s.
         let budget = Duration::from_secs(drain_secs.unwrap_or(30) + 60);
-        let frame = tokio::time::timeout(budget, read_frame(&mut c.reader))
+        let frame = tokio::time::timeout(budget, read_frame(&mut c.reader, &mut c.buf))
             .await
             .map_err(|_| TransportError::Protocol("reload reply timed out".into()))??;
         match frame {
@@ -339,9 +382,20 @@ impl SocketTransport {
         Envelope { session_id: self.session.clone(), seq: u64::MAX, ts: chrono::Utc::now(), event: SessionEventWire::SystemNotice(text) }
     }
 
-    /// The client's view of `api_messages` (kept current by the digest protocol).
+    /// The client's view of `api_messages` (kept current by the digest
+    /// protocol in `Full` mode; always empty in `Digest` mode).
     pub fn messages(&self) -> &[crate::SharedMessage] {
         &self.messages
+    }
+
+    /// Length in bytes of the last frame decoded on this connection
+    /// (the `Attached` frame right after `attach`).
+    pub fn last_frame_bytes(&self) -> usize {
+        self.buf.last_frame_bytes
+    }
+
+    pub fn history_mode(&self) -> HistoryMode {
+        self.history
     }
 
     /// Turn a wire envelope into the in-process one, keeping the message
@@ -349,6 +403,9 @@ impl SocketTransport {
     /// needs a re-query first — the `Conversation` is re-emitted once the
     /// `Messages` result lands).
     fn absorb(&mut self, w: WireEnvelope) -> Option<Envelope> {
+        if self.history == HistoryMode::Digest {
+            return self.absorb_digest(w);
+        }
         match w.event {
             WireSessionEvent::Conversation { digest } => {
                 if digest.matches(&self.messages) {
@@ -400,6 +457,32 @@ impl SocketTransport {
     }
 }
 
+impl SocketTransport {
+    /// `HistoryMode::Digest`: no mirror, no `matches()` re-serialisation, no
+    /// `Query{Messages}`. `Conversation` is passed through with an empty
+    /// `api_messages` (`messages_len` from the digest); a stray
+    /// `MessageHistory` is dropped (the daemon should not send one).
+    fn absorb_digest(&mut self, w: WireEnvelope) -> Option<Envelope> {
+        match w.event {
+            WireSessionEvent::Conversation { digest } => {
+                let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
+                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+            }
+            WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
+            event => {
+                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                if matches!(
+                    env.event,
+                    SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(_)))
+                ) {
+                    return None;
+                }
+                Some(env)
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ClientTransport for SocketTransport {
     fn session_id(&self) -> &SessionId {
@@ -429,7 +512,7 @@ impl ClientTransport for SocketTransport {
             return None;
         }
         loop {
-            match read_frame(&mut self.reader).await {
+            match read_frame(&mut self.reader, &mut self.buf).await {
                 Ok(Some(DaemonFrame::Event(w))) => {
                     let Some(env) = self.absorb(w) else { continue };
                     match &env.event {
@@ -596,6 +679,7 @@ mod tests {
                         pending_prompts: vec![],
                         clients: vec![],
                         input_owner: Some(ClientId(7)),
+                        display_tail: None,
                     },
                 )),
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {

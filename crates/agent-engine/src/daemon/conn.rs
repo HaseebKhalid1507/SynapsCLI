@@ -19,6 +19,7 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
+use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -278,6 +279,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     };
 
     // ── attach ──
+    let mut attached_to_live = false;
     let (handle, mode) = match attach {
         Attach::Existing { session_id, mode } => match state.attach(&session_id) {
             Some(h) => (h, mode),
@@ -307,7 +309,21 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     return;
                 }
             }
+            // `--continue X` while X is live here: the host hands back the
+            // running actor (attach-if-live). Tell the client — it asked to
+            // create and got the existing session instead. Detected by id
+            // presence before/after so a client-less Parked target counts too.
+            let before: Vec<SessionId> = if config.continue_session.is_some() {
+                state.live_sessions().into_iter().map(|h| h.id).collect()
+            } else {
+                Vec::new()
+            };
             match state.create(config).await {
+                Ok(h) if before.contains(&h.id) => {
+                    tracing::info!(session = %h.id, "daemon: continue target is live — attaching, not creating");
+                    attached_to_live = true;
+                    (h, mode)
+                }
                 Ok(h) => (h, mode),
                 Err(e) => {
                     let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("create session: {e}") }).await;
@@ -361,12 +377,35 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         return;
     }
     tracing::debug!(session = %handle.id, client = client.0, "daemon: client attached");
+    if attached_to_live {
+        let env = Envelope {
+            session_id: handle.id.clone(),
+            seq: u64::MAX,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::SystemNotice(format!(
+                "session {} is already running in this daemon — attached to it instead of creating a second copy",
+                handle.id
+            )),
+        };
+        let _ = tx.send(DaemonFrame::Event(env.into())).await;
+    }
 
     // ── pump ──
     let sid = handle.id.clone();
     let fwd_tx = tx.clone();
     let fwd_handle = handle.clone();
     let fwd_announce = state.announce();
+    // Phase 4 §2.3: Digest clients never receive the per-round full history;
+    // the `Conversation` digest the actor emits right after is what they key on.
+    let history = hello.client.history;
+    let skip = move |env: &Envelope| -> bool {
+        matches!(env.event, SessionEventWire::Attached { .. })
+            || (history == HistoryMode::Digest
+                && matches!(
+                    env.event,
+                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+                ))
+    };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -378,7 +417,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
                     while let Ok(env) = rx.try_recv() {
-                        if matches!(env.event, SessionEventWire::Attached { .. }) {
+                        if skip(&env) {
                             continue;
                         }
                         if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
@@ -391,7 +430,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             match next {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
-                    if matches!(env.event, SessionEventWire::Attached { .. }) {
+                    if skip(&env) {
                         continue;
                     }
                     let ended = matches!(env.event, SessionEventWire::Ended { .. });

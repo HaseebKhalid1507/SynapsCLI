@@ -128,6 +128,52 @@ impl Drop for DaemonLock {
     }
 }
 
+impl DaemonPaths {
+    /// `<stem>.spawn.lock` next to the flock: held by the one client that
+    /// is spawning the daemon (jcode's spawn lock). Never the liveness oracle.
+    pub fn spawn_lock(&self) -> std::path::PathBuf {
+        self.lock.with_extension("spawn.lock")
+    }
+}
+
+/// Held while a client spawns the daemon; dropping releases it.
+#[derive(Debug)]
+pub struct SpawnLock {
+    file: File,
+}
+
+impl SpawnLock {
+    /// `flock(LOCK_EX|LOCK_NB)` on the spawn lock, retried for up to `wait`
+    /// (a loser waits for the winner's spawn to finish, then re-probes the
+    /// daemon flock). `TimedOut` if the holder never lets go.
+    pub fn acquire(paths: &DaemonPaths, wait: std::time::Duration) -> io::Result<Self> {
+        let path = paths.spawn_lock();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        chmod_600(&path);
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if FileExt::try_lock_exclusive(&file)? {
+                return Ok(Self { file });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "another client is still spawning the daemon"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for SpawnLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 /// Liveness probe: try to take the lock; success means nobody holds it
 /// (dead or never started) — release immediately. Never unlinks anything.
 pub fn is_alive(paths: &DaemonPaths) -> bool {
@@ -176,6 +222,17 @@ mod tests {
         assert!(DaemonLock::try_acquire(&p).unwrap().is_none(), "second holder refused");
         drop(guard);
         assert!(!is_alive(&p));
+    }
+
+    #[test]
+    fn spawn_lock_is_exclusive_and_waits() {
+        let (_d, p) = paths();
+        let a = SpawnLock::acquire(&p, std::time::Duration::from_millis(10)).unwrap();
+        let err = SpawnLock::acquire(&p, std::time::Duration::from_millis(120)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        drop(a);
+        SpawnLock::acquire(&p, std::time::Duration::from_millis(10)).unwrap();
+        assert!(!is_alive(&p), "the spawn lock is not the liveness oracle");
     }
 
     #[test]

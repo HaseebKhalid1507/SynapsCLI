@@ -90,6 +90,11 @@ pub struct SessionConfig {
     /// Never `Park` this session (`--keep-warm`). Default `false`.
     #[serde(default)]
     pub keep_warm: bool,
+    /// `--name`: name the session at create (same rules as `/cmd saveas`;
+    /// must be unique among saved sessions). Applied before the registry
+    /// entry is written so `synaps send --session <name>` resolves at once.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -128,6 +133,7 @@ impl Default for SessionConfig {
             compaction_policy: CompactionPolicyWire::InPlace,
             await_extensions: true,
             keep_warm: false,
+            name: None,
         }
     }
 }
@@ -211,6 +217,28 @@ pub struct ClientMeta {
     pub terminal: Option<String>,
     /// Client-generated uuid; reattach dedup (day 3).
     pub instance: String,
+    /// How much history this client wants mirrored (phase 4).
+    #[serde(default)]
+    pub history: HistoryMode,
+    /// Display items in `Attached.display_tail` / `DisplayTail` queries (phase 4).
+    #[serde(default = "default_tail_items")]
+    pub tail_items: usize,
+}
+
+/// Default for `ClientMeta.tail_items`: matches the TUI's resumed-display cap.
+pub const DEFAULT_TAIL_ITEMS: usize = 120;
+
+fn default_tail_items() -> usize {
+    DEFAULT_TAIL_ITEMS
+}
+
+/// `SYNAPS_ATTACH_TAIL_ITEMS` (client side): display items requested in
+/// `Attached.display_tail`; `DEFAULT_TAIL_ITEMS` when unset/invalid.
+pub fn tail_items_from_env() -> usize {
+    std::env::var("SYNAPS_ATTACH_TAIL_ITEMS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TAIL_ITEMS)
 }
 
 impl ClientMeta {
@@ -220,7 +248,38 @@ impl ClientMeta {
             kind,
             terminal: None,
             instance: uuid::Uuid::new_v4().to_string(),
+            history: HistoryMode::default(),
+            tail_items: tail_items_from_env(),
         }
+    }
+}
+
+/// What a client wants in `Attached` / `Conversation`: the full
+/// `api_messages` mirror (`Full`, the 741b6b60 behaviour) or only the
+/// digest + a daemon-side display tail (`Digest`, phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    #[default]
+    Full,
+    Digest,
+}
+
+impl HistoryMode {
+    /// `SYNAPS_CLIENT_HISTORY=full|digest`; `default` wins when unset or
+    /// unrecognised.
+    pub fn from_env_or(default: Self) -> Self {
+        match std::env::var("SYNAPS_CLIENT_HISTORY").ok().as_deref().map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("full") => Self::Full,
+            Some(v) if v.eq_ignore_ascii_case("digest") => Self::Digest,
+            _ => default,
+        }
+    }
+
+    /// What `synaps --attach` asks for (phase 4 B7: `Digest`).
+    /// `SYNAPS_CLIENT_HISTORY=full` restores the 741b6b60 mirror wholesale.
+    pub fn attach_client_default() -> Self {
+        Self::Digest
     }
 }
 
@@ -266,13 +325,18 @@ pub enum PromptKind {
 }
 
 /// Fixed title `resolve_before_tool_call_result` uses for Confirm prompts
-/// (runtime/mod.rs). Everything else is `Secret`.
+/// (runtime/mod.rs).
 pub const CONFIRM_PROMPT_TITLE: &str = "Confirm tool call";
+/// Fixed title `confirm_activation_with_host` uses for the `activate_tools`
+/// y/yes gate (tools/discovery.rs). Everything not in the confirm set is
+/// `Secret` (masked input).
+pub const CONFIRM_ACTIVATION_PROMPT_TITLE: &str = "Confirm tool activation";
 
 impl PromptKind {
-    /// Derive the kind from the prompt title (the actor classifies at receipt).
+    /// Derive the kind from the prompt title (the actor classifies at receipt;
+    /// `SecretPromptHandle::prompt` classifies for the in-process TUI).
     pub fn from_title(title: &str) -> Self {
-        if title == CONFIRM_PROMPT_TITLE {
+        if title == CONFIRM_PROMPT_TITLE || title == CONFIRM_ACTIVATION_PROMPT_TITLE {
             Self::Confirm
         } else {
             Self::Secret
@@ -544,6 +608,8 @@ pub enum SessionQuery {
     ContextAssessment,
     /// `engine::commands::context_command(runtime, Some(api_messages))` text.
     ContextReport,
+    /// `display::DisplayTail` of the last `items` display items (phase 4).
+    DisplayTail { items: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,6 +762,10 @@ pub struct ConversationSnapshot {
     #[serde(default)]
     pub header: SessionHeader,
     pub api_messages: Vec<crate::SharedMessage>,
+    /// `api_messages.len()` on the daemon — always filled by the actor;
+    /// `api_messages` itself may be empty for `HistoryMode::Digest` clients.
+    #[serde(default)]
+    pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
     pub abort_context: Option<String>,
@@ -748,6 +818,9 @@ pub struct AttachSnapshot {
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
     pub input_owner: Option<ClientId>,
+    /// Daemon-projected display tail — `Some` iff the client attached with
+    /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
+    pub display_tail: Option<crate::session::display::DisplayTail>,
 }
 
 /// `ReasoningLevel` has no serde impls in agent-core; go through its
@@ -774,6 +847,10 @@ mod tests {
     #[test]
     fn prompt_kind_from_title() {
         assert_eq!(PromptKind::from_title("Confirm tool call"), PromptKind::Confirm);
+        assert_eq!(
+            PromptKind::from_title("Confirm tool activation"),
+            PromptKind::Confirm
+        );
         assert_eq!(PromptKind::from_title("API key"), PromptKind::Secret);
     }
 

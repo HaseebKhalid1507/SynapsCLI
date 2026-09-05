@@ -346,6 +346,7 @@ impl PromptBridge {
         let _ = self
             .secret_prompt_tx
             .send(synaps_cli::tools::SecretPromptRequest {
+                kind: req.kind,
                 title: req.title,
                 prompt: req.prompt,
                 response_tx,

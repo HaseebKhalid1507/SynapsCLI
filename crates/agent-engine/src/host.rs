@@ -385,33 +385,51 @@ impl EngineHost {
         map.values().cloned().collect()
     }
 
-    /// Resolve a `continue_session` request the same way
-    /// `setup::resolve_or_create_session` will (chain → name → partial id;
-    /// `Some(None)` = latest by mtime) and return the live handle if that
-    /// session is already running here. Resolution failures return `None`
-    /// so the real boot path reports the error.
+    /// Resolve a `continue_session` request against the LIVE sessions
+    /// first — actor id, current journal id (a LinkedSuccessor compaction
+    /// moves it off the actor id), or name (`--name` / `saveas`, which may
+    /// not be on disk yet) — then the way `setup::resolve_or_create_session`
+    /// will (chain → name → partial id; `Some(None)` = latest by mtime) and
+    /// match the resolved id against id *and* journal id. Anything that is
+    /// not running here returns `None` so the real boot path builds/reports.
+    ///
+    /// The daemon's `Attach::Create{continue}` goes through here too
+    /// (`host_factory` → `create_session`): a live journal is always one
+    /// actor, never a second one on the same file / UDS / registry entry.
     fn live_continue_target(
         &self,
         continue_session: &Option<Option<String>>,
     ) -> Option<SessionHandle> {
         let query = continue_session.as_ref()?;
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if sessions.is_empty() {
+        let handles: Vec<SessionHandle> = {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions.values().filter(|h| h.is_alive()).cloned().collect()
+        };
+        if handles.is_empty() {
             return None;
         }
+        let by_id = |id: &str| {
+            handles
+                .iter()
+                .find(|h| h.id.as_str() == id || h.journal_id() == id)
+                .cloned()
+        };
         let id = match query {
             Some(q) => {
-                if let Some(h) = sessions.get(&SessionId::from(q.clone())) {
+                if let Some(h) = by_id(q) {
+                    return Some(h);
+                }
+                if let Some(h) = handles.iter().find(|h| h.name().as_deref() == Some(q.as_str())) {
                     return Some(h.clone());
                 }
                 crate::core::session::resolve_session(q).ok()?.id
             }
             None => crate::core::session::latest_session().ok()?.id,
         };
-        sessions.get(&SessionId::from(id)).cloned()
+        by_id(&id)
     }
 
     /// Handle for a live session, if any.

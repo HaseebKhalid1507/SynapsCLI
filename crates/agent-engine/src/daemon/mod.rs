@@ -2,9 +2,11 @@
 //! registry file, lifecycle (PLAN-phase2 §2.11). Lives in `agent-engine`
 //! (S289 D-1 amended) — `agent-tui` must never appear in this graph.
 //!
-//! Gated: `SYNAPS_DAEMON=1` is required for `run_foreground` (exit 3 with a
-//! one-line reason otherwise). Safety properties that are NEVER stubbed:
-//! the flock liveness oracle, the ready-fd pipe, socket perms 0700/0600.
+//! On by default: the first `--attach`/`attach` client auto-spawns the
+//! daemon ([`ensure_running`]); `SYNAPS_DAEMON=0` disables every daemon
+//! feature (exit 3 with a one-line reason). Safety properties that are
+//! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
+//! perms 0700/0600, the spawn lock (one spawner per registry dir).
 
 pub mod conn;
 pub mod lifecycle;
@@ -35,10 +37,29 @@ pub const READY_FD_ENV: &str = "SYNAPS_DAEMON_READY_FD";
 /// How long `spawn_detached` waits for the child's ready byte.
 pub const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `SYNAPS_DAEMON=1` feature flag (§4.4).
+/// `SYNAPS_DAEMON` feature flag: ON unless set to `0`/`false`/`off`/`no`.
+/// `SYNAPS_DAEMON=1` is accepted (no-op, kept for older scripts).
 pub fn enabled() -> bool {
-    matches!(std::env::var("SYNAPS_DAEMON").as_deref(), Ok("1") | Ok("true"))
+    enabled_from(std::env::var("SYNAPS_DAEMON").ok().as_deref())
 }
+
+fn env_is_off(v: Option<&str>) -> bool {
+    matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
+}
+
+fn enabled_from(v: Option<&str>) -> bool {
+    !env_is_off(v)
+}
+
+/// `SYNAPS_DAEMON_AUTOSPAWN`: ON unless `0`/`false`/`off`/`no`. Off means
+/// an attach with no live daemon fails with the "no daemon running" message
+/// instead of starting one.
+pub fn autospawn_enabled() -> bool {
+    !env_is_off(std::env::var("SYNAPS_DAEMON_AUTOSPAWN").ok().as_deref())
+}
+
+/// One-line reason used by every attach path when the flag is off.
+pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
 /// `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` (§4.4).
 pub fn allow_legacy_mcp_env() -> bool {
@@ -531,17 +552,91 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     if let Some(mut err) = child.stderr.take() {
         let _ = err.read_to_string(&mut tail);
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let tail: String = tail.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-    anyhow::bail!("daemon did not become ready within {SPAWN_READY_TIMEOUT:?}\n{tail}")
+    // EOF before `R`: the child is gone (or dying) — collect its status. A
+    // still-running child that just never signalled is killed.
+    let status = child.try_wait().ok().flatten().or_else(|| {
+        let _ = child.kill();
+        child.wait().ok()
+    });
+    let reason = tail
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .map(|l| l.trim_start_matches("synaps daemon: ").to_string());
+    match (status, reason) {
+        (Some(st), Some(r)) if st.code().is_some() => {
+            anyhow::bail!("daemon exited (code {}): {r}", st.code().unwrap_or(-1))
+        }
+        (_, Some(r)) => anyhow::bail!("daemon did not become ready within {SPAWN_READY_TIMEOUT:?}: {r}"),
+        (_, None) => anyhow::bail!("daemon did not become ready within {SPAWN_READY_TIMEOUT:?}"),
+    }
 }
+
+/// Result of [`ensure_running`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ensured {
+    /// A daemon already held the flock.
+    Running,
+    /// We spawned one (pid) and it signalled ready.
+    Spawned(u32),
+}
+
+/// Why [`ensure_running`] could not hand back a live daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsureError {
+    /// `SYNAPS_DAEMON_AUTOSPAWN=0` and nobody is running.
+    AutospawnDisabled,
+    /// The spawn failed or the child refused/died: one-line reason.
+    Spawn(String),
+}
+
+impl std::fmt::Display for EnsureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutospawnDisabled => write!(f, "no daemon running (SYNAPS_DAEMON_AUTOSPAWN=0)"),
+            Self::Spawn(r) => write!(f, "{r}"),
+        }
+    }
+}
+
+/// How long a second first-client waits for the spawn lock (the winner's
+/// `spawn_detached` is bounded by [`SPAWN_READY_TIMEOUT`]).
+const SPAWN_LOCK_WAIT: Duration = SPAWN_READY_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+/// Attach-path entry: a live daemon or a freshly spawned one (jcode model —
+/// first client spawns via `setsid` + ready-fd; the daemon holds the flock).
+/// The **spawn lock** (`<stem>.spawn.lock` next to the flock) serialises
+/// concurrent first-clients: the loser blocks on it, then re-probes the
+/// flock and finds the winner's daemon. Never touches the socket on
+/// ECONNREFUSED alone — `reap_stale` + the flock decide.
+#[cfg(unix)]
+pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
+    let paths = opts.paths();
+    registry::reap_stale(&paths);
+    if registry::is_alive(&paths) {
+        return Ok(Ensured::Running);
+    }
+    if !autospawn_enabled() {
+        return Err(EnsureError::AutospawnDisabled);
+    }
+    let _ = std::fs::create_dir_all(&paths.dir);
+    let _guard = registry::SpawnLock::acquire(&paths, SPAWN_LOCK_WAIT)
+        .map_err(|e| EnsureError::Spawn(format!("spawn lock {}: {e}", paths.spawn_lock().display())))?;
+    // Somebody may have spawned while we waited.
+    registry::reap_stale(&paths);
+    if registry::is_alive(&paths) {
+        return Ok(Ensured::Running);
+    }
+    spawn_detached(opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
+}
+
 
 /// `synaps daemon --foreground` body: gate → boot host → extension discovery
 /// once → start → wait for SIGTERM/SIGINT/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if !enabled() {
-        anyhow::bail!("synaps daemon is experimental; set SYNAPS_DAEMON=1 to enable (exit {EXIT_REFUSED})");
+        anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
     }
     let host = EngineHost::boot_and_install(crate::HostOpts { profile: opts.profile.clone(), no_extensions: false }).await?;
     if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
@@ -593,4 +688,27 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     });
     daemon.wait().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn enabled_env_matrix() {
+        assert!(enabled_from(None), "unset → on");
+        for on in ["1", "true", "yes", "on", "", "anything"] {
+            assert!(enabled_from(Some(on)), "{on:?} → on");
+        }
+        for off in ["0", "false", "off", "no", "FALSE", " 0 ", "Off"] {
+            assert!(!enabled_from(Some(off)), "{off:?} → off");
+        }
+    }
+
+    #[test]
+    fn env_is_off_is_case_and_space_insensitive() {
+        assert!(env_is_off(Some("NO")));
+        assert!(!env_is_off(Some("1")));
+        assert!(!env_is_off(None));
+    }
 }

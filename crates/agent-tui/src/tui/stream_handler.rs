@@ -59,9 +59,9 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
         StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
             app.on_tool_result(tool_id, result);
         }
-        StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-            app.api_messages = history;
-        }
+        // Digest clients never receive it; in-process the `Conversation`
+        // that follows carries `messages_len` (phase 4 §2.2).
+        StreamEvent::Session(SessionEvent::MessageHistory(_)) => {}
         StreamEvent::Agent(AgentEvent::SubagentStart {
             subagent_id,
             agent_name,
@@ -353,11 +353,11 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Conversation(snap) => {
             app.apply_conversation(&snap);
             if let Some(applied) = app.compaction_applied.take() {
+                super::helpers::rebuild_display_from_conversation(&snap, app, link).await;
                 finish_compaction(app, applied);
             }
             if let Some(pending) = app.resume_pending.take() {
-                let msgs = app.api_messages.clone();
-                super::helpers::rebuild_display_messages(&msgs, app);
+                super::helpers::rebuild_display_from_conversation(&snap, app, link).await;
                 if let Some(notice) = pending.clamp_notice {
                     app.push_msg(ChatMessage::System(notice));
                 }
@@ -445,7 +445,7 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Cleared { .. } => {
             app.transcript.clear();
             app.invalidate();
-            app.api_messages.clear();
+            app.api_messages_len = 0;
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_cache_read_tokens = 0;
@@ -526,7 +526,7 @@ pub(super) async fn handle_session_event_arm(
             if client == me {
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
                 // The pre-send presentation assumed a turn: undo it.
-                if app.streaming && app.turn_baseline == app.api_messages.len() {
+                if app.streaming && app.turn_baseline == app.api_messages_len {
                     app.streaming = false;
                     app.status_text = None;
                     app.drop_empty_thinking();
@@ -564,11 +564,10 @@ pub(super) async fn handle_session_event_arm(
 }
 
 /// `CompactionApplied` + the `Conversation` that followed: the lines the
-/// compaction poll used to push (loop_arms.rs:783-812).
+/// compaction poll used to push (loop_arms.rs:783-812). The transcript was
+/// rebuilt by the caller (`rebuild_display_from_conversation`).
 fn finish_compaction(app: &mut App, applied: super::app::CompactionApplied) {
     let old_id = applied.previous_session_id;
-    let msgs = app.api_messages.clone();
-    super::helpers::rebuild_display_messages(&msgs, app);
     for name in &applied.chains_advanced {
         app.push_msg(ChatMessage::System(format!(
             "chain '{}' advanced: {} → {}",

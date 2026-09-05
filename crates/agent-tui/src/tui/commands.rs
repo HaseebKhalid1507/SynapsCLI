@@ -1110,6 +1110,17 @@ pub(super) async fn handle_command(
                 app.push_msg(ChatMessage::System(lines.join("\n")));
             }
         }
+        // Phase 4: reload the transcript from the engine's history (the
+        // manual recovery path for a Digest client whose DisplayTail
+        // roundtrip failed). In-process it is a harmless rebuild.
+        "resync" => {
+            if super::helpers::reload_display_tail(app, link).await {
+                app.push_msg(ChatMessage::System(format!(
+                    "transcript resynced from session {} ({} messages)",
+                    app.session.id, app.api_messages_len
+                )));
+            }
+        }
         _ => match registry.resolve(cmd) {
             Resolution::Skill(skill) => {
                 return CommandAction::LoadSkill {

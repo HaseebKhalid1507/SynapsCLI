@@ -22,12 +22,20 @@
 //! Stream-START sites inside the `Submit`/`SlashCommand` arms are untouched.
 //! No logic changed.
 
+use super::run_setup::LazyHttp;
 use super::view_model::ViewInputs;
 use super::*;
 
 use std::ops::ControlFlow;
 
-fn spawn_auto_catalog_refreshes(app: &App, http: &reqwest::Client) {
+fn spawn_auto_catalog_refreshes(app: &mut App, http: &LazyHttp) {
+    let http = match http.get() {
+        Ok(c) => c,
+        Err(e) => {
+            app.push_msg(ChatMessage::Error(format!("http client: {e}")));
+            return;
+        }
+    };
     for &provider_key in models::auto_refresh_catalog_providers() {
         let client = http.clone();
         let tx = app.model_list_tx.clone();
@@ -79,7 +87,7 @@ pub(crate) struct LoopState<'a> {
     /// The session behind its transport (+ the published `RuntimeView`).
     pub link: &'a mut session_link::SessionLink,
     /// Client-local HTTP client for catalog/model-list fetches.
-    pub http: &'a reqwest::Client,
+    pub http: &'a LazyHttp,
     pub config: &'a mut synaps_cli::SynapsConfig,
     pub registry: &'a std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     pub keybind_registry:
@@ -125,7 +133,7 @@ fn begin_turn_presentation(
 ) {
     app.status_text = Some("connecting…".to_string());
     app.streaming = true;
-    app.turn_baseline = app.api_messages.len();
+    app.turn_baseline = app.api_messages_len;
     app.spinner_frame = 0;
     let term_size = crossterm::terminal::size()
         .map(|(w, h)| ratatui::layout::Size {
@@ -393,7 +401,7 @@ pub(crate) async fn handle_input_action(
                     custom_instructions,
                 } => {
                     // Need at least 2 full turns (user + assistant = 2 messages each).
-                    if app.api_messages.len() < 4 {
+                    if app.api_messages_len < 4 {
                         app.push_msg(ChatMessage::System(
                             "nothing to compact (need at least 2 turns)".to_string(),
                         ));
@@ -423,7 +431,7 @@ pub(crate) async fn handle_input_action(
                         } else {
                             app.session.title.clone()
                         },
-                        app.api_messages.len(),
+                        app.api_messages_len,
                     ));
 
                     // Walk backward through parents
@@ -1414,7 +1422,13 @@ pub(crate) async fn handle_input_action(
                 });
                 return ControlFlow::Continue(());
             }
-            let client = http.clone();
+            let client = match http.get() {
+                Ok(c) => c.clone(),
+                Err(e) => {
+                    let _ = app.model_list_tx.send((provider_key, Err(format!("http client: {e}"))));
+                    return ControlFlow::Continue(());
+                }
+            };
             let tx = app.model_list_tx.clone();
             tokio::spawn(async move {
                 if let Ok(provider) = provider_key.parse::<synaps_cli::auth::CloudProviderId>() {

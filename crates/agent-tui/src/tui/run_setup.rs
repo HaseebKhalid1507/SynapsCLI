@@ -18,6 +18,7 @@ use agent_engine::session::{
     AttachMode, AttachSnapshot, ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire,
     LocalTransport, SessionConfig,
 };
+use helpers::apply_display_tail;
 use session_link::{PromptBridge, SessionLink};
 
 /// How this TUI reaches its session (PLAN-phase3 §3.2).
@@ -32,6 +33,48 @@ pub(crate) enum TransportMode {
     Socket,
 }
 
+/// Client-local HTTP client, built on first use (P4-0). The in-process TUI
+/// seeds it with the host's client (`LazyHttp::from`), so nothing changes
+/// there; the socket client (`--attach`) pays for reqwest + rustls + the
+/// native root store only when `/models`, `/settings` or a catalog expand
+/// actually asks (`SYNAPS_CLIENT_HTTP=eager` builds it at boot — bisect aid).
+pub(crate) struct LazyHttp(std::cell::OnceCell<reqwest::Client>);
+
+use agent_core::core::memstat::ladder as ladder_stage;
+
+impl LazyHttp {
+    /// Empty; the first `get()` builds via `build_host_http_client`.
+    pub(crate) fn new() -> Self {
+        Self(std::cell::OnceCell::new())
+    }
+
+    /// The client, building it on first use (emits the `http` ladder stage).
+    pub(crate) fn get(&self) -> Result<&reqwest::Client> {
+        if let Some(c) = self.0.get() {
+            return Ok(c);
+        }
+        let t0 = Instant::now();
+        let client = agent_engine::runtime::build_host_http_client()?;
+        agent_core::core::memstat::ladder(
+            "http",
+            &format_args!("build_ms={}", t0.elapsed().as_millis()),
+        );
+        Ok(self.0.get_or_init(|| client))
+    }
+
+    /// Already built?
+    #[allow(dead_code)]
+    pub(crate) fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+impl From<reqwest::Client> for LazyHttp {
+    fn from(client: reqwest::Client) -> Self {
+        Self(std::cell::OnceCell::from(client))
+    }
+}
+
 /// Everything `run()`'s event loop and teardown consume from the boot
 /// prologue. Fields are handed back by value so `run()` owns them exactly as
 /// it did when they were locals — the loop's `&mut` borrows are unchanged.
@@ -41,8 +84,8 @@ pub(crate) struct RunContext {
     /// `SocketTransport` for `--attach`).
     pub link: SessionLink,
     /// Client-local HTTP client for catalog/model-list fetches (the same
-    /// builder the host uses).
-    pub http: reqwest::Client,
+    /// builder the host uses; lazy on the socket path).
+    pub http: LazyHttp,
     pub prompt_bridge: PromptBridge,
     pub mode: TransportMode,
     pub config: synaps_cli::SynapsConfig,
@@ -75,6 +118,19 @@ pub(crate) struct RunContext {
 }
 
 /// Boot prologue for [`super::run`]. Same inputs / error type as `run()`.
+static BOOT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Queue a `SystemNotice` shown at the top of the in-process TUI (called
+/// before the runtime exists — e.g. `--attach` falling back after the daemon
+/// refused to start).
+pub fn push_boot_notice(text: impl Into<String>) {
+    BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(text.into());
+}
+
+fn take_boot_notices() -> Vec<String> {
+    std::mem::take(&mut *BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 pub(crate) async fn run_setup(
     continue_session: Option<Option<String>>,
     system: Option<String>,
@@ -101,6 +157,7 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            name: None,
         })
         .await?;
     let (transport, snapshot) =
@@ -113,12 +170,16 @@ pub(crate) async fn run_setup(
     let keybind_registry = Arc::clone(host.keybind_registry());
     let mcp_server_count = host.mcp_server_count();
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-    let http = host.parts().client.clone();
+    let http = LazyHttp::from(host.parts().client.clone());
     let ext_mgr_shared = Arc::clone(host.ext_manager());
 
     let mut app = app_from_snapshot(&snapshot);
     app.keybinds = Some(keybind_registry.clone());
 
+    // Notices queued before boot (daemon auto-spawn fallback) go first.
+    for n in take_boot_notices() {
+        app.push_msg(ChatMessage::System(n));
+    }
     // Surface config parse warnings once at startup (unknown keys, bad values).
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
@@ -192,11 +253,7 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
     let mut app = if snapshot.meta.continued {
         let mut app = App::new_with_clock(session, clock::TuiClock::real());
         app.apply_conversation(conv);
-        // mem::take avoids deep-cloning the full history just to satisfy
-        // the borrow checker (P5 in REVIEW.md).
-        let msgs = std::mem::take(&mut app.api_messages);
-        rebuild_display_messages(&msgs, &mut app);
-        app.api_messages = msgs;
+        rebuild_display_from_snapshot(&mut app, snapshot);
         app.push_msg(ChatMessage::System(format!(
             "resumed session {}",
             conv.header.id
@@ -229,7 +286,7 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
 pub(crate) async fn finish_setup(
     mut app: App,
     transport: Box<dyn ClientTransport>,
-    http: reqwest::Client,
+    http: LazyHttp,
     mode: TransportMode,
     config: synaps_cli::SynapsConfig,
     registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
@@ -257,6 +314,10 @@ pub(crate) async fn finish_setup(
     // Pass `None` ⇒ blind best-effort push, byte-identical with today. See the
     // `setup_terminal` doc for why the push can't be fact-gated at this site.
     let terminal = setup_terminal(None)?;
+    ladder_stage("terminal", &{
+        let (c, r) = crossterm::terminal::size().unwrap_or((0, 0));
+        format!("cols={c} rows={r}")
+    });
 
     // ── P16.2: DA1-fenced terminal capability query burst ──
     //
@@ -276,13 +337,16 @@ pub(crate) async fn finish_setup(
     // Timeout / partial replies ⇒ env-detected caps unchanged (= today's
     // behavior) ⇒ boot proceeds normally. NEVER move this below
     // `EventStream::new()`; NEVER add a second stdin reader for it.
+    let t_caps = Instant::now();
     let term_caps =
         termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
+    ladder_stage("termcaps", &format_args!("burst_ms={}", t_caps.elapsed().as_millis()));
 
     // P16.3: hand the negotiated caps to the render thread so `render_frame`
     // can gate edge-scrub (tmux provenance) and synchronized-output (mode 2026)
     // on facts. Cloned because `term_caps` is also returned in `RunContext`.
     let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal, term_caps.clone());
+    ladder_stage("render_thread", &"");
     // Boot effect is sent via the command channel so the render thread owns it.
     // SYNAPS_NO_BOOT_FX=1 skips it (slow/high-latency links, screen readers).
     if std::env::var("SYNAPS_NO_BOOT_FX").map_or(true, |v| v != "1") {
@@ -291,7 +355,11 @@ pub(crate) async fn finish_setup(
 
     let event_reader = EventStream::new();
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
+    let shutdown_signal_task = signals::spawn_shutdown_signal_task_with(
+        shutdown_signal_tx,
+        signals::SignalBackend::for_socket(matches!(mode, TransportMode::Socket)),
+    );
+    ladder_stage("event_stream", &"");
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let prompt_bridge = PromptBridge::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
@@ -362,15 +430,22 @@ pub(crate) async fn try_reconnect(
     }
 }
 
+/// Digest attaches carry a daemon-projected `display_tail`; Full attaches
+/// carry the history and project it locally — same filter either way.
+fn rebuild_display_from_snapshot(app: &mut App, snapshot: &AttachSnapshot) {
+    match &snapshot.display_tail {
+        Some(tail) => apply_display_tail(tail, app),
+        None => rebuild_display_messages(&snapshot.conversation.api_messages, app),
+    }
+}
+
 /// Rebuild the transcript from an `AttachSnapshot` (reconnect / re-attach):
 /// the cancelled turn's partial text is gone by design (§2.8 step 7).
 pub(crate) fn remirror(app: &mut App, snapshot: &AttachSnapshot) {
     app.transcript.clear();
     app.invalidate();
     app.apply_conversation(&snapshot.conversation);
-    let msgs = std::mem::take(&mut app.api_messages);
-    rebuild_display_messages(&msgs, &mut *app);
-    app.api_messages = msgs;
+    rebuild_display_from_snapshot(app, snapshot);
     app.streaming = snapshot.streaming;
     app.last_turn_context_window = snapshot.view.context_window;
 }

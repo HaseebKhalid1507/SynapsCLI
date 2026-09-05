@@ -167,71 +167,97 @@ pub(super) fn is_event_payload(content: &str) -> bool {
     content.starts_with("<event ") && content.ends_with("</event>")
 }
 
-pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
-    app.transcript.clear();
-    for msg in api_messages {
-        // Skip compaction summary messages — internal context, not user-visible
-        if let Some(content) = msg["content"].as_str() {
-            if content.contains("<context-summary>") {
-                continue;
-            }
-        }
-        // Skip event messages — already displayed as event cards
-        if let Some(content) = msg["content"].as_str() {
-            if is_event_payload(content) {
-                continue;
-            }
-        }
-        match msg["role"].as_str() {
-            Some("user") => {
-                if let Some(content) = msg["content"].as_str() {
-                    app.push_msg(ChatMessage::User(content.to_string()));
-                }
-            }
-            Some("assistant") => {
-                if let Some(content) = msg["content"].as_array() {
-                    for block in content {
-                        match block["type"].as_str() {
-                            Some("thinking") => {
-                                if let Some(text) = block["thinking"].as_str() {
-                                    app.push_msg(ChatMessage::Thinking(text.to_string()));
-                                }
-                            }
-                            Some("text") => {
-                                if let Some(text) = block["text"].as_str() {
-                                    app.push_msg(ChatMessage::Text(text.to_string()));
-                                }
-                            }
-                            Some("tool_use") => {
-                                let name = block["name"].as_str().unwrap_or("").to_string();
-                                let input =
-                                    serde_json::to_string(&block["input"]).unwrap_or_default();
-                                let tool_id = block["id"].as_str().unwrap_or("").to_string();
-                                app.push_msg(ChatMessage::ToolUse {
-                                    tool_id,
-                                    tool_name: name,
-                                    input,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // Cap the rendered scrollback so a long --continue doesn't markdown-render
-    // hundreds of messages on the first frame (the slow-boot cause). Full
-    // history stays in api_messages for the model. See App::cap_resumed_display.
-    app.cap_resumed_display(120);
+/// Display items shown on resume/rebuild (matches `cap_resumed_display(120)`
+/// at 741b6b60 and `ClientMeta::tail_items`' default).
+pub(super) const DISPLAY_TAIL_ITEMS: usize = agent_engine::session::DEFAULT_TAIL_ITEMS;
 
+/// Rebuild the transcript from a full history: the same projection the
+/// daemon ships Digest clients (`session::display::display_tail`), so Local
+/// and Socket render byte-identical lines.
+pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
+    let tail = agent_engine::session::display::display_tail(api_messages, DISPLAY_TAIL_ITEMS);
+    apply_display_tail(&tail, app);
+}
+
+/// Replace the transcript with a daemon-projected tail. `omitted > 0`
+/// prepends the identical sentinel `cap_resumed_display` produced at
+/// 741b6b60 (same text, same position).
+pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
+    use agent_engine::session::DisplayItem;
+    app.transcript.clear();
+    if tail.omitted > 0 {
+        app.push_msg(ChatMessage::System(format!(
+            "… {} earlier message(s) hidden to speed resume — full history is still in the model's context",
+            tail.omitted
+        )));
+    }
+    for item in &tail.items {
+        app.push_msg(match item {
+            DisplayItem::User { text } => ChatMessage::User(text.clone()),
+            DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
+            DisplayItem::Text { text } => ChatMessage::Text(text.clone()),
+            DisplayItem::ToolUse {
+                tool_id,
+                tool_name,
+                input,
+            } => ChatMessage::ToolUse {
+                tool_id: tool_id.clone(),
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+            },
+        });
+    }
     // Wholesale rebuild = a full message-list reshuffle. `messages.clear()` above
     // does NOT touch the line cache, and push_msg's incremental invalidate_last()
-    // only covers the tail — so if api_messages was empty or fully filtered, the
-    // stale cache would render deleted messages. Force a full invalidate; this is
-    // exactly the "message list reshuffle" case invalidate() is documented for.
+    // only covers the tail — so if the tail was empty, the stale cache would
+    // render deleted messages. Force a full invalidate.
     app.invalidate();
+}
+
+/// Rebuild the transcript after a `Conversation` that changed history shape
+/// (compaction, resume). Full mode / in-process: the snapshot carries the
+/// history → project locally. Digest mode: the snapshot's `api_messages` is
+/// empty while `messages_len > 0` → one `DisplayTail` roundtrip to the
+/// daemon (ordering preserved: the link buffers concurrent envelopes).
+/// Returns false (and pushes an Error line) when the roundtrip failed; the
+/// transcript is then stale until `/resync`.
+pub(super) async fn rebuild_display_from_conversation(
+    snap: &agent_engine::session::ConversationSnapshot,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> bool {
+    if !snap.api_messages.is_empty() || snap.messages_len == 0 {
+        rebuild_display_messages(&snap.api_messages, app);
+        return true;
+    }
+    reload_display_tail(app, link).await
+}
+
+/// `/resync` and the Digest-mode rebuild: fetch the daemon's projection and
+/// replace the transcript with it.
+pub(super) async fn reload_display_tail(
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> bool {
+    match link
+        .query(agent_engine::session::SessionQuery::DisplayTail {
+            items: DISPLAY_TAIL_ITEMS,
+        })
+        .await
+        .and_then(|v| {
+            serde_json::from_value::<agent_engine::session::DisplayTail>(v).map_err(|e| e.to_string())
+        }) {
+        Ok(tail) => {
+            apply_display_tail(&tail, app);
+            true
+        }
+        Err(e) => {
+            app.push_msg(ChatMessage::Error(format!(
+                "history reload failed: {e} — /resync to retry"
+            )));
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +385,176 @@ mod tests {
             "cache must be Missing after rebuild with fully-filtered api_messages — \
              stale cache would render deleted messages (fbcfa05 regression)"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Golden: the daemon-side projection (`session::display::display_tail`)
+    // must reproduce `rebuild_display_messages` @ 741b6b60 byte-for-byte.
+    // The legacy body is kept VERBATIM below (including cap_resumed_display).
+    // -------------------------------------------------------------------------
+
+    fn legacy_rebuild(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
+        app.transcript.clear();
+        for msg in api_messages {
+            if let Some(content) = msg["content"].as_str() {
+                if content.contains("<context-summary>") {
+                    continue;
+                }
+            }
+            if let Some(content) = msg["content"].as_str() {
+                if is_event_payload(content) {
+                    continue;
+                }
+            }
+            match msg["role"].as_str() {
+                Some("user") => {
+                    if let Some(content) = msg["content"].as_str() {
+                        app.push_msg(ChatMessage::User(content.to_string()));
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(content) = msg["content"].as_array() {
+                        for block in content {
+                            match block["type"].as_str() {
+                                Some("thinking") => {
+                                    if let Some(text) = block["thinking"].as_str() {
+                                        app.push_msg(ChatMessage::Thinking(text.to_string()));
+                                    }
+                                }
+                                Some("text") => {
+                                    if let Some(text) = block["text"].as_str() {
+                                        app.push_msg(ChatMessage::Text(text.to_string()));
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    let name = block["name"].as_str().unwrap_or("").to_string();
+                                    let input =
+                                        serde_json::to_string(&block["input"]).unwrap_or_default();
+                                    let tool_id = block["id"].as_str().unwrap_or("").to_string();
+                                    app.push_msg(ChatMessage::ToolUse {
+                                        tool_id,
+                                        tool_name: name,
+                                        input,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        app.transcript.cap_resumed_display(120);
+        app.invalidate();
+    }
+
+    fn transcript_repr(app: &App) -> Vec<String> {
+        app.transcript
+            .messages()
+            .iter()
+            .map(|m| match &m.msg {
+                ChatMessage::User(t) => format!("U|{t}"),
+                ChatMessage::Thinking(t) => format!("K|{t}"),
+                ChatMessage::Text(t) => format!("T|{t}"),
+                ChatMessage::System(t) => format!("S|{t}"),
+                ChatMessage::ToolUse {
+                    tool_id,
+                    tool_name,
+                    input,
+                } => format!("X|{tool_id}|{tool_name}|{input}"),
+                _ => "?".to_string(),
+            })
+            .collect()
+    }
+
+    fn j(v: serde_json::Value) -> synaps_cli::SharedMessage {
+        std::sync::Arc::new(v)
+    }
+
+    fn golden_fixtures() -> Vec<(&'static str, Vec<synaps_cli::SharedMessage>)> {
+        use serde_json::json;
+        let plain = vec![
+            j(json!({"role": "user", "content": "hello"})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "hi there"}]})),
+            j(json!({"role": "user", "content": "what's 2+2"})),
+            j(json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "easy"},
+                {"type": "text", "text": "4"}]})),
+        ];
+        let tool_loop = vec![
+            j(json!({"role": "user", "content": "list files"})),
+            j(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})),
+            j(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a\nb"}]})),
+            j(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t2", "name": "read", "input": {"path": "a"}},
+                {"type": "tool_use", "id": "t3", "name": "read", "input": {"path": "b"}}]})),
+            j(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": "A"},
+                {"type": "tool_result", "tool_use_id": "t3", "content": "B"}]})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]})),
+        ];
+        let context_summary = vec![
+            j(json!({"role": "user", "content": "<context-summary>old stuff</context-summary>"})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "ok, continuing"}]})),
+            j(json!({"role": "user", "content": "mentions <context-summary> inline too"})),
+            j(json!({"role": "assistant", "content": "string-content assistant (ignored)"})),
+            j(json!({"role": "system", "content": "never shown"})),
+        ];
+        let events = vec![
+            j(json!({"role": "user", "content": "<event id=\"1\" type=\"subagent_completion\">done</event>"})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "noted"}]})),
+            j(json!({"role": "user", "content": "please re-read the <event ...> above"})),
+            j(json!({"role": "assistant", "content": [
+                {"type": "text"},
+                {"type": "thinking"},
+                {"type": "tool_use", "input": {"x": 1}},
+                {"type": "unknown", "text": "zzz"}]})),
+        ];
+        let mut long = Vec::new();
+        for i in 0..70 {
+            long.push(j(json!({"role": "user", "content": format!("q{i}")})));
+            long.push(j(json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("think{i}")},
+                {"type": "text", "text": format!("a{i}")}]})));
+        }
+        vec![
+            ("plain", plain),
+            ("tool_loop", tool_loop),
+            ("context_summary", context_summary),
+            ("events", events),
+            ("long_over_120", long),
+            ("empty", Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn display_tail_golden_matches_741b6b60_rebuild() {
+        for (name, fixture) in golden_fixtures() {
+            let mut old = test_app();
+            legacy_rebuild(&fixture, &mut old);
+            let mut new = test_app();
+            rebuild_display_messages(&fixture, &mut new);
+            assert_eq!(transcript_repr(&old), transcript_repr(&new), "fixture {name}");
+            assert!(new.transcript.line_cache().is_none(), "fixture {name}: cache invalidated");
+            // The daemon-projected tail applied directly is the same again.
+            let tail = agent_engine::session::display::display_tail(&fixture, 120);
+            let mut via_tail = test_app();
+            super::apply_display_tail(&tail, &mut via_tail);
+            assert_eq!(transcript_repr(&old), transcript_repr(&via_tail), "fixture {name} via tail");
+        }
+    }
+
+    #[test]
+    fn long_fixture_actually_exercises_the_cap() {
+        let (_, long) = golden_fixtures().into_iter().find(|(n, _)| *n == "long_over_120").unwrap();
+        let mut app = test_app();
+        rebuild_display_messages(&long, &mut app);
+        let repr = transcript_repr(&app);
+        assert_eq!(repr.len(), 121);
+        assert!(repr[0].starts_with("S|… 90 earlier message(s) hidden"), "{}", repr[0]);
     }
 
     const T: Duration = Duration::from_millis(100);

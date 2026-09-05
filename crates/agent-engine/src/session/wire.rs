@@ -155,6 +155,18 @@ impl Hello {
             reconnect_of: None,
         }
     }
+
+    /// Ask for `Full` (mirror) or `Digest` (digest + display tail) history.
+    pub fn with_history(mut self, history: HistoryMode) -> Self {
+        self.client.history = history;
+        self
+    }
+
+    /// Display items wanted in `Attached.display_tail` / `DisplayTail` queries.
+    pub fn with_tail_items(mut self, tail_items: usize) -> Self {
+        self.client.tail_items = tail_items;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +307,8 @@ pub struct AttachedWire {
     pub clients: Vec<(ClientId, ClientKind)>,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
+    #[serde(default)]
+    pub display_tail: Option<crate::session::display::DisplayTail>,
 }
 
 impl AttachedWire {
@@ -309,6 +323,7 @@ impl AttachedWire {
             pending_prompts: s.pending_prompts,
             clients: s.clients,
             input_owner: s.input_owner,
+            display_tail: s.display_tail,
         }
     }
 
@@ -324,6 +339,7 @@ impl AttachedWire {
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
                 input_owner: self.input_owner,
+                display_tail: self.display_tail,
             },
         )
     }
@@ -390,6 +406,7 @@ impl ConversationDigest {
     pub fn into_snapshot(self, api_messages: Vec<crate::SharedMessage>) -> ConversationSnapshot {
         ConversationSnapshot {
             header: self.header,
+            messages_len: self.messages_len,
             api_messages,
             tokens: self.tokens,
             cost: self.cost,
@@ -838,6 +855,7 @@ mod tests {
                 parent_session: Some("p".into()),
             },
             api_messages: vec![Arc::new(serde_json::json!({"role":"user","content":"hi"}))],
+            messages_len: 1,
             tokens: ConversationTokens { input: 1, output: 2, cache_read: 3, cache_creation: 4 },
             cost: 0.5,
             abort_context: Some("ctx".into()),
@@ -937,6 +955,7 @@ mod tests {
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
                     input_owner: Some(ClientId(1)),
+                    display_tail: None,
                 },
             },
             S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
@@ -998,6 +1017,33 @@ mod tests {
     }
 
     #[test]
+    fn hello_history_fields_default_and_roundtrip() {
+        // Old peers omit the fields: Full / 120.
+        let legacy = r#"{"kind":"tui","terminal":null,"instance":"i"}"#;
+        let m: ClientMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.history, HistoryMode::Full);
+        assert_eq!(m.tail_items, DEFAULT_TAIL_ITEMS);
+        let h = Hello::new(ClientKind::Tui).with_history(HistoryMode::Digest).with_tail_items(9);
+        let line = encode_line(&ClientFrame::Hello(h)).unwrap();
+        assert!(line.contains("\"history\":\"digest\""), "{line}");
+        assert!(line.contains("\"tail_items\":9"), "{line}");
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => {
+                assert_eq!(h.client.history, HistoryMode::Digest);
+                assert_eq!(h.client.tail_items, 9);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Digest snapshots keep messages_len even with api_messages empty.
+        let d = ConversationDigest::of(&conv());
+        let snap = d.into_snapshot(Vec::new());
+        assert_eq!(snap.messages_len, 1);
+        assert!(snap.api_messages.is_empty());
+        let legacy: ConversationSnapshot = serde_json::from_str(r#"{"api_messages":[],"tokens":{"input":0,"output":0,"cache_read":0,"cache_creation":0},"cost":0.0,"abort_context":null,"queued_message":null,"pending_events_len":0,"consecutive_auto_turns":0}"#).unwrap();
+        assert_eq!(legacy.messages_len, 0);
+    }
+
+    #[test]
     fn conversation_digest_roundtrips_and_detects_drift() {
         let c = conv();
         let d = ConversationDigest::of(&c);
@@ -1025,6 +1071,7 @@ mod tests {
     fn client_frames_roundtrip_and_daemon_frames_roundtrip() {
         let frames = vec![
             ClientFrame::Hello(Hello::new(ClientKind::Attach)),
+            ClientFrame::Hello(Hello::new(ClientKind::Tui).with_history(HistoryMode::Digest).with_tail_items(7)),
             ClientFrame::Ping,
             ClientFrame::Sessions,
             ClientFrame::Shutdown { force: true },
@@ -1071,6 +1118,7 @@ mod tests {
                     pending_prompts: vec![],
                     clients: vec![],
                     input_owner: None,
+                    display_tail: None,
                 },
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
@@ -1159,5 +1207,25 @@ mod tests {
         for bad in ["token", "secret", "api_key", "apikey", "password", "credential"] {
             assert!(!w.contains(bad), "{bad} in Welcome");
         }
+    }
+}
+
+#[cfg(test)]
+mod float_roundtrip_tests {
+    use super::*;
+
+    /// L≡S (phase 4 G9): the session cost crosses the wire as an f64. Without
+    /// serde_json's `float_roundtrip` the parse is one ulp short for values
+    /// like `0.000105 + 0.000045` and the footer rounds `$0.0002` → `$0.0001`.
+    #[test]
+    fn conversation_digest_cost_survives_the_wire_exactly() {
+        let cost = (10f64 / 1_000_000.0) * 3.0 + (5f64 / 1_000_000.0) * 15.0
+            + ((10f64 / 1_000_000.0) * 3.0 + (1f64 / 1_000_000.0) * 15.0);
+        let snap = ConversationSnapshot { cost, ..Default::default() };
+        let d = ConversationDigest::of(&snap);
+        let line = encode_line(&d).unwrap();
+        let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
+        assert_eq!(back.cost.to_bits(), cost.to_bits(), "{line}");
+        assert_eq!(format!("{:.4}", back.cost), format!("{:.4}", cost));
     }
 }

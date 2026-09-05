@@ -4,8 +4,20 @@ use std::path::PathBuf;
 
 use crate::core::config::base_dir;
 
+/// Discriminator written into every registration so the registry can tell
+/// its own files from other `*.json` sharing the run dir (`daemon.json`,
+/// tooling drops). Files missing it (older binaries) are treated as sessions.
+pub const REGISTRATION_KIND: &str = "session";
+
+fn default_kind() -> String {
+    REGISTRATION_KIND.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRegistration {
+    /// Always `"session"`; see [`REGISTRATION_KIND`].
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub session_id: String,
     pub name: Option<String>,
     pub socket_path: String,
@@ -94,6 +106,23 @@ fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Resu
     Ok(())
 }
 
+/// Rewrite `{session_id}.json` with a new `name` (rename / `saveas`). The
+/// rest of the record (socket, pid, started_at) is kept. Errors when there
+/// is no registration to update.
+pub fn update_session_name(session_id: &str, name: Option<&str>) -> Result<(), String> {
+    update_session_name_in(session_id, name, &registry_dir())
+}
+
+fn update_session_name_in(session_id: &str, name: Option<&str>, dir: &std::path::Path) -> Result<(), String> {
+    let safe_id = sanitize_session_id(session_id);
+    let path = dir.join(format!("{}.json", safe_id));
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut reg: SessionRegistration =
+        serde_json::from_str(&content).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    reg.name = name.map(str::to_string);
+    register_session_in(&reg, dir)
+}
+
 /// Remove the registration file. Best-effort — never panics.
 /// Also removes the socket file at `socket_path` if it exists.
 pub fn unregister_session(session_id: &str) {
@@ -135,7 +164,20 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+/// Files in the run dir that are never session registrations, whatever
+/// their contents: the daemon's own `daemon.json` / `daemon-<profile>.json`.
+fn is_reserved_json(path: &std::path::Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-"))
+}
+
 /// Read all registration files, prune stale ones (dead PID), return live set.
+///
+/// Only files this registry wrote are ever unlinked: a `*.json` that is not
+/// a `SessionRegistration` (parse failure, or `kind != "session"`) is logged
+/// and skipped — `daemon.json` lives in the same dir and `synaps send` must
+/// never destroy it.
 pub fn list_active_sessions() -> Vec<SessionRegistration> {
     list_active_sessions_in(&registry_dir())
 }
@@ -149,21 +191,34 @@ fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+        if !path.extension().is_some_and(|e| e == "json") || is_reserved_json(&path) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let reg = match serde_json::from_str::<SessionRegistration>(&content) {
+            Ok(reg) if reg.kind == REGISTRATION_KIND => reg,
+            Ok(reg) => {
+                tracing::debug!(path = %path.display(), kind = %reg.kind, "registry: not a session registration — skipped");
                 continue;
-            };
-            let Ok(reg) = serde_json::from_str::<SessionRegistration>(&content) else {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            };
-
-            if pid_is_alive(reg.pid) {
-                live.push(reg);
-            } else {
-                let _ = std::fs::remove_file(std::path::Path::new(&reg.socket_path));
-                let _ = std::fs::remove_file(&path);
             }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "registry: unparseable json — skipped, not ours");
+                continue;
+            }
+        };
+
+        if pid_is_alive(reg.pid) {
+            live.push(reg);
+        } else {
+            // Dead owner: prune the registration and its socket, but only a
+            // socket inside our dir (a crafted file must not delete elsewhere).
+            let sock = std::path::Path::new(&reg.socket_path);
+            if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
+                let _ = std::fs::remove_file(sock);
+            }
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -218,6 +273,7 @@ mod tests {
 
     fn make_reg(id: &str, name: Option<&str>, pid: u32) -> SessionRegistration {
         SessionRegistration {
+            kind: REGISTRATION_KIND.to_string(),
             session_id: id.to_string(),
             name: name.map(|s| s.to_string()),
             socket_path: socket_path_for_session(id),
@@ -297,6 +353,76 @@ mod tests {
 
         let found = find_session_registration_in("dup-aaaa", &dir);
         assert!(found.is_none(), "ambiguous prefix should return None");
+    }
+
+    /// Bug: `synaps send` used to unlink every `run/*.json` it could not
+    /// parse as a registration — `daemon.json` included.
+    #[test]
+    fn foreign_json_is_never_unlinked() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let daemon = dir.join("daemon.json");
+        std::fs::write(
+            &daemon,
+            r#"{"pid":1,"version":"0.9.0","exe":"/usr/bin/synaps","socket":"/x/daemon.sock","protocol":2}"#,
+        )
+        .unwrap();
+        let garbage = dir.join("garbage.json");
+        std::fs::write(&garbage, "this is not json {").unwrap();
+        // Parses as a registration structurally but declares another kind.
+        let other = dir.join("other-kind.json");
+        std::fs::write(
+            &other,
+            r#"{"kind":"widget","session_id":"x","name":null,"socket_path":"/x.sock","pid":1,"started_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        // A legacy registration without `kind` still counts as a session.
+        let legacy = dir.join("legacy-0001.json");
+        std::fs::write(
+            &legacy,
+            format!(
+                r#"{{"session_id":"legacy-0001","name":"old","socket_path":"{}","pid":{},"started_at":"2024-01-01T00:00:00Z"}}"#,
+                dir.join("legacy-0001.sock").display(),
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let reg = make_reg("live-0002", Some("ambient"), std::process::id());
+        register_session_in(&reg, &dir).unwrap();
+
+        for _ in 0..2 {
+            let found = find_session_registration_in("ambient", &dir).expect("session resolved");
+            assert_eq!(found.session_id, "live-0002");
+            assert!(find_session_registration_in("old", &dir).is_some(), "legacy reg counts");
+            let ids: Vec<_> = list_active_sessions_in(&dir).into_iter().map(|r| r.session_id).collect();
+            assert!(!ids.contains(&"x".to_string()), "foreign kind not listed");
+            assert!(daemon.exists(), "daemon.json must survive");
+            assert!(garbage.exists(), "garbage.json must survive");
+            assert!(other.exists(), "other-kind.json must survive");
+            assert!(legacy.exists());
+        }
+        assert!(std::fs::read_to_string(&daemon).unwrap().contains("0.9.0"));
+    }
+
+    /// Bug: the name was frozen at create — `saveas` never reached the
+    /// registry, so `synaps send --session <name>` missed until a
+    /// `--continue`.
+    #[test]
+    fn update_name_rewrites_registration() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = make_reg("rename-0001", None, std::process::id());
+        register_session_in(&reg, &dir).unwrap();
+        assert!(find_session_registration_in("ambient", &dir).is_none());
+
+        update_session_name_in("rename-0001", Some("ambient"), &dir).unwrap();
+        let found = find_session_registration_in("ambient", &dir).expect("resolves by new name");
+        assert_eq!(found.session_id, "rename-0001");
+        assert_eq!(found.socket_path, reg.socket_path, "rest of the record kept");
+
+        update_session_name_in("rename-0001", None, &dir).unwrap();
+        assert!(find_session_registration_in("ambient", &dir).is_none(), "cleared");
+        assert!(update_session_name_in("ghost", Some("x"), &dir).is_err(), "no reg → error");
     }
 
     #[test]

@@ -29,6 +29,31 @@ pub(crate) struct ResumePending {
     pub clamp_notice: Option<String>,
 }
 
+/// Scrollback cap for [`super::transcript::TranscriptStore::set_scrollback`]
+/// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 2 MiB, Local → 0/0
+/// (unbounded — today's behaviour, so the R-vs-L differential cannot move).
+/// `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` (aliases
+/// `SYNAPS_CLIENT_SCROLLBACK_MSGS` / `_BYTES`) override either (0 =
+/// unbounded); unparsable values fall back to the mode default.
+pub(crate) fn scrollback_from_env(mode: &super::run_setup::TransportMode) -> (usize, usize) {
+    let (msgs, bytes) = match mode {
+        // 2 MiB ≈ 70 × `max_tool_output` (30 000 B) of tool scrollback;
+        // `client_bounded` (G6) runs 80 turns so the cap engages in-window.
+        super::run_setup::TransportMode::Socket => (400, 2 * 1024 * 1024),
+        super::run_setup::TransportMode::Local { .. } => (0, 0),
+    };
+    let env = |keys: [&str; 2], default: usize| {
+        keys.iter()
+            .find_map(|k| std::env::var(k).ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    (
+        env(["SYNAPS_TUI_SCROLLBACK", "SYNAPS_CLIENT_SCROLLBACK_MSGS"], msgs),
+        env(["SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_BYTES"], bytes),
+    )
+}
+
 pub(crate) fn apply_header(s: &mut Session, h: &agent_engine::session::SessionHeader) {
     s.id = h.id.clone();
     s.title = h.title.clone();
@@ -74,9 +99,11 @@ pub(crate) struct App {
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
     /// soft-wrap render pipeline.
     pub(crate) editor: tui_textarea::TextArea<'static>,
-    pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
+    /// `api_messages.len()` on the engine side (mirrored by `Conversation`).
+    /// The history itself never lives in the client (phase 4 §2.2).
+    pub(crate) api_messages_len: usize,
     pub(crate) streaming: bool,
-    /// `api_messages.len()` at active-turn start. Failure repair may only
+    /// `api_messages_len` at active-turn start. Failure repair may only
     /// remove messages appended at or after this index (spec §5.2).
     pub(crate) turn_baseline: usize,
     pub(crate) input_history: Vec<String>,
@@ -318,7 +345,7 @@ impl App {
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
-            api_messages: Vec::new(),
+            api_messages_len: 0,
             streaming: false,
             turn_baseline: 0,
             input_history: Vec::new(),
@@ -513,7 +540,7 @@ impl App {
     /// `output_tokens`, the TTL-split cache counters and `api_call_count`
     /// are client-side per-turn state and stay as `Stream(Usage)` left them.
     pub(crate) fn apply_conversation(&mut self, conv: &agent_engine::session::ConversationSnapshot) {
-        self.api_messages = conv.api_messages.clone();
+        self.api_messages_len = conv.messages_len.max(conv.api_messages.len());
         self.total_input_tokens = conv.tokens.input;
         self.total_output_tokens = conv.tokens.output;
         self.total_cache_read_tokens = conv.tokens.cache_read;
@@ -585,13 +612,6 @@ impl App {
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
         self.transcript.push_msg(msg);
         self.needs_redraw = true;
-    }
-
-    /// Delegates to [`TranscriptStore::cap_resumed_display`]. Note: does not
-    /// signal a redraw — verbatim-preserves the pre-move behavior (the method
-    /// never invalidated; it runs at resume before any cache exists).
-    pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
-        self.transcript.cap_resumed_display(cap);
     }
 
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.

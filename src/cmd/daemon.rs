@@ -90,12 +90,12 @@ fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
     }
 }
 
-/// Exit code 3 + one-line reason when the flag is off.
+/// Exit code 3 + one-line reason when `SYNAPS_DAEMON=0`.
 pub(crate) fn require_enabled(what: &str) -> Result<(), i32> {
     if daemon::enabled() {
         return Ok(());
     }
-    eprintln!("{what}: experimental; set SYNAPS_DAEMON=1 to enable");
+    eprintln!("{what}: {}", daemon::DISABLED_NOTICE);
     Err(EXIT_REFUSED)
 }
 
@@ -226,7 +226,7 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         (_, true, true) => "running",
         (_, true, false) => "running (not answering)",
         (true, false, _) => "stale (pid dead)",
-        (false, false, _) => "stopped",
+        (false, false, _) => "not running (auto-starts on first --attach)",
     };
     if json {
         println!(

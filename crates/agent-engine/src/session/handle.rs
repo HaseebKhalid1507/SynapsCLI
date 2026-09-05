@@ -49,6 +49,9 @@ pub struct SessionHandle {
     journal_id: Arc<arc_swap::ArcSwap<String>>,
     /// Clients / input owner / pending prompts, written by the actor.
     presence: Arc<arc_swap::ArcSwap<Presence>>,
+    /// Session name — `--name` at create / `/cmd saveas` later. Written by
+    /// the actor so listings and `--continue <name>` see renames live.
+    name: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -68,6 +71,7 @@ pub struct SessionEndpoints {
     pub lifecycle: Arc<AtomicU8>,
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
+    pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl SessionHandle {
@@ -80,6 +84,7 @@ impl SessionHandle {
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
+        let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -89,6 +94,7 @@ impl SessionHandle {
             lifecycle: Arc::clone(&lifecycle),
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
+            name: Arc::clone(&name),
         };
         (
             handle,
@@ -99,6 +105,7 @@ impl SessionHandle {
                 lifecycle,
                 journal_id,
                 presence,
+                name,
             },
         )
     }
@@ -139,6 +146,11 @@ impl SessionHandle {
         **self.presence.load()
     }
 
+    /// Current session name (create `--name` or a later `saveas`).
+    pub fn name(&self) -> Option<String> {
+        (**self.name.load()).clone()
+    }
+
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
     /// awaiting_input, journal_id) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
@@ -149,6 +161,7 @@ impl SessionHandle {
         m.input_owner = p.input_owner;
         m.awaiting_input = p.awaiting_input;
         m.journal_id = self.journal_id();
+        m.name = self.name();
         m
     }
 
@@ -264,16 +277,31 @@ pub mod echo {
             let _ = self.events.send(env);
         }
 
-        fn snapshot(&self) -> AttachSnapshot {
+        fn conv_snapshot(&self) -> ConversationSnapshot {
+            let mut c = self.conv.clone();
+            c.messages_len = c.api_messages.len();
+            c
+        }
+
+        /// Mirrors `SessionActor::snapshot_for`: Digest clients get the
+        /// tail, not the history.
+        fn snapshot_for(&self, client: &ClientMeta) -> AttachSnapshot {
+            let mut conversation = self.conv_snapshot();
+            let display_tail = (client.history == HistoryMode::Digest).then(|| {
+                let t = crate::session::display::display_tail(&conversation.api_messages, client.tail_items);
+                conversation.api_messages = Vec::new();
+                t
+            });
             AttachSnapshot {
                 meta: meta_for(&self.id),
                 view: (**self.view.load()).clone(),
-                conversation: self.conv.clone(),
+                conversation,
                 streaming: false,
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
                 input_owner: None,
+                display_tail,
             }
         }
 
@@ -283,13 +311,14 @@ pub mod echo {
                     let cid = ClientId(self.next_client);
                     self.next_client += 1;
                     let kind = client.kind;
+                    let snapshot_meta = client.clone();
                     self.clients.insert(cid, client);
                     if mode != AttachMode::Mirror {
                         self.emit(SessionEventWire::SystemNotice(format!(
                             "attach mode {mode:?} not supported yet; using mirror"
                         )));
                     }
-                    let snapshot = self.snapshot();
+                    let snapshot = self.snapshot_for(&snapshot_meta);
                     self.emit(SessionEventWire::Attached {
                         client: cid,
                         snapshot,
@@ -323,7 +352,7 @@ pub mod echo {
                     self.emit(SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::Done,
                     )));
-                    let snap = self.conv.clone();
+                    let snap = self.conv_snapshot();
                     self.emit(SessionEventWire::Conversation(snap));
                 }
                 SessionCommand::Steer { text } => {
@@ -334,7 +363,7 @@ pub mod echo {
                     });
                 }
                 SessionCommand::Cancel => {
-                    let snap = self.conv.clone();
+                    let snap = self.conv_snapshot();
                     self.emit(SessionEventWire::Conversation(snap));
                 }
                 SessionCommand::Query { id, query } => {
@@ -345,6 +374,10 @@ pub mod echo {
                         SessionQuery::Messages => {
                             serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
                         }
+                        SessionQuery::DisplayTail { items } => serde_json::to_value(
+                            super::super::display::display_tail(&self.conv.api_messages, items),
+                        )
+                        .unwrap_or_default(),
                         other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                     };
                     self.emit(SessionEventWire::QueryResult { id, value });
