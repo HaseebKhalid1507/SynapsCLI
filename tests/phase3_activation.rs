@@ -1124,11 +1124,13 @@ async fn a14_consent_policy_hooks_gate_model_activation() {
         let set = Arc::new(std::sync::RwLock::new(
             SessionToolSet::progressive_core_for_catalog(session.clone(), registry.catalog()),
         ));
+        // `tools.activation_confirm = prompt` explicitly (default is `auto`).
         let cap = ActivationCapability::new(
             registry.catalog().clone(),
             Arc::clone(&set),
             ActivationAuthority::Unauthorized,
-        );
+        )
+        .with_host_prompt(true);
         let result = ActivateToolsTool
             .execute(
                 json!({"tools": ["builtin:dormant_00"]}),

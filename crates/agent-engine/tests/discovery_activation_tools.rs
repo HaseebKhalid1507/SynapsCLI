@@ -156,6 +156,17 @@ fn capability(
     ActivationCapability::new(registry.catalog().clone(), Arc::clone(set), authority)
 }
 
+/// Capability as the stream builds it for a given `tools.activation_confirm`
+/// mode (`runtime::stream::activation_policy`, no server auto-approve).
+fn capability_for_mode(
+    registry: &ToolRegistry,
+    set: &SharedSessionToolSet,
+    mode: agent_core::config::ActivationConfirm,
+) -> ActivationCapability {
+    let (authority, prompt_allowed) = agent_engine::runtime::activation_policy(mode, false);
+    capability(registry, set, authority).with_host_prompt(prompt_allowed)
+}
+
 /// Snapshot of externally observable session-set state, for byte-stable
 /// no-partial-mutation assertions.
 fn set_fingerprint(set: &SessionToolSet) -> (u64, Vec<String>, Vec<String>) {
@@ -418,6 +429,107 @@ fn fake_prompt(
     (handle, seen)
 }
 
+// ── tools.activation_confirm policy (auto | prompt | deny) ──────────────────
+
+#[tokio::test]
+async fn activation_confirm_auto_default_activates_without_any_prompt() {
+    use agent_core::config::ActivationConfirm;
+    assert_eq!(ActivationConfirm::default(), ActivationConfirm::Auto);
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let (prompt, seen) = fake_prompt(Some("no")); // would deny if consulted
+
+    let out = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability_for_mode(&registry, &set, ActivationConfirm::Auto)),
+                Some(prompt),
+            ),
+        )
+        .await
+        .expect("auto mode activates without confirmation");
+    assert!(seen.lock().unwrap().is_empty(), "NO PromptRequest in auto mode");
+    let guard = set.read().unwrap();
+    assert_eq!(guard.schema_generation(), 1);
+    ExecutionGate::authorize_wire_call(&registry, &guard, "beta_tool").expect("activated");
+    let body: serde_json::Value = serde_json::from_str(&out).expect("json result");
+    assert_eq!(body["schema_generation"], json!(1));
+}
+
+#[tokio::test]
+async fn activation_confirm_prompt_emits_confirm_kind_prompt() {
+    use agent_core::config::ActivationConfirm;
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<agent_engine::tools::SecretPromptRequest>();
+    let handle = agent_engine::tools::SecretPromptHandle::new(tx);
+    let task = tokio::spawn(async move {
+        let req = rx.recv().await.expect("prompt mode raises exactly one prompt");
+        let kind = req.kind;
+        let title = req.title.clone();
+        let body = req.prompt.clone();
+        let _ = req.response_tx.send(Some("y".into()));
+        (kind, title, body)
+    });
+    ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability_for_mode(&registry, &set, ActivationConfirm::Prompt)),
+                Some(handle),
+            ),
+        )
+        .await
+        .expect("y authorizes");
+    let (kind, title, body) = task.await.unwrap();
+    assert_eq!(kind, agent_engine::session::PromptKind::Confirm);
+    assert_eq!(title, agent_engine::session::CONFIRM_ACTIVATION_PROMPT_TITLE);
+    assert!(body.contains("builtin:beta_tool"), "{body}");
+    assert_eq!(set.read().unwrap().schema_generation(), 1);
+}
+
+#[tokio::test]
+async fn activation_confirm_deny_never_prompts_and_fails_confirmation_required() {
+    use agent_core::config::ActivationConfirm;
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let before = set_fingerprint(&set.read().unwrap());
+    let (prompt, seen) = fake_prompt(Some("yes")); // would allow if consulted
+
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability_for_mode(&registry, &set, ActivationConfirm::Deny)),
+                Some(prompt),
+            ),
+        )
+        .await
+        .expect_err("deny mode fails closed");
+    assert!(
+        err.to_string()
+            .contains(&HostActivationError::ConfirmationRequired.to_string()),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "NO prompt raised in deny mode");
+    assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+}
+
+#[test]
+fn activation_policy_matrix() {
+    use agent_core::config::ActivationConfirm::*;
+    use agent_engine::runtime::activation_policy as p;
+    use ActivationAuthority::*;
+    assert_eq!(p(Auto, false), (ModelConfirmed, false));
+    assert_eq!(p(Prompt, false), (Unauthorized, true));
+    assert_eq!(p(Deny, false), (Unauthorized, false));
+    // server.auto_approve_confirms keeps its meaning in every mode.
+    assert_eq!(p(Prompt, true), (ModelConfirmed, false));
+    assert_eq!(p(Deny, true), (ModelConfirmed, false));
+}
+
 #[tokio::test]
 async fn activate_tools_host_prompt_yes_activates_exact_tool_only() {
     let registry = fixture_registry();
@@ -428,10 +540,10 @@ async fn activate_tools_host_prompt_yes_activates_exact_tool_only() {
         .execute(
             json!({"tools": ["builtin:beta_tool"]}),
             ctx_with_prompt(
-                Some(capability(
+                Some(capability_for_mode(
                     &registry,
                     &set,
-                    ActivationAuthority::Unauthorized,
+                    agent_core::config::ActivationConfirm::Prompt,
                 )),
                 Some(prompt),
             ),
@@ -470,10 +582,10 @@ async fn activate_tools_host_prompt_no_or_absent_denies_without_mutation() {
         .execute(
             json!({"tools": ["builtin:beta_tool"]}),
             ctx_with_prompt(
-                Some(capability(
+                Some(capability_for_mode(
                     &registry,
                     &set,
-                    ActivationAuthority::Unauthorized,
+                    agent_core::config::ActivationConfirm::Prompt,
                 )),
                 Some(deny_prompt),
             ),
@@ -489,10 +601,10 @@ async fn activate_tools_host_prompt_no_or_absent_denies_without_mutation() {
         .execute(
             json!({"tools": ["builtin:beta_tool"]}),
             ctx_with_prompt(
-                Some(capability(
+                Some(capability_for_mode(
                     &registry,
                     &set,
-                    ActivationAuthority::Unauthorized,
+                    agent_core::config::ActivationConfirm::Prompt,
                 )),
                 Some(cancel_prompt),
             ),
@@ -508,10 +620,10 @@ async fn activate_tools_host_prompt_no_or_absent_denies_without_mutation() {
         .execute(
             json!({"tools": ["builtin:beta_tool"], "confirmed": true}),
             ctx_with_prompt(
-                Some(capability(
+                Some(capability_for_mode(
                     &registry,
                     &set,
-                    ActivationAuthority::Unauthorized,
+                    agent_core::config::ActivationConfirm::Prompt,
                 )),
                 None,
             ),
