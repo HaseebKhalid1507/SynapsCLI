@@ -679,6 +679,7 @@ pub(crate) fn build_render_model(
 
     // ── 12. Secret prompt ─────────────────────────────────────────────────────
     let secret_prompt = inputs.secret_prompts.active().map(|p| SecretPromptSnap {
+        kind: p.kind,
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
@@ -1649,14 +1650,41 @@ pub(crate) fn render_frame_into(
     }
 }
 
-/// Render the secret / masked-input prompt modal.
+/// Number of terminal rows `text` occupies when word-wrapped at `width`
+/// columns (ratatui `Wrap { trim: false }` semantics, approximated by
+/// character count per `\n`-separated line). Empty lines still count as one.
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let w = width.max(1) as usize;
+    text.lines()
+        .map(|l| l.chars().count().div_ceil(w).max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Render the async prompt modal — dispatched on [`SecretPromptSnap::kind`].
 ///
-/// P7.8: extracted verbatim from the former inline block so it can be
-/// dispatched from the stack-order modal loop in [`render_frame_into`].
+/// * `Secret`  → the masked `password:` field (unchanged behaviour, now with
+///   a word-wrapped multi-line body so a long sudo reason is not cut off).
+/// * `Confirm` → a y/n dialog: the FULL body (e.g. the exact tool-id list from
+///   `activate_tools`) is visible and unmasked; there is no input field.
+///   `y` allows, `n`/Esc/Enter deny (fail-closed, see `route_secret_prompt`).
+///
+/// P7.8: extracted from the former inline block so it can be dispatched from
+/// the stack-order modal loop in [`render_frame_into`].
 fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
+    use synaps_cli::tools::PromptKind;
     let area = frame.area();
-    let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
-    let height = 7u16;
+    let is_confirm = prompt.kind == PromptKind::Confirm;
+    // Cap to available width; prefer 30-62 (72 for confirm — tool ids are
+    // long) but never overflow (#tui-safety fix 3).
+    let width = area.width.min(if is_confirm { 72 } else { 62 });
+    let inner_w = width.saturating_sub(2);
+    let body_lines = wrapped_line_count(&prompt.prompt, inner_w);
+    // body + blank + (field | nothing) + footer, plus 2 border rows. Floor
+    // at the legacy fixed 7 so single-line secret prompts render exactly as
+    // before (reference-binary differential); grow only for longer bodies.
+    let content_rows = body_lines + 1 + if is_confirm { 0 } else { 1 } + 1;
+    let height = (content_rows as u16 + 2).max(7).min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let modal_area = ratatui::layout::Rect {
@@ -1677,24 +1705,41 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(THEME.load().warning_color))
         .style(Style::default().bg(THEME.load().bg));
-    let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
-    let text = vec![
-        ratatui::text::Line::from(Span::styled(
-            prompt.prompt.clone(),
-            Style::default().fg(THEME.load().help_fg),
-        )),
-        ratatui::text::Line::from(""),
-        ratatui::text::Line::from(vec![
+    let mut text: Vec<ratatui::text::Line<'_>> = prompt
+        .prompt
+        .lines()
+        .map(|l| {
+            ratatui::text::Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(THEME.load().help_fg),
+            ))
+        })
+        .collect();
+    if text.is_empty() {
+        text.push(ratatui::text::Line::from(""));
+    }
+    text.push(ratatui::text::Line::from(""));
+    if is_confirm {
+        text.push(ratatui::text::Line::from(Span::styled(
+            "y allow · n/esc deny · server.auto_approve_confirms=true skips this",
+            Style::default().fg(THEME.load().muted),
+        )));
+    } else {
+        let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
+        text.push(ratatui::text::Line::from(vec![
             Span::styled("password: ", Style::default().fg(THEME.load().muted)),
             Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
-        ]),
-        ratatui::text::Line::from(Span::styled(
+        ]));
+        text.push(ratatui::text::Line::from(Span::styled(
             "Enter submit · Esc cancel",
             Style::default().fg(THEME.load().muted),
-        )),
-    ];
+        )));
+    }
     frame.render_widget(
-        Paragraph::new(text).block(block).alignment(Alignment::Left),
+        Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         modal_area,
     );
 }

@@ -730,6 +730,10 @@ mod actor {
         fatal: Option<synaps_cli::TurnError>,
         cost: f64,
         ended: bool,
+        /// A `Confirm` prompt waiting for a y/n line from a TTY user (the
+        /// next stdin line answers it). Secret prompts are never held here:
+        /// the line client has no masked input and cancels them.
+        pending_confirm: Option<agent_engine::session::PromptRequest>,
     }
 
     impl Render {
@@ -750,14 +754,31 @@ mod actor {
                 SessionEventWire::Conversation(c) => self.cost = c.cost,
                 SessionEventWire::Idle => self.idle = true,
                 SessionEventWire::Prompt(pr) => {
-                    // Headless chat has no prompt UI: cancel, as the inline
-                    // loop did by passing no SecretPromptHandle.
+                    if pr.kind == agent_engine::session::PromptKind::Confirm
+                        && self.is_tty
+                        && self.pending_confirm.is_none()
+                    {
+                        // Confirm (e.g. `activate_tools`): show the FULL body
+                        // and take one y/n line. Anything but y/yes denies.
+                        self.end_thinking();
+                        eprint!("\n[confirm] {}\n{}\n(y/n): ", pr.title, pr.prompt);
+                        io::stderr().flush().ok();
+                        self.pending_confirm = Some(pr);
+                        return;
+                    }
+                    // Headless chat has no masked prompt UI: cancel, as the
+                    // inline loop did by passing no SecretPromptHandle.
                     let _ = transport
                         .send(SessionCommand::Answer {
                             prompt_id: pr.id,
                             value: None,
                         })
                         .await;
+                }
+                SessionEventWire::PromptResolved { prompt_id } => {
+                    if self.pending_confirm.as_ref().is_some_and(|p| p.id == prompt_id) {
+                        self.pending_confirm = None;
+                    }
                 }
                 SessionEventWire::External(event) => {
                     eprintln!(
@@ -985,6 +1006,7 @@ mod actor {
             fatal: None,
             cost: snap.conversation.cost,
             ended: false,
+            pending_confirm: None,
         };
         let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
         let mut next_query: u64 = 1;
@@ -1011,13 +1033,24 @@ mod actor {
                     }
                     None => break,
                 },
-                line = stdin_lines.next_line(), if r.idle => match line {
+                line = stdin_lines.next_line(), if r.idle || r.pending_confirm.is_some() => match line {
                     Ok(Some(l)) => l,
                     Ok(None) => break,
                     Err(e) => { eprintln!("input error: {}", e); break; }
                 },
             };
             prompt_shown = false;
+
+            // A pending confirm owns the next line: `y`/`yes` allows, anything
+            // else (including empty) denies — fail-closed, never a Submit.
+            if let Some(pr) = r.pending_confirm.take() {
+                let answer = line.trim();
+                let value = if answer.is_empty() { None } else { Some(answer.to_string()) };
+                let _ = t
+                    .send(SessionCommand::Answer { prompt_id: pr.id, value })
+                    .await;
+                continue;
+            }
 
             let trimmed = line.trim_end_matches('\r').trim();
             if trimmed.is_empty() {

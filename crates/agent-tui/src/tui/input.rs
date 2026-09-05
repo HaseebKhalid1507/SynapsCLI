@@ -854,9 +854,10 @@ pub(super) fn reconcile_secret_prompt(app: &mut App) {
     }
 }
 
-/// P7.8 stack-routed pane handler for the async secret / masked-input prompt.
+/// P7.8 stack-routed pane handler for the async secret / masked-input prompt
+/// and (by `PromptKind`) the y/n confirm dialog.
 ///
-/// Reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
+/// Secret reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
 /// Esc cancels, Backspace deletes, Char / per-char Paste append, everything
 /// else is swallowed (`PaneOutcome::Consumed`). After `submit()` / `cancel()`
 /// (which may auto-activate the next queued prompt) it reconciles the stack so
@@ -864,6 +865,32 @@ pub(super) fn reconcile_secret_prompt(app: &mut App) {
 /// drains. Returns `InputAction::None`; the former inline `app.request_redraw()`
 /// is preserved by `request_immediate_redraw` on the input path (`mod.rs`).
 fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
+    use synaps_cli::tools::PromptKind;
+    let is_confirm = app
+        .secret_prompts
+        .active()
+        .is_some_and(|p| p.kind == PromptKind::Confirm);
+    if is_confirm {
+        // Confirm dialog: no free-text field. `y` answers "y" (allow);
+        // `n`, Esc and Enter (empty field) answer None (deny, fail-closed).
+        // Everything else — including pastes — is swallowed so nothing can
+        // accidentally form an allow.
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.secret_prompts.push_char('y');
+                    app.secret_prompts.submit();
+                    reconcile_secret_prompt(app);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    app.secret_prompts.cancel();
+                    reconcile_secret_prompt(app);
+                }
+                _ => {}
+            }
+        }
+        return InputAction::None;
+    }
     match event {
         Event::Key(key) => match key.code {
             KeyCode::Enter => {

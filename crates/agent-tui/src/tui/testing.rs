@@ -437,19 +437,48 @@ impl TestHarness {
     /// stack exactly as production does. The response receiver is dropped: the
     /// harness asserts on UI state (buffer / stack / frame), not the tool reply.
     pub fn activate_secret_prompt(&mut self, title: &str, prompt: &str) -> &mut Self {
+        let _rx = self.activate_prompt_with_kind(
+            synaps_cli::tools::PromptKind::Secret,
+            title,
+            prompt,
+        );
+        self
+    }
+
+    /// Inject a prompt of an explicit [`PromptKind`] and keep the answer
+    /// receiver so tests can assert what the pane sent back (`Some("y")` for
+    /// a confirm allow, `None` for deny/cancel). Same production path as
+    /// [`Self::activate_secret_prompt`].
+    pub fn activate_prompt_with_kind(
+        &mut self,
+        kind: synaps_cli::tools::PromptKind,
+        title: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         use synaps_cli::tools::SecretPromptRequest;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         tx.send(SecretPromptRequest {
+            kind,
             title: title.to_string(),
             prompt: prompt.to_string(),
             response_tx,
         })
-        .expect("secret prompt request send is infallible on a fresh channel");
+        .expect("prompt request send is infallible on a fresh channel");
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         self.app.secret_prompts.poll_requests(&rx);
         input::reconcile_secret_prompt(&mut self.app);
-        self
+        response_rx
+    }
+
+    /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
+    /// gate shape). Returns the answer receiver.
+    pub fn activate_confirm_prompt(
+        &mut self,
+        title: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
     }
 
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt

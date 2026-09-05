@@ -325,13 +325,18 @@ pub enum PromptKind {
 }
 
 /// Fixed title `resolve_before_tool_call_result` uses for Confirm prompts
-/// (runtime/mod.rs). Everything else is `Secret`.
+/// (runtime/mod.rs).
 pub const CONFIRM_PROMPT_TITLE: &str = "Confirm tool call";
+/// Fixed title `confirm_activation_with_host` uses for the `activate_tools`
+/// y/yes gate (tools/discovery.rs). Everything not in the confirm set is
+/// `Secret` (masked input).
+pub const CONFIRM_ACTIVATION_PROMPT_TITLE: &str = "Confirm tool activation";
 
 impl PromptKind {
-    /// Derive the kind from the prompt title (the actor classifies at receipt).
+    /// Derive the kind from the prompt title (the actor classifies at receipt;
+    /// `SecretPromptHandle::prompt` classifies for the in-process TUI).
     pub fn from_title(title: &str) -> Self {
-        if title == CONFIRM_PROMPT_TITLE {
+        if title == CONFIRM_PROMPT_TITLE || title == CONFIRM_ACTIVATION_PROMPT_TITLE {
             Self::Confirm
         } else {
             Self::Secret
@@ -842,6 +847,10 @@ mod tests {
     #[test]
     fn prompt_kind_from_title() {
         assert_eq!(PromptKind::from_title("Confirm tool call"), PromptKind::Confirm);
+        assert_eq!(
+            PromptKind::from_title("Confirm tool activation"),
+            PromptKind::Confirm
+        );
         assert_eq!(PromptKind::from_title("API key"), PromptKind::Secret);
     }
 
