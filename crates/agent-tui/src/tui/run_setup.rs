@@ -296,7 +296,10 @@ pub(crate) async fn finish_setup(
     // Pass `None` ⇒ blind best-effort push, byte-identical with today. See the
     // `setup_terminal` doc for why the push can't be fact-gated at this site.
     let terminal = setup_terminal(None)?;
-    ladder_stage("terminal", &{ let (c, r) = crossterm::terminal::size().unwrap_or((0, 0)); format!("cols={c} rows={r}") });
+    ladder_stage("terminal", &{
+        let (c, r) = crossterm::terminal::size().unwrap_or((0, 0));
+        format!("cols={c} rows={r}")
+    });
 
     // ── P16.2: DA1-fenced terminal capability query burst ──
     //

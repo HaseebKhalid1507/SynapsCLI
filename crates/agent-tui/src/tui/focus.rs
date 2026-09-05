@@ -632,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn stack_sync_tripwire_passes_for_valid_stack() {
         let mut s = ModalStack::new();
         s.push(PaneId::Settings);

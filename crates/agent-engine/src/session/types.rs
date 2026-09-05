@@ -806,7 +806,8 @@ pub struct AttachSnapshot {
     pub clients: Vec<(ClientId, ClientKind)>,
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
-    pub input_owner: Option<ClientId>,    /// Daemon-projected display tail — `Some` iff the client attached with
+    pub input_owner: Option<ClientId>,
+    /// Daemon-projected display tail — `Some` iff the client attached with
     /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
     pub display_tail: Option<crate::session::display::DisplayTail>,
 }
