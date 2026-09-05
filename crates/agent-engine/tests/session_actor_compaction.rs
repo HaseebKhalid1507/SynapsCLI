@@ -270,6 +270,22 @@ async fn linked_successor_updates_journal_id_and_continue_target() {
     let parent = agent_engine::core::session::Session::load(&prev).unwrap();
     assert_eq!(parent.compacted_into.as_deref(), Some(new.as_str()));
 
+    // `--continue <successor>` / `--continue` (latest = the successor on
+    // disk) while this actor is live must attach to it, not build a second
+    // actor on the successor journal (the map is keyed by the ORIGINAL id).
+    for q in [Some(Some(new.clone())), Some(None)] {
+        let again = host
+            .create_session(SessionConfig {
+                continue_session: q.clone(),
+                persist: true,
+                ..cfg()
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.id, handle.id, "continue {q:?} → the live actor");
+        assert_eq!(host.sessions().len(), 1, "no second actor for {q:?}");
+    }
+
     // The next turn journals into the successor.
     a.send(submit("after")).await.unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;

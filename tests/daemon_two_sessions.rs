@@ -158,3 +158,109 @@ async fn two_sessions_one_daemon_isolated() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(host.sessions().is_empty(), "host map drained after End");
 }
+
+/// Bug: `--continue X` of a journal already live in the daemon built a
+/// second actor on the same journal (two per-session UDS / registry entries
+/// fighting over one file). The daemon's `Attach::Create{continue}` must
+/// land on the running actor (mirror) with a notice — never a second actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn continue_of_live_journal_attaches_instead_of_second_actor() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _bodies) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host: Arc<EngineHost> =
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true }).await.expect("host boot");
+    let d = Daemon::start(host.clone(), DaemonOpts { runtime_dir: Some(guard.base_dir().join("run")), ..Default::default() })
+        .await
+        .expect("daemon start");
+    let sock = d.paths.sock.clone();
+    let cwd = guard.home.path().join("a");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // A: created fresh, named at create, NO turn yet (nothing but the name on disk).
+    let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut a, snap_a) = SocketTransport::attach(
+        conn,
+        Attach::Create {
+            config: SessionConfig {
+                cwd: Some(cwd.clone()),
+                model_override: Some("claude-sonnet-4-5".into()),
+                name: Some("ambient".into()),
+                ..Default::default()
+            },
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await
+    .expect("attach create");
+    assert_eq!(snap_a.meta.name.as_deref(), Some("ambient"));
+    let id_a = a.session_id().clone();
+    assert!(matches!(next(&mut a).await.event, SessionEventWire::ClientJoined { .. }));
+
+    // Second client: `--continue ambient` (by name) and `--continue <id>` — same actor both times.
+    let mut mirrors = Vec::new();
+    for query in ["ambient", id_a.as_str()] {
+        let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut b, snap_b) = SocketTransport::attach(
+            conn,
+            Attach::Create {
+                config: SessionConfig {
+                    continue_session: Some(Some(query.to_string())),
+                    cwd: Some(cwd.clone()),
+                    ..Default::default()
+                },
+                mode: AttachMode::Mirror,
+            },
+        )
+        .await
+        .expect("attach continue");
+        assert_eq!(b.session_id(), &id_a, "continue {query:?} → the live session");
+        assert_eq!(snap_b.meta.name.as_deref(), Some("ambient"));
+        assert_eq!(host.sessions().len(), 1, "one actor after continue {query:?}");
+        assert_eq!(d.state.live_sessions().len(), 1);
+        // The client is told it was attached, not given a fresh session.
+        let notice = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let e = next(&mut b).await;
+                if let SessionEventWire::SystemNotice(t) = e.event {
+                    if t.contains("already running") {
+                        return t;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("attach-to-live notice");
+        assert!(notice.contains(id_a.as_str()), "{notice}");
+        // A sees the join (a Conversation/Lifecycle publish may precede it).
+        let mut seen = Vec::new();
+        loop {
+            let e = next(&mut a).await;
+            let joined = matches!(e.event, SessionEventWire::ClientJoined { .. });
+            seen.push(format!("{:?}", e.event).chars().take(60).collect::<String>());
+            if joined {
+                break;
+            }
+            assert!(seen.len() < 8, "A never saw ClientJoined: {seen:?}");
+        }
+        mirrors.push(b);
+    }
+    // One registry entry, resolvable by name — the first actor's socket, still bound.
+    let regs = agent_engine::events::registry::list_active_sessions();
+    assert_eq!(regs.len(), 1, "{regs:?}");
+    assert_eq!(regs[0].name.as_deref(), Some("ambient"));
+    assert!(tokio::net::UnixStream::connect(&regs[0].socket_path).await.is_ok());
+
+    // Same actor: a turn submitted via A streams to the mirrors.
+    a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
+    let seen_a = turn(&mut a).await;
+    assert_eq!(text_of(&seen_a), "hi");
+    for b in mirrors.iter_mut() {
+        let seen_b = turn(b).await;
+        assert_eq!(text_of(&seen_b), "hi", "mirror saw A's turn");
+    }
+
+    SocketTransport::shutdown(&sock, false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), d.wait()).await.expect("daemon wait");
+}

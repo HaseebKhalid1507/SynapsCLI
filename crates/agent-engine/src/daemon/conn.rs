@@ -279,6 +279,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     };
 
     // ── attach ──
+    let mut attached_to_live = false;
     let (handle, mode) = match attach {
         Attach::Existing { session_id, mode } => match state.attach(&session_id) {
             Some(h) => (h, mode),
@@ -308,7 +309,21 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     return;
                 }
             }
+            // `--continue X` while X is live here: the host hands back the
+            // running actor (attach-if-live). Tell the client — it asked to
+            // create and got the existing session instead. Detected by id
+            // presence before/after so a client-less Parked target counts too.
+            let before: Vec<SessionId> = if config.continue_session.is_some() {
+                state.live_sessions().into_iter().map(|h| h.id).collect()
+            } else {
+                Vec::new()
+            };
             match state.create(config).await {
+                Ok(h) if before.contains(&h.id) => {
+                    tracing::info!(session = %h.id, "daemon: continue target is live — attaching, not creating");
+                    attached_to_live = true;
+                    (h, mode)
+                }
                 Ok(h) => (h, mode),
                 Err(e) => {
                     let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("create session: {e}") }).await;
@@ -362,6 +377,18 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         return;
     }
     tracing::debug!(session = %handle.id, client = client.0, "daemon: client attached");
+    if attached_to_live {
+        let env = Envelope {
+            session_id: handle.id.clone(),
+            seq: u64::MAX,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::SystemNotice(format!(
+                "session {} is already running in this daemon — attached to it instead of creating a second copy",
+                handle.id
+            )),
+        };
+        let _ = tx.send(DaemonFrame::Event(env.into())).await;
+    }
 
     // ── pump ──
     let sid = handle.id.clone();
