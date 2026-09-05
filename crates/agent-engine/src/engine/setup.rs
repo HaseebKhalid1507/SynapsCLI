@@ -289,6 +289,7 @@ pub(crate) fn spawn_session_background(
         socket_shutdown.clone(),
     );
     let session_registration = crate::events::registry::SessionRegistration {
+        kind: crate::events::registry::REGISTRATION_KIND.to_string(),
         session_id: session.id.clone(),
         name: session.name.clone(),
         socket_path: session_socket_path.clone(),
