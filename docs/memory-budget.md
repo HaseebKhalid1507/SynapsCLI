@@ -102,25 +102,49 @@ SYNAPS_LOG_BUFFER_LINES=128000     old tracing-appender buffer
 SYNAPS_CONFIG_LOCK=0               skip fs4 lock in write_config_value
 ```
 
-Phase 4 — thin client (`synaps --attach`), PLAN-phase4-client §8.5. Rows are
-"(phase 4, pending)" until the owning package lands; P4-0 rows are live.
+Phase 4 — thin client (`synaps --attach` / `synaps attach`, requires
+`SYNAPS_DAEMON=1`; without it `--attach` boots the ordinary in-process TUI
+and **none** of the rows below apply). Every row is live; defaults are what
+`client_diet.rs`, `main.rs`, `app.rs`, `signals.rs` and `highlight.rs` read.
 
-| Env | Default | Effect | Status |
-|---|---|---|---|
-| `SYNAPS_CLIENT_HISTORY=full\|digest` | `digest` (B7) | `full` restores the 741b6b60 mirror + `Query{Messages}` resync + `MessageHistory` forwarding | phase 4 B1–B7 |
-| `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | display items in `Attached.display_tail` / `/resync` | phase 4 B7 |
-| `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` | Socket 400 / 1 MiB; Local 0 / 0 | 0 = unbounded; drain past cap+64 msgs / cap+256 KiB (audit every 64 pushes or 256 KiB pushed), one sentinel line, `/resync` reloads | phase 4 B6 |
-| `SYNAPS_CLIENT_MALLOC=off` | on | skip bg-thread/decay/tcache mallctls | (phase 4, pending A) |
-| `SYNAPS_CLIENT_PURGE_SECS` | 10 | idle purge delay; 0 disables | (phase 4, pending A) |
-| `SYNAPS_CLIENT_TCACHE=0` | 1 | disable main-thread tcache (fallback) | (phase 4, pending A) |
-| `SYNAPS_CLIENT_REEXEC_MALLOC=1` | off | re-exec with `_RJEM_MALLOC_CONF=narenas:1,…` (fallback) | (phase 4, pending A) |
-| `SYNAPS_CLIENT_SIGNAL_THREAD=1` | off | keep the signal-hook thread on the socket client | (phase 4, pending A) |
-| `SYNAPS_MEMPROF_PURGE=1` | off | purge on every `Idle` immediately (bench) | (phase 4, pending A) |
-| `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | boot ladder (`memstat::ladder`) | sink + `http` stage (P4-0); remaining stages (phase 4, pending A) |
-| `SYNAPS_CLIENT_HTTP=eager` | lazy | build the reqwest client at boot (bisect aid) | live (P4-0) |
-| `SYNAPS_TUI_SYNTECT=full` | curated | full default `SyntaxSet` (75 grammars) instead of the 26-grammar curated dump | live (C1) |
-| `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | drop syntect state after N s without a highlight call; 0 = never evict | live (C2; A's idle arm calls `highlight::evict_if_idle`) |
-| `SYNAPS_TUI_SYNTECT_REPORT=1` | off | build-time only: `build.rs` prints the curated/full dump sizes as a `cargo:warning` | live (C1) |
+| Env | Default | Effect |
+|---|---|---|
+| `SYNAPS_CLIENT_REEXEC=0` | on | Skip the one-time self re-exec. The re-exec runs only when `/sys/kernel/mm/transparent_hugepage/enabled` is `[always]` **and** THP is not already off for the process: it sets `PR_SET_THP_DISABLE` (inherited across `execve`, so `.bss`/stack/first jemalloc chunks map at 4 KiB instead of 2 MiB — 6 of the pre-diet 7.4 MB at `main`) and boots jemalloc with `narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0` via `_RJEM_MALLOC_CONF`. Cost 3–5 ms (`reexec` ladder stage). On `[madvise]`/`[never]` kernels it is skipped (`reexec skipped=thp-not-always`) and the mallctls below do the rest in-process; only `narenas` (boot-only) is then left at the binary's 4. |
+| `SYNAPS_CLIENT_MALLOC_CONF` | the string above | Replaces our part of the re-exec conf. A user-exported `_RJEM_MALLOC_CONF` is **kept**: the child gets `user,ours` (later keys win) and the user's value is restored in the environment afterwards, so children the client spawns (`tmux`, plugin commands) see exactly what the user set. |
+| `SYNAPS_CLIENT_THP=1` | off | Keep transparent huge pages (also skips the re-exec). |
+| `SYNAPS_CLIENT_ALLOC=default` (alias `SYNAPS_CLIENT_MALLOC=off`) | tuned | Skip every allocator knob: no re-exec, no `PR_SET_THP_DISABLE`, no bg-thread/decay/tcache mallctls (`alloc skipped=1`). |
+| `SYNAPS_CLIENT_TCACHE=0` | on | Disable the main thread's tcache (fallback probe). |
+| `SYNAPS_CLIENT_PURGE_IDLE_SECS` (alias `SYNAPS_CLIENT_PURGE_SECS`) | 10 | Seconds after the client goes idle before `arena.<all>.purge` (`idle+N` → `purged` ladder lines), then every 30 s while idle. **0 disables the whole idle arm** — the purge *and* the syntect eviction check (`SYNAPS_TUI_SYNTECT_IDLE_SECS` then never fires). |
+| `SYNAPS_MEMPROF_PURGE=1` | off | Purge immediately on every idle (bench/ladder aid). |
+| `SYNAPS_CLIENT_HISTORY=full` | `digest` | Restores the **history mirror** only: the client keeps a copy of `api_messages`, receives `MessageHistory` frames and resyncs with `Query{Messages}`. It does *not* undo the rest of the diet — the scrollback cap, re-exec, allocator tuning, tokio signals and syntect eviction stay on (`client_bounded` fails under it: G6 slope 2.49 MB). |
+| `SYNAPS_ATTACH_TAIL_ITEMS` | 120 | Display items the daemon projects into `Attached.display_tail` and on `/resync` (user text, assistant thinking/text/tool_use — **no tool output**). |
+| `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` (aliases `SYNAPS_CLIENT_SCROLLBACK_MSGS` / `_BYTES`) | Socket 400 / 2 MiB; Local 0 / 0 | 0 = unbounded. Drain once past cap+64 msgs or cap+256 KiB (audited every 64 pushes or 256 KiB pushed); one sentinel line naming what `/resync` reloads. 2 MiB ≈ 70 tool outputs at `max_tool_output` 30 000 B. |
+| `SYNAPS_TUI_SYNTECT=full` | curated | Full default `SyntaxSet` (75 grammars) instead of the 26-grammar curated dump. Saves ~180 KB of dump bytes only — see the table below. |
+| `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | Drop the syntect state (grammars, compiled regexes, theme) after N s without a highlight; 0 = never. Applies to the in-process TUI too (same idle arm; re-highlight after eviction costs one 20–25 ms load). |
+| `SYNAPS_TUI_SYNTECT_REPORT=1` | off | Build-time: `build.rs` prints the curated/full dump sizes as a `cargo:warning`. |
+| `SYNAPS_CLIENT_SIGNAL_THREAD=1` | off | Socket client handles SIGTERM/SIGHUP/SIGINT on tokio's signal driver (no `signal-listener` thread); `=1` keeps the signal-hook thread. |
+| `SYNAPS_CLIENT_HTTP=eager` | lazy | Build the reqwest client at boot (bisect aid; the `http` ladder stage reappears). |
+| `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | Boot ladder (`memstat::ladder`): `main reexec alloc runtime attach:enter config app attached purge:attached terminal render_thread event_stream hl_first first_frame idle+N purged detach`. |
+
+### Phase 4 — what the thin client costs (bella, THP=`[always]`, release @ c8a7e030, median of 3)
+
+| | before (741b6b60 client path) | after |
+|---|---|---|
+| RssAnon idle, empty session, post-purge (G1) | 19.35 MB (18.4 MB of it huge pages), 4.10 MB after jemalloc's own purge | **2.27 MB** |
+| RssAnon idle, 20 MB history (G2) | 78.5 MB | **2.38 MB** (`bounded_delta` 0.11 MB) |
+| threads at idle (G3) | 8 (`jemalloc_bg_thd`×4, `signal-listener`, render, main×2) | **3** (main ×2 + render; no jemalloc bg threads, no signal thread) |
+| first frame (G4) | attach_ms 47 | **7–10 ms** to `first_frame`, attach_ms 46–48 |
+| all-in marginal per extra session, N=2→3 (G5) | 17.6 MB | **3.18 MB** (daemon anon 0.91 + client 2.27) |
+| RssAnon after 80 tool turns (G6) | grows unbounded | capped by the 2 MiB scrollback (slope ≤ 1.5 MB over turns 30→80, max ≤ 14 MB) |
+
+**With code on screen the number is not 2.3 MB.** One rendered code block
+(any language) compiles that grammar's fancy-regex programs: `first_frame`
++11.2 MB RssAnon → the client idles at **≈ 13.7 MB** until the syntect idle
+eviction fires (`SYNAPS_TUI_SYNTECT_IDLE_SECS`, default 120 s), then
+**≈ 4.9 MB** (the residual is transcript + pane buffers). Each further
+language rendered adds ~8–10 MB until eviction. The curated dump (C1) saves
+dump *bytes* (163 vs 341 KB) and nothing on the heap — the expected
+−1.5…−3 MB was not achieved; C2's eviction is what returns the memory.
 
 ### Phase 4 C — syntect (bella, release, `tests/highlight_mem.rs` jemalloc-accounted, 3 runs each)
 
@@ -140,7 +164,8 @@ touched*, so the curated dump (C1) only saves the ~180 KB of dump bytes and the
 first-fence latency is unchanged — the heap is fancy-regex compiled programs,
 ~8–10 MB **per language rendered**, monotone until dropped. C2's eviction is
 what returns it (83 MB after 10 languages). RssAnon follows `allocated` only
-after a purge (A's §4 arm); the numbers above are jemalloc `stats.allocated`.
+after a purge (the idle arm); the numbers above are jemalloc `stats.allocated`,
+the real-client RssAnon step is +11.2 MB (table above).
 Gate G10: `hl_first` ≤ 60 ms warm / ≤ 120 ms after eviction — 32 / 26 ms.
 Golden: `tests/highlight_curated.rs` — 14 fixtures, curated ≡ full spans;
 unknown languages fall back to Plain Text identically in both.

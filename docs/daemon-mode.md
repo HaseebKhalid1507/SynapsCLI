@@ -15,7 +15,8 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
 | `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
-| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` for attach clients is not wired yet (A4/C4 client diet). |
+| `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` makes the attach client purge on every idle immediately. |
+| Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` path **with** `SYNAPS_DAEMON=1`; the in-process fallback boots untouched (`tests/attach_no_daemon.rs`). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
 | `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
@@ -33,7 +34,7 @@ synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
-synaps --attach [ID]                 # today: notice + routes to `synaps attach` (daemon-attached TUI is day 2)
+synaps --attach [ID]                 # thin TUI client over the socket (phase 4); without SYNAPS_DAEMON=1: notice + ordinary in-process TUI
 ```
 
 `--detach` forks `current_exe daemon --foreground` under `setsid`, stdout → null, stderr → pipe,
@@ -84,7 +85,9 @@ C: bye | socket close = Detach (turn keeps running)
   `Conversation` with the fetched history. Per-event wire cost is O(1) in history size; the O(history)
   cost is paid once per attach and once per tool round (`MessageHistory`, which the engine emits anyway).
 - **Phase 4 (thin client) — `HistoryMode::Digest`** (`hello.client.history = "digest"`, `tail_items`,
-  the `synaps --attach` default; `SYNAPS_CLIENT_HISTORY=full` restores the mirror above wholesale): the
+  the `synaps --attach` default; `SYNAPS_CLIENT_HISTORY=full` restores the mirror above — the local
+  `api_messages` copy, `MessageHistory` forwarding and `Query{Messages}` resync — and nothing else of
+  the client diet): the
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
   `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
@@ -267,6 +270,35 @@ Reading:
   with 1 proc/session, and every additional session costs a 20 MB thin client instead of a full engine.
 
 Raw runs: `/tmp/memprof-synaps-b-daemon-N<N>-r<i>.txt` on bella.
+
+### Phase 4 — the thin client after the diet (bella, THP=`[always]`, release @ c8a7e030, median of 3)
+
+The 19.3 MB / 10-thread client above is the **before**. `DAEMON=1 CLIENT=1 BOUNDED=1 SETTLE=12 REPEAT=3
+FIXTURE_MSGS_MB=0 scripts/memprof/bench-sessions.sh BIN 1 2 3` plus `scripts/memprof/client-ladder.sh`:
+
+| Gate | before (741b6b60) | after | |
+|---|---|---|---|
+| G1 client RssAnon idle, empty session, post-purge | 19.35 MB (18.4 MB huge pages) | **2.27 MB** (N=1/2/3: 2.27 / 2.26 / 2.27) | ≤ 10 ✓ |
+| G2 client RssAnon idle, 20 MB history | 78.5 MB | **2.38 MB**, `bounded_delta` 0.11 MB | ≤ 12 ✓ |
+| G3 client threads at idle | 8 | **3** | ≤ 4 ✓ |
+| G4 `first_frame` | attach_ms 47 | **7–10 ms** (attach_ms 46–48; 79 ms / 114 on the 20 MB fixture) | ≤ 100 ✓ |
+| G5 all-in marginal N=2→3 (daemon anon + client) | 17.6 MB | **3.18 MB** (0.91 + 2.27) | ≤ 10 ✓ |
+| G7 retention pre→post purge | — | 0.00 MB | ≤ 0.5 ✓ |
+| G11 daemon side | — | unchanged within noise; daemon procs 3/3 | ✓ |
+
+Where it went: the re-exec with `PR_SET_THP_DISABLE` (−17 MB of huge pages on a 0.86 MB heap),
+no history mirror (−76 MB on the 20 MB fixture), jemalloc background threads + `signal-listener`
+off (−5 threads), lazy reqwest (`http` stage gone).
+
+**Honest coding-session number:** the 2.3 MB is with no code rendered. One rendered code block
+compiles that grammar's regexes → **≈ 13.7 MB** idle until the syntect idle eviction (default 120 s),
+**≈ 4.9 MB** after; each further language ≈ +8–10 MB until then. The curated grammar dump saves
+dump bytes, not heap. On `[madvise]`/`[never]` kernels the re-exec is skipped (nothing is
+huge-mapped before `main`); the remaining knobs are applied in-process.
+
+The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`) compares
+**content order**, not layout: its normaliser drops blank rows, `█` cursor rows and the
+`│Extensions` line before diffing L against S.
 
 ### Fix round: daemon-tree RssAnon column (§9 of the phase-2 review)
 
