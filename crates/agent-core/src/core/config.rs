@@ -219,6 +219,39 @@ impl CacheTtl {
     }
 }
 
+/// `tools.activation_confirm` — host policy for model-initiated
+/// `activate_tools` (progressive tool disclosure).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivationConfirm {
+    /// Authorize model-initiated activation without prompting (default).
+    #[default]
+    Auto,
+    /// Ask the host: the y/n "Confirm tool activation" dialog; only an
+    /// explicit y/yes authorizes (fail-closed).
+    Prompt,
+    /// Never authorize model-initiated activation; no prompt is raised.
+    Deny,
+}
+
+impl ActivationConfirm {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "prompt" => Some(Self::Prompt),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Prompt => "prompt",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Animated theme-transition mode, parsed from `theme_transition`:
 /// - `"on"` (default): cross-fade theme changes over the default 350 ms.
 /// - `"off"`: instant snap — accessibility, and mercy on tmux-over-ssh.
@@ -589,6 +622,12 @@ pub struct SynapsConfig {
     /// stream starts with the small essential local core plus discovery and
     /// authorization gateways; exact activations are added per session.
     pub progressive_tool_disclosure: bool,
+    /// Host confirmation policy for MODEL-INITIATED `activate_tools`
+    /// (`tools.activation_confirm`). `Auto` (default) authorizes without
+    /// prompting; `Prompt` asks the host (y/n confirm dialog); `Deny` never
+    /// authorizes (locked-down hosts). `server.auto_approve_confirms = true`
+    /// still authorizes regardless of this key.
+    pub tools_activation_confirm: ActivationConfirm,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -643,6 +682,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
+            tools_activation_confirm: ActivationConfirm::default(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
@@ -686,6 +726,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_skills",
     "disabled_tools",
     "progressive_tool_disclosure",
+    "tools.activation_confirm",
     "session_persistence",
 ];
 
@@ -1116,6 +1157,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "tools.activation_confirm" => match ActivationConfirm::parse(val) {
+                Some(mode) => config.tools_activation_confirm = mode,
+                None => config.warnings.push(format!(
+                    "tools.activation_confirm = {val} — expected auto, prompt or deny; \
+                     keeping the default (auto)"
+                )),
+            },
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,
@@ -1842,6 +1890,7 @@ mod tests {
         assert!(config.favorite_models.is_empty());
         assert!(config.disabled_skills.is_empty());
         assert!(!config.progressive_tool_disclosure);
+        assert_eq!(config.tools_activation_confirm, ActivationConfirm::Auto);
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
@@ -1853,6 +1902,32 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_tools_activation_confirm_modes() {
+        for (raw, expected, warns) in [
+            ("prompt", ActivationConfirm::Prompt, false),
+            ("deny", ActivationConfirm::Deny, false),
+            ("AUTO", ActivationConfirm::Auto, false),
+            ("garbage", ActivationConfirm::Auto, true),
+        ] {
+            let home = make_test_home(&format!("activation-confirm-{raw}"));
+            let cfg = home.join(".synaps-cli/config");
+            std::fs::write(&cfg, format!("tools.activation_confirm = {raw}\n")).unwrap();
+            with_home(&home, || {
+                let config = load_config();
+                assert_eq!(config.tools_activation_confirm, expected, "{raw}");
+                assert_eq!(
+                    config.warnings.iter().any(|w| w.contains("tools.activation_confirm")),
+                    warns,
+                    "{raw}: {:?}",
+                    config.warnings
+                );
+            });
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]

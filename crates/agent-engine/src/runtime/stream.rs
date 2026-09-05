@@ -16,6 +16,31 @@ use tokio_util::sync::CancellationToken;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
 /// Constructed once by `Runtime::run_stream_with_messages` before spawning the stream task.
+/// Host activation policy for MODEL-INITIATED `activate_tools`
+/// (`tools.activation_confirm` + `server.auto_approve_confirms`).
+///
+/// Returns `(authority, host_prompt_allowed)`:
+/// * `auto_approve_confirms` or `Auto` → `ModelConfirmed`, no prompt.
+/// * `Prompt` → `Unauthorized` + prompt allowed: `activate_tools` asks the
+///   host (y/n confirm dialog) and only an explicit y/yes authorizes.
+/// * `Deny` → `Unauthorized` + prompt NOT allowed: always
+///   `ConfirmationRequired`, no dialog is ever raised.
+pub fn activation_policy(
+    mode: agent_core::config::ActivationConfirm,
+    auto_approve_confirms: bool,
+) -> (crate::tools::activation::ActivationAuthority, bool) {
+    use agent_core::config::ActivationConfirm;
+    use crate::tools::activation::ActivationAuthority;
+    if auto_approve_confirms {
+        return (ActivationAuthority::ModelConfirmed, false);
+    }
+    match mode {
+        ActivationConfirm::Auto => (ActivationAuthority::ModelConfirmed, false),
+        ActivationConfirm::Prompt => (ActivationAuthority::Unauthorized, true),
+        ActivationConfirm::Deny => (ActivationAuthority::Unauthorized, false),
+    }
+}
+
 pub(super) struct StreamSession {
     // Auth & network
     pub(super) auth: Arc<RwLock<AuthState>>,
@@ -66,6 +91,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.activation_confirm` policy (auto | prompt | deny).
+    pub(super) activation_confirm: agent_core::config::ActivationConfirm,
     /// Runtime-scoped tool-session identity the execution gate scopes the
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
@@ -271,6 +298,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            activation_confirm,
             tool_session_id,
             mcp_runtime,
             mcp_session_scope,
@@ -333,11 +361,8 @@ impl StreamMethods {
         });
         let _extension_session_scope = extension_session_scope;
 
-        let activation_authority = if auto_approve_confirms {
-            crate::tools::activation::ActivationAuthority::ModelConfirmed
-        } else {
-            crate::tools::activation::ActivationAuthority::Unauthorized
-        };
+        let (activation_authority, activation_prompt_allowed) =
+            activation_policy(activation_confirm, auto_approve_confirms);
 
         // ═══ TURN BUDGET (Task 23, spec §8.1) ═══
         // One meter for the whole turn; the shared usage counters are
@@ -945,7 +970,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -1200,7 +1225,8 @@ impl StreamMethods {
                             catalog_snapshot.clone(),
                             std::sync::Arc::clone(&session_tool_set),
                             activation_authority,
-                        );
+                        )
+                        .with_host_prompt(activation_prompt_allowed);
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
@@ -2170,6 +2196,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: false,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             mcp_runtime: None,
             mcp_session_scope: None,
