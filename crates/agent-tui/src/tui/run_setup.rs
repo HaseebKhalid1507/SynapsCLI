@@ -118,6 +118,19 @@ pub(crate) struct RunContext {
 }
 
 /// Boot prologue for [`super::run`]. Same inputs / error type as `run()`.
+static BOOT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Queue a `SystemNotice` shown at the top of the in-process TUI (called
+/// before the runtime exists — e.g. `--attach` falling back after the daemon
+/// refused to start).
+pub fn push_boot_notice(text: impl Into<String>) {
+    BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(text.into());
+}
+
+fn take_boot_notices() -> Vec<String> {
+    std::mem::take(&mut *BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 pub(crate) async fn run_setup(
     continue_session: Option<Option<String>>,
     system: Option<String>,
@@ -162,6 +175,10 @@ pub(crate) async fn run_setup(
     let mut app = app_from_snapshot(&snapshot);
     app.keybinds = Some(keybind_registry.clone());
 
+    // Notices queued before boot (daemon auto-spawn fallback) go first.
+    for n in take_boot_notices() {
+        app.push_msg(ChatMessage::System(n));
+    }
     // Surface config parse warnings once at startup (unknown keys, bad values).
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));

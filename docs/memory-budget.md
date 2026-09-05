@@ -102,13 +102,16 @@ SYNAPS_LOG_BUFFER_LINES=128000     old tracing-appender buffer
 SYNAPS_CONFIG_LOCK=0               skip fs4 lock in write_config_value
 ```
 
-Phase 4 — thin client (`synaps --attach` / `synaps attach`, requires
-`SYNAPS_DAEMON=1`; without it `--attach` boots the ordinary in-process TUI
-and **none** of the rows below apply). Every row is live; defaults are what
+Phase 4 — thin client (`synaps --attach` / `synaps attach`; the daemon is
+auto-started on first use. With `SYNAPS_DAEMON=0`, or when the auto-spawn
+fails, `--attach` boots the ordinary in-process TUI and **none** of the rows
+below apply). Every row is live; defaults are what
 `client_diet.rs`, `main.rs`, `app.rs`, `signals.rs` and `highlight.rs` read.
 
 | Env | Default | Effect |
 |---|---|---|
+| `SYNAPS_DAEMON=0` | on | Daemon features off: `--attach` = in-process TUI (notice on stderr), `synaps daemon`/`attach` exit 3. |
+| `SYNAPS_DAEMON_AUTOSPAWN=0` | on | Never spawn the daemon from a client; with nobody running the attach exits 3 with the `no daemon running` message. |
 | `SYNAPS_CLIENT_REEXEC=0` | on | Skip the one-time self re-exec. The re-exec runs only when `/sys/kernel/mm/transparent_hugepage/enabled` is `[always]` **and** THP is not already off for the process: it sets `PR_SET_THP_DISABLE` (inherited across `execve`, so `.bss`/stack/first jemalloc chunks map at 4 KiB instead of 2 MiB — 6 of the pre-diet 7.4 MB at `main`) and boots jemalloc with `narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0` via `_RJEM_MALLOC_CONF`. Cost 3–5 ms (`reexec` ladder stage). On `[madvise]`/`[never]` kernels it is skipped (`reexec skipped=thp-not-always`) and the mallctls below do the rest in-process; only `narenas` (boot-only) is then left at the binary's 4. |
 | `SYNAPS_CLIENT_MALLOC_CONF` | the string above | Replaces our part of the re-exec conf. A user-exported `_RJEM_MALLOC_CONF` is **kept**: the child gets `user,ours` (later keys win) and the user's value is restored in the environment afterwards, so children the client spawns (`tmux`, plugin commands) see exactly what the user set. |
 | `SYNAPS_CLIENT_THP=1` | off | Keep transparent huge pages (also skips the re-exec). |

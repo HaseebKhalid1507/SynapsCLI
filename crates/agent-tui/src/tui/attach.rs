@@ -145,7 +145,7 @@ pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -
         "no daemon is running{why} — nothing to attach to.\n\
          start one with:  {start}\n\
          or run in the foreground:  {}\n\
-         then re-run `synaps --attach` (SYNAPS_DAEMON=1).",
+         then re-run `synaps --attach` (or unset SYNAPS_DAEMON_AUTOSPAWN=0 to auto-start).",
         start.replace("--detach", "--foreground")
     )
 }

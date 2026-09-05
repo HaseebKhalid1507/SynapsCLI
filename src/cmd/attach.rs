@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use agent_engine::daemon::{registry, EXIT_VERSION};
+use agent_engine::daemon::{registry, EXIT_REFUSED, EXIT_VERSION};
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::*;
 use agent_engine::session::*;
@@ -20,7 +20,7 @@ pub(crate) struct AttachArgs {
     /// Session id to attach to (omit with --create).
     pub id: Option<String>,
     /// Create a new session in the daemon (cwd = this process's cwd).
-    #[arg(long)]
+    #[arg(long, alias = "new")]
     pub create: bool,
     /// Create by continuing a saved session (name or id).
     #[arg(long = "continue", value_name = "NAME_OR_ID")]
@@ -212,8 +212,10 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         std::process::exit(code);
     }
     let paths = registry::daemon_paths(profile.as_deref());
+    // `main` already auto-spawned (or exited 3); this is the safety net.
     if !registry::is_alive(&paths) {
-        anyhow::bail!("daemon not running (start it with `synaps daemon --detach`)");
+        eprintln!("{}", no_daemon_message(profile.as_deref()));
+        std::process::exit(EXIT_REFUSED);
     }
     let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
         Ok(c) => c,
@@ -313,6 +315,15 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
     set_echo(true);
     c.t.detach().await;
     Ok(())
+}
+
+/// `SYNAPS_DAEMON_AUTOSPAWN=0` and nobody running: say how to start one.
+pub(crate) fn no_daemon_message(profile: Option<&str>) -> String {
+    let start = match profile {
+        Some(p) => format!("synaps --profile {p} daemon --detach"),
+        None => "synaps daemon --detach".to_string(),
+    };
+    format!("no daemon running — start it with `{start}` (or unset SYNAPS_DAEMON_AUTOSPAWN=0 to auto-start)")
 }
 
 fn resolve_id(sessions: &[SessionMeta], q: &str) -> Option<SessionId> {
