@@ -87,12 +87,11 @@ struct Cli {
     #[arg(long)]
     no_extensions: bool,
 
-    /// EXPERIMENTAL (SYNAPS_DAEMON=1): run the TUI attached to a daemon
-    /// session instead of in-process. Optionally a session ID (prefix ok);
-    /// with no live session a new one is created (`--continue` continues);
-    /// --new (alias --create) forces a fresh session even if one is live.
-    /// The daemon must already be running (`synaps daemon --detach`).
-    /// Modifiers: --observe (read-only), --takeover (steal input),
+    /// Run the TUI attached to a daemon session instead of in-process
+    /// (the daemon is started on first use). Optionally a session ID
+    /// (prefix ok); with no live session a new one is created (`--continue`
+    /// continues); --new (alias --create) forces a fresh session even if
+    /// one is live. Modifiers: --observe (read-only), --takeover (steal input),
     /// --keep-warm (never parked), --new (fresh session); default mode is
     /// SYNAPS_ATTACH_MODE or mirror (input only if nobody owns it).
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
@@ -113,8 +112,9 @@ struct Cli {
     keep_warm: bool,
 
     /// With --attach: always create a fresh session even if one is live
-    /// (cannot be combined with an explicit session ID).
-    #[arg(long = "new", alias = "create", global = true, requires = "attach")]
+    /// (cannot be combined with an explicit session ID). Not global: the
+    /// `attach` subcommand has its own `--create`/`--new`.
+    #[arg(long = "new", alias = "create", requires = "attach")]
     new_session: bool,
 
     #[command(subcommand)]
@@ -233,9 +233,9 @@ enum Command {
         #[arg(long)]
         insecure_http: bool,
     },
-    /// EXPERIMENTAL: session daemon (SYNAPS_DAEMON=1) — start/status/stop/sessions
+    /// Session daemon — status/stop/sessions/reload (auto-started by --attach)
     Daemon(cmd::daemon::DaemonArgs),
-    /// EXPERIMENTAL: thin line client attached to a daemon session (SYNAPS_DAEMON=1)
+    /// Thin line client attached to a daemon session (starts the daemon if needed)
     Attach(cmd::attach::AttachArgs),
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
     Rpc {
@@ -329,41 +329,93 @@ fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
     }
 }
 
-/// Thin-client decision: `SYNAPS_DAEMON=1` **and** argv asks for attach
-/// (`attach` as the first positional, or `--attach`/`--attach=` anywhere).
-/// Without the daemon flag `--attach` falls back to the in-process TUI,
-/// which must boot exactly like `synaps` does — no re-exec, no allocator
-/// diet, multi-thread runtime (review H2).
-fn is_thin_client() -> bool {
+/// Which thin client argv asks for (`SYNAPS_DAEMON` not `0`): the TUI
+/// (`--attach`/`--attach=` anywhere) or the line client (`attach` as the
+/// first positional). `None` = the ordinary in-process boot, which must run
+/// exactly like `synaps` does — no re-exec, no allocator diet, multi-thread
+/// runtime (review H2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThinClient {
+    Tui { profile: Option<String> },
+    Line { profile: Option<String> },
+}
+
+fn thin_client() -> Option<ThinClient> {
     thin_client_from(std::env::args().skip(1), agent_engine::daemon::enabled())
 }
 
-fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: bool) -> bool {
+fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: bool) -> Option<ThinClient> {
     if !daemon_enabled {
-        return false;
+        return None;
     }
-    let mut skip_value = false;
+    let mut want_profile = false;
+    let mut profile: Option<String> = None;
     let mut first_positional: Option<String> = None;
     let mut attach_flag = false;
     for a in args {
-        if skip_value {
-            skip_value = false;
+        if want_profile {
+            want_profile = false;
+            profile = Some(a);
             continue;
         }
         if a == "--attach" || a.starts_with("--attach=") {
             attach_flag = true;
         } else if a == "--profile" {
-            skip_value = true;
+            want_profile = true;
+        } else if let Some(p) = a.strip_prefix("--profile=") {
+            profile = Some(p.to_string());
         } else if !a.starts_with('-') && first_positional.is_none() {
             first_positional = Some(a);
         }
     }
-    attach_flag || first_positional.as_deref() == Some("attach")
+    if first_positional.as_deref() == Some("attach") {
+        Some(ThinClient::Line { profile })
+    } else if attach_flag && first_positional.is_none() {
+        Some(ThinClient::Tui { profile })
+    } else {
+        None
+    }
+}
+
+/// Auto-spawn (jcode model) before the runtime exists: a live daemon or a
+/// freshly spawned one. Runs BEFORE the thin re-exec/diet so a failed spawn
+/// can fall back to the untouched in-process boot. Returns the reason the
+/// TUI should fall back in-process; the line client exits 3 instead.
+fn ensure_daemon(kind: &ThinClient) -> Option<String> {
+    use agent_engine::daemon::{self, EnsureError, Ensured, EXIT_REFUSED};
+    let (profile, line) = match kind {
+        ThinClient::Tui { profile } => (profile.clone(), false),
+        ThinClient::Line { profile } => (profile.clone(), true),
+    };
+    let opts = daemon::DaemonOpts { profile, ..Default::default() };
+    match daemon::ensure_running(&opts) {
+        Ok(Ensured::Running) => None,
+        Ok(Ensured::Spawned(pid)) => {
+            eprintln!("starting daemon (pid {pid}) — synaps daemon stop to end it");
+            None
+        }
+        Err(EnsureError::AutospawnDisabled) => {
+            let msg = cmd::attach::no_daemon_message(opts.profile.as_deref());
+            eprintln!("{msg}");
+            std::process::exit(EXIT_REFUSED);
+        }
+        Err(EnsureError::Spawn(reason)) => {
+            if line {
+                eprintln!("synaps attach: daemon unavailable: {reason}");
+                std::process::exit(EXIT_REFUSED);
+            }
+            Some(reason)
+        }
+    }
 }
 
 /// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
 /// overrides). `narenas` is boot-only — the one knob a mallctl cannot set.
 const THIN_MALLOC_CONF: &str = "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0";
+
+/// Set by `main` when the daemon could not be started: `--attach` runs the
+/// ordinary TUI with a notice instead of the socket client.
+const ATTACH_FALLBACK: &str = "SYNAPS_ATTACH_FALLBACK";
 
 /// Env markers carried across the re-exec: the loop guard and the user's own
 /// `_RJEM_MALLOC_CONF` (restored in the child so what we spawn sees it, M2).
@@ -442,7 +494,17 @@ fn scrub_reexec_env() {
 }
 
 fn main() -> anyhow::Result<()> {
-    let thin = is_thin_client();
+    let mut thin = false;
+    if let Some(kind) = thin_client() {
+        match ensure_daemon(&kind) {
+            None => thin = true,
+            Some(reason) => {
+                eprintln!("daemon unavailable: {reason} — running in-process");
+                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                std::env::set_var(ATTACH_FALLBACK, "1");
+            }
+        }
+    }
     if thin {
         thin_client_reexec();
         scrub_reexec_env();
@@ -489,8 +551,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     match cli.command {
         None if cli.attach.is_some() => {
-            if !agent_engine::daemon::enabled() {
-                eprintln!("--attach ignored: set SYNAPS_DAEMON=1 to enable daemon mode");
+            let fallback = std::env::var_os(ATTACH_FALLBACK).is_some();
+            std::env::remove_var(ATTACH_FALLBACK);
+            if !agent_engine::daemon::enabled() || fallback {
+                if !fallback {
+                    eprintln!("--attach ignored: {}", agent_engine::daemon::DISABLED_NOTICE);
+                }
                 tui::run(
                     cli.continue_session,
                     cli.system,
@@ -668,16 +734,20 @@ mod worker_threads_tests {
 
     #[test]
     fn thin_client_requires_daemon_flag() {
-        assert!(!thin_client_from(v(&["--attach"]), false));
-        assert!(!thin_client_from(v(&["attach"]), false));
-        assert!(thin_client_from(v(&["--attach"]), true));
-        assert!(thin_client_from(v(&["--attach=abc"]), true));
-        assert!(thin_client_from(v(&["attach"]), true));
-        assert!(thin_client_from(v(&["--profile", "x", "attach"]), true));
+        use super::ThinClient::{Line, Tui};
+        assert_eq!(thin_client_from(v(&["--attach"]), false), None);
+        assert_eq!(thin_client_from(v(&["attach"]), false), None);
+        assert_eq!(thin_client_from(v(&["--attach"]), true), Some(Tui { profile: None }));
+        assert_eq!(thin_client_from(v(&["--attach=abc"]), true), Some(Tui { profile: None }));
+        assert_eq!(thin_client_from(v(&["attach"]), true), Some(Line { profile: None }));
+        assert_eq!(thin_client_from(v(&["--profile", "x", "attach"]), true), Some(Line { profile: Some("x".into()) }));
+        assert_eq!(thin_client_from(v(&["--profile=x", "--attach", "--new"]), true), Some(Tui { profile: Some("x".into()) }));
         // bare `attach` is only the subcommand position, not a value elsewhere
-        assert!(!thin_client_from(v(&["send", "attach"]), true));
-        assert!(!thin_client_from(v(&["--profile", "attach"]), true));
-        assert!(!thin_client_from(v(&[]), true));
+        assert_eq!(thin_client_from(v(&["send", "attach"]), true), None);
+        assert_eq!(thin_client_from(v(&["--profile", "attach"]), true), None);
+        // `--attach` next to a subcommand is not the TUI attach path
+        assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true), None);
+        assert_eq!(thin_client_from(v(&[]), true), None);
     }
 
     #[test]
@@ -692,6 +762,12 @@ mod worker_threads_tests {
         let both = super::Cli::try_parse_from(["synaps", "--attach", "abc", "--new"]).unwrap();
         assert_eq!(both.attach.flatten().as_deref(), Some("abc"));
         assert!(both.new_session);
+        // The line client's own --create/--new must not collide with the
+        // top-level alias (clap's debug assert panics on duplicate longs).
+        let line = super::Cli::try_parse_from(["synaps", "attach", "--create"]).unwrap();
+        assert!(matches!(line.command, Some(super::Command::Attach(ref a)) if a.create));
+        let line = super::Cli::try_parse_from(["synaps", "attach", "--new"]).unwrap();
+        assert!(matches!(line.command, Some(super::Command::Attach(ref a)) if a.create));
         // --new without --attach is a clap error
         assert!(super::Cli::try_parse_from(["synaps", "--new"]).is_err());
     }

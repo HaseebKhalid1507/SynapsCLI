@@ -1,14 +1,16 @@
 # Daemon mode (`synaps daemon` / `synaps attach`) — phase 2, package B
 
-**Status:** experimental, off by default. Everything here is gated by `SYNAPS_DAEMON=1`.
-Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
+**Status:** on by default. The first `synaps --attach` / `synaps attach` starts the daemon itself
+(jcode model: `setsid` + ready-fd, the daemon holds the flock); `SYNAPS_DAEMON=0` turns every daemon
+feature off. Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
 (no `agent-tui` in its graph — `tests/daemon_no_tui_dep.rs`).
 
 ## Flags and kill-switches
 
 | Env | Effect |
 |---|---|
-| `SYNAPS_DAEMON=1` | Required for `synaps daemon`, `synaps attach`, and `--attach`. Unset → exit 3 with a one-line reason (`--attach` prints a notice and runs the normal TUI). |
+| `SYNAPS_DAEMON=0` (also `false`/`off`/`no`) | Disable daemon features: `synaps daemon` and `synaps attach` exit 3 with `daemon disabled by SYNAPS_DAEMON=0`; `--attach` prints `--attach ignored: …` and runs the normal in-process TUI. Unset or `1` = on (`=1` is a no-op kept for older scripts). |
+| `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: an attach with no live daemon exits 3 with `no daemon running — start it with \`synaps daemon --detach\``. Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 5 s on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses/dies inside the 5 s (e.g. the legacy-MCP refusal, exit 3) `--attach` falls back to the in-process TUI with a `daemon unavailable: <reason> — running in-process` notice (exit 0); `synaps attach` prints the reason and exits 3. |
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Allow start with `progressive_tool_disclosure=false` **and** MCP servers configured (legacy `McpTool` connections would be shared across sessions). Same as `--allow-legacy-mcp`. |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
@@ -16,7 +18,7 @@ Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
 | `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
 | `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` makes the attach client purge on every idle immediately. |
-| Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` path **with** `SYNAPS_DAEMON=1`; the in-process fallback boots untouched (`tests/attach_no_daemon.rs`). |
+| Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` thin path; the in-process fallback (`SYNAPS_DAEMON=0`, or a failed auto-spawn) boots untouched (`tests/attach_no_daemon.rs`, `tests/daemon_autospawn.rs`). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
 | `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
@@ -34,8 +36,17 @@ synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
-synaps --attach [ID]                 # thin TUI client over the socket (phase 4); without SYNAPS_DAEMON=1: notice + ordinary in-process TUI
+synaps --attach [ID]                 # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
+
+### How to use
+
+```
+synaps --attach --new
+```
+
+That is all: no env, no `daemon --detach` first. `synaps daemon status` says
+`not running (auto-starts on first --attach)` until then; `synaps daemon stop` ends it.
 
 `--detach` forks `current_exe daemon --foreground` under `setsid`, stdout → null, stderr → pipe,
 and waits ≤ 5 s for `R` on an anonymous ready pipe (EOF before `R` = child died → error with its
@@ -55,6 +66,7 @@ With no ID: attaches to the single live session, creates one if none, lists if s
 |---|---|---|
 | `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup) |
 | `daemon.lock` | 0600 | **flock = liveness oracle.** Alive iff someone holds it. Nobody unlinks on ECONNREFUSED alone; `reap_stale` unlinks sock/json/pid only when the lock is free. A second daemon on the same paths is refused. |
+| `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
 
@@ -220,7 +232,7 @@ process cwd. Start the daemon in the project you care about until day 2's `memor
 
 ## What changes on the default (in-process) path — read before merging
 
-Honest list of behaviour changes on this branch with `SYNAPS_DAEMON` **unset**:
+Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
 
 1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The differential test
    (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the

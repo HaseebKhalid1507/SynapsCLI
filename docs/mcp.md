@@ -84,7 +84,7 @@ Safety properties:
   live.
 
 **This is on by default in every mode, including the single-session TUI /
-`synaps chat` with `SYNAPS_DAEMON` unset.** Before: exact mode with no cache
+plain `synaps chat` (no daemon).** Before: exact mode with no cache
 meant "MCP tools are not discoverable this run", every run. After: run 1
 writes the cache, run 2 registers dormant tools at boot — the tool list,
 system prompt and provider prompt-cache prefix differ between the first and

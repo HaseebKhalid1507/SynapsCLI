@@ -51,6 +51,8 @@ mod viewport;
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub use run_setup::push_boot_notice;
+
 use app::{App, ChatMessage};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};

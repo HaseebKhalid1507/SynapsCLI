@@ -17,7 +17,7 @@
 # (sum of RssAnon over the daemon tree — PSS is a sharing artefact once the
 # clients map the same binary, RssAnon is the honest daemon-side number) and
 # anon_marginal (daemon_anon(N) − daemon_anon(N−1) = daemon-side cost of one
-# idle session). Requires SYNAPS_DAEMON=1 (exported here). Sessions are REAL
+# idle session). SYNAPS_DAEMON=1 is exported (no-op since auto-spawn; kept explicit). Sessions are REAL
 # SessionActors.
 #
 # DAEMON=1 PARKED=1 mode (PLAN-phase3 §5.5): every session is created from a
