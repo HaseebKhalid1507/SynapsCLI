@@ -937,6 +937,40 @@ async fn name_at_create_and_saveas_reach_registry_and_meta() {
         handle.id.as_str()
     );
 
+    // `--continue ambient2` while live → the same actor (name resolved in
+    // memory first, then disk; either way never a second actor).
+    let again = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some("ambient2".into())),
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.id, handle.id);
+    assert_eq!(host.sessions().len(), 1);
+    // Non-persisted session: its name exists ONLY in memory — still attaches.
+    let eph = host
+        .create_session(SessionConfig {
+            name: Some("ephemeral".into()),
+            persist: false,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert!(agent_engine::core::session::resolve_session("ephemeral").is_err(), "not on disk");
+    let again = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some("ephemeral".into())),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.id, eph.id);
+    assert_eq!(host.sessions().len(), 2);
+    eph.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+    eph.closed().await;
+
     // Clear: `saveas` with no arg.
     a.send(SessionCommand::EngineCommand {
         id: 2,
