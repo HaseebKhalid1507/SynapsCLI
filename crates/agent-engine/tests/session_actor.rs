@@ -985,3 +985,68 @@ async fn name_at_create_and_saveas_reach_registry_and_meta() {
     assert!(find_session_registration(handle.id.as_str()).is_some(), "still registered by id");
     end(&mut a).await;
 }
+
+/// Bug: `events.auto_turn = false` was parsed but the actor hardcoded
+/// `auto_turn_enabled = true` — in daemon mode the opt-out did nothing. The
+/// event must still be injected and forwarded; no EventAuto turn may run.
+/// Flipping the key back on (host.reload_config) re-enables auto turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn events_auto_turn_false_injects_without_a_turn() {
+    use tokio::io::AsyncWriteExt;
+    let h = Home::new();
+    let config_path = h._dir.path().join(".synaps-cli").join("config");
+    std::fs::write(&config_path, "events.auto_turn = false\n").unwrap();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    assert!(!host.config().events.auto_turn, "config key read at boot");
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+
+    let push = |text: &'static str| {
+        let reg = agent_engine::events::registry::find_session_registration(handle.id.as_str())
+            .expect("registered");
+        async move {
+            let event = agent_engine::events::types::Event::simple(
+                "test",
+                text,
+                Some(agent_engine::events::types::Severity::High),
+            );
+            let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
+            c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+            c.shutdown().await.unwrap();
+        }
+    };
+
+    push("no turn please").await;
+    // Injected + forwarded, then nothing: no TurnStarted within the window.
+    let external = until(&mut a, |e| matches!(e, SessionEventWire::External(_))).await;
+    assert!(external.iter().all(|e| !matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let e = next(&mut a).await;
+            if matches!(e.event, SessionEventWire::TurnStarted { .. }) {
+                return e.event;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "auto_turn=false must not start a turn: {quiet:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "provider never called");
+
+    // Opt back in without a restart: the actor reads the host config per wake.
+    std::fs::write(&config_path, "events.auto_turn = true\n").unwrap();
+    host.reload_config();
+    assert!(host.config().events.auto_turn);
+    push("now turn").await;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::TurnStarted { trigger: agent_engine::session::TurnTrigger::EventAuto, .. }
+    )));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    end(&mut a).await;
+}

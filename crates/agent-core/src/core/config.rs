@@ -271,8 +271,8 @@ impl ThemeTransitionMode {
 /// server and RPC modes.
 #[derive(Debug, Clone)]
 pub struct EventsConfig {
-    /// When `true` (default), the server/RPC session automatically triggers a
-    /// model turn when runtime events arrive while idle.  Set
+    /// When `true` (default), the server/RPC/daemon session automatically
+    /// triggers a model turn when runtime events arrive while idle.  Set
     /// `events.auto_turn = false` (or `0` / `no` / `off`) to opt out.
     /// Unrecognised values fail safe to `false` with a warning.
     /// The consecutive-turn cap (`auto_turn_cap`) still applies regardless.
