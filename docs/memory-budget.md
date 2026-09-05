@@ -118,8 +118,32 @@ Phase 4 — thin client (`synaps --attach`), PLAN-phase4-client §8.5. Rows are
 | `SYNAPS_MEMPROF_PURGE=1` | off | purge on every `Idle` immediately (bench) | (phase 4, pending A) |
 | `SYNAPS_MEM_TRACE=1`, `SYNAPS_MEM_TRACE_FILE` | off; `${XDG_RUNTIME_DIR:-/tmp}/synaps-memtrace-<pid>.log` | boot ladder (`memstat::ladder`) | sink + `http` stage (P4-0); remaining stages (phase 4, pending A) |
 | `SYNAPS_CLIENT_HTTP=eager` | lazy | build the reqwest client at boot (bisect aid) | live (P4-0) |
-| `SYNAPS_TUI_SYNTECT=full` | curated | full default `SyntaxSet` | (phase 4, pending C) |
-| `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | 0 = never evict | (phase 4, pending C) |
+| `SYNAPS_TUI_SYNTECT=full` | curated | full default `SyntaxSet` (75 grammars) instead of the 26-grammar curated dump | live (C1) |
+| `SYNAPS_TUI_SYNTECT_IDLE_SECS` | 120 | drop syntect state after N s without a highlight call; 0 = never evict | live (C2; A's idle arm calls `highlight::evict_if_idle`) |
+| `SYNAPS_TUI_SYNTECT_REPORT=1` | off | build-time only: `build.rs` prints the curated/full dump sizes as a `cargo:warning` | live (C1) |
+
+### Phase 4 C — syntect (bella, release, `tests/highlight_mem.rs` jemalloc-accounted, 3 runs each)
+
+| | curated (C1) | full (`SYNAPS_TUI_SYNTECT=full`) |
+|---|---|---|
+| dump bytes embedded / copied at load | 163 KB (26 grammars) | 341 KB (75 grammars) |
+| `SyntaxSet` load (`hl_first load_ms=`) | 0 ms | 0 ms |
+| first Rust highlight (contexts + regex compile) | 19–24 ms (32 ms via `highlight_code_block` incl. theme) | 20–21 ms |
+| reload after eviction, first highlight | 22–26 ms | — |
+| jemalloc `allocated` after first Rust fence | +9.8–10.6 MB | +10.0–10.4 MB |
+| after 10 languages (rs py js go sh json yaml md diff sql) | +83 MB | +83 MB |
+| returned by `evict_if_idle` (C2) | −83 MB allocated | −83 MB allocated |
+| `ThemeSet::load_defaults()` retained pre-C3 vs one `Theme` (C3) | 67 KB → one `Theme` (dropped with the set on eviction) | |
+
+Reading: syntect deserialises contexts and compiles regexes lazily *per grammar
+touched*, so the curated dump (C1) only saves the ~180 KB of dump bytes and the
+first-fence latency is unchanged — the heap is fancy-regex compiled programs,
+~8–10 MB **per language rendered**, monotone until dropped. C2's eviction is
+what returns it (83 MB after 10 languages). RssAnon follows `allocated` only
+after a purge (A's §4 arm); the numbers above are jemalloc `stats.allocated`.
+Gate G10: `hl_first` ≤ 60 ms warm / ≤ 120 ms after eviction — 32 / 26 ms.
+Golden: `tests/highlight_curated.rs` — 14 fixtures, curated ≡ full spans;
+unknown languages fall back to Plain Text identically in both.
 
 ## Observability
 

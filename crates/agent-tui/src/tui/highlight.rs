@@ -2,9 +2,11 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
@@ -49,20 +51,148 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(clamped)
 }
 
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
-    #[cfg(any(test, feature = "testing"))]
-    SYNTAX_SET_TOUCHED.store(true, std::sync::atomic::Ordering::Relaxed);
-    SyntaxSet::load_defaults_newlines()
-});
-static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+/// Curated syntect dump written by `build.rs` (PLAN-phase4 §3 C1): the
+/// `CURATED` grammars plus their include closure. Colours are golden-tested
+/// identical to the full default set (`tests/highlight_curated.rs`).
+static CURATED_DUMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/curated_newlines.packdump"));
 
-/// Drop the syntect `SyntaxSet` when it has not been used for `idle`
-/// (PLAN-phase4 §3 C2). **P4-0 stub**: the set is a `LazyLock` today and
-/// cannot be evicted, so this always returns `false`; C2 replaces the
-/// static with a `SyntaxCache` and makes this real. A's idle arm calls it.
+/// `SYNAPS_TUI_SYNTECT=full` → syntect's full default set (kill-switch for a
+/// language missing from the curated list). Anything else → curated dump.
+fn load_syntax_set() -> SyntaxSet {
+    if std::env::var("SYNAPS_TUI_SYNTECT").is_ok_and(|v| v == "full") {
+        return SyntaxSet::load_defaults_newlines();
+    }
+    // The dump is produced by this same build, so a decode failure is a build
+    // bug — fall back to the full set rather than lose highlighting.
+    syntect::dumps::from_uncompressed_data(CURATED_DUMP)
+        .unwrap_or_else(|_| SyntaxSet::load_defaults_newlines())
+}
+
+/// Everything syntect needs to highlight, loaded together and dropped
+/// together (PLAN-phase4 §3 C2).
+struct Loaded {
+    set: SyntaxSet,
+    theme: Theme,
+}
+
+impl Loaded {
+    fn theme(&self) -> &Theme {
+        &self.theme
+    }
+}
+
+/// The one syntect theme the palette maps code colours from. Only this theme
+/// is kept (PLAN-phase4 §3 C3); the rest of `ThemeSet::load_defaults()` is
+/// dropped on the spot. Falls back to the first default theme if the name
+/// ever disappears from syntect's bundle — never panics.
+const CODE_THEME: &str = "base16-ocean.dark";
+
+fn load_theme() -> Theme {
+    let mut themes = ThemeSet::load_defaults().themes;
+    themes
+        .remove(CODE_THEME)
+        .or_else(|| themes.into_values().next())
+        .unwrap_or_default()
+}
+
+/// Lazily loaded, idle-evictable syntect state. Rendered `Line<'static>`s own
+/// their spans, so dropping this never touches what is on screen — only the
+/// next highlight call pays a reload (`hl_first` ladder stage, `load_ms=`).
+struct SyntaxCache {
+    loaded: Mutex<Option<Arc<Loaded>>>,
+    /// Millis since `EPOCH` of the last `syntax_set()` call.
+    last_use: AtomicU64,
+    /// Number of loads so far (1 = first touch, >1 = reload after eviction).
+    loads: AtomicU64,
+}
+
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static CACHE: SyntaxCache = SyntaxCache {
+    loaded: Mutex::new(None),
+    last_use: AtomicU64::new(0),
+    loads: AtomicU64::new(0),
+};
+
+fn now_ms() -> u64 {
+    EPOCH.elapsed().as_millis() as u64
+}
+
+/// The syntect state, loading it on first use and stamping `last_use`.
+fn syntax_set() -> Arc<Loaded> {
+    CACHE.last_use.store(now_ms(), Ordering::Relaxed);
+    let mut guard = CACHE.loaded.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(loaded) = guard.as_ref() {
+        return Arc::clone(loaded);
+    }
+    #[cfg(any(test, feature = "testing"))]
+    SYNTAX_SET_TOUCHED.store(true, Ordering::Relaxed);
+    let t0 = Instant::now();
+    let loaded = Arc::new(Loaded {
+        set: load_syntax_set(),
+        theme: load_theme(),
+    });
+    let loads = CACHE.loads.fetch_add(1, Ordering::Relaxed) + 1;
+    agent_core::core::memstat::ladder(
+        "hl_first",
+        &format!("load_ms={} loads={}", t0.elapsed().as_millis(), loads),
+    );
+    *guard = Some(Arc::clone(&loaded));
+    loaded
+}
+
+/// `SYNAPS_TUI_SYNTECT_IDLE_SECS` override for the idle-eviction period:
+/// `None` = not set (use the caller's default), `Some(None)` = `0` (never),
+/// `Some(Some(d))` = evict after `d`.
+fn idle_override() -> Option<Option<Duration>> {
+    static OVERRIDE: OnceLock<Option<Option<Duration>>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let secs: u64 = std::env::var("SYNAPS_TUI_SYNTECT_IDLE_SECS")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((secs > 0).then(|| Duration::from_secs(secs)))
+    })
+}
+
+/// Default idle period before the syntect state is dropped (PLAN-phase4 §8.5).
 #[allow(dead_code)]
-pub(crate) fn evict_if_idle(_idle: std::time::Duration) -> bool {
-    false
+pub(crate) const SYNTECT_IDLE_DEFAULT: Duration = Duration::from_secs(120);
+
+/// Drop the syntect `SyntaxSet`/`Theme` when no highlight call has used
+/// them for `idle` (PLAN-phase4 §3 C2). `SYNAPS_TUI_SYNTECT_IDLE_SECS`
+/// overrides `idle` when set (`0` = never evict). Returns `true` only when
+/// something was actually dropped; a set that is currently borrowed by a
+/// highlight call (another `Arc` alive) is left alone. The next highlight
+/// call reloads lazily and emits another `hl_first` ladder line.
+#[allow(dead_code)] // A's idle arm is the caller
+pub(crate) fn evict_if_idle(idle: Duration) -> bool {
+    let idle = match idle_override() {
+        Some(None) => return false,
+        Some(Some(d)) => d,
+        None => idle,
+    };
+    let mut guard = CACHE.loaded.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(loaded) = guard.as_ref() else {
+        return false;
+    };
+    let since = now_ms().saturating_sub(CACHE.last_use.load(Ordering::Relaxed));
+    if Duration::from_millis(since) < idle || Arc::strong_count(loaded) > 1 {
+        return false;
+    }
+    *guard = None;
+    true
+}
+
+/// Whether the syntect state is currently resident.
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+pub(crate) fn is_loaded() -> bool {
+    CACHE
+        .loaded
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
 }
 
 // ── Test-only highlight instrumentation (Slice 0 / T241) ─────────────────────
@@ -121,9 +251,9 @@ fn note_highlight_call() {}
 /// Highlight a code block using syntect
 pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'static>> {
     note_highlight_call();
-    let ss = &*SYNTAX_SET;
-    let ts = &*THEME_SET;
-    let theme = &ts.themes["base16-ocean.dark"];
+    let loaded = syntax_set();
+    let ss = &loaded.set;
+    let theme = loaded.theme();
 
     let syntax = ss
         .find_syntax_by_token(lang)
@@ -164,9 +294,9 @@ pub(crate) fn highlight_tool_code(
     marker_color: Color,
 ) -> Vec<Line<'static>> {
     note_highlight_call();
-    let ss = &*SYNTAX_SET;
-    let ts = &*THEME_SET;
-    let theme = &ts.themes["base16-ocean.dark"];
+    let loaded = syntax_set();
+    let ss = &loaded.set;
+    let theme = loaded.theme();
 
     let syntax = ss
         .find_syntax_by_extension(ext)
@@ -422,9 +552,9 @@ pub(crate) fn highlight_read_output(
     margin: &str,
 ) -> Option<Vec<Line<'static>>> {
     note_highlight_call();
-    let ss = &*SYNTAX_SET;
-    let ts = &*THEME_SET;
-    let theme = &ts.themes["base16-ocean.dark"];
+    let loaded = syntax_set();
+    let ss = &loaded.set;
+    let theme = loaded.theme();
 
     let syntax = if !ext.is_empty() {
         ss.find_syntax_by_extension(ext)
@@ -514,6 +644,93 @@ mod tests {
 
         assert_eq!(rendered, "ab漢");
         assert_eq!(display_width(rendered.as_str()), 4);
+    }
+
+    fn evict_now() -> bool {
+        // Other tests in this binary may hold the Arc for a moment.
+        for _ in 0..200 {
+            if evict_if_idle(Duration::ZERO) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// PLAN-phase4 §8.4 C1/C2 numbers. Run in release, once per mode:
+    /// `cargo test -p synaps-tui --release --lib -- --ignored measure_hl_first --nocapture`
+    /// and again with `SYNAPS_TUI_SYNTECT=full`. Prints RssAnon before the
+    /// first highlight, after it (`hl_first` step), after eviction, and after
+    /// the reload, with `load_ms` for both loads. The lib test binary runs on
+    /// the system allocator, so RssAnon does not come back after eviction here
+    /// (glibc keeps the free lists) — `tests/highlight_mem.rs` has the
+    /// jemalloc-accounted heap numbers; this one is for the two latencies.
+    #[test]
+    #[ignore]
+    #[serial_test::serial(highlight_cache)]
+    fn measure_hl_first() {
+        use agent_core::core::memstat::self_snapshot;
+        let code = include_str!("../../tests/fixtures/highlight/sample.rs.txt");
+        let py = include_str!("../../tests/fixtures/highlight/sample.py.txt");
+        let _ = evict_now();
+        let mode = std::env::var("SYNAPS_TUI_SYNTECT").unwrap_or_else(|_| "curated".into());
+        let base = self_snapshot().rss_anon_kb;
+        let t0 = Instant::now();
+        let _ = highlight_code_block(code, "rust", "");
+        let first_ms = t0.elapsed().as_millis();
+        let after_first = self_snapshot().rss_anon_kb;
+        let _ = highlight_code_block(py, "python", "");
+        let _ = highlight_code_block(code, "rust", "");
+        let after_more = self_snapshot().rss_anon_kb;
+        assert!(evict_now());
+        let after_evict = self_snapshot().rss_anon_kb;
+        let t1 = Instant::now();
+        let _ = highlight_code_block(code, "rust", "");
+        let reload_ms = t1.elapsed().as_millis();
+        let after_reload = self_snapshot().rss_anon_kb;
+        eprintln!(
+            "measure_hl_first mode={mode} dump_bytes={} rss_anon_kb: base={base} hl_first={after_first} (+{}) +py={after_more} (+{}) evicted={after_evict} ({:+}) reload={after_reload} (+{}) first_hl_ms={first_ms} reload_hl_ms={reload_ms}",
+            CURATED_DUMP.len(),
+            after_first as i64 - base as i64,
+            after_more as i64 - base as i64,
+            after_evict as i64 - after_more as i64,
+            after_reload as i64 - after_evict as i64,
+        );
+    }
+
+    #[test]
+    fn single_code_theme_is_the_palette_theme() {
+        let full = ThemeSet::load_defaults();
+        assert_eq!(load_theme(), full.themes[CODE_THEME]);
+    }
+
+    #[test]
+    #[serial_test::serial(highlight_cache)]
+    fn evict_if_idle_drops_and_reloads_with_identical_output() {
+        let code = "fn main() {\n    let x: u32 = 0x1f;\n}\n";
+        let before = highlight_code_block(code, "rust", "");
+        assert!(is_loaded());
+        assert!(evict_now(), "evict_if_idle(0) must drop the idle set");
+        assert!(!is_loaded());
+        assert!(!evict_if_idle(Duration::ZERO), "nothing to evict twice");
+        let after = highlight_code_block(code, "rust", "");
+        assert!(is_loaded());
+        assert_eq!(before, after);
+        assert!(before.iter().flat_map(|l| l.spans.iter()).count() > 3);
+    }
+
+    #[test]
+    #[serial_test::serial(highlight_cache)]
+    fn evict_if_idle_refuses_while_in_use_or_not_idle() {
+        let held = syntax_set();
+        assert!(
+            !evict_if_idle(Duration::ZERO),
+            "borrowed set must not be dropped"
+        );
+        drop(held);
+        let _ = syntax_set();
+        assert!(!evict_if_idle(Duration::from_secs(3600)), "not idle yet");
+        assert!(is_loaded());
     }
 
     #[test]

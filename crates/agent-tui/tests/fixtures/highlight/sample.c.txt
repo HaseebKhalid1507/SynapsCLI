@@ -1,0 +1,21 @@
+#include <stdio.h>
+#include "local.h"
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+/* block comment */
+typedef struct node { int val; struct node *next; } node_t;
+
+static inline unsigned long hash(const char *s) {
+    unsigned long h = 5381UL;
+    while (*s) h = ((h << 5) + h) ^ (unsigned char)*s++;
+    return h;
+}
+
+int main(int argc, char **argv) {
+    // line comment
+    node_t n = { .val = 0x7f, .next = NULL };
+    float f = 1.5e-3f; char c = '\n';
+    printf("%s %d %f\n", argv[0], n.val, f);
+    for (int i = 0; i < argc; ++i) { if (!argv[i]) break; }
+    return argc > 1 ? 0 : -1;
+}

@@ -1,0 +1,20 @@
+# comment
+require 'json'
+module Foo
+  class Bar < Base
+    attr_reader :name
+    def initialize(name, opts = {})
+      @name = name
+      @count = opts.fetch(:count, 0)
+    end
+    def to_s = "#{@name} #{@count}"
+    def each(&block)
+      [1, 2.5, :sym, nil, true].each { |x| yield x if block_given? }
+    end
+  end
+end
+puts Foo::Bar.new("x", count: 3).to_s unless ARGV.empty?
+str = <<~HEREDOC
+  heredoc #{1 + 1}
+HEREDOC
+re = /ab+c/i =~ "abbc"

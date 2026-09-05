@@ -54,6 +54,11 @@ tui-textarea-2 = { version = "0.12", default-features = false, features = ["cros
 # Render-thread synchronisation (tui/render_thread.rs)
 parking_lot  = "0.12"
 
+[build-dependencies]
+# C1: curated syntect dump (`build.rs`). `parsing` implies dump-create + dump-load.
+syntect    = { version = "5", default-features = false, features = ["default-syntaxes", "dump-create", "regex-fancy"] }
+serde_json = "1.0"
+
 [features]
 # Headless TUI test harness (tui::testing). Pulls in the engine's offline
 # Runtime constructor. Never enabled in production builds.
@@ -61,6 +66,12 @@ testing = ["agent-engine/testing"]
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", features = ["iterator"] }
+
+[target.'cfg(all(unix, not(target_env = "musl")))'.dev-dependencies]
+# tests/highlight_mem.rs: same allocator as the synaps binary so the C1/C2
+# syntect heap numbers come from jemalloc's own accounting, not glibc's
+# never-returned free lists.
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"
