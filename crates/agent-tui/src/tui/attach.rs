@@ -34,6 +34,84 @@ pub struct AttachOpts {
     pub prompt_manifest: Option<PathBuf>,
     pub mode: AttachMode,
     pub keep_warm: bool,
+    /// `--new`/`--create`: always create a fresh session even if one is
+    /// live. Rejected together with an explicit `id`.
+    pub new_session: bool,
+}
+
+/// The slice of `Welcome.sessions` the attach decision needs.
+pub struct LiveSession {
+    pub id: SessionId,
+    pub model: String,
+    pub clients: usize,
+}
+
+/// What to send: `Existing` for an explicit or sole live session, `Create`
+/// for `--new`, `--continue`, or no live sessions. Errors are user-facing.
+/// `notice` is a one-line stderr message when a live session was picked
+/// implicitly (no id given).
+pub fn choose_attach(
+    opts: &AttachOpts,
+    sessions: &[LiveSession],
+    cwd: Option<PathBuf>,
+) -> std::result::Result<(Attach, Option<String>), String> {
+    let create = |continue_session: Option<Option<String>>| Attach::Create {
+        config: SessionConfig {
+            continue_session,
+            system: opts.system.clone(),
+            prompt_manifest: opts.prompt_manifest.clone(),
+            cwd: cwd.clone(),
+            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+            await_extensions: true,
+            keep_warm: opts.keep_warm,
+            ..Default::default()
+        },
+        mode: opts.mode,
+    };
+    if opts.new_session && opts.id.is_some() {
+        return Err("cannot combine --attach <ID> with --new: pick one".to_string());
+    }
+    if let Some(c) = &opts.continue_session {
+        return Ok((create(Some(Some(c.clone()))), None));
+    }
+    if opts.new_session {
+        return Ok((create(None), None));
+    }
+    if let Some(id) = &opts.id {
+        let sid = sessions
+            .iter()
+            .find(|m| m.id.as_str() == id || m.id.as_str().starts_with(id.as_str()))
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| SessionId::from(id.as_str()));
+        return Ok((
+            Attach::Existing {
+                session_id: sid,
+                mode: opts.mode,
+            },
+            None,
+        ));
+    }
+    match sessions {
+        [] => Ok((create(None), None)),
+        [only] => Ok((
+            Attach::Existing {
+                session_id: only.id.clone(),
+                mode: opts.mode,
+            },
+            Some(format!(
+                "attaching to live session {} (--new for a fresh one; `synaps daemon sessions` lists all)",
+                only.id
+            )),
+        )),
+        many => {
+            let mut lines =
+                vec!["several sessions; pick one with --attach <ID> (or --new for a fresh one):".to_string()];
+            for m in many {
+                lines.push(format!("  {}  model={}  clients={}", m.id, m.model, m.clients));
+            }
+            Err(lines.join("\n"))
+        }
+    }
 }
 
 /// `SYNAPS_ATTACH_MODE=mirror|observe|takeover` default, overridden by flags.
@@ -106,47 +184,21 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     );
 
     let cwd = std::env::current_dir().ok();
-    let create = |continue_session: Option<Option<String>>| Attach::Create {
-        config: SessionConfig {
-            continue_session,
-            system: opts.system.clone(),
-            prompt_manifest: opts.prompt_manifest.clone(),
-            cwd: cwd.clone(),
-            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
-            await_extensions: true,
-            keep_warm: opts.keep_warm,
-            ..Default::default()
-        },
-        mode: opts.mode,
-    };
-    let attach = if let Some(c) = &opts.continue_session {
-        create(Some(Some(c.clone())))
-    } else if let Some(id) = &opts.id {
-        let sid = conn
-            .welcome
-            .sessions
-            .iter()
-            .find(|m| m.id.as_str() == id || m.id.as_str().starts_with(id.as_str()))
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| SessionId::from(id.as_str()));
-        Attach::Existing {
-            session_id: sid,
-            mode: opts.mode,
-        }
-    } else if conn.welcome.sessions.len() == 1 {
-        Attach::Existing {
-            session_id: conn.welcome.sessions[0].id.clone(),
-            mode: opts.mode,
-        }
-    } else if conn.welcome.sessions.is_empty() {
-        create(None)
-    } else {
-        let mut lines = vec!["several sessions; pick one with --attach <ID>:".to_string()];
-        for m in &conn.welcome.sessions {
-            lines.push(format!("  {}  model={}  clients={}", m.id, m.model, m.clients));
-        }
-        return Err(cfg_err(lines.join("\n")));
-    };
+    let live: Vec<LiveSession> = conn
+        .welcome
+        .sessions
+        .iter()
+        .map(|m| LiveSession {
+            id: m.id.clone(),
+            model: m.model.clone(),
+            clients: m.clients,
+        })
+        .collect();
+    let (attach, notice) = choose_attach(&opts, &live, cwd).map_err(cfg_err)?;
+    if let Some(n) = notice {
+        // Before the TUI takes the terminal, so it survives on the scrollback.
+        eprintln!("{n}");
+    }
 
     let (transport, snapshot) = SocketTransport::attach(conn, attach)
         .await
@@ -255,6 +307,61 @@ mod tests {
         let m = daemon_not_running_message(Some("work"), Some("connection refused"));
         assert!(m.contains("(connection refused)"), "{m}");
         assert!(m.contains("synaps --profile work daemon --detach"), "{m}");
+    }
+
+    fn opts(id: Option<&str>, new_session: bool) -> AttachOpts {
+        AttachOpts {
+            profile: None,
+            id: id.map(str::to_string),
+            continue_session: None,
+            system: None,
+            prompt_manifest: None,
+            mode: AttachMode::Mirror,
+            keep_warm: false,
+            new_session,
+        }
+    }
+
+    fn live(id: &str) -> LiveSession {
+        LiveSession {
+            id: SessionId::from(id),
+            model: "m".into(),
+            clients: 1,
+        }
+    }
+
+    #[test]
+    fn new_creates_even_with_live_sessions() {
+        let (a, notice) = choose_attach(&opts(None, true), &[live("abc")], None).unwrap();
+        assert!(matches!(a, Attach::Create { .. }), "{a:?}");
+        assert!(notice.is_none());
+        let (a, _) = choose_attach(&opts(None, true), &[live("a"), live("b")], None).unwrap();
+        assert!(matches!(a, Attach::Create { .. }), "{a:?}");
+    }
+
+    #[test]
+    fn new_with_explicit_id_is_rejected() {
+        let e = choose_attach(&opts(Some("abc"), true), &[live("abc")], None).unwrap_err();
+        assert!(e.contains("cannot combine"), "{e}");
+    }
+
+    #[test]
+    fn sole_live_session_is_picked_with_notice() {
+        let (a, notice) = choose_attach(&opts(None, false), &[live("abc")], None).unwrap();
+        assert!(
+            matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "abc"),
+            "{a:?}"
+        );
+        let n = notice.unwrap();
+        assert!(n.contains("abc") && n.contains("--new") && n.contains("daemon sessions"), "{n}");
+    }
+
+    #[test]
+    fn no_live_sessions_creates_and_many_errors_with_hint() {
+        let (a, _) = choose_attach(&opts(None, false), &[], None).unwrap();
+        assert!(matches!(a, Attach::Create { .. }), "{a:?}");
+        let e = choose_attach(&opts(None, false), &[live("a"), live("b")], None).unwrap_err();
+        assert!(e.contains("--new") && e.contains("  a  ") && e.contains("  b  "), "{e}");
     }
 
     #[test]

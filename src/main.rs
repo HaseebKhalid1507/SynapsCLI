@@ -89,11 +89,12 @@ struct Cli {
 
     /// EXPERIMENTAL (SYNAPS_DAEMON=1): run the TUI attached to a daemon
     /// session instead of in-process. Optionally a session ID (prefix ok);
-    /// with no live session a new one is created (`--continue` continues).
+    /// with no live session a new one is created (`--continue` continues);
+    /// --new (alias --create) forces a fresh session even if one is live.
     /// The daemon must already be running (`synaps daemon --detach`).
     /// Modifiers: --observe (read-only), --takeover (steal input),
-    /// --keep-warm (never parked); default mode is SYNAPS_ATTACH_MODE or
-    /// mirror (input only if nobody owns it).
+    /// --keep-warm (never parked), --new (fresh session); default mode is
+    /// SYNAPS_ATTACH_MODE or mirror (input only if nobody owns it).
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
 
@@ -110,6 +111,11 @@ struct Cli {
     /// With --attach: pin the session live (never parked).
     #[arg(long = "keep-warm", global = true)]
     keep_warm: bool,
+
+    /// With --attach: always create a fresh session even if one is live
+    /// (cannot be combined with an explicit session ID).
+    #[arg(long = "new", alias = "create", global = true, requires = "attach")]
+    new_session: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -503,6 +509,7 @@ async fn async_main() -> anyhow::Result<()> {
                     prompt_manifest: cli.prompt_manifest,
                     mode: tui::attach::attach_mode(cli.observe, cli.takeover),
                     keep_warm: cli.keep_warm,
+                    new_session: cli.new_session,
                 })
                 .await?;
             }
@@ -671,6 +678,22 @@ mod worker_threads_tests {
         assert!(!thin_client_from(v(&["send", "attach"]), true));
         assert!(!thin_client_from(v(&["--profile", "attach"]), true));
         assert!(!thin_client_from(v(&[]), true));
+    }
+
+    #[test]
+    fn attach_new_flag_combos() {
+        use clap::Parser;
+        let ok = super::Cli::try_parse_from(["synaps", "--attach", "--new"]).unwrap();
+        assert!(ok.new_session && ok.attach.is_some());
+        let alias = super::Cli::try_parse_from(["synaps", "--attach", "--create"]).unwrap();
+        assert!(alias.new_session);
+        // `--attach ID --new` parses; the attach path rejects the combination
+        // (`choose_attach`: "cannot combine") so the message names both flags.
+        let both = super::Cli::try_parse_from(["synaps", "--attach", "abc", "--new"]).unwrap();
+        assert_eq!(both.attach.flatten().as_deref(), Some("abc"));
+        assert!(both.new_session);
+        // --new without --attach is a clap error
+        assert!(super::Cli::try_parse_from(["synaps", "--new"]).is_err());
     }
 
     #[test]
