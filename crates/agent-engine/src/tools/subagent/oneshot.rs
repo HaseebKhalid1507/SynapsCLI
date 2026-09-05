@@ -96,6 +96,7 @@ impl Tool for SubagentTool {
             .resolve_and_authorize(&orchestration_id, requested_model)
             .map_err(|error| RuntimeError::Tool(error.to_string()))?;
         let model = decision.model.as_str().to_owned();
+        let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -161,6 +162,7 @@ impl Tool for SubagentTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model);
+                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();

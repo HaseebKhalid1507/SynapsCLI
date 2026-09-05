@@ -721,6 +721,7 @@ mod thinking_options_tests {
         live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
+            multi_agent_reasoning_effort: None,
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
             multi_agent_version: None,

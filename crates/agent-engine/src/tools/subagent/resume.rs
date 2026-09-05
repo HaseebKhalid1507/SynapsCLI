@@ -140,6 +140,7 @@ impl Tool for SubagentResumeTool {
             .resolve_and_authorize(&handle_id, Some(&model))
             .map_err(|error| RuntimeError::Tool(error.to_string()))?;
         let model = decision.model.as_str().to_owned();
+        let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -241,6 +242,7 @@ impl Tool for SubagentResumeTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model_a.clone());
+                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();

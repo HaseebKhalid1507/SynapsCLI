@@ -330,7 +330,7 @@ fn remove_favorite_compat(id: &str) {
 /// when the Models modal opens (logged-in OAuth discovery).
 ///
 /// `openai-codex` is intentionally absent: its picker rows are hardcoded to
-/// the seven source-controlled OAuth slugs (`codex_static_catalog_models`)
+/// the eight source-controlled OAuth slugs (`codex_static_catalog_models`)
 /// and must never be replaced by live `/models` results.
 pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
     &["anthropic"]
@@ -341,7 +341,7 @@ pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
 /// ANY /models surface (main sections, /settings picker, expanded browser).
 const SOURCE_CONTROLLED_PROVIDER: &str = "openai-codex";
 
-/// The seven static OpenAI Codex OAuth models as expanded-browser entries,
+/// The eight static OpenAI Codex OAuth models as expanded-browser entries,
 /// provider-qualified, in catalog order (`codex_static_catalog_models`).
 pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
     synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
@@ -362,7 +362,7 @@ pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
 }
 
 /// Central invariant: canonicalize a model-list result before it reaches any
-/// state. For `openai-codex` the result is ALWAYS the seven static OAuth
+/// state. For `openai-codex` the result is ALWAYS the eight static OAuth
 /// entries — live rows, injected rows, and fetch errors alike are replaced.
 /// All other providers (Anthropic included) pass through unchanged.
 pub(crate) fn canonicalize_model_list_result(
@@ -418,7 +418,7 @@ pub(crate) fn catalog_override_rows(
     models: &[ExpandedModelEntry],
 ) -> ProviderCatalogOverride {
     if provider_key == SOURCE_CONTROLLED_PROVIDER {
-        // openai-codex sections/pickers are hardcoded to the seven static
+        // openai-codex sections/pickers are hardcoded to the eight static
         // OAuth slugs — override rows must never exist for it.
         return Vec::new();
     }
@@ -1975,6 +1975,7 @@ mod tests {
         assert_eq!(
             codex_ids,
             vec![
+                "openai-codex/gpt-6-astra",
                 "openai-codex/gpt-5.6-sol",
                 "openai-codex/gpt-5.6-terra",
                 "openai-codex/gpt-5.6-luna",
@@ -2124,10 +2125,10 @@ mod tests {
         );
     }
 
-    /// (c) The openai-codex picker rows are exactly the seven source-controlled
+    /// (c) The openai-codex picker rows are exactly the eight source-controlled
     /// OAuth slugs, in catalog order — regardless of any injected override.
     #[test]
-    fn openai_codex_picker_rows_are_exactly_the_seven_static_oauth_slugs() {
+    fn openai_codex_picker_rows_are_exactly_the_eight_static_oauth_slugs() {
         let provider = dev_model_providers()
             .into_iter()
             .find(|provider| provider.key == "openai-codex")
@@ -2142,6 +2143,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -2150,12 +2152,13 @@ mod tests {
                 "gpt-5.4-mini",
                 "gpt-5.3-codex-spark",
             ],
-            "openai-codex picker rows must be exactly the seven hardcoded OAuth slugs, in order"
+            "openai-codex picker rows must be exactly the eight hardcoded OAuth slugs, in order"
         );
     }
 
     fn codex_static_qualified_ids() -> Vec<&'static str> {
         vec![
+            "openai-codex/gpt-6-astra",
             "openai-codex/gpt-5.6-sol",
             "openai-codex/gpt-5.6-terra",
             "openai-codex/gpt-5.6-luna",
@@ -2186,7 +2189,7 @@ mod tests {
 
     /// (d) Central invariant: a live/injected openai-codex list result must
     /// not affect main-section overrides NOR the expanded 'e' browser rows.
-    /// Expanded OpenAI rows are exactly the seven static OAuth models, in
+    /// Expanded OpenAI rows are exactly the eight static OAuth models, in
     /// catalog order — dynamic IDs never appear anywhere in /models.
     #[test]
     fn injected_openai_codex_result_cannot_affect_overrides_or_expanded_rows() {
@@ -2218,7 +2221,7 @@ mod tests {
                 assert_eq!(
                     ids,
                     codex_static_qualified_ids(),
-                    "expanded OpenAI Codex rows must be exactly the seven static OAuth slugs"
+                    "expanded OpenAI Codex rows must be exactly the eight static OAuth slugs"
                 );
             }
             other => panic!("expected static Ready rows, got {other:?}"),
@@ -2226,7 +2229,7 @@ mod tests {
     }
 
     /// (e) A failed live fetch for openai-codex also resolves to the static
-    /// seven — the expanded browser is source-controlled, never an error/
+    /// eight — the expanded browser is source-controlled, never an error/
     /// loading surface for this provider.
     #[test]
     fn openai_codex_expanded_error_result_falls_back_to_static_rows() {

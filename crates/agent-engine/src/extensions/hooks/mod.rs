@@ -1079,6 +1079,7 @@ mod tests {
                 subagent_registry: None,
                 event_queue: None,
                 delegation_parent: None,
+                codex_parent_plan: None,
                 secret_prompt: None,
                 orchestration: None,
                 tool_activation: None,

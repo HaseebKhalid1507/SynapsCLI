@@ -18,6 +18,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             subagent_registry: None,
             event_queue: None,
             delegation_parent: None,
+            codex_parent_plan: None,
             secret_prompt: None,
             orchestration: Some(std::sync::Arc::new(
                 crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
