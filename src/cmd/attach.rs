@@ -3,7 +3,9 @@
 //!
 //! stdin lines → `Submit` (or `Steer` while streaming); `/abort` → `Cancel`;
 //! `/detach` or Ctrl-C → `Detach` (the turn keeps running); `/sessions`;
-//! prompts render as `[prompt #id] title: prompt > ` (echo off for Secret).
+//! prompts render as `[prompt #id] title: prompt > ` (echo off for Secret) or,
+//! for `PromptKind::Confirm`, `[confirm #id] title\n<body>\n(y/n): ` with echo
+//! on — only `y`/`yes` allows; an empty line or anything else denies.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -96,7 +98,7 @@ impl Client {
             SessionEventWire::TurnStarted { .. } => self.streaming = true,
             SessionEventWire::Prompt(p) => {
                 self.pending.push(p.clone());
-                self.out(&format!("[prompt #{}] {}: {} > ", p.id, p.title, p.prompt));
+                self.out(&render_prompt_line(p));
             }
             SessionEventWire::PromptResolved { prompt_id } => self.pending.retain(|p| p.id != *prompt_id),
             SessionEventWire::SystemNotice(s) => self.out(&format!("[system] {s}\n")),
@@ -283,7 +285,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         c.render(env);
     }
     for p in &snap.pending_prompts {
-        c.out(&format!("[prompt #{}] {}: {} > ", p.id, p.title, p.prompt));
+        c.out(&render_prompt_line(p));
     }
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -365,5 +367,15 @@ mod tests {
         let a = Cli::parse_from(["attach", "--create", "--name", "ambient"]).args;
         assert!(a.create);
         assert_eq!(a.name.as_deref(), Some("ambient"));
+    }
+}
+
+/// One prompt as the line client shows it. Confirm prompts keep the FULL
+/// multi-line body (the exact tool-id list for `activate_tools`) and ask
+/// `(y/n)`; Secret prompts keep the legacy `> ` shape with echo off.
+fn render_prompt_line(p: &PromptRequest) -> String {
+    match p.kind {
+        PromptKind::Confirm => format!("[confirm #{}] {}\n{}\n(y/n): ", p.id, p.title, p.prompt),
+        PromptKind::Secret => format!("[prompt #{}] {}: {} > ", p.id, p.title, p.prompt),
     }
 }

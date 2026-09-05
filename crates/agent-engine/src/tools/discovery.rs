@@ -160,7 +160,10 @@ async fn confirm_activation_with_host(
         ids.join("\n")
     );
     match prompt
-        .prompt("Confirm tool activation".to_string(), question)
+        .prompt(
+            crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE.to_string(),
+            question,
+        )
         .await
     {
         Some(answer) => {
