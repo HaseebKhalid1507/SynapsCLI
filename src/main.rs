@@ -323,11 +323,46 @@ fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
     }
 }
 
-/// `synaps attach` / `--attach` is a thin line client: one socket, one stdin.
-/// A current-thread runtime saves the worker pool (client diet, day 2 §9).
+/// Thin-client decision: `SYNAPS_DAEMON=1` **and** argv asks for attach
+/// (`attach` as the first positional, or `--attach`/`--attach=` anywhere).
+/// Without the daemon flag `--attach` falls back to the in-process TUI,
+/// which must boot exactly like `synaps` does — no re-exec, no allocator
+/// diet, multi-thread runtime (review H2).
 fn is_thin_client() -> bool {
-    std::env::args().skip(1).any(|a| a == "attach" || a == "--attach" || a.starts_with("--attach="))
+    thin_client_from(std::env::args().skip(1), agent_engine::daemon::enabled())
 }
+
+fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: bool) -> bool {
+    if !daemon_enabled {
+        return false;
+    }
+    let mut skip_value = false;
+    let mut first_positional: Option<String> = None;
+    let mut attach_flag = false;
+    for a in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if a == "--attach" || a.starts_with("--attach=") {
+            attach_flag = true;
+        } else if a == "--profile" {
+            skip_value = true;
+        } else if !a.starts_with('-') && first_positional.is_none() {
+            first_positional = Some(a);
+        }
+    }
+    attach_flag || first_positional.as_deref() == Some("attach")
+}
+
+/// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
+/// overrides). `narenas` is boot-only — the one knob a mallctl cannot set.
+const THIN_MALLOC_CONF: &str = "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0";
+
+/// Env markers carried across the re-exec: the loop guard and the user's own
+/// `_RJEM_MALLOC_CONF` (restored in the child so what we spawn sees it, M2).
+const REEXECED: &str = "SYNAPS_CLIENT_REEXECED";
+const USER_MALLOC_CONF: &str = "SYNAPS_CLIENT_USER_MALLOC_CONF";
 
 /// Thin-client re-exec (PLAN-phase4 §4.5, extended): `PR_SET_THP_DISABLE`
 /// is inherited across `execve`, so re-exec'ing ourselves once means the
@@ -337,14 +372,24 @@ fn is_thin_client() -> bool {
 /// carries `_RJEM_MALLOC_CONF` so jemalloc boots with one arena and no
 /// background thread. `SYNAPS_CLIENT_REEXEC=0` disables; cost ≈ 3–5 ms
 /// (the `reexec` ladder stage is the pre-exec process' last line).
+///
+/// Only worth it when the kernel's THP mode is `[always]` (M1): under
+/// `[madvise]`/`[never]` nothing is huge-mapped before `main`, and the only
+/// thing the exec would buy is `narenas:1` — `tune_allocator` sets the rest
+/// in-process via mallctl. `SYNAPS_CLIENT_THP=1` (keep huge pages) skips too.
 #[cfg(target_os = "linux")]
 fn thin_client_reexec() {
     use agent_core::core::memstat;
     if std::env::var("SYNAPS_CLIENT_REEXEC").is_ok_and(|v| v == "0")
-        || std::env::var_os("SYNAPS_CLIENT_REEXECED").is_some()
+        || std::env::var_os(REEXECED).is_some()
+        || std::env::var("SYNAPS_CLIENT_THP").is_ok_and(|v| v == "1")
         || tui::client_diet::allocator_tuning_disabled()
         || memstat::thp_disabled() == Some(true)
     {
+        return;
+    }
+    if memstat::thp_sysfs_always() != Some(true) {
+        memstat::ladder("reexec", &"skipped=thp-not-always");
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
@@ -353,30 +398,48 @@ fn thin_client_reexec() {
     }
     memstat::ladder("reexec", &"");
     use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env("SYNAPS_CLIENT_REEXECED", "1")
-        .env(
-            "_RJEM_MALLOC_CONF",
-            std::env::var("SYNAPS_CLIENT_MALLOC_CONF").unwrap_or_else(|_| {
-                "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0".into()
-            }),
-        )
-        .exec();
+    let ours = std::env::var("SYNAPS_CLIENT_MALLOC_CONF").unwrap_or_else(|_| THIN_MALLOC_CONF.into());
+    let user = std::env::var("_RJEM_MALLOC_CONF").ok().filter(|v| !v.is_empty());
+    // Later keys win in jemalloc's conf parser: the user's value stays visible, ours applies.
+    let conf = match &user {
+        Some(u) => format!("{u},{ours}"),
+        None => ours,
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1)).env(REEXECED, "1").env("_RJEM_MALLOC_CONF", conf);
+    if let Some(u) = user {
+        cmd.env(USER_MALLOC_CONF, u);
+    }
+    let err = cmd.exec();
     // exec only returns on failure: carry on in this image.
     let _ = err;
+    std::env::remove_var(REEXECED);
 }
 
 #[cfg(not(target_os = "linux"))]
 fn thin_client_reexec() {}
 
+/// After the (possible) re-exec: jemalloc has read `_RJEM_MALLOC_CONF` at
+/// load, so put the environment back the way the user had it — only what
+/// the exec added is removed; a conf the user exported themselves is left
+/// (or restored) for every child the client spawns (M2).
+fn scrub_reexec_env() {
+    if std::env::var_os(REEXECED).is_none() {
+        return;
+    }
+    std::env::remove_var(REEXECED);
+    match std::env::var(USER_MALLOC_CONF) {
+        Ok(user) => std::env::set_var("_RJEM_MALLOC_CONF", user),
+        Err(_) => std::env::remove_var("_RJEM_MALLOC_CONF"),
+    }
+    std::env::remove_var(USER_MALLOC_CONF);
+}
+
 fn main() -> anyhow::Result<()> {
     let thin = is_thin_client();
     if thin {
         thin_client_reexec();
-        // Consumed (jemalloc read it at load); keep them out of children.
-        std::env::remove_var("SYNAPS_CLIENT_REEXECED");
-        std::env::remove_var("_RJEM_MALLOC_CONF");
+        scrub_reexec_env();
         // Ladder START pins on the first call — `main` must be first (§7.1).
         agent_core::core::memstat::ladder("main", &"");
         tui::client_diet::tune_allocator();
@@ -590,7 +653,25 @@ async fn async_main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod worker_threads_tests {
-    use super::worker_threads_from;
+    use super::{thin_client_from, worker_threads_from};
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn thin_client_requires_daemon_flag() {
+        assert!(!thin_client_from(v(&["--attach"]), false));
+        assert!(!thin_client_from(v(&["attach"]), false));
+        assert!(thin_client_from(v(&["--attach"]), true));
+        assert!(thin_client_from(v(&["--attach=abc"]), true));
+        assert!(thin_client_from(v(&["attach"]), true));
+        assert!(thin_client_from(v(&["--profile", "x", "attach"]), true));
+        // bare `attach` is only the subcommand position, not a value elsewhere
+        assert!(!thin_client_from(v(&["send", "attach"]), true));
+        assert!(!thin_client_from(v(&["--profile", "attach"]), true));
+        assert!(!thin_client_from(v(&[]), true));
+    }
 
     #[test]
     fn worker_threads_env_matrix() {

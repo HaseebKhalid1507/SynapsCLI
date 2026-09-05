@@ -245,6 +245,26 @@ pub fn thp_disabled() -> Option<bool> {
     }
 }
 
+/// Kernel THP mode: `Some(true)` when
+/// `/sys/kernel/mm/transparent_hugepage/enabled` is `[always]`, `Some(false)`
+/// for `[madvise]`/`[never]`, `None` when unreadable (non-Linux, no sysfs).
+pub fn thp_sysfs_always() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok()?;
+        Some(thp_mode_is_always(&s))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn thp_mode_is_always(sysfs: &str) -> bool {
+    sysfs.split_whitespace().any(|w| w == "[always]")
+}
+
 /// `prctl(PR_SET_THP_DISABLE)` — no transparent huge pages for this process
 /// from now on. With `THP=always` every touched thread stack, the `.bss` and
 /// each jemalloc chunk costs a 2 MiB page; the thin client wants 4 KiB
@@ -662,6 +682,14 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thp_mode_parse() {
+        assert!(super::thp_mode_is_always("[always] madvise never\n"));
+        assert!(!super::thp_mode_is_always("always [madvise] never\n"));
+        assert!(!super::thp_mode_is_always("always madvise [never]\n"));
+        assert!(!super::thp_mode_is_always(""));
+    }
 
     #[test]
     fn ladder_line_format_and_noop_when_disabled() {
