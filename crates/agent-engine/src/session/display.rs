@@ -79,6 +79,35 @@ fn items_of(msg: &serde_json::Value, out: &mut Vec<DisplayItem>) {
     }
 }
 
+/// `items_of(msg).len()` without building the items: the same skip rules,
+/// no string clones (M4 — the daemon runs this over the whole history on
+/// every attach/compaction/resync).
+fn count_items_of(msg: &serde_json::Value) -> usize {
+    if let Some(content) = msg["content"].as_str() {
+        if content.contains("<context-summary>") || is_event_payload(content) {
+            return 0;
+        }
+    }
+    match msg["role"].as_str() {
+        Some("user") => usize::from(msg["content"].is_string()),
+        Some("assistant") => msg["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| match b["type"].as_str() {
+                        Some("thinking") => b["thinking"].is_string(),
+                        Some("text") => b["text"].is_string(),
+                        Some("tool_use") => true,
+                        _ => false,
+                    })
+                    .count()
+            })
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Every display item of `msgs` (no cap).
 pub fn display_items(msgs: &[SharedMessage]) -> Vec<DisplayItem> {
     let mut out = Vec::new();
@@ -89,7 +118,8 @@ pub fn display_items(msgs: &[SharedMessage]) -> Vec<DisplayItem> {
 }
 
 /// The last `max_items` display items (`0` = unbounded). Walks from the back
-/// and stops once the cap is met, so a 20 MB history costs O(tail).
+/// and stops once the cap is met; the head is only counted (no allocation),
+/// so a 20 MB history costs O(tail) allocations + one O(n) scan.
 pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
     if max_items == 0 {
         return DisplayTail { items: display_items(msgs), omitted: 0 };
@@ -105,16 +135,8 @@ pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
         held += g.len();
         groups.push(g);
     }
-    // Items before `idx` were never projected: count them (cheap: no strings kept).
-    let mut omitted = 0usize;
-    {
-        let mut scratch = Vec::new();
-        for m in &msgs[..idx] {
-            scratch.clear();
-            items_of(m, &mut scratch);
-            omitted += scratch.len();
-        }
-    }
+    // Items before `idx` were never projected: count them without cloning.
+    let mut omitted: usize = msgs[..idx].iter().map(|m| count_items_of(m)).sum();
     let mut items: Vec<DisplayItem> = groups.into_iter().rev().flatten().collect();
     if items.len() > max_items {
         let extra = items.len() - max_items;
@@ -160,6 +182,33 @@ mod tests {
                 DisplayItem::ToolUse { tool_id: "t1".into(), tool_name: "bash".into(), input: "{\"cmd\":\"ls\"}".into() },
             ]
         );
+    }
+
+    #[test]
+    fn count_items_of_matches_items_of() {
+        let msgs: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}),
+            serde_json::json!({"role": "user", "content": "<context-summary>s</context-summary>"}),
+            serde_json::json!({"role": "user", "content": "<event id=1>x</event>"}),
+            serde_json::json!({"role": "assistant", "content": "plain string"}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t"},
+                {"type": "thinking", "signature": "no-text"},
+                {"type": "text", "text": "a"},
+                {"type": "text"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}},
+                {"type": "tool_use"},
+                {"type": "unknown"}
+            ]}),
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({}),
+        ];
+        for m in &msgs {
+            let mut v = Vec::new();
+            items_of(m, &mut v);
+            assert_eq!(count_items_of(m), v.len(), "{m}");
+        }
     }
 
     #[test]

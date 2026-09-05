@@ -756,8 +756,8 @@ impl TranscriptStore {
         self.scrollback_dropped += dropped_real;
         let sentinel = TimestampedMsg {
             msg: ChatMessage::System(format!(
-                "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; /resync reloads from the daemon)",
-                self.scrollback_dropped, self.max_msgs
+                "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; /resync reloads the last {} user/assistant items from the daemon, without tool output)",
+                self.scrollback_dropped, self.max_msgs, agent_engine::session::types::tail_items_from_env()
             )),
             time: chrono::Local::now().format("%H:%M").to_string(),
         };
@@ -2659,6 +2659,11 @@ impl TranscriptStore {
         self.messages.clear();
         self.clear_selection();
         self.cache = CacheState::Missing;
+        // Scrollback bookkeeping restarts with the transcript (L3): the next
+        // sentinel must not count messages `/clear` or `/resync` removed.
+        self.scrollback_dropped = 0;
+        self.pushes_since_audit = 0;
+        self.bytes_since_audit = 0;
     }
 
     /// Current scroll-back offset (0 = pinned to the latest line).
@@ -4444,6 +4449,6 @@ mod scrollback_cap_tests {
         for k in ["SYNAPS_TUI_SCROLLBACK", "SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_MSGS", "SYNAPS_CLIENT_SCROLLBACK_BYTES"] {
             std::env::remove_var(k);
         }
-        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 1024 * 1024));
+        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 2 * 1024 * 1024));
     }
 }

@@ -1,12 +1,15 @@
 //! PLAN-phase4 §7.3 — the growth proof for the thin client.
 //!
 //! One daemon on a scripted provider stub, one `--attach` TUI pane in tmux
-//! with `SYNAPS_MEM_TRACE=1 SYNAPS_MEMPROF_PURGE=1`; 40 turns, each a `bash`
+//! with `SYNAPS_MEM_TRACE=1 SYNAPS_MEMPROF_PURGE=1`; 80 turns, each a `bash`
 //! tool round producing ~30 KB of tool output (≈ 40 KB of history) and a
 //! text reply. The client's idle purge fires after every turn and writes a
-//! `purged` ladder line; RssAnon after turns 10/20/30/40 comes from those.
+//! `purged` ladder line; RssAnon after every 10th turn comes from those.
 //!
-//! Gates (G6): `RssAnon(40) − RssAnon(10) ≤ 1.5 MB`, `max ≤ 14 MB`.
+//! Gates (G6): `RssAnon(80) − RssAnon(30) ≤ 1.5 MB`, `max ≤ 14 MB`. The
+//! window is sized for the 2 MiB Socket scrollback cap (+256 KiB
+//! hysteresis): it engages near turn 56, so an uncapped client accrues
+//! ≈ 2 MB over 30→80 and fails; a capped one ≈ 1.1 MB.
 //! With the history mirror on (`SYNAPS_CLIENT_HISTORY=full`, the default
 //! until B7) this is expected to FAIL — that output is B's "before".
 //!
@@ -30,7 +33,9 @@ use std::time::{Duration, Instant};
 use phase2::{spawn_stub, Script};
 
 const TMUX: &str = "clientbounded";
-const TURNS: usize = 40;
+const TURNS: usize = 80;
+const WIN_LO: usize = 30;
+const WIN_HI: usize = TURNS;
 const SLOPE_LIMIT_KB: i64 = 1536;
 const MAX_LIMIT_KB: u64 = 14 * 1024;
 
@@ -211,15 +216,15 @@ async fn client_rss_is_bounded_over_40_tool_turns() {
 
     let all = purged_lines(&trace);
     let max = all.iter().copied().max().unwrap_or(0);
-    let r10 = samples.iter().find(|(t, _)| *t == 10).unwrap().1 as i64;
-    let r40 = samples.iter().find(|(t, _)| *t == 40).unwrap().1 as i64;
-    let slope = r40 - r10;
+    let r_lo = samples.iter().find(|(t, _)| *t == WIN_LO).unwrap().1 as i64;
+    let r_hi = samples.iter().find(|(t, _)| *t == WIN_HI).unwrap().1 as i64;
+    let slope = r_hi - r_lo;
     eprintln!(
-        "samples={samples:?} slope(40-10)={slope} kB ({:.2} MB) max={max} kB ({:.1} MB) history_mode={}",
+        "samples={samples:?} slope({WIN_HI}-{WIN_LO})={slope} kB ({:.2} MB) max={max} kB ({:.1} MB) history_mode={}",
         slope as f64 / 1024.0,
         max as f64 / 1024.0,
         std::env::var("SYNAPS_CLIENT_HISTORY").unwrap_or_else(|_| "default".into())
     );
-    assert!(slope <= SLOPE_LIMIT_KB, "G6: RssAnon grew {slope} kB over turns 10→40 (limit {SLOPE_LIMIT_KB})");
+    assert!(slope <= SLOPE_LIMIT_KB, "G6: RssAnon grew {slope} kB over turns {WIN_LO}→{WIN_HI} (limit {SLOPE_LIMIT_KB})");
     assert!(max <= MAX_LIMIT_KB, "G6: max RssAnon {max} kB over the run (limit {MAX_LIMIT_KB})");
 }
