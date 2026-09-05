@@ -97,6 +97,9 @@ pub struct ToolCapabilities {
     /// Current worker handle when this context belongs to a delegated
     /// runtime. `None` denotes the foreground root.
     pub delegation_parent: Option<String>,
+    /// Host-built foreground Codex plan for exact-model Ultra inheritance.
+    /// Not a model-supplied tool parameter or an authorization grant.
+    pub codex_parent_plan: Option<crate::runtime::openai::catalog::CodexExecutionPlan>,
     pub secret_prompt: Option<SecretPromptHandle>,
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.

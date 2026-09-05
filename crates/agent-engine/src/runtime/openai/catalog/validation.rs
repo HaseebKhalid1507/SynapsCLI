@@ -547,6 +547,7 @@ mod tests {
             live.provider_kind = CatalogProviderKind::OpenAiCodex;
             live.source = CatalogSource::Live;
             live.reasoning = ReasoningSupport::CodexNamed {
+                multi_agent_reasoning_effort: None,
                 supported: vec![Low, Medium, High, XHigh, Max, Ultra],
                 default_level: Some(High),
                 multi_agent_version: version,

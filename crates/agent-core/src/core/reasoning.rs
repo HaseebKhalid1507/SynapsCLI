@@ -61,7 +61,8 @@ impl ReasoningLevel {
     /// The canonical logical/config representation.
     ///
     /// Provider request planners own wire conversion. In particular, Codex
-    /// logical Ultra is serialized as wire effort `max` plus proactive mode.
+    /// logical Ultra uses the exact catalog's multi-agent wire effort (e.g.
+    /// Astra `xhigh`, Sol `max`) plus foreground proactive mode.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",

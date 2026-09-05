@@ -184,6 +184,8 @@ pub enum ReasoningSupport {
         supported: Vec<agent_core::reasoning::ReasoningLevel>,
         /// Default level from catalog's `default_reasoning_level`, if present.
         default_level: Option<agent_core::reasoning::ReasoningLevel>,
+        /// Wire effort for Ultra from the exact model catalog. Not a worker-only hint.
+        multi_agent_reasoning_effort: Option<agent_core::reasoning::ReasoningLevel>,
         /// Exact model's collaboration protocol. Ultra requires V2.
         multi_agent_version: Option<CodexMultiAgentVersion>,
     },
