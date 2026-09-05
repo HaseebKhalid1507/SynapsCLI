@@ -395,7 +395,7 @@ pub(super) async fn handle_command(
     // `/context` with the TUI's own conversation history: the runtime does
     // not own session messages, so the surface passes them in. Must run
     // before the generic engine intercept (which has no history access).
-    if cmd == "context" {
+    if cmd == "context" && arg.is_empty() {
         match synaps_cli::engine::commands::context_command(runtime, Some(&app.api_messages)) {
             synaps_cli::engine::commands::CommandResult::Output(text) => {
                 app.push_msg(ChatMessage::System(text));
@@ -507,6 +507,7 @@ pub(super) async fn handle_command(
                 runtime.thinking_level(),
                 runtime.system_prompt(),
             );
+            runtime.reset_context_continuation(&app.session.id, &[]);
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         "model" | "models" => {
@@ -665,6 +666,7 @@ pub(super) async fn handle_command(
                         app.transcript.clear();
                         app.invalidate();
                         app.api_messages = session.api_messages.clone();
+                        runtime.reset_context_continuation(&session.id, &app.api_messages);
                         app.total_input_tokens = session.total_input_tokens;
                         app.total_output_tokens = session.total_output_tokens;
                         app.session_cost = session.session_cost;

@@ -21,6 +21,7 @@ pub mod chat_capture;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
+pub mod continuation;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
@@ -254,6 +255,7 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
+    pub(crate) continuation: continuation::SharedContinuation,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
@@ -730,6 +732,7 @@ impl Runtime {
             explicit_reasoning: false,
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
+            continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             compaction_model: None,
             compaction_mode: agent_core::compaction::CompactionMode::default(),
             compaction_exclusions: Vec::new(),
@@ -827,6 +830,7 @@ impl Runtime {
             explicit_reasoning: false,
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
+            continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             compaction_model: None,
             compaction_mode: agent_core::compaction::CompactionMode::default(),
             compaction_exclusions: Vec::new(),
@@ -2012,6 +2016,10 @@ impl Runtime {
             );
         }
         self.context_window_override = config.context_window;
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = config.context_management;
         self.compaction_model = config.compaction_model.clone();
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
@@ -2958,6 +2966,9 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
+        if self.context_management_enabled() {
+            return Err(RuntimeError::Config("automatic context management requires the streaming engine; run_single does not support rollover".into()));
+        }
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         // Refresh OAuth token if expired only after capability preflight.
@@ -3480,6 +3491,8 @@ impl Runtime {
             system_prompt,
             thinking_budget,
             reasoning_level,
+            context_window: self.context_window(),
+            continuation: self.continuation.clone(),
             tx: tx.clone(),
             cancel,
             steering_rx,
@@ -3579,6 +3592,7 @@ impl Clone for Runtime {
             explicit_reasoning: self.explicit_reasoning,
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
+            continuation: self.continuation.clone(),
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),

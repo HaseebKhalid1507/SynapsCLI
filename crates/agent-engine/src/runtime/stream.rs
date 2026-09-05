@@ -35,6 +35,8 @@ pub(super) struct StreamSession {
     pub(super) system_prompt: Option<String>,
     pub(super) thinking_budget: u32,
     pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
+    pub(super) context_window: u64,
+    pub(super) continuation: super::continuation::SharedContinuation,
 
     // Channels
     pub(super) tx: mpsc::UnboundedSender<StreamEvent>,
@@ -244,6 +246,8 @@ impl StreamMethods {
             system_prompt,
             thinking_budget,
             reasoning_level,
+            context_window,
+            continuation,
             tx,
             cancel,
             mut steering_rx,
@@ -276,6 +280,35 @@ impl StreamMethods {
             options.codex_request_role,
         );
         let mut messages = initial_messages;
+        let context_enabled = continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enabled();
+        if context_enabled {
+            super::continuation::restore_window(&messages, &continuation);
+            let mut registry = tools.write().await;
+            registry.register(Arc::new(
+                crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
+            ));
+            for name in ["memory_search", "memory_fetch"] {
+                if registry.get(name).map_or(true, |tool| {
+                    tool.origin() != crate::tools::ToolOrigin::Builtin
+                }) {
+                    return Err(crate::RuntimeError::Config("automatic context management requires builtin memory_search and memory_fetch; history unchanged".into()));
+                }
+            }
+        } else {
+            tools.write().await.disable(&["context_checkpoint".into()]);
+        }
+        let system_prompt = if context_enabled {
+            Some(format!(
+                "{}\n\n{}",
+                system_prompt.as_deref().unwrap_or_default(),
+                super::continuation::GUIDANCE
+            ))
+        } else {
+            system_prompt
+        };
 
         // One retained `SessionToolSet` per stream session (Task 16), held
         // behind ONE shared handle (Task 17): the same set the execution
@@ -288,17 +321,12 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let set = if progressive_tool_disclosure {
-                crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
-                    tool_session_id.clone(),
-                    registry.catalog(),
-                )
-            } else {
-                crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                    tool_session_id.clone(),
-                    registry.catalog(),
-                )
-            };
+            let set = super::continuation::context_tool_set(
+                tool_session_id.clone(),
+                registry.catalog(),
+                progressive_tool_disclosure,
+                context_enabled,
+            );
             std::sync::Arc::new(std::sync::RwLock::new(set))
         };
         // Thread the RETAINED handle into the extension-provider route so
@@ -461,17 +489,12 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = if progressive_tool_disclosure {
-                            crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
-                                tool_session_id.clone(),
-                                registry.catalog(),
-                            )
-                        } else {
-                            crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                                tool_session_id.clone(),
-                                registry.catalog(),
-                            )
-                        };
+                        *set = super::continuation::context_tool_set(
+                            tool_session_id.clone(),
+                            registry.catalog(),
+                            progressive_tool_disclosure,
+                            context_enabled,
+                        );
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -620,6 +643,155 @@ impl StreamMethods {
                 &metered_options
             };
 
+            if context_enabled {
+                use agent_core::core::context_policy::{
+                    assess_context, ContextAction, ContextBudget,
+                };
+                let fallback_schema = tools_snapshot.tools_schema();
+                let schema = round_options
+                    .request_tools_schema
+                    .as_deref()
+                    .map(|s| s.as_slice())
+                    .unwrap_or(&fallback_schema);
+                let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+                    model: &model,
+                    provider_window: context_window,
+                    system_prompt: injected_system.as_deref(),
+                    tools_schema: schema,
+                    messages: request_messages,
+                    skill_contents: &[],
+                    memory_contents: &[],
+                    thinking_budget_tokens: thinking_budget as u64,
+                    next_tool_result_bytes: max_tool_output as u64,
+                    output_reserve_tokens: HelperMethods::max_tokens_for_model(&model),
+                });
+                let decision = {
+                    let mut s = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let d = assess_context(
+                        &s.config,
+                        &s.policy,
+                        ContextBudget {
+                            context_window_tokens: context_window,
+                            used_tokens: assessment.used_tokens(),
+                            hard_remaining_tokens: context_window
+                                .saturating_sub(assessment.used_tokens()),
+                            required_next_round_tokens: assessment
+                                .reserves
+                                .total()
+                                .saturating_add(512),
+                        },
+                    );
+                    s.policy = d.next_state;
+                    d
+                };
+                if matches!(
+                    decision.action,
+                    ContextAction::Rollover | ContextAction::HardStop
+                ) {
+                    let readable = {
+                        let current = tools.read().await;
+                        let admitted = session_tool_set
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ["memory_search", "memory_fetch"].iter().all(|name| {
+                            schema.iter().any(|s| s["name"] == *name)
+                                && crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                    &current, &admitted, name,
+                                )
+                                .is_ok_and(|a| {
+                                    a.implementation().origin() == crate::tools::ToolOrigin::Builtin
+                                })
+                        })
+                    };
+                    if !readable {
+                        let _ =
+                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
+                    }
+                    let workers_pending = orchestration
+                        .as_ref()
+                        .is_some_and(|o| !o.unreconciled_runtime_handles().is_empty())
+                        || subagent_registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .list_active()
+                            .iter()
+                            .any(|(_, _, status)| {
+                                matches!(status, super::subagent::SubagentStatus::Running)
+                            });
+                    if workers_pending {
+                        if decision.action == ContextAction::HardStop {
+                            let _ = tx
+                                .send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                            return Err(crate::RuntimeError::Config("context hard limit reached with pending workers; collect/reconcile before continuing; history retained".into()));
+                        }
+                        let _=tx.send(StreamEvent::Session(SessionEvent::Notice("Context rollover pending: finish/collect workers first; no new large task.".into())));
+                    } else {
+                        match super::continuation::rollover(
+                            &messages,
+                            &continuation,
+                            assessment.budget_tokens().saturating_sub(
+                                assessment.breakdown.system_tokens
+                                    + assessment.breakdown.tool_schema_tokens,
+                            ),
+                            &cancel,
+                        )
+                        .await
+                        {
+                            Ok(next) => {
+                                messages = next;
+                                let window = continuation
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .window;
+                                let _ = tx.send(StreamEvent::Session(
+                                    SessionEvent::MessageHistory(messages.clone()),
+                                ));
+                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window}; earlier eligible source evidence remains searchable. No summarizing compaction."))));
+                                continue;
+                            }
+                            Err(error) => {
+                                let _ = tx.send(StreamEvent::Session(
+                                    SessionEvent::MessageHistory(messages),
+                                ));
+                                return Err(error);
+                            }
+                        }
+                    }
+                } else if matches!(
+                    decision.action,
+                    ContextAction::Advisory | ContextAction::FinishBounded { .. }
+                ) {
+                    let notice = super::continuation::pressure_notice(assessment.used_tokens());
+                    let mut s = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let key = format!("{:?}", decision.band);
+                    if s.last_notice != key {
+                        s.last_notice = key;
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                    }
+                }
+            }
+
+            let pressure_request;
+            let request_messages = if context_enabled {
+                let s = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !s.last_notice.is_empty() {
+                    pressure_request = request_messages.iter().cloned().chain(std::iter::once(Arc::new(json!({
+                        "role":"user", "content":format!("[Host context-pressure advisory, not a new user request] Phase={}. Finish bounded work or prepare a spec/checkpoint. Do not start a large new task without reporting phase=new_task or execute using context_checkpoint alone. Host capacity limits remain authoritative.",s.policy.phase().as_str())
+                    })))).collect::<Vec<_>>();
+                    pressure_request.as_slice()
+                } else {
+                    request_messages
+                }
+            } else {
+                request_messages
+            };
             let response = match ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
@@ -696,6 +868,13 @@ impl StreamMethods {
                     "content": content
                 })));
 
+                if context_enabled
+                    && tool_uses.len() > 1
+                    && tool_uses.iter().any(|t| t["name"] == "context_checkpoint")
+                {
+                    messages.push(Arc::new(json!({"role":"user","content":tool_uses.iter().map(|t|json!({"type":"tool_result","tool_use_id":t["id"],"is_error":true,"content":"No tools executed: context_checkpoint must be called alone so the host can assess rollover before more work."})).collect::<Vec<_>>()})));
+                    continue;
+                }
                 let assistant_text = assistant_text_from_content(content);
                 let hook_event = HookEvent::on_message_complete(
                     &assistant_text,
@@ -2079,6 +2258,23 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        drive_with_context(
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            Arc::new(Mutex::new(Default::default())),
+        )
+        .await
+    }
+
+    async fn drive_with_context(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        continuation: super::super::continuation::SharedContinuation,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -2117,6 +2313,8 @@ mod rich_output_tests {
             system_prompt: None,
             thinking_budget: 0,
             reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            context_window: 200_000,
+            continuation,
             tx,
             cancel: CancellationToken::new(),
             steering_rx: None,
@@ -2174,6 +2372,81 @@ mod rich_output_tests {
             ui_results,
             bodies,
         }
+    }
+
+    struct ContextEvidenceTool(super::super::continuation::SharedContinuation);
+    #[async_trait::async_trait]
+    impl Tool for ContextEvidenceTool {
+        fn name(&self) -> &str {
+            "context_evidence_stub"
+        }
+        fn description(&self) -> &str {
+            "fixture"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            let mut state = self.0.lock().unwrap();
+            state.checkpoint(agent_core::core::context_policy::WorkPhase::Plan,Some("Specification complete. Original no-deploy requirement remains applicable.")).unwrap();
+            state
+                .checkpoint(agent_core::core::context_policy::WorkPhase::Execute, None)
+                .unwrap();
+            Ok("SPEC_COMPLETE_EVIDENCE".into())
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn automatic_rollover_between_tool_rounds_preserves_evidence_and_pairs() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let state = Arc::new(Mutex::new(
+            super::super::continuation::ContinuationState::default(),
+        ));
+        state.lock().unwrap().config = agent_core::config::ContextManagementConfig {
+            mode: agent_core::config::ContextManagementMode::Auto,
+            pressure_tokens: Some(30_000),
+            rollover_tokens: Some(100_000),
+            ..Default::default()
+        };
+        let messages = vec![
+            Arc::new(json!({"role":"user","content":"Make a spec then implement. Do not deploy."})),
+            Arc::new(json!({"role":"assistant","content":"HISTORICAL_DETAIL ".repeat(7000)})),
+            Arc::new(json!({"role":"user","content":"Finish the specification."})),
+        ];
+        let d = drive_with_context(
+            messages,
+            vec![Arc::new(ContextEvidenceTool(state.clone()))],
+            &[("toolu_context", "context_evidence_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(state.lock().unwrap().window, 2);
+        let serialized = d.bodies[1].to_string();
+        assert!(!serialized.contains("HISTORICAL_DETAIL"));
+        assert!(serialized.contains("Do not deploy."));
+        assert!(serialized.contains("SPEC_COMPLETE_EVIDENCE"));
+        assert!(!serialized.contains("_synaps_context"));
+        assert_eq!(
+            tool_result_message(&d.bodies[1])["content"][0]["tool_use_id"],
+            "toolu_context"
+        );
+        let archive = state.lock().unwrap().latest_archive.clone().unwrap();
+        let source = super::super::continuation::archive_store()
+            .unwrap()
+            .fetch(&archive, 0, 10)
+            .unwrap();
+        assert!(source
+            .iter()
+            .any(|m| m.to_string().contains("HISTORICAL_DETAIL")));
+        assert!(d
+            .history
+            .iter()
+            .any(|m| m["_synaps_context"]["schema"] == super::super::continuation::MARKER));
     }
 
     /// The user message carrying tool results, from the round-2 request body.

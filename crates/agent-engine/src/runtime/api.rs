@@ -965,6 +965,8 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
+        let wire_messages = super::continuation::wire_messages(messages);
+        let messages = wire_messages.as_deref().unwrap_or(messages);
         // One provider-neutral schema source for every transport. The opt-in
         // progressive path supplies a per-round session projection; flag-off
         // keeps cloning the registry's existing cached Arc byte-for-byte.

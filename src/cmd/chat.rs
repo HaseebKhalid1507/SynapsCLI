@@ -500,7 +500,7 @@ pub async fn run(
             // token math.
             conv.save().await;
             let assessment = runtime.assess_context(&conv.api_messages).await;
-            if assessment.should_compact() {
+            if assessment.should_compact() && !runtime.context_management_enabled() {
                 eprintln!(
                     "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
                     assessment.used_tokens()

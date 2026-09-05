@@ -920,6 +920,7 @@ pub async fn apply_compaction(
     );
 
     let api_messages = session.api_messages.clone();
+    runtime.reset_context_continuation(&session.id, &api_messages);
     // The transition is fully persisted — count the successful pass through
     // the ONE typed entry (runtime-observable architectural proof).
     TRANSITIONS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

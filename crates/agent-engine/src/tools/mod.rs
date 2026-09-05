@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 // ── Module declarations ──────────────────────────────────────────────────────────
 
 mod bash;
+pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
 mod find;

@@ -725,6 +725,18 @@ Sessions and compaction lineages can be aliased for easy resume.
 - `/chain unname <name>` — remove a chain bookmark.
 - `/chain` (no args) — show lineage + "bookmarked by: @name" if present.
 
+Experimental automatic context windows are separate from `/compact`: `/context auto`
+opts in for this runtime; `/context off` disables it; `/context status` shows the
+configured capacity and effective pressure/rollover thresholds. Persistent opt-in
+uses `context_management.mode = auto`. It keeps the same session/environment and
+archives eligible prior-window evidence before reducing active request history.
+The model reports task phases through `context_checkpoint`; short `memory_search`
+(`source=history`) and `memory_fetch` retrieve archived evidence. Default is off;
+Unix only for now. No Axel note migration is implied. See
+[context-continuation spec](docs/specs/context-continuation.md) for bounds, privacy,
+crash-recovery limits and the 140k/200k versus 250k–400k/1m policy.
+
+
 Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
 
 ---

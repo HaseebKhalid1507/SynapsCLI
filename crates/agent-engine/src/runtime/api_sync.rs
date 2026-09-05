@@ -96,6 +96,8 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
+        let wire_messages = super::continuation::wire_messages(messages);
+        let messages = wire_messages.as_deref().unwrap_or(messages);
         // Route through OpenAI-compat provider if model resolves to one.
         // This synchronous facade consumes only the final response value, so
         // high-volume display deltas are suppressed at the provider boundary.

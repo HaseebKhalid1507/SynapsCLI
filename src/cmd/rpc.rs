@@ -675,6 +675,7 @@ async fn handle_new_session(
         let sid = new_sess.id.clone();
         st.session = new_sess;
         st.api_messages.clear();
+        st.runtime.reset_context_continuation(&sid, &[]);
         st.total_input_tokens = 0;
         st.total_output_tokens = 0;
         st.session_cost = 0.0;

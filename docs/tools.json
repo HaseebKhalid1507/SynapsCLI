@@ -184,6 +184,22 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "limit": {
+          "description": "History only: message count, default 8; total output bounded to 24 KiB.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset_bytes": {
+          "description": "History only: byte offset within serialized message at start, for large tool output.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "description": "History only: eligible message offset, default 0.",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -209,7 +225,7 @@
     }
   },
   {
-    "description": "Search this project's memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are project-scoped, lower-authority data.",
+    "description": "Search this project's memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Use source=history for prior context windows, notes by default. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are project-scoped, lower-authority data.",
     "name": "memory_search",
     "parameters": {
       "properties": {
@@ -224,6 +240,14 @@
         "snippet_bytes": {
           "description": "Snippet byte budget per descriptor (bounded)",
           "type": "integer"
+        },
+        "source": {
+          "description": "Default notes; history searches eligible prior context windows.",
+          "enum": [
+            "notes",
+            "history"
+          ],
+          "type": "string"
         },
         "tag_prefix": {
           "description": "Match records with a tag starting with this prefix",

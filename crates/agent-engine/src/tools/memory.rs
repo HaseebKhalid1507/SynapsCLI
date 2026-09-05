@@ -100,7 +100,7 @@ impl Tool for MemorySearchTool {
 
     fn description(&self) -> &str {
         "Search this project's memory records with ONE short literal case-insensitive substring, \
-         not a semantic, Boolean, keyword-list, or sentence query. Retry a small bounded set of \
+         not a semantic, Boolean, keyword-list, or sentence query. Use source=history for prior context windows, notes by default. Retry a small bounded set of \
          shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, \
          size, sensitivity) with short snippets — never full bodies. Then wait for this search \
          output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. \
@@ -111,6 +111,7 @@ impl Tool for MemorySearchTool {
         json!({
             "type": "object",
             "properties": {
+                "source": {"type":"string","enum":["notes","history"],"description":"Default notes; history searches eligible prior context windows."},
                 "query": {"type": "string", "description": "ONE short literal substring to match in record content (case-insensitive); not semantic/Boolean/sentence search"},
                 "tag_prefix": {"type": "string", "description": "Match records with a tag starting with this prefix"},
                 "limit": {"type": "integer", "description": format!("Maximum descriptors to return (hard cap {MAX_SEARCH_LIMIT})")},
@@ -123,6 +124,31 @@ impl Tool for MemorySearchTool {
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
         let scope = host_scope()?;
         verify_project_arg(&params, &scope)?;
+        if params["source"] == "history" {
+            let query = params["query"].as_str().unwrap_or("").to_owned();
+            let limit = params["limit"].as_u64().unwrap_or(8).min(25) as usize;
+            let base = base_dir();
+            let rows = tokio::task::spawn_blocking(move || {
+                crate::runtime::continuation::archive_store_in(&base, &scope)?.search(&query, limit)
+            })
+            .await
+            .map_err(|_| RuntimeError::Tool("archive search worker failed".into()))?
+            .map_err(|e| RuntimeError::Tool(format!("archive search: {e}")))?;
+            let mut out = LOWER_AUTHORITY_HEADER.to_owned();
+            for row in rows {
+                out.push_str(&format!(
+                    "\nctx-{} messages={} source_messages={} snippet={}",
+                    row.id, row.message_count, row.source_message_count, row.snippet
+                ));
+            }
+            return Ok(out);
+        }
+        if params
+            .get("source")
+            .is_some_and(|s| !s.is_null() && s != "notes")
+        {
+            return Err(RuntimeError::Tool("source must be notes or history".into()));
+        }
         let query = ProjectMemoryQuery {
             content_contains: params["query"].as_str().map(String::from),
             tag_prefix: params["tag_prefix"].as_str().map(String::from),
@@ -199,6 +225,9 @@ impl Tool for MemoryFetchTool {
         json!({
             "type": "object",
             "properties": {
+                "offset_bytes": {"type":"integer","minimum":0,"description":"History only: byte offset within serialized message at start, for large tool output."},
+                "start": {"type":"integer","minimum":0,"description":"History only: eligible message offset, default 0."},
+                "limit": {"type":"integer","minimum":1,"maximum":32,"description":"History only: message count, default 8; total output bounded to 24 KiB."},
                 "ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -225,6 +254,67 @@ impl Tool for MemoryFetchTool {
             return Err(RuntimeError::Tool(format!(
                 "memory_fetch is bounded to {MAX_SEARCH_LIMIT} ids per call"
             )));
+        }
+        let history_ids = ids
+            .iter()
+            .filter(|id| id.starts_with("ctx-"))
+            .copied()
+            .collect::<Vec<_>>();
+        if !history_ids.is_empty() {
+            if ids.len() != 1 {
+                return Err(RuntimeError::Tool(
+                    "fetch one history range at a time".into(),
+                ));
+            }
+            let id = history_ids[0].trim_start_matches("ctx-").to_owned();
+            let start = params["start"].as_u64().unwrap_or(0) as usize;
+            let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 32) as usize;
+            let base = base_dir();
+            let rows = tokio::task::spawn_blocking(move || {
+                crate::runtime::continuation::archive_store_in(&base, &scope)?
+                    .fetch_with_provenance(&id, start, limit)
+            })
+            .await
+            .map_err(|_| RuntimeError::Tool("archive fetch worker failed".into()))?
+            .map_err(|e| RuntimeError::Tool(format!("archive fetch: {e}")))?;
+            let mut out = LOWER_AUTHORITY_HEADER.to_owned();
+            for (offset, row) in rows.iter().enumerate() {
+                let serialized = row.message.to_string();
+                let requested = if offset == 0 {
+                    params["offset_bytes"].as_u64().unwrap_or(0) as usize
+                } else {
+                    0
+                };
+                if requested > serialized.len() {
+                    return Err(RuntimeError::Tool(
+                        "offset_bytes exceeds message length".into(),
+                    ));
+                }
+                let mut from = requested;
+                while !serialized.is_char_boundary(from) {
+                    from += 1;
+                }
+                let available = (24 * 1024usize).saturating_sub(out.len() + 300);
+                let excerpt = agent_core::truncate_str(&serialized[from..], available);
+                out.push_str(&format!(
+                    "\n[eligible_index={} source_index={} bytes={}..{} of {}] {}",
+                    start + offset,
+                    row.source_index,
+                    from,
+                    from + excerpt.len(),
+                    serialized.len(),
+                    excerpt
+                ));
+                if from + excerpt.len() < serialized.len() {
+                    out.push_str(&format!(
+                        "\n[next fetch: start={} offset_bytes={}]",
+                        start + offset,
+                        from + excerpt.len()
+                    ));
+                    break;
+                }
+            }
+            return Ok(out);
         }
         let records = fetch_exact_in(&base_dir(), &scope, &ids).map_err(map_err)?;
         let mut out = LOWER_AUTHORITY_HEADER.to_string();
@@ -405,6 +495,17 @@ impl Tool for MemoryForgetTool {
         let id = params["id"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("memory_forget requires an id".into()))?;
+        if let Some(id) = id.strip_prefix("ctx-") {
+            let id = id.to_owned();
+            let base = base_dir();
+            tokio::task::spawn_blocking(move || {
+                crate::runtime::continuation::archive_store_in(&base, &scope)?.forget(&id)
+            })
+            .await
+            .map_err(|_| RuntimeError::Tool("archive forget worker failed".into()))?
+            .map_err(|e| RuntimeError::Tool(format!("archive forget: {e}")))?;
+            return Ok("Forgot this archived context window. Tombstone retained; other sessions/notes are not erased.".into());
+        }
         forget_in(&base_dir(), &scope, id).map_err(map_err)?;
         Ok(format!(
             "tombstoned memory {} in project {}",
@@ -446,6 +547,62 @@ mod tests {
             .to_string()
     }
 
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn history_search_fetch_paginates_large_messages_and_forgets_exact_window() {
+        let _env = BaseDirGuard::new();
+        let text = format!("HISTORY_NEEDLE {} HISTORY_TAIL", "evidence ".repeat(6000));
+        let reference = crate::runtime::continuation::archive_store()
+            .unwrap()
+            .seal(
+                &[std::sync::Arc::new(
+                    json!({"role":"assistant","content":text}),
+                )],
+                "note",
+            )
+            .unwrap();
+        let id = format!("ctx-{}", reference.id);
+        let search = MemorySearchTool
+            .execute(
+                json!({"source":"history","query":"HISTORY_NEEDLE"}),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        assert!(search.contains(&id));
+        let first = MemoryFetchTool
+            .execute(json!({"ids":[id],"limit":1}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(first.contains("HISTORY_NEEDLE"));
+        assert!(first.contains("next fetch:"));
+        assert!(first.len() < 25 * 1024);
+        let tail = MemoryFetchTool
+            .execute(
+                json!({"ids":[id],"limit":1,"offset_bytes":48000}),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        assert!(tail.contains("HISTORY_TAIL"));
+        MemoryForgetTool
+            .execute(json!({"id":id}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(MemoryFetchTool
+            .execute(json!({"ids":[id]}), create_tool_context())
+            .await
+            .is_err());
+        assert!(!MemorySearchTool
+            .execute(
+                json!({"source":"history","query":"HISTORY_NEEDLE"}),
+                create_tool_context()
+            )
+            .await
+            .unwrap()
+            .contains(&id));
+    }
+
     #[test]
     fn memory_search_and_fetch_descriptions_teach_literal_sequential_exact_id_workflow() {
         let search = MemorySearchTool;
@@ -477,7 +634,7 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["limit", "query", "snippet_bytes", "tag_prefix"]
+            ["limit", "query", "snippet_bytes", "source", "tag_prefix"]
                 .into_iter()
                 .map(String::from)
                 .collect()

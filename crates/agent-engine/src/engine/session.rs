@@ -90,6 +90,7 @@ impl ConversationState {
             runtime.thinking_level(),
             runtime.system_prompt(),
         );
+        runtime.reset_context_continuation(&self.session.id, &[]);
     }
 
     /// Add usage from a model turn.

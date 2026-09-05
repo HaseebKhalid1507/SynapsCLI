@@ -188,6 +188,12 @@ pub fn handle_engine_command(
     // owns it) — the TUI intercepts `/context` earlier and passes its own
     // history through `context_command`.
     match cmd {
+        "context" if !arg.is_empty() => {
+            return Some(match runtime.context_management_command(arg) {
+                Ok(s) => CommandResult::Output(s),
+                Err(e) => CommandResult::Error(e),
+            })
+        }
         "context" => return Some(context_command(runtime, None)),
         "trace" => return Some(trace_command(arg, runtime)),
         "memory" => return Some(memory_command(arg, runtime)),
@@ -282,7 +288,11 @@ pub fn context_command(
     runtime: &crate::Runtime,
     history: Option<&[crate::SharedMessage]>,
 ) -> CommandResult {
-    CommandResult::Output(runtime.context_report(history).render())
+    CommandResult::Output(format!(
+        "{}\n{}",
+        runtime.context_report(history).render(),
+        runtime.context_management_status()
+    ))
 }
 
 /// `/trace next|next content|status` (Task 12): explicit trace controls.

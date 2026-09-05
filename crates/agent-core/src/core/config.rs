@@ -107,6 +107,155 @@ pub fn get_active_config_dir() -> PathBuf {
     base
 }
 
+/// Automatic context management is opt-in; independent of compaction disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextManagementMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl ContextManagementMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Task-aware soft context bands, parsed from `context_management.*` keys.
+///
+/// Missing thresholds use window-aware defaults (200k: 140k/180k;
+/// 1m: 250k/400k). A single override adjusts the other default as necessary
+/// to keep pressure below rollover. These settings never override the host's
+/// hard capacity or authorize tools, disclosure, or a session transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextManagementConfig {
+    pub mode: ContextManagementMode,
+    /// Optional absolute token threshold; `auto` in config clears the override.
+    pub pressure_tokens: Option<u64>,
+    /// Optional absolute token threshold; `auto` in config clears the override.
+    pub rollover_tokens: Option<u64>,
+    /// Minimum remaining headroom before any model round. Default: 16,000.
+    pub reserve_tokens: u64,
+    /// Maximum extra Plan/WrapUp rounds after rollover becomes due. Default: 2.
+    /// Zero disables extensions; phase reports cannot renew this allowance.
+    pub finish_rounds: u32,
+}
+
+impl Default for ContextManagementConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextManagementMode::Off,
+            pressure_tokens: None,
+            rollover_tokens: None,
+            reserve_tokens: 16_000,
+            finish_rounds: 2,
+        }
+    }
+}
+
+impl ContextManagementConfig {
+    pub const MAX_FINISH_ROUNDS: u32 = 8;
+    pub const MAX_RESERVE_TOKENS: u64 = 1_000_000;
+
+    /// Validate independently of a model selection. Also call
+    /// `validate_for_window` when the effective context window is known.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.pressure_tokens == Some(0) {
+            return Err("pressure_tokens must be positive");
+        }
+        if self.rollover_tokens.is_some_and(|v| v < 2) {
+            return Err("rollover_tokens must be at least 2");
+        }
+        if let (Some(pressure), Some(rollover)) = (self.pressure_tokens, self.rollover_tokens) {
+            if pressure >= rollover {
+                return Err("pressure_tokens must be below rollover_tokens");
+            }
+        }
+        if !(1..=Self::MAX_RESERVE_TOKENS).contains(&self.reserve_tokens) {
+            return Err("reserve_tokens must be between 1 and 1000000");
+        }
+        if self.finish_rounds > Self::MAX_FINISH_ROUNDS {
+            return Err("finish_rounds must be between 0 and 8");
+        }
+        Ok(())
+    }
+
+    /// Threshold overrides must fit the effective window. The hard budget
+    /// remains authoritative even when an override fits this validation.
+    pub fn validate_for_window(&self, context_window_tokens: u64) -> Result<(), &'static str> {
+        self.validate()?;
+        if context_window_tokens < 2 {
+            return Err("context window must contain at least two tokens");
+        }
+        if self
+            .pressure_tokens
+            .is_some_and(|v| v >= context_window_tokens)
+        {
+            return Err("pressure_tokens must be below the context window");
+        }
+        if self
+            .rollover_tokens
+            .is_some_and(|v| v > context_window_tokens)
+        {
+            return Err("rollover_tokens must not exceed the context window");
+        }
+        Ok(())
+    }
+}
+
+/// Parse fields first; validate the complete policy after all lines so threshold
+/// ordering and an explicit context window do not depend on config key order.
+fn parse_context_management_config_key(
+    config: &mut ContextManagementConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    match key {
+        "context_management.mode" => {
+            config.mode = ContextManagementMode::parse(value).ok_or("expected off or auto")?;
+        }
+        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+            let tokens = if value.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "expected auto or an unsigned token count")?,
+                )
+            };
+            if key == "context_management.pressure_tokens" {
+                config.pressure_tokens = tokens;
+            } else {
+                config.rollover_tokens = tokens;
+            }
+        }
+        "context_management.reserve_tokens" => {
+            config.reserve_tokens = value
+                .parse()
+                .map_err(|_| "expected an unsigned token count")?;
+        }
+        "context_management.finish_rounds" => {
+            config.finish_rounds = value
+                .parse()
+                .map_err(|_| "expected an unsigned round count")?;
+        }
+        _ => return Err("unknown context management key"),
+    }
+    Ok(())
+}
+
 /// Server security configuration parsed from `server.*` keys.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
@@ -511,6 +660,7 @@ pub struct SynapsConfig {
     /// to `thinking_budget` for legacy numeric-only values.
     pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>, // override auto-detected context window (tokens)
+    pub context_management: ContextManagementConfig,
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
@@ -582,6 +732,7 @@ impl Default for SynapsConfig {
             thinking_budget: None,
             thinking_level: None,
             context_window: None,
+            context_management: ContextManagementConfig::default(),
             compaction_model: None,
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
@@ -627,6 +778,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "thinking",
     "compaction_model",
     "context_window",
+    "context_management.mode",
+    "context_management.pressure_tokens",
+    "context_management.rollover_tokens",
+    "context_management.reserve_tokens",
+    "context_management.finish_rounds",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",
@@ -902,6 +1058,7 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
+    let mut invalid_context_management = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1106,6 +1263,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     parse_turn_budget_config_key(&mut config.turn_budgets, key, val);
                 } else if key.starts_with("memory.") {
                     parse_memory_config_key(&mut config.memory, key, val);
+                } else if key.starts_with("context_management.") {
+                    if let Err(reason) = parse_context_management_config_key(
+                        &mut config.context_management, key, val,
+                    ) {
+                        invalid_context_management = true;
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config
                         .provider_keys
@@ -1131,6 +1295,25 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 }
             }
         }
+    }
+
+    // Never leave a partially parsed automatic policy enabled. Syntax errors
+    // invalidate this whole parse pass, even if a later duplicate is valid.
+    let context_validation = match config.context_window {
+        Some(window) => config.context_management.validate_for_window(window),
+        None => config.context_management.validate(),
+    };
+    if let Err(reason) = context_validation {
+        invalid_context_management = true;
+        config
+            .warnings
+            .push(format!("context_management — {reason}"));
+    }
+    if invalid_context_management {
+        config.context_management = ContextManagementConfig::default();
+        config.warnings.push(
+            "invalid context_management configuration — using defaults (mode off)".to_string(),
+        );
     }
 
     // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
@@ -1285,6 +1468,205 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_management_defaults_off_and_parses_all_keys() {
+        use super::{ContextManagementConfig, ContextManagementMode};
+        assert_eq!(
+            super::load_config_from_str("").context_management,
+            ContextManagementConfig::default()
+        );
+        let parsed = super::load_config_from_str(
+            "context_management.mode = AUTO\n\
+             context_management.pressure_tokens = 250000\n\
+             context_management.rollover_tokens = 400000\n\
+             context_management.reserve_tokens = 24000\n\
+             context_management.finish_rounds = 3\n\
+             context_window = 1m\n",
+        );
+        assert_eq!(
+            parsed.context_management,
+            ContextManagementConfig {
+                mode: ContextManagementMode::Auto,
+                pressure_tokens: Some(250_000),
+                rollover_tokens: Some(400_000),
+                reserve_tokens: 24_000,
+                finish_rounds: 3,
+            }
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert!(parsed.provider_keys.is_empty());
+        assert!(super::load_config_from_str("context_management.mode = off")
+            .warnings
+            .is_empty());
+    }
+
+    #[test]
+    fn context_management_auto_clears_overrides_and_allows_bounded_extremes() {
+        for rounds in [0, super::ContextManagementConfig::MAX_FINISH_ROUNDS] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\n\
+                 context_management.pressure_tokens = 300000\n\
+                 context_management.rollover_tokens = 450000\n\
+                 context_management.pressure_tokens = auto\n\
+                 context_management.rollover_tokens = AUTO\n\
+                 context_management.finish_rounds = {rounds}\n"
+            ));
+            assert_eq!(parsed.context_management.pressure_tokens, None);
+            assert_eq!(parsed.context_management.rollover_tokens, None);
+            assert_eq!(parsed.context_management.finish_rounds, rounds);
+            assert!(parsed.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn context_management_invalid_values_reset_entire_policy() {
+        for (key, value) in [
+            ("mode", "on"),
+            ("pressure_tokens", "0"),
+            ("pressure_tokens", "-1"),
+            ("pressure_tokens", "250k"),
+            ("pressure_tokens", "18446744073709551616"),
+            ("rollover_tokens", "1"),
+            ("rollover_tokens", "nope"),
+            ("reserve_tokens", "0"),
+            ("reserve_tokens", "1000001"),
+            ("reserve_tokens", "auto"),
+            ("finish_rounds", "9"),
+            ("finish_rounds", "-1"),
+            ("finish_rounds", "4294967296"),
+            ("finish_rounds", ""),
+            ("mod", "auto"),
+        ] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\ncontext_management.{key} = {value}\n"
+            ));
+            assert_eq!(
+                parsed.context_management,
+                super::ContextManagementConfig::default(),
+                "{key}={value}"
+            );
+            assert!(!parsed.warnings.is_empty(), "{key}={value}");
+            assert!(parsed.provider_keys.is_empty());
+        }
+        let duplicate = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.finish_rounds = bad\ncontext_management.finish_rounds = 2"
+        );
+        assert_eq!(
+            duplicate.context_management,
+            super::ContextManagementConfig::default()
+        );
+    }
+
+    #[test]
+    fn context_management_validates_final_threshold_order_and_window() {
+        for fields in [
+            "pressure_tokens = 400000\ncontext_management.rollover_tokens = 400000",
+            "pressure_tokens = 500000\ncontext_management.rollover_tokens = 400000",
+            "pressure_tokens = 1000000",
+            "rollover_tokens = 1000001",
+        ] {
+            for window_first in [false, true] {
+                let policy =
+                    format!("context_management.mode = auto\ncontext_management.{fields}\n");
+                let content = if window_first {
+                    format!("context_window = 1m\n{policy}")
+                } else {
+                    format!("{policy}context_window = 1m\n")
+                };
+                let parsed = super::load_config_from_str(&content);
+                assert_eq!(
+                    parsed.context_management,
+                    super::ContextManagementConfig::default()
+                );
+                assert!(!parsed.warnings.is_empty());
+            }
+        }
+        // Temporarily reversed overrides are valid once the whole file is parsed.
+        let parsed = super::load_config_from_str(
+            "context_management.mode = auto\n\
+             context_management.rollover_tokens = 100000\n\
+             context_management.pressure_tokens = 300000\n\
+             context_management.rollover_tokens = 450000\ncontext_window = 1m",
+        );
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.context_management.rollover_tokens, Some(450_000));
+    }
+
+    #[test]
+    fn context_management_parsed_finish_override_bounds_rollover_extension() {
+        use crate::core::context_policy::{
+            assess_context, ContextAction, ContextBudget, ContextState, WorkPhase,
+        };
+        let config = super::load_config_from_str(
+            "context_management.mode = auto\n\
+             context_management.finish_rounds = 1\ncontext_window = 1m",
+        );
+        let budget = ContextBudget {
+            context_window_tokens: 1_000_000,
+            used_tokens: 400_000,
+            hard_remaining_tokens: 600_000,
+            required_next_round_tokens: 8_000,
+        };
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::Plan);
+        let first = assess_context(&config.context_management, &state, budget);
+        assert_eq!(
+            first.action,
+            ContextAction::FinishBounded {
+                rounds_remaining: 0
+            }
+        );
+        state = first.next_state;
+        state.report_phase(WorkPhase::WrapUp);
+        assert_eq!(
+            assess_context(&config.context_management, &state, budget).action,
+            ContextAction::Rollover
+        );
+    }
+
+    #[test]
+    fn context_management_keys_are_known_for_suggestions() {
+        for key in [
+            "mode",
+            "pressure_tokens",
+            "rollover_tokens",
+            "reserve_tokens",
+            "finish_rounds",
+        ] {
+            let full = format!("context_management.{key}");
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&full.as_str()));
+            assert_eq!(
+                super::did_you_mean(&format!("{full}x")),
+                Some(full.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn context_management_parsed_policy_rolls_over_before_executing_350k_plan() {
+        use crate::core::context_policy::{
+            assess_context, ContextAction, ContextBudget, ContextState, WorkPhase,
+        };
+        let config =
+            super::load_config_from_str("context_management.mode = auto\ncontext_window = 1m");
+        let budget = ContextBudget {
+            context_window_tokens: config.context_window.unwrap(),
+            used_tokens: 350_000,
+            hard_remaining_tokens: 650_000,
+            required_next_round_tokens: 8_000,
+        };
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::Plan);
+        let plan = assess_context(&config.context_management, &state, budget);
+        assert_eq!(plan.action, ContextAction::Advisory);
+        state = plan.next_state;
+        state.report_phase(WorkPhase::Execute);
+        assert_eq!(
+            assess_context(&config.context_management, &state, budget).action,
+            ContextAction::Rollover
+        );
+    }
+
     #[test]
     fn tui_background_opaque_defaults_and_parses_supported_values() {
         assert!(super::load_config_from_str("").tui_background_opaque);
