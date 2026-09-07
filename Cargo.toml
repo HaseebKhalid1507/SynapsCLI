@@ -129,9 +129,9 @@ members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 
 [workspace.dependencies]
-agent-core   = { path = "crates/agent-core",   version = "0.9.0", package = "synaps-core" }
-agent-engine = { path = "crates/agent-engine", version = "0.9.0", package = "synaps-engine" }
-agent-tui    = { path = "crates/agent-tui",    version = "0.9.0", package = "synaps-tui" }
+agent-core   = { path = "crates/agent-core",   version = "0.9.1", package = "synaps-core" }
+agent-engine = { path = "crates/agent-engine", version = "0.9.1", package = "synaps-engine" }
+agent-tui    = { path = "crates/agent-tui",    version = "0.9.1", package = "synaps-tui" }
