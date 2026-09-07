@@ -1379,7 +1379,7 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::ModelsApply(model) => match runtime.try_set_model(model.clone()) {
-            Ok(()) => {
+            Ok(clamp) => {
                 let applied = runtime.model().to_string();
                 let status = synaps_cli::engine::commands::persist_to_config("model", &applied);
                 app.session.model = applied.clone();
@@ -1387,6 +1387,13 @@ pub(crate) async fn handle_input_action(
                     "model set to: {} {}",
                     applied, status
                 )));
+                // Session-only: the user's configured thinking value stays theirs.
+                if let Some(clamp) = clamp {
+                    app.session.thinking_level = runtime.thinking_level().to_string();
+                    app.push_msg(ChatMessage::System(
+                        crate::tui::commands::reasoning_clamp_notice(&clamp, &applied),
+                    ));
+                }
             }
             Err(error) => app.push_msg(ChatMessage::Error(error)),
         },

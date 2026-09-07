@@ -312,6 +312,32 @@ Begin now and continue autonomously until the exercise reaches a verified safe o
 }
 
 #[test]
+fn messages_to_gemini_turns_degrades_image_tool_result_with_omission_note() {
+    let b64 = "iVBORw0KGgo".repeat(200);
+    let msgs: Vec<crate::SharedMessage> = vec![
+        Arc::new(json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"t1","name":"read","input":{"path":"x.png"}}
+        ]})),
+        Arc::new(json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"Image: x"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64}}
+            ]}
+        ]})),
+    ];
+    let turns = messages_to_gemini_turns(&msgs);
+    let ChatTurn::ToolResult { name, result } = &turns[1] else {
+        panic!("expected ToolResult, got {:?}", turns.len());
+    };
+    assert_eq!(name, "read");
+    assert_eq!(
+        result,
+        &json!({"output": "Image: x\n[image omitted: image/png — this provider does not accept images in tool results]"})
+    );
+    assert!(!result.to_string().contains("iVBORw0KGgo"));
+}
+
+#[test]
 fn messages_to_gemini_turns_preserves_object_tool_results_and_error_metadata() {
     let msgs: Vec<crate::SharedMessage> = vec![
         Arc::new(json!({"role":"assistant","content":[

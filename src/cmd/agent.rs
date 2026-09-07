@@ -168,7 +168,9 @@ pub async fn run(config_path: String, trigger_context: String) {
 
     // Setup session logging
     let logs_dir = agent_dir.join("logs");
-    std::fs::create_dir_all(&logs_dir).unwrap_or_default();
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        eprintln!("failed to create logs dir {}: {}", logs_dir.display(), e);
+    }
     let session_number = get_session_number(&logs_dir);
     let session_log_path = logs_dir.join(format!("session-{:03}.jsonl", session_number));
     let current_log_path = logs_dir.join("current.log");

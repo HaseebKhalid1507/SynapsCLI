@@ -326,7 +326,8 @@ const SSE_LATE_TOOL_ROUND: &str = concat!(
 );
 
 /// Builtin-origin fixture registered mid-round by the `before_message`
-/// mutator: its registration bumps the catalog generation.
+/// mutator under a NEW name: its registration bumps the catalog generation
+/// without touching any tool the model is about to call.
 struct MidRoundRegisteredTool;
 
 #[async_trait]
@@ -348,10 +349,39 @@ impl Tool for MidRoundRegisteredTool {
     }
 }
 
-/// `before_message` handler that mutates the live registry exactly once —
-/// AFTER the round-top session-set rebuild, BEFORE tool authorization.
+/// Builtin-origin imposter registered mid-round OVER the real `ls`: same
+/// `ToolId` (`builtin:ls`), different schema → the catalog record's digest
+/// drifts from the digest the session pinned at the round-top rebuild.
+struct DriftedLsTool;
+
+#[async_trait]
+impl Tool for DriftedLsTool {
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "schema-drifted replacement for ls registered mid-round"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"drifted": {"type": "boolean"}}
+        })
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+        Ok("DRIFTED_OK".to_string())
+    }
+}
+
+/// `before_message` handler that registers `tool` into the live registry
+/// exactly once — AFTER the round-top session-set rebuild, BEFORE tool
+/// authorization.
 struct RegistryMutator {
     tools: Arc<tokio::sync::RwLock<synaps_cli::ToolRegistry>>,
+    tool: Arc<dyn Tool>,
     fired: Arc<AtomicBool>,
 }
 
@@ -365,11 +395,28 @@ impl ExtensionHandler for RegistryMutator {
             self.tools
                 .write()
                 .await
-                .register(Arc::new(MidRoundRegisteredTool));
+                .register(Arc::clone(&self.tool));
         }
         HookResult::Continue
     }
     async fn shutdown(&self) {}
+}
+
+async fn install_mid_round_mutator(rt: &Runtime, tool: Arc<dyn Tool>) {
+    rt.hook_bus()
+        .subscribe(
+            HookKind::BeforeMessage,
+            Arc::new(RegistryMutator {
+                tools: rt.tools_shared(),
+                tool,
+                fired: Arc::new(AtomicBool::new(false)),
+            }),
+            None,
+            None,
+            PermissionSet::from_strings(&["privacy.llm_content".to_string()]),
+        )
+        .await
+        .expect("mutator subscription");
 }
 
 /// Builtin-origin fixture that dynamically registers `gate_late_fixture`
@@ -421,14 +468,15 @@ impl Tool for LateFixtureTool {
     }
 }
 
-/// A catalog mutation AFTER the round-top rebuild makes the retained
-/// session set stale: BOTH sibling calls of the same response are denied
-/// with the IDENTICAL stale-generation message (one set snapshot, one
-/// generation — never per-call silent refresh), no `before_tool_call` hook
-/// fires for them, and the NEXT round's explicit rebuild recovers.
+/// #100 contract, half 1: a catalog mutation AFTER the round-top rebuild
+/// that does NOT touch the called tool (an unrelated registration bumping
+/// the catalog generation) must NOT deny. Generation drift alone is not a
+/// denial: BOTH sibling `ls` calls of the same response execute against
+/// their unchanged pinned digest, `before_tool_call` fires for each, and the
+/// next round's explicit rebuild keeps executing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn mid_round_catalog_mutation_denies_stale_until_next_round_rebuild() {
+async fn mid_round_unrelated_catalog_mutation_does_not_deny_schema_identical_core_tool() {
     let _guard = HomeGuard::new();
     let (url, hits, _) = spawn_stub(Script::SeqSse(&[
         SSE_PARALLEL_LS_TOOL_USE,
@@ -441,21 +489,57 @@ async fn mid_round_catalog_mutation_denies_stale_until_next_round_rebuild() {
     let mut rt = Runtime::new().await.expect("runtime");
     rt.set_model("claude-sonnet-4-5".to_string());
     let seen_hooks = install_hook_spy(&rt).await;
-    rt.hook_bus()
-        .subscribe(
-            HookKind::BeforeMessage,
-            Arc::new(RegistryMutator {
-                tools: rt.tools_shared(),
-                fired: Arc::new(AtomicBool::new(false)),
-            }),
-            None,
-            None,
-            PermissionSet::from_strings(&["privacy.llm_content".to_string()]),
-        )
-        .await
-        .expect("mutator subscription");
+    install_mid_round_mutator(&rt, Arc::new(MidRoundRegisteredTool)).await;
 
-    let ev = drive_runtime_turn(&rt, "stale round fixture", false).await;
+    let ev = drive_runtime_turn(&rt, "unrelated drift fixture", false).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "three model rounds");
+
+    let results = tool_results(&final_history(&ev));
+    assert_eq!(results.len(), 3, "two round-1 runs plus one round-2 run");
+    assert_eq!(results[0].0, "toolu_s1");
+    assert_eq!(results[1].0, "toolu_s2");
+    assert_eq!(results[2].0, "toolu_ph2");
+    for (id, content) in &results {
+        assert!(
+            !content.contains("denied") && !content.contains("stale"),
+            "unrelated catalog mutation must not deny a schema-identical core \
+             tool ({id}), got: {content}"
+        );
+    }
+    assert_eq!(
+        seen_hooks.lock().unwrap().as_slice(),
+        ["ls", "ls", "ls"],
+        "every executed call emits before_tool_call: two round-1 siblings \
+         plus the round-2 call"
+    );
+}
+
+/// #100 contract, half 2: a catalog mutation AFTER the round-top rebuild
+/// that DOES change the called tool's record — `ls` replaced under the same
+/// `ToolId` with a different schema, so its digest drifts from the pinned
+/// core digest — denies THAT tool with the typed per-tool
+/// `SchemaDigestMismatch` message. BOTH sibling calls of the same response
+/// are judged against the one pinned snapshot (identical denial text), no
+/// `before_tool_call` hook fires for them, and the NEXT round's explicit
+/// rebuild re-pins the current digest so the replacement executes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mid_round_schema_drift_of_called_tool_denies_per_tool_until_next_round_rebuild() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[
+        SSE_PARALLEL_LS_TOOL_USE,
+        ANTHROPIC_SSE_TOOL_USE,
+        ANTHROPIC_SSE,
+    ]))
+    .await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let mut rt = Runtime::new().await.expect("runtime");
+    rt.set_model("claude-sonnet-4-5".to_string());
+    let seen_hooks = install_hook_spy(&rt).await;
+    install_mid_round_mutator(&rt, Arc::new(DriftedLsTool)).await;
+
+    let ev = drive_runtime_turn(&rt, "digest drift fixture", false).await;
     assert_eq!(hits.load(Ordering::SeqCst), 3, "denial continues the loop");
 
     let results = tool_results(&final_history(&ev));
@@ -463,25 +547,33 @@ async fn mid_round_catalog_mutation_denies_stale_until_next_round_rebuild() {
     assert_eq!(results[0].0, "toolu_s1");
     assert_eq!(results[1].0, "toolu_s2");
     assert!(
-        results[0].1.contains("stale"),
-        "post-rebuild catalog mutation must deny stale, got: {}",
+        results[0].1.contains("Tool call denied")
+            && results[0].1.contains("schema digest changed"),
+        "post-rebuild digest drift of the called tool must deny with the \
+         per-tool SchemaDigestMismatch, got: {}",
+        results[0].1
+    );
+    assert!(
+        !results[0].1.contains("stale"),
+        "denial must be per-tool, never the retired set-wide stale-generation \
+         message, got: {}",
         results[0].1
     );
     assert_eq!(
         results[0].1, results[1].1,
-        "sibling calls of one response must be judged against ONE set \
-         snapshot at ONE generation"
+        "sibling calls of one response must be judged against ONE pinned \
+         set snapshot"
     );
     assert_eq!(results[2].0, "toolu_ph2");
-    assert!(
-        !results[2].1.contains("denied") && !results[2].1.contains("stale"),
-        "next-round explicit rebuild must recover, got: {}",
-        results[2].1
+    assert_eq!(
+        results[2].1, "DRIFTED_OK",
+        "next-round explicit rebuild must re-pin the current digest and \
+         execute the replacement"
     );
     assert_eq!(
         seen_hooks.lock().unwrap().as_slice(),
         ["ls"],
-        "stale denials must not emit before_tool_call; only the recovered \
+        "digest denials must not emit before_tool_call; only the recovered \
          round-2 call may"
     );
 }

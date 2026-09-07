@@ -290,6 +290,10 @@ pub async fn try_route(
                     max_tokens,
                     reasoning_level,
                     cancel,
+                    // In-stream capacity errors (HTTP 200 + lone `error`
+                    // event) are transient; re-send identical bytes with
+                    // the configured retry budget.
+                    max_retries,
                     trace,
                     exact_wire_bytes,
                 )

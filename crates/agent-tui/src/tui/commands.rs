@@ -325,12 +325,19 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
-fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) {
-    if let Some(level) = agent_core::reasoning::ReasoningLevel::parse(thinking_level) {
-        runtime.set_reasoning_level_explicit(level);
-    } else if let Some(budget) = synaps_cli::models::budget_for_thinking_level(thinking_level) {
-        runtime.set_thinking_budget_explicit(budget);
-    }
+/// Re-apply a saved session's reasoning level as explicit, clamped to the
+/// current model. Returns a notice when the saved level was clamped.
+fn restore_session_reasoning(runtime: &mut Runtime, thinking_level: &str) -> Option<String> {
+    runtime
+        .restore_session_reasoning(thinking_level)
+        .map(|clamp| {
+            format!(
+                "thinking → {} (clamped from {}: not supported by {})",
+                clamp.to.as_str(),
+                clamp.from.as_str(),
+                runtime.model()
+            )
+        })
 }
 
 /// Handle a slash command when NOT streaming.
@@ -418,7 +425,9 @@ pub(super) async fn handle_command(
         };
         return match result {
             CommandResult::Quit => CommandAction::Quit,
-            CommandResult::ModelChanged { .. } => {
+            CommandResult::ModelChanged {
+                reasoning_clamped, ..
+            } => {
                 // Use the runtime's cleaned model string, not the raw arg.
                 let applied = runtime.model().to_string();
                 app.session.model = applied.clone();
@@ -427,6 +436,13 @@ pub(super) async fn handle_command(
                     "model set to: {} {}",
                     applied, status
                 )));
+                // Session-only: the user's configured thinking value stays theirs.
+                if let Some(clamp) = reasoning_clamped {
+                    app.session.thinking_level = runtime.thinking_level().to_string();
+                    app.push_msg(ChatMessage::System(reasoning_clamp_notice(
+                        &clamp, &applied,
+                    )));
+                }
                 CommandAction::None
             }
             CommandResult::ThinkingChanged { spec } => {
@@ -576,21 +592,49 @@ pub(super) async fn handle_command(
                     sessions.len()
                 )));
                 for s in sessions.iter().take(20) {
-                    let title = if s.title.is_empty() {
-                        "(untitled)"
-                    } else {
-                        &s.title
-                    };
-                    let active = if s.id == app.session.id { " *" } else { "" };
+                    let active_marker = if s.id == app.session.id { " ●" } else { "" };
                     let name_tag = s
                         .name
                         .as_deref()
                         .map(|n| format!(" [@{}]", n))
                         .unwrap_or_default();
+                    let age = {
+                        let secs = chrono::Utc::now()
+                            .signed_duration_since(s.updated_at)
+                            .num_seconds();
+                        if secs < 3600 {
+                            format!("{}m ago", secs / 60)
+                        } else if secs < 86400 {
+                            format!("{}h ago", secs / 3600)
+                        } else {
+                            format!("{}d ago", secs / 86400)
+                        }
+                    };
+                    let title_display = if s.title.is_empty() {
+                        "(no title)".to_string()
+                    } else {
+                        s.title.chars().take(60).collect::<String>()
+                    };
+                    // Last 4 chars — more recognizable than a prefix
+                    let id_short = &s.id[s.id.len().saturating_sub(4)..];
+                    let msg_str = if s.message_count > 0 {
+                        format!("{} msgs · ", s.message_count)
+                    } else {
+                        String::new()
+                    };
+                    // Line 1: identity + meta
                     app.push_msg(ChatMessage::System(format!(
-                        "  {}{} — {} [{}] ${:.4}{}",
-                        &s.id, name_tag, title, s.model, s.session_cost, active
+                        "  …{}{}{} · {}{}${:.3} · {}",
+                        id_short, active_marker, name_tag,
+                        msg_str, age, s.session_cost, s.model
                     )));
+                    // Line 2: title
+                    app.push_msg(ChatMessage::System(format!(
+                        "     └ {}",
+                        title_display
+                    )));
+                    // Blank separator between entries
+                    app.push_msg(ChatMessage::System(String::new()));
                 }
             }
             Err(e) => {
@@ -611,7 +655,8 @@ pub(super) async fn handle_command(
                         runtime.set_model(session.model.clone());
                         // A resumed session owns its saved choice. Preserve that
                         // explicit provenance across later model switches.
-                        restore_session_reasoning(runtime, &session.thinking_level);
+                        let clamp_notice =
+                            restore_session_reasoning(runtime, &session.thinking_level);
                         if let Some(ref sp) = session.system_prompt {
                             runtime.set_system_prompt(sp.clone());
                         }
@@ -626,6 +671,11 @@ pub(super) async fn handle_command(
                         super::rebuild_display_messages(&session.api_messages, app);
                         let new_id = session.id.clone();
                         app.session = session;
+                        if let Some(notice) = clamp_notice {
+                            // Keep the session file in sync with the clamped runtime.
+                            app.session.thinking_level = runtime.thinking_level().to_string();
+                            app.push_msg(ChatMessage::System(notice));
+                        }
                         let via = if synaps_cli::chain::load_chain(arg).is_ok() {
                             format!(" (via chain '{}')", arg)
                         } else if synaps_cli::session::find_session_by_name(arg).is_ok() {
@@ -1207,6 +1257,19 @@ pub(super) fn handle_streaming_command(
         "quit" | "exit" => CommandAction::Quit,
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
     }
+}
+
+/// Notice shown when a model change forced a reasoning-level substitution.
+pub(crate) fn reasoning_clamp_notice(
+    clamp: &synaps_cli::runtime::ReasoningClamp,
+    model: &str,
+) -> String {
+    format!(
+        "thinking → {} (clamped from {}: not supported by {})",
+        clamp.to.as_str(),
+        clamp.from.as_str(),
+        model
+    )
 }
 
 #[cfg(test)]
@@ -2126,5 +2189,20 @@ mod tests {
             agent_core::reasoning::ReasoningLevel::Ultra,
             "restored explicit Ultra must survive model switches"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_clamps_unsupported_saved_level() {
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_model("xai-auth/grok-4.6".to_string());
+
+        let notice = restore_session_reasoning(&mut runtime, "xhigh");
+
+        assert!(notice.is_some(), "clamp must be surfaced");
+        assert_eq!(
+            runtime.reasoning_level(),
+            agent_core::reasoning::ReasoningLevel::High
+        );
+        assert!(runtime.is_reasoning_explicit());
     }
 }

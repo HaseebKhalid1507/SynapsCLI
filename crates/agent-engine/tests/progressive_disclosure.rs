@@ -117,7 +117,7 @@ fn bytes(value: &[Value]) -> Vec<u8> {
 fn progressive_core_is_exact_and_excludes_specialized_sources() {
     let registry = registry_with_dormant(10);
     let set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
-    let projected = registry.session_tools_schema(&set).unwrap();
+    let projected = registry.session_tools_schema(&set).schema;
     let names: Vec<_> = projected
         .iter()
         .filter_map(|schema| schema["name"].as_str())
@@ -160,7 +160,7 @@ fn progressive_core_is_exact_and_excludes_specialized_sources() {
 fn production_core_first_request_fits_documented_budget() {
     let registry = ToolRegistry::new();
     let set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
-    let projected = registry.session_tools_schema(&set).unwrap();
+    let projected = registry.session_tools_schema(&set).schema;
     let names: Vec<_> = projected
         .iter()
         .filter_map(|schema| schema["name"].as_str())
@@ -215,7 +215,7 @@ fn progressive_first_request_bytes_are_invariant_at_catalog_scale() {
     for dormant in [10, 100, 500, 1_000, 2_000] {
         let registry = registry_with_dormant(dormant);
         let set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
-        let projected = registry.session_tools_schema(&set).unwrap();
+        let projected = registry.session_tools_schema(&set).schema;
         let encoded = bytes(&projected);
         let prefix = agent_engine::runtime::trace::diagnostics::tools_prefix_bytes(&projected);
         eprintln!(
@@ -250,7 +250,7 @@ fn progressive_first_request_bytes_are_invariant_at_catalog_scale() {
 fn activation_adds_one_exact_schema_to_progressive_projection() {
     let registry = registry_with_dormant(10);
     let mut set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
-    let before = registry.session_tools_schema(&set).unwrap();
+    let before = registry.session_tools_schema(&set).schema;
 
     activate_exact_for_user(
         &mut set,
@@ -259,7 +259,7 @@ fn activation_adds_one_exact_schema_to_progressive_projection() {
     )
     .unwrap();
 
-    let after = registry.session_tools_schema(&set).unwrap();
+    let after = registry.session_tools_schema(&set).schema;
     assert_eq!(after.len(), before.len() + 1);
     let names: Vec<_> = after
         .iter()
@@ -275,7 +275,7 @@ fn flag_off_full_schema_path_remains_byte_identical() {
     let registry = registry_with_dormant(100);
     let before = bytes(registry.tools_schema().as_ref());
     let full_set = SessionToolSet::default_core_for_catalog(sid(), registry.catalog());
-    let projected_full = registry.session_tools_schema(&full_set).unwrap();
+    let projected_full = registry.session_tools_schema(&full_set).schema;
     let after = bytes(registry.tools_schema().as_ref());
 
     assert_eq!(before, after, "projection mutated the legacy cached schema");

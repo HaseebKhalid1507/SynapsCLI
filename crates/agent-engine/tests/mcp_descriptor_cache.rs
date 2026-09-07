@@ -368,7 +368,7 @@ fn dormant_registration_is_atomic_searchable_and_activation_gated_without_spawn(
     let mut set = SessionToolSet::progressive_core_for_catalog(sid(), registry.catalog());
     let before: Vec<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();
@@ -381,7 +381,7 @@ fn dormant_registration_is_atomic_searchable_and_activation_gated_without_spawn(
     assert_eq!(registry.catalog().generation(), generation_before);
     let after: Vec<String> = registry
         .session_tools_schema(&set)
-        .unwrap()
+        .schema
         .iter()
         .filter_map(|s| s["name"].as_str().map(String::from))
         .collect();

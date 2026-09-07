@@ -1210,6 +1210,37 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     *state.cancel_token.write().await = None;
 }
 
+/// Run an engine command and mirror any model/thinking change into `conv`
+/// atomically with respect to other commands.
+///
+/// Both locks are taken in the file-wide order `runtime` → `conv`, and the
+/// `runtime` guard is held across the `conv` write so a second client's
+/// command can't slip between "runtime mutated" and "conv mirrored" and
+/// leave `conv.session.{model,thinking_level}` stale.
+async fn run_engine_command_synced(
+    name: &str,
+    args: &str,
+    runtime: &Mutex<Runtime>,
+    conv: &RwLock<ConversationState>,
+) -> Option<CommandResult> {
+    let mut rt = runtime.lock().await;
+    let result = engine_commands::handle_engine_command(name, args, &mut rt)?;
+    match &result {
+        CommandResult::ModelChanged { .. } => {
+            let mut conv = conv.write().await;
+            conv.session.model = rt.model().to_string();
+            // Covers the reasoning-clamp case; a no-op otherwise.
+            conv.session.thinking_level = rt.thinking_level().to_string();
+        }
+        CommandResult::ThinkingChanged { spec } => {
+            // Custom budgets persist as the raw number (matches chat.rs).
+            conv.write().await.session.thinking_level = spec.config_value();
+        }
+        _ => {}
+    }
+    Some(result)
+}
+
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     let broadcast = &state.broadcast_tx;
 
@@ -1242,21 +1273,31 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
 
     // Try engine-level command (model with args, thinking with engine-known
     // levels, quit, compact).
-    let engine_result = {
-        let mut rt = state.runtime.lock().await;
-        engine_commands::handle_engine_command(name, args, &mut rt)
-    };
+    //
+    // Lock order in this file is `runtime` → `conv` (see `/clear` below).
+    // The engine result is applied to `conv` while `runtime` is still held
+    // so concurrent clients can't interleave between the runtime mutation
+    // and the conv mirror (runtime → conv is the legal order).
+    let engine_result = run_engine_command_synced(name, args, &state.runtime, &state.conv).await;
 
     if let Some(result) = engine_result {
         match result {
-            CommandResult::ModelChanged { model } => {
-                state.conv.write().await.session.model = model.clone();
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("model set to: {model}"),
-                });
+            CommandResult::ModelChanged {
+                model,
+                reasoning_clamped,
+            } => {
+                let mut message = format!("model set to: {model}");
+                if let Some(clamp) = reasoning_clamped {
+                    message.push_str(&format!(
+                        "; thinking → {} (clamped from {}: not supported by {})",
+                        clamp.to.as_str(),
+                        clamp.from.as_str(),
+                        model
+                    ));
+                }
+                let _ = broadcast.send(ServerMessage::System { message });
             }
             CommandResult::ThinkingChanged { spec } => {
-                state.conv.write().await.session.thinking_level = spec.config_value();
                 let _ = broadcast.send(ServerMessage::System {
                     message: format!("thinking set to: {}", spec.level()),
                 });
@@ -1273,12 +1314,11 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 // T30 (spec §9.2): server compaction routes through the ONE
                 // engine transition with the in-place policy. Snapshot under
                 // brief locks; the LLM round-trip runs with no lock held.
+                // Lock order: `runtime` → `conv` (file-wide invariant).
                 let (msgs, session, rt) = {
+                    let rt = state.runtime.lock().await;
                     let conv = state.conv.read().await;
-                    (conv.api_messages.clone(), conv.session.clone(), {
-                        let rt = state.runtime.lock().await;
-                        rt.clone()
-                    })
+                    (conv.api_messages.clone(), conv.session.clone(), rt.clone())
                 };
                 if msgs.len() < 4 {
                     let _ = broadcast.send(ServerMessage::System {
@@ -1462,4 +1502,72 @@ fn rebuild_history(api_messages: &[synaps_cli::SharedMessage]) -> Vec<HistoryEnt
         }
     }
     history
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synaps_cli::Session;
+
+    /// Two clients hammering `/model` and `/thinking` concurrently must never
+    /// leave `conv.session` out of sync with the live runtime — the mirror
+    /// write happens under the `runtime` lock (runtime → conv).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interleaved_commands_keep_conv_in_sync_with_runtime() {
+        let runtime = Arc::new(Mutex::new(Runtime::new_headless()));
+        let conv = Arc::new(RwLock::new(ConversationState::new(Session::new(
+            "anthropic/claude-fable-5",
+            "medium",
+            None,
+        ))));
+
+        let models = [
+            "anthropic/claude-fable-5",
+            "openrouter/deepseek/deepseek-v4-pro",
+        ];
+        let mut tasks = Vec::new();
+        for i in 0..2 {
+            let runtime = Arc::clone(&runtime);
+            let conv = Arc::clone(&conv);
+            tasks.push(tokio::spawn(async move {
+                for n in 0..50 {
+                    let model = models[(i + n) % 2];
+                    let res = run_engine_command_synced("model", model, &runtime, &conv).await;
+                    assert!(matches!(res, Some(CommandResult::ModelChanged { .. })));
+                    // Check the invariant at an arbitrary point, not just at the end.
+                    let rt = runtime.lock().await;
+                    let c = conv.read().await;
+                    assert_eq!(c.session.model, rt.model());
+                    assert_eq!(c.session.thinking_level, rt.thinking_level());
+                    drop(c);
+                    drop(rt);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let rt = runtime.lock().await;
+        let c = conv.read().await;
+        assert_eq!(c.session.model, rt.model());
+        assert_eq!(c.session.thinking_level, rt.thinking_level());
+    }
+
+    #[tokio::test]
+    async fn thinking_custom_budget_persists_raw_number() {
+        let runtime = Mutex::new(Runtime::new_headless());
+        let conv = RwLock::new(ConversationState::new(Session::new(
+            "anthropic/claude-fable-5",
+            "medium",
+            None,
+        )));
+        let res = run_engine_command_synced("thinking", "high", &runtime, &conv).await;
+        assert!(
+            matches!(res, Some(CommandResult::ThinkingChanged { .. })),
+            "{res:?}"
+        );
+        assert_eq!(conv.read().await.session.thinking_level, "high");
+        assert_eq!(runtime.lock().await.thinking_level(), "high");
+    }
 }

@@ -353,7 +353,7 @@ fn resolve_or_create_session(
 ) -> Result<SessionBootResult> {
     match continue_session {
         Some(ref maybe_id) => {
-            let session = match maybe_id {
+            let mut session = match maybe_id {
                 Some(ref id) => resolve_session(id).map_err(|e| {
                     crate::error::RuntimeError::Tool(format!(
                         "Failed to load session '{}': {}",
@@ -366,15 +366,17 @@ fn resolve_or_create_session(
             };
             runtime.set_model(session.model.clone());
             // Restore the session's named reasoning level so max/ultra/off
-            // and custom budgets survive --continue.
-            if let Some(level) =
-                agent_core::reasoning::ReasoningLevel::parse(&session.thinking_level)
-            {
-                runtime.set_reasoning_level_explicit(level);
-            } else if let Some(budget) =
-                crate::models::budget_for_thinking_level(&session.thinking_level)
-            {
-                runtime.set_thinking_budget_explicit(budget);
+            // and custom budgets survive --continue — then clamp against the
+            // model so old grok+xhigh session files don't resume into a
+            // permanently failing state.
+            if let Some(clamp) = runtime.restore_session_reasoning(&session.thinking_level) {
+                tracing::warn!(
+                    from = %clamp.from,
+                    to = %clamp.to,
+                    model = %session.model,
+                    "saved session thinking level not supported by model; clamped"
+                );
+                session.thinking_level = runtime.thinking_level().to_string();
             }
             if let Some(ref sp) = session.system_prompt {
                 runtime.set_system_prompt(sp.clone());

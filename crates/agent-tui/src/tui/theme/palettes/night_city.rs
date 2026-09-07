@@ -34,6 +34,7 @@ impl Theme {
             border: Color::Rgb(30, 35, 52),
             border_active: CYAN,
             muted: Color::Rgb(74, 82, 104),
+            system_msg: Color::Rgb(140, 150, 185),
 
             // Messages
             user_color: Color::Rgb(220, 228, 242),

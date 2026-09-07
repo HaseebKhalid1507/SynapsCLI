@@ -115,7 +115,7 @@ pub(crate) fn check_heartbeat(agent_dir: &std::path::Path, stale_threshold: u64)
 pub(crate) fn expand_watch_path(p: &str) -> PathBuf {
     if p.starts_with("~/") {
         if let Some(home) = dirs_next() {
-            return home.join(p.strip_prefix("~/").unwrap());
+            return home.join(p.trim_start_matches("~/"));
         }
     }
     PathBuf::from(p)

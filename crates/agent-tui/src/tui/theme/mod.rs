@@ -45,6 +45,7 @@ pub(crate) struct Theme {
     pub(crate) border: Color,
     pub(crate) border_active: Color,
     pub(crate) muted: Color,
+    pub(crate) system_msg: Color,
 
     // Messages
     pub(crate) user_color: Color,
@@ -140,6 +141,7 @@ impl Default for Theme {
             border: Color::Rgb(33, 42, 58),
             border_active: Color::Rgb(54, 190, 210),
             muted: Color::Rgb(62, 73, 90),
+            system_msg: Color::Rgb(140, 160, 180),
 
             user_color: Color::Rgb(185, 195, 215),
             user_bg: Color::Rgb(19, 23, 33),
@@ -280,6 +282,7 @@ impl Theme {
             "border" => self.border = c,
             "border_active" => self.border_active = c,
             "muted" => self.muted = c,
+            "system_msg" => self.system_msg = c,
             "user_color" => self.user_color = c,
             "user_bg" => self.user_bg = c,
             "claude_label" => self.claude_label = c,

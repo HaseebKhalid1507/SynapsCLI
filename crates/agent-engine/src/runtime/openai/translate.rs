@@ -255,6 +255,14 @@ pub fn messages_to_oai(
                                         Some(Value::Array(arr)) => arr
                                             .iter()
                                             .filter_map(|b| {
+                                                if b["type"] == "image" {
+                                                    let mt = b["source"]["media_type"]
+                                                        .as_str()
+                                                        .unwrap_or("image");
+                                                    return Some(format!(
+                                                        "\n[image omitted: {mt} — this provider does not accept images in tool results]"
+                                                    ));
+                                                }
                                                 b.get("text")
                                                     .and_then(|t| t.as_str())
                                                     .map(String::from)
@@ -429,6 +437,31 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_tool_result_degrades_to_text_with_omission_note() {
+        let b64 = "iVBORw0KGgo".repeat(200);
+        let msgs: Vec<crate::SharedMessage> = vec![
+            std::sync::Arc::new(json!({"role":"user","content":"look"})),
+            std::sync::Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"read","input":{"path":"x.png"}}
+            ]})),
+            std::sync::Arc::new(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"text","text":"Image: x"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64}}
+                ]}
+            ]})),
+        ];
+        let out = messages_to_oai(&msgs, &None, &ToolNameMap::default());
+        let tool_msg = out.iter().find(|m| m.role == "tool").expect("tool message");
+        let content = tool_msg.content.as_deref().unwrap();
+        assert_eq!(
+            content,
+            "Image: x\n[image omitted: image/png — this provider does not accept images in tool results]"
+        );
+        assert!(!content.contains("iVBORw0KGgo"));
+    }
 
     /// Regression fixture from session 20260429-235559-094c: the lsrf-manager
     /// extension exposed `managerApi_cloudfrontInvalidate` whose `paths`

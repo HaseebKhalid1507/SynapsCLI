@@ -1084,8 +1084,7 @@ impl TranscriptStore {
                 // Mirrors the User/Text pattern using wrap_text() so all
                 // chat content wraps consistently.
                 let style = Style::default()
-                    .fg(THEME.load().muted)
-                    .add_modifier(Modifier::DIM);
+                    .fg(THEME.load().system_msg);
                 for (src_line, line_off, line) in source_lines(msg) {
                     let prefix_len = m.len() + 2;
                     for row in wrap_text_spans(&format!("{}  {}", m, line), width) {

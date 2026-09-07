@@ -883,14 +883,65 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
     out
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ResponsesStreamFailure {
     code: &'static str,
-    message: &'static str,
+    /// User-facing text built from OUR static templates plus the provider
+    /// display label — never provider free-text.
+    message: String,
 }
 
-#[derive(Default)]
+impl ResponsesStreamFailure {
+    /// Terminal failures that are transient by nature and safe to re-send
+    /// with identical request bytes: provider capacity exhaustion, an empty
+    /// completion, or a stream that ended without any terminal event.
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self.code,
+            "responses_capacity" | "responses_empty" | "responses_missing_terminal"
+        )
+    }
+}
+
+/// Sanitized provider error codes that mean "try again later" on the
+/// Responses wire. Classification-only: the code is matched against this
+/// fixed set, never echoed beyond the local sanitized log line.
+const CAPACITY_ERROR_CODES: &[&str] = &[
+    "rate_limit_exceeded",
+    "server_overloaded",
+    "overloaded",
+    "capacity",
+    "server_error",
+];
+
+/// Fixed substrings that mark a provider free-text error message as a
+/// transient capacity condition (xAI: "The model is currently at capacity
+/// due to high demand. Please try again in a few minutes…"). The message is
+/// consulted ONLY to produce a boolean — it is never logged, stored, or
+/// surfaced (privacy invariant: provider bodies can echo request content).
+const CAPACITY_MESSAGE_PATTERNS: &[&str] = &[
+    "at capacity",
+    "high demand",
+    "try again in a few minutes",
+    "overloaded",
+];
+
+/// Classification-only capacity check. `error_code` is already sanitized;
+/// `message` is raw provider text used solely as a boolean signal.
+fn is_capacity_failure(error_code: &str, message: Option<&str>) -> bool {
+    if CAPACITY_ERROR_CODES.contains(&error_code) {
+        return true;
+    }
+    message.is_some_and(|m| {
+        let lower = m.to_ascii_lowercase();
+        CAPACITY_MESSAGE_PATTERNS.iter().any(|p| lower.contains(p))
+    })
+}
+
 struct CodexSseDecoder {
+    /// Provider display label used in user-facing terminal messages
+    /// ("Codex", "xAI"). Static, ours — never provider-supplied.
+    provider_label: &'static str,
     buffer: String,
     active_tools: Vec<CodexToolAccumulator>,
     completed_tools: Vec<ToolCall>,
@@ -906,6 +957,12 @@ struct CodexSseDecoder {
     /// Trace (Task 10A): provider-reported usage from `response.completed`
     /// (input including cached, output, cached slice). `None` until observed.
     observed_usage: Option<(u64, u64, u64)>,
+}
+
+impl Default for CodexSseDecoder {
+    fn default() -> Self {
+        Self::for_provider("Codex")
+    }
 }
 
 #[derive(Default)]
@@ -966,21 +1023,67 @@ fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     }
 }
 
-/// Map a Codex terminal failure to a user-facing message. Only reacts to the
-/// already-sanitized enum identifiers (`error.type` / `error.code`) — never to
-/// provider free-text — so no request content can leak. Known, user-actionable
-/// conditions get a specific remedy; everything else keeps the neutral,
-/// details-withheld default.
-fn user_message_for_terminal_failure(error_kind: &str, error_code: &str) -> &'static str {
+/// Static message suffixes for Responses terminal failures. The provider
+/// display label is prefixed at construction; `net.rs` classifies on these
+/// label-independent suffixes so every label maps to `ApiStatus`.
+pub(crate) const RESPONSES_FAILED_SUFFIX: &str =
+    " response failed in stream. Provider error details withheld because they can echo request content.";
+pub(crate) const RESPONSES_CONTEXT_SUFFIX: &str = " rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.";
+pub(crate) const RESPONSES_CAPACITY_SUFFIX: &str = " reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model.";
+pub(crate) const RESPONSES_INCOMPLETE_SUFFIX: &str =
+    " response was incomplete. Retry the request or reduce the requested output/context size.";
+pub(crate) const RESPONSES_EMPTY_SUFFIX: &str =
+    " completed without text or tool output. Retry the request.";
+pub(crate) const RESPONSES_MISSING_TERMINAL_SUFFIX: &str =
+    " response stream ended without a terminal event. Retry the request.";
+
+/// Map a Responses terminal failure to a user-facing message. Only reacts to
+/// the already-sanitized enum identifiers (`error.type` / `error.code`) and
+/// the boolean capacity classification — never to provider free-text — so no
+/// request content can leak. Known, user-actionable conditions get a specific
+/// remedy; everything else keeps the neutral, details-withheld default.
+fn user_message_for_terminal_failure(
+    label: &str,
+    error_kind: &str,
+    error_code: &str,
+    capacity: bool,
+) -> String {
     // Context-window overflow is deterministic and user-fixable: the turn
     // cannot succeed until the conversation is smaller.
     if error_code == "context_length_exceeded" || error_kind == "context_length_exceeded" {
-        return "Codex rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.";
+        return format!("{label}{RESPONSES_CONTEXT_SUFFIX}");
     }
-    "Codex response failed in stream. Provider error details withheld because they can echo request content."
+    if capacity {
+        return format!("{label}{RESPONSES_CAPACITY_SUFFIX}");
+    }
+    format!("{label}{RESPONSES_FAILED_SUFFIX}")
 }
 
 impl CodexSseDecoder {
+    /// Decoder whose user-facing messages name `label` as the provider.
+    fn for_provider(label: &'static str) -> Self {
+        Self {
+            provider_label: label,
+            buffer: String::new(),
+            active_tools: Vec::new(),
+            completed_tools: Vec::new(),
+            saw_model_event: false,
+            terminal_success: false,
+            terminal_failure: None,
+            emitted_output: false,
+            observed_usage: None,
+        }
+    }
+
+    /// True once anything was streamed to the UI for this attempt (text
+    /// deltas, tool starts, or completed tools). A retry after this point
+    /// would duplicate output, so callers must treat the failure as terminal.
+    fn emitted_any_output(&self) -> bool {
+        self.emitted_output
+            || !self.completed_tools.is_empty()
+            || self.active_tools.iter().any(|tool| tool.started)
+    }
+
     fn push_line(
         &mut self,
         line: &str,
@@ -1099,10 +1202,17 @@ impl CodexSseDecoder {
                 // identifiers (`type` / `code`) after sanitizing them down to a
                 // short identifier charset. The free-text `message` field is
                 // never logged or surfaced — it can echo request content.
+                //
+                // Two envelope shapes are accepted: the nested Responses form
+                // (`response.error.{type,code,message}` / `error.{…}`) and
+                // xAI's flat form (`{"type":"error","code":…,"message":…}`)
+                // where the event's own `type` is just "error", so only the
+                // top-level `code` is a meaningful identifier there.
                 let error_obj = event
                     .get("response")
                     .and_then(|r| r.get("error"))
-                    .or_else(|| event.get("error"));
+                    .or_else(|| event.get("error"))
+                    .filter(|e| e.is_object());
                 let error_kind = sanitize_error_identifier(
                     error_obj
                         .and_then(|e| e.get("type"))
@@ -1111,17 +1221,38 @@ impl CodexSseDecoder {
                 let error_code = sanitize_error_identifier(
                     error_obj
                         .and_then(|e| e.get("code"))
+                        .or_else(|| event.get("code"))
+                        .and_then(Value::as_str),
+                );
+                // Provider free-text: classification-only boolean, never
+                // retained past this expression.
+                let capacity = is_capacity_failure(
+                    error_code,
+                    error_obj
+                        .and_then(|e| e.get("message"))
+                        .or_else(|| event.get("message"))
                         .and_then(Value::as_str),
                 );
                 tracing::warn!(
+                    provider = self.provider_label,
                     event_type,
                     error_kind,
                     error_code,
-                    "codex stream terminal failure (provider message withheld)"
+                    capacity,
+                    "responses stream terminal failure (provider message withheld)"
                 );
                 self.terminal_failure = Some(ResponsesStreamFailure {
-                    code: "responses_failed",
-                    message: user_message_for_terminal_failure(error_kind, error_code),
+                    code: if capacity {
+                        "responses_capacity"
+                    } else {
+                        "responses_failed"
+                    },
+                    message: user_message_for_terminal_failure(
+                        self.provider_label,
+                        error_kind,
+                        error_code,
+                        capacity,
+                    ),
                 });
                 self.finish();
             }
@@ -1134,10 +1265,14 @@ impl CodexSseDecoder {
                         .and_then(|d| d.get("reason"))
                         .and_then(Value::as_str),
                 );
-                tracing::warn!(reason, "codex stream terminal incomplete");
+                tracing::warn!(
+                    provider = self.provider_label,
+                    reason,
+                    "responses stream terminal incomplete"
+                );
                 self.terminal_failure = Some(ResponsesStreamFailure {
                     code: "responses_incomplete",
-                    message: "Codex response was incomplete. Retry the request or reduce the requested output/context size.",
+                    message: format!("{}{RESPONSES_INCOMPLETE_SUFFIX}", self.provider_label),
                 });
                 self.finish();
             }
@@ -1150,8 +1285,8 @@ impl CodexSseDecoder {
     }
 
     fn terminal_result(&self) -> Result<(), ResponsesStreamFailure> {
-        if let Some(failure) = self.terminal_failure {
-            return Err(failure);
+        if let Some(failure) = &self.terminal_failure {
+            return Err(failure.clone());
         }
         if self.terminal_success {
             if self.emitted_output || !self.completed_tools.is_empty() {
@@ -1159,13 +1294,13 @@ impl CodexSseDecoder {
             } else {
                 Err(ResponsesStreamFailure {
                     code: "responses_empty",
-                    message: "Codex completed without text or tool output. Retry the request.",
+                    message: format!("{}{RESPONSES_EMPTY_SUFFIX}", self.provider_label),
                 })
             }
         } else {
             Err(ResponsesStreamFailure {
                 code: "responses_missing_terminal",
-                message: "Codex response stream ended without a terminal event. Retry the request.",
+                message: format!("{}{RESPONSES_MISSING_TERMINAL_SUFFIX}", self.provider_label),
             })
         }
     }
@@ -1886,19 +2021,133 @@ mod codex_decoder_tests {
     #[test]
     fn terminal_failure_user_message_is_specific_only_for_known_codes() {
         assert!(user_message_for_terminal_failure(
+            "Codex",
             "invalid_request_error",
-            "context_length_exceeded"
+            "context_length_exceeded",
+            false
         )
         .contains("/compact"));
         // Code carried on `type` rather than `code` still maps.
-        assert!(
-            user_message_for_terminal_failure("context_length_exceeded", "absent")
-                .contains("context window")
-        );
+        assert!(user_message_for_terminal_failure(
+            "Codex",
+            "context_length_exceeded",
+            "absent",
+            false
+        )
+        .contains("context window"));
         // Unknown/other codes keep the neutral default (no remedy claim).
-        let default = user_message_for_terminal_failure("server_error", "unlisted_identifier");
+        let default = user_message_for_terminal_failure(
+            "Codex",
+            "server_error",
+            "unlisted_identifier",
+            false,
+        );
         assert!(default.starts_with("Codex response failed in stream."));
         assert!(!default.contains("/compact"));
+        // Capacity gets the specific remedy, labelled for the provider.
+        let capacity = user_message_for_terminal_failure("xAI", "absent", "absent", true);
+        assert_eq!(
+            capacity,
+            "xAI reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model."
+        );
+    }
+
+    /// The exact flat envelope xAI emits (HTTP 200, one SSE event, close):
+    /// no nested `error` object, `code` null, free-text `message`. It must
+    /// classify as retryable capacity — labelled for the provider, and the
+    /// provider prose must never reach the surfaced message.
+    #[test]
+    fn xai_flat_capacity_error_is_retryable_capacity_failure() {
+        let lines = [
+            r#"data: {"sequence_number":0,"type":"error","code":null,"message":"The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing: https://docs.x.ai/developers/advanced-api-usage/priority-processing","param":null}"#,
+            "",
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut decoder = CodexSseDecoder::for_provider("xAI");
+        let mut text = String::new();
+        for line in lines {
+            decoder.push_line(line, &tx, &mut text);
+        }
+        decoder.finish();
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_capacity");
+        assert!(failure.is_retryable());
+        assert_eq!(
+            failure.message,
+            "xAI reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model."
+        );
+        for banned in ["high demand", "docs.x.ai", "service tier", "Codex"] {
+            assert!(
+                !failure.message.contains(banned),
+                "provider text `{banned}` leaked: {}",
+                failure.message
+            );
+        }
+        assert!(text.is_empty());
+        assert!(!decoder.emitted_any_output());
+        assert!(rx.try_recv().is_err(), "no events for an error-only stream");
+    }
+
+    /// Flat `code` identifiers are honoured when no nested error object is
+    /// present; only vetted codes classify as capacity.
+    #[test]
+    fn flat_code_classifies_capacity_only_for_vetted_codes() {
+        let capacity = [
+            r#"data: {"type":"error","code":"rate_limit_exceeded","message":"private"}"#,
+            "",
+        ];
+        let (decoder, _, _) = drive(&capacity);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_capacity");
+        assert!(failure.is_retryable());
+
+        let other = [
+            r#"data: {"type":"error","code":"invalid_api_key","message":"private"}"#,
+            "",
+        ];
+        let (decoder, _, _) = drive(&other);
+        let failure = decoder.terminal_result().expect_err("must fail");
+        assert_eq!(failure.code, "responses_failed");
+        assert!(!failure.is_retryable());
+        assert!(!failure.message.contains("private"));
+    }
+
+    #[test]
+    fn provider_label_is_carried_into_every_terminal_message() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut text = String::new();
+        let mut decoder = CodexSseDecoder::for_provider("xAI");
+        decoder.push_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            &tx,
+            &mut text,
+        );
+        decoder.push_line("", &tx, &mut text);
+        let failure = decoder.terminal_result().expect_err("empty");
+        assert_eq!(failure.code, "responses_empty");
+        assert!(failure.is_retryable());
+        assert_eq!(
+            failure.message,
+            "xAI completed without text or tool output. Retry the request."
+        );
+
+        let decoder = CodexSseDecoder::for_provider("xAI");
+        let failure = decoder.terminal_result().expect_err("missing terminal");
+        assert_eq!(failure.code, "responses_missing_terminal");
+        assert!(failure.is_retryable());
+        assert!(failure.message.starts_with("xAI response stream ended"));
+
+        let mut decoder = CodexSseDecoder::for_provider("xAI");
+        decoder.push_line(
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            &tx,
+            &mut text,
+        );
+        decoder.push_line("", &tx, &mut text);
+        let failure = decoder.terminal_result().expect_err("incomplete");
+        assert_eq!(failure.code, "responses_incomplete");
+        assert!(!failure.is_retryable());
+        assert!(failure.message.starts_with("xAI response was incomplete."));
     }
 
     #[test]
@@ -2209,6 +2458,9 @@ mod broker_stream_tests {
     }
 }
 
+/// Provider display label for the xai-auth Responses route.
+const XAI_PROVIDER_LABEL: &str = "xAI";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_responses_stream_inner(
     cfg: &ProviderConfig,
@@ -2220,6 +2472,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
     max_tokens: Option<u32>,
     reasoning_level: agent_core::reasoning::ReasoningLevel,
     cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -2250,7 +2503,9 @@ pub(crate) async fn call_xai_responses_stream_inner(
     // the very bytes the broker sends upstream (`body_bytes` handoff,
     // LocalBroker verbatim) — `body`/`body_bytes` cannot diverge. On a
     // remote broker the daemon re-serializes out of process → honest
-    // `CloudProxy` kind and no wire-byte claim.
+    // `CloudProxy` kind and no wire-byte claim. Every retry clones this
+    // same request (identical `body` and `body_bytes`), so one wire digest
+    // is honest for all attempt records.
     let (proxy_request, body_bytes) =
         crate::auth::ProxyRequest::post_json_exact("xai-auth", "/responses", body, true)?;
     let tracer = tr::begin_openai_tracer(
@@ -2279,80 +2534,115 @@ pub(crate) async fn call_xai_responses_stream_inner(
         trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
-    let stream = broker
-        .proxy_stream(proxy_request)
-        .await
-        // Privacy (spec §5.1): a broker proxy error may carry an upstream
-        // response-body snippet; redact it to status-only before surfacing.
-        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
-    let mut stream = match stream {
-        Ok(stream) => {
-            attempt.mark_headers();
-            stream
-        }
-        Err(msg) => {
-            let status = tr::broker_error_status(&msg);
-            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
-            attempt.finish_failed(&code, status, None);
-            return Err(msg.into());
-        }
-    };
-    let mut text = String::new();
-    let mut parser = CodexSseDecoder::default();
-    let mut buf = bytes::BytesMut::new();
-    while let Some(chunk) = tokio::select! {
-        c = stream.next() => c,
-        _ = cancel.cancelled() => {
-            attempt.finish_canceled(None, parser.trace_usage());
-            return Err("request canceled".into());
-        }
-    } {
-        let chunk = match chunk {
-            Ok(chunk) => {
-                attempt.mark_first_byte();
-                chunk
+    let mut stream_retry = 0u32;
+
+    loop {
+        let stream = broker
+            .proxy_stream(proxy_request.clone())
+            .await
+            // Privacy (spec §5.1): a broker proxy error may carry an upstream
+            // response-body snippet; redact it to status-only before surfacing.
+            .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+        let mut stream = match stream {
+            Ok(stream) => {
+                attempt.mark_headers();
+                stream
             }
-            Err(e) => {
-                attempt.finish_failed("stream_error", None, None);
-                return Err(e.into());
+            Err(msg) => {
+                let status = tr::broker_error_status(&msg);
+                let code =
+                    status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+                attempt.finish_failed(&code, status, None);
+                return Err(msg.into());
             }
         };
-        buf.extend_from_slice(&chunk);
-        while let Some(n) = memchr::memchr(b'\n', &buf) {
-            let line = buf.split_to(n + 1);
-            parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
+        let mut text = String::new();
+        let mut parser = CodexSseDecoder::for_provider(XAI_PROVIDER_LABEL);
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = tokio::select! {
+            c = stream.next() => c,
+            _ = cancel.cancelled() => {
+                attempt.finish_canceled(None, parser.trace_usage());
+                return Err("request canceled".into());
+            }
+        } {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    attempt.mark_first_byte();
+                    chunk
+                }
+                Err(e) => {
+                    attempt.finish_failed("stream_error", None, None);
+                    return Err(e.into());
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(n) = memchr::memchr(b'\n', &buf) {
+                let line = buf.split_to(n + 1);
+                parser.push_line(std::str::from_utf8(&line[..n]).unwrap_or(""), tx, &mut text);
+            }
+            if parser.saw_model_event {
+                attempt.mark_first_model_event();
+            }
         }
+        if !buf.is_empty() {
+            parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
+        }
+        parser.finish();
+        // Trailing-buffer flush and finish() can surface the first (or only)
+        // model event; mark it so first_model_event_ms is honest for tail-only
+        // streams (mirrors the Codex direct path above).
         if parser.saw_model_event {
             attempt.mark_first_model_event();
         }
+        // Broker paths never observe the upstream HTTP status; the Responses
+        // stream does not yet expose a normalized stop reason — both stay
+        // honest `None` rather than guessed values.
+        if let Err(failure) = parser.terminal_result() {
+            // xAI answers HTTP 200 + a lone `{"type":"error",…}` capacity
+            // event while the model is saturated; a re-send seconds later
+            // usually succeeds. Retry only when NOTHING reached the UI on
+            // this attempt — text or tool events already streamed would be
+            // emitted twice on a re-send, so those failures stay terminal.
+            let output_already_streamed = !text.is_empty() || parser.emitted_any_output();
+            if failure.is_retryable() && !output_already_streamed && stream_retry < max_retries {
+                stream_retry += 1;
+                let delay = retry_delay(stream_retry);
+                attempt.attempt_failed(
+                    crate::runtime::trace::RetryClass::Other,
+                    delay,
+                    None,
+                    None,
+                    failure.code,
+                );
+                tracing::warn!(
+                    code = failure.code,
+                    "xai stream retry {stream_retry}/{max_retries} after {delay:?}"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => {
+                        attempt.finish_canceled(None, None);
+                        return Err("request canceled".into());
+                    }
+                }
+                attempt.restart_clock();
+                continue;
+            }
+            attempt.finish_failed(failure.code, None, None);
+            return Err(failure.message.into());
+        }
+        attempt.finish_success(None, None, None, parser.trace_usage());
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type":"text","text":text}));
+        }
+        content.extend(translate::tool_calls_to_content_blocks(
+            &parser.completed_tools,
+            &names,
+        ));
+        return Ok(json!({"role":"assistant","content":content}));
     }
-    if !buf.is_empty() {
-        parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
-    }
-    parser.finish();
-    // Trailing-buffer flush and finish() can surface the first (or only)
-    // model event; mark it so first_model_event_ms is honest for tail-only
-    // streams (mirrors the Codex direct path above).
-    if parser.saw_model_event {
-        attempt.mark_first_model_event();
-    }
-    // Broker paths never observe the upstream HTTP status; the Responses
-    // stream does not yet expose a normalized stop reason — both stay
-    // honest `None` rather than guessed values.
-    if let Err(failure) = parser.terminal_result() {
-        attempt.finish_failed(failure.code, None, None);
-        return Err(failure.message.into());
-    }
-    attempt.finish_success(None, None, None, parser.trace_usage());
-    let mut content = Vec::new();
-    if !text.is_empty() {
-        content.push(json!({"type":"text","text":text}));
-    }
-    content.extend(translate::tool_calls_to_content_blocks(
-        &parser.completed_tools,
-        &names,
-    ));
-    Ok(json!({"role":"assistant","content":content}))
 }
 
 /// Pure, validated body construction for the xAI Responses API.
@@ -2519,6 +2809,243 @@ mod xai_tests {
         assert!(body.get("input").is_some());
         assert!(body.get("messages").is_none());
         assert!(body.get("max_output_tokens").is_none());
+    }
+}
+
+#[cfg(test)]
+mod xai_capacity_retry_tests {
+    //! Regression tests for the xai-auth Responses route: xAI answers HTTP
+    //! 200 + a lone flat `{"type":"error",…}` capacity event while the model
+    //! is saturated (reproduced live: grok-4.6 failed 3 of 4 turns, a re-send
+    //! seconds later succeeded). The route must retry with identical request
+    //! bytes, label its messages "xAI" (not "Codex"), and never surface the
+    //! provider prose. A scripted fake broker serves the SSE bodies directly
+    //! through `proxy_stream` — no HTTP server involved.
+
+    use super::*;
+    use agent_core::auth::{
+        AccessToken, BrokerError, ProxyByteStream, ProxyRequest, ProxyResponse,
+    };
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    /// The exact envelope observed on the wire (flat: `type` is the event
+    /// type, `code` null, `message` top-level, no nested `error` object).
+    const XAI_CAPACITY_SSE: &str = "data: {\"sequence_number\":0,\"type\":\"error\",\"code\":null,\"message\":\"The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing: https://docs.x.ai/developers/advanced-api-usage/priority-processing\",\"param\":null}\n\n";
+
+    const XAI_SUCCESS_SSE: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"GROK_OK\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n",
+    );
+
+    /// Serves `bodies[n]` for the n-th `proxy_stream` call (the last body
+    /// repeats once exhausted) and records every request body it saw.
+    struct ScriptedXaiBroker {
+        bodies: Vec<&'static str>,
+        calls: Arc<AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<ProxyRequest>>>,
+    }
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for ScriptedXaiBroker {
+        async fn access_token(
+            &self,
+            _p: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            Err(BrokerError::Denied(
+                "xai route must use proxy_stream".into(),
+            ))
+        }
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn proxy_stream(
+            &self,
+            request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            request.validate()?;
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(request);
+            let body = self.bodies[n.min(self.bodies.len() - 1)];
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                bytes::Bytes::from(body),
+            )])))
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    struct Run {
+        result: Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+        calls: usize,
+        seen: Vec<ProxyRequest>,
+        events: Vec<StreamEvent>,
+    }
+
+    async fn run_xai(bodies: Vec<&'static str>, max_retries: u32) -> Run {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(ScriptedXaiBroker {
+            bodies,
+            calls: Arc::clone(&calls),
+            seen: Arc::clone(&seen),
+        });
+        let cfg = ProviderConfig {
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "grok-4.5".to_string(),
+            provider: "xai-auth".to_string(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = call_xai_responses_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &Some("system".to_string()),
+            &[],
+            &tx,
+            None,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &tokio_util::sync::CancellationToken::new(),
+            max_retries,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        Run {
+            result,
+            calls: calls.load(Ordering::SeqCst),
+            seen,
+            events,
+        }
+    }
+
+    fn text_events(events: &[StreamEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xai_capacity_error_is_retried_with_identical_bytes_then_succeeds() {
+        let run = run_xai(vec![XAI_CAPACITY_SSE, XAI_SUCCESS_SSE], 3).await;
+        let value = run.result.expect("second attempt must succeed");
+        assert_eq!(value["content"][0]["text"], "GROK_OK");
+        assert_eq!(run.calls, 2, "exactly one retry");
+        assert_eq!(run.seen.len(), 2);
+        assert_eq!(
+            run.seen[0].body_bytes, run.seen[1].body_bytes,
+            "retry must re-send the identical serialized body"
+        );
+        assert_eq!(run.seen[0].body, run.seen[1].body);
+        assert_eq!(run.seen[0].provider, "xai-auth");
+        assert_eq!(run.seen[0].path, "/responses");
+        // No output was streamed twice: the failed attempt emitted nothing.
+        assert_eq!(text_events(&run.events), vec!["GROK_OK".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xai_capacity_error_with_zero_retries_surfaces_xai_capacity_message() {
+        let run = run_xai(vec![XAI_CAPACITY_SSE], 0).await;
+        let err = run.result.expect_err("no retry budget → terminal");
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            "xAI reports the model is at capacity (retries exhausted). Try again in a few minutes or switch models with /model."
+        );
+        assert_eq!(run.calls, 1);
+        for banned in ["Codex", "high demand", "docs.x.ai", "service tier"] {
+            assert!(!msg.contains(banned), "`{banned}` leaked: {msg}");
+        }
+        // And the runtime classifies it as an API failure, not a config one.
+        assert!(matches!(
+            super::super::net::provider_error_to_runtime(err),
+            crate::RuntimeError::ApiStatus(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xai_capacity_error_exhausting_budget_counts_every_attempt() {
+        let run = run_xai(vec![XAI_CAPACITY_SSE], 2).await;
+        let err = run.result.expect_err("persistent capacity → terminal");
+        assert!(err
+            .to_string()
+            .starts_with("xAI reports the model is at capacity"));
+        assert_eq!(run.calls, 3, "initial attempt + 2 retries");
+        assert!(text_events(&run.events).is_empty());
+    }
+
+    /// If the failed attempt already streamed text, a re-send would duplicate
+    /// it in the UI — the failure must stay terminal even with budget left.
+    #[tokio::test(start_paused = true)]
+    async fn xai_does_not_retry_after_partial_text_was_streamed() {
+        const PARTIAL_THEN_ERROR: &str = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"error\",\"code\":null,\"message\":\"at capacity\"}\n\n",
+        );
+        let run = run_xai(vec![PARTIAL_THEN_ERROR, XAI_SUCCESS_SSE], 3).await;
+        let err = run.result.expect_err("must not retry after partial output");
+        assert!(err
+            .to_string()
+            .starts_with("xAI reports the model is at capacity"));
+        assert_eq!(run.calls, 1, "no retry once output reached the UI");
+        assert_eq!(text_events(&run.events), vec!["partial".to_string()]);
+    }
+
+    /// Same guard for tool events: a started tool call must not be replayed.
+    #[tokio::test(start_paused = true)]
+    async fn xai_does_not_retry_after_tool_events_were_emitted() {
+        const TOOL_THEN_EOF: &str = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\"}}\n\n";
+        let run = run_xai(vec![TOOL_THEN_EOF, XAI_SUCCESS_SSE], 3).await;
+        // EOF without a terminal event is itself retryable
+        // (`responses_missing_terminal`) — but the ToolUseStart already
+        // reached the UI, so the guard must keep it terminal.
+        let err = run
+            .result
+            .expect_err("missing terminal after a tool event stays terminal");
+        assert!(
+            err.to_string()
+                .starts_with("xAI response stream ended without a terminal event."),
+            "got: {err}"
+        );
+        assert_eq!(run.calls, 1, "no retry once a tool event reached the UI");
+        assert!(run.events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Llm(crate::runtime::types::LlmEvent::ToolUseStart { .. })
+        )));
+    }
+
+    /// Deterministic (non-capacity) failures are terminal on the first try
+    /// and keep the neutral, xAI-labelled, details-withheld message.
+    #[tokio::test(start_paused = true)]
+    async fn xai_non_capacity_error_is_terminal_and_labelled_xai() {
+        const OTHER_ERROR: &str = "data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"ECHOED:secret prompt\"}\n\n";
+        let run = run_xai(vec![OTHER_ERROR, XAI_SUCCESS_SSE], 3).await;
+        let err = run.result.expect_err("must fail");
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            "xAI response failed in stream. Provider error details withheld because they can echo request content."
+        );
+        assert!(!msg.contains("ECHOED"));
+        assert_eq!(run.calls, 1);
     }
 }
 
@@ -2895,7 +3422,7 @@ mod codex_wire_tests {
         );
         let includes = body.get("include").expect("include must be present");
         assert!(
-            includes.as_array().map_or(false, |a| {
+            includes.as_array().is_some_and(|a| {
                 a.iter()
                     .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
             }),

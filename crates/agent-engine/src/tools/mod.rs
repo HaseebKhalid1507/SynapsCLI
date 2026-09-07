@@ -53,7 +53,7 @@ pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
-pub use registry::ToolRegistry;
+pub use registry::{DroppedSessionMember, SessionSchemaProjection, ToolRegistry};
 pub use respond::RespondTool;
 pub use secret_prompt::SecretPromptQueue;
 pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
@@ -181,6 +181,59 @@ pub enum ConcurrencyKey {
     Serialize,
 }
 
+/// Structured tool output. `Text` is the legacy contract (what `execute`
+/// returns). `Blocks` carries Anthropic-shaped content blocks destined for
+/// `tool_result.content`, plus a plain-text `summary` used everywhere a
+/// `String` is expected today: UI preview, `after_tool_call` hooks, trace
+/// ledger byte counts, headless logs, and providers that cannot carry the
+/// blocks. INVARIANT: `blocks[0]` MUST be a `{"type":"text"}` block whose
+/// `text` == `summary` (compaction reads `blocks[0].text`; non-Anthropic
+/// translators join only text sub-blocks).
+#[derive(Debug, Clone)]
+pub enum ToolOutput {
+    Text(String),
+    Blocks { blocks: Vec<Value>, summary: String },
+}
+
+impl ToolOutput {
+    pub fn summary(&self) -> &str {
+        match self {
+            Self::Text(s) => s,
+            Self::Blocks { summary, .. } => summary,
+        }
+    }
+
+    /// `(summary, Some(blocks))` for rich output, `(text, None)` for plain.
+    /// This is the one choke point every rich result passes through, so the
+    /// `blocks[0]` text-first invariant is ENFORCED here in every build: a
+    /// `Blocks` value whose first block is not `{"type":"text"}` gets a text
+    /// block built from `summary` prepended. Debug builds additionally
+    /// assert that an existing leading text block matches `summary`.
+    pub fn into_parts(self) -> (String, Option<Vec<Value>>) {
+        match self {
+            Self::Text(s) => (s, None),
+            Self::Blocks {
+                mut blocks,
+                summary,
+            } => {
+                let text_first = blocks.first().is_some_and(|b| b["type"] == "text");
+                if !text_first {
+                    blocks.insert(0, serde_json::json!({"type": "text", "text": summary}));
+                }
+                debug_assert!(
+                    blocks[0]["text"] == summary,
+                    "ToolOutput::Blocks invariant: blocks[0] text must equal summary"
+                );
+                (summary, Some(blocks))
+            }
+        }
+    }
+
+    pub fn into_summary(self) -> String {
+        self.into_parts().0
+    }
+}
+
 /// The core trait for all tools. Implement this to add a new tool.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -195,6 +248,18 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given parameters.
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
+
+    /// Structured variant of [`Tool::execute`]. DEFAULTED — existing tools
+    /// keep returning `String` via `execute` and never see this. Tools that
+    /// need to place non-text content blocks (images) into the model history
+    /// override this and make `execute` delegate to it.
+    ///
+    /// RECURSION TRAP: the default delegates to `execute`. If you make
+    /// `execute` delegate here (as `ReadTool` does) you MUST override this
+    /// method too, or the pair recurses until the stack blows.
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        self.execute(params, ctx).await.map(ToolOutput::Text)
+    }
 
     /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
     fn extension_id(&self) -> Option<&str> {
@@ -231,3 +296,48 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 mod test_helpers;
+
+#[cfg(test)]
+mod tool_output_tests {
+    use super::ToolOutput;
+    use serde_json::json;
+
+    #[test]
+    fn into_parts_prepends_summary_text_when_blocks_not_text_first() {
+        let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+        let out = ToolOutput::Blocks {
+            blocks: vec![img.clone()],
+            summary: "[image 1x1]".into(),
+        };
+        let (summary, blocks) = out.into_parts();
+        let blocks = blocks.unwrap();
+        assert_eq!(summary, "[image 1x1]");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], json!({"type": "text", "text": "[image 1x1]"}));
+        assert_eq!(blocks[1], img);
+    }
+
+    #[test]
+    fn into_parts_prepends_summary_text_when_blocks_empty() {
+        let out = ToolOutput::Blocks {
+            blocks: vec![],
+            summary: "s".into(),
+        };
+        let (_, blocks) = out.into_parts();
+        assert_eq!(blocks.unwrap(), vec![json!({"type": "text", "text": "s"})]);
+    }
+
+    #[test]
+    fn into_parts_leaves_well_formed_blocks_alone() {
+        let blocks = vec![
+            json!({"type": "text", "text": "ok"}),
+            json!({"type": "image"}),
+        ];
+        let out = ToolOutput::Blocks {
+            blocks: blocks.clone(),
+            summary: "ok".into(),
+        };
+        let (_, got) = out.into_parts();
+        assert_eq!(got.unwrap(), blocks);
+    }
+}
