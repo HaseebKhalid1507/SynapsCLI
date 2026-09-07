@@ -48,6 +48,12 @@ pub fn parse_frame(line: &str, max_bytes: usize) -> Result<RpcCommand, RpcEvent>
 /// [`RpcState`].
 pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
     match ev {
+        StreamEvent::Llm(LlmEvent::ResponseStart) => Some(RpcEvent::MessageUpdate {
+            event: AssistantEvent::ResponseStart,
+        }),
+        StreamEvent::Llm(LlmEvent::ResponseReset) => Some(RpcEvent::MessageUpdate {
+            event: AssistantEvent::ResponseReset,
+        }),
         StreamEvent::Llm(LlmEvent::Thinking(s)) => Some(RpcEvent::MessageUpdate {
             event: AssistantEvent::ThinkingDelta { delta: s.clone() },
         }),
@@ -173,8 +179,10 @@ pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
 
 /// Build the user message string to push into `api_messages`.
 ///
-/// When attachments are present (v0) a human-readable note listing the file
-/// paths is prepended.  File bytes are **not** read — Task 10 handles that.
+/// Legacy display-only path hint formatter. This is NOT an upload API.
+/// The RPC ingress uses `agent_engine::attachments::build_user_content` to
+/// validate/read local files and embed actual blocks; retain this pure helper
+/// for compatibility with consumers that only need a textual reference.
 fn quote_path(p: &str) -> String {
     let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")

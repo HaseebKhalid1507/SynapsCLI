@@ -340,6 +340,13 @@ impl ProjectScope {
         let canonical = root
             .canonicalize()
             .map_err(|e| MemoryError::InvalidProjectRoot(format!("{}: {e}", root.display())))?;
+        Ok(Self::for_canonical_root(canonical))
+    }
+
+    // Internal seam for historical, already-verified canonical paths retained
+    // in the private repository marker. Unlike for_root this does not re-resolve
+    // an old path that may have moved or been reused by another repository.
+    pub(super) fn for_canonical_root(canonical: PathBuf) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_os_str().as_encoded_bytes());
@@ -350,10 +357,56 @@ impl ProjectScope {
             use std::fmt::Write;
             let _ = write!(key, "{byte:02x}");
         }
-        Ok(Self {
+        Self {
             key,
             root: canonical,
-        })
+        }
+    }
+
+    /// Construct an explicit user-wide scope at a canonical host base path.
+    /// This is the ONLY constructor accepting the reserved all-zero key.
+    /// Never derive this scope from model-authored project arguments.
+    pub fn user_scope(root: &Path) -> Result<Self, MemoryError> {
+        let mut scope = Self::for_root(root)?;
+        scope.require_directory()?;
+        scope.key = "p0000000000000000".into();
+        Ok(scope)
+    }
+
+    /// Restore a host-verified key (e.g. an operator migration manifest).
+    /// Syntax validation is NOT authorization: callers must establish the key's
+    /// trusted provenance, never accept a model-supplied key as a scope grant.
+    /// Accepts exactly `p[0-9a-f]{16}`, excluding the user-wide reserved key.
+    pub fn from_key(root: &Path, key: &str) -> Result<Self, MemoryError> {
+        Self::validate_repository_key(key)?;
+        let mut scope = Self::for_root(root)?;
+        scope.require_directory()?;
+        scope.key = key.to_owned();
+        Ok(scope)
+    }
+
+    fn require_directory(&self) -> Result<(), MemoryError> {
+        if !self.root.is_dir() {
+            return Err(MemoryError::InvalidProjectRoot(
+                "host scope root must be a directory".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_repository_key(key: &str) -> Result<(), MemoryError> {
+        if key.len() != 17
+            || !key.starts_with('p')
+            || !key.as_bytes()[1..]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            || key == "p0000000000000000"
+        {
+            return Err(MemoryError::InvalidProjectRoot(
+                "invalid or reserved repository scope key".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Stable scope key (`p<16 hex>`).

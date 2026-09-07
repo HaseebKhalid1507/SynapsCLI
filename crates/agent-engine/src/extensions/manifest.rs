@@ -271,6 +271,7 @@ impl ExtensionManifest {
                     | "config.subscribe"
                     | "audio.input"
                     | "audio.output"
+                    | "session.drive"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {

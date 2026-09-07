@@ -34,8 +34,14 @@ pub(crate) struct App {
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
     /// soft-wrap render pipeline.
     pub(crate) editor: tui_textarea::TextArea<'static>,
+    pub(crate) response_preview: Option<(usize, Option<ChatMessage>)>,
     pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
+    /// Captured local bytes awaiting an explicit, idle user submission. Never
+    /// place these in the string-only steering/compaction queues.
+    pub(crate) pending_attachments: agent_engine::attachments::PendingAttachments,
     pub(crate) streaming: bool,
+    /// Ephemeral, explicitly authorized local driver. Never serialized.
+    pub(crate) session_driver: super::session_driver::SessionDriver,
     /// `api_messages.len()` at active-turn start. Failure repair may only
     /// remove messages appended at or after this index (spec §5.2).
     pub(crate) turn_baseline: usize,
@@ -72,6 +78,7 @@ pub(crate) struct App {
     api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
+    pub(crate) context_head: synaps_cli::engine::session::ContextHeadPersistence,
     pub(crate) agent_name: String,
     pub(crate) needs_redraw: bool,
     /// When set, the next repaint bypasses the streaming redraw throttle.
@@ -175,6 +182,9 @@ pub(crate) struct App {
     /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
     /// multiple plugin-claimed sidecars can be hosted concurrently.
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
+    /// Owned background startups; dropping one aborts its task and child.
+    pub(crate) sidecar_starts: std::collections::HashMap<String, super::sidecar::SidecarStartup>,
+    pub(crate) sidecars_disabled: bool,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     /// Stored behind `Arc` so the per-frame snapshot is a refcount bump, not a deep clone.
     pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
@@ -272,7 +282,10 @@ impl App {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
             api_messages: Vec::new(),
+            response_preview: None,
+            pending_attachments: Default::default(),
             streaming: false,
+            session_driver: Default::default(),
             turn_baseline: 0,
             input_history: Vec::new(),
             history_index: None,
@@ -293,6 +306,7 @@ impl App {
             api_call_count: 0,
             session_cost: 0.0,
             session,
+            context_head: Default::default(),
             agent_name: synaps_cli::config::load_config()
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
@@ -338,6 +352,8 @@ impl App {
             model_list_rx: model_list_rx_init,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
+            sidecar_starts: std::collections::HashMap::new(),
+            sidecars_disabled: false,
             active_tasks: std::sync::Arc::new(
                 synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             ),
@@ -356,6 +372,34 @@ impl App {
             clock,
         }
     }
+    /// Append one explicit user submission atomically with respect to attachment
+    /// validation. Rejections retain both captured bytes and abort context.
+    pub(crate) fn append_user_submission(
+        &mut self,
+        model: &str,
+        input: &str,
+    ) -> Result<(), String> {
+        if !self.pending_attachments.is_empty() && (self.streaming || self.compact_task.is_some()) {
+            return Err("attachments require idle submission — wait for streaming/compaction to finish; pending attachments retained".into());
+        }
+        let text = if let Some(ctx) = &self.abort_context {
+            format!("{}\n\n{}", ctx, input)
+        } else {
+            input.to_string()
+        };
+        let content = self.pending_attachments.build_content(&text);
+        let message = std::sync::Arc::new(serde_json::json!({"role": "user", "content": content}));
+        if !self.pending_attachments.is_empty() {
+            let mut proposed = self.api_messages.clone();
+            proposed.push(message.clone());
+            synaps_cli::runtime::attachments::validate_messages(model, &proposed)?;
+        }
+        self.api_messages.push(message);
+        self.pending_attachments.clear();
+        self.abort_context = None;
+        Ok(())
+    }
+
     /// Build the text shown in the chat transcript for a submitted user message.
     /// Large pasted payloads are collapsed to a label, while any text typed before
     /// or after the pasted range remains visible.
@@ -458,7 +502,7 @@ impl App {
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
     ///
     pub(crate) async fn save_session(&mut self) {
-        if self.api_messages.is_empty() {
+        if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
             return;
         }
         self.session.api_messages = self.api_messages.clone();
@@ -471,6 +515,95 @@ impl App {
         if let Err(e) = self.session.save().await {
             eprintln!("\x1b[31m[ERROR] Failed to save session: {}\x1b[0m", e);
         }
+    }
+
+    /// A visible post-rename head does not prove directory fsync succeeded.
+    /// Re-read and publish under one ordered writer lock before clearing either
+    /// latch: the name-resolution snapshot may predate a detached writer.
+    pub(crate) async fn recover_reloaded_context_head(
+        &mut self,
+        runtime: &synaps_cli::Runtime,
+        session_id: &str,
+    ) -> std::io::Result<()> {
+        self.recover_reloaded_context_head_with(runtime, session_id, |id| async move {
+            Session::recover_durable(&id).await
+        })
+        .await
+    }
+
+    async fn recover_reloaded_context_head_with<F, Fut>(
+        &mut self,
+        runtime: &synaps_cli::Runtime,
+        session_id: &str,
+        recover: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Session>>,
+    {
+        if self.streaming {
+            return Err(std::io::Error::other(
+                "cannot recover while streaming — wait for the stream to stop, then /resume",
+            ));
+        }
+        if !self.pending_attachments.is_empty() {
+            return Err(std::io::Error::other(
+                "pending attachments retained — submit or /detach before /resume",
+            ));
+        }
+        if session_id != self.session.id
+            && (self.queued_message.is_some() || !self.pending_events.is_empty())
+        {
+            return Err(std::io::Error::other(
+                "cannot resume a different session while deferred work is pending — queued message and pending events retained; /resume the same session first",
+            ));
+        }
+        let session = recover(session_id.to_owned()).await?;
+        if session.id != session_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "recovered context head does not match the requested session",
+            ));
+        }
+        runtime.reset_context_continuation(&session.id, &session.api_messages);
+        self.adopt_reloaded_context_head(session);
+        Ok(())
+    }
+
+    /// Called only after the loaded head has been durably re-saved.
+    fn adopt_reloaded_context_head(&mut self, session: Session) {
+        super::session_driver::revoke(self, "session replaced");
+        self.api_messages = session.api_messages.clone();
+        self.total_input_tokens = session.total_input_tokens;
+        self.total_output_tokens = session.total_output_tokens;
+        self.session_cost = session.session_cost;
+        self.abort_context = session.abort_context.clone();
+        self.session = session;
+        self.context_head = Default::default();
+    }
+
+    /// Context checkpoints replace messages, not host-owned session metadata.
+    pub(crate) async fn persist_context_head(
+        &mut self,
+        session_id: &str,
+        messages: Vec<synaps_cli::SharedMessage>,
+    ) -> std::io::Result<()> {
+        let mut candidate = self.session.clone();
+        candidate.api_messages = messages;
+        candidate.total_input_tokens = self.total_input_tokens;
+        candidate.total_output_tokens = self.total_output_tokens;
+        candidate.session_cost = self.session_cost;
+        candidate.abort_context = self.abort_context.clone();
+        candidate.updated_at = chrono::Utc::now();
+        candidate.auto_title();
+        self.context_head
+            .persist(
+                &mut self.session,
+                &mut self.api_messages,
+                session_id,
+                candidate,
+            )
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -941,6 +1074,64 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Session::new("test-model", "low", None))
+    }
+
+    #[tokio::test]
+    async fn attachments_survive_rejected_submit_and_consume_only_on_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "captured original").unwrap();
+        let mut app = test_app();
+        app.pending_attachments
+            .add(
+                agent_engine::attachments::load_attachment(&path)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        app.abort_context = Some("interrupted work".into());
+        app.streaming = true;
+        assert!(app
+            .append_user_submission("claude-sonnet-4-5", "question")
+            .is_err());
+        app.streaming = false;
+        assert!(app
+            .append_user_submission("google-gemini/test", "question")
+            .is_err());
+        assert!(app.api_messages.is_empty());
+        assert_eq!(app.pending_attachments.len(), 1);
+        assert_eq!(app.abort_context.as_deref(), Some("interrupted work"));
+        // Preflight must inspect old history too, not just the new candidate.
+        let invalid_history = std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://invalid.test/image"}}]
+        }));
+        app.api_messages.push(invalid_history.clone());
+        assert!(app
+            .append_user_submission("claude-sonnet-4-5", "question")
+            .is_err());
+        assert_eq!(app.api_messages, vec![invalid_history]);
+        assert_eq!(app.pending_attachments.len(), 1);
+        app.api_messages.clear();
+        app.append_user_submission("claude-sonnet-4-5", "question")
+            .unwrap();
+        assert_eq!(
+            app.api_messages[0]["content"][0]["text"],
+            "interrupted work\n\nquestion"
+        );
+        assert_eq!(
+            app.api_messages[0]["content"][1]["source"]["data"],
+            "captured original"
+        );
+        assert!(app.pending_attachments.is_empty());
+        assert!(app.abort_context.is_none());
+    }
+
+    #[test]
+    fn text_only_submission_keeps_string_shape() {
+        let mut app = test_app();
+        app.append_user_submission("test-model", "hello").unwrap();
+        assert_eq!(app.api_messages[0]["content"], "hello");
     }
 
     #[test]
@@ -2226,5 +2417,195 @@ mod tests {
             app.myx_last_live.is_none(),
             "the last-good cache must not survive switch-away"
         );
+    }
+}
+
+#[cfg(test)]
+mod context_head_tests {
+    use super::*;
+
+    async fn blocked_app() -> App {
+        let mut session = Session::new("synthetic", "medium", Some("synthetic host prompt"));
+        session.id = "synthetic-recovery".into();
+        session.api_messages = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": "synthetic old head"
+        }))];
+        let mut app = App::new(session.clone());
+        app.api_messages = session.api_messages;
+        // Identity rejection latches without touching any host session files.
+        assert!(app
+            .persist_context_head("wrong-id", Vec::new())
+            .await
+            .is_err());
+        app
+    }
+
+    #[tokio::test]
+    async fn context_head_recovery_failed_or_dropped_resave_keeps_latch_and_state() {
+        let mut app = blocked_app().await;
+        let runtime = synaps_cli::Runtime::new_headless();
+        let old = app.session.clone();
+        let mut loaded = old.clone();
+        loaded.api_messages = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": "synthetic visible post-rename head"
+        }))];
+        app.queued_message = Some("synthetic queued work".into());
+        app.pending_events = vec!["synthetic event".into()];
+        let started = std::cell::Cell::new(false);
+        {
+            let recovery =
+                app.recover_reloaded_context_head_with(&runtime, &loaded.id, |_| async {
+                    started.set(true);
+                    std::future::pending::<std::io::Result<Session>>().await
+                });
+            tokio::pin!(recovery);
+            assert!(futures::poll!(recovery.as_mut()).is_pending());
+            assert!(started.get());
+        }
+        assert!(app.context_head.is_blocked(&app.session));
+        assert_eq!(app.api_messages, old.api_messages);
+        let error = app
+            .recover_reloaded_context_head_with(&runtime, &loaded.id, |_| async {
+                Err(std::io::Error::other("synthetic directory fsync failure"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "synthetic directory fsync failure");
+        assert!(app.context_head.is_blocked(&app.session));
+        assert_eq!(app.api_messages, old.api_messages);
+        assert_eq!(app.session.api_messages, old.api_messages);
+        assert_eq!(app.queued_message.as_deref(), Some("synthetic queued work"));
+        assert_eq!(app.pending_events, ["synthetic event"]);
+    }
+
+    #[tokio::test]
+    async fn context_head_recovery_refuses_streaming_and_cross_id_deferred_work() {
+        let mut app = blocked_app().await;
+        let runtime = synaps_cli::Runtime::new_headless();
+        let old = app.session.clone();
+        app.streaming = true;
+        let error = app
+            .recover_reloaded_context_head_with(&runtime, &old.id, |_| async {
+                panic!("streaming must not save")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("while streaming"));
+        assert!(app.context_head.is_blocked(&app.session));
+        app.streaming = false;
+        let mut other = old.clone();
+        other.id = "synthetic-other-session".into();
+        for (queued, events) in [
+            (Some("synthetic queued".to_string()), vec![]),
+            (None, vec!["synthetic pending".to_string()]),
+            (
+                Some("synthetic queued".to_string()),
+                vec!["synthetic pending".to_string()],
+            ),
+        ] {
+            app.queued_message = queued.clone();
+            app.pending_events = events.clone();
+            let error = app
+                .recover_reloaded_context_head_with(&runtime, &other.id, |_| async {
+                    panic!("cross-ID deferred work must not save")
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("different session"));
+            assert!(error.to_string().contains("retained"));
+            assert!(app.context_head.is_blocked(&app.session));
+            assert_eq!(app.session.id, old.id);
+            assert_eq!(app.api_messages, old.api_messages);
+            assert_eq!(app.queued_message, queued);
+            assert_eq!(app.pending_events, events);
+        }
+    }
+
+    #[tokio::test]
+    async fn context_head_recovery_durable_success_allows_same_id_deferred_work() {
+        let mut app = blocked_app().await;
+        let runtime = synaps_cli::Runtime::new_headless();
+        app.queued_message = Some("synthetic queued".into());
+        app.pending_events = vec!["synthetic pending".into()];
+        let mut loaded = app.session.clone();
+        loaded.total_input_tokens = 42;
+        loaded.api_messages = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": "synthetic loaded head"
+        }))];
+        let dir = tempfile::tempdir().unwrap();
+        let expected = loaded.api_messages.clone();
+        // The initial name resolution exposed the old snapshot. The recovery
+        // closure returns a newer head, as if a detached writer finished first.
+        let resolved = app.session.clone();
+        app.recover_reloaded_context_head_with(&runtime, &resolved.id, |id| {
+            let candidate = loaded.clone();
+            let dir = dir.path();
+            async move {
+                assert_eq!(id, candidate.id);
+                assert_eq!(candidate.api_messages, expected);
+                agent_core::core::session_journal::save_session_durable_in_dir(
+                    dir,
+                    &candidate,
+                    agent_core::core::session_journal::SessionPersistence::default(),
+                )?;
+                Ok(candidate)
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!app.context_head.is_blocked(&app.session));
+        assert_eq!(app.api_messages, loaded.api_messages);
+        assert_eq!(app.total_input_tokens, 42);
+        assert_eq!(app.session.system_prompt, loaded.system_prompt);
+        assert_eq!(app.queued_message.as_deref(), Some("synthetic queued"));
+        assert_eq!(app.pending_events, ["synthetic pending"]);
+        assert_eq!(
+            Session::load_from_dir(dir.path(), &loaded.id)
+                .unwrap()
+                .api_messages,
+            loaded.api_messages
+        );
+
+        // Cross-ID recovery is permitted once no work could leak to it.
+        app.queued_message = None;
+        app.pending_events.clear();
+        let mut other = loaded;
+        other.id = "synthetic-other-session".into();
+        app.recover_reloaded_context_head_with(&runtime, &other.id, |_| async {
+            Ok(other.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.session.id, other.id);
+    }
+
+    #[tokio::test]
+    async fn context_head_rejected_checkpoint_blocks_save_until_authoritative_reload() {
+        let mut session = Session::new("synthetic", "medium", Some("host-only"));
+        session.id = "synthetic-tui-context-head".into();
+        session.api_messages = vec![std::sync::Arc::new(serde_json::json!({
+            "role":"user", "content":"authoritative old head"
+        }))];
+        let mut app = App::new(session.clone());
+        app.api_messages = session.api_messages.clone();
+        let result = app.persist_context_head("wrong-session", Vec::new()).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(app.context_head.is_blocked(&app.session));
+        assert_eq!(app.api_messages, session.api_messages);
+        app.api_messages
+            .push(std::sync::Arc::new(serde_json::json!({
+                "role":"user", "content":"must not be saved on quit"
+            })));
+        app.save_session().await; // blocked: no host filesystem access
+        assert_eq!(app.session.api_messages, session.api_messages);
+        let runtime = synaps_cli::Runtime::new_headless();
+        app.recover_reloaded_context_head_with(&runtime, &session.id, |_| async {
+            Ok(session.clone())
+        })
+        .await
+        .unwrap();
+        assert!(!app.context_head.is_blocked(&app.session));
+        assert_eq!(app.api_messages, session.api_messages);
+        assert_eq!(app.session.system_prompt, session.system_prompt);
     }
 }

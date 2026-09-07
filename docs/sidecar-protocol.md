@@ -35,7 +35,7 @@ The host also sends the version in the `init` command payload.
 
 ### `init`
 
-Sent immediately after process spawn.
+Sent after the sidecar’s versioned Hello is accepted.
 
 ```json
 {"type":"init","config":{"protocol_version":2}}
@@ -66,13 +66,21 @@ Requests graceful termination.
 
 ### `hello`
 
-Initial readiness frame.
+Initial protocol-readiness frame, emitted before the host sends Init.
 
 ```json
-{"type":"hello","capabilities":["insert-text","status"]}
+{"type":"hello","protocol_version":2,"extension":"example","capabilities":["insert-text","status"]}
 ```
 
-`capabilities` is a free-form string list. Core does not enumerate or interpret plugin-specific capabilities.
+`capabilities` is a free-form string list. The optional host capability
+`ready_after_init` opts into a stronger initialization contract: after processing
+Init and completing model/device loading, the sidecar emits exactly
+`{"type":"status","state":"ready"}`. It must not emit this acknowledgment before
+Init. Generic `status`, or an `idle`/`stopped` status, does not make that promise.
+The TUI keeps such a sidecar loading until that acknowledgment; error, exit, or
+timeout fails startup instead of activating it. Without this capability,
+Hello plus a successful Init write remains the legacy protocol-ready boundary;
+it is not a guarantee that plugin-specific initialization has finished.
 
 ### `status`
 
@@ -120,3 +128,32 @@ Core does not interpret `event_type` or `payload`.
 ## Compatibility notes
 
 Protocol v2 intentionally has no modality-specific command, frame, capability, or state names. Plugins may expose modality-specific UX through their own lifecycle claim, command names, help text, settings, and internal implementation, but core sidecar protocol fields remain generic.
+
+## Non-blocking TUI startup and activation
+
+Extension discovery/loading already runs in the background after terminal setup.
+Sidecar processes remain on-demand: no prewarming of disabled/deferred plugins
+or automatic device activation. The first explicit toggle starts an owned
+background task for plugin bootstrap RPC and the sidecar handshake. It returns
+immediately with “still loading — try the toggle again when ready”. Repeated
+toggles/status requests do not wait, create duplicate processes, or queue a press.
+Completion leaves the sidecar **unarmed** and reports “ready — toggle to activate”.
+
+The UI uses the cached, disable-filtered plugin registry instead of rediscovering
+plugins on every toggle/status. Extension commands/settings reads do not wait on
+an extension loader’s manager lock; they report loading/busy and can be retried.
+Sidecar startup has a 30-second overall deadline, including the bootstrap lock/RPC
+and optional readiness acknowledgment. Hello is bounded to 10 seconds and each
+command write to 2 seconds. A partial failed/timed-out/cancelled write closes the
+input pipe rather than permitting a corrupt-frame retry.
+
+Failures clear loading state for retry. Plugin disable/removal/reload cancels
+ineligible pending startups and drops live instances. Shutdown aborts owned
+startup tasks and drops children; a late completion cannot resurrect a removed
+plugin. Queued lifecycle state is checked again before publishing readiness or
+sending a trigger.
+
+This removes sidecar startup waits from the input loop. It does not eliminate
+other pre-render work such as session loading, filesystem discovery, repository
+identity checks, or terminal negotiation. Changes take effect in a newly built
+Synaps process; an already-running executable is not hot-patched.

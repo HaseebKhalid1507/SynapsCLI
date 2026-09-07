@@ -751,6 +751,9 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
+    /// Immutable host binding for extension-provider interior tool execution.
+    /// `None` is only for internal/test callers without a runtime capability.
+    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Prompt-cache TTL strategy (spec: cache-ttl). Default `FiveMinutes`
@@ -907,6 +910,19 @@ pub(super) async fn begin_anthropic_tracer(
     tracer
 }
 
+/// Cancellation-first wait for request preparation, dispatch and retry delays.
+/// The future is not polled when cancellation is already observable.
+pub(super) async fn await_or_cancel<F: std::future::Future>(
+    cancel: &CancellationToken,
+    future: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(RuntimeError::Canceled),
+        output = future => Ok(output),
+    }
+}
+
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
@@ -965,6 +981,13 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
+        // Do not route, resolve credentials or prepare a request for a revoked turn.
+        if cancel.is_cancelled() {
+            return Err(RuntimeError::Canceled);
+        }
+        super::attachments::validate_messages(model, messages).map_err(RuntimeError::Config)?;
+        let wire_messages = super::continuation::wire_messages(messages);
+        let messages = wire_messages.as_deref().unwrap_or(messages);
         // One provider-neutral schema source for every transport. The opt-in
         // progressive path supplies a per-round session projection; flag-off
         // keeps cloning the registry's existing cached Arc byte-for-byte.
@@ -978,6 +1001,9 @@ impl ApiMethods {
         let (cloud_model, cloud_context) = crate::auth::cloud::split_model_route(model);
         if let Some((provider_key, _)) = cloud_model.split_once('/') {
             if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
+                if cancel.is_cancelled() {
+                    return Err(RuntimeError::Canceled);
+                }
                 return crate::runtime::cloud_invoke::cloud_invoke_stream(
                     provider,
                     model,
@@ -1001,7 +1027,10 @@ impl ApiMethods {
             }
         }
         // Route to OpenAI-compat provider if the model id resolves to one.
-        if let Some(result) = crate::runtime::openai::try_route(
+        if cancel.is_cancelled() {
+            return Err(RuntimeError::Canceled);
+        }
+        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
             client,
             &tools_schema,
@@ -1019,6 +1048,7 @@ impl ApiMethods {
             options.codex_request_role,
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
+            options.memory_backend.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )
@@ -1057,7 +1087,7 @@ impl ApiMethods {
 
         // Read auth state for this API call
         let (mut auth_header_name, mut auth_header_value, auth_type) =
-            Self::build_auth_header(auth).await;
+            await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
         // C1: allow a single on-401 token refetch+retry for Remote clients.
         let mut auth_retried = false;
 
@@ -1163,19 +1193,22 @@ impl ApiMethods {
         // ═══ TRACE (Task 8): one record per actual attempt ════════════════════
         // Emission rule documented in `trace::emit`. Tracing is metadata-only
         // and can never fail or delay the request.
-        let mut tracer = begin_anthropic_tracer(
-            options,
-            &anthropic_url,
-            model,
-            &body_bytes,
-            &cleaned_messages,
-            system_prompt.as_deref(),
-            &tools_schema,
-            has_tool_marker,
-            has_system_marker,
-            &translation_report,
+        let mut tracer = await_or_cancel(
+            cancel,
+            begin_anthropic_tracer(
+                options,
+                &anthropic_url,
+                model,
+                &body_bytes,
+                &cleaned_messages,
+                system_prompt.as_deref(),
+                &tools_schema,
+                has_tool_marker,
+                has_system_marker,
+                &translation_report,
+            ),
         )
-        .await;
+        .await?;
         // Placeholder value: every send re-starts the clock immediately
         // before handing bytes to reqwest (per-attempt timing).
         #[allow(unused_assignments)]
@@ -1219,8 +1252,13 @@ impl ApiMethods {
                         req = req.header("anthropic-beta", beta);
                     }
 
+                    // Every attempt (including 401/refusal retries) rechecks at
+                    // the dispatch boundary, not merely at the round's start.
+                    if cancel.is_cancelled() {
+                        return Err(RuntimeError::Canceled);
+                    }
                     clock = crate::runtime::trace::AttemptClock::start();
-                    match req.body(body_bytes.clone()).send().await {
+                    match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
                         Ok(resp) => {
                             let status = resp.status();
                             if status.is_success() {
@@ -1250,21 +1288,25 @@ impl ApiMethods {
                                         "http_401",
                                     );
                                 }
-                                let _ = resp.text().await; // drain body
+                                let _ = await_or_cancel(cancel, resp.text()).await?; // drain body
                                 options.token_cache.invalidate("anthropic");
                                 {
-                                    let mut g = auth.write().await;
+                                    let mut g = await_or_cancel(cancel, auth.write()).await?;
                                     g.auth_token.clear();
                                     g.token_expires = None;
                                 }
-                                super::auth::AuthMethods::refresh_if_needed(
-                                    std::sync::Arc::clone(auth),
-                                    client,
-                                    &options.credential_source,
-                                    &options.token_cache,
+                                await_or_cancel(
+                                    cancel,
+                                    super::auth::AuthMethods::refresh_if_needed(
+                                        std::sync::Arc::clone(auth),
+                                        client,
+                                        &options.credential_source,
+                                        &options.token_cache,
+                                    ),
                                 )
-                                .await?;
-                                let (n, v, _t) = Self::build_auth_header(auth).await;
+                                .await??;
+                                let (n, v, _t) =
+                                    await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
                                 auth_header_name = n;
                                 auth_header_value = v;
                                 continue;
@@ -1285,7 +1327,9 @@ impl ApiMethods {
 
                             clock.mark_headers();
                             let trace_rid = provider_request_id_from_headers(resp.headers());
-                            let error_text = resp.text().await.unwrap_or_default();
+                            let error_text = await_or_cancel(cancel, resp.text())
+                                .await?
+                                .unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
                             let retry_exhausted = if is_429 {
@@ -1369,7 +1413,7 @@ impl ApiMethods {
                                 );
                             }
 
-                            tokio::time::sleep(delay).await;
+                            await_or_cancel(cancel, tokio::time::sleep(delay)).await?;
 
                             if cancel.is_cancelled() {
                                 return Err(RuntimeError::Canceled);
@@ -1413,7 +1457,7 @@ impl ApiMethods {
                                     "network",
                                 );
                             }
-                            tokio::time::sleep(delay).await;
+                            await_or_cancel(cancel, tokio::time::sleep(delay)).await?;
                             if cancel.is_cancelled() {
                                 return Err(RuntimeError::Canceled);
                             }
@@ -1463,6 +1507,9 @@ impl ApiMethods {
             let mut stream = response.bytes_stream();
             tracing::debug!("Stream opened");
 
+            if !options.suppress_stream_deltas {
+                let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseStart));
+            }
             let mut state = ParseState::new();
             let ctx = EventCtx {
                 tx: &tx,
@@ -1481,7 +1528,9 @@ impl ApiMethods {
             // borrowed from the buffer, parsed in place (REVIEW.md P2).
             let mut line_buffer = super::sse::SseLineBuffer::new();
 
-            while let Some(chunk) = stream.next().await {
+            // Cancellation exits through the normal finalization below: partial
+            // content, residual Usage and attempt telemetry must not be dropped.
+            while let Ok(Some(chunk)) = await_or_cancel(cancel, stream.next()).await {
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -1496,6 +1545,9 @@ impl ApiMethods {
                         c
                     }
                     Err(e) => {
+                        if state.stop_reason_seen || state.stream_error.is_some() {
+                            break;
+                        }
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
                             error_type: None,
@@ -1714,7 +1766,10 @@ impl ApiMethods {
                             stream_error_code,
                         );
                     }
-                    tokio::time::sleep(delay).await;
+                    if !options.suppress_stream_deltas {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseReset));
+                    }
+                    await_or_cancel(cancel, tokio::time::sleep(delay)).await?;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
                     }
@@ -1773,7 +1828,10 @@ impl ApiMethods {
                             "refusal",
                         );
                     }
-                    tokio::time::sleep(delay).await;
+                    if !options.suppress_stream_deltas {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseReset));
+                    }
+                    await_or_cancel(cancel, tokio::time::sleep(delay)).await?;
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
                     }
@@ -3915,5 +3973,250 @@ mod cloud_capability_tests {
             hits, 0,
             "cloud pre-flight must reject tools before any credential or network use"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use axum::{body::Body, http::Response, routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_auth() -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: "offline-test-key".into(),
+            auth_type: "api_key".into(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+        }))
+    }
+
+    async fn call(
+        auth: &Arc<RwLock<AuthState>>,
+        cancel: &CancellationToken,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        options: &ApiOptions,
+    ) -> Result<Value> {
+        ApiMethods::call_api_stream_inner(
+            auth,
+            &Client::builder().no_proxy().build().unwrap(),
+            "claude-haiku-4-5-20251001",
+            &ToolRegistry::new(),
+            &None,
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &[Arc::new(json!({"role":"user", "content":"offline test"}))],
+            tx,
+            cancel,
+            3,
+            1,
+            options,
+            TelemetryLevel::Off,
+        )
+        .await
+    }
+
+    #[derive(Clone, Copy)]
+    enum Stall {
+        Headers,
+        ErrorBody,
+        Retry,
+        Sse,
+    }
+
+    /// Loopback only, no credentials/config/environment changes. All streams
+    /// deliberately stay open so cancellation, not EOF/client timeout, wins.
+    async fn stalled_server(
+        stall: Stall,
+    ) -> (
+        ApiOptions,
+        Arc<AtomicUsize>,
+        mpsc::UnboundedReceiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let (seen, rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let hits = counter.clone();
+                let seen = seen.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = seen.send(());
+                    if matches!(stall, Stall::Headers) {
+                        return std::future::pending::<Response<Body>>().await;
+                    }
+                    if matches!(stall, Stall::Retry) {
+                        return Response::builder()
+                            .status(429)
+                            .header("retry-after", "60")
+                            .body(Body::from("{}"))
+                            .unwrap();
+                    }
+                    let prefix = if matches!(stall, Stall::Sse) {
+                        concat!(
+                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"offline\",",
+                            "\"usage\":{\"input_tokens\":12,\"output_tokens\":1,",
+                            "\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}}}\n\n",
+                            "data: {\"type\":\"content_block_start\",\"index\":0,",
+                            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                            "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                        )
+                    } else {
+                        "{"
+                    };
+                    let chunks = futures::stream::once(async move {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(prefix.as_bytes()))
+                    })
+                    .chain(futures::stream::pending());
+                    Response::builder()
+                        .status(if matches!(stall, Stall::Sse) { 200 } else { 500 })
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            rx,
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_call_never_waits_for_auth_or_dispatches() {
+        let auth = test_auth();
+        let _held = auth.write().await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            call(&auth, &cancel, tx, &ApiOptions::default()),
+        )
+        .await
+        .expect("pre-cancel must not wait for auth");
+        assert!(matches!(result, Err(RuntimeError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_auth_lock_before_dispatch() {
+        let auth = test_auth();
+        let _held = auth.write().await;
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let options = ApiOptions::default();
+        let call = call(&auth, &cancel, tx, &options);
+        tokio::pin!(call);
+        assert!(futures::poll!(&mut call).is_pending());
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancel must release the auth wait");
+        assert!(matches!(result, Err(RuntimeError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_send_and_error_body_waits() {
+        for stall in [Stall::Headers, Stall::ErrorBody] {
+            let (options, hits, mut seen, server) = stalled_server(stall).await;
+            let auth = test_auth();
+            let cancel = CancellationToken::new();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let (result, ()) = tokio::join!(call(&auth, &cancel, tx, &options), async {
+                    seen.recv().await.unwrap();
+                    // Allow the error headers to reach the client in ErrorBody mode.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    cancel.cancel();
+                });
+                result
+            })
+            .await;
+            server.abort();
+            assert!(matches!(
+                result.expect("cancel must not wait for response"),
+                Err(RuntimeError::Canceled)
+            ));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_after_without_second_dispatch() {
+        let (options, hits, _seen, server) = stalled_server(Stall::Retry).await;
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(call(&auth, &cancel, tx, &options), async {
+                while let Some(event) = rx.recv().await {
+                    if matches!(event, StreamEvent::Session(SessionEvent::Notice(_))) {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                panic!("expected retry notice");
+            });
+            result
+        })
+        .await;
+        server.abort();
+        assert!(matches!(
+            result.expect("cancel must interrupt retry-after"),
+            Err(RuntimeError::Canceled)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stalled_sse_preserves_partial_content_and_residual_usage_once() {
+        let (mut options, hits, _seen, server) = stalled_server(Stall::Sse).await;
+        let counters = Arc::new(crate::runtime::budget::UsageCounters::default());
+        options.usage_counters = Some(counters.clone());
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                let mut usage_events = 0;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        StreamEvent::Llm(LlmEvent::Text(text)) => {
+                            assert_eq!(text, "partial");
+                            cancel.cancel();
+                        }
+                        StreamEvent::Session(SessionEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            ..
+                        }) => {
+                            assert_eq!((input_tokens, output_tokens), (12, 1));
+                            usage_events += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                usage_events
+            })
+        })
+        .await;
+        server.abort();
+        let (response, usage_events) = result.expect("cancel must finish a stalled SSE stream");
+        assert_eq!(response.unwrap()["content"][0]["text"], "partial");
+        assert_eq!(usage_events, 1);
+        assert_eq!(counters.totals(), (12, 1, 5, 3));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

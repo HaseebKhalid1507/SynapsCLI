@@ -109,6 +109,7 @@ pub(crate) async fn run_setup(
     } else {
         App::new_with_clock(boot.session, clock::TuiClock::real())
     };
+    app.sidecars_disabled = boot.no_extensions;
     app.keybinds = Some(keybind_registry.clone());
     app.last_turn_context_window = runtime.context_window();
 

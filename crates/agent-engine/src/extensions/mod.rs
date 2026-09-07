@@ -32,6 +32,7 @@ pub mod manifest;
 pub mod permissions;
 pub mod providers;
 pub mod runtime;
+pub mod session_driver;
 pub mod settings_editor;
 pub mod tasks;
 pub mod trust;

@@ -21,7 +21,7 @@ use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
-use synaps_cli::{truncate_str, CancellationToken, Runtime};
+use synaps_cli::{truncate_str, CancellationToken, Runtime, SessionEvent, StreamEvent};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Shared server state
@@ -35,6 +35,7 @@ struct ServerState {
     /// engine pricing and silently dropped cache tokens.
     conv: RwLock<ConversationState>,
     display_history: RwLock<Vec<HistoryEntry>>,
+    response_preview: tokio::sync::Mutex<Option<(usize, Option<HistoryEntry>)>>,
     streaming: std::sync::atomic::AtomicBool,
     cancel_token: RwLock<Option<CancellationToken>>,
     /// Broadcast channel — server events go to ALL connected clients
@@ -121,35 +122,26 @@ impl ServerState {
         );
     }
 
-    /// Save the conversation to disk.
-    ///
-    /// Reproduces ConversationState::save inline so we can release the
-    /// `conv` write-lock BEFORE the slow `Session::save().await`
-    /// (atomic file rename). Holding the conv lock across that I/O
-    /// would block every other state read — particularly the stream
-    /// loop's `process_stream_event` write — for the duration of the
-    /// disk write.
+    /// Serialize all frontend saves with checkpoint publication under the
+    /// conversation lock. A detached stale snapshot must never finish after a
+    /// durable replacement. Ordinary saves still use Session::save unchanged.
     async fn save_session(&self) {
-        let session_to_save = {
-            let mut conv = self.conv.write().await;
-            if conv.api_messages.is_empty() {
-                return;
-            }
-            // Mirror ConversationState::save body — sync conv state into
-            // the embedded session struct.
-            conv.session.api_messages = conv.api_messages.clone();
-            conv.session.total_input_tokens = conv.total_input_tokens;
-            conv.session.total_output_tokens = conv.total_output_tokens;
-            conv.session.session_cost = conv.session_cost;
-            conv.session.abort_context = conv.abort_context.clone();
-            conv.session.updated_at = chrono::Utc::now();
-            conv.session.auto_title();
-            // Clone the session out so we can save it without holding the lock.
-            conv.session.clone()
-        }; // conv write-lock released here
-        if let Err(e) = session_to_save.save().await {
-            tracing::error!("Failed to save session: {}", e);
-        }
+        self.conv.write().await.save().await;
+    }
+
+    async fn persist_context_head(
+        &self,
+        session_id: &str,
+        messages: Vec<synaps_cli::SharedMessage>,
+        receipt: synaps_cli::core::context_head::ContextHeadReceipt,
+    ) -> usize {
+        // Identity validation, candidate construction, durable write and state
+        // adoption are atomic with respect to other frontend state mutations.
+        let mut conv = self.conv.write().await;
+        let result = conv.persist_context_head(session_id, messages).await;
+        let baseline = conv.api_messages.len();
+        receipt.complete(result);
+        baseline
     }
 
     async fn push_history(&self, entry: HistoryEntry) {
@@ -282,6 +274,7 @@ pub async fn run(
         runtime: Mutex::new(runtime),
         conv: RwLock::new(conv),
         display_history: RwLock::new(initial_history),
+        response_preview: tokio::sync::Mutex::new(None),
         streaming: std::sync::atomic::AtomicBool::new(false),
         cancel_token: RwLock::new(None),
         broadcast_tx,
@@ -337,7 +330,8 @@ pub async fn run(
                         &drained,
                         &conv_ref.api_messages,
                         busy,
-                        state_d.events_auto_turn,
+                        state_d.events_auto_turn
+                            && !conv_ref.context_head.is_blocked(&conv_ref.session),
                         consecutive,
                     )
                 }; // conv write-lock released
@@ -765,11 +759,20 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     // no follow-up turn — the next real user message would ship malformed
     // history to the API.
     'turn: loop {
+        {
+            let conv = state.conv.read().await;
+            if conv.context_head.is_blocked(&conv.session) {
+                let _ = broadcast.send(ServerMessage::Error {
+                    message: "context head is unverified — restart/resume before continuing".into(),
+                });
+                break 'turn;
+            }
+        }
         // Snapshot messages and set up a fresh cancel token for this turn.
         // Vec<SharedMessage> clone = pointer bumps only.
         let messages: Vec<synaps_cli::SharedMessage> = state.conv.read().await.api_messages.clone();
         // Failure repair may only remove messages appended by this turn.
-        let turn_baseline = messages.len();
+        let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -781,6 +784,17 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
         // Inner loop — process events from this turn's stream.
         while let Some(event) = stream.next().await {
+            if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                session_id,
+                messages,
+                receipt,
+            }) = event
+            {
+                turn_baseline = state
+                    .persist_context_head(&session_id, messages, receipt)
+                    .await;
+                continue;
+            }
             let ts = ServerState::timestamp();
 
             // process_stream_event mutates conv fields in place. Hold the
@@ -789,6 +803,12 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
+                if conv.context_head.is_blocked(&conv.session) {
+                    if matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_))) {
+                        continue;
+                    }
+                    turn_baseline = conv.api_messages.len();
+                }
                 stream::process_stream_event(
                     event,
                     &mut conv.api_messages,
@@ -895,6 +915,32 @@ async fn apply_engine_event_side_effects(
     ts: &str,
 ) {
     match event {
+        EngineStreamEvent::ResponseStart => {
+            let history = state.display_history.read().await;
+            *state.response_preview.lock().await = Some((history.len(), history.last().cloned()));
+        }
+        EngineStreamEvent::ResponseReset => {
+            let mut history = state.display_history.write().await;
+            if let Some((start, last)) = state.response_preview.lock().await.take() {
+                let mut index = 0;
+                history.retain(|entry| {
+                    let keep = index < start
+                        || !matches!(
+                            entry,
+                            HistoryEntry::Text { .. }
+                                | HistoryEntry::Thinking { .. }
+                                | HistoryEntry::ToolUse { .. }
+                        );
+                    index += 1;
+                    keep
+                });
+                if let Some(last) = last {
+                    if let Some(entry) = start.checked_sub(1).and_then(|i| history.get_mut(i)) {
+                        *entry = last;
+                    }
+                }
+            }
+        }
         EngineStreamEvent::Thinking(text) => {
             let mut history = state.display_history.write().await;
             if let Some(HistoryEntry::Thinking { content: c, .. }) = history.last_mut() {
@@ -996,6 +1042,8 @@ async fn apply_engine_event_side_effects(
 /// (subagent / steering / noop — TODO: wire subagent variant in v2).
 fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMessage> {
     match event {
+        EngineStreamEvent::ResponseStart => Some(ServerMessage::ResponseStart),
+        EngineStreamEvent::ResponseReset => Some(ServerMessage::ResponseReset),
         EngineStreamEvent::Thinking(content) => Some(ServerMessage::Thinking { content }),
         EngineStreamEvent::Text(content) => Some(ServerMessage::Text { content }),
         EngineStreamEvent::ToolStart { tool_name, .. } => {
@@ -1085,7 +1133,7 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     {
         let conv = state.conv.read().await;
         let last_role = conv.api_messages.last().and_then(|m| m["role"].as_str());
-        if last_role != Some("user") {
+        if conv.context_head.is_blocked(&conv.session) || last_role != Some("user") {
             tracing::debug!("server: auto-turn parked — last message is not role=user");
             return;
         }
@@ -1118,9 +1166,18 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     // Turn loop — mirrors handle_user_message's loop but no history entry
     // and no initial message push (event is already in api_messages).
     'turn: loop {
+        {
+            let conv = state.conv.read().await;
+            if conv.context_head.is_blocked(&conv.session) {
+                let _ = broadcast.send(ServerMessage::Error {
+                    message: "context head is unverified — restart/resume before continuing".into(),
+                });
+                break 'turn;
+            }
+        }
         let messages: Vec<synaps_cli::SharedMessage> = state.conv.read().await.api_messages.clone();
         // Failure repair may only remove messages appended by this turn.
-        let turn_baseline = messages.len();
+        let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -1131,11 +1188,28 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
         };
 
         while let Some(event) = stream.next().await {
+            if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                session_id,
+                messages,
+                receipt,
+            }) = event
+            {
+                turn_baseline = state
+                    .persist_context_head(&session_id, messages, receipt)
+                    .await;
+                continue;
+            }
             let ts = ServerState::timestamp();
 
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
+                if conv.context_head.is_blocked(&conv.session) {
+                    if matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_))) {
+                        continue;
+                    }
+                    turn_baseline = conv.api_messages.len();
+                }
                 stream::process_stream_event(
                     event,
                     &mut conv.api_messages,
@@ -1243,6 +1317,34 @@ async fn run_engine_command_synced(
 
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     let broadcast = &state.broadcast_tx;
+
+    // These commands publish session heads outside the stream loop. Reserve
+    // the same streaming slot so a stale compaction/clear save cannot race a
+    // checkpoint (nor start one while its publication is ambiguous).
+    let _head_write_guard = if matches!(name, "compact" | "clear") {
+        if state
+            .streaming
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = broadcast.send(ServerMessage::Error {
+                message: "already streaming — cancel first or wait".into(),
+            });
+            return;
+        }
+        let guard = StreamingGuard {
+            state: Arc::clone(state),
+        };
+        let conv = state.conv.read().await;
+        if name == "compact" && conv.context_head.is_blocked(&conv.session) {
+            let _ = broadcast.send(ServerMessage::Error {
+                message: "context head is unverified — restart/resume before compacting".into(),
+            });
+            return;
+        }
+        Some(guard)
+    } else {
+        None
+    };
 
     // Server-specific overrides — handled BEFORE engine to preserve
     // existing wire behaviour for empty-arg display queries that the
@@ -1456,9 +1558,11 @@ fn rebuild_history(api_messages: &[synaps_cli::SharedMessage]) -> Vec<HistoryEnt
     for msg in api_messages {
         match msg["role"].as_str() {
             Some("user") => {
-                if let Some(content) = msg["content"].as_str() {
+                if let Some(content) =
+                    synaps_cli::session::user_content_for_display(&msg["content"])
+                {
                     history.push(HistoryEntry::User {
-                        content: content.to_string(),
+                        content,
                         time: String::new(),
                     });
                 }
@@ -1508,6 +1612,53 @@ fn rebuild_history(api_messages: &[synaps_cli::SharedMessage]) -> Vec<HistoryEnt
 mod tests {
     use super::*;
     use synaps_cli::Session;
+
+    #[test]
+    fn restored_history_projects_attachments_not_sources_or_tool_results() {
+        use serde_json::json;
+        let messages = vec![
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "TOOL_SENTINEL"},
+                    {"type": "document", "title": "NESTED_SENTINEL",
+                     "source": {"type": "text", "data": "DOC_SENTINEL"}}
+                ]}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "text", "text": "Review these"},
+                {"type": "image", "source": {"type": "base64", "data": "IMAGE_SENTINEL"}},
+                {"type": "document", "title": "notes.txt",
+                 "source": {"type": "text", "data": "TEXT_SENTINEL"}},
+                {"type": "document", "title": "report.pdf",
+                 "source": {"type": "base64", "data": "PDF_SENTINEL"}},
+                {"type": "text", "text": "then compare"}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "image", "source": {"data": "IMAGE_ONLY_SENTINEL"}}
+            ]})),
+            Arc::new(json!({"role": "user", "content": "legacy text"})),
+        ];
+        let original = messages.clone();
+        let history = rebuild_history(&messages);
+        let displayed: Vec<&str> = history
+            .iter()
+            .map(|entry| {
+                let HistoryEntry::User { content, .. } = entry else {
+                    panic!("expected only genuine user messages");
+                };
+                content.as_str()
+            })
+            .collect();
+        assert_eq!(displayed, vec![
+            "Review these\n[attached image]\n[attached document: notes.txt]\n[attached document: report.pdf]\nthen compare",
+            "[attached image]",
+            "legacy text",
+        ]);
+        assert!(!serde_json::to_string(&history)
+            .unwrap()
+            .contains("SENTINEL"));
+        assert_eq!(messages, original);
+    }
 
     /// Two clients hammering `/model` and `/thinking` concurrently must never
     /// leave `conv.session` out of sync with the live runtime — the mirror

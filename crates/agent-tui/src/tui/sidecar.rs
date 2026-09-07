@@ -23,9 +23,311 @@ use synaps_cli::sidecar::spawn::SidecarSpawnArgs;
 
 use super::app::{App, ChatMessage};
 
+type ExtensionManager =
+    std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>;
+type CommandRegistry = synaps_cli::skills::registry::CommandRegistry;
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Own the task rather than detaching it: shutdown, cancellation and a dropped
+/// completion all drop the manager, which kills the child and aborts readers.
+pub(crate) struct SidecarStartup {
+    task: tokio::task::JoinHandle<Result<SidecarUiState, String>>,
+    sidecar: DiscoveredSidecar,
+    label: String,
+}
+
+impl Drop for SidecarStartup {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SidecarStartup {
+    fn start(
+        sidecar: DiscoveredSidecar,
+        has_extension: bool,
+        label: String,
+        manager: ExtensionManager,
+    ) -> Self {
+        let discovered = sidecar.clone();
+        let display_name = label.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(STARTUP_TIMEOUT, async move {
+                let (info, handler) = if has_extension {
+                    // Only this background task may wait for extension loading.
+                    // Clone the authorized handler, then release the manager
+                    // lock BEFORE IPC/sidecar initialization.
+                    let manager = manager.read().await;
+                    (
+                        manager.plugin_info(&discovered.plugin_name).cloned(),
+                        Some(manager.user_action_handler(&discovered.plugin_name)?),
+                    )
+                } else {
+                    (None, None)
+                };
+                let args = if let Some(handler) = handler {
+                    match handler.sidecar_spawn_args().await {
+                        Ok(args) => Some(args),
+                        // Only legacy unsupported-method replies can fall back.
+                        // A denied activation, crash or timeout must never start
+                        // a sidecar with unintended manifest defaults.
+                        Err(error) if spawn_args_unsupported(&error) => None,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                let mut state = SidecarUiState::spawn_for(discovered, args, info.as_ref()).await?;
+                state.set_display_name(Some(display_name));
+                Ok(state)
+            })
+            .await
+            .map_err(|_| "sidecar startup timed out after 30s; toggle to retry".to_string())?
+        });
+        Self {
+            task,
+            sidecar,
+            label,
+        }
+    }
+}
+
+fn spawn_args_unsupported(error: &str) -> bool {
+    matches!(
+        error,
+        "extension runtime does not support sidecar.spawn_args"
+            | "Extension error: method not found"
+            | "Extension error: unknown method"
+            | "Extension error: unknown method: sidecar.spawn_args"
+    )
+}
+
+fn loading_message(label: &str) -> String {
+    format!("{label}: still loading — try the toggle again when ready")
+}
+
+/// Non-blocking half of the toggle path. All filesystem discovery came from
+/// the filtered boot registry; lock waits, RPC and process startup run off-loop.
+pub(crate) async fn toggle(
+    app: &mut App,
+    plugin_id: Option<String>,
+    registry: &CommandRegistry,
+    manager: &ExtensionManager,
+) {
+    if app.sidecars_disabled {
+        app.push_msg(ChatMessage::System(
+            "Sidecars are disabled (--no-extensions).".into(),
+        ));
+        return;
+    }
+    let all = registry.sidecars();
+    let target = plugin_id.or_else(|| all.first().map(|s| s.plugin_name.clone()));
+    let Some(pid) = target else {
+        app.push_msg(ChatMessage::Error(
+            "sidecar unavailable: no enabled plugin provides a sidecar binary".into(),
+        ));
+        return;
+    };
+    if let Some(pending) = app.sidecar_starts.get(&pid) {
+        app.push_msg(ChatMessage::System(loading_message(&pending.label)));
+        return;
+    }
+    // Do not operate stale instances after reload/disable.
+    let Some(discovered) = all.into_iter().find(|s| s.plugin_name == pid) else {
+        app.sidecars.remove(&pid);
+        app.push_msg(ChatMessage::Error(format!(
+            "sidecar plugin '{pid}' is not enabled or discoverable"
+        )));
+        return;
+    };
+    drain_events(app, &pid);
+    if app.sidecars.get(&pid).is_some_and(|state| {
+        state.sidecar != discovered || matches!(state.status, SidecarUiStatus::Error(_))
+    }) {
+        app.sidecars.remove(&pid);
+    }
+    if let Some(state) = app.sidecars.get_mut(&pid) {
+        let label = state.display_name.clone().unwrap_or_else(|| pid.clone());
+        if matches!(state.status, SidecarUiStatus::Loading) {
+            app.push_msg(ChatMessage::System(loading_message(&label)));
+            return;
+        }
+        if state.armed {
+            state.armed = false;
+            match state.manager.release().await {
+                Ok(()) => app.push_msg(ChatMessage::System(format!(
+                    "{label}: stopping — final transcript will be appended"
+                ))),
+                Err(error) => {
+                    state.status = SidecarUiStatus::Error(error.to_string());
+                    app.push_msg(ChatMessage::Error(format!(
+                        "{label} release failed: {error}"
+                    )));
+                }
+            }
+        } else {
+            match state.manager.press().await {
+                Ok(()) => {
+                    state.armed = true;
+                    app.push_msg(ChatMessage::System(format!(
+                        "{label} active — toggle again to stop"
+                    )));
+                }
+                Err(error) => {
+                    state.status = SidecarUiStatus::Error(error.to_string());
+                    app.push_msg(ChatMessage::Error(format!("{label} press failed: {error}")));
+                }
+            }
+        }
+        return;
+    }
+    let label = super::loop_arms::pick_display_name_for_plugin(&pid, &registry.lifecycle_claims())
+        .unwrap_or_else(|| pid.clone());
+    // Startup discovery may not even have acquired the manager lock yet.
+    // Never turn an early keypress into an unknown-extension failure (or an
+    // activation queued behind discovery). Let the user retry after loading.
+    if registry.sidecar_has_extension(&pid) && app.extension_loader_running {
+        app.push_msg(ChatMessage::System(loading_message(&label)));
+        return;
+    }
+    let startup = SidecarStartup::start(
+        discovered,
+        registry.sidecar_has_extension(&pid),
+        label.clone(),
+        manager.clone(),
+    );
+    app.sidecar_starts.insert(pid, startup);
+    app.push_msg(ChatMessage::System(loading_message(&label)));
+}
+
+/// JoinHandle polling is cancellation-safe across tokio::select iterations.
+/// No result channel/sender cycle or detached completion can outlive App.
+pub(crate) async fn next_startup(
+    starts: &mut std::collections::HashMap<String, SidecarStartup>,
+) -> (String, Result<SidecarUiState, String>) {
+    if starts.is_empty() {
+        return std::future::pending().await;
+    }
+    let futures: Vec<_> = starts
+        .iter_mut()
+        .map(|(pid, start)| {
+            let pid = pid.clone();
+            Box::pin(async move {
+                let result = (&mut start.task)
+                    .await
+                    .unwrap_or_else(|_| Err("sidecar startup task failed; toggle to retry".into()));
+                (pid, result)
+            })
+        })
+        .collect();
+    futures::future::select_all(futures).await.0
+}
+
+pub(crate) fn finish_startup(
+    app: &mut App,
+    registry: &CommandRegistry,
+    pid: String,
+    result: Result<SidecarUiState, String>,
+) {
+    let Some(pending) = app.sidecar_starts.remove(&pid) else {
+        return;
+    };
+    // A registry reload may disable/change the plugin while it initializes.
+    if app.sidecars_disabled || !registry.sidecars().contains(&pending.sidecar) {
+        app.push_msg(ChatMessage::System(format!(
+            "{} startup cancelled: plugin changed or disabled",
+            pending.label
+        )));
+        return; // result drops here, killing a late successful process
+    }
+    match result {
+        Ok(state) => {
+            debug_assert!(!state.armed);
+            app.sidecars.insert(pid.clone(), state);
+            drain_events(app, &pid);
+            if app
+                .sidecars
+                .get(&pid)
+                .is_some_and(|state| matches!(state.status, SidecarUiStatus::Idle))
+            {
+                app.push_msg(ChatMessage::System(format!(
+                    "{} ready — toggle to activate",
+                    pending.label
+                )));
+            }
+        }
+        Err(error) => app.push_msg(ChatMessage::Error(format!(
+            "{} unavailable: {error}",
+            pending.label
+        ))),
+    }
+}
+
+fn drain_events(app: &mut App, pid: &str) {
+    // Bound work even for a continuously noisy child. The bounded channel has
+    // 64 slots; if still full after draining, conservatively withhold activation.
+    for _ in 0..64 {
+        let Some(event) = app
+            .sidecars
+            .get_mut(pid)
+            .and_then(|s| s.manager.try_next_event())
+        else {
+            return;
+        };
+        let failed = matches!(
+            event,
+            SidecarLifecycleEvent::Error(_) | SidecarLifecycleEvent::Exited
+        );
+        handle_event(app, pid, event);
+        if failed || !app.sidecars.contains_key(pid) {
+            return;
+        }
+    }
+    if let Some(state) = app.sidecars.get_mut(pid) {
+        state.status = SidecarUiStatus::Loading;
+    }
+}
+
+pub(crate) fn retain_enabled(app: &mut App, registry: &CommandRegistry) {
+    let enabled = registry.sidecars();
+    app.sidecar_starts
+        .retain(|_, pending| enabled.contains(&pending.sidecar));
+    app.sidecars
+        .retain(|_, state| enabled.contains(&state.sidecar));
+}
+
+pub(crate) fn status(app: &App, plugin_id: Option<&str>, registry: &CommandRegistry) -> String {
+    if app.sidecars_disabled {
+        return "Sidecars are disabled (--no-extensions).".into();
+    }
+    let mut lines = Vec::new();
+    for sidecar in registry
+        .sidecars()
+        .into_iter()
+        .filter(|s| plugin_id.map_or(true, |p| p == s.plugin_name))
+    {
+        let pid = &sidecar.plugin_name;
+        lines.push(if let Some(pending) = app.sidecar_starts.get(pid) {
+            loading_message(&pending.label)
+        } else if let Some(state) = app.sidecars.get(pid) {
+            state.status_line()
+        } else {
+            format!("{pid}: not yet started — toggle to load in the background")
+        });
+    }
+    lines.sort();
+    if lines.is_empty() {
+        "sidecar: no enabled plugin provides the requested sidecar".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// What the chatui currently shows for the sidecar indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarUiStatus {
+    /// Plugin initialization/reinitialization has not finished.
+    Loading,
     /// Sidecar is not currently doing plugin-defined work.
     Idle,
     /// Sidecar is doing plugin-defined work and supplied a display label.
@@ -116,9 +418,33 @@ impl SidecarUiState {
             "protocol_version": SIDECAR_PROTOCOL_VERSION,
         });
 
-        let manager = SidecarManager::spawn(&sidecar.binary, &args, config)
+        let mut manager = SidecarManager::spawn(&sidecar.binary, &args, config)
             .await
             .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
+
+        // Strong post-Init readiness is opt-in; legacy Hello-only sidecars
+        // remain compatible. "ready_after_init" promises exactly a ready status
+        // only AFTER Init has been processed and triggers can be accepted.
+        if manager.ready_after_init() {
+            tokio::time::timeout(STARTUP_TIMEOUT, async {
+                loop {
+                    match manager.next_event().await {
+                        Some(SidecarLifecycleEvent::StateChanged { state, .. })
+                            if state == "ready" =>
+                        {
+                            return Ok(())
+                        }
+                        Some(SidecarLifecycleEvent::Error(error)) => return Err(error),
+                        Some(SidecarLifecycleEvent::Exited) | None => {
+                            return Err("sidecar exited while loading".to_string())
+                        }
+                        _ => {} // progress only; idle/stopped are not initialization acknowledgments
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "sidecar did not report ready after Init within 30s".to_string())??;
+        }
 
         // Read the sidecar's compiled backend straight from the cached
         // `info.get` response (Phase 5). Falls back to None when the plugin
@@ -169,6 +495,7 @@ fn format_status_line(
 ) -> String {
     let label = display_name.unwrap_or("sidecar");
     let state = match status {
+        SidecarUiStatus::Loading => "loading".to_string(),
         SidecarUiStatus::Idle => "idle".to_string(),
         SidecarUiStatus::Active { label } => label.clone(),
         SidecarUiStatus::Error(msg) => return format!("{label}: error — {msg}"),
@@ -183,6 +510,31 @@ fn format_status_line(
     )
 }
 
+/// Poll every live sidecar without holding a borrow across UI dispatch.
+/// Channel closure is an exit, not an endlessly ready select branch.
+pub(crate) async fn next_event(
+    sidecars: &mut std::collections::HashMap<String, SidecarUiState>,
+) -> (String, SidecarLifecycleEvent) {
+    if sidecars.is_empty() {
+        return std::future::pending().await;
+    }
+    let futures: Vec<_> = sidecars
+        .iter_mut()
+        .map(|(pid, state)| {
+            let pid = pid.clone();
+            Box::pin(async move {
+                let event = state
+                    .manager
+                    .next_event()
+                    .await
+                    .unwrap_or(SidecarLifecycleEvent::Exited);
+                (pid, event)
+            })
+        })
+        .collect();
+    futures::future::select_all(futures).await.0
+}
+
 /// Apply a [`SidecarLifecycleEvent`] to the chatui state.
 ///
 /// InsertText payloads are inserted at the cursor position (with a
@@ -194,11 +546,13 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
     };
     match event {
         SidecarLifecycleEvent::Ready { .. } => {
-            // Sidecar handshake is informational; we already pressed.
+            // Duplicate Hello is informational; readiness follows Init status.
         }
         SidecarLifecycleEvent::StateChanged { state, label } => {
             let is_inactive = matches!(state.as_str(), "idle" | "ready" | "stopped");
-            if is_inactive {
+            if matches!(state.as_str(), "loading" | "initializing") && !v.armed {
+                v.status = SidecarUiStatus::Loading;
+            } else if is_inactive {
                 if !v.armed {
                     v.status = SidecarUiStatus::Idle;
                 }
@@ -285,6 +639,376 @@ mod tests {
         insert_text_into_input(&mut app, "hello world");
         assert_eq!(app.input_text(), "hello world");
         assert_eq!(app.cursor_char_pos(), "hello world".chars().count());
+    }
+
+    #[cfg(unix)]
+    mod async_startup {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::{path::Path, sync::Arc, time::Duration};
+
+        fn fixture() -> (tempfile::TempDir, synaps_cli::skills::Plugin) {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("sidecar.py");
+            std::fs::write(
+                &bin,
+                r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+root = pathlib.Path(__file__).parent
+(root / 'pid').write_text(str(os.getpid()))
+with (root / 'spawns').open('a') as f: f.write('spawn\n')
+while not (root / 'hello').exists(): time.sleep(.01)
+print(json.dumps({'type':'hello','protocol_version':2,'extension':'test-sidecar','capabilities':['ready_after_init']}), flush=True)
+for line in sys.stdin:
+    msg = json.loads(line)
+    with (root / 'commands').open('a') as f: f.write(line)
+    if msg['type'] == 'init':
+        while not (root / 'ready').exists(): time.sleep(.01)
+        print(json.dumps({'type':'status','state':'ready'}), flush=True)
+    elif msg['type'] == 'shutdown': break
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let manifest = serde_json::from_value(serde_json::json!({
+                "name": "test-sidecar",
+                "provides": {"sidecar": {"command": "sidecar.py", "protocol_version": 2}}
+            }))
+            .unwrap();
+            let plugin = synaps_cli::skills::Plugin {
+                name: "test-sidecar".into(),
+                root: dir.path().to_path_buf(),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(manifest),
+            };
+            (dir, plugin)
+        }
+
+        fn registry(plugin: synaps_cli::skills::Plugin) -> CommandRegistry {
+            CommandRegistry::new_with_plugins(&[], vec![], vec![plugin])
+        }
+
+        fn manager() -> ExtensionManager {
+            let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(Arc::new(
+                synaps_cli::extensions::hooks::HookBus::new(),
+            ));
+            manager.bind_memory_backend(false);
+            Arc::new(tokio::sync::RwLock::new(manager))
+        }
+
+        async fn wait_for(mut condition: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture condition timed out");
+        }
+        fn text(path: &Path) -> String {
+            std::fs::read_to_string(path).unwrap_or_default()
+        }
+
+        async fn complete(app: &mut App, registry: &CommandRegistry) {
+            let (pid, result) = tokio::time::timeout(
+                Duration::from_secs(5),
+                next_startup(&mut app.sidecar_starts),
+            )
+            .await
+            .expect("startup should finish");
+            finish_startup(app, registry, pid, result);
+        }
+
+        #[tokio::test]
+        async fn slow_hello_and_init_do_not_block_or_queue_activation() {
+            let (dir, plugin) = fixture();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            // Even an unrelated extension load holding the write lock must not
+            // stall this sidecar (no extension RPC required by this fixture).
+            let _busy = manager.write().await;
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                toggle(&mut app, None, &registry, &manager),
+            )
+            .await
+            .expect("toggle must return before Hello");
+            assert!(status(&app, None, &registry).contains("still loading"));
+            wait_for(|| dir.path().join("pid").exists()).await;
+            toggle(&mut app, None, &registry, &manager).await;
+            assert_eq!(app.sidecar_starts.len(), 1);
+            assert_eq!(text(&dir.path().join("spawns")).lines().count(), 1);
+            assert!(!app.sidecar_starts["test-sidecar"].task.is_finished());
+            // UI edits work while the child is waiting for Hello.
+            app.set_input_text("responsive");
+            assert_eq!(app.input_text(), "responsive");
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            wait_for(|| text(&dir.path().join("commands")).contains("init")).await;
+            assert!(
+                !app.sidecar_starts["test-sidecar"].task.is_finished(),
+                "Hello alone is not ready"
+            );
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(!text(&dir.path().join("commands")).contains("trigger"));
+            std::fs::write(dir.path().join("ready"), "go").unwrap();
+            complete(&mut app, &registry).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(!app.sidecars["test-sidecar"].armed);
+            assert!(!text(&dir.path().join("commands")).contains("trigger"));
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(app.sidecars["test-sidecar"].armed);
+            wait_for(|| text(&dir.path().join("commands")).contains("press")).await;
+            app.sidecars.clear();
+        }
+
+        #[tokio::test]
+        async fn legacy_hello_only_completes_unarmed_without_post_init_status() {
+            let (dir, plugin) = fixture();
+            let bin = dir.path().join("sidecar.py");
+            let source =
+                text(&bin).replace("'capabilities':['ready_after_init']", "'capabilities':[]");
+            std::fs::write(&bin, source).unwrap();
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            // No ready gate: legacy child will never emit post-Init status.
+            let registry = registry(plugin);
+            let mut app = fresh_app();
+            toggle(&mut app, None, &registry, &manager()).await;
+            complete(&mut app, &registry).await;
+            assert!(!app.sidecars["test-sidecar"].armed);
+            assert!(!text(&dir.path().join("commands")).contains("trigger"));
+        }
+
+        #[tokio::test]
+        async fn negotiated_readiness_error_never_publishes_or_triggers() {
+            let (dir, plugin) = fixture();
+            let bin = dir.path().join("sidecar.py");
+            let source = text(&bin).replace(
+                "{'type':'status','state':'ready'}",
+                "{'type':'error','message':'initialization failed'}",
+            );
+            std::fs::write(&bin, source).unwrap();
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            std::fs::write(dir.path().join("ready"), "go").unwrap();
+            let registry = registry(plugin);
+            let mut app = fresh_app();
+            toggle(&mut app, None, &registry, &manager()).await;
+            complete(&mut app, &registry).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(app.sidecars.is_empty());
+            assert!(!text(&dir.path().join("commands")).contains("trigger"));
+        }
+
+        #[tokio::test]
+        async fn delayed_completion_drains_loading_before_allowing_a_trigger() {
+            let (dir, plugin) = fixture();
+            let bin = dir.path().join("sidecar.py");
+            let source = text(&bin).replace(
+                "print(json.dumps({'type':'status','state':'ready'}), flush=True)",
+                "print(json.dumps({'type':'status','state':'ready'}), flush=True)\n        print(json.dumps({'type':'status','state':'loading'}), flush=True)\n        (root / 'loading-sent').write_text('yes')"
+            );
+            std::fs::write(&bin, source).unwrap();
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            std::fs::write(dir.path().join("ready"), "go").unwrap();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            toggle(&mut app, None, &registry, &manager).await;
+            wait_for(|| dir.path().join("loading-sent").exists()).await;
+            // Delay publishing until the reader has queued both states.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            complete(&mut app, &registry).await;
+            assert_eq!(
+                app.sidecars["test-sidecar"].status,
+                SidecarUiStatus::Loading
+            );
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(!app.sidecars["test-sidecar"].armed);
+            assert!(!text(&dir.path().join("commands")).contains("trigger"));
+        }
+
+        #[tokio::test]
+        async fn startup_timeout_clears_pending_instead_of_falling_back() {
+            // Hold the manager lock through the entire bounded startup. Tokio
+            // virtual time avoids adding 30 seconds to the test suite.
+            let (dir, mut plugin) = fixture();
+            plugin.extension = Some(
+                serde_json::from_value(serde_json::json!({
+                    "runtime":"process", "command":"unused"
+                }))
+                .unwrap(),
+            );
+            let registry = registry(plugin);
+            let manager = manager();
+            let _lock = manager.write().await;
+            let mut app = fresh_app();
+            tokio::time::pause();
+            toggle(&mut app, None, &registry, &manager).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(STARTUP_TIMEOUT + Duration::from_secs(1)).await;
+            complete(&mut app, &registry).await;
+            tokio::time::resume();
+            assert!(app.sidecar_starts.is_empty());
+            assert!(app.sidecars.is_empty());
+            assert!(!dir.path().join("pid").exists());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn disable_cancels_both_loading_and_live_sidecars() {
+            for live in [false, true] {
+                let (dir, plugin) = fixture();
+                let registry = registry(plugin);
+                let mut app = fresh_app();
+                toggle(&mut app, None, &registry, &manager()).await;
+                wait_for(|| dir.path().join("pid").exists()).await;
+                let pid = text(&dir.path().join("pid"));
+                if live {
+                    std::fs::write(dir.path().join("hello"), "go").unwrap();
+                    std::fs::write(dir.path().join("ready"), "go").unwrap();
+                    complete(&mut app, &registry).await;
+                }
+                registry.rebuild_with_plugins(vec![], vec![]);
+                retain_enabled(&mut app, &registry);
+                assert!(app.sidecars.is_empty());
+                assert!(app.sidecar_starts.is_empty());
+                wait_for(|| dead(&pid)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn extension_lock_wait_is_background_and_failed_load_is_retryable() {
+            let (dir, mut plugin) = fixture();
+            plugin.extension = Some(
+                serde_json::from_value(serde_json::json!({
+                    "runtime":"process", "command":"unused"
+                }))
+                .unwrap(),
+            );
+            let registry = registry(plugin);
+            let manager = manager();
+            let guard = manager.write().await;
+            let mut app = fresh_app();
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                toggle(&mut app, None, &registry, &manager),
+            )
+            .await
+            .expect("must not queue UI behind extension loading");
+            tokio::task::yield_now().await;
+            assert_eq!(app.sidecar_starts.len(), 1);
+            assert!(!dir.path().join("pid").exists());
+            drop(guard);
+            // Extension wasn't registered, so no fallback child may start.
+            complete(&mut app, &registry).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(app.sidecars.is_empty());
+            assert!(!dir.path().join("pid").exists());
+            toggle(&mut app, None, &registry, &manager).await;
+            assert_eq!(app.sidecar_starts.len(), 1);
+            complete(&mut app, &registry).await;
+        }
+
+        #[tokio::test]
+        async fn disabled_sidecars_and_registry_removal_never_start() {
+            let (dir, plugin) = fixture();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            app.sidecars_disabled = true;
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(status(&app, None, &registry).contains("disabled"));
+            app.sidecars_disabled = false;
+            registry.rebuild_with_plugins(vec![], vec![]);
+            toggle(&mut app, Some("test-sidecar".into()), &registry, &manager).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(!dir.path().join("pid").exists());
+        }
+
+        #[tokio::test]
+        async fn panic_clears_loading_and_allows_retry() {
+            let (dir, plugin) = fixture();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            app.sidecar_starts.insert(
+                "test-sidecar".into(),
+                SidecarStartup {
+                    task: tokio::spawn(async { panic!("synthetic startup failure") }),
+                    sidecar: registry.sidecars()[0].clone(),
+                    label: "test".into(),
+                },
+            );
+            complete(&mut app, &registry).await;
+            assert!(app.sidecar_starts.is_empty());
+            toggle(&mut app, None, &registry, &manager).await;
+            assert_eq!(app.sidecar_starts.len(), 1);
+            app.sidecar_starts.clear();
+            drop(dir);
+        }
+
+        #[cfg(target_os = "linux")]
+        fn dead(pid: &str) -> bool {
+            let stat = text(&std::path::PathBuf::from(format!(
+                "/proc/{}/stat",
+                pid.trim()
+            )));
+            stat.is_empty()
+                || stat
+                    .split(')')
+                    .nth(1)
+                    .is_some_and(|s| s.trim_start().starts_with('Z'))
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn drop_loading_app_kills_child_and_stale_success_is_not_published() {
+            for stale_success in [false, true] {
+                let (dir, plugin) = fixture();
+                let registry = registry(plugin);
+                let manager = manager();
+                let mut app = fresh_app();
+                toggle(&mut app, None, &registry, &manager).await;
+                wait_for(|| dir.path().join("pid").exists()).await;
+                let pid = text(&dir.path().join("pid"));
+                if stale_success {
+                    std::fs::write(dir.path().join("hello"), "go").unwrap();
+                    std::fs::write(dir.path().join("ready"), "go").unwrap();
+                    let (key, result) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        next_startup(&mut app.sidecar_starts),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(result.is_ok());
+                    registry.rebuild_with_plugins(vec![], vec![]);
+                    finish_startup(&mut app, &registry, key, result);
+                    assert!(app.sidecars.is_empty());
+                }
+                drop(app);
+                wait_for(|| dead(&pid)).await;
+            }
+        }
+    }
+
+    #[test]
+    fn only_unsupported_spawn_args_can_use_defaults() {
+        assert!(spawn_args_unsupported("Extension error: method not found"));
+        assert!(spawn_args_unsupported(
+            "extension runtime does not support sidecar.spawn_args"
+        ));
+        for error in [
+            "activation denied",
+            "sidecar.spawn_args timed out",
+            "invalid response",
+            "denied -32601",
+        ] {
+            assert!(!spawn_args_unsupported(error));
+        }
     }
 
     // ---- build_spawn_args tests ---------------------------------------

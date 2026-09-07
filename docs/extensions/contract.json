@@ -67,6 +67,7 @@
     "tools.transform_output",
     "privacy.llm_content",
     "session.lifecycle",
+    "session.drive",
     "tools.register",
     "providers.register",
     "context_providers.register",
@@ -150,6 +151,53 @@
       },
       "spec": "docs/specs/extension-providers.md"
     }
+  },
+  "session_driver": {
+    "permission": "session.drive",
+    "frontend": "local TUI only; no activation in headless/RPC/server/subagents",
+    "activation": "Only an explicit interactive command response can propose a start; permission metadata alone, hooks, tool calls, printed output, load and resume cannot arm a driver.",
+    "method": "command.invoke",
+    "poll_command": "__session_driver__",
+    "poll_args": "One JSON string: run_id, decision_id (unique UUID), outcome, error_kind, model, effort; outcome time_checkpoint/error_kind wall_clock only with start time_checkpoint_version:1; optional feedback only with start feedback_version:1 (unknown|changed|repeated|empty); no transcript, hashes or raw error.",
+    "response_field": "session_driver",
+    "actions": {
+      "interactive": [
+        "start",
+        "stop",
+        "status"
+      ],
+      "poll": [
+        "next",
+        "stop"
+      ]
+    },
+    "limits": {
+      "reply_bytes": 65536,
+      "prompt_bytes": 16384,
+      "notice_bytes": 2048,
+      "run_id_bytes": 128,
+      "models": 16,
+      "model_bytes": 512,
+      "effort_bytes": 16,
+      "delay_ms": [
+        1000,
+        300000
+      ],
+      "max_duration_ms": 31536000000,
+      "poll_timeout_ms": 5000
+    },
+    "semantics": [
+      "Validated eager manifest SessionDrive permission and pinned handler identity are checked before polling; unknown/deferred/unloaded/reloaded handlers invalidate authority.",
+      "Start pins the exact qualified model/effort allowlist, owning plugin/session/run and optional monotonic deadline. No aliases or effort downgrades. Optional start selection must equal models[0].",
+      "Prepare clones Runtime and validates exact selection plus existing history and proposed user message atomically, preserving same-model session policy. Unsupported history is blocked, not failover.",
+      "Only settled final foreground turns permit a poll; one pending decision/prompt, bounded concurrent invoke-event collector, ignored display output.",
+      "Cancellation, explicit control commands, session/history replacement, lifecycle loss and deadline revoke pending work. Draft edits do not revoke or send content; submitted ordinary text steers the same grant. No run persistence. Frontend cancels an inflight turn at deadline.",
+      "Plugin owns loop prompts, successful-turn limits, retries and failover policy; host transmits only conservative typed error classifications. The broker's exact known-provider missing-account template is the sole config_error exception; generic config/policy failures block.",
+      "Unknown exact models or unsupported named efforts are selection_rejected. Native catalogs currently have no x-ai/grok-4.6 route and no bundled anthropic/claude-fable-5-1 row: preserve favorites literally and visibly reject unsupported choices rather than substituting xai-auth or claude-fable-5. An exact live Anthropic catalog row can authorize the latter identity.",
+      "Optional start context_mode is exactly auto or off (null is rejected); absence preserves the session mode. Only accepted explicit starts apply it through the ordinary session-only /context validation. It does not grant recall/capture/import consent, clear durability blocks, persist config, or enable worker rollover. Next/poll cannot change it.",
+      "Start may opt into time_checkpoint_version:1. Typed wall-clock exhaustion then permits same-grant polling with outcome time_checkpoint/error_kind wall_clock and unknown or absent feedback, not success or provider fallback. Legacy grants and other budget failures stay blocked; cancellation, deadlines, worker and durability gates remain authoritative. Zero elapsed budgets stop. Reference plugin 0.1.4 starts a fresh same-model turn and does not count checkpoints as successful turns.",
+      "Start may opt into feedback_version:1. Host computes bounded process-local fingerprints at successful foreground boundaries; only unknown/changed/repeated/empty labels leave the host. No semantic-progress proof or in-flight interruption; plugin owns thresholds and fallback. Blocked/canceled outcomes cannot be promoted by feedback."
+    ]
   },
   "deferred_lifecycle": {
     "manifest_key": "extension.deferred",

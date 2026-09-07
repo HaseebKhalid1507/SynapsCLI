@@ -9,7 +9,22 @@ pub const PROVIDER_NAME: &str = "OpenAI Codex";
 /// Pinned ChatGPT backend host for Codex model catalog discovery.
 pub const MODELS_BASE_URL: &str = "https://chatgpt.com/backend-api";
 /// Relative path allowlisted on the broker for catalog discovery.
-pub const MODELS_PATH: &str = "/models";
+///
+/// This is the Codex-specific catalog (`/codex/models`), which publishes
+/// `display_name` / `visibility` / `supported_reasoning_levels` per model.
+/// The sibling `/models` path serves the ChatGPT web picker (different
+/// schema, `-wm` slugs, no `visibility`) and must not be used here.
+pub const MODELS_PATH: &str = "/codex/models";
+/// Codex client protocol version advertised on catalog discovery.
+///
+/// The ChatGPT backend filters `/codex/models` by `client_version` against
+/// each model's `minimal_client_version`: an unknown or too-old version
+/// (e.g. SynapsCLI's own crate version) yields an empty catalog. This value
+/// is therefore decoupled from `CARGO_PKG_VERSION` and pinned to the lowest
+/// official Codex CLI release that exposes the newest generation
+/// (`gpt-6-astra` requires >= 0.153.0). Bump deliberately when a new model
+/// raises the floor; never derive it from SynapsCLI's version.
+pub const CODEX_CLIENT_VERSION: &str = "0.153.3";
 
 // ─── Static capability table ─────────────────────────────────────────────────
 //
@@ -29,6 +44,13 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
         ReasoningLevel,
         Option<CodexMultiAgentVersion>,
     ) = match model_id {
+        // GPT-6 generation. Live row (2026-09): default medium, full ladder
+        // through Ultra, multi-agent v2 (Ultra requests use xhigh).
+        "gpt-6-astra" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Medium,
+            Some(CodexMultiAgentVersion::V2),
+        ),
         "gpt-5.6-sol" => (
             &[Low, Medium, High, XHigh, Max, Ultra],
             Low,
@@ -50,6 +72,7 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     };
     Some(ReasoningSupport::CodexNamed {
         supported: supported.to_vec(),
+        multi_agent_reasoning_effort: (model_id == "gpt-6-astra").then_some(XHigh),
         default_level: Some(default_level),
         multi_agent_version,
     })
@@ -58,6 +81,7 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
 /// Build the static catalog models with static capability data attached.
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
+        ("gpt-6-astra", "GPT-6-Astra"),
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
         ("gpt-5.6-terra", "GPT-5.6-Terra"),
         ("gpt-5.6-luna", "GPT-5.6-Luna"),
@@ -72,17 +96,35 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.label = Some(label.to_string());
         m.reasoning = codex_static_capability(id).unwrap_or(ReasoningSupport::Unknown);
+        // Exact input-modality evidence from the official local Codex cache,
+        // verified 2026-09-05. Do not infer from generation/family names:
+        // gpt-5.4 was not observed, and spark explicitly advertises text only.
+        if matches!(
+            id,
+            "gpt-6-astra"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
+                | "gpt-5.5"
+                | "gpt-5.4-mini"
+        ) {
+            m.input_modalities.push(Modality::Image);
+        }
+        // No static row has observed File support.
         m.source = CatalogSource::StaticFallback;
         Some(m)
     })
     .collect()
 }
 
-/// Build the broker-relative path for the ChatGPT backend models endpoint,
-/// including the required `client_version` query (matches official Codex).
+/// Build the broker-relative path for the ChatGPT backend Codex catalog
+/// endpoint, including the required `client_version` query (matches
+/// official Codex). An empty `client_version` falls back to the pinned
+/// [`CODEX_CLIENT_VERSION`] — never SynapsCLI's own crate version, which
+/// the backend would reject with an empty catalog.
 pub fn codex_models_path(client_version: &str) -> String {
     let version = if client_version.trim().is_empty() {
-        env!("CARGO_PKG_VERSION")
+        CODEX_CLIENT_VERSION
     } else {
         client_version.trim()
     };
@@ -112,6 +154,9 @@ struct CodexModelItem {
     supported_in_api: Option<bool>,
     #[serde(default)]
     context_window: Option<u64>,
+    /// Exact advertised inputs. Absence must not inherit static image support.
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
     /// Live catalog reasoning metadata.
     #[serde(default)]
     supported_reasoning_levels: Option<Vec<CodexReasoningLevelItem>>,
@@ -119,6 +164,8 @@ struct CodexModelItem {
     default_reasoning_level: Option<String>,
     #[serde(default)]
     multi_agent_version: Option<String>,
+    #[serde(default)]
+    multi_agent_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,10 +226,13 @@ fn parse_multi_agent_version(s: Option<&str>) -> Option<CodexMultiAgentVersion> 
 fn codex_reasoning_support(item: &CodexModelItem) -> ReasoningSupport {
     let default_level = parse_default_level(item.default_reasoning_level.as_deref());
     let multi_agent_version = parse_multi_agent_version(item.multi_agent_version.as_deref());
+    let multi_agent_reasoning_effort =
+        parse_default_level(item.multi_agent_reasoning_effort.as_deref());
 
     if let Some(items) = item.supported_reasoning_levels.as_deref() {
         return ReasoningSupport::CodexNamed {
             supported: parse_reasoning_levels(items),
+            multi_agent_reasoning_effort,
             default_level,
             multi_agent_version,
         };
@@ -198,6 +248,8 @@ fn codex_reasoning_support(item: &CodexModelItem) -> ReasoningSupport {
         }) => ReasoningSupport::CodexNamed {
             supported,
             default_level: default_level.or(static_default),
+            // Live absence must not borrow Astra's offline override.
+            multi_agent_reasoning_effort,
             multi_agent_version,
         },
         Some(other) => other,
@@ -225,6 +277,11 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
             m.provider_kind = CatalogProviderKind::OpenAiCodex;
             m.label = item.display_name.filter(|name| !name.trim().is_empty());
             m.context_tokens = item.context_window;
+            if let Some(modalities) = item.input_modalities {
+                // Even an explicit empty/text-only list is authoritative. Unknown
+                // tokens remain Other and never authorize a supported modality.
+                m.input_modalities = modalities.iter().map(|m| Modality::from_str(m)).collect();
+            }
             m.reasoning = reasoning;
             m.source = CatalogSource::Live;
             Some(m)
@@ -247,6 +304,18 @@ pub enum CodexWireEffort {
 }
 
 impl CodexWireEffort {
+    fn from_level(level: ReasoningLevel) -> Option<Self> {
+        match level {
+            ReasoningLevel::Low => Some(Self::Low),
+            ReasoningLevel::Medium => Some(Self::Medium),
+            ReasoningLevel::High => Some(Self::High),
+            ReasoningLevel::XHigh => Some(Self::XHigh),
+            ReasoningLevel::Max => Some(Self::Max),
+            // Logical/omission modes must never be emitted as wire effort.
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -407,6 +476,7 @@ impl CodexExecutionPlan {
 #[derive(Debug, Clone)]
 struct CodexCapabilitySnapshot {
     supported: Vec<ReasoningLevel>,
+    multi_agent_reasoning_effort: Option<ReasoningLevel>,
     multi_agent_version: Option<CodexMultiAgentVersion>,
     source: CodexCapabilitySource,
 }
@@ -418,10 +488,12 @@ fn snapshot_from_model(
     match &model.reasoning {
         ReasoningSupport::CodexNamed {
             supported,
+            multi_agent_reasoning_effort,
             multi_agent_version,
             ..
         } => Some(CodexCapabilitySnapshot {
             supported: supported.clone(),
+            multi_agent_reasoning_effort: *multi_agent_reasoning_effort,
             multi_agent_version: *multi_agent_version,
             source,
         }),
@@ -483,10 +555,12 @@ fn authoritative_capability(
     Ok(match codex_static_capability(model_id) {
         Some(ReasoningSupport::CodexNamed {
             supported,
+            multi_agent_reasoning_effort,
             multi_agent_version,
             ..
         }) => Some(CodexCapabilitySnapshot {
             supported,
+            multi_agent_reasoning_effort,
             multi_agent_version,
             source: CodexCapabilitySource::Static,
         }),
@@ -563,15 +637,38 @@ pub fn plan_codex_execution(
         ReasoningLevel::Ultra => CodexExecutionMode::Ultra,
         _ => CodexExecutionMode::Standard,
     };
-    let wire_effort = match selected_level {
-        ReasoningLevel::Off | ReasoningLevel::Adaptive => None,
-        ReasoningLevel::Low => Some(CodexWireEffort::Low),
-        ReasoningLevel::Medium => Some(CodexWireEffort::Medium),
-        ReasoningLevel::High => Some(CodexWireEffort::High),
-        ReasoningLevel::XHigh => Some(CodexWireEffort::XHigh),
-        ReasoningLevel::Max | ReasoningLevel::Ultra => Some(CodexWireEffort::Max),
-        // Anthropic-only logical mode; Codex validation rejects it before lowering.
-        ReasoningLevel::UltraCode => None,
+    let wire_effort = if selected_level == ReasoningLevel::Ultra {
+        // Official Codex client::reasoning_effort_for_request applies this to
+        // BOTH foreground and worker requests. Honor only a supported wire
+        // effort; otherwise prefer Max, then the last supported wire effort.
+        // A malformed ladder with no wire effort fails closed before network.
+        let cap = capability
+            .as_ref()
+            .expect("Ultra capability validated above");
+        Some(
+            cap.multi_agent_reasoning_effort
+                .filter(|level| cap.supported.contains(level))
+                .and_then(CodexWireEffort::from_level)
+                .or_else(|| {
+                    cap.supported
+                        .contains(&ReasoningLevel::Max)
+                        .then_some(CodexWireEffort::Max)
+                })
+                .or_else(|| {
+                    cap.supported
+                        .iter()
+                        .rev()
+                        .find_map(|level| CodexWireEffort::from_level(*level))
+                })
+                .ok_or_else(|| {
+                    CodexPlanError::new(
+                        CodexPlanErrorCode::CapabilityMetadataMissing,
+                        format!("no supported wire effort for Ultra on {qualified_model}"),
+                    )
+                })?,
+        )
+    } else {
+        CodexWireEffort::from_level(selected_level)
     };
     let multi_agent_mode = if request_role == CodexRequestRole::Foreground
         && multi_agent_version == Some(CodexMultiAgentVersion::V2)
@@ -630,12 +727,281 @@ mod tests {
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
     #[test]
+    fn input_modalities_use_only_exact_observed_static_and_fixture_rows() {
+        for models in [
+            codex_static_catalog_models(),
+            parse_codex_catalog_models(FIXTURE).unwrap(),
+        ] {
+            for model in models {
+                let expected = match model.id.as_str() {
+                    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+                    | "gpt-5.5" | "gpt-5.4-mini" => vec![Modality::Text, Modality::Image],
+                    // 5.4 unobserved; spark explicitly text-only.
+                    "gpt-5.4" | "gpt-5.3-codex-spark" => vec![Modality::Text],
+                    _ => panic!("unexpected selectable fixture row"),
+                };
+                assert_eq!(model.input_modalities, expected, "{}", model.id);
+                assert!(!model.input_modalities.contains(&Modality::File));
+            }
+        }
+    }
+
+    #[test]
+    fn live_input_modalities_never_backfill_static_images() {
+        for (field, expected) in [
+            ("", vec![Modality::Text]),
+            (r#", "input_modalities": null"#, vec![Modality::Text]),
+            (r#", "input_modalities": ["text"]"#, vec![Modality::Text]),
+            (r#", "input_modalities": []"#, vec![]),
+            (r#", "input_modalities": ["image"]"#, vec![Modality::Image]),
+            (
+                r#", "input_modalities": ["text", "file"]"#,
+                vec![Modality::Text, Modality::File],
+            ),
+            (
+                r#", "input_modalities": ["Image", "image/png", "future"]"#,
+                vec![
+                    Modality::Other("Image".into()),
+                    Modality::Other("image/png".into()),
+                    Modality::Other("future".into()),
+                ],
+            ),
+        ] {
+            let body = format!(r#"{{"models":[{{"slug":"gpt-6-astra"{field}}}]}}"#);
+            let models = parse_codex_catalog_models(&body).unwrap();
+            assert_eq!(models[0].input_modalities, expected);
+            assert_eq!(models[0].source, CatalogSource::Live);
+        }
+    }
+
+    #[test]
+    fn malformed_input_modalities_reject_catalog_instead_of_authorizing_static() {
+        for value in [
+            r#""image""#,
+            "true",
+            "{}",
+            "[null]",
+            "[1]",
+            r#"["text", {}]"#,
+        ] {
+            let body =
+                format!(r#"{{"models":[{{"slug":"gpt-6-astra","input_modalities":{value}}}]}}"#);
+            assert!(parse_codex_catalog_models(&body).is_err());
+        }
+    }
+
+    fn ultra_test_row(
+        id: &str,
+        levels: &[&str],
+        override_value: serde_json::Value,
+    ) -> CatalogModel {
+        let body = serde_json::json!({"models": [{
+            "slug": id, "visibility": "list", "multi_agent_version": "v2",
+            "supported_reasoning_levels": levels.iter().map(|level| serde_json::json!({"effort": level})).collect::<Vec<_>>(),
+            "multi_agent_reasoning_effort": override_value,
+        }]}).to_string();
+        parse_codex_catalog_models(&body).unwrap().remove(0)
+    }
+
+    #[test]
+    fn ultra_uses_supported_override_for_foreground_worker_and_internal() {
+        for (value, wire) in [
+            ("low", CodexWireEffort::Low),
+            ("medium", CodexWireEffort::Medium),
+            ("high", CodexWireEffort::High),
+            ("xhigh", CodexWireEffort::XHigh),
+            ("max", CodexWireEffort::Max),
+        ] {
+            let row = ultra_test_row(
+                "gpt-override-matrix",
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                value.into(),
+            );
+            for role in [
+                CodexRequestRole::Foreground,
+                CodexRequestRole::Worker,
+                CodexRequestRole::Internal,
+            ] {
+                let plan = plan_codex_execution(
+                    &row.runtime_id(),
+                    ReasoningLevel::Ultra,
+                    role,
+                    Some(&row),
+                )
+                .unwrap();
+                assert_eq!(plan.selected_level, ReasoningLevel::Ultra);
+                assert_eq!(plan.wire_effort, Some(wire));
+                assert_eq!(
+                    plan.automatic_delegation(),
+                    role == CodexRequestRole::Foreground
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ultra_invalid_or_absent_override_uses_supported_fallback_only() {
+        for value in [
+            serde_json::Value::Null,
+            "future".into(),
+            "ultra".into(),
+            "adaptive".into(),
+            "off".into(),
+            "ultracode".into(),
+            "high".into(),
+        ] {
+            for (levels, expected) in [
+                (vec!["low", "max", "xhigh", "ultra"], CodexWireEffort::Max),
+                (vec!["low", "xhigh", "ultra"], CodexWireEffort::XHigh),
+                (vec!["low", "ultra"], CodexWireEffort::Low),
+            ] {
+                let row = ultra_test_row("gpt-fallback-matrix", &levels, value.clone());
+                let plan = plan_codex_execution(
+                    &row.runtime_id(),
+                    ReasoningLevel::Ultra,
+                    CodexRequestRole::Foreground,
+                    Some(&row),
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.wire_effort,
+                    Some(expected),
+                    "override={value} levels={levels:?}"
+                );
+            }
+        }
+        let row = ultra_test_row("gpt-no-wire-effort", &["ultra"], "xhigh".into());
+        assert_eq!(
+            plan_codex_execution(
+                &row.runtime_id(),
+                ReasoningLevel::Ultra,
+                CodexRequestRole::Foreground,
+                Some(&row)
+            )
+            .unwrap_err()
+            .code(),
+            CodexPlanErrorCode::CapabilityMetadataMissing
+        );
+    }
+
+    #[test]
+    fn astra_live_absence_never_borrows_static_xhigh_override() {
+        for levels in [
+            Some(serde_json::json!([{"effort":"max"},{"effort":"ultra"}])),
+            None,
+        ] {
+            for value in [None, Some(serde_json::Value::Null), Some("future".into())] {
+                let mut body = serde_json::json!({"models":[{"slug":"gpt-6-astra", "multi_agent_version":"v2"}]});
+                if let Some(levels) = &levels {
+                    body["models"][0]["supported_reasoning_levels"] = levels.clone();
+                }
+                if let Some(value) = value {
+                    body["models"][0]["multi_agent_reasoning_effort"] = value;
+                }
+                let row = parse_codex_catalog_models(&body.to_string())
+                    .unwrap()
+                    .remove(0);
+                let plan = plan_codex_execution(
+                    &row.runtime_id(),
+                    ReasoningLevel::Ultra,
+                    CodexRequestRole::Foreground,
+                    Some(&row),
+                )
+                .unwrap();
+                assert_eq!(plan.wire_effort, Some(CodexWireEffort::Max));
+                assert_eq!(plan.capability_source, Some(CodexCapabilitySource::Live));
+            }
+        }
+    }
+
+    #[test]
+    fn ultra_override_survives_cache_and_refresh_removal() {
+        // Synthetic exact identity avoids races with any live/ambient catalog.
+        let id = "gpt-ultra-cache-override-removal";
+        let row = ultra_test_row(id, &["high", "max", "ultra"], "high".into());
+        let qualified = row.runtime_id();
+        super::super::capability_cache::insert(row);
+        assert_eq!(
+            plan_codex_execution(
+                &qualified,
+                ReasoningLevel::Ultra,
+                CodexRequestRole::Worker,
+                None
+            )
+            .unwrap()
+            .wire_effort,
+            Some(CodexWireEffort::High)
+        );
+        let row = ultra_test_row(id, &["high", "max", "ultra"], serde_json::Value::Null);
+        super::super::capability_cache::insert(row);
+        assert_eq!(
+            plan_codex_execution(
+                &qualified,
+                ReasoningLevel::Ultra,
+                CodexRequestRole::Worker,
+                None
+            )
+            .unwrap()
+            .wire_effort,
+            Some(CodexWireEffort::Max)
+        );
+    }
+
+    #[test]
+    fn astra_override_does_not_change_explicit_levels_or_omission_modes() {
+        let row = parse_codex_catalog_models(FIXTURE).unwrap().remove(0);
+        for (level, wire) in [
+            (ReasoningLevel::Max, Some(CodexWireEffort::Max)),
+            (ReasoningLevel::XHigh, Some(CodexWireEffort::XHigh)),
+            (ReasoningLevel::Medium, Some(CodexWireEffort::Medium)),
+            (ReasoningLevel::Off, None),
+            (ReasoningLevel::Adaptive, None),
+        ] {
+            let plan = plan_codex_execution(
+                &row.runtime_id(),
+                level,
+                CodexRequestRole::Foreground,
+                Some(&row),
+            )
+            .unwrap();
+            assert_eq!(plan.wire_effort, wire);
+            assert!(!plan.automatic_delegation());
+        }
+        assert!(validate_codex_level("gpt-6-astra-wm", ReasoningLevel::Ultra, None).is_err());
+    }
+
+    #[test]
+    fn ultra_override_does_not_grant_missing_v2() {
+        for version in [None, Some("v1"), Some("future")] {
+            let mut body = serde_json::json!({"models":[{"slug":"gpt-6-astra", "multi_agent_reasoning_effort":"xhigh"}]});
+            if let Some(version) = version {
+                body["models"][0]["multi_agent_version"] = version.into();
+            }
+            let row = parse_codex_catalog_models(&body.to_string())
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                plan_codex_execution(
+                    &row.runtime_id(),
+                    ReasoningLevel::Ultra,
+                    CodexRequestRole::Foreground,
+                    Some(&row)
+                )
+                .unwrap_err()
+                .code(),
+                CodexPlanErrorCode::UltraRequiresMultiAgentV2
+            );
+        }
+    }
+
+    #[test]
     fn parse_fixture_matches_list_visible_chatgpt_picker_models() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -677,6 +1043,7 @@ mod tests {
                 .find(|model| model.id == id)
                 .and_then(CatalogModel::codex_multi_agent_version)
         };
+        assert_eq!(version("gpt-6-astra"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-sol"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-terra"), Some(CodexMultiAgentVersion::V2));
         assert_eq!(version("gpt-5.6-luna"), Some(CodexMultiAgentVersion::V1));
@@ -798,6 +1165,7 @@ mod tests {
         let qualified = format!("openai-codex/{id}");
         let mut spoofed = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, id).unwrap();
         spoofed.reasoning = ReasoningSupport::CodexNamed {
+            multi_agent_reasoning_effort: None,
             supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
             default_level: Some(ReasoningLevel::Max),
             multi_agent_version: Some(CodexMultiAgentVersion::V2),
@@ -821,6 +1189,7 @@ mod tests {
             model.provider_kind = CatalogProviderKind::OpenAiCodex;
             model.source = CatalogSource::Inferred;
             model.reasoning = ReasoningSupport::CodexNamed {
+                multi_agent_reasoning_effort: None,
                 supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
                 default_level: Some(ReasoningLevel::Max),
                 multi_agent_version: Some(CodexMultiAgentVersion::V2),
@@ -858,6 +1227,36 @@ mod tests {
     }
 
     // ── Reasoning level parsing from fixture ──────────────────────────────────
+
+    #[test]
+    fn parse_fixture_astra_is_first_with_full_ladder_and_v2() {
+        let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
+        let astra = &models[0];
+        assert_eq!(
+            astra.id, "gpt-6-astra",
+            "astra is priority 1 in the live catalog"
+        );
+        assert_eq!(astra.label.as_deref(), Some("GPT-6-Astra"));
+        assert_eq!(astra.context_tokens, Some(272_000));
+        for level in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(
+                astra.codex_supports_level(level),
+                "astra must support {level}"
+            );
+        }
+        assert_eq!(
+            astra.codex_multi_agent_version(),
+            Some(CodexMultiAgentVersion::V2)
+        );
+        assert_eq!(astra.runtime_id(), "openai-codex/gpt-6-astra");
+    }
 
     #[test]
     fn parse_fixture_sol_has_ultra() {
@@ -930,6 +1329,11 @@ mod tests {
             ReasoningSupport::CodexNamed { default_level, .. } => *default_level,
             other => panic!("{id}: expected CodexNamed, got {other:?}"),
         };
+        assert_eq!(
+            default_of("gpt-6-astra"),
+            Some(ReasoningLevel::Medium),
+            "astra"
+        );
         assert_eq!(default_of("gpt-5.6-sol"), Some(ReasoningLevel::Low), "sol");
         assert_eq!(
             default_of("gpt-5.6-terra"),
@@ -1002,6 +1406,66 @@ mod tests {
     }
 
     // ── Static capability table ───────────────────────────────────────────────
+
+    #[test]
+    fn static_astra_has_ultra_v2_and_default_medium() {
+        let cap = codex_static_capability("gpt-6-astra").expect("astra");
+        match cap {
+            ReasoningSupport::CodexNamed {
+                supported,
+                default_level,
+                multi_agent_version,
+                ..
+            } => {
+                assert_eq!(
+                    supported,
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                        ReasoningLevel::Max,
+                        ReasoningLevel::Ultra,
+                    ],
+                    "astra ladder matches the live catalog exactly"
+                );
+                assert_eq!(
+                    default_level,
+                    Some(ReasoningLevel::Medium),
+                    "astra default is Medium (unlike Sol's Low)"
+                );
+                assert_eq!(
+                    multi_agent_version,
+                    Some(CodexMultiAgentVersion::V2),
+                    "astra advertises multi-agent v2 so Ultra is authorizable offline"
+                );
+            }
+            _ => panic!("expected CodexNamed"),
+        }
+    }
+
+    #[test]
+    fn static_astra_matches_fixture_row_exactly() {
+        // Guard against the static seed drifting from the live/fixture row.
+        let live = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
+        let live_astra = live.iter().find(|m| m.id == "gpt-6-astra").unwrap();
+        let static_astra = codex_static_catalog_models()
+            .into_iter()
+            .find(|m| m.id == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(static_astra.label, live_astra.label);
+        assert_eq!(static_astra.reasoning, live_astra.reasoning);
+        assert_eq!(
+            static_astra.codex_supported_levels(),
+            live_astra.codex_supported_levels()
+        );
+        assert_eq!(
+            static_astra.codex_multi_agent_version(),
+            live_astra.codex_multi_agent_version()
+        );
+        assert_eq!(static_astra.source, CatalogSource::StaticFallback);
+        assert_eq!(live_astra.source, CatalogSource::Live);
+    }
 
     #[test]
     fn static_sol_has_ultra_and_default_low() {
@@ -1137,6 +1601,39 @@ mod tests {
     // ── validate_codex_level ──────────────────────────────────────────────────
 
     #[test]
+    fn validate_astra_full_ladder_ok() {
+        for level in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultra,
+        ] {
+            assert!(
+                validate_codex_level("gpt-6-astra", level, None).is_ok(),
+                "astra must accept {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_plan_astra_ultra_is_proactive_foreground_xhigh_wire() {
+        let plan = plan_codex_execution(
+            "openai-codex/gpt-6-astra",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("astra ultra plan");
+        assert_eq!(plan.mode, CodexExecutionMode::Ultra);
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::XHigh));
+        assert_eq!(plan.multi_agent_version, Some(CodexMultiAgentVersion::V2));
+        assert_eq!(plan.multi_agent_mode, Some(CodexMultiAgentMode::Proactive));
+        assert!(plan.automatic_delegation());
+    }
+
+    #[test]
     fn validate_sol_ultra_ok() {
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, None).is_ok());
     }
@@ -1172,6 +1669,7 @@ mod tests {
         let mut live = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, "gpt-5.6-sol").unwrap();
         live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.reasoning = ReasoningSupport::CodexNamed {
+            multi_agent_reasoning_effort: None,
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
             multi_agent_version: None,
@@ -1190,6 +1688,7 @@ mod tests {
         live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
+            multi_agent_reasoning_effort: None,
             supported: vec![ReasoningLevel::Max, ReasoningLevel::Ultra],
             default_level: Some(ReasoningLevel::Max),
             multi_agent_version: None,
@@ -1215,6 +1714,7 @@ mod tests {
         live.provider_kind = CatalogProviderKind::OpenAiCodex;
         live.source = CatalogSource::Live;
         live.reasoning = ReasoningSupport::CodexNamed {
+            multi_agent_reasoning_effort: None,
             supported: vec![ReasoningLevel::Low, ReasoningLevel::Medium],
             default_level: Some(ReasoningLevel::Low),
             multi_agent_version: None,
@@ -1249,11 +1749,33 @@ mod tests {
 
     #[test]
     fn models_path_includes_client_version_query() {
-        assert_eq!(codex_models_path("0.6.0"), "/models?client_version=0.6.0");
         assert_eq!(
-            codex_models_url("0.6.0"),
-            "https://chatgpt.com/backend-api/models?client_version=0.6.0"
+            codex_models_path("0.153.3"),
+            "/codex/models?client_version=0.153.3"
         );
+        assert_eq!(
+            codex_models_url("0.153.3"),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.153.3"
+        );
+    }
+
+    #[test]
+    fn models_path_empty_version_falls_back_to_pinned_protocol_version() {
+        // Never the crate version: the backend returns an empty catalog for
+        // unknown client versions, which would silently hide every model.
+        assert_eq!(
+            codex_models_path(""),
+            format!("/codex/models?client_version={CODEX_CLIENT_VERSION}")
+        );
+        assert_eq!(codex_models_path("   "), codex_models_path(""));
+    }
+
+    #[test]
+    fn models_path_targets_codex_catalog_not_chatgpt_web_picker() {
+        // `/models` is the ChatGPT web picker (different schema, `-wm` slugs,
+        // no `visibility`); the Codex catalog lives under `/codex/models`.
+        assert_eq!(MODELS_PATH, "/codex/models");
+        assert!(codex_models_path("0.153.3").starts_with("/codex/models?"));
     }
 
     #[test]
@@ -1274,6 +1796,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -1283,7 +1806,14 @@ mod tests {
                 "gpt-5.3-codex-spark",
             ]
         );
-        for api_only in ["gpt-5.6-sol-wm", "gpt-5.6-pro", "gpt-5.5-pro"] {
+        // ChatGPT-web-only / API-only slugs never appear in the Codex picker.
+        for api_only in [
+            "gpt-6-astra-wm",
+            "gpt-6-pro",
+            "gpt-5.6-sol-wm",
+            "gpt-5.6-pro",
+            "gpt-5.5-pro",
+        ] {
             assert!(!ids.contains(&api_only));
         }
         assert!(models

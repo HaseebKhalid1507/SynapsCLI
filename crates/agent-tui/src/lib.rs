@@ -17,7 +17,9 @@ pub use agent_core::{core, memory, pricing};
 pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 
 // ── agent-engine re-exports ────────────────────────────────────────────────────
-pub use agent_engine::{engine, events, extensions, help, mcp, runtime, sidecar, skills, tools};
+pub use agent_engine::{
+    attachments, engine, events, extensions, help, mcp, runtime, sidecar, skills, tools,
+};
 
 // ── item re-exports (tui uses these at crate root) ────────────────────────────
 pub use agent_engine::{

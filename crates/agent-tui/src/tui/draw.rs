@@ -97,6 +97,7 @@ fn sidecar_pill_segment(
                 (base.2 as f64 * pulse) as u8,
             )
         }
+        super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
         super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
     };
     let modifier = Modifier::BOLD;
@@ -145,6 +146,7 @@ pub(crate) fn sidecar_pill_text(
     spinner_frame: usize,
 ) -> String {
     match status {
+        super::sidecar::SidecarUiStatus::Loading => format!(" {label}: loading "),
         super::sidecar::SidecarUiStatus::Idle => {
             if armed {
                 format!(" \u{25cf} {label} active ")
@@ -976,6 +978,7 @@ pub(crate) fn render_frame_into(
                         (base.2 as f64 * pulse) as u8,
                     )
                 }
+                super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
                 super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
             };
             spans.push(Span::styled(

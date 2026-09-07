@@ -25,6 +25,9 @@ pub enum Permission {
     LlmContent,
     /// Can subscribe to session lifecycle hooks.
     SessionLifecycle,
+    /// May propose foreground turns after explicit local user authorization.
+    /// Declaration alone never arms a session driver or grants a hook.
+    SessionDrive,
     /// Can register new tools.
     ToolsRegister,
     /// Can register new providers.
@@ -67,6 +70,7 @@ impl Permission {
         Self::ToolsOverride,
         Self::LlmContent,
         Self::SessionLifecycle,
+        Self::SessionDrive,
         Self::ToolsRegister,
         Self::ProvidersRegister,
         Self::ContextProvidersRegister,
@@ -86,6 +90,7 @@ impl Permission {
             Self::ToolsOverride => "tools.override",
             Self::LlmContent => "privacy.llm_content",
             Self::SessionLifecycle => "session.lifecycle",
+            Self::SessionDrive => "session.drive",
             Self::ToolsRegister => "tools.register",
             Self::ProvidersRegister => "providers.register",
             Self::ContextProvidersRegister => "context_providers.register",
@@ -106,6 +111,7 @@ impl Permission {
             "tools.override" => Some(Self::ToolsOverride),
             "privacy.llm_content" => Some(Self::LlmContent),
             "session.lifecycle" => Some(Self::SessionLifecycle),
+            "session.drive" => Some(Self::SessionDrive),
             "tools.register" => Some(Self::ToolsRegister),
             "providers.register" => Some(Self::ProvidersRegister),
             "context_providers.register" => Some(Self::ContextProvidersRegister),
@@ -207,6 +213,21 @@ mod tests {
             Permission::parse("session.lifecycle"),
             Some(Permission::SessionLifecycle)
         );
+    }
+
+    #[test]
+    fn session_drive_is_active_explicit_and_grants_no_hooks() {
+        assert_eq!(
+            Permission::parse("session.drive"),
+            Some(Permission::SessionDrive)
+        );
+        assert!(!Permission::SessionDrive.is_reserved());
+        let perms = PermissionSet::try_from_strings(&["session.drive".into()]).unwrap();
+        assert!(perms.has(Permission::SessionDrive));
+        assert!(!perms.has(Permission::SessionLifecycle));
+        assert!(!perms.allows_hook(HookKind::OnSessionStart));
+        assert!(!perms.allows_hook(HookKind::BeforeMessage));
+        assert_eq!(Permission::parse("session_drive"), None);
     }
 
     #[test]
@@ -347,6 +368,7 @@ mod tests {
                 | Permission::ToolsOverride
                 | Permission::LlmContent
                 | Permission::SessionLifecycle
+                | Permission::SessionDrive
                 | Permission::ToolsRegister
                 | Permission::ProvidersRegister
                 | Permission::ContextProvidersRegister
@@ -360,7 +382,7 @@ mod tests {
         }
         assert_eq!(
             Permission::ALL.len(),
-            14,
+            15,
             "a Permission variant was added or removed -- update Permission::ALL \
              and docs/extensions/contract.json to match"
         );

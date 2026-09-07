@@ -10,15 +10,17 @@ use std::sync::{Arc, Mutex};
 // ── Module declarations ──────────────────────────────────────────────────────────
 
 mod bash;
+pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
 mod find;
+pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
 mod powershell;
-mod read;
+pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
 mod write;
@@ -89,14 +91,24 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
+    /// Host-owned note storage binding. Runtime contexts always provide the
+    /// same binding; `None` is reserved for manually constructed contexts.
+    /// A present binding is exclusive: errors never permit legacy fallback.
+    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
+    /// Originating turn cancellation, pinned before tool dispatch. A late
+    /// registration cannot inherit a later user's renewed launch authority.
+    pub launch_cancel: Option<crate::CancellationToken>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
     /// Current worker handle when this context belongs to a delegated
     /// runtime. `None` denotes the foreground root.
     pub delegation_parent: Option<String>,
+    /// Host-built foreground Codex plan for exact-model Ultra inheritance.
+    /// Not a model-supplied tool parameter or an authorization grant.
+    pub codex_parent_plan: Option<crate::runtime::openai::catalog::CodexExecutionPlan>,
     pub secret_prompt: Option<SecretPromptHandle>,
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.
@@ -295,7 +307,7 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod tool_output_tests {

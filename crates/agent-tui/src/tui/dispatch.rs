@@ -122,6 +122,24 @@ pub(crate) async fn handle_input_action(
         ext_mgr_shared,
         exit_fx_sent,
     } = state;
+    // Remember the owner before revocation so generic owner commands can
+    // cancel a streaming turn and invoke (e.g. stop), without plugin names.
+    let driver_owner = app.session_driver.owner().map(str::to_owned);
+    if matches!(
+        &action,
+        InputAction::SlashCommand(_, _)
+            | InputAction::Abort
+            | InputAction::Quit
+            | InputAction::ModelsApply(_)
+            | InputAction::EffortApply(_)
+            | InputAction::SettingsApply(_, _)
+            | InputAction::PluginsOutcome(_)
+            | InputAction::OpenPluginsMarketplace
+            | InputAction::PluginEditorOpen { .. }
+            | InputAction::PluginEditorKey { .. }
+    ) {
+        session_driver::revoke(app, "explicit user action");
+    }
     // Body verbatim from mod.rs:486-1796 (original indentation preserved for
     // diff-ability of the motion; see module header for the mechanical edits).
     match action {
@@ -186,11 +204,90 @@ pub(crate) async fn handle_input_action(
             app.save_session().await;
         }
         InputAction::SlashCommand(cmd, arg) => {
+            if cmd == "attach" && (app.streaming || stream.is_some() || app.compact_task.is_some())
+            {
+                app.push_msg(ChatMessage::Error(
+                    "/attach requires idle chat — wait for streaming/compaction to finish".into(),
+                ));
+                return ControlFlow::Continue(());
+            }
+            if cmd == "resume" && !app.pending_attachments.is_empty() {
+                app.push_msg(ChatMessage::Error(
+                    "pending attachments retained — submit or /detach before /resume".into(),
+                ));
+                return ControlFlow::Continue(());
+            }
+            if app.context_head.is_blocked(&app.session) {
+                if cmd == "resume" && !arg.is_empty() {
+                    // Do not reload while a checkpoint producer can still be
+                    // active. A visible head alone is not a durability receipt.
+                    if app.streaming {
+                        app.push_msg(ChatMessage::Error(
+                            "cannot recover while streaming — wait for the stream to stop, then /resume".into(),
+                        ));
+                        return ControlFlow::Continue(());
+                    }
+                    // Resolution selects only the host-owned ID. Recovery must
+                    // re-read after any detached writer, not save this snapshot.
+                    match synaps_cli::resolve_session(&arg) {
+                        Ok(session) => {
+                            let old_id = app.session.id.clone();
+                            if let Err(error) = app
+                                .recover_reloaded_context_head(runtime, &session.id)
+                                .await
+                            {
+                                app.push_msg(ChatMessage::Error(format!(
+                                    "failed to recover session: {error}"
+                                )));
+                                return ControlFlow::Continue(());
+                            }
+                            runtime.set_model(app.session.model.clone());
+                            let clamp =
+                                runtime.restore_session_reasoning(&app.session.thinking_level);
+                            if let Some(ref prompt) = app.session.system_prompt {
+                                runtime.set_system_prompt(prompt.clone());
+                            }
+                            let messages = app.api_messages.clone();
+                            rebuild_display_messages(&messages, app);
+                            if let Some(clamp) = clamp {
+                                app.session.thinking_level = runtime.thinking_level().to_string();
+                                app.push_msg(ChatMessage::System(format!(
+                                    "thinking → {} (clamped from {}: not supported by {})",
+                                    clamp.to.as_str(),
+                                    clamp.from.as_str(),
+                                    runtime.model()
+                                )));
+                            }
+                            app.push_msg(ChatMessage::System(format!(
+                                "reloaded verified session {} (from {})",
+                                app.session.id, old_id
+                            )));
+                        }
+                        Err(error) => app.push_msg(ChatMessage::Error(format!(
+                            "failed to load session: {error}"
+                        ))),
+                    }
+                    return ControlFlow::Continue(());
+                }
+                // In particular /compact must not publish an old/ambiguous
+                // head, and skill/plugin commands must not start inference.
+                // /clear skips the blocked old save; /quit's save is guarded.
+                if !matches!(
+                    cmd.as_str(),
+                    "clear" | "quit" | "exit" | "attachments" | "detach"
+                ) {
+                    app.push_msg(ChatMessage::Error(
+                        "context head is unverified — /resume or /clear before continuing".into(),
+                    ));
+                    return ControlFlow::Continue(());
+                }
+            }
             let kb_snapshot = {
                 let g = keybind_registry.read().expect("keybind registry poisoned");
                 g.clone()
             };
-            match commands::handle_command(
+            let previous_session_id = app.session.id.clone();
+            let command_action = commands::handle_command(
                 &cmd,
                 &arg,
                 app,
@@ -199,8 +296,13 @@ pub(crate) async fn handle_input_action(
                 registry,
                 &kb_snapshot,
             )
-            .await
-            {
+            .await;
+            // /clear and successful session switches establish fresh host
+            // state. Do not leave a dormant old-ID latch to reappear later.
+            if app.session.id != previous_session_id {
+                app.context_head = Default::default();
+            }
+            match command_action {
                 CommandAction::None => {}
                 CommandAction::StartStream => {} // reserved for future use
                 CommandAction::Quit => {
@@ -311,6 +413,7 @@ pub(crate) async fn handle_input_action(
                 }
                 CommandAction::ReloadPlugins => {
                     synaps_cli::skills::reload_registry(registry, config);
+                    self::sidecar::retain_enabled(app, registry);
                     app.push_msg(ChatMessage::System("plugins reloaded".to_string()));
                 }
                 CommandAction::LoadSkill { skill, arg } => {
@@ -359,6 +462,7 @@ pub(crate) async fn handle_input_action(
                                 ));
                                 app.push_msg(ChatMessage::User(arg));
                             }
+                            session_driver::user_takeover(app, runtime);
                             // Start stream — mirror InputAction::Submit stream-start pattern.
                             let ct = CancellationToken::new();
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -401,15 +505,31 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::PluginCommand { command, arg } => {
+                    if app.extension_loader_running && matches!(command.backend,
+                        synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
+                        | synaps_cli::skills::registry::RegisteredPluginCommandBackend::ExtensionTool { .. }) {
+                        app.push_msg(ChatMessage::System("Extensions are still loading — try again shortly.".into()));
+                        return ControlFlow::Continue(());
+                    }
                     if matches!(
                         command.backend,
                         synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
                     ) {
-                        let manager = ext_mgr_shared.read().await;
-                        commands::execute_interactive_plugin_command_events(
-                            &command, &arg, &manager, app,
-                        )
-                        .await;
+                        if let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { plugin_extension_id } = &command.backend {
+                            let Ok(manager) = ext_mgr_shared.try_read() else {
+                                app.push_msg(ChatMessage::System("Extensions are still loading or busy — try again shortly.".into()));
+                                return ControlFlow::Continue(());
+                            };
+                            if manager.session_driver_handler(plugin_extension_id).is_ok() {
+                                drop(manager);
+                                session_driver::start_command(app, ext_mgr_shared, plugin_extension_id, &command.name, &arg);
+                            } else {
+                                // Ordinary/deferred commands retain their existing display-only
+                                // semantics. Lazy handlers are not stable Arc identities and
+                                // cannot receive session-driving authority through this path.
+                                commands::execute_interactive_plugin_command_events(&command, &arg, &manager, app).await;
+                            }
+                        }
                     } else {
                         commands::execute_command_action(
                             CommandAction::PluginCommand { command, arg },
@@ -593,7 +713,12 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::ExtensionsStatus => {
-                    let manager = ext_mgr_shared.read().await;
+                    let Ok(manager) = ext_mgr_shared.try_read() else {
+                        app.push_msg(ChatMessage::System(
+                            "Extensions are still loading or busy — try again shortly.".into(),
+                        ));
+                        return ControlFlow::Continue(());
+                    };
                     let snapshots = manager.capability_snapshots().await;
                     let trust_view = manager.provider_trust_view();
                     if snapshots.is_empty() {
@@ -746,7 +871,12 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::ExtensionsConfig { id } => {
-                    let manager = ext_mgr_shared.read().await;
+                    let Ok(manager) = ext_mgr_shared.try_read() else {
+                        app.push_msg(ChatMessage::System(
+                            "Extensions are still loading or busy — try again shortly.".into(),
+                        ));
+                        return ControlFlow::Continue(());
+                    };
                     let diags: Vec<synaps_cli::extensions::config::ExtensionConfigDiagnostics> =
                         match &id {
                             Some(want) => match manager.config_diagnostics(want) {
@@ -823,7 +953,13 @@ pub(crate) async fn handle_input_action(
                     use crate::tui::commands::ExtensionsTrustAction;
                     match action {
                         ExtensionsTrustAction::List => {
-                            let manager = ext_mgr_shared.read().await;
+                            let Ok(manager) = ext_mgr_shared.try_read() else {
+                                app.push_msg(ChatMessage::System(
+                                    "Extensions are still loading or busy — try again shortly."
+                                        .into(),
+                                ));
+                                return ControlFlow::Continue(());
+                            };
                             let providers = manager.provider_summaries();
                             let trust = synaps_cli::extensions::trust::load_trust_state()
                                 .unwrap_or_default();
@@ -962,6 +1098,10 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::ExtensionsMemory(action) => {
+                    if runtime.memory_backend_exclusive() {
+                        app.push_msg(ChatMessage::Error("legacy extension memory inspection is disabled by the selected host backend; use short memory tools".into()));
+                        return ControlFlow::Continue(());
+                    }
                     use crate::tui::commands::ExtensionsMemoryAction;
                     match action {
                         ExtensionsMemoryAction::Namespaces => {
@@ -1068,190 +1208,67 @@ pub(crate) async fn handle_input_action(
                 }
 
                 CommandAction::SidecarToggle { plugin_id } => {
-                    // Phase 8 8B: target either the
-                    // claim-supplied plugin id, or fall
-                    // back to the legacy single-slot
-                    // discovery for the unclaimed case.
-                    let all = synaps_cli::sidecar::discovery::discover_all();
-                    let target = plugin_id
-                        .clone()
-                        .or_else(|| all.first().map(|s| s.plugin_name.clone()));
-                    let Some(target_pid) = target else {
-                        app.push_msg(ChatMessage::Error(
-                            "sidecar unavailable: no plugin provides a sidecar binary".to_string(),
-                        ));
-                        return ControlFlow::Continue(());
-                    };
-
-                    if app.sidecars.contains_key(&target_pid) {
-                        // Subsequent toggle on existing sidecar — arm flag is source of truth.
-                        let label = app
-                            .sidecars
-                            .get(&target_pid)
-                            .and_then(|s| s.display_name.as_deref())
-                            .unwrap_or("sidecar")
-                            .to_string();
-                        let v = match app.sidecars.get_mut(&target_pid) {
-                            Some(v) => v,
-                            None => return ControlFlow::Continue(()),
-                        };
-                        if v.armed {
-                            v.armed = false;
-                            if let Err(err) = v.manager.release().await {
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "{label} release failed: {err}"
-                                )));
-                            }
-                            app.push_msg(ChatMessage::System(format!(
-                                "{label}: stopping — final transcript will be appended"
-                            )));
-                        } else {
-                            v.armed = true;
-                            if let Err(err) = v.manager.press().await {
-                                v.armed = false;
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "{label} press failed: {err}"
-                                )));
-                            }
-                        }
-                    } else {
-                        // Spawn new sidecar instance for target_pid.
-                        let Some(discovered) =
-                            all.into_iter().find(|s| s.plugin_name == target_pid)
-                        else {
-                            app.push_msg(ChatMessage::Error(format!(
-                                "sidecar plugin '{}' not discoverable",
-                                target_pid,
-                            )));
-                            return ControlFlow::Continue(());
-                        };
-                        let (sidecar_plugin_info, sidecar_spawn_args) = {
-                            let manager = ext_mgr_shared.read().await;
-                            let info = manager.plugin_info(&target_pid).cloned();
-                            let args = match manager.sidecar_spawn_args(&target_pid).await {
-                                Ok(a) => Some(a),
-                                Err(err) => {
-                                    tracing::debug!(
-                                        plugin = %target_pid,
-                                        error = %err,
-                                        "sidecar.spawn_args RPC unavailable; using manifest defaults",
-                                    );
-                                    None
-                                }
-                            };
-                            (info, args)
-                        };
-                        match self::sidecar::SidecarUiState::spawn_for(
-                            discovered,
-                            sidecar_spawn_args,
-                            sidecar_plugin_info.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(mut state) => {
-                                let claims = registry.lifecycle_claims();
-                                let display = loop_arms::pick_display_name_for_plugin(
-                                    &state.sidecar.plugin_name,
-                                    &claims,
-                                );
-                                state.set_display_name(display);
-                                let label = state
-                                    .display_name
-                                    .clone()
-                                    .unwrap_or_else(|| "sidecar".to_string());
-                                let plugin_key = state.sidecar.plugin_name.clone();
-                                app.sidecars.insert(plugin_key.clone(), state);
-                                app.push_msg(ChatMessage::System(format!(
-                                    "{label} active — press the toggle again to stop"
-                                )));
-                                if let Some(v) = app.sidecars.get_mut(&plugin_key) {
-                                    v.armed = true;
-                                    if let Err(err) = v.manager.press().await {
-                                        v.armed = false;
-                                        v.status =
-                                            self::sidecar::SidecarUiStatus::Error(err.to_string());
-                                        app.push_msg(ChatMessage::Error(format!(
-                                            "{label} press failed: {err}"
-                                        )));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "sidecar unavailable: {err}"
-                                )));
-                            }
-                        }
-                    }
+                    self::sidecar::toggle(app, plugin_id, registry, ext_mgr_shared).await;
                 }
-
                 CommandAction::SidecarStatus { plugin_id } => {
-                    // Phase 8 8B: show status for the
-                    // requested plugin, or — when None —
-                    // for the single legacy sidecar (or
-                    // the discovery hint when none have
-                    // been spawned).
-                    let line = if let Some(pid) = plugin_id.as_deref() {
-                        match app.sidecars.get(pid) {
-                                                Some(v) => v.status_line(),
-                                                None => match synaps_cli::sidecar::discovery::discover_all().into_iter().find(|s| s.plugin_name == pid) {
-                                                    Some(s) => format!(
-                                                        "sidecar: not yet started — sidecar available from plugin '{}' at {}",
-                                                        s.plugin_name, s.binary.display()
-                                                    ),
-                                                    None => format!("sidecar: no plugin '{}' provides a sidecar", pid),
-                                                },
-                                            }
-                    } else if app.sidecars.len() == 1 {
-                        // Safe: len() == 1 guarantees .next() is Some
-                        app.sidecars
-                            .values()
-                            .next()
-                            .expect("len == 1")
-                            .status_line()
-                    } else if app.sidecars.is_empty() {
-                        match synaps_cli::sidecar::discovery::discover() {
-                                                Some(s) => format!(
-                                                    "sidecar: not yet started — sidecar available from plugin '{}' at {}",
-                                                    s.plugin_name, s.binary.display()
-                                                ),
-                                                None => "sidecar: no plugin provides a sidecar binary (install a plugin that declares provides.sidecar)".to_string(),
-                                            }
-                    } else {
-                        // Multiple active — list each.
-                        let mut lines: Vec<String> =
-                            app.sidecars.values().map(|v| v.status_line()).collect();
-                        lines.sort();
-                        lines.join("\n")
-                    };
-                    app.push_msg(ChatMessage::System(line));
+                    app.push_msg(ChatMessage::System(self::sidecar::status(
+                        app,
+                        plugin_id.as_deref(),
+                        registry,
+                    )));
                 }
             }
         }
         InputAction::Submit(input) => {
+            if session_driver::submit_steering(app, &input, steer_tx.as_ref()) {
+                return ControlFlow::Continue(());
+            }
+            // A command still awaiting its initial grant cannot own steering.
+            session_driver::revoke(app, "user submitted work before driver authorization");
+            if !app.pending_attachments.is_empty()
+                && (app.streaming || stream.is_some() || app.compact_task.is_some())
+            {
+                if app.input_is_empty() {
+                    app.set_input_text(&input);
+                }
+                app.push_msg(ChatMessage::Error("attachments require idle submission — wait for streaming/compaction to finish; pending attachments retained".into()));
+                return ControlFlow::Continue(());
+            }
+            if app.context_head.is_blocked(&app.session) {
+                app.push_msg(ChatMessage::Error(
+                    "context head is unverified — /resume or /clear before continuing".into(),
+                ));
+                return ControlFlow::Continue(());
+            }
             // Queue input during compaction — will be sent after session swap
             if app.compact_task.is_some() {
                 app.push_msg(ChatMessage::System(format!("queued: {}", input)));
                 app.queued_message = Some(input);
                 return ControlFlow::Continue(());
             }
-            let display_text = app.user_display_text_for_submission(&input);
+            let mut display_text = app.user_display_text_for_submission(&input);
+            let summaries = app.pending_attachments.summaries();
+            if !summaries.is_empty() {
+                if !display_text.is_empty() {
+                    display_text.push('\n');
+                }
+                display_text.push_str(&format!("[Attachments]\n{}", summaries.join("\n")));
+            }
+            if let Err(error) = app.append_user_submission(runtime.model(), &input) {
+                if app.input_is_empty() {
+                    app.set_input_text(&input);
+                }
+                app.push_msg(ChatMessage::Error(format!(
+                    "message not submitted: {error}; pending attachments retained"
+                )));
+                return ControlFlow::Continue(());
+            }
+            session_driver::user_takeover(app, runtime);
             app.push_msg(ChatMessage::User(display_text));
             app.input_before_paste = None;
             app.pasted_char_count = 0;
             // Real user send — reset auto-turn counter.
             app.consecutive_auto_turns = 0;
-            // Inject abort context if previous response was interrupted
-            let api_content = if let Some(ref ctx) = app.abort_context {
-                let combined = format!("{}\n\n{}", ctx, input);
-                app.abort_context = None;
-                combined
-            } else {
-                input
-            };
-            app.api_messages.push(std::sync::Arc::new(
-                json!({"role": "user", "content": api_content}),
-            ));
             let ct = CancellationToken::new();
             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             app.status_text = Some("connecting…".to_string());
@@ -1287,6 +1304,51 @@ pub(crate) async fn handle_input_action(
             *steer_tx = Some(s_tx);
         }
         InputAction::StreamingInput(input) => {
+            // Listing and detaching never read files and are safe even while busy.
+            let known_command = input.strip_prefix('/').and_then(|rest| {
+                let (raw, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let all = commands::all_commands_with_skills(registry);
+                let resolved = commands::resolve_prefix(raw, &all);
+                all.contains(&resolved).then_some((resolved, arg.trim()))
+            });
+            if known_command.is_none()
+                && session_driver::submit_steering(app, &input, steer_tx.as_ref())
+            {
+                return ControlFlow::Continue(());
+            }
+            session_driver::revoke(app, "explicit command or unowned streaming input");
+            if let Some((cmd, arg)) = &known_command {
+                if let synaps_cli::skills::registry::Resolution::PluginCommand(command) =
+                    registry.resolve(cmd)
+                {
+                    if let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { plugin_extension_id } = &command.backend {
+                        if driver_owner.as_deref() == Some(plugin_extension_id.as_str()) {
+                            // Stop promptly, retain partial work, and release all
+                            // locks before invoking the explicit owner command.
+                            if let Some(ct) = cancel_token.take() { ct.cancel(); }
+                            app.capture_abort_context();
+                            *stream = None;
+                            *steer_tx = None;
+                            app.streaming = false;
+                            app.status_text = None;
+                            app.drop_empty_thinking();
+                            session_driver::start_command(app, ext_mgr_shared, plugin_extension_id, &command.name, arg);
+                            app.save_session().await;
+                            return ControlFlow::Continue(());
+                        }
+                    }
+                }
+                if commands::handle_pending_attachment_command(cmd, arg, app) {
+                    return ControlFlow::Continue(());
+                }
+            }
+            if !app.pending_attachments.is_empty() && known_command.is_none() {
+                if app.input_is_empty() {
+                    app.set_input_text(&input);
+                }
+                app.push_msg(ChatMessage::Error("attachments require idle submission — wait for streaming to finish; pending attachments retained".into()));
+                return ControlFlow::Continue(());
+            }
             // Check for streaming slash commands
             if let Some(rest) = input.strip_prefix('/') {
                 let raw_cmd = rest.split_whitespace().next().unwrap_or("");
@@ -1574,7 +1636,12 @@ pub(crate) async fn handle_input_action(
             category,
             field,
         } => {
-            let manager = ext_mgr_shared.read().await;
+            let Ok(manager) = ext_mgr_shared.try_read() else {
+                app.push_msg(ChatMessage::System(
+                    "Extensions are still loading or busy — try again shortly.".into(),
+                ));
+                return ControlFlow::Continue(());
+            };
             match manager
                 .settings_editor_open(&plugin_id, &category, &field)
                 .await
@@ -1632,7 +1699,12 @@ pub(crate) async fn handle_input_action(
                         _ => None,
                     });
                 if let Some(value) = selected {
-                    let manager = ext_mgr_shared.read().await;
+                    let Ok(manager) = ext_mgr_shared.try_read() else {
+                        app.push_msg(ChatMessage::System(
+                            "Extensions are still loading or busy — try again shortly.".into(),
+                        ));
+                        return ControlFlow::Continue(());
+                    };
                     match manager
                         .settings_editor_commit(&plugin_id, &category, &field, value.clone())
                         .await
@@ -1710,7 +1782,12 @@ pub(crate) async fn handle_input_action(
                     }
                 }
             } else {
-                let manager = ext_mgr_shared.read().await;
+                let Ok(manager) = ext_mgr_shared.try_read() else {
+                    app.push_msg(ChatMessage::System(
+                        "Extensions are still loading or busy — try again shortly.".into(),
+                    ));
+                    return ControlFlow::Continue(());
+                };
                 match manager
                     .settings_editor_key(&plugin_id, &category, &field, &wire_key)
                     .await
@@ -1809,6 +1886,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
             }
+            self::sidecar::retain_enabled(app, registry);
         }
         InputAction::OpenPluginsMarketplace => {
             let path = synaps_cli::skills::state::PluginsState::default_path();

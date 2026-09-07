@@ -1,0 +1,7 @@
+# User-requested ceiling for Synaps builds and tests.
+[build]
+jobs = 8
+
+# Explicit --test-threads=1 still overrides this for PTY/environment-sensitive tests.
+[env]
+RUST_TEST_THREADS = { value = "8", force = false }

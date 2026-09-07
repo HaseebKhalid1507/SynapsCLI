@@ -136,6 +136,8 @@ impl Tool for SubagentStartTool {
                 RuntimeError::Tool(error.to_string())
             })?;
         let model = decision.model.as_str().to_owned();
+        let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
+        let memory_backend = ctx.capabilities.memory_backend.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -200,7 +202,7 @@ impl Tool for SubagentStartTool {
         .with_authorization(&decision);
         {
             let mut reg = registry.lock().unwrap();
-            reg.register(handle);
+            reg.register_with_cancellation(handle, ctx.capabilities.launch_cancel.as_ref());
         }
 
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
@@ -253,9 +255,11 @@ impl Tool for SubagentStartTool {
                     // unconditionally force cache TTL to 5m. Subagents are short-lived
                     // one-shots — paying the 1h write premium (~2× input price) on them
                     // is unrecoverable waste (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
+                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model_a.clone());
+                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
+                    super::apply_anthropic_worker_reasoning(&mut runtime);
                     runtime.set_tools(super::subagent_tools().await);
                     runtime.install_worker_orchestration(Arc::clone(
                         &orchestration_for_runtime,
@@ -263,6 +267,12 @@ impl Tool for SubagentStartTool {
                     runtime.set_delegation_parent(Some(child_parent_id.clone()));
 
                     let cancel = crate::CancellationToken::new();
+                    // Registration may have inherited a revoked session-driver
+                    // launch fence. Do not wait for the shutdown watcher to be
+                    // scheduled before honoring that cancellation.
+                    if state_a.read().unwrap_or_else(|p| p.into_inner()).cancel_requested {
+                        cancel.cancel();
+                    }
                     let cancel_inner = cancel.clone();
                     tokio::spawn(async move {
                         let _ = shutdown_rx.await;
@@ -272,6 +282,7 @@ impl Tool for SubagentStartTool {
                     let mut stream = runtime.run_stream_with_messages(vec![std::sync::Arc::new(serde_json::json!({"role": "user", "content": task}))], cancel, Some(steer_rx), None, false).await;
 
                     let mut tool_count = 0u32;
+                    let mut response_baseline = (0usize, 0usize, 0u32);
                     let mut total_input_tokens = 0u64;
                     let mut total_output_tokens = 0u64;
                     let mut total_cache_read = 0u64;
@@ -296,6 +307,16 @@ impl Tool for SubagentStartTool {
                                                 status: "💭 thinking...".to_string(),
                                             }));
                                         }
+                                    }
+                                    crate::StreamEvent::Llm(LlmEvent::ResponseStart) => {
+                                        let s = state_a.read().unwrap();
+                                        response_baseline = (s.partial_text.len(), s.tool_log.len(), tool_count);
+                                    }
+                                    crate::StreamEvent::Llm(LlmEvent::ResponseReset) => {
+                                        let mut s = state_a.write().unwrap();
+                                        s.partial_text.truncate(response_baseline.0);
+                                        s.tool_log.truncate(response_baseline.1);
+                                        tool_count = response_baseline.2;
                                     }
                                     crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                         state_a.write().unwrap().partial_text.push_str(&text);

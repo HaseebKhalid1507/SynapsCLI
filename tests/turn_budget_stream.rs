@@ -318,6 +318,62 @@ async fn wall_clock_budget_stops_before_any_provider_call() {
     assert_history_pairing(&final_history(&events));
 }
 
+/// Explicit operator recovery changes the next-turn snapshot only; retained
+/// history survives and is sent exactly once to the loopback provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wall_clock_exhaustion_can_resume_retained_history_after_explicit_extension() {
+    use synaps_cli::engine::commands::{handle_engine_command, CommandResult};
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let budget = TurnBudget {
+        max_elapsed: Duration::ZERO,
+        ..TurnBudget::for_role(TurnRole::Foreground)
+    };
+    let (mut rt, executions) = runtime_with_fixture(budget, 8).await;
+    let events = drive_runtime_turn(&rt, "retained-budget-history-sentinel", false).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Session(SessionEvent::Error(error)) => Some(error),
+            _ => None,
+        })
+        .expect("budget failure");
+    assert!(error.message.contains("/ limit 0s"));
+    assert!(error.message.contains("History retained"));
+    assert!(error.message.contains("/budget status"));
+    assert!(!error.message.contains("retained-budget-history-sentinel"));
+    let mut retained = final_history(&events);
+    assert!(retained.iter().any(|message| message
+        .to_string()
+        .contains("retained-budget-history-sentinel")));
+    let prefix = retained.clone();
+    assert!(matches!(
+        handle_engine_command("budget", "time 4h", &mut rt),
+        Some(CommandResult::Output(_))
+    ));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "command never starts inference"
+    );
+    retained.push(Arc::new(
+        serde_json::json!({"role": "user", "content": "continue"}),
+    ));
+    let recovered = drive_runtime_history_turn(&rt, retained).await;
+    assert!(budget_outcome(&recovered).is_none());
+    assert!(!recovered
+        .iter()
+        .any(|event| matches!(event, StreamEvent::Session(SessionEvent::Error(_)))));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let history = final_history(&recovered);
+    assert_eq!(&history[..prefix.len()], &prefix);
+    assert_history_pairing(&history);
+}
+
 /// Per-role defaults are typed, distinct, and config-overridable; the
 /// chat auto-turn cap (reactor-level, ACROSS turns) composes with — and is
 /// not duplicated by — the engine per-turn budget.

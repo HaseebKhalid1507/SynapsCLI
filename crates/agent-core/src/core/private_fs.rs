@@ -261,6 +261,28 @@ mod tests {
     }
 
     #[test]
+    fn durable_directory_sync_uses_held_handle_after_path_swap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("new/parent/sessions");
+        let handle = ConfinedDir::create_absolute_no_symlinks_durable(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o700);
+        let held_path = root.join("held-sessions");
+        std::fs::rename(&path, &held_path).unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        handle.write_atomic("checkpoint.json", b"{}").unwrap();
+        handle.sync_all().unwrap();
+        assert_eq!(
+            std::fs::read(held_path.join("checkpoint.json")).unwrap(),
+            b"{}"
+        );
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+        assert!(ConfinedDir::create_absolute_no_symlinks_durable(&path).is_err());
+    }
+
+    #[test]
     fn ensure_private_dir_repairs_broad_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("broad");
@@ -354,10 +376,21 @@ impl ConfinedDir {
     /// counterpart of [`ensure_private_dir`]. Every existing component,
     /// ancestor or final, must be a real (non-symlink) directory.
     pub fn create_absolute_no_symlinks(path: &Path) -> std::io::Result<Self> {
+        Self::create_absolute_no_symlinks_impl(path, false)
+    }
+
+    /// Durable variant: sync each parent handle so newly created directory
+    /// entries (including on retry after a failed sync) survive a crash.
+    /// The caller must still sync the leaf after publishing files in it.
+    pub fn create_absolute_no_symlinks_durable(path: &Path) -> std::io::Result<Self> {
+        Self::create_absolute_no_symlinks_impl(path, true)
+    }
+
+    fn create_absolute_no_symlinks_impl(path: &Path, durable: bool) -> std::io::Result<Self> {
         let components = absolute_real_components(path)?;
         let mut dir = Self::open_dir_nofollow_at_path(Path::new("/"))?;
         for component in &components {
-            dir = match dir.open_child_dir_nofollow(component) {
+            let next = match dir.open_child_dir_nofollow(component) {
                 Ok(next) => next,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     let c_name = validated_component_cstring(component)?;
@@ -372,9 +405,19 @@ impl ConfinedDir {
                 }
                 Err(e) => return Err(e),
             };
+            if durable {
+                dir.sync_all()?;
+            }
+            dir = next;
         }
         dir.fchmod_private()?;
         Ok(dir)
+    }
+
+    /// Sync this opened directory, without re-resolving its pathname. An
+    /// atomic file rename is not a durable commit until this succeeds.
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        self.handle.sync_all()
     }
 
     /// Open one existing DIRECT child directory, `O_NOFOLLOW | O_DIRECTORY`.

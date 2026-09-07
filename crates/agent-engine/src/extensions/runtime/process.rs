@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use super::{ExtensionHandler, ExtensionHealth, RestartPolicy};
+use super::{ExtensionHandler, ExtensionHealth, ExtensionLifecycle, RestartPolicy};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
 
@@ -567,6 +567,13 @@ struct Inbox {
     /// Set to true when the reader task exits (EOF or error). Used to prevent
     /// callers from registering pending requests that will never be fulfilled.
     closed: std::sync::atomic::AtomicBool,
+    /// Child observation is separate from `ProcessExtension::state`: that lock
+    /// serializes RPC I/O and may be held for an entire request. The lifecycle
+    /// slot is held only to clone/publish a handle, never across process I/O.
+    lifecycle: Mutex<Option<Arc<ProcessLifecycle>>>,
+    /// Even generations identify live transports; the low bit permanently
+    /// invalidates a transport. Allocation fails closed rather than wrapping.
+    next_generation: AtomicU64,
     /// Permissions granted to the calling extension. Set after manifest
     /// validation; checked by inbound RPC handlers (e.g. memory.append).
     permissions: RwLock<Option<crate::extensions::permissions::PermissionSet>>,
@@ -576,6 +583,7 @@ struct Inbox {
     inbound_stdin: Mutex<Option<Arc<Mutex<ChildStdin>>>>,
     /// Extension id, used for namespace policy and diagnostics.
     extension_id: String,
+    exclusive_memory: bool,
 }
 
 impl Inbox {
@@ -585,15 +593,26 @@ impl Inbox {
             notification_sinks: Mutex::new(Vec::new()),
             next_sink_id: std::sync::atomic::AtomicUsize::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
+            lifecycle: Mutex::new(None),
+            next_generation: AtomicU64::new(2),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
+            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
+                .exclusive(),
             extension_id,
+        }
+    }
+
+    async fn invalidate_lifecycle(&self) {
+        if let Some(lifecycle) = self.lifecycle.lock().await.as_ref() {
+            lifecycle.invalidate();
         }
     }
 
     /// Drains all pending request senders, sending `Err(reason)` to each.
     /// Also marks the inbox as closed so no new requests can be registered.
     async fn fail_all_pending(&self, reason: &str) {
+        self.invalidate_lifecycle().await;
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         let drained: Vec<_> = {
@@ -606,10 +625,59 @@ impl Inbox {
     }
 }
 
+/// One actual child/transport lifetime. Reader tasks retain this exact record,
+/// so a late EOF from an old reader can never invalidate a replacement's token.
+struct ProcessLifecycle {
+    child: Mutex<Child>,
+    generation: AtomicU64,
+    initialized: AtomicBool,
+}
+
+impl ProcessLifecycle {
+    fn invalidate(&self) {
+        // Idempotent; no wraparound and no window that exposes the old token
+        // as healthy while teardown or replacement is already underway.
+        self.generation.fetch_or(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self, recovered: bool) -> Option<ExtensionLifecycle> {
+        if self.generation.load(Ordering::Acquire) & 1 == 0 {
+            let mut child = self.child.try_lock().ok()?;
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => self.invalidate(),
+            }
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let health = if generation & 1 != 0 {
+            ExtensionHealth::Failed
+        } else if !self.initialized.load(Ordering::Acquire) {
+            ExtensionHealth::Loaded
+        } else if recovered {
+            ExtensionHealth::Degraded
+        } else {
+            ExtensionHealth::Running
+        };
+        Some(ExtensionLifecycle { generation, health })
+    }
+}
+
 struct ProcessState {
-    child: Child,
+    lifecycle: Arc<ProcessLifecycle>,
     stdin: Arc<Mutex<ChildStdin>>,
     reader_handle: JoinHandle<()>,
+}
+
+impl Drop for ProcessState {
+    fn drop(&mut self) {
+        self.lifecycle.invalidate();
+        self.reader_handle.abort();
+        // `kill_on_drop` alone is insufficient: the lifecycle observation slot
+        // also owns the child. Request cancellation must stop it immediately.
+        if let Ok(mut child) = self.lifecycle.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 /// A running extension process communicating via JSON-RPC 2.0 over stdio.
@@ -646,11 +714,12 @@ impl ProcessExtension {
     /// than waiting for the per-call permit; draining pending responders
     /// releases every blocked call/producer.
     pub async fn force_shutdown(&self) {
+        self.inbox.invalidate_lifecycle().await;
         let mut state_guard = self.state.lock().await;
         if let Some(state) = state_guard.take() {
             state.reader_handle.abort();
-            let mut child = state.child;
-            let _ = child.kill().await;
+            state.lifecycle.invalidate();
+            let _ = state.lifecycle.child.lock().await.kill().await;
         }
         drop(state_guard);
         self.inbox.closed.store(true, Ordering::Release);
@@ -674,7 +743,25 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let inbox = Arc::new(Inbox::new(id.to_string()));
+        let exclusive = crate::memory_backend::MemoryBinding::configured_current().exclusive();
+        Self::spawn_with_memory_policy(id, command, args, cwd, exclusive).await
+    }
+
+    pub(crate) async fn spawn_with_memory_policy(
+        id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<PathBuf>,
+        exclusive: bool,
+    ) -> Result<Self, String> {
+        if exclusive && id == "axel-memory-manager" {
+            return Err(
+                "independent Axel plugin is disabled by the host-selected memory backend".into(),
+            );
+        }
+        let mut inbox = Inbox::new(id.to_string());
+        inbox.exclusive_memory = exclusive;
+        let inbox = Arc::new(inbox);
         let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
@@ -796,7 +883,26 @@ impl ProcessExtension {
             });
         }
 
-        let reader_handle = Self::spawn_reader(stdout, inbox.clone(), id.to_string());
+        let generation = inbox
+            .next_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(2))
+            .map_err(|_| "extension lifecycle generation exhausted".to_string())?;
+        let lifecycle = Arc::new(ProcessLifecycle {
+            child: Mutex::new(child),
+            generation: AtomicU64::new(generation),
+            initialized: AtomicBool::new(false),
+        });
+        {
+            let mut slot = inbox.lifecycle.lock().await;
+            if let Some(old) = slot.as_ref() {
+                old.invalidate();
+            }
+            *slot = Some(lifecycle.clone());
+        }
+        // Reset BEFORE starting the reader: a fast EOF must never be erased.
+        inbox.closed.store(false, Ordering::Release);
+        let reader_handle =
+            Self::spawn_reader(stdout, inbox.clone(), id.to_string(), lifecycle.clone());
 
         let stdin_arc = Arc::new(Mutex::new(stdin));
         // Publish current stdin into the inbox so the reader task can write
@@ -804,7 +910,7 @@ impl ProcessExtension {
         *inbox.inbound_stdin.lock().await = Some(stdin_arc.clone());
 
         Ok(ProcessState {
-            child,
+            lifecycle,
             stdin: stdin_arc,
             reader_handle,
         })
@@ -818,6 +924,7 @@ impl ProcessExtension {
         stdout: ChildStdout,
         inbox: Arc<Inbox>,
         extension_id: String,
+        lifecycle: Arc<ProcessLifecycle>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -827,6 +934,7 @@ impl ProcessExtension {
                         Self::dispatch_frame(value, &inbox, &extension_id).await;
                     }
                     Ok(None) => {
+                        lifecycle.invalidate();
                         tracing::debug!(
                             extension = %extension_id,
                             "Extension stdout closed (EOF); failing pending requests",
@@ -837,6 +945,7 @@ impl ProcessExtension {
                         return;
                     }
                     Err(error) => {
+                        lifecycle.invalidate();
                         tracing::debug!(
                             extension = %extension_id,
                             error = %error,
@@ -991,6 +1100,7 @@ impl ProcessExtension {
                     let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
                     let mut stdin = stdin.lock().await;
                     if let Err(error) = stdin.write_all(frame.as_bytes()).await {
+                        inbox.invalidate_lifecycle().await;
                         tracing::warn!(
                             extension = %extension_id,
                             error = %error,
@@ -999,6 +1109,7 @@ impl ProcessExtension {
                         return;
                     }
                     if let Err(error) = stdin.flush().await {
+                        inbox.invalidate_lifecycle().await;
                         tracing::warn!(
                             extension = %extension_id,
                             error = %error,
@@ -1126,6 +1237,13 @@ impl ProcessExtension {
     ) -> Result<Value, (i32, String)> {
         use crate::extensions::permissions::Permission;
         use crate::memory::store::{self, MemoryQuery};
+
+        if inbox.exclusive_memory && matches!(method, "memory.append" | "memory.query") {
+            return Err((
+                -32000,
+                "legacy extension memory is disabled by the host-selected backend".into(),
+            ));
+        }
 
         match method {
             "memory.append" => {
@@ -1477,6 +1595,7 @@ impl ProcessExtension {
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        self.inbox.invalidate_lifecycle().await;
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.total_restarts.fetch_add(1, Ordering::Relaxed);
         let max_attempts = self.restart_policy.max_attempts;
@@ -1490,8 +1609,8 @@ impl ProcessExtension {
 
         if let Some(old) = state.take() {
             old.reader_handle.abort();
-            let mut child = old.child;
-            let _ = child.kill().await;
+            old.lifecycle.invalidate();
+            let _ = old.lifecycle.child.lock().await.kill().await;
         }
         // Drain any stale pending entries before reusing the inbox.
         self.inbox
@@ -1525,10 +1644,6 @@ impl ProcessExtension {
             )
             .await?,
         );
-        // Reset closed flag now that we have a fresh transport
-        self.inbox
-            .closed
-            .store(false, std::sync::atomic::Ordering::Release);
         self.initialize_locked(state).await?;
         // NOTE: the consecutive-failure counter is NOT reset here. A
         // successful handshake isn't proof of recovery — a crash-looping
@@ -1563,7 +1678,15 @@ impl ProcessExtension {
         )
         .await
         .map_err(|_| format!("Extension '{}' initialize timed out after 10s", self.id))??;
-        Self::parse_initialize_result(&self.id, value).map(|_| ())
+        let result = Self::parse_initialize_result(&self.id, value).map(|_| ());
+        if let Some(state) = state.as_ref() {
+            if result.is_ok() {
+                state.lifecycle.initialized.store(true, Ordering::Release);
+            } else {
+                state.lifecycle.invalidate();
+            }
+        }
+        result
     }
 
     /// Send a single JSON-RPC request and await the matching response,
@@ -1611,6 +1734,7 @@ impl ProcessExtension {
             }
         };
         if let Err(e) = write_result {
+            state.lifecycle.invalidate();
             // Make sure we don't leak the pending entry if the write fails.
             self.inbox.pending.lock().await.remove(&id);
             return Err(format!("Write error: {}", e));
@@ -1619,6 +1743,7 @@ impl ProcessExtension {
         match rx.await {
             Ok(payload) => payload,
             Err(_) => {
+                state.lifecycle.invalidate();
                 // Sender was dropped without sending — typically because the
                 // reader task observed EOF/error after we registered. The
                 // reader normally sends an Err first; this branch is a
@@ -1645,13 +1770,19 @@ impl ProcessExtension {
                 .await?,
             );
         }
-        self.call_once_locked(
-            state_guard.as_mut().expect("state should exist"),
-            method,
-            params,
-            id,
-        )
-        .await
+        let state = state_guard.as_mut().expect("state should exist");
+        let result = self.call_once_locked(state, method, params, id).await;
+        if method == "initialize" {
+            // Publish readiness while still serialized with replacement; never
+            // accidentally mark a newer child ready using an older response.
+            match result.as_ref() {
+                Ok(value) if Self::parse_initialize_result(&self.id, value.clone()).is_ok() => {
+                    state.lifecycle.initialized.store(true, Ordering::Release);
+                }
+                _ => state.lifecycle.invalidate(),
+            }
+        }
+        result
     }
 
     /// Send one request only if the current child is still present. Teardown
@@ -1708,7 +1839,8 @@ impl ProcessExtension {
                 *self.state.lock().await = Some(state);
             } else {
                 state.reader_handle.abort();
-                let _ = state.child.kill().await;
+                state.lifecycle.invalidate();
+                let _ = state.lifecycle.child.lock().await.kill().await;
             }
             result
         };
@@ -1973,6 +2105,11 @@ impl ProcessExtension {
 impl ExtensionHandler for ProcessExtension {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn lifecycle_snapshot(&self) -> Option<ExtensionLifecycle> {
+        let lifecycle = self.inbox.lifecycle.try_lock().ok()?.clone()?;
+        lifecycle.snapshot(self.total_restarts.load(Ordering::Relaxed) > 0)
     }
 
     async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
@@ -2275,6 +2412,7 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn shutdown(&self) {
+        self.inbox.invalidate_lifecycle().await;
         // Lease teardown is terminal for this ProcessExtension. In
         // particular, a concurrent force_shutdown may already have removed
         // the child; sending shutdown through the normal restart-capable
@@ -2290,8 +2428,8 @@ impl ExtensionHandler for ProcessExtension {
         let mut state_guard = self.state.lock().await;
         if let Some(state) = state_guard.take() {
             state.reader_handle.abort();
-            let mut child = state.child;
-            let _ = child.kill().await;
+            state.lifecycle.invalidate();
+            let _ = state.lifecycle.child.lock().await.kill().await;
         }
         // Drop all active notification subscribers and signal pending callers.
         self.inbox.notification_sinks.lock().await.clear();
@@ -2331,6 +2469,26 @@ impl ExtensionHandler for ProcessExtension {
             }
         } else {
             ExtensionHealth::Running
+        }
+    }
+}
+
+#[cfg(test)]
+mod exclusive_memory_tests {
+    use super::*;
+    #[tokio::test]
+    async fn exclusive_inbox_refuses_legacy_memory_without_writes() {
+        let mut inbox = Inbox::new("fixture".into());
+        inbox.exclusive_memory = true;
+        let inbox = Arc::new(inbox);
+        for method in ["memory.append", "memory.query"] {
+            let result = ProcessExtension::handle_inbound_request(
+                &inbox,
+                method,
+                serde_json::json!({"namespace":"fixture","content":"must not persist"}),
+            )
+            .await;
+            assert!(result.unwrap_err().1.contains("disabled"));
         }
     }
 }
@@ -2804,5 +2962,210 @@ mod invoke_command_dispatch_tests {
         // Done detection is independent of sink state.
         assert!(saw_done);
         assert!(!open);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Offline stdio fixture: read exactly one request frame, then echo its id.
+    // No Python, network, model calls, or filesystem fixtures are required.
+    async fn fixture() -> ProcessExtension {
+        let result = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {}
+        })
+        .to_string();
+        let script = format!(
+            r#"while IFS= read -r header; do
+    length=${{header#Content-Length: }}
+    length=${{length%?}}
+    IFS= read -r blank || exit 1
+    body=$(dd bs=1 count="$length" 2>/dev/null) || exit 1
+    id=${{body##*\"id\":}}
+    id=${{id%%[!0-9]*}}
+    case "$body" in
+        *'"method":"pending"'*) IFS= read -r hold; continue ;;
+    esac
+    reply='{{"jsonrpc":"2.0","id":'"$id"',"result":{result}}}'
+    printf 'Content-Length: %s\r\n\r\n%s' "${{#reply}}" "$reply"
+done"#
+        );
+        let ext = ProcessExtension::spawn("lifecycle-fixture", "/bin/sh", &["-c".into(), script])
+            .await
+            .expect("spawn offline lifecycle fixture");
+        tokio::time::timeout(Duration::from_secs(3), ext.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize fixture");
+        ext
+    }
+
+    async fn wait_failed(ext: &ProcessExtension) -> ExtensionLifecycle {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(snapshot) = ext.lifecycle_snapshot() {
+                    if snapshot.health == ExtensionHealth::Failed {
+                        return snapshot;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("lifecycle must detect failure without another RPC")
+    }
+
+    #[tokio::test]
+    async fn actual_child_exit_is_detected_while_rpc_holds_state_and_reader_is_stopped() {
+        let ext = fixture().await;
+        let before = ext.lifecycle_snapshot().expect("live snapshot");
+        assert_eq!(before.health, ExtensionHealth::Running);
+        let call_guard = ext.call_lock.lock().await;
+        let mut state_guard = ext.state.lock().await;
+        let state = state_guard.as_mut().unwrap();
+        let lifecycle = state.lifecycle.clone();
+        state.reader_handle.abort();
+        // No reader can observe EOF or close the response channel in this test.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !state.reader_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader cancellation");
+        {
+            let rpc = ext.call_once_locked(state, "pending", Value::Null, 900);
+            tokio::pin!(rpc);
+            tokio::select! {
+                biased;
+                result = &mut rpc => panic!("RPC must remain pending: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert!(ext.inbox.pending.lock().await.contains_key(&900));
+            assert_eq!(ext.lifecycle_snapshot(), Some(before));
+            lifecycle.child.lock().await.start_kill().unwrap();
+            let dead = wait_failed(&ext).await;
+            assert_ne!(dead.generation, before.generation);
+            assert_eq!(ext.lifecycle_snapshot(), Some(dead));
+            assert!(!ext.inbox.closed.load(Ordering::Acquire));
+            assert!(ext.inbox.pending.lock().await.contains_key(&900));
+        }
+        drop(state_guard);
+        drop(call_guard);
+        ext.force_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalidates_generation_before_waiting_for_rpc_lock() {
+        let ext = Arc::new(fixture().await);
+        let before = ext.lifecycle_snapshot().unwrap();
+        let call_guard = ext.call_lock.lock().await;
+        let shutdown_ext = ext.clone();
+        let shutdown = tokio::spawn(async move { shutdown_ext.shutdown().await });
+        let dead = wait_failed(&ext).await;
+        assert_ne!(dead.generation, before.generation);
+        assert!(!shutdown.is_finished());
+        drop(call_guard);
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("bounded shutdown")
+            .expect("shutdown task");
+        assert_eq!(ext.lifecycle_snapshot(), Some(dead));
+    }
+
+    #[tokio::test]
+    async fn in_place_restart_changes_generation_and_old_invalidation_is_isolated() {
+        let ext = fixture().await;
+        let before = ext.lifecycle_snapshot().unwrap();
+        let mut state = ext.state.lock().await;
+        let old = state.as_ref().unwrap().lifecycle.clone();
+        {
+            // Hold teardown at the child lock to inspect the invalidation window
+            // before a replacement can be spawned or initialized.
+            let child_guard = old.child.lock().await;
+            let restart = ext.restart_locked(&mut state);
+            tokio::pin!(restart);
+            tokio::select! {
+                biased;
+                result = &mut restart => panic!("restart must await child lock: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            let replacing = ext.lifecycle_snapshot().unwrap();
+            assert_ne!(replacing.generation, before.generation);
+            assert_eq!(replacing.health, ExtensionHealth::Failed);
+            drop(child_guard);
+            tokio::time::timeout(Duration::from_secs(5), restart)
+                .await
+                .expect("bounded restart")
+                .expect("restart fixture");
+        }
+        let after = ext.lifecycle_snapshot().unwrap();
+        assert_ne!(after.generation, before.generation);
+        assert_eq!(after.health, ExtensionHealth::Degraded);
+        assert_eq!(old.snapshot(false).unwrap().health, ExtensionHealth::Failed);
+        old.invalidate();
+        assert_eq!(ext.lifecycle_snapshot(), Some(after));
+        drop(state);
+        ext.force_shutdown().await;
+        let stopped = ext.lifecycle_snapshot().unwrap();
+        assert_ne!(stopped.generation, after.generation);
+        assert_eq!(stopped.health, ExtensionHealth::Failed);
+    }
+
+    #[tokio::test]
+    async fn transport_eof_invalidates_generation_even_while_child_is_alive() {
+        // Close stdout, but keep the actual child blocked on stdin.
+        let ext = ProcessExtension::spawn(
+            "lifecycle-eof",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "IFS= read -r trigger; exec 1>&-; IFS= read -r hold".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut state_guard = ext.state.lock().await;
+        let state = state_guard.as_mut().unwrap();
+        state.lifecycle.initialized.store(true, Ordering::Release);
+        let before = ext.lifecycle_snapshot().unwrap();
+        state
+            .stdin
+            .lock()
+            .await
+            .write_all(b"close\n")
+            .await
+            .unwrap();
+        let dead = wait_failed(&ext).await;
+        assert_ne!(dead.generation, before.generation);
+        assert!(state
+            .lifecycle
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .unwrap()
+            .is_none());
+        drop(state_guard);
+        ext.force_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn contended_child_probe_is_unavailable_without_changing_generation() {
+        let ext = fixture().await;
+        let before = ext.lifecycle_snapshot().unwrap();
+        let lifecycle = ext.inbox.lifecycle.lock().await.clone().unwrap();
+        let child_guard = lifecycle.child.lock().await;
+        assert_eq!(ext.lifecycle_snapshot(), None);
+        drop(child_guard);
+        assert_eq!(ext.lifecycle_snapshot(), Some(before));
+        let slot_guard = ext.inbox.lifecycle.lock().await;
+        assert_eq!(ext.lifecycle_snapshot(), None);
+        drop(slot_guard);
+        assert_eq!(ext.lifecycle_snapshot(), Some(before));
+        ext.force_shutdown().await;
     }
 }

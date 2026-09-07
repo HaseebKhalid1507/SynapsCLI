@@ -62,6 +62,7 @@ testing = ["agent-engine/testing"]
 signal-hook = { version = "0.3", features = ["iterator"] }
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
 serial_test = "3.4.0"
 # P5 spike: escape-level render verification — parses the ANSI byte stream a
 # real CrosstermBackend emits so tests can assert on the *parsed* screen.

@@ -25,6 +25,12 @@ cargo test --test extensions_e2e         # end-to-end with real extension proces
 cargo clippy --all-targets -- -D warnings  # linting (CI gate)
 ```
 
+**Build/test worker ceiling (user preference):** always use at most **8 workers**
+for Synaps builds/tests (`CARGO_BUILD_JOBS=8` or `cargo -j 8`, test harness
+`--test-threads=8` maximum; use `1` for PTY/environment-sensitive suites).
+Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
+to the independently built Axel sidecar; do not multiply parallel build jobs.
+
 **Minimum Rust:** 1.80 (edition 2021).
 **Config path:** `~/.synaps-cli/config` (plain `key = value`, see `crates/agent-core/src/core/config.rs`).
 **Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
@@ -209,6 +215,21 @@ Project-scoped persistent memory in `crates/agent-core/src/memory/`:
 - **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone), `memory_context` (session lifecycle control).
 
 Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
+
+Opt-in `memory.backend = axel` routes short notes, eligible context history,
+consented capture/recall, explicit history import, migration and memory retention
+to `sidecars/axel-memory-service`, independently built at an exact Axel revision.
+Axel uses one shared user-owned brain with per-repository scopes: Git worktrees
+share a random durable identity in their common Git directory. Default service is
+an installed sibling; default brain is `~/.synaps-cli/memory/axel/brain.r8`.
+Absolute `memory.axel.executable`/`memory.axel.brain` overrides remain supported.
+Linux/procfs is required. Old path scopes require explicit migration/linking;
+there is no legacy fallback or automatic private-history import. User-wide notes
+require separate `memory.user_scope = true` and explicit tool `scope=user`.
+Selection is restart-bound; `/memory` consent and `/context auto` remain separate
+host decisions. See `docs/specs/shared-axel-repositories.md`. Atomic operator migration preserves original IDs, expiry and
+deletion evidence without deleting sources or changing config. See
+`docs/specs/axel-host-backend.md` and `docs/specs/memory-migration.md`.
 
 ### Reactive Subagent Lifecycle
 
@@ -724,6 +745,21 @@ Sessions and compaction lineages can be aliased for easy resume.
 - `/chain list` — all named chains (`*` marks the active one).
 - `/chain unname <name>` — remove a chain bookmark.
 - `/chain` (no args) — show lineage + "bookmarked by: @name" if present.
+
+Experimental automatic context windows are separate from `/compact`: `/context auto`
+opts in for this runtime; `/context off` disables it; `/context status` shows the
+configured capacity and effective pressure/rollover thresholds. Persistent opt-in
+uses `context_management.mode = auto`. It keeps the same session/environment and
+archives eligible prior-window evidence before reducing active request history.
+The model reports task phases through `context_checkpoint`; short `memory_search`
+(`source=history`) and `memory_fetch` retrieve archived evidence. Default is off;
+Unix only for now. Rollover waits for a durable frontend head acknowledgement;
+journal generations prevent stale replay after head replacement. Failed saves
+block inference until recovery; this is not an exactly-once tool-effect guarantee.
+No Axel note migration is implied. See
+[context-continuation spec](docs/specs/context-continuation.md) for bounds, privacy,
+crash-recovery limits and the 140k/200k versus 250k–400k/1m policy.
+
 
 Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
 

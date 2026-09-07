@@ -402,6 +402,15 @@ impl Tool for DeferredMcpTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
+        let binding = ctx
+            .capabilities
+            .memory_backend
+            .clone()
+            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
+        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.server_tool_name)
+        {
+            return Err(crate::RuntimeError::Tool("independent MCP memory is disabled by the host-selected backend; use short memory tools".into()));
+        }
         // Without the typed session lease capability, a deferred tool NEVER
         // starts a process.
         let Some(leases) = ctx.capabilities.mcp_leases.clone() else {

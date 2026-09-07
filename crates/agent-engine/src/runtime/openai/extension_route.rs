@@ -65,6 +65,7 @@ pub(crate) async fn route_extension_provider(
     cancel: &tokio_util::sync::CancellationToken,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
+    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -338,12 +339,15 @@ pub(crate) async fn route_extension_provider(
                         tx_events: None,
                     },
                     capabilities: ToolCapabilities {
+                        launch_cancel: None,
+                        memory_backend: memory_backend.cloned(),
                         watcher_exit_path: None,
                         tool_register_tx: None,
                         session_manager: None,
                         subagent_registry: None,
                         event_queue: None,
                         delegation_parent: None,
+                        codex_parent_plan: None,
                         secret_prompt: None,
                         orchestration: None,
                         tool_activation: None,

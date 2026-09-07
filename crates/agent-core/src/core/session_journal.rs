@@ -1,22 +1,31 @@
-//! Task 35 — opt-in session journal + periodic atomic snapshots (spec §9.8;
-//! decision record: docs/decisions/T35-session-journal-opt-in.md).
+//! Session snapshots with opt-in delta journals and durable checkpoints.
 //!
-//! The DEFAULT persistence (`SessionPersistence::Json`) is byte-for-byte the
-//! legacy path: every save atomically rewrites `sessions/<id>.json`. The
-//! opt-in `Journal` mode is purely ADDITIVE: the snapshot file keeps the
-//! unchanged legacy `Session` schema, and an append-only `sessions/<id>.journal`
-//! (JSONL, schema v1) carries the deltas since the snapshot, so a steady-state
-//! save costs O(delta) instead of O(total history).
+//! New journal snapshots carry a storage-only `_journal_generation` UUID;
+//! v2 journals replay ONLY against that exact generation. Publishing a new
+//! snapshot is the logical commit, even if a crash leaves the old journal.
+//! Unmarked legacy snapshots still accept v1 journals. Their pre-migration
+//! crash ambiguity cannot be repaired retrospectively. Old binaries can read
+//! the Session-shaped snapshot but cannot replay v2 deltas; downgrade/export
+//! should first fold the journal with a JSON save using this implementation.
 //!
-//! Replay is IDEMPOTENT by construction — `msg` records carry absolute
-//! history indices (`i == len` appends, `i < len` skips, `i > len` stops at
-//! the last consistent prefix) and `meta` records only apply when their
-//! `updated_at` is not older than the loaded state. Torn tails (kill during
-//! append), stale journals (kill between snapshot and journal reset), and
-//! manual journal deletion therefore all recover to a consistent session.
+//! Normal JSON saves retain the legacy bytes when no journal/generation has
+//! ever been present. Once bound, all snapshot replacements (including JSON
+//! saves) rotate the generation so leftover journals cannot resurrect history.
+//! Metadata is not a Session field: serde exports/mirrors ignore it. Stripping
+//! it loses v2 deltas, rather than applying a potentially unrelated journal.
 //!
-//! Everything here writes through the T4 `private_fs` helpers: 0700 dirs,
-//! 0600 files, symlink-refusing, atomic snapshot replacement, synced appends.
+//! Journal appends write O(delta) bytes; a streaming history hash checks the
+//! entire saved prefix for edits (O(history) CPU, no history-sized allocation).
+//! Journal-bound snapshot rotation syncs the snapshot directory before removing
+//! old deltas; JSON-only normal saves retain their prior best-effort behavior.
+//! Durable saves always publish a full snapshot and sync through cleanup.
+//! Errors can follow logical commit;
+//! callers must stop and reload/retry, not assume rollback. All saves of one
+//! session must be externally serialized; no multi-writer transaction is offered.
+//!
+//! Private 0700/0600, no-symlink handle-relative I/O is preserved on Unix.
+//! Normal saves retain the documented non-Unix best effort; durable saves
+//! fail closed there rather than pretend directory fsync is supported.
 
 use crate::core::session::Session;
 use crate::core::stream_types::SharedMessage;
@@ -26,7 +35,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Journal record schema version (line-level `"v"` field).
-pub const JOURNAL_SCHEMA_VERSION: u8 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u8 = 2;
 
 /// Journal size floor before a periodic snapshot is forced.
 pub const JOURNAL_SNAPSHOT_MIN_BYTES: u64 = 256 * 1024;
@@ -248,8 +257,8 @@ pub fn session_dir_entries(dir: &Path) -> std::io::Result<Vec<SessionDirEntry>> 
 
 /// Which on-disk persistence strategy `Session::save` uses.
 ///
-/// `Json` (the default) is the unchanged legacy behavior. `Journal` is the
-/// spec §9.8 opt-in and is only ever selected explicitly via the
+/// `Json` (the default) writes a full Session-shaped snapshot. `Journal` is
+/// the spec §9.8 opt-in and is only ever selected explicitly via the
 /// `session_persistence = journal` config key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionPersistence {
@@ -273,7 +282,7 @@ impl SessionPersistence {
 /// How a save landed on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveMode {
-    /// Full legacy-schema snapshot written (and, in journal mode, the
+    /// Full Session-shaped snapshot written (and, in journal mode, the
     /// journal reset to a lone `open` record).
     FullSnapshot,
     /// Delta append: `messages` new history entries plus one meta record.
@@ -315,7 +324,14 @@ pub fn snapshot_due(journal_bytes: u64, snapshot_bytes: u64) -> bool {
 enum JournalRecord {
     /// First line of every journal: the snapshot held `base` messages.
     #[serde(rename = "open")]
-    Open { v: u8, base: usize },
+    Open {
+        v: u8,
+        base: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_hash: Option<String>,
+    },
     /// Message at ABSOLUTE history index `i`.
     #[serde(rename = "msg")]
     Msg {
@@ -325,7 +341,12 @@ enum JournalRecord {
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
-    Meta { v: u8, meta: Box<SessionMeta> },
+    Meta {
+        v: u8,
+        meta: Box<SessionMeta>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_hash: Option<String>,
+    },
 }
 
 /// Mirror of [`Session`] WITHOUT `api_messages`, with identical serde
@@ -403,128 +424,187 @@ impl SessionMeta {
     }
 }
 
-/// Parsed view of an on-disk journal: the durable message count implied by
-/// the contiguous valid prefix, the last durable message (tripwire), and
-/// whether every line parsed cleanly (a torn tail forces a resnapshot so
-/// later appends are never shadowed behind an unparseable line).
+/// A binding is deliberately outside Session/SessionMeta. It is emitted
+/// before `api_messages`, so listings and append checks need only the header.
+#[derive(Default, Deserialize)]
+struct SnapshotBinding {
+    #[serde(default, rename = "_journal_generation")]
+    generation: Option<String>,
+}
+
+fn snapshot_binding(file: std::fs::File) -> std::io::Result<SnapshotBinding> {
+    let header = crate::core::session::read_session_header_from_file(file)
+        .ok_or_else(|| std::io::Error::other("cannot read session snapshot header"))?;
+    serde_json::from_str(&header).map_err(std::io::Error::other)
+}
+
+/// v1 is interpretable only against an unmarked legacy snapshot. A bound
+/// snapshot must never fall back to v1, even for an empty/torn v2 journal.
+fn matching_open(record: &JournalRecord, snapshot_generation: Option<&str>) -> Option<u8> {
+    match record {
+        JournalRecord::Open {
+            v: 1,
+            generation: None,
+            ..
+        } if snapshot_generation.is_none() => Some(1),
+        JournalRecord::Open {
+            v,
+            generation: Some(generation),
+            ..
+        } if *v == JOURNAL_SCHEMA_VERSION
+            && !generation.is_empty()
+            && Some(generation.as_str()) == snapshot_generation =>
+        {
+            Some(*v)
+        }
+        _ => None,
+    }
+}
+
+/// Hash the exact ordered prefix, including all message fields. Unlike the
+/// old last-message tripwire this detects same-length edits anywhere, even
+/// when the journal contains only its open record. Uses the existing sha2 dep.
+fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, messages).map_err(std::io::Error::other)?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
+/// Only clean, generation-matched v2 journals can be appended to. Legacy
+/// saves migrate through a full snapshot; torn/gapped tails resnapshot too.
 struct JournalState {
     durable_len: usize,
-    last_msg: Option<(usize, serde_json::Value)>,
+    history_hash: String,
     bytes: u64,
-    clean: bool,
 }
 
 fn read_journal_state(
     handle: &SessionsDirHandle,
     id: &str,
+    generation: Option<&str>,
 ) -> std::io::Result<Option<JournalState>> {
     let Some(raw) = read_artifact_bytes(handle, &format!("{id}.journal"))? else {
         return Ok(None);
     };
-    let bytes = raw.len() as u64;
-    let text = String::from_utf8_lossy(&raw);
+    if !raw.ends_with(b"\n") {
+        return Ok(None); // appending after an unterminated line would hide data
+    }
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        return Ok(None);
+    };
     let mut lines = text.lines();
-
-    let Some(first) = lines.next() else {
-        return Ok(Some(JournalState {
-            durable_len: 0,
-            last_msg: None,
-            bytes,
-            clean: false,
-        }));
+    let Some(open) = lines
+        .next()
+        .and_then(|s| serde_json::from_str::<JournalRecord>(s).ok())
+    else {
+        return Ok(None);
     };
-    let base = match serde_json::from_str::<JournalRecord>(first) {
-        // fix1 M1: only the CURRENT schema version is interpretable. An
-        // unsupported open version invalidates the whole journal — its
-        // record semantics are unknown, so nothing may replay or be
-        // appended behind it.
-        Ok(JournalRecord::Open { v, base }) if v == JOURNAL_SCHEMA_VERSION => base,
-        _ => {
-            // No/invalid/unsupported open record: the journal is unusable
-            // as an append target — resnapshot.
-            return Ok(Some(JournalState {
-                durable_len: 0,
-                last_msg: None,
-                bytes,
-                clean: false,
-            }));
-        }
+    if matching_open(&open, generation) != Some(JOURNAL_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let JournalRecord::Open {
+        base,
+        history_hash: Some(mut hash),
+        ..
+    } = open
+    else {
+        return Ok(None);
     };
-
     let mut durable_len = base;
-    let mut last_msg = None;
-    let mut clean = true;
+    let mut hashed_len = base;
     for line in lines {
         match serde_json::from_str::<JournalRecord>(line) {
-            // fix1 M1: a record from an unknown schema version ends the
-            // valid prefix — the next save must resnapshot.
-            Ok(JournalRecord::Msg { v, .. }) | Ok(JournalRecord::Meta { v, .. })
-                if v != JOURNAL_SCHEMA_VERSION =>
+            Ok(JournalRecord::Msg { v, i, .. })
+                if v == JOURNAL_SCHEMA_VERSION && i == durable_len =>
             {
-                clean = false;
-                break;
+                durable_len += 1;
             }
-            Ok(JournalRecord::Msg { i, m, .. }) => {
-                if i == durable_len {
-                    durable_len += 1;
-                    last_msg = Some((i, m));
-                } else if i > durable_len {
-                    clean = false; // gap — inconsistent suffix
-                    break;
-                }
-                // i < durable_len: stale duplicate, ignore.
+            Ok(JournalRecord::Meta {
+                v,
+                meta,
+                history_hash: Some(next_hash),
+            }) if v == JOURNAL_SCHEMA_VERSION
+                && meta.id == id
+                && meta.message_count == Some(durable_len) =>
+            {
+                hash = next_hash;
+                hashed_len = durable_len;
             }
-            Ok(JournalRecord::Meta { .. }) => {}
-            Ok(JournalRecord::Open { .. }) | Err(_) => {
-                clean = false; // torn tail or nested open
-                break;
-            }
+            _ => return Ok(None),
         }
+    }
+    if hashed_len != durable_len {
+        return Ok(None); // messages without a complete committing meta record
     }
     Ok(Some(JournalState {
         durable_len,
-        last_msg,
-        bytes,
-        clean,
+        history_hash: hash,
+        bytes: raw.len() as u64,
     }))
 }
 
 // ─── save ────────────────────────────────────────────────────────────────────
 
-/// Persist `session` into `dir` under the given persistence mode.
-///
-/// `Json` (default): the unchanged legacy path — one atomic private
-/// `<id>.json` — plus rollback folding: any journal left over from a
-/// previous opt-in is deleted, because the fresh snapshot supersedes it.
-///
-/// `Journal`: append the delta since the last durable state; write a fresh
-/// snapshot instead when the journal is missing/unusable, the history
-/// shrank or its durable tail was edited (append-only tripwires), or the
-/// journal outgrew [`snapshot_due`].
+/// Persist under the configured mode. Journal-bound replacement syncs the
+/// snapshot directory before discarding old deltas; normal JSON-only saves do
+/// not promise directory durability. Use [`save_session_durable_in_dir`] for a
+/// full context-head barrier. Snapshot replacements are generation-safe in both.
 pub fn save_session_in_dir(
     dir: &Path,
     session: &Session,
     mode: SessionPersistence,
 ) -> std::io::Result<SaveReceipt> {
-    // ONE strict resolution per save (fix2); every artifact operation below
-    // is relative to this handle.
     let handle = create_sessions_dir(dir)?;
-    // The persisted listing hint (`message_count`) is refreshed at write
-    // time by `snapshot_json` / `SessionMeta::of` — no `Session` clone, so
-    // the journal delta path stays O(delta) rather than O(history).
     match mode {
         SessionPersistence::Json => {
-            let json = snapshot_json(session)?;
-            handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
-            // Rollback fold: the snapshot now holds everything; a stale
-            // journal must not shadow future legacy-only readers.
-            remove_artifact_if_exists(&handle, &format!("{}.journal", session.id))?;
-            Ok(SaveReceipt {
-                mode: SaveMode::FullSnapshot,
-                bytes_written: json.len() as u64,
-            })
+            // Keep virgin JSON-only saves byte-compatible. Once a journal or
+            // generation exists, never publish an unmarked snapshot again.
+            let journal = open_artifact(&handle, &format!("{}.journal", session.id))?;
+            let bound =
+                open_artifact(&handle, &format!("{}.json", session.id))?.is_some_and(|file| {
+                    // An unreadable/oversized header must not prevent repair
+                    // by a full save; conservatively rotate the generation.
+                    snapshot_binding(file).map_or(true, |b| b.generation.is_some())
+                });
+            publish_snapshot(&handle, session, mode, false, journal.is_some() || bound)
         }
         SessionPersistence::Journal => save_journal_mode(&handle, session),
+    }
+}
+
+/// Blocking body of `Session::save_durable`: a full generation-bound snapshot
+/// in either mode. Fsync the file, rename it, fsync the directory, then clean
+/// up the journal and fsync the directory again. Snapshot rename is the logical
+/// commit; any later error is returned without rollback. Retry/reload is safe
+/// with stale journals. Concurrent saves of the same session are NOT supported.
+pub fn save_session_durable_in_dir(
+    dir: &Path,
+    session: &Session,
+    mode: SessionPersistence,
+) -> std::io::Result<SaveReceipt> {
+    #[cfg(unix)]
+    {
+        let handle = SessionsDirHandle::create_absolute_no_symlinks_durable(dir)?;
+        publish_snapshot(&handle, session, mode, true, true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, session, mode);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable session checkpoints require Unix directory fsync",
+        ))
     }
 }
 
@@ -535,24 +615,21 @@ fn save_journal_mode(
     let journal_name = format!("{}.journal", session.id);
 
     let snapshot = open_artifact(handle, &format!("{}.json", session.id))?;
-    let state = match read_journal_state(handle, &session.id)? {
-        Some(state) if snapshot.is_some() => state,
-        // First journal-mode save of a new or legacy session (or the
-        // snapshot vanished out-of-band): full snapshot + fresh journal.
-        _ => return full_snapshot_reset(handle, session),
+    let Some(snapshot) = snapshot else {
+        return full_snapshot_reset(handle, session);
+    };
+    let snapshot_bytes = snapshot.metadata()?.len();
+    let Ok(binding) = snapshot_binding(snapshot) else {
+        return full_snapshot_reset(handle, session);
+    };
+    let Some(state) = read_journal_state(handle, &session.id, binding.generation.as_deref())?
+    else {
+        return full_snapshot_reset(handle, session);
     };
 
-    // Append-only tripwires — anything the journal cannot express safely
-    // becomes a fresh atomic snapshot instead.
-    let rewrite_needed = !state.clean
-        || session.api_messages.len() < state.durable_len
-        || state.last_msg.as_ref().is_some_and(|(i, m)| {
-            session
-                .api_messages
-                .get(*i)
-                .map_or(true, |live| live.as_ref() != m)
-        });
-    if rewrite_needed {
+    if session.api_messages.len() < state.durable_len
+        || history_hash(&session.api_messages[..state.durable_len])? != state.history_hash
+    {
         return full_snapshot_reset(handle, session);
     }
 
@@ -570,6 +647,7 @@ fn save_journal_mode(
     let meta = JournalRecord::Meta {
         v: JOURNAL_SCHEMA_VERSION,
         meta: Box::new(SessionMeta::of(session)),
+        history_hash: Some(history_hash(&session.api_messages)?),
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -580,14 +658,9 @@ fn save_journal_mode(
     file.sync_data()?;
     drop(file);
 
-    // Periodic snapshot: fold an oversized journal back into the atomic
-    // snapshot. Crash between the two steps leaves a stale journal whose
-    // records replay idempotently (see module docs).
+    // Periodic snapshot: its fresh generation invalidates the old journal
+    // at publication, before the journal reset can occur.
     let journal_bytes = state.bytes + buf.len() as u64;
-    let snapshot_bytes = snapshot
-        .and_then(|f| f.metadata().ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
     if snapshot_due(journal_bytes, snapshot_bytes) {
         let reset = full_snapshot_reset(handle, session)?;
         return Ok(SaveReceipt {
@@ -602,9 +675,6 @@ fn save_journal_mode(
     })
 }
 
-/// Atomic full snapshot (unchanged legacy schema) followed by an atomic
-/// journal reset to a lone `open` record. Snapshot strictly first: a crash
-/// between the two leaves a stale-but-idempotent journal, never data loss.
 /// Borrowing mirror of [`Session`] used ONLY for snapshot serialization:
 /// identical field order and serde attributes, with `message_count`
 /// computed from `api_messages.len()` at write time instead of read from
@@ -613,6 +683,10 @@ fn save_journal_mode(
 /// The `snapshot_json_matches_session_schema` test guards drift.
 #[derive(Serialize)]
 struct SessionSnapshotRef<'a> {
+    // Storage-only metadata, omitted for legacy JSON-only saves. Session
+    // serde deliberately ignores it; it is not journaled as SessionMeta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _journal_generation: Option<&'a str>,
     id: &'a str,
     title: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -640,8 +714,9 @@ struct SessionSnapshotRef<'a> {
 }
 
 impl<'a> SessionSnapshotRef<'a> {
-    fn of(s: &'a Session) -> Self {
+    fn of(s: &'a Session, generation: Option<&'a str>) -> Self {
         Self {
+            _journal_generation: generation,
             id: &s.id,
             title: &s.title,
             name: &s.name,
@@ -664,30 +739,78 @@ impl<'a> SessionSnapshotRef<'a> {
     }
 }
 
-/// Full-snapshot JSON with a fresh `message_count`, without cloning.
-fn snapshot_json(session: &Session) -> std::io::Result<String> {
-    serde_json::to_string(&SessionSnapshotRef::of(session)).map_err(std::io::Error::other)
+/// Full-snapshot JSON with fresh count and optional storage-only binding.
+fn snapshot_json(session: &Session, generation: Option<&str>) -> std::io::Result<String> {
+    serde_json::to_string(&SessionSnapshotRef::of(session, generation))
+        .map_err(std::io::Error::other)
 }
 
 fn full_snapshot_reset(
     handle: &SessionsDirHandle,
     session: &Session,
 ) -> std::io::Result<SaveReceipt> {
-    let json = snapshot_json(session)?;
+    publish_snapshot(handle, session, SessionPersistence::Journal, false, true)
+}
+
+fn publish_snapshot(
+    handle: &SessionsDirHandle,
+    session: &Session,
+    mode: SessionPersistence,
+    durable: bool,
+    bind: bool,
+) -> std::io::Result<SaveReceipt> {
+    let generation = bind.then(|| uuid::Uuid::new_v4().to_string());
+    let json = snapshot_json(session, generation.as_deref())?;
+    // Prepare all serialization BEFORE the logical commit.
+    let mut journal = Vec::new();
+    if mode == SessionPersistence::Journal {
+        let open = JournalRecord::Open {
+            v: JOURNAL_SCHEMA_VERSION,
+            base: session.api_messages.len(),
+            generation,
+            history_hash: Some(history_hash(&session.api_messages)?),
+        };
+        serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
+        journal.push(b'\n');
+    }
+    // Preflight journal symlinks in either mode, even JSON cleanup (which
+    // otherwise only unlinks). This does not claim multi-writer isolation.
+    open_artifact(handle, &format!("{}.journal", session.id))?;
     handle.write_atomic(&format!("{}.json", session.id), json.as_bytes())?;
-
-    let open = JournalRecord::Open {
-        v: JOURNAL_SCHEMA_VERSION,
-        base: session.api_messages.len(),
-    };
-    let mut line = serde_json::to_vec(&open).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    handle.write_atomic(&format!("{}.journal", session.id), &line)?;
-
+    // Before destroying the old journal, the new snapshot must be durable.
+    // Binding prevents new-snapshot/old-journal replay, but without this sync
+    // a power loss could recover old-snapshot/new-journal and lose deltas.
+    #[cfg(unix)]
+    if durable || bind {
+        sync_sessions_dir(handle)?;
+    }
+    if mode == SessionPersistence::Journal {
+        handle.write_atomic(&format!("{}.journal", session.id), &journal)?;
+    } else {
+        remove_artifact_if_exists(handle, &format!("{}.journal", session.id))?;
+    }
+    if durable {
+        sync_sessions_dir(handle)?;
+    }
     Ok(SaveReceipt {
         mode: SaveMode::FullSnapshot,
-        bytes_written: json.len() as u64 + line.len() as u64,
+        bytes_written: json.len() as u64 + journal.len() as u64,
     })
+}
+
+fn sync_sessions_dir(handle: &SessionsDirHandle) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        handle.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = handle;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable session checkpoints require Unix directory fsync",
+        ))
+    }
 }
 
 // ─── load ────────────────────────────────────────────────────────────────────
@@ -711,6 +834,8 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             format!("no session snapshot for '{id}'"),
         )
     })?;
+    let binding: SnapshotBinding =
+        serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
@@ -718,18 +843,19 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
     };
     let text = String::from_utf8_lossy(&raw);
     let mut lines = text.lines();
-    // The first line must be an open record OF THE SUPPORTED VERSION;
-    // otherwise the whole journal is untrusted and the snapshot alone is
-    // the consistent state (fix1 M1).
-    match lines.next().map(serde_json::from_str::<JournalRecord>) {
-        Some(Ok(JournalRecord::Open { v, .. })) if v == JOURNAL_SCHEMA_VERSION => {}
-        _ => return Ok(session),
-    }
+    let version = match lines
+        .next()
+        .and_then(|s| serde_json::from_str::<JournalRecord>(s).ok())
+        .and_then(|open| matching_open(&open, binding.generation.as_deref()))
+    {
+        Some(version) => version,
+        None => return Ok(session),
+    };
     for line in lines {
         match serde_json::from_str::<JournalRecord>(line) {
             // fix1 M1: an unknown-version record ends the valid prefix.
             Ok(JournalRecord::Msg { v, .. }) | Ok(JournalRecord::Meta { v, .. })
-                if v != JOURNAL_SCHEMA_VERSION =>
+                if v != version =>
             {
                 break;
             }
@@ -757,8 +883,35 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
 /// complete supported-version meta record, or a refused (non-confined)
 /// artifact — a symlinked journal discloses nothing.
 pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = confined_open(dir, &format!("{id}.journal")).ok()??;
+    let handle = open_sessions_dir(dir).ok()??;
+    let binding = snapshot_binding(open_artifact(&handle, &format!("{id}.json")).ok()??).ok()?;
+    journal_meta_tail_from_handle(&handle, id, binding.generation.as_deref())
+}
+
+/// Listings already read a snapshot header: use THAT generation rather than
+/// reopening a possibly replaced snapshot and mixing two checkpoint heads.
+pub(crate) fn journal_meta_tail_for_generation(
+    dir: &Path,
+    id: &str,
+    generation: Option<&str>,
+) -> Option<JournalMetaTail> {
+    let handle = open_sessions_dir(dir).ok()??;
+    journal_meta_tail_from_handle(&handle, id, generation)
+}
+
+fn journal_meta_tail_from_handle(
+    handle: &SessionsDirHandle,
+    id: &str,
+    generation: Option<&str>,
+) -> Option<JournalMetaTail> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    let mut file = open_artifact(handle, &format!("{id}.journal")).ok()??;
+    let mut first = String::new();
+    BufReader::new((&mut file).take(4096))
+        .read_line(&mut first)
+        .ok()?;
+    let open: JournalRecord = serde_json::from_str(&first).ok()?;
+    let version = matching_open(&open, generation)?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(META_TAIL_WINDOW);
     file.seek(SeekFrom::Start(start)).ok()?;
@@ -767,8 +920,9 @@ pub fn journal_meta_tail(dir: &Path, id: &str) -> Option<JournalMetaTail> {
 
     let mut freshest = None;
     for line in tail.lines() {
-        if let Ok(JournalRecord::Meta { v, meta }) = serde_json::from_str::<JournalRecord>(line) {
-            if v == JOURNAL_SCHEMA_VERSION {
+        if let Ok(JournalRecord::Meta { v, meta, .. }) = serde_json::from_str::<JournalRecord>(line)
+        {
+            if v == version && meta.id == id {
                 freshest = Some(JournalMetaTail {
                     updated_at: meta.updated_at,
                     session_cost: meta.session_cost,
@@ -833,15 +987,15 @@ mod tests {
         let mut expected = s.clone();
         expected.message_count = expected.api_messages.len();
         let expected = serde_json::to_string(&expected).unwrap();
-        assert_eq!(snapshot_json(&s).unwrap(), expected);
-        let back: Session = serde_json::from_str(&snapshot_json(&s).unwrap()).unwrap();
+        assert_eq!(snapshot_json(&s, None).unwrap(), expected);
+        let back: Session = serde_json::from_str(&snapshot_json(&s, None).unwrap()).unwrap();
         assert_eq!(back.message_count, 1);
         // Same check with every optional absent.
         let s = Session::new("model-x", "medium", None);
         let mut expected = s.clone();
         expected.message_count = 0;
         assert_eq!(
-            snapshot_json(&s).unwrap(),
+            snapshot_json(&s, None).unwrap(),
             serde_json::to_string(&expected).unwrap()
         );
     }
@@ -876,6 +1030,312 @@ mod tests {
         assert_eq!(b.total_input_tokens, 7);
         assert_eq!(b.session_cost, 0.5);
         assert_eq!(b.updated_at, a.updated_at);
+    }
+
+    fn with_messages(n: usize) -> Session {
+        let mut s = Session::new("checkpoint-test", "medium", None);
+        for i in 0..n {
+            push_message(&mut s, &format!("old {i}"));
+        }
+        s
+    }
+
+    fn push_message(s: &mut Session, text: &str) {
+        s.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": text}),
+        ));
+    }
+
+    fn assert_saved(dir: &Path, expected: &Session) {
+        let loaded = load_session_in_dir(dir, &expected.id).unwrap();
+        let mut expected = expected.clone();
+        expected.message_count = expected.api_messages.len();
+        // message_count is a snapshot hint, not authoritative after replay.
+        let mut loaded = loaded;
+        loaded.message_count = loaded.api_messages.len();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    fn disk_generation(dir: &Path, id: &str) -> String {
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{id}.json"))).unwrap())
+                .unwrap();
+        snapshot["_journal_generation"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn bound_snapshot_is_session_shaped_and_storage_metadata_is_not_mirrored() {
+        let s = with_messages(2);
+        let json = snapshot_json(&s, Some("test-generation")).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("_journal_generation")
+                .unwrap(),
+            "test-generation"
+        );
+        let mut expected = s.clone();
+        expected.message_count = 2;
+        assert_eq!(value, serde_json::to_value(&expected).unwrap());
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_value(back).unwrap(), value);
+        value.as_object_mut().unwrap().remove("api_messages");
+        serde_json::from_value::<SessionMeta>(value).unwrap();
+    }
+
+    /// Recreate the exact two-file state of a crash after snapshot rename but
+    /// before journal reset/unlink: keep the newly published snapshot and put
+    /// back the old journal bytes. No clocks, processes, config, or real data.
+    fn replacement_crash_case(mode: SessionPersistence, durable: bool, shorten: bool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        for _ in 0..4 {
+            push_message(&mut s, "obsolete journal message");
+        }
+        s.title = "obsolete metadata".into();
+        s.updated_at += chrono::Duration::hours(1);
+        s.session_cost = 99.0;
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let old = std::fs::read(journal_path(&dir, &s.id)).unwrap();
+        let old_generation = disk_generation(&dir, &s.id);
+
+        // Even same-length edits with an unchanged final message must commit.
+        s.api_messages[0] =
+            std::sync::Arc::new(serde_json::json!({"role":"user","content":"new head"}));
+        if shorten {
+            s.api_messages.truncate(3);
+        }
+        s.title = "candidate".into();
+        s.updated_at -= chrono::Duration::hours(2); // old metadata would win by timestamp alone
+        s.session_cost = 1.0;
+        let receipt = if durable {
+            save_session_durable_in_dir(&dir, &s, mode).unwrap()
+        } else {
+            save_session_in_dir(&dir, &s, mode).unwrap()
+        };
+        assert_eq!(receipt.mode, SaveMode::FullSnapshot);
+        assert_ne!(disk_generation(&dir, &s.id), old_generation);
+        std::fs::write(journal_path(&dir, &s.id), old).unwrap();
+        assert_saved(&dir, &s);
+        assert!(journal_meta_tail(&dir, &s.id).is_none());
+
+        // A subsequent normal save must not append into the stale generation.
+        push_message(&mut s, "post-checkpoint");
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert_eq!(receipt.mode, SaveMode::FullSnapshot);
+        assert_saved(&dir, &s);
+        push_message(&mut s, "new generation delta");
+        assert_eq!(
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal)
+                .unwrap()
+                .mode,
+            SaveMode::Append { messages: 1 }
+        );
+        assert_saved(&dir, &s);
+    }
+
+    #[test]
+    fn normal_replacements_ignore_stale_journal_after_snapshot_publication() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            for shorten in [false, true] {
+                replacement_crash_case(mode, false, shorten);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_replacements_ignore_stale_journal_after_snapshot_publication() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            for shorten in [false, true] {
+                replacement_crash_case(mode, true, shorten);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_v1_reads_then_migrates_and_cannot_replay_over_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut s = with_messages(1);
+        std::fs::write(
+            dir.join(format!("{}.json", s.id)),
+            snapshot_json(&s, None).unwrap(),
+        )
+        .unwrap();
+        let mut legacy = vec![JournalRecord::Open {
+            v: 1,
+            base: 1,
+            generation: None,
+            history_hash: None,
+        }];
+        for i in 1..5 {
+            push_message(&mut s, "legacy delta");
+            legacy.push(JournalRecord::Msg {
+                v: 1,
+                i,
+                m: s.api_messages[i].as_ref().clone(),
+            });
+        }
+        s.title = "legacy title".into();
+        s.updated_at += chrono::Duration::hours(1);
+        legacy.push(JournalRecord::Meta {
+            v: 1,
+            meta: Box::new(SessionMeta::of(&s)),
+            history_hash: None,
+        });
+        let mut bytes = Vec::new();
+        for record in legacy {
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(journal_path(&dir, &s.id), &bytes).unwrap();
+        assert_saved(&dir, &s);
+        assert_eq!(
+            journal_meta_tail(&dir, &s.id).unwrap().message_count,
+            Some(5)
+        );
+        let migrated = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(
+            save_session_in_dir(&dir, &migrated, SessionPersistence::Journal)
+                .unwrap()
+                .mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(&dir, &s);
+        assert!(!disk_generation(&dir, &s.id).is_empty());
+
+        s.api_messages.truncate(2);
+        s.title = "new window".into();
+        s.updated_at -= chrono::Duration::hours(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        std::fs::write(journal_path(&dir, &s.id), &bytes).unwrap();
+        assert_saved(&dir, &s);
+        assert!(journal_meta_tail(&dir, &s.id).is_none());
+    }
+
+    #[test]
+    fn same_length_edits_in_snapshot_or_earlier_journal_message_resnapshot() {
+        for appended in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            let mut s = with_messages(3);
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            let edited = if appended {
+                push_message(&mut s, "editable");
+                push_message(&mut s, "unchanged last message");
+                save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+                3
+            } else {
+                0
+            };
+            let old_generation = disk_generation(&dir, &s.id);
+            std::sync::Arc::make_mut(&mut s.api_messages[edited])["content"] = "replaced".into();
+            assert_eq!(
+                save_session_in_dir(&dir, &s, SessionPersistence::Journal)
+                    .unwrap()
+                    .mode,
+                SaveMode::FullSnapshot
+            );
+            assert_ne!(disk_generation(&dir, &s.id), old_generation);
+            assert_saved(&dir, &s);
+        }
+    }
+
+    #[test]
+    fn v2_never_replays_without_binding_or_across_record_versions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut s = with_messages(1);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let first = std::fs::read(journal_path(&dir, &s.id)).unwrap();
+        push_message(&mut s, "v2 delta");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let snapshot: Session =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{}.json", s.id))).unwrap())
+                .unwrap();
+        // A generic Session serde mirror drops only the storage metadata.
+        std::fs::write(
+            dir.join(format!("{}.json", s.id)),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert_saved(&dir, &snapshot); // never apply an unbound v2 delta
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let bound_snapshot = s.clone();
+        let mut journal = std::fs::read(journal_path(&dir, &s.id)).unwrap();
+        journal.extend_from_slice(
+            b"{\"v\":1,\"k\":\"msg\",\"i\":2,\"m\":{\"content\":\"wrong version\"}}\n",
+        );
+        std::fs::write(journal_path(&dir, &s.id), &journal).unwrap();
+        assert_saved(&dir, &bound_snapshot);
+        assert_eq!(
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal)
+                .unwrap()
+                .mode,
+            SaveMode::FullSnapshot
+        );
+        // Restoring an older *v2* open also invalidates the whole overlay.
+        std::fs::write(journal_path(&dir, &s.id), first).unwrap();
+        assert_saved(&dir, &s);
+    }
+
+    #[test]
+    fn json_saves_keep_binding_even_after_journal_deletion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        push_message(&mut s, "old delta");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let journal = std::fs::read(journal_path(&dir, &s.id)).unwrap();
+        save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+        let generation = disk_generation(&dir, &s.id);
+        s.api_messages.truncate(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+        assert_ne!(generation, disk_generation(&dir, &s.id));
+        std::fs::write(journal_path(&dir, &s.id), journal).unwrap();
+        assert_saved(&dir, &s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_error_after_rename_keeps_candidate_and_retry_is_safe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        push_message(&mut s, "old delta");
+        push_message(&mut s, "more old history");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let old_journal = std::fs::read(journal_path(&dir, &s.id)).unwrap();
+        let old_generation = disk_generation(&dir, &s.id);
+        s.api_messages.truncate(2);
+        s.title = "durable candidate".into();
+        // Snapshot fsync/rename/dir fsync succeeds; journal temp cleanup fails.
+        let blocker = dir.join(format!("{}.journal.tmp", s.id));
+        std::fs::create_dir(&blocker).unwrap();
+        let error = save_session_durable_in_dir(&dir, &s, SessionPersistence::Journal).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_ne!(old_generation, disk_generation(&dir, &s.id));
+        assert_eq!(
+            std::fs::read(journal_path(&dir, &s.id)).unwrap(),
+            old_journal
+        );
+        assert_saved(&dir, &s); // Err did NOT roll back the published head
+        std::fs::remove_dir(blocker).unwrap();
+        save_session_durable_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert_saved(&dir, &s);
     }
 
     /// Private modes (spec §5.4): journal-mode saves keep the 0700 dir and
@@ -918,6 +1378,67 @@ mod tests {
         }
 
         #[test]
+        #[serial(umask)]
+        fn durable_files_are_private_in_both_modes_and_repair_leaf_modes() {
+            let _umask = UmaskGuard::set(0);
+            for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("new/profile/sessions");
+                let s = with_messages(2);
+                save_session_durable_in_dir(&dir, &s, mode).unwrap();
+                assert_eq!(mode_of(dir.parent().unwrap()), 0o700);
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+                let snapshot = dir.join(format!("{}.json", s.id));
+                std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o666))
+                    .unwrap();
+                save_session_durable_in_dir(&dir, &s, mode).unwrap();
+                assert_eq!(mode_of(&dir), 0o700);
+                assert_eq!(mode_of(&snapshot), 0o600);
+                if mode == SessionPersistence::Journal {
+                    assert_eq!(mode_of(&journal_path(&dir, &s.id)), 0o600);
+                }
+                assert_saved(&dir, &s);
+            }
+        }
+
+        #[test]
+        fn durable_saves_refuse_artifact_and_ancestor_symlinks_in_both_modes() {
+            for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+                for extension in ["json", "journal"] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let root = tmp.path().canonicalize().unwrap();
+                    let dir = root.join("sessions");
+                    std::fs::create_dir(&dir).unwrap();
+                    let victim = root.join("victim");
+                    std::fs::write(&victim, "original").unwrap();
+                    let s = with_messages(1);
+                    std::os::unix::fs::symlink(
+                        &victim,
+                        dir.join(format!("{}.{}", s.id, extension)),
+                    )
+                    .unwrap();
+                    assert!(save_session_durable_in_dir(&dir, &s, mode).is_err());
+                    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+                }
+                let tmp = tempfile::TempDir::new().unwrap();
+                let root = tmp.path().canonicalize().unwrap();
+                let victim_dir = root.join("victim-dir");
+                std::fs::create_dir(&victim_dir).unwrap();
+                let link = root.join("link");
+                std::os::unix::fs::symlink(&victim_dir, &link).unwrap();
+                let s = with_messages(1);
+                for dir in [link.clone(), link.join("profile/sessions")] {
+                    assert!(save_session_durable_in_dir(&dir, &s, mode).is_err());
+                }
+                assert_eq!(std::fs::read_dir(&victim_dir).unwrap().count(), 0);
+            }
+        }
+
+        #[test]
         fn journal_append_refuses_symlink_target() {
             let tmp = tempfile::TempDir::new().unwrap();
             let dir = tmp.path().join("sessions");
@@ -926,7 +1447,7 @@ mod tests {
             let victim = tmp.path().join("victim");
             std::fs::write(&victim, "original").unwrap();
             std::os::unix::fs::symlink(&victim, journal_path(&dir, &s.id)).unwrap();
-            // Snapshot write succeeds; the journal step must refuse.
+            // Preflight refuses the journal before publishing a snapshot.
             s.api_messages.push(std::sync::Arc::new(
                 serde_json::json!({"role":"user","content":"x"}),
             ));

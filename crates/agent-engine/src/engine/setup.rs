@@ -120,6 +120,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
     let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    runtime.reset_context_continuation(&sb.session.id, &sb.api_messages);
 
     // Validate and compile an opted-in manifest before any session/network work.
     let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
@@ -267,6 +268,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     );
     // Task 20: progressive disclosure defers tool-only extension spawns
     // (dormant descriptors only); flag-off keeps the legacy eager loads.
+    ext_mgr.bind_memory_backend(runtime.memory_backend_exclusive());
     ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
     if config.progressive_tool_disclosure {
         // ONE shared extension runtime lease manager: the manager uses it

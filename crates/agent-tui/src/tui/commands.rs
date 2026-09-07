@@ -16,6 +16,38 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit"];
 
+/// These commands inspect/discard captured bytes only, so are safe while busy.
+pub(super) fn handle_pending_attachment_command(cmd: &str, arg: &str, app: &mut App) -> bool {
+    use synaps_cli::skills::registry::ATTACHMENT_DISCLOSURE;
+    match cmd {
+        "attachments" => {
+            if !matches!(arg.trim(), "" | "list") {
+                app.push_msg(ChatMessage::Error("usage: /attachments [list]".into()));
+            } else if app.pending_attachments.is_empty() {
+                app.push_msg(ChatMessage::System(
+                    "no pending attachments — /attach PATH to stage a file".into(),
+                ));
+            } else {
+                app.push_msg(ChatMessage::System(format!(
+                    "Pending attachments ({}):\n{}\n{}\nSend with the next normal input (Enter with no text also sends); /detach to clear.",
+                    app.pending_attachments.len(), app.pending_attachments.summaries().join("\n"), ATTACHMENT_DISCLOSURE
+                )));
+            }
+        }
+        "detach" => {
+            if !matches!(arg.trim(), "" | "clear") {
+                app.push_msg(ChatMessage::Error("usage: /detach [clear]".into()));
+            } else {
+                let count = app.pending_attachments.len();
+                app.pending_attachments.clear();
+                app.push_msg(ChatMessage::System(format!("cleared {count} pending attachment(s) (already-submitted history is unchanged)")));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
 pub(super) fn all_commands_with_skills(
@@ -200,6 +232,19 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
         .invoke_command_collected(plugin_extension_id, command_name, args, &request_id)
         .await;
 
+    // Settings editors also use this helper. They are NOT driver activation
+    // surfaces; only the explicit slash-command task consumes the return value.
+    let _ =
+        apply_interactive_command_result(plugin_extension_id, command_name, result, report, app);
+}
+
+pub(crate) fn apply_interactive_command_result(
+    plugin_extension_id: &str,
+    command_name: &str,
+    result: Result<serde_json::Value, String>,
+    report: synaps_cli::extensions::invoke_output::InvokeOutputReport,
+    app: &mut App,
+) -> Option<serde_json::Value> {
     let notice = report.limit_notice();
     for event in report.events {
         match event {
@@ -223,11 +268,15 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
         }
     }
 
-    if let Err(err) = result {
-        app.push_msg(ChatMessage::Error(format!(
-            "interactive plugin command {}:{} failed: {}",
-            plugin_extension_id, command_name, err
-        )));
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            app.push_msg(ChatMessage::Error(format!(
+                "interactive plugin command {}:{} failed: {}",
+                plugin_extension_id, command_name, err
+            )));
+            None
+        }
     }
 }
 
@@ -351,6 +400,40 @@ pub(super) async fn handle_command(
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {
     use synaps_cli::skills::registry::Resolution;
+    if matches!(cmd, "resume" | "new" | "compact") && !app.pending_attachments.is_empty() {
+        app.push_msg(ChatMessage::Error("pending attachments retained — submit or /detach before switching sessions or compacting".into()));
+        return CommandAction::None;
+    }
+    if handle_pending_attachment_command(cmd, arg, app) {
+        return CommandAction::None;
+    }
+    if cmd == "attach" {
+        if app.streaming || app.compact_task.is_some() {
+            app.push_msg(ChatMessage::Error(
+                "/attach requires idle chat — wait for streaming/compaction to finish".into(),
+            ));
+            return CommandAction::None;
+        }
+        let result = match synaps_cli::skills::registry::attachment_path_argument(arg) {
+            Ok(path) => match agent_engine::attachments::load_attachment(path).await {
+                Ok(attachment) => app.pending_attachments.add(attachment),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                app.push_msg(ChatMessage::System(
+                    "attachment captured for the next normal input".into(),
+                ));
+                handle_pending_attachment_command("attachments", "", app);
+            }
+            Err(error) => app.push_msg(ChatMessage::Error(format!(
+                "attachment not staged: {error}"
+            ))),
+        }
+        return CommandAction::None;
+    }
     // Phase 8 slice 8A: plugin-claimed lifecycle commands take precedence
     // over builtins. If a plugin's manifest claims `/capture` (or any other
     // top-level word) via `provides.sidecar.lifecycle`, route
@@ -395,7 +478,7 @@ pub(super) async fn handle_command(
     // `/context` with the TUI's own conversation history: the runtime does
     // not own session messages, so the surface passes them in. Must run
     // before the generic engine intercept (which has no history access).
-    if cmd == "context" {
+    if cmd == "context" && arg.is_empty() {
         match synaps_cli::engine::commands::context_command(runtime, Some(&app.api_messages)) {
             synaps_cli::engine::commands::CommandResult::Output(text) => {
                 app.push_msg(ChatMessage::System(text));
@@ -495,6 +578,7 @@ pub(super) async fn handle_command(
             app.transcript.clear();
             app.invalidate();
             app.api_messages.clear();
+            app.pending_attachments.clear();
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_cache_read_tokens = 0;
@@ -507,6 +591,7 @@ pub(super) async fn handle_command(
                 runtime.thinking_level(),
                 runtime.system_prompt(),
             );
+            runtime.reset_context_continuation(&app.session.id, &[]);
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         "model" | "models" => {
@@ -625,14 +710,10 @@ pub(super) async fn handle_command(
                     // Line 1: identity + meta
                     app.push_msg(ChatMessage::System(format!(
                         "  …{}{}{} · {}{}${:.3} · {}",
-                        id_short, active_marker, name_tag,
-                        msg_str, age, s.session_cost, s.model
+                        id_short, active_marker, name_tag, msg_str, age, s.session_cost, s.model
                     )));
                     // Line 2: title
-                    app.push_msg(ChatMessage::System(format!(
-                        "     └ {}",
-                        title_display
-                    )));
+                    app.push_msg(ChatMessage::System(format!("     └ {}", title_display)));
                     // Blank separator between entries
                     app.push_msg(ChatMessage::System(String::new()));
                 }
@@ -665,6 +746,7 @@ pub(super) async fn handle_command(
                         app.transcript.clear();
                         app.invalidate();
                         app.api_messages = session.api_messages.clone();
+                        runtime.reset_context_continuation(&session.id, &app.api_messages);
                         app.total_input_tokens = session.total_input_tokens;
                         app.total_output_tokens = session.total_output_tokens;
                         app.session_cost = session.session_cost;
@@ -716,6 +798,17 @@ pub(super) async fn handle_command(
         }
         "help" => {
             let trimmed = arg.trim();
+            if trimmed.is_empty()
+                || synaps_cli::skills::registry::ATTACHMENT_COMMANDS.contains(&trimmed)
+            {
+                app.push_msg(ChatMessage::System(format!(
+                    "/attach PATH — capture a local image, PDF, or UTF-8 document for the next normal input\n/attachments [list] — list staged files\n/detach [clear] — discard staged files\n{}",
+                    synaps_cli::skills::registry::ATTACHMENT_DISCLOSURE
+                )));
+                if !trimmed.is_empty() {
+                    return CommandAction::None;
+                }
+            }
             if trimmed == "find" || trimmed.starts_with("find ") {
                 let query = trimmed
                     .strip_prefix("find")
@@ -1292,6 +1385,46 @@ mod tests {
     };
     use synaps_cli::{Tool, ToolContext, ToolRegistry};
 
+    #[tokio::test]
+    async fn staged_attachments_block_session_switch_and_detach_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "captured notes").unwrap();
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.pending_attachments
+            .add(
+                agent_engine::attachments::load_attachment(&path)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        let session_id = app.session.id.clone();
+        let mut runtime = synaps_cli::Runtime::new_headless();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        for cmd in ["resume", "new", "compact"] {
+            assert!(matches!(
+                handle_command(
+                    cmd,
+                    "another-session",
+                    &mut app,
+                    &mut runtime,
+                    dir.path(),
+                    &registry,
+                    &keybinds
+                )
+                .await,
+                CommandAction::None
+            ));
+            assert_eq!(app.session.id, session_id);
+            assert_eq!(app.pending_attachments.len(), 1);
+        }
+        assert!(super::handle_pending_attachment_command(
+            "detach", "clear", &mut app
+        ));
+        assert!(app.pending_attachments.is_empty());
+    }
+
     #[test]
     fn plugins_is_in_all_commands() {
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"plugins"));
@@ -1837,6 +1970,39 @@ mod tests {
                 settings: None,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn budget_command_uses_engine_and_keeps_session_history() {
+        let registry = Arc::new(CommandRegistry::new(
+            synaps_cli::skills::BUILTIN_COMMANDS,
+            vec![],
+        ));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.api_messages.push(Arc::new(
+            serde_json::json!({"role": "user", "content": "retain this"}),
+        ));
+        let history = app.api_messages.clone();
+        let id = app.session.id.clone();
+        let mut runtime = synaps_cli::Runtime::new_headless();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "budget",
+            "time 4h",
+            &mut app,
+            &mut runtime,
+            std::path::Path::new("/tmp/unused"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::None));
+        assert_eq!(runtime.turn_budget().max_elapsed.as_secs(), 14400);
+        assert_eq!(app.api_messages, history);
+        assert_eq!(app.session.id, id);
+        assert!(app.transcript.messages().iter().any(|message| matches!(&message.msg, ChatMessage::System(text) if text.contains("14400s") && text.contains("not saved"))));
+        assert!(registry.all_commands().contains(&"budget".to_string()));
+        assert!(!super::STREAMING_COMMANDS.contains(&"budget"));
     }
 
     #[tokio::test]

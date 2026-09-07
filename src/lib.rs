@@ -5,7 +5,8 @@ pub use agent_core::pricing;
 
 // agent-engine is now a separate crate; re-export its modules as if they lived here
 pub use agent_engine::{
-    engine, events, extensions, help, mcp, orchestration, runtime, sidecar, skills, tools,
+    attachments, engine, events, extensions, help, mcp, orchestration, runtime, sidecar, skills,
+    tools,
 };
 
 // agent-tui is now a separate crate; re-export tui + toast so bin/cmd still resolve
