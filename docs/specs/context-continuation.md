@@ -53,6 +53,21 @@ User-facing pressure notices show only the estimated token count, not internal
 phase names or task-planning instructions. `/context status` reports the
 configured capacity, current window, and effective thresholds.
 
+`memory_context` controls continuous-memory consent, not context-window usage.
+For a consent status read, agents should send `{"action":"status"}`. Providers
+that require every schema property can instead send:
+
+```json
+{"action":"status","mode":null,"capture_tools":null,"expires_minutes":null}
+```
+
+Only these three optional fields accept null as omission. Non-null `mode` and
+`capture_tools` apply only to enable proposals; non-null `expires_minutes` applies
+only to enable/recall_once. Other supplied values are rejected without changing
+consent. Model calls still cannot enable durable capture or confirm history
+import; Axel's control-only tool capability also cannot grant one-shot recall
+(use `/memory once`).
+
 For an isolated test profile, `/context auto 20000 120000` supplies lower
 session-only thresholds. Do not use test thresholds as production defaults.
 Invalid config disables the policy with a warning. Model tools cannot enable
@@ -78,13 +93,21 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
 2. Prepare a smaller context, preserving actual user-authored turns (including
    image-only turns), system/developer messages, the last assistant/result tail,
    and all tool-call/result dependencies of retained messages.
-3. If retained material cannot fit or meaningfully shrink, fail without clearing
-   history. User constraints are not silently selected or summarized away.
+3. If retained material cannot meaningfully shrink at a soft boundary, keep the
+   current history and continue only if the full request still passes hard
+   admission. Reassess after four admitted rounds or an 8,192-token footprint
+   change; repeated phase reports do not force another attempt. No archive,
+   window advance or budget reset occurs for this no-op. If the current request
+   cannot fit safely, stop without clearing history. User constraints are not
+   silently selected or summarized away. See `context-rollover-recovery.md`.
 4. Seal the old eligible source projection and working note to a private archive,
    with data/directory sync and retry deduplication. Verify the note before commit.
-5. Publish replacement history and notify the frontend. A private message marker
-   identifies the window/archive for resume; it is removed before provider wire
-   serialization. The frontend's existing session save persists this history.
+5. Request a frontend durable-head checkpoint. The frontend validates the logical
+   session ID, preserves host metadata/accounting and saves a full snapshot in
+   either persistence mode. Only a successful durable acknowledgement permits
+   the runtime to publish the new window and dispatch another provider round.
+   A private message marker identifies the window/archive for resume; it is
+   removed before provider wire serialization.
 6. Continue with the same turn meter, authority, tools and runtime state.
 
 Archive retry deduplication is bound to the persisted session ID, while retrieval
@@ -100,12 +123,43 @@ evidence are screened/redacted, not summarized. User-authored images remain in
 active context; the archive does not claim to preserve every original byte.
 Redaction is defense-in-depth, not a universal secret detector.
 
-Cancellation before replacement preserves active history. An already-running
+Cancellation before head publication preserves active history. An already-running
 atomic archive write can finish after cancellation, leaving an unreferenced
-eligible segment. Archive failures prevent replacement. This is not yet a
-multi-file transaction covering the frontend session save and archive: after a
-process crash, normal session/journal recovery may resume the older window.
+eligible segment. Archive failures prevent replacement. Once head publication is
+requested, cancellation is not raced against its atomic save: the candidate may
+already be on disk. A missing/error acknowledgement stops further inference and
+blocks ordinary saves/automatic turns until explicit recovery; it never writes
+old history back over an ambiguously committed head. TUI recovery re-reads after
+any detached writer and durably republishes the loaded head before clearing
+latches. Cross-session recovery refuses while deferred work remains, rather than
+automatically delivering the previous session's work into another conversation.
+Unsupported consumers fail
+closed. Host reset epochs prevent late acknowledgements from mutating a reloaded
+conversation, including a reload with the same logical session ID.
+
+The archive is synced first; the session snapshot rename is the logical head
+commit, followed by directory fsync before acknowledgement. This is an ordered
+publication protocol, not a general multi-file transaction: a crash before head
+commit can leave an orphan archive and the older session head. After successful
+acknowledgement, the new head is durable subject to filesystem/device guarantees.
 Exactly-once external effects across a process crash are not promised.
+
+Snapshots now use storage-only `_journal_generation` metadata and matching v2
+journals. Stale journals cannot replay into a shortened or same-length replacement
+head. Legacy unmarked snapshots/v1 journals remain readable and migrate on save.
+Older binaries can read the snapshot but cannot replay v2 deltas; fold the journal
+through a JSON-mode save with this implementation before downgrading. Prefix
+validation costs O(history) CPU while append writes remain delta-sized. Async
+session saves are ordered in-process through blocking-worker completion, even if
+the awaiting frontend is dropped; concurrent processes writing the same session
+are not supported. Ordinary bound snapshot rotation syncs before discarding old
+journal deltas. No existing sessions are proactively migrated.
+
+Known responsiveness limit: TUI checkpoint persistence currently awaits in the
+event handler; RPC holds its state lock while saving. A stalled filesystem can
+therefore delay cancellation/UI handling. A timeout must never clear the durability
+block or permit inference; moving save ownership out of those control paths is
+follow-up work.
 
 ## Short retrieval tools
 
@@ -129,34 +183,37 @@ suppression, not content-wide erasure.
 
 Archives live under the private `context-archives/<scope-hash>/` directory,
 separate from ordinary session-retention cleanup. Limits: 128 slots including
-tombstones, 16 MiB input/segment, 256 MiB per project, 4,096 source messages.
+tombstones, 16 MiB eligible input/serialized segment, 256 MiB per project,
+4,096 source messages, 65,536 visited input nodes and depth 32. Excluded message
+and media payloads and ignored metadata do not consume eligible byte budget;
+their opaque descendants are not traversed. Admitted tool arguments/results
+still count, and genuinely oversized eligible evidence fails without truncation.
+See [eligible-input budgeting](archive-eligible-input-budget.md).
 Storage exhaustion stops rollover; no automatic source eviction or tombstoning.
 The index is currently a bounded scan, not a large-corpus search engine.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
-## Axel integration: NOT completed in this slice
+## Axel integration: one selected memory authority
 
-This implements the automatic policy/rollover and a project history archive,
-not the requested final single Axel memory authority. No existing memories were
-migrated or tombstoned. No external repository or installed plugin was changed.
+**Shared-repository update:** the host now uses one shared brain with durable Git
+repository scopes. Worktrees share repository memory; migration of existing path
+scopes is explicit. Context-head durability and capture consent remain independent.
+See [shared Axel repositories](shared-axel-repositories.md).
 
-Source inspection found incompatible local revisions: the plugin's pinned Axel
-revision predates newer retrieval imports, and the checked-out Axel main differs
-from the branch with scoped memory/history support. Further incompatibilities:
 
-- host project IDs use `p…`; plugin IDs use `proj_…`, with different path-byte
-  normalization;
-- built-in fetch takes `ids[]`; plugin fetch takes `id`;
-- note search is substring versus plugin lexical FTS;
-- sensitivity, retention, minimum content length and capture RPC shapes differ;
-- exact-ID tombstones do not suppress re-capture under a newly derived ID.
+The unified host service now covers explicit notes, eligible source archives,
+consented capture/recall, prior-session import, atomic legacy migration and memory
+retention. See [unified Axel backend](axel-host-backend.md). In Axel mode rollover
+projects source in memory and persists it directly in the same `.r8` database;
+short history tools never fall back to the legacy archive. The durable frontend
+head acknowledgement still gates further inference. Independent plugin/MCP memory
+routes are disabled, rather than remain a second writable memory authority.
 
-The follow-up must align versions, define one host-owned memory backend
-contract, preserve old ID aliases, map scope/retention without weakening them,
-and migrate only with an explicit reversible plan. In Axel mode there must be
-no silent fallback to a second writable note store. The current archive can be
-a source artifact behind that future service; it must not be mistaken for a
-completed Axel migration.
+Migration is implemented but never automatic: metadata preview, exact digest and
+explicit source/target scope precede one bounded transaction. Existing source
+notes/archives and the installed plugin are untouched until the operator elects
+cutover. Absolute expiry, restrictive policy and deletion evidence are preserved.
+No real existing memories were migrated by implementation/testing.
 
 ## Evidence and remaining limits
 
@@ -172,8 +229,8 @@ search/fetch recovered `ROLLOVER_EVIDENCE_COBALT` and checksum `blue-27`.
 Lower thresholds exercised the real control flow without sending a 350k-token
 live request. No cost/quality improvement claim is inferred from that smoke.
 
-Remaining work includes durable thread-level source/derivation graphs, full
-Axel migration, atomic archive+active-head recovery, actual-token/cost calibration,
+Remaining work includes richer thread-level derivation graphs,
+multi-process active-head coordination, actual-token/cost calibration,
 large-corpus indexing, and portable archive support. The prototype intentionally
 retains every real user turn; instruction-heavy histories may stop instead of
 shrinking. Keep it opt-in until these limits have been reviewed.
@@ -211,3 +268,55 @@ without changing those safeguards.
 - Final release pane check (before inference): `window 2 | capacity 1000000 |
   pressure 250000 | rollover 400000`; the earlier synthetic test overrides
   have been removed from the test profile. Installed/global Synaps is unchanged.
+
+### Resumed durability follow-up
+
+The resume experiment located `CONTEXT-ROLLOVER-RESUME-C12D603E`, fetched its exact
+returned checkpoint ID, and verified clean branch `feat/context-continuation` at
+`c12d603e`. The existing test pane still showed window 2 with 1m capacity and
+250k/400k thresholds; it was inspected without sending a prompt or restarting it.
+
+The follow-up adds the archive-before-durable-head barrier described above,
+generation-safe journal recovery, frontend save/auto-turn failure latches and
+runtime reset-epoch checks. Synthetic tests cover acknowledgement ordering,
+rejected/unhandled checkpoints, blocked retries, stale journal crash states,
+post-publication errors, session identity and detached-writer ordering. The real
+loopback stream test verifies no second provider request before successful head
+persistence and no second request at all after a failed save. This is not a new
+large live-context or cost/quality benchmark.
+
+The subsequent full backend integration resolves the independent notes/history/
+capture routing gaps; see [unified Axel backend](axel-host-backend.md). The earlier
+[source audit](../reviews/context-resume-axel-boundary.md) is historical, not the
+current implementation status. No global
+configuration, installed binary, plugin, external checkout or stored memories
+were migrated by this follow-up.
+
+Follow-up validation (synthetic/offline except the previously established ambient
+catalog exclusion):
+
+- Workspace: **3,898 passed, 21 ignored, 1 filtered**, 118 targets, using
+  `cargo test --workspace --offline --no-fail-fast -- --test-threads=1 --skip ui_catalog_fetch_github_copilot_returns_prefixed_chat_models`.
+- `cargo clippy --workspace --all-targets --offline`: succeeded with existing
+  warnings, no warning in the new durability modules.
+- `cargo build --release --locked --offline --bin synaps`: succeeded.
+- Tool-schema drift, LOC ratchet, ignore ratchet, and `git diff --check`: passed.
+- Workspace formatting check still reports pre-existing differences in untouched
+  files; changed Rust files were formatted without unrelated churn.
+- Logs: `/tmp/context-resume-workspace.log`, `/tmp/context-resume-clippy.log`,
+  `/tmp/context-resume-release.log` and their `.exit` files. The release artifact
+  was rebuilt locally; the running test pane and installed binary were not replaced.
+
+
+### Wall-clock successor semantics (2026-09-06)
+
+A successfully archived, durably acknowledged successor now starts a fresh
+wall-clock segment; it no longer carries the original window's elapsed time.
+This resets elapsed time only, not permissions, cumulative tool/cost/usage limits,
+worker dispatch limits or autonomous grant deadlines. `/context auto` also makes
+elapsed-time exhaustion request a successor even below context pressure. A
+low-pressure time successor need not shrink the history, but must fit the request
+budget and pass the same archive, tool-admission, worker and durable-head barriers.
+Zero allowance and inference-free successor loops stop. Cancellation remains
+checked before the next request; failed saves never renew time. A normal completed
+answer still ends the stream; this is not an implicit autonomous plugin loop.

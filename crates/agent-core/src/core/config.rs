@@ -469,7 +469,7 @@ pub struct TurnBudgetOverrides {
     pub max_cost_usd: Option<f64>,
     /// Bounded auto-renewals of the provider-round allowance after it is
     /// exhausted mid-turn (spec §8.1). Each renewal resets the round counter;
-    /// wall-clock is never renewed, so total turn time stays bounded. `0`
+    /// round renewals never reset wall-clock (durable context successors do). `0`
     /// disables graceful continuation (hard stop at the first exhaustion).
     pub max_round_renewals: Option<u32>,
 }
@@ -526,7 +526,8 @@ fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val:
 /// Continuous-memory settings surface (Task A2, spec §12). Every field is
 /// fail-closed: unknown or invalid values warn and keep the compiled default.
 ///
-/// By construction this struct is the complete `memory.*` config surface.
+/// This struct contains continuous-memory policy; backend selection lives in
+/// the separate `MemoryBackendConfig`.
 /// Secret handling, retention, and project-scope rules are deliberately NOT
 /// fields here — they are not configurable at all (spec §12: "Secret,
 /// retention, and project rules are not configurable to fail open").
@@ -650,6 +651,27 @@ fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
     }
 }
 
+/// Host-owned note storage selection, independent of continuous-memory consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryBackendKind {
+    #[default]
+    Legacy,
+    Axel,
+    /// Invalid configuration must never select legacy storage implicitly.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryBackendConfig {
+    pub kind: MemoryBackendKind,
+    /// Explicit absolute executable path; never resolved through PATH.
+    pub executable: Option<PathBuf>,
+    /// Optional absolute shared Axel brain path; absent uses the private user default.
+    pub brain: Option<PathBuf>,
+    /// Explicit host opt-in to user-wide notes. Never grants capture/history consent.
+    pub user_scope: bool,
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -720,6 +742,8 @@ pub struct SynapsConfig {
     pub turn_budgets: TurnBudgetsConfig,
     /// Continuous-memory settings surface (Task A2, spec §12).
     pub memory: MemoryConfig,
+    /// Host-owned backend; selecting it does not enable recall or capture.
+    pub memory_backend: MemoryBackendConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
@@ -767,6 +791,7 @@ impl Default for SynapsConfig {
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
             memory: MemoryConfig::default(),
+            memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -1059,6 +1084,7 @@ pub fn load_config() -> SynapsConfig {
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
     let mut invalid_context_management = false;
+    let mut invalid_memory_backend = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1247,6 +1273,43 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
             }
+            "memory.backend" => {
+                config.memory_backend.kind = match val {
+                    "legacy" => MemoryBackendKind::Legacy,
+                    "axel" => MemoryBackendKind::Axel,
+                    _ => {
+                        invalid_memory_backend = true;
+                        config.warnings.push(format!(
+                            "memory.backend = {val} — expected legacy or axel; memory backend unavailable"
+                        ));
+                        MemoryBackendKind::Unavailable
+                    }
+                };
+            }
+            "memory.user_scope" => match val {
+                "true" => config.memory_backend.user_scope = true,
+                "false" => config.memory_backend.user_scope = false,
+                _ => {
+                    invalid_memory_backend = true;
+                    config.warnings.push("memory.user_scope — expected true or false; memory backend unavailable".into());
+                }
+            },
+            "memory.axel.executable" | "memory.axel.brain" => {
+                let path = PathBuf::from(val);
+                if !path.is_absolute() {
+                    invalid_memory_backend = true;
+                    config.warnings.push(format!(
+                        "{key} — expected an absolute path; memory backend unavailable"
+                    ));
+                }
+                // Retain invalid paths too: direct config consumers must not
+                // mistake an invalid explicit path for an absent default.
+                if key == "memory.axel.executable" {
+                    config.memory_backend.executable = Some(path);
+                } else {
+                    config.memory_backend.brain = Some(path);
+                }
+            }
             _ => {
                 // Handle namespaced keys
                 if key.starts_with("shell.") {
@@ -1314,6 +1377,12 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
         config.warnings.push(
             "invalid context_management configuration — using defaults (mode off)".to_string(),
         );
+    }
+
+    // Any invalid backend setting poisons this parse pass, regardless of key
+    // order or later duplicate selectors. Never silently route to legacy.
+    if invalid_memory_backend {
+        config.memory_backend.kind = MemoryBackendKind::Unavailable;
     }
 
     // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
@@ -1824,6 +1893,92 @@ mod tests {
              memory.default_mode_confirmed = true\n",
         );
         assert_eq!(after.memory.default_mode, "recall_once");
+    }
+
+    #[test]
+    fn memory_backend_defaults_are_independent_of_consent() {
+        let config = super::load_config_from_str("");
+        assert_eq!(config.memory_backend, super::MemoryBackendConfig::default());
+        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
+        let axel = super::load_config_from_str("memory.backend = axel\n");
+        assert_eq!(axel.memory_backend.kind, super::MemoryBackendKind::Axel);
+        assert_eq!(axel.memory, config.memory);
+        assert!(axel.warnings.is_empty());
+    }
+
+    #[test]
+    fn user_wide_notes_require_explicit_valid_opt_in() {
+        let default = super::load_config_from_str("memory.backend = axel\n");
+        assert!(!default.memory_backend.user_scope);
+        let enabled =
+            super::load_config_from_str("memory.backend = axel\nmemory.user_scope = true\n");
+        assert!(enabled.memory_backend.user_scope);
+        assert_eq!(enabled.memory, default.memory);
+        for bad in ["yes", "", "1", "TRUE"] {
+            let config = super::load_config_from_str(&format!(
+                "memory.user_scope = {bad}\nmemory.backend = axel\n"
+            ));
+            assert_eq!(
+                config.memory_backend.kind,
+                super::MemoryBackendKind::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn memory_backend_invalid_selector_fails_closed() {
+        for content in [
+            "memory.backend = typo\n",
+            "memory.backend = \n",
+            "memory.backend = unavailable\n",
+            "memory.backend = axel\nmemory.backend = typo\n",
+            "memory.backend = typo\nmemory.backend = legacy\n",
+        ] {
+            let config = super::load_config_from_str(content);
+            assert_eq!(
+                config.memory_backend.kind,
+                super::MemoryBackendKind::Unavailable
+            );
+            assert!(config
+                .warnings
+                .iter()
+                .any(|w| w.contains("memory backend unavailable")));
+        }
+    }
+
+    #[test]
+    fn memory_backend_absolute_paths_are_preserved() {
+        let root = std::env::current_dir().unwrap();
+        let executable = root.join("fixture bin/axel");
+        let brain = root.join("fixture brain");
+        let config = super::load_config_from_str(&format!(
+            "memory.axel.brain = {}\nmemory.backend = axel\nmemory.axel.executable = {}\n",
+            brain.display(),
+            executable.display()
+        ));
+        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Axel);
+        assert_eq!(config.memory_backend.executable, Some(executable));
+        assert_eq!(config.memory_backend.brain, Some(brain));
+        assert!(config.warnings.is_empty());
+    }
+
+    #[test]
+    fn memory_backend_relative_or_empty_paths_fail_closed_in_any_order() {
+        for key in ["memory.axel.executable", "memory.axel.brain"] {
+            for path in ["relative/path", "~/brain", ""] {
+                for content in [
+                    format!("memory.backend = axel\n{key} = {path}\n"),
+                    format!("{key} = {path}\nmemory.backend = legacy\n"),
+                ] {
+                    let config = super::load_config_from_str(&content);
+                    assert_eq!(
+                        config.memory_backend.kind,
+                        super::MemoryBackendKind::Unavailable
+                    );
+                    assert!(config.warnings.iter().any(|w| w.contains("absolute path")));
+                }
+            }
+        }
     }
 
     #[test]

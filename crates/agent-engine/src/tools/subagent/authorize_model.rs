@@ -122,6 +122,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fable_5_1_is_authorized_and_dispatches_without_aliasing() {
+        let ctx = context_without_sonnet();
+        let policy = ctx.capabilities.orchestration.clone().unwrap();
+        let model = "anthropic/claude-fable-5-1";
+        assert!(policy.preflight(model).is_err());
+
+        let output = SubagentModelAuthorizeTool
+            .execute(json!({"model": model}), ctx)
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["authorized_model"], model);
+        assert_eq!(output["scope"], "session");
+        assert_eq!(output["persisted"], false);
+        let authorized = policy
+            .resolve_and_authorize("sa_fable_5_1", Some(model))
+            .expect("newly authorized Fable 5.1 must dispatch");
+        assert_eq!(authorized.model.as_str(), model);
+        let route = crate::runtime::openai::resolve_route(model).unwrap();
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-fable-5-1");
+        assert!(policy.preflight("anthropic/claude-fable-5").is_err());
+        assert!(context_without_sonnet()
+            .capabilities
+            .orchestration
+            .unwrap()
+            .preflight(model)
+            .is_err());
+        for near_miss in [
+            "anthropic/claude-fable-5-10",
+            "anthropic/claude-fable-5-1-preview",
+        ] {
+            assert!(crate::orchestration::validate_user_authorizable_model(near_miss).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn already_authorized_model_is_idempotent_without_prompting() {
         let ctx = create_tool_context();
         let policy = ctx.capabilities.orchestration.clone().unwrap();

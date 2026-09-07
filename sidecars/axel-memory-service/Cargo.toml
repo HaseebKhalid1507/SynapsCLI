@@ -1,0 +1,23 @@
+[package]
+name = "synaps-axel-memory-service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately independent of the host workspace and its SQLite dependency graph.
+[workspace]
+
+[dependencies]
+axel = { git = "https://github.com/maha-media/axel.git", rev = "edbdea401d66feedb87fcad28c879ece54e3ccd2" }
+axel-memkoshi = { git = "https://github.com/maha-media/axel.git", rev = "edbdea401d66feedb87fcad28c879ece54e3ccd2" }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
+chrono = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -61,6 +61,9 @@ pub struct ContextState {
     rollover_due: bool,
     rollover_required: bool,
     finish_rounds_used: u32,
+    /// Host-recorded failed-to-shrink attempt: (input footprint, skipped rounds).
+    /// Advisory phases never clear this; hard admission is checked first.
+    unproductive_rollover: Option<(u64, u8)>,
 }
 
 impl ContextState {
@@ -85,6 +88,13 @@ impl ContextState {
             _ => {}
         }
         self.phase = phase;
+    }
+
+    /// Host-only: candidate cannot meaningfully shrink, but the current full
+    /// request still passes hard admission. Keep task/finish state intact and
+    /// avoid a no-op archive/rollover loop. Reassess after bounded progress.
+    pub fn defer_unproductive_rollover(&mut self, used_tokens: u64) {
+        self.unproductive_rollover = Some((used_tokens, 0));
     }
 
     /// Host-only lifecycle operation after successful context replacement.
@@ -184,6 +194,7 @@ pub enum ContextReason {
     BoundedFinish,
     FinishAllowanceExhausted,
     RolloverPending,
+    UnproductiveRollover,
     HardCapacity,
     InvalidConfig,
 }
@@ -247,6 +258,20 @@ pub fn assess_context(
         ContextBand::Normal
     };
 
+    // Hard admission and configuration validation above always win. A soft
+    // no-shrink result may admit work, never renew finish/time/cost allowances.
+    // Retry on changed footprint (growth OR reduction), otherwise after four
+    // provider admissions so a newly archivable tail is eventually reconsidered.
+    if let Some((used, skipped)) = state.unproductive_rollover {
+        if budget.used_tokens.abs_diff(used) < 8_192 && skipped < 4 {
+            assessment.next_state.unproductive_rollover = Some((used, skipped + 1));
+            assessment.action = ContextAction::Advisory;
+            assessment.reason = ContextReason::UnproductiveRollover;
+            return assessment;
+        }
+        assessment.next_state.unproductive_rollover = None;
+    }
+
     if state.rollover_required {
         assessment.action = ContextAction::Rollover;
         assessment.reason = ContextReason::RolloverPending;
@@ -309,6 +334,76 @@ mod tests {
             hard_remaining_tokens: window.saturating_sub(used),
             required_next_round_tokens: 8_000,
         }
+    }
+
+    #[test]
+    fn unproductive_rollover_defers_only_soft_admission_and_retries_after_progress() {
+        let config = auto_config();
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::NewTask);
+        state = assess_context(&config, &state, budget(1_000_000, 339_058)).next_state;
+        state.defer_unproductive_rollover(339_058);
+        for _ in 0..4 {
+            state.report_phase(WorkPhase::NewTask); // repeated model reports cannot clear cooldown
+            let next = assess_context(&config, &state, budget(1_000_000, 339_100));
+            assert_eq!(next.action, ContextAction::Advisory);
+            assert_eq!(next.reason, ContextReason::UnproductiveRollover);
+            state = next.next_state;
+        }
+        assert_eq!(
+            assess_context(&config, &state, budget(1_000_000, 339_100)).action,
+            ContextAction::Rollover
+        );
+        for changed in [329_000, 350_000] {
+            state.defer_unproductive_rollover(339_058);
+            assert_eq!(
+                assess_context(&config, &state, budget(1_000_000, changed)).action,
+                ContextAction::Rollover
+            );
+        }
+        state.reset();
+        assert_eq!(state.unproductive_rollover, None);
+        assert_eq!(state.phase(), WorkPhase::Unknown);
+    }
+
+    #[test]
+    fn unproductive_cooldown_cannot_bypass_hard_budget_or_renew_finish_allowance() {
+        let config = auto_config();
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::Plan);
+        for _ in 0..config.finish_rounds {
+            state = assess_context(&config, &state, budget(1_000_000, 400_000)).next_state;
+        }
+        state = assess_context(&config, &state, budget(1_000_000, 400_000)).next_state;
+        state.defer_unproductive_rollover(400_000);
+        state.report_phase(WorkPhase::WrapUp);
+        let off = ContextManagementConfig {
+            mode: ContextManagementMode::Off,
+            ..config
+        };
+        state = assess_context(&off, &state, budget(1_000_000, 400_000)).next_state;
+        assert_eq!(state.unproductive_rollover, Some((400_000, 0)));
+        assert_eq!(state.finish_rounds_used(), config.finish_rounds);
+        let denied = assess_context(
+            &config,
+            &state,
+            ContextBudget {
+                hard_remaining_tokens: 0,
+                ..budget(1_000_000, 400_000)
+            },
+        );
+        assert_eq!(denied.action, ContextAction::HardStop);
+        assert_eq!(denied.next_state, state);
+        assert_eq!(
+            assess_context(&config, &state, budget(410_000, 400_000)).action,
+            ContextAction::HardStop
+        );
+        let allowed = assess_context(&config, &state, budget(1_000_000, 400_000));
+        assert_eq!(allowed.reason, ContextReason::UnproductiveRollover);
+        assert_eq!(
+            allowed.next_state.finish_rounds_used(),
+            config.finish_rounds
+        );
     }
 
     #[test]

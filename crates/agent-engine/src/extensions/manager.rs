@@ -15,6 +15,7 @@ use super::context_provider::{
 use super::hooks::HookBus;
 use super::info::PluginInfo;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
+use super::permissions::{Permission, PermissionSet};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
 use super::runtime::process::ProcessExtension;
 use super::runtime::{ExtensionHandler, ExtensionHealth};
@@ -141,6 +142,9 @@ pub fn compute_extension_load_hint(
     plugin_dir: &std::path::Path,
     declared_setup: Option<&str>,
 ) -> String {
+    if error == "independent Axel plugin is disabled by the host-selected memory backend" {
+        return "Expected: integrated Axel owns memory. Disable axel-memory-manager in this configuration to skip its load; do not reinstall it or delete its data.".into();
+    }
     let missing_binary =
         error.contains("No such file or directory") || error.contains("os error 2");
     match (missing_binary, declared_setup) {
@@ -156,6 +160,7 @@ pub fn compute_extension_load_hint(
 
 /// Manages the lifecycle of all loaded extensions.
 pub struct ExtensionManager {
+    exclusive_memory: bool,
     /// The shared hook bus.
     hook_bus: Arc<HookBus>,
     /// Optional shared tool registry for extension-provided tools.
@@ -164,6 +169,9 @@ pub struct ExtensionManager {
     providers: ProviderRegistry,
     /// Running extensions keyed by ID.
     extensions: HashMap<String, Arc<dyn ExtensionHandler>>,
+    /// Validated permission metadata for successfully loaded EAGER handlers only.
+    /// No resolved config or secrets; removed before any unload I/O.
+    eager_permissions: HashMap<String, PermissionSet>,
     /// Declared manifest config entries per loaded extension, kept so we can
     /// produce diagnostics without re-reading the manifest.
     manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
@@ -232,6 +240,7 @@ pub(crate) type SharedDeferredRecords =
 /// acquisition stays inside the manager/lease lifecycle API.
 #[derive(Clone)]
 pub(crate) struct DeferredExtensionRecord {
+    pub(crate) exclusive_memory: bool,
     pub(crate) manifest: ExtensionManifest,
     pub(crate) cwd: Option<std::path::PathBuf>,
     pub(crate) config: Value,
@@ -241,10 +250,13 @@ impl ExtensionManager {
     /// Create a new manager with a shared hook bus.
     pub fn new(hook_bus: Arc<HookBus>) -> Self {
         Self {
+            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
+                .exclusive(),
             hook_bus,
             tools: None,
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
+            eager_permissions: HashMap::new(),
             manifest_configs: HashMap::new(),
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
@@ -264,10 +276,13 @@ impl ExtensionManager {
         tools: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     ) -> Self {
         Self {
+            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
+                .exclusive(),
             hook_bus,
             tools: Some(tools),
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
+            eager_permissions: HashMap::new(),
             manifest_configs: HashMap::new(),
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
@@ -296,6 +311,11 @@ impl ExtensionManager {
         let config = Self::resolve_config(id, &manifest.config, self.host_project_root())?;
         self.load_with_cwd_and_config(id, manifest, cwd, config)
             .await
+    }
+
+    /// Set once at host boot, before any extension can spawn.
+    pub fn bind_memory_backend(&mut self, exclusive: bool) {
+        self.exclusive_memory = exclusive;
     }
 
     /// Enable Task 20 progressive spawn deferral (set at engine boot from
@@ -536,6 +556,7 @@ impl ExtensionManager {
                 .insert(
                     id.to_string(),
                     DeferredExtensionRecord {
+                        exclusive_memory: self.exclusive_memory,
                         manifest: manifest.clone(),
                         cwd,
                         config: config.clone(),
@@ -651,9 +672,14 @@ impl ExtensionManager {
         }
 
         // Spawn the extension process only after the manifest is known-good.
-        let process =
-            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone())
-                .await?;
+        let process = ProcessExtension::spawn_with_memory_policy(
+            id,
+            &manifest.command,
+            &manifest.args,
+            cwd.clone(),
+            self.exclusive_memory,
+        )
+        .await?;
         // Publish permissions to the inbound-request dispatcher so memory.*
         // calls during initialize can be authorized correctly.
         process.set_permissions(permissions.clone()).await;
@@ -811,6 +837,7 @@ impl ExtensionManager {
         }
 
         self.extensions.insert(id.to_string(), handler);
+        self.eager_permissions.insert(id.to_string(), permissions);
         self.manifest_configs
             .insert(id.to_string(), manifest.config.clone());
         if !manifest.theme_tokens.is_empty() {
@@ -1037,6 +1064,7 @@ impl ExtensionManager {
     /// grants cannot survive), and terminates every session's runtime
     /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        self.eager_permissions.remove(id);
         let deferred = self
             .deferred_tool_only
             .lock()
@@ -1263,7 +1291,7 @@ impl ExtensionManager {
     /// whose first use acquires the shared per-plugin runtime lease — a
     /// user action is a legitimate activation trigger. Discovery/search/
     /// diagnostics never call this.
-    fn user_action_handler(
+    pub fn user_action_handler(
         &self,
         id: &str,
     ) -> Result<Arc<dyn super::runtime::ExtensionHandler>, String> {
@@ -1276,6 +1304,29 @@ impl ExtensionManager {
             ));
         }
         Err(format!("unknown extension '{}'", id))
+    }
+
+    /// Resolve authority for an explicitly user-armed session driver without I/O.
+    /// Only successful eager loads retain validated permission metadata. Deferred,
+    /// unknown, failed, and unloaded instances fail closed; never acquire a lease.
+    /// Callers pin this Arc and compare it with `Arc::ptr_eq` on every timer and
+    /// before applying an async result. Drop the manager guard before plugin RPC.
+    pub fn session_driver_handler(&self, id: &str) -> Result<Arc<dyn ExtensionHandler>, String> {
+        if self.is_deferred(id) {
+            return Err("session drivers require an eagerly loaded extension; deferred drivers are unsupported".into());
+        }
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| "session driver extension is not loaded".to_string())?;
+        if !self
+            .eager_permissions
+            .get(id)
+            .is_some_and(|permissions| permissions.has(Permission::SessionDrive))
+        {
+            return Err("session driver extension lacks validated session.drive permission".into());
+        }
+        Ok(handler.clone())
     }
 
     pub async fn sidecar_spawn_args(
@@ -2503,6 +2554,17 @@ mod tests {
     // ---- compute_extension_load_hint --------------------------------
 
     #[test]
+    fn hint_exclusive_axel_is_expected_not_missing_binary() {
+        let hint = compute_extension_load_hint(
+            "independent Axel plugin is disabled by the host-selected memory backend",
+            std::path::Path::new("/synthetic/plugin"),
+            None,
+        );
+        assert!(hint.contains("Expected: integrated Axel"));
+        assert!(!hint.contains("plugin validate"));
+    }
+
+    #[test]
     fn hint_missing_binary_with_declared_setup_points_at_script() {
         let hint = compute_extension_load_hint(
             "Failed to spawn extension 'sample-sidecar': No such file or directory (os error 2)",
@@ -2742,15 +2804,17 @@ mod secret_env_allowlist_tests {
     /// own scoped override.
     #[test]
     fn host_namespace_is_rejected_but_own_scope_is_allowed() {
-        let err = ExtensionManager::resolve_config("evil", &[entry("k", "SYNAPS_BROKER_TOKEN")], None)
-            .expect_err("host namespace must be rejected");
+        let err =
+            ExtensionManager::resolve_config("evil", &[entry("k", "SYNAPS_BROKER_TOKEN")], None)
+                .expect_err("host namespace must be rejected");
         assert!(err.contains("host namespace"), "unexpected error: {err}");
 
         // an extension's own scoped var is fine
-        assert!(
-            ExtensionManager::denied_secret_env("SYNAPS_EXTENSION_MY_PLUGIN_TOKEN", "my-plugin")
-                .is_none()
-        );
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_MY_PLUGIN_TOKEN",
+            "my-plugin"
+        )
+        .is_none());
     }
 
     /// Third-party secrets an extension legitimately needs still work.

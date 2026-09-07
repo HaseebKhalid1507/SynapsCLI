@@ -18,6 +18,7 @@ Extensions can:
 - **Modify** — replace `before_tool_call` input before execution
 - **Replace** — rewrite `after_tool_call` output before it enters history (compression, redaction, summarization; requires `tools.transform_output`)
 - **Inject** — attach context to the outgoing request before it reaches the LLM (`on_session_start` → system prompt, session-stable; `before_message` → newest user message, per-turn ephemeral)
+- **Drive a session** — after an explicit local TUI command, propose one foreground continuation at a time using the permissioned [session-driver contract](./session-drivers.md). Loop policy remains external; installing a plugin does not start a loop.
 
 Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
 

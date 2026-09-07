@@ -339,13 +339,25 @@ fn estimate_serialized(estimator: &TokenEstimator, value: &Value) -> u64 {
 /// `IMAGE_TOKEN_ESTIMATE` instead of by payload length. Walks
 /// `content[]` and nested `tool_result.content[]`; every other block is
 /// still charged on its serialized form.
+/// Attachment-aware history estimate shared with rollover's reduction check.
+/// Does not charge megabytes of image base64 as ordinary prompt tokens.
+pub(crate) fn estimate_history(messages: &[SharedMessage]) -> u64 {
+    messages.iter().fold(0u64, |sum, message| {
+        sum.saturating_add(estimate_message(&TokenEstimator::Conservative, message))
+            .saturating_add(PER_MESSAGE_FRAMING_TOKENS)
+    })
+}
+
 fn estimate_message(estimator: &TokenEstimator, msg: &Value) -> u64 {
     let Some(blocks) = msg["content"].as_array() else {
         return estimate_serialized(estimator, msg);
     };
     // Zero drift for messages without images: charge exactly as before.
     if !blocks.iter().any(|b| {
-        is_base64_image(b) || b["content"].as_array().is_some_and(|a| a.iter().any(is_base64_image))
+        is_base64_image(b)
+            || b["content"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(is_base64_image))
     }) {
         return estimate_serialized(estimator, msg);
     }

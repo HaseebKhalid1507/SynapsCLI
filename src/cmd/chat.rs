@@ -12,6 +12,7 @@
 //! Exactly ONE waiter on notified() exists while idle at the prompt.
 //! Piped stdin, EOF, and CRLF behaviour are preserved.
 
+use agent_engine::attachments::{load_attachment, PendingAttachments};
 use futures::StreamExt;
 use serde_json::json;
 use std::io::{self, Write};
@@ -26,7 +27,8 @@ use synaps_cli::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
 };
-use synaps_cli::{flush_stdout, CancellationToken};
+use synaps_cli::skills::registry::{attachment_path_argument, ATTACHMENT_DISCLOSURE};
+use synaps_cli::{flush_stdout, CancellationToken, SessionEvent, StreamEvent};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 /// What was read while waiting at the prompt.
@@ -40,6 +42,49 @@ enum PromptRead {
     EventWake { run_turn: bool },
     /// I/O error.
     Error(std::io::Error),
+}
+
+/// Only called from the idle stdin branch, never an event-triggered turn or
+/// the string-only follow-up queue. Keep captured bytes on any rejection.
+fn append_user_submission(
+    conv: &mut ConversationState,
+    pending: &mut PendingAttachments,
+    model: &str,
+    text: &str,
+) -> Result<(), String> {
+    if conv.context_head.is_blocked(&conv.session) {
+        return Err("context head is unverified — restart/resume before continuing".into());
+    }
+    let text = if let Some(ctx) = &conv.abort_context {
+        format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", text, ctx)
+    } else {
+        text.to_string()
+    };
+    let content = pending.build_content(&text);
+    let message = std::sync::Arc::new(json!({"role": "user", "content": content}));
+    if !pending.is_empty() {
+        let mut proposed = conv.api_messages.clone();
+        proposed.push(message.clone());
+        synaps_cli::runtime::attachments::validate_messages(model, &proposed)?;
+    }
+    conv.api_messages.push(message);
+    pending.clear();
+    conv.abort_context = None;
+    Ok(())
+}
+
+fn list_pending_attachments(pending: &PendingAttachments) {
+    if pending.is_empty() {
+        eprintln!("no pending attachments — /attach PATH to stage a file");
+    } else {
+        eprintln!(
+            "Pending attachments ({}):\n{}\n{}",
+            pending.len(),
+            pending.summaries().join("\n"),
+            ATTACHMENT_DISCLOSURE
+        );
+        eprintln!("Send with the next normal input (a blank line also sends); /detach to clear.");
+    }
 }
 
 pub async fn run(
@@ -115,6 +160,9 @@ pub async fn run(
     // mode an unrecovered failure aborts the read loop and the process exits
     // nonzero — after the session (with valid partial history) is saved.
     let mut fatal_failure: Option<synaps_cli::TurnError> = None;
+    let mut pending_attachments = PendingAttachments::default();
+    // Piped input must not silently submit subsequent text after a failed attach.
+    let mut input_failure: Option<String> = None;
 
     // C4a: consecutive auto-turn counter; reset to 0 on real user input.
     // Initial value doesn't matter — always reset before first turn.
@@ -166,7 +214,7 @@ pub async fn run(
                         &drained,
                         &conv.api_messages,
                         false,
-                        true,  // auto_turn_enabled in chat mode
+                        !conv.context_head.is_blocked(&conv.session),
                         consecutive_auto_turns,
                     );
                     PromptRead::EventWake { run_turn: action == WakeAction::RunTurn }
@@ -202,7 +250,7 @@ pub async fn run(
             PromptRead::Line(raw_line) => {
                 let trimmed = raw_line.trim_end_matches('\r').trim();
 
-                if trimmed.is_empty() {
+                if trimmed.is_empty() && pending_attachments.is_empty() {
                     continue;
                 }
 
@@ -292,8 +340,46 @@ pub async fn run(
 
                     // Commands not handled by engine — headless-specific handling
                     match cmd {
+                        "attach" => {
+                            // Stdin is only consumed while idle. Streaming and
+                            // compaction complete before returning to this loop.
+                            let result = match attachment_path_argument(arg) {
+                                Ok(path) => match load_attachment(path).await {
+                                    Ok(attachment) => pending_attachments.add(attachment),
+                                    Err(error) => Err(error),
+                                },
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(()) => list_pending_attachments(&pending_attachments),
+                                Err(error) => {
+                                    eprintln!("attachment not staged: {error}");
+                                    if !is_tty {
+                                        input_failure = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        "attachments" => {
+                            if matches!(arg, "" | "list") {
+                                list_pending_attachments(&pending_attachments);
+                            } else {
+                                eprintln!("usage: /attachments [list]");
+                            }
+                        }
+                        "detach" => {
+                            if matches!(arg, "" | "clear") {
+                                let count = pending_attachments.len();
+                                pending_attachments.clear();
+                                eprintln!("cleared {count} pending attachment(s) (already-submitted history is unchanged)");
+                            } else {
+                                eprintln!("usage: /detach [clear]");
+                            }
+                        }
                         "clear" => {
                             conv.clear(&runtime).await;
+                            pending_attachments.clear();
                             eprintln!("session cleared → {}", &conv.session.id[..8]);
                         }
                         "sessions" => match synaps_cli::list_recent_sessions(20) {
@@ -334,7 +420,8 @@ pub async fn run(
                             );
                         }
                         "help" => {
-                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach PATH /attachments [list] /detach [clear] /quit");
+                            eprintln!("{ATTACHMENT_DISCLOSURE}");
                         }
                         _ => {
                             eprintln!("unknown command: /{} (try /help)", cmd);
@@ -343,25 +430,34 @@ pub async fn run(
                     continue;
                 }
 
-                // ── Regular user message ──
-                let message = if let Some(ctx) = conv.abort_context.take() {
-                    format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", trimmed, ctx)
-                } else {
-                    trimmed.to_string()
-                };
-                conv.api_messages.push(std::sync::Arc::new(
-                    json!({"role": "user", "content": message}),
-                ));
+                // ── Regular user message (including attachment-only blank line) ──
+                if let Err(error) = append_user_submission(
+                    &mut conv,
+                    &mut pending_attachments,
+                    runtime.model(),
+                    trimmed,
+                ) {
+                    eprintln!("message not submitted: {error}; pending attachments retained");
+                    if !is_tty {
+                        input_failure = Some(error);
+                        break;
+                    }
+                    continue;
+                }
             }
         }
 
         // ── C4a: turn loop — run until no pending events or cap reached ──
         'turn_loop: loop {
+            if conv.context_head.is_blocked(&conv.session) {
+                eprintln!("context head is unverified — restart/resume before continuing");
+                break 'turn_loop;
+            }
             let cancel = CancellationToken::new();
             // Vec<SharedMessage> clone = pointer bumps only.
             let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
             // Failure repair may only remove messages appended by this turn.
-            let turn_baseline = msgs_in.len();
+            let mut turn_baseline = msgs_in.len();
             let mut stream = runtime
                 .run_stream_with_messages(msgs_in, cancel, None, None, false)
                 .await;
@@ -372,6 +468,25 @@ pub async fn run(
                 let Some(event) = stream.next().await else {
                     break StreamCompletion::Done;
                 };
+                if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                    session_id,
+                    messages,
+                    receipt,
+                }) = event
+                {
+                    let result = conv.persist_context_head(&session_id, messages).await;
+                    turn_baseline = conv.api_messages.len();
+                    receipt.complete(result);
+                    continue;
+                }
+                // A failed publication is not a rollback. Ignore stale history
+                // and disable failure repair; still consume the typed Error.
+                if conv.context_head.is_blocked(&conv.session) {
+                    if matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_))) {
+                        continue;
+                    }
+                    turn_baseline = conv.api_messages.len();
+                }
                 let (engine_event, completion) = stream::process_stream_event(
                     event,
                     &mut conv.api_messages,
@@ -382,6 +497,11 @@ pub async fn run(
                 );
 
                 match engine_event {
+                    EngineStreamEvent::ResponseStart => {}
+                    EngineStreamEvent::ResponseReset => {
+                        eprintln!("\x1b[0m\n[Interrupted response discarded; retrying — tools were not executed]");
+                        in_thinking = false;
+                    }
                     EngineStreamEvent::Thinking(text) => {
                         if !in_thinking {
                             eprint!("\x1b[2m"); // dim
@@ -500,7 +620,11 @@ pub async fn run(
             // token math.
             conv.save().await;
             let assessment = runtime.assess_context(&conv.api_messages).await;
-            if assessment.should_compact() && !runtime.context_management_enabled() {
+            if !conv.context_head.is_blocked(&conv.session)
+                && !matches!(turn_completion, StreamCompletion::Error(_))
+                && assessment.should_compact()
+                && !runtime.context_management_enabled()
+            {
                 eprintln!(
                     "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
                     assessment.used_tokens()
@@ -564,7 +688,7 @@ pub async fn run(
                         &drained,
                         &conv.api_messages,
                         false,
-                        true, // auto_turn_enabled
+                        !conv.context_head.is_blocked(&conv.session),
                         consecutive_auto_turns,
                     );
                     match action {
@@ -605,7 +729,7 @@ pub async fn run(
         // nonzero exit instead of silently waiting for more input. In
         // interactive (TTY) mode the user keeps their session and can retry.
         if fatal_failure.is_some() {
-            if !is_tty {
+            if !is_tty || conv.context_head.is_blocked(&conv.session) {
                 break;
             }
             fatal_failure = None;
@@ -613,6 +737,12 @@ pub async fn run(
     }
 
     // ── Shutdown ──
+    if !pending_attachments.is_empty() {
+        eprintln!(
+            "{} pending attachment(s) were not submitted or saved",
+            pending_attachments.len()
+        );
+    }
     conv.save().await;
 
     // Fire on_session_end hook
@@ -659,5 +789,57 @@ pub async fn run(
             err.category_label()
         )));
     }
+    if let Some(error) = input_failure {
+        return Err(synaps_cli::RuntimeError::Session(format!(
+            "attachment submission failed: {error}"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_attachment_submission_retains_bytes_and_abort_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "captured notes").unwrap();
+        let mut pending = PendingAttachments::default();
+        pending.add(load_attachment(&path).await.unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut conv = ConversationState::new(synaps_cli::Session::new(
+            "claude-sonnet-4-5",
+            "medium",
+            None,
+        ));
+        conv.abort_context = Some("interrupted".into());
+        assert!(
+            append_user_submission(&mut conv, &mut pending, "google-gemini/test", "question")
+                .is_err()
+        );
+        assert!(conv.api_messages.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(conv.abort_context.as_deref(), Some("interrupted"));
+        conv.api_messages.push(std::sync::Arc::new(json!({
+            "role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://invalid.test/image"}}]
+        })));
+        assert!(
+            append_user_submission(&mut conv, &mut pending, "claude-sonnet-4-5", "question")
+                .is_err()
+        );
+        assert_eq!(conv.api_messages.len(), 1);
+        assert_eq!(pending.len(), 1);
+        conv.api_messages.clear();
+        conv.abort_context = None;
+        append_user_submission(&mut conv, &mut pending, "claude-sonnet-4-5", "").unwrap();
+        assert_eq!(
+            conv.api_messages[0]["content"][0]["source"]["data"],
+            "captured notes"
+        );
+        assert!(pending.is_empty());
+        append_user_submission(&mut conv, &mut pending, "test-model", "hello").unwrap();
+        assert_eq!(conv.api_messages[1]["content"], "hello");
+    }
 }

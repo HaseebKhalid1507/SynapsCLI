@@ -43,6 +43,19 @@ pub(super) async fn handle_stream_event(
     runtime: &Runtime,
 ) -> StreamAction {
     match event {
+        StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            app.drop_empty_thinking();
+            app.response_preview = Some((
+                app.transcript.messages().len(),
+                app.transcript.messages().last().map(|m| m.msg.clone()),
+            ));
+        }
+        StreamEvent::Llm(LlmEvent::ResponseReset) => {
+            if let Some((start, last)) = app.response_preview.take() {
+                app.transcript.reset_response_preview(start, last);
+                app.invalidate();
+            }
+        }
         StreamEvent::Llm(LlmEvent::Thinking(text)) => {
             app.append_or_update_thinking(&text);
         }
@@ -72,7 +85,27 @@ pub(super) async fn handle_stream_event(
             app.on_tool_result(tool_id, result);
             return StreamAction::Continue;
         }
+        StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+            session_id,
+            messages,
+            receipt,
+        }) => {
+            let result = app.persist_context_head(&session_id, messages).await;
+            super::session_driver::observe_checkpoint(app, &session_id, result.is_ok());
+            if result.is_err() {
+                if let Some(task) = app.compact_task.take() {
+                    task.abort();
+                }
+            }
+            // The candidate is now a new history baseline, including on an
+            // ambiguous attempted-save error. Failure repair must not trim it.
+            app.turn_baseline = app.api_messages.len();
+            receipt.complete(result);
+        }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+            if app.context_head.is_blocked(&app.session) {
+                return StreamAction::Continue;
+            }
             app.api_messages = history;
             app.save_session().await;
         }
@@ -124,6 +157,7 @@ pub(super) async fn handle_stream_event(
             app.invalidate();
         }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
+            super::session_driver::steering_delivered(app, &message);
             // Queue-drained events (subagent completion wakes, watcher
             // alerts) ride the same steering channel as genuine user
             // steering, but they were already presented as Event cards at
@@ -183,6 +217,10 @@ pub(super) async fn handle_stream_event(
             // NOTE: cleanup_finished removed — engine now reaps at turn completion
             // inside the tokio::spawn wrapper (runtime/mod.rs) before Done is sent.
 
+            if app.context_head.is_blocked(&app.session) {
+                return StreamAction::Continue;
+            }
+
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();
             for formatted in app.pending_events.drain(..) {
@@ -199,7 +237,7 @@ pub(super) async fn handle_stream_event(
             }
 
             // If events arrived during streaming, trigger a new model turn
-            if had_pending {
+            if had_pending && super::session_driver::auto_wakes_allowed(app) {
                 app.save_session().await;
                 return StreamAction::AutoTriggerEvents;
             }
@@ -228,10 +266,12 @@ pub(super) async fn handle_stream_event(
             // message (the prompt that started the turn) is never removed —
             // it stays in history so the failed turn can be retried with
             // full context (spec §5.2).
-            synaps_cli::engine::stream::repair_history_after_failure(
-                &mut app.api_messages,
-                app.turn_baseline,
-            );
+            if !app.context_head.is_blocked(&app.session) {
+                synaps_cli::engine::stream::repair_history_after_failure(
+                    &mut app.api_messages,
+                    app.turn_baseline,
+                );
+            }
         }
     }
     StreamAction::Continue
@@ -275,6 +315,8 @@ pub(super) async fn handle_event_queue_arm(
     if drained.is_empty() {
         return;
     }
+
+    super::session_driver::observe_events(app, drained.iter().map(|d| &d.disposition));
 
     // Presentation: push each event to the transcript and update the HUD.
     for de in &drained {
@@ -325,7 +367,8 @@ pub(super) async fn handle_event_queue_arm(
     app.invalidate();
 
     // Wake decision.
-    let auto_turn_enabled = true; // C2+ will wire config; always on for C1
+    let auto_turn_enabled = !app.context_head.is_blocked(&app.session)
+        && super::session_driver::auto_wakes_allowed(app);
     let action = wake_action(
         &drained,
         &app.api_messages,
@@ -401,9 +444,19 @@ pub(super) async fn handle_stream_arm(
     cancel_token: &mut Option<CancellationToken>,
     steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
+    super::session_driver::observe_feedback(app, maybe_event.as_ref());
+    let terminal = super::session_driver::capture_terminal(
+        maybe_event.as_ref(),
+        cancel_token.as_ref().is_some_and(|ct| ct.is_cancelled()),
+    );
+    // Done may consume queued work, so remember its priority before dispatch.
+    if app.queued_message.is_some() || !app.pending_events.is_empty() {
+        super::session_driver::revoke(app, "queued work took priority");
+    }
     if let Some(event) = maybe_event {
         let do_draw = needs_immediate_draw(&event);
         let action = handle_stream_event(event, app, runtime).await;
+        super::session_driver::observe_terminal(app, runtime, terminal);
 
         match action {
             StreamAction::Continue => {
@@ -434,6 +487,7 @@ pub(super) async fn handle_stream_arm(
                     app.invalidate();
                 }
                 // Auto-send the queued message (user-authored — reset auto-turn counter)
+                super::session_driver::user_takeover(app, runtime);
                 app.consecutive_auto_turns = 0;
                 app.push_msg(ChatMessage::User(queued.clone()));
                 app.transcript.scroll_to_bottom();
@@ -493,7 +547,9 @@ pub(super) async fn handle_stream_arm(
                 // Use the central claim_auto_turn gate: allows turns 1-5
                 // (counter < CAP), denies the 6th (counter == CAP).
                 // Increment happens inside claim on success — no inline +=.
-                if claim_auto_turn(&mut app.consecutive_auto_turns) {
+                if super::session_driver::auto_wakes_allowed(app)
+                    && claim_auto_turn(&mut app.consecutive_auto_turns)
+                {
                     let ct = CancellationToken::new();
                     let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     app.streaming = true;
@@ -537,13 +593,30 @@ pub(super) async fn handle_stream_arm(
                 render_handle.publish(model);
             }
         }
+    } else {
+        // EOF without an actual terminal event is never success. In
+        // particular it must not leave the idle frontend polling a closed
+        // stream forever or auto-restart a canceled driver.
+        super::session_driver::observe_terminal(app, runtime, terminal);
+        if let Some(ct) = cancel_token.take() {
+            ct.cancel();
+        }
+        *stream = None;
+        *steer_tx = None;
+        app.streaming = false;
+        app.status_text = None;
+        app.drop_empty_thinking();
+        app.push_msg(ChatMessage::Error(
+            "foreground stream ended without a terminal event; automatic continuation stopped"
+                .into(),
+        ));
     }
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text
 /// before it reaches the render path. Notices can carry raw API error bodies;
 /// an embedded ESC (0x1b) would otherwise inject terminal escape sequences.
-fn sanitize_notice(text: &str) -> String {
+pub(super) fn sanitize_notice(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_ascii_control() || *c == '\n' || *c == '\t')
         .collect()

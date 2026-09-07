@@ -224,3 +224,40 @@ fn mid_session_user_grant_wins_over_expired_pinned_grant() {
         Some("session-user-grant-openai-codex/gpt-5.6-sol")
     );
 }
+
+#[test]
+fn explicit_cumulative_limit_survives_reconciliation() {
+    let m = model("anthropic/haiku");
+    let mut r = WorkerRegistry::new(DelegationPolicy::enforced(m.clone(), [m.clone()], 1, 1));
+    let h = r
+        .authorize_dispatch(&m, WorkerRole::Tester, WorkerWritePolicy::ReadOnly)
+        .unwrap();
+    r.mark_starting(&h).unwrap();
+    r.mark_running(&h).unwrap();
+    r.mark_terminal(&h, WorkerTerminal::Completed).unwrap();
+    r.collect(&h).unwrap();
+    r.reconcile(&h).unwrap();
+    assert_eq!(r.validate_dispatch(&m).unwrap_err().code(), "total_limit");
+}
+
+#[test]
+fn rollback_never_reuses_or_overwrites_another_worker_identity() {
+    let m = model("anthropic/haiku");
+    let mut r = WorkerRegistry::new(DelegationPolicy::enforced(m.clone(), [m.clone()], 3, 3));
+    let a = r
+        .authorize_dispatch(&m, WorkerRole::Tester, WorkerWritePolicy::ReadOnly)
+        .unwrap();
+    let b = r
+        .authorize_dispatch(&m, WorkerRole::Tester, WorkerWritePolicy::ReadOnly)
+        .unwrap();
+    r.rollback_dispatch(&a).unwrap();
+    let c = r
+        .authorize_dispatch(&m, WorkerRole::Tester, WorkerWritePolicy::ReadOnly)
+        .unwrap();
+    assert_ne!(a, c);
+    assert_ne!(b, c);
+    r.mark_starting(&b).unwrap();
+    r.mark_running(&b).unwrap();
+    r.mark_starting(&c).unwrap();
+    r.mark_running(&c).unwrap();
+}

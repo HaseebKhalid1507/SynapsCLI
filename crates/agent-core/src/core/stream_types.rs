@@ -22,6 +22,10 @@ pub enum StreamEvent {
 
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
+    /// Marks a new uncommitted provider response (not a new turn).
+    ResponseStart,
+    /// Discard previews since ResponseStart. History/tools/usage are unchanged.
+    ResponseReset,
     Thinking(String),
     Text(String),
     /// A tool-use block has begun streaming. `tool_id` is the call id the
@@ -53,6 +57,14 @@ pub enum LlmEvent {
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     MessageHistory(Vec<SharedMessage>),
+    /// A sealed archive exists; persist this replacement active head and then
+    /// acknowledge. The runtime must not dispatch another provider round until
+    /// the frontend reports a durable save. Unsupported consumers fail closed.
+    ContextHeadCheckpoint {
+        session_id: String,
+        messages: Vec<SharedMessage>,
+        receipt: crate::core::context_head::ContextHeadReceipt,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,

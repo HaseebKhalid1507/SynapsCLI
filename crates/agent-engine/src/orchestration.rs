@@ -227,9 +227,10 @@ impl OrchestrationRuntime {
     ) -> Result<Self, &'static str> {
         let choices = manifestless_worker_choices(&foreground);
         let catalog = Self::trusted_catalog(&foreground, std::iter::empty())?;
-        Ok(Self::new(DelegationPolicy::provider_baseline(
-            foreground, catalog, choices, concurrent, total,
-        )?))
+        let mut policy =
+            DelegationPolicy::provider_baseline(foreground, catalog, choices, concurrent, total)?;
+        policy.recycle_reconciled_workers = true;
+        Ok(Self::new(policy))
     }
 
     pub fn new(policy: DelegationPolicy) -> Self {
@@ -435,7 +436,17 @@ impl OrchestrationRuntime {
                 foreground_model: foreground.as_str().into(),
                 selection_source,
                 network_attempted: false,
-                remediation: "Omit model to inherit foreground, select an exact session choice, or trust the model mid-session (favorite it in the models picker).",
+                remediation: match error.typed_code() {
+                    agent_core::orchestration::DispatchFailureCode::ConcurrencyLimit =>
+                        "Wait for running workers to finish; collect and reconcile their results. Changing model does not release capacity.",
+                    agent_core::orchestration::DispatchFailureCode::TotalWorkerLimit =>
+                        if inner.registry.policy().recycle_reconciled_workers {
+                            "Collect finished workers with reconciled=true to release outstanding-worker capacity. Changing model does not release capacity."
+                        } else {
+                            "The explicit delegation policy cumulative worker budget is exhausted. Changing model or collecting workers does not renew it."
+                        },
+                    _ => "Omit model to inherit foreground, select an exact session choice, or trust the model mid-session (favorite it in the models picker).",
+                },
             })?;
         inner.handles.insert(runtime_handle.to_owned(), handle);
         Ok(AuthorizedWorkerModel {
@@ -575,7 +586,10 @@ impl OrchestrationRuntime {
     }
     pub fn finish_one_shot(&self, id: &str, terminal: WorkerTerminal) -> Result<(), String> {
         self.terminal_and_collect(id, terminal)?;
-        self.reconcile(id)
+        self.reconcile(id)?;
+        // One-shot results have no retained reactive handle to be reaped later.
+        self.retire_reconciled(&[id.to_owned()].into_iter().collect());
+        Ok(())
     }
     pub fn reconcile(&self, id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
@@ -586,6 +600,19 @@ impl OrchestrationRuntime {
             .ok_or_else(|| "unknown worker".to_string())?;
         inner.registry.reconcile(&h).map_err(str::to_string)
     }
+    /// Reaper handoff: use exact IDs removed under the runtime registry lock,
+    /// never a complement snapshot that could include newly registered workers.
+    pub fn retire_reconciled(&self, removed_handles: &HashSet<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        for id in removed_handles {
+            if let Some(handle) = inner.handles.get(id).cloned() {
+                if inner.registry.retire_reconciled(&handle) {
+                    inner.handles.remove(id);
+                }
+            }
+        }
+    }
+
     /// Snapshot runtime handle IDs still named by the completion gate. Taking this
     /// snapshot before locking the subagent registry avoids cross-registry lock order.
     pub fn unreconciled_runtime_handles(&self) -> HashSet<String> {
@@ -1067,5 +1094,76 @@ mod tests {
             }
             other => panic!("expected only sa_beta still blocked, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod capacity_recovery_tests {
+    use super::*;
+    fn baseline(concurrent: usize, total: usize) -> OrchestrationRuntime {
+        OrchestrationRuntime::baseline(
+            QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+            concurrent,
+            total,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn manifestless_long_session_reuses_capacity_without_replacing_policy() {
+        let rt = baseline(8, 64);
+        let choices = rt.effective_choices();
+        for n in 0..150 {
+            let id = format!("sa_{n}");
+            rt.resolve_and_authorize(&id, None).unwrap();
+            rt.mark_starting(&id).unwrap();
+            rt.mark_running(&id).unwrap();
+            rt.terminal_and_collect(&id, WorkerTerminal::Completed)
+                .unwrap();
+            rt.reconcile(&id).unwrap();
+            rt.reconcile(&id).unwrap();
+        }
+        assert_eq!(rt.effective_choices(), choices);
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+    }
+    #[test]
+    fn retirement_only_touches_explicit_reconciled_ids() {
+        let rt = baseline(8, 64);
+        for id in ["old", "new", "uncollected"] {
+            rt.authorize(id, &rt.foreground_model()).unwrap();
+            rt.terminal_and_collect(id, WorkerTerminal::Completed)
+                .unwrap();
+        }
+        rt.reconcile("old").unwrap();
+        rt.reconcile("new").unwrap();
+        rt.retire_reconciled(&["old".into(), "uncollected".into()].into_iter().collect());
+        let inner = rt.inner.lock().unwrap();
+        assert!(!inner.handles.contains_key("old"));
+        assert!(inner.handles.contains_key("new"));
+        assert!(inner.handles.contains_key("uncollected"));
+        assert_eq!(inner.registry.total_dispatched(), 3);
+    }
+
+    #[test]
+    fn capacity_returns_only_after_reconcile_and_concurrency_still_applies() {
+        let rt = baseline(1, 2);
+        rt.authorize("a", &rt.foreground_model()).unwrap();
+        let denial = rt.resolve_and_authorize("b", None).unwrap_err();
+        assert_eq!(denial.code, "concurrency_limit");
+        assert!(denial.remediation.contains("Changing model does not"));
+        rt.terminal_and_collect("a", WorkerTerminal::Failed)
+            .unwrap();
+        rt.authorize("b", &rt.foreground_model()).unwrap();
+        rt.terminal_and_collect("b", WorkerTerminal::TimedOut)
+            .unwrap();
+        assert_eq!(
+            rt.resolve_and_authorize("c", None).unwrap_err().code,
+            "total_limit"
+        );
+        rt.reconcile("a").unwrap();
+        rt.resolve_and_authorize("c", None).unwrap();
+        assert!(matches!(
+            rt.completion_gate(),
+            CompletionGate::Blocked { .. }
+        ));
     }
 }

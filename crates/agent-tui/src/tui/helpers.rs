@@ -165,8 +165,10 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
         }
         match msg["role"].as_str() {
             Some("user") => {
-                if let Some(content) = msg["content"].as_str() {
-                    app.push_msg(ChatMessage::User(content.to_string()));
+                if let Some(content) =
+                    synaps_cli::session::user_content_for_display(&msg["content"])
+                {
+                    app.push_msg(ChatMessage::User(content));
                 }
             }
             Some("assistant") => {
@@ -340,6 +342,55 @@ mod tests {
             "cache must be Missing after rebuild with fully-filtered api_messages — \
              stale cache would render deleted messages (fbcfa05 regression)"
         );
+    }
+
+    #[test]
+    fn rebuild_display_projects_attachments_without_tool_result_prompts() {
+        use serde_json::json;
+        use std::sync::Arc;
+        let messages = vec![
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "TOOL_SENTINEL"},
+                    {"type": "document", "title": "NESTED_SENTINEL",
+                     "source": {"type": "text", "data": "DOC_SENTINEL"}}
+                ]}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "text", "text": "Review these"},
+                {"type": "image", "source": {"type": "base64", "data": "IMAGE_SENTINEL"}},
+                {"type": "document", "title": "notes.txt",
+                 "source": {"type": "text", "data": "TEXT_SENTINEL"}},
+                {"type": "text", "text": "and compare"},
+                {"type": "document", "title": "report.pdf",
+                 "source": {"type": "base64", "data": "PDF_SENTINEL"}}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "image", "source": {"data": "IMAGE_ONLY_SENTINEL"}}
+            ]})),
+            Arc::new(json!({"role": "user", "content": "legacy text"})),
+        ];
+        let original = messages.clone();
+        let mut app = test_app();
+        rebuild_display_messages(&messages, &mut app);
+        let displayed: Vec<&str> = app
+            .transcript
+            .messages()
+            .iter()
+            .map(|entry| {
+                let ChatMessage::User(text) = &entry.msg else {
+                    panic!("expected only genuine user messages");
+                };
+                text.as_str()
+            })
+            .collect();
+        assert_eq!(displayed, vec![
+            "Review these\n[attached image]\n[attached document: notes.txt]\nand compare\n[attached document: report.pdf]",
+            "[attached image]",
+            "legacy text",
+        ]);
+        assert!(!displayed.join("\n").contains("SENTINEL"));
+        assert_eq!(messages, original);
     }
 
     const T: Duration = Duration::from_millis(100);

@@ -83,6 +83,47 @@ fn humanize_broker_status_message(qualified_model: &str, msg: &str) -> Option<St
     crate::core::error::humanize_proxy_status_error(provider, status, Some(label))
 }
 
+/// Admit only the complete broker-authored HTTP status envelope. Other broker
+/// errors (policy/config/credentials/transport ambiguity) keep their category.
+pub(super) fn normalize_broker_http_error(message: String) -> String {
+    let valid = message
+        .strip_prefix("broker transport error: provider request failed: ")
+        .is_some_and(|rest| {
+            let Some((status, tail)) = rest.split_once(' ') else {
+                return false;
+            };
+            if status.len() != 3 || !status.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            let Ok(status) = status
+                .parse::<u16>()
+                .ok()
+                .and_then(|n| reqwest::StatusCode::from_u16(n).ok())
+                .ok_or(())
+            else {
+                return false;
+            };
+            if !status.is_client_error() && !status.is_server_error() {
+                return false;
+            }
+            let Some(reason) = status.canonical_reason() else {
+                return false;
+            };
+            if tail == reason {
+                return true;
+            }
+            tail.strip_prefix(reason)
+                .and_then(|r| r.strip_prefix(" ["))
+                .and_then(|r| r.strip_suffix(']'))
+                .is_some_and(|label| crate::core::error::VETTED_PROXY_ERROR_TYPES.contains(&label))
+        });
+    if valid {
+        format!("openai request failed: {message}")
+    } else {
+        message
+    }
+}
+
 /// Extract the `[label]` the broker appends after the canonical reason
 /// phrase (`provider request failed: 403 Forbidden [access_terminated_error]`).
 /// Only identifier-shaped labels are accepted; anything else is `None`.
@@ -106,10 +147,13 @@ pub(crate) fn broker_error_label(msg: &str) -> Option<&str> {
 /// suffix so every provider label classifies as an API failure.
 fn is_responses_terminal_failure_message(msg: &str) -> bool {
     use super::stream::{
-        RESPONSES_CAPACITY_SUFFIX, RESPONSES_CONTEXT_SUFFIX, RESPONSES_EMPTY_SUFFIX,
-        RESPONSES_FAILED_SUFFIX, RESPONSES_INCOMPLETE_SUFFIX, RESPONSES_MISSING_TERMINAL_SUFFIX,
+        RESPONSES_AUTH_SUFFIX, RESPONSES_CAPACITY_SUFFIX, RESPONSES_CONTEXT_SUFFIX,
+        RESPONSES_EMPTY_SUFFIX, RESPONSES_FAILED_SUFFIX, RESPONSES_INCOMPLETE_SUFFIX,
+        RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_QUOTA_SUFFIX,
     };
     const SUFFIXES: &[&str] = &[
+        RESPONSES_AUTH_SUFFIX,
+        RESPONSES_QUOTA_SUFFIX,
         RESPONSES_FAILED_SUFFIX,
         RESPONSES_CAPACITY_SUFFIX,
         RESPONSES_CONTEXT_SUFFIX,
@@ -162,6 +206,40 @@ pub(crate) fn redact_provider_proxy_error(msg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn broker_http_envelope_retains_provider_error_provenance() {
+        use crate::extensions::session_driver::{classify_turn_error, Outcome};
+        for (tail, expected) in [
+            ("401 Unauthorized", Some("auth")),
+            ("402 Payment Required", Some("quota")),
+            ("429 Too Many Requests", Some("rate_limit")),
+            ("429 Too Many Requests [insufficient_quota]", Some("quota")),
+            ("503 Service Unavailable", Some("transient")),
+            ("403 Forbidden", None),
+        ] {
+            let message = super::normalize_broker_http_error(format!(
+                "broker transport error: provider request failed: {tail}"
+            ));
+            assert!(message.starts_with("openai request failed: "));
+            let runtime = super::provider_error_to_runtime_for("xai-auth/grok-4.6", message.into());
+            assert!(matches!(runtime, crate::RuntimeError::ApiStatus(_)));
+            let result =
+                classify_turn_error(&crate::runtime::helpers::turn_error_for(&runtime, "test"));
+            match expected {
+                Some(kind) => assert_eq!(result, (Outcome::ProviderError, kind.into())),
+                None => assert_eq!(result.0, Outcome::Blocked),
+            }
+        }
+        for message in [
+            "broker transport error: private config problem",
+            "broker transport error: provider request failed: 401 untrusted reason",
+            "broker transport error: provider request failed: 401 Unauthorized: private body",
+            "broker transport error: provider request failed: 429 Too Many Requests [unlisted_error]",
+            "quoted broker transport error: provider request failed: 503 Service Unavailable",
+        ] {
+            assert_eq!(super::normalize_broker_http_error(message.into()), message);
+        }
+    }
     use super::*;
 
     async fn connect_error() -> reqwest::Error {

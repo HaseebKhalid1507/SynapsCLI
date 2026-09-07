@@ -96,6 +96,10 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
+            // This fixture exercises independent extension memory, not the
+            // operator's configured host backend. Make that boundary explicit.
+            memory_backend: Some(agent_engine::memory_backend::MemoryBinding::legacy_current()),
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

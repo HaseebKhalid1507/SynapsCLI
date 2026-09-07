@@ -120,6 +120,9 @@ pub enum Resolution {
 }
 
 struct Inner {
+    /// Already discovered, disable-filtered sidecars. Never rewalk disk on a UI toggle.
+    sidecars: Vec<crate::sidecar::discovery::DiscoveredSidecar>,
+    sidecar_extensions: std::collections::HashSet<String>,
     skills: HashMap<String, Vec<Arc<LoadedSkill>>>, // unqualified name -> all matches
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
     plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>>, // "plugin:cmd" -> single
@@ -137,6 +140,31 @@ struct Inner {
     lifecycle_claim_collisions: Vec<(String, String, String)>,
 }
 
+/// Local frontend commands; reserved so plugins cannot hijack explicit file consent.
+pub const ATTACHMENT_COMMANDS: &[&str] = &["attach", "attachments", "detach"];
+
+/// Parse the entire `/attach` argument as one literal path, not shell words.
+/// Only a matching pair of surrounding quotes is removed; no expansion,
+/// unescaping, globbing, URL handling, or automatic path discovery occurs.
+pub fn attachment_path_argument(arg: &str) -> Result<&std::path::Path, String> {
+    let arg = arg.trim();
+    let path = if let Some(quote) = arg.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+        if arg.len() < 2 || !arg.ends_with(quote) {
+            return Err("/attach: unmatched surrounding quote".into());
+        }
+        &arg[1..arg.len() - 1]
+    } else {
+        arg
+    };
+    if path.is_empty() {
+        return Err("usage: /attach PATH (the entire argument is one path)".into());
+    }
+    Ok(std::path::Path::new(path))
+}
+
+pub const ATTACHMENT_DISCLOSURE: &str =
+    "Attachment bytes are included in provider requests and stored in private session storage after submission.";
+
 pub struct CommandRegistry {
     builtins: Vec<&'static str>,
     inner: RwLock<Inner>,
@@ -152,9 +180,17 @@ impl CommandRegistry {
         skills: Vec<LoadedSkill>,
         plugins: Vec<Plugin>,
     ) -> Self {
+        let mut builtins = builtins.to_vec();
+        for &command in ATTACHMENT_COMMANDS {
+            if !builtins.contains(&command) {
+                builtins.push(command);
+            }
+        }
         let r = CommandRegistry {
-            builtins: builtins.to_vec(),
+            builtins,
             inner: RwLock::new(Inner {
+                sidecars: Vec::new(),
+                sidecar_extensions: std::collections::HashSet::new(),
                 skills: HashMap::new(),
                 qualified: HashMap::new(),
                 plugin_commands: HashMap::new(),
@@ -183,6 +219,12 @@ impl CommandRegistry {
         let mut new_plugin_settings_categories: Vec<PluginSettingsCategory> = Vec::new();
         let mut new_lifecycle_claims: HashMap<String, LifecycleClaim> = HashMap::new();
         let mut new_lifecycle_collisions: Vec<(String, String, String)> = Vec::new();
+        let sidecars = crate::sidecar::discovery::discover_all_in(&plugins);
+        let sidecar_extensions = plugins
+            .iter()
+            .filter(|p| p.extension.is_some())
+            .map(|p| p.name.clone())
+            .collect();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
                 new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(
@@ -393,6 +435,8 @@ impl CommandRegistry {
         }
 
         let mut w = self.inner.write().unwrap();
+        w.sidecars = sidecars;
+        w.sidecar_extensions = sidecar_extensions;
         w.skills = new_skills;
         w.qualified = new_qualified;
         w.plugin_commands = new_plugin_commands;
@@ -521,6 +565,21 @@ impl CommandRegistry {
             .clone()
     }
 
+    /// Snapshot from the same filtered discovery pass as commands/keybindings.
+    /// Reading this never starts a plugin or probes a sidecar binary.
+    pub fn sidecars(&self) -> Vec<crate::sidecar::discovery::DiscoveredSidecar> {
+        self.inner.read().unwrap().sidecars.clone()
+    }
+
+    /// Whether the discovered sidecar requires its plugin bootstrap RPC.
+    pub fn sidecar_has_extension(&self, plugin: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .sidecar_extensions
+            .contains(plugin)
+    }
+
     pub fn plugins(&self) -> Vec<PluginSummary> {
         let r = self.inner.read().unwrap();
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -589,6 +648,48 @@ mod tests {
     use super::*;
     use crate::skills::manifest::{ManifestCommand, ManifestShellCommand};
     use std::path::PathBuf;
+
+    #[test]
+    fn attachment_commands_are_reserved_and_deduplicated() {
+        let r = CommandRegistry::new(&["attach"], vec![mk("attach", Some("p"))]);
+        for &command in ATTACHMENT_COMMANDS {
+            assert!(matches!(r.resolve(command), Resolution::Builtin));
+            assert_eq!(
+                r.all_commands()
+                    .iter()
+                    .filter(|c| c.as_str() == command)
+                    .count(),
+                1
+            );
+        }
+        assert!(matches!(r.resolve("p:attach"), Resolution::Skill(_)));
+    }
+
+    #[test]
+    fn attachment_argument_is_one_literal_path() {
+        for arg in ["some file.txt", "  \"some file.txt\"  ", "'some file.txt'"] {
+            assert_eq!(
+                attachment_path_argument(arg).unwrap(),
+                std::path::Path::new("some file.txt")
+            );
+        }
+        assert_eq!(
+            attachment_path_argument("~/file* $HOME.txt").unwrap(),
+            std::path::Path::new("~/file* $HOME.txt")
+        );
+        for arg in [
+            "",
+            "  ",
+            "\"\"",
+            "''",
+            "\"",
+            "'",
+            "\"unclosed",
+            "'unclosed\"",
+        ] {
+            assert!(attachment_path_argument(arg).is_err(), "{arg:?}");
+        }
+    }
 
     fn mk_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
         Plugin {
@@ -792,7 +893,18 @@ mod tests {
             vec![mk("search", Some("p")), mk("help-me", None)],
         );
         let cmds = r.all_commands();
-        assert_eq!(cmds, vec!["clear", "help-me", "model", "search"]);
+        assert_eq!(
+            cmds,
+            vec![
+                "attach",
+                "attachments",
+                "clear",
+                "detach",
+                "help-me",
+                "model",
+                "search"
+            ]
+        );
     }
 
     #[test]

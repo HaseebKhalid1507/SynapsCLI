@@ -23,6 +23,7 @@ mod render;
 mod render_model;
 mod render_thread;
 mod run_setup;
+mod session_driver;
 mod settings;
 mod sidecar;
 mod signals;
@@ -122,6 +123,8 @@ pub async fn run(
     loop_arms::boot_myx_live(&mut app);
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
+    let mut driver_timer = tokio::time::interval(std::time::Duration::from_millis(50));
+    driver_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
         // redraws to the configured frame budget (`max_fps`, default 60fps =
@@ -153,24 +156,23 @@ pub async fn run(
                     height: h,
                 },
                 _ => {
-                    // Terminal not yet ready or transient resize — clear redraw
-                    // flags and back off so we don't busy-spin when the size is
-                    // 0×0 or the syscall fails (#tui-safety fix 1).
-                    app.needs_redraw = false;
-                    app.force_redraw = false;
-                    last_draw = Instant::now();
-                    continue;
+                    // Skip this frame, not event dispatch (#tui-safety fix 1).
+                    ratatui::layout::Size::default()
                 }
             };
             app.needs_redraw = false;
             app.force_redraw = false;
             last_draw = Instant::now();
-            let built = build_render_model(
-                &mut view_model::ViewInputs::from_app(&mut app),
-                &runtime,
-                &registry,
-                term_size,
-            );
+            let built = if term_size.width > 0 && term_size.height > 0 {
+                build_render_model(
+                    &mut view_model::ViewInputs::from_app(&mut app),
+                    &runtime,
+                    &registry,
+                    term_size,
+                )
+            } else {
+                None
+            };
             if let Some((model, patch)) = built {
                 patch.apply(&mut app);
                 render_handle.publish(model);
@@ -178,6 +180,7 @@ pub async fn run(
         }
 
         tokio::select! {
+            biased;
 
             // ── OS shutdown signals: Ctrl-C from terminal, SIGTERM from systemd/tmux/SSH ──
             signal = shutdown_signal_rx.recv() => {
@@ -196,80 +199,6 @@ pub async fn run(
                     // open past the teardown budget.
                     if let Some(ref h) = app.compact_task { h.abort(); }
                     // Fall through to unified bounded-teardown below the loop.
-                    break;
-                }
-            }
-
-            // ── Ping results — fires when a model ping completes ──
-            result = app.ping_rx.recv() => {
-                loop_arms::handle_ping_arm(&mut app, result);
-            }
-
-            // ── Expanded model-list results ──
-            result = app.model_list_rx.recv() => {
-                loop_arms::handle_model_list_arm(&mut app, result);
-            }
-
-            // ── Async extension loader progress ──
-            event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
-                loop_arms::handle_extension_loader_arm(&mut app, &runtime, event, &ext_mgr_shared).await;
-            }
-
-            // ── Widget events from background extension notification watchers ──
-            Some(widget_event) = app.widget_rx.recv() => {
-                loop_arms::handle_widget_arm(&mut app, widget_event);
-            }
-
-            // ── Live MXC palettes (myx theme) — UI-thread apply, same path as /theme ──
-            Some(myx_theme) = app.myx_theme_rx.recv() => {
-                loop_arms::handle_myx_theme_arm(&mut app, myx_theme);
-            }
-
-            // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
-            sidecar_event = async {
-                if app.sidecars.is_empty() {
-                    let _: () = std::future::pending().await;
-                    unreachable!()
-                } else {
-                    // Collect (plugin_id, &mut manager) and race them.
-                    let mut futures = Vec::with_capacity(app.sidecars.len());
-                    for (pid, v) in app.sidecars.iter_mut() {
-                        let pid = pid.clone();
-                        futures.push(Box::pin(async move {
-                            let ev = v.manager.next_event().await;
-                            (pid, ev)
-                        }));
-                    }
-                    let ((pid, ev), _, _) = futures::future::select_all(futures).await;
-                    (pid, ev)
-                }
-            } => {
-                let (pid, sidecar_event) = sidecar_event;
-                if let Some(event) = sidecar_event {
-                    self::sidecar::handle_event(&mut app, &pid, event);
-                    app.request_redraw();
-                }
-            }
-
-            // ── Event bus wake — fires instantly when an event is pushed to the queue.
-            // P12.4: arm body moved verbatim to stream_handler::handle_event_queue_arm.
-            _ = runtime.event_queue().notified() => {
-                stream_handler::handle_event_queue_arm(
-                    &mut app, &runtime, &secret_prompt_handle,
-                    &mut stream, &mut cancel_token, &mut steer_tx,
-                ).await;
-            }
-
-            // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
-                if loop_arms::handle_animation_tick(
-                    &mut app, &runtime, &config, &registry, &render_handle,
-                    &secret_prompt_rx, &boot_done, &exit_done,
-                    &mut boot_fx_sent, exit_fx_sent,
-                    &mut last_subagent_reconcile,
-                )
-                .await
-                {
                     break;
                 }
             }
@@ -330,6 +259,73 @@ pub async fn run(
                 }
             }
 
+            _ = driver_timer.tick(), if app.session_driver.is_active() || app.streaming => {
+                session_driver::tick(
+                    &mut app, &mut runtime, &ext_mgr_shared, &secret_prompt_handle,
+                    &mut stream, &mut cancel_token, &mut steer_tx,
+                ).await;
+            }
+
+            // ── Ping results — fires when a model ping completes ──
+            result = app.ping_rx.recv() => {
+                loop_arms::handle_ping_arm(&mut app, result);
+            }
+
+            // ── Expanded model-list results ──
+            result = app.model_list_rx.recv() => {
+                loop_arms::handle_model_list_arm(&mut app, result);
+            }
+
+            // ── Async extension loader progress ──
+            event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
+                loop_arms::handle_extension_loader_arm(&mut app, &runtime, event, &ext_mgr_shared).await;
+            }
+
+            // ── Widget events from background extension notification watchers ──
+            Some(widget_event) = app.widget_rx.recv() => {
+                loop_arms::handle_widget_arm(&mut app, widget_event);
+            }
+
+            // ── Live MXC palettes (myx theme) — UI-thread apply, same path as /theme ──
+            Some(myx_theme) = app.myx_theme_rx.recv() => {
+                loop_arms::handle_myx_theme_arm(&mut app, myx_theme);
+            }
+
+            // Startup joins run off-loop; only publish their final state here.
+            (pid, result) = self::sidecar::next_startup(&mut app.sidecar_starts) => {
+                self::sidecar::finish_startup(&mut app, &registry, pid, result);
+                app.request_redraw();
+            }
+
+            // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
+            (pid, event) = self::sidecar::next_event(&mut app.sidecars) => {
+                self::sidecar::handle_event(&mut app, &pid, event);
+                app.request_redraw();
+            }
+
+            // ── Event bus wake — fires instantly when an event is pushed to the queue.
+            // P12.4: arm body moved verbatim to stream_handler::handle_event_queue_arm.
+            _ = runtime.event_queue().notified() => {
+                stream_handler::handle_event_queue_arm(
+                    &mut app, &runtime, &secret_prompt_handle,
+                    &mut stream, &mut cancel_token, &mut steer_tx,
+                ).await;
+            }
+
+            // ── Tick: animations + spinner (~60fps when active) ──
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
+                if loop_arms::handle_animation_tick(
+                    &mut app, &runtime, &config, &registry, &render_handle,
+                    &secret_prompt_rx, &boot_done, &exit_done,
+                    &mut boot_fx_sent, exit_fx_sent,
+                    &mut last_subagent_reconcile,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+
             // ── Stream events from runtime. P12.4: the polling future stays
             // inline (it borrows `stream`); the arm body moved verbatim to
             // stream_handler::handle_stream_arm — delta/tool_use/done/abort
@@ -348,6 +344,14 @@ pub async fn run(
             }
         }
     }
+
+    session_driver::revoke(&mut app, "TUI shutting down");
+    if let Some(ct) = &cancel_token {
+        ct.cancel();
+    }
+    // No loading child or late startup result may survive UI teardown.
+    app.sidecar_starts.clear();
+    app.sidecars.clear();
 
     // Stop the live-MXC subscriber FIRST — no background task writes past here.
     loop_arms::abort_myx_live(&mut app);

@@ -56,6 +56,53 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// Project canonical user content for display/title/compaction, never for inference.
+/// Only top-level text and attachment labels are visible; in particular, tool
+/// results are NOT user prompts and their nested content is never traversed.
+/// The original message (including attachment sources) is left untouched.
+pub fn user_content_for_display(content: &serde_json::Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let parts: Vec<String> = content
+        .as_array()?
+        .iter()
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => block["text"].as_str().map(str::to_string),
+            Some("image") => Some("[attached image]".to_string()),
+            Some("document") => {
+                // Canonical title is a filename, not document text. Accept the
+                // explicit filename spelling too, but never inspect source.
+                // Strip path prefixes and terminal/label control characters.
+                let name = block["filename"]
+                    .as_str()
+                    .or_else(|| block["title"].as_str())
+                    .unwrap_or("")
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("");
+                let name: String = name
+                    .chars()
+                    .filter(|c| {
+                        !c.is_control()
+                            && !matches!(c, '[' | ']' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                    })
+                    .take(120)
+                    .collect();
+                let name = name.trim();
+                Some(if name.is_empty() {
+                    "[attached document]".to_string()
+                } else {
+                    format!("[attached document: {name}]")
+                })
+            }
+            _ => None,
+        })
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 impl Session {
     pub fn new(model: &str, thinking_level: &str, system_prompt: Option<&str>) -> Self {
         let now = Utc::now();
@@ -142,7 +189,7 @@ impl Session {
         }
         for msg in &self.api_messages {
             if msg["role"].as_str() == Some("user") {
-                if let Some(content) = msg["content"].as_str() {
+                if let Some(content) = user_content_for_display(&msg["content"]) {
                     self.title = content.chars().take(80).collect();
                     return;
                 }
@@ -154,11 +201,71 @@ impl Session {
     /// (`session_persistence` config key; default is the unchanged legacy
     /// JSON path — see Task 35 / `crate::core::session_journal`).
     pub async fn save(&self) -> std::io::Result<()> {
-        let dir = crate::config::resolve_write_path("sessions");
+        let dir = sessions_dir();
         let mode = crate::config::load_config().session_persistence;
         let session = self.clone(); // messages are Arc-shared — cheap clone
+        let guard = crate::core::session_save_order::acquire(&dir, &session.id).await;
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             crate::core::session_journal::save_session_in_dir(&dir, &session, mode).map(|_| ())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Publish a full context checkpoint and wait for durable persistence.
+    /// Captures the destination and configured mode BEFORE spawning blocking
+    /// work. Unlike `save`, journal mode always replaces the snapshot here.
+    ///
+    /// On success the snapshot file AND its containing directory have been
+    /// fsynced (also newly created directory ancestry). Snapshot publication
+    /// is the logical commit: errors from directory sync or journal cleanup
+    /// can occur AFTER it is visible, and do not imply rollback. Callers must
+    /// stop inference on ANY error and reload/retry rather than assume the old
+    /// head survived. Dropping this future does not cancel blocking I/O.
+    ///
+    /// Async saves to the same destination/session are ordered in-process,
+    /// including blocking writers whose awaiter was dropped. Callers still own
+    /// ordering of logical session mutations; this is not a multi-process
+    /// transaction. Durable saves fail closed on non-Unix platforms; fsync
+    /// guarantees still depend on the underlying filesystem/device.
+    pub async fn save_durable(&self) -> std::io::Result<()> {
+        let dir = sessions_dir();
+        let mode = crate::config::load_config().session_persistence;
+        self.save_durable_to(dir, mode).await
+    }
+
+    // Explicit inputs also let synthetic tempdir tests exercise the exact
+    // blocking dispatch without mutating process-wide config/environment.
+    async fn save_durable_to(
+        &self,
+        dir: PathBuf,
+        mode: crate::core::session_journal::SessionPersistence,
+    ) -> std::io::Result<()> {
+        let session = self.clone();
+        let guard = crate::core::session_save_order::acquire(&dir, &session.id).await;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            crate::core::session_journal::save_session_durable_in_dir(&dir, &session, mode)
+                .map(|_| ())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Resolve an ambiguous head without racing an older detached writer.
+    /// Read and durable re-publication share the same save-order guard. A
+    /// successful read alone must not clear a failed directory-sync barrier.
+    pub async fn recover_durable(id: &str) -> std::io::Result<Self> {
+        let dir = sessions_dir();
+        let mode = crate::config::load_config().session_persistence;
+        let id = id.to_owned();
+        let guard = crate::core::session_save_order::acquire(&dir, &id).await;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let session = Self::load_from_dir(&dir, &id)?;
+            crate::core::session_journal::save_session_durable_in_dir(&dir, &session, mode)?;
+            Ok(session)
         })
         .await
         .map_err(std::io::Error::other)?
@@ -405,6 +512,8 @@ pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
 fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<SessionInfo> {
     #[derive(Deserialize)]
     struct SessionMetadata {
+        #[serde(default)]
+        _journal_generation: Option<String>,
         id: String,
         #[serde(default)]
         title: String,
@@ -433,7 +542,11 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
     // Journal freshness overlay (Task 35): when an opt-in journal exists,
     // its bounded meta tail is newer than the (possibly lagging) snapshot
     // header. Legacy sessions have no journal — zero extra I/O.
-    if let Some(tail) = crate::core::session_journal::journal_meta_tail(dir, &info.id) {
+    if let Some(tail) = crate::core::session_journal::journal_meta_tail_for_generation(
+        dir,
+        &info.id,
+        meta._journal_generation.as_deref(),
+    ) {
         if tail.updated_at > info.updated_at {
             info.updated_at = tail.updated_at;
             info.session_cost = tail.session_cost;
@@ -453,6 +566,12 @@ fn parse_session_header(dir: &std::path::Path, file_name: &str) -> Option<Sessio
 /// sessions). This is what keeps `list_sessions()` O(#sessions) instead of
 /// O(total bytes on disk).
 fn read_session_header(dir: &std::path::Path, file_name: &str) -> Option<String> {
+    let file = crate::core::session_journal::confined_open(dir, file_name).ok()??;
+    read_session_header_from_file(file)
+}
+
+/// Shared with generation checks; callers provide an already-confined handle.
+pub(crate) fn read_session_header_from_file(mut file: std::fs::File) -> Option<String> {
     use std::io::Read;
     const KEY: &[u8] = b"\"api_messages\"";
     const MAX_HEADER: usize = 256 * 1024; // safety cap if the key is never found
@@ -460,7 +579,6 @@ fn read_session_header(dir: &std::path::Path, file_name: &str) -> Option<String>
     // fix2: confined strict open — same root resolution as every other
     // session read; a symlinked ancestor or artifact yields None, never
     // foreign bytes.
-    let mut file = crate::core::session_journal::confined_open(dir, file_name).ok()??;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut cut: Option<usize> = None;
@@ -590,6 +708,92 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_dispatch_checkpoints_json_and_journal_without_global_config() {
+        use crate::core::session_journal::{save_session_in_dir, SessionPersistence};
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("profile/nested/sessions");
+            let mut session = Session::new("m", "medium", None);
+            session.api_messages.push(std::sync::Arc::new(
+                json!({"role":"user","content":"checkpoint"}),
+            ));
+            session.save_durable_to(dir.clone(), mode).await.unwrap();
+            let loaded = Session::load_from_dir(&dir, &session.id).unwrap();
+            assert_eq!(loaded.api_messages, session.api_messages);
+            // Force a later checkpoint after a journal-only append; both
+            // durable modes must contain the whole candidate in the snapshot.
+            session.api_messages.push(std::sync::Arc::new(
+                json!({"role":"assistant","content":"old tail"}),
+            ));
+            save_session_in_dir(&dir, &session, SessionPersistence::Journal).unwrap();
+            session.api_messages.truncate(1);
+            session.save_durable_to(dir.clone(), mode).await.unwrap();
+            assert_eq!(
+                Session::load_from_dir(&dir, &session.id)
+                    .unwrap()
+                    .api_messages,
+                session.api_messages
+            );
+            let snapshot: Session = serde_json::from_slice(
+                &std::fs::read(dir.join(format!("{}.json", session.id))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot.api_messages, session.api_messages);
+            assert_eq!(
+                dir.join(format!("{}.journal", session.id)).exists(),
+                mode == SessionPersistence::Journal
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_dispatch_returns_io_errors_and_refuses_symlinks() {
+        use crate::core::session_journal::SessionPersistence;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let dir = root.join("sessions");
+        std::fs::create_dir(&dir).unwrap();
+        let session = Session::new("m", "medium", None);
+        std::os::unix::fs::symlink(&victim, dir.join(format!("{}.json", session.id))).unwrap();
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            assert!(session.save_durable_to(dir.clone(), mode).await.is_err());
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_dispatch_reports_post_commit_cleanup_error() {
+        use crate::core::session_journal::SessionPersistence;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let mut session = Session::new("m", "medium", None);
+        session
+            .save_durable_to(dir.clone(), SessionPersistence::Journal)
+            .await
+            .unwrap();
+        session.title = "published candidate".into();
+        std::fs::create_dir(dir.join(format!("{}.journal.tmp", session.id))).unwrap();
+        assert!(session
+            .save_durable_to(dir.clone(), SessionPersistence::Journal)
+            .await
+            .is_err());
+        // The receipt must be an error, even though rename already committed.
+        assert_eq!(
+            Session::load_from_dir(&dir, &session.id).unwrap().title,
+            session.title
+        );
+    }
+
     #[test]
     fn test_session_new() {
         let session = Session::new("gpt-4", "brief", Some("test prompt"));
@@ -669,6 +873,88 @@ mod tests {
         session_long.auto_title();
         assert_eq!(session_long.title.len(), 80);
         assert_eq!(session_long.title, "a".repeat(80));
+    }
+
+    #[test]
+    fn attachment_projection_and_auto_title_never_read_sources_or_tool_results() {
+        let content = json!([
+            {"type": "text", "text": "Review"},
+            {"type": "image", "source": {"type": "base64", "data": "IMAGE_SENTINEL"}},
+            {"type": "document", "title": "a.txt",
+             "source": {"type": "text", "data": "DOCUMENT_TEXT_SENTINEL"}},
+            {"type": "document", "title": "b.pdf",
+             "source": {"type": "base64", "data": "PDF_SENTINEL"}},
+            {"type": "text", "text": "Then compare"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "TOOL_TEXT_SENTINEL"},
+                {"type": "document", "title": "TOOL_TITLE_SENTINEL",
+                 "source": {"type": "text", "data": "NESTED_DOCUMENT_SENTINEL"}}
+            ]}
+        ]);
+        let original = content.clone();
+        let projected = user_content_for_display(&content).unwrap();
+        assert_eq!(projected, "Review\n[attached image]\n[attached document: a.txt]\n[attached document: b.pdf]\nThen compare");
+        assert!(!projected.contains("SENTINEL"));
+        assert_eq!(
+            content, original,
+            "projection must not mutate canonical data"
+        );
+
+        let tool_only = json!([content[5].clone()]);
+        assert!(user_content_for_display(&tool_only).is_none());
+        let mut session = Session::new("m", "low", None);
+        session.api_messages.push(std::sync::Arc::new(json!({
+            "role": "user", "content": tool_only
+        })));
+        session.api_messages.push(std::sync::Arc::new(json!({
+            "role": "user", "content": content
+        })));
+        session.auto_title();
+        assert_eq!(
+            session.title,
+            projected.chars().take(80).collect::<String>()
+        );
+        assert!(!session.title.contains("SENTINEL"));
+    }
+
+    #[test]
+    fn attachment_only_titles_and_safe_filename_labels() {
+        let content = json!([
+            {"type": "document", "title": "/private/path/[report]\u{1b}\n.txt",
+             "source": {"type": "text", "data": "DO_NOT_DISPLAY"}},
+            {"type": "document", "filename": "C:\\private\\note.txt"},
+            {"type": "document", "source": {"data": "NO_FILENAME"}}
+        ]);
+        assert_eq!(
+            user_content_for_display(&content).unwrap(),
+            "[attached document: report.txt]\n[attached document: note.txt]\n[attached document]"
+        );
+        for (block, title) in [
+            (
+                json!({"type": "image", "source": {"data": "IMAGE_SENTINEL"}}),
+                "[attached image]",
+            ),
+            (
+                json!({"type": "document", "title": "notes.txt",
+                    "source": {"type": "text", "data": "TEXT_SENTINEL"}}),
+                "[attached document: notes.txt]",
+            ),
+        ] {
+            let mut session = Session::new("m", "low", None);
+            session.api_messages.push(std::sync::Arc::new(json!({
+                "role": "user", "content": [block]
+            })));
+            session.auto_title();
+            assert_eq!(session.title, title);
+        }
+        assert!(user_content_for_display(&json!([])).is_none());
+        assert!(
+            user_content_for_display(&json!([{"type": "unknown", "text": "hidden"}])).is_none()
+        );
+        assert_eq!(
+            user_content_for_display(&json!("plain text")).as_deref(),
+            Some("plain text")
+        );
     }
 
     #[test]
@@ -1053,8 +1339,9 @@ mod tests {
             let mut s = Session::new("claude-sonnet-4-6", "medium", None);
             for i in 0..n {
                 let role = if i % 2 == 0 { "user" } else { "assistant" };
-                s.api_messages
-                    .push(Arc::new(serde_json::json!({"role": role, "content": format!("m{i}")})));
+                s.api_messages.push(Arc::new(
+                    serde_json::json!({"role": role, "content": format!("m{i}")}),
+                ));
             }
             s
         }
@@ -1083,12 +1370,37 @@ mod tests {
             let dir = tmp.path().join("sessions");
             let mut s = session_with(2);
             save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
-            s.api_messages
-                .push(Arc::new(serde_json::json!({"role": "user", "content": "more"})));
+            s.api_messages.push(Arc::new(
+                serde_json::json!({"role": "user", "content": "more"}),
+            ));
             s.updated_at = Utc::now();
             save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
             let info = parse_session_header(&dir, &format!("{}.json", s.id)).unwrap();
             assert_eq!(info.message_count, 3);
+        }
+
+        #[test]
+        fn listing_does_not_overlay_stale_generation_metadata() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().canonicalize().unwrap().join("sessions");
+            let mut s = session_with(2);
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            s.api_messages
+                .push(Arc::new(serde_json::json!({"role":"user","content":"old"})));
+            s.session_cost = 999.0;
+            s.updated_at += chrono::Duration::hours(1);
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            let journal_path = dir.join(format!("{}.journal", s.id));
+            let stale = std::fs::read(&journal_path).unwrap();
+            s.api_messages.truncate(1);
+            s.session_cost = 1.0;
+            s.updated_at -= chrono::Duration::hours(2);
+            save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            std::fs::write(journal_path, stale).unwrap();
+            let info = parse_session_header(&dir, &format!("{}.json", s.id)).unwrap();
+            assert_eq!(info.message_count, 1);
+            assert_eq!(info.session_cost, 1.0);
+            assert_eq!(info.updated_at, s.updated_at);
         }
 
         /// Legacy files without the field report 0, never fail to parse.

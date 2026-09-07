@@ -84,6 +84,15 @@ pub(super) fn handle_event(
         }
     }
 
+    // Cancellation outranks plugin keybinds and modal routing while armed.
+    if app.session_driver.is_active()
+        && matches!(&event,
+        Event::Key(k) if k.code == KeyCode::Esc ||
+            (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)))
+    {
+        return InputAction::Abort;
+    }
+
     // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
     // `Chat` (empty stack) is the base pane; every modal + the folded-in
     // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.
@@ -359,10 +368,14 @@ fn handle_key(
         (KeyCode::Enter, KeyModifiers::ALT) if !streaming => {
             app.editor.insert_newline();
         }
-        (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
+        (KeyCode::Enter, _)
+            if !streaming && (!app.input_is_empty() || !app.pending_attachments.is_empty()) =>
+        {
             return process_submit(app, registry);
         }
-        (KeyCode::Enter, _) if streaming && !app.input_is_empty() => {
+        (KeyCode::Enter, _)
+            if streaming && (!app.input_is_empty() || !app.pending_attachments.is_empty()) =>
+        {
             return process_streaming_submit(app);
         }
         // Enter that matched none of the above (empty buffer) stays a no-op.
@@ -445,6 +458,13 @@ fn handle_key(
 
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
+    if app.compact_task.is_some()
+        && !app.pending_attachments.is_empty()
+        && !app.input_text().starts_with('/')
+    {
+        app.push_msg(ChatMessage::Error("attachments require idle submission — wait for compaction to finish; draft and attachments retained".into()));
+        return InputAction::None;
+    }
     if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
@@ -456,7 +476,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
         let commands = super::commands::all_commands_with_skills(registry);
@@ -470,6 +490,10 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
 /// User pressed Enter with non-empty input while streaming.
 fn process_streaming_submit(app: &mut App) -> InputAction {
     let input = app.input_text();
+    if !app.pending_attachments.is_empty() && !input.starts_with('/') {
+        app.push_msg(ChatMessage::Error("attachments require idle submission — wait for streaming to finish; draft and attachments retained".into()));
+        return InputAction::None;
+    }
     app.input_history.push(input.clone());
     app.history_index = None;
     app.input_stash.clear();
@@ -1123,6 +1147,48 @@ mod tests {
             &registry,
             &keybinds,
         )
+    }
+
+    #[tokio::test]
+    async fn attachment_only_enter_and_busy_draft_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "captured").unwrap();
+        let mut app = make_app();
+        app.pending_attachments
+            .add(
+                agent_engine::attachments::load_attachment(&path)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), InputAction::Submit(text) if text.is_empty())
+        );
+        assert_eq!(app.pending_attachments.len(), 1);
+        app.set_input_text("keep this draft");
+        assert!(matches!(
+            process_streaming_submit(&mut app),
+            InputAction::None
+        ));
+        assert_eq!(app.input_text(), "keep this draft");
+        assert!(app.queued_message.is_none());
+        app.compact_task = Some(tokio::spawn(std::future::pending()));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        assert_eq!(app.input_text(), "keep this draft");
+        app.compact_task.take().unwrap().abort();
+    }
+
+    #[test]
+    fn attach_command_keeps_the_entire_path_argument() {
+        let mut app = make_app();
+        app.set_input_text("/attach \"some file.png\"");
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), InputAction::SlashCommand(cmd, arg) if cmd == "attach" && arg == "\"some file.png\"")
+        );
     }
 
     /// Shift-Enter inserts a newline into the buffer instead of submitting.

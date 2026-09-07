@@ -109,26 +109,30 @@ impl CaptureWorker {
                 let mut submitted = HashSet::new();
                 while let Ok(job) = receiver.recv() {
                     let id = (job.provider_id.clone(), job.payload.id_bytes());
-                    let result = if submitted.contains(&id) {
-                        Ok(())
-                    } else if let Err(error) = job.payload.dispatch(job.provider.as_ref()) {
-                        // The call may have committed before its acknowledgement
-                        // was lost. Reconcile by idempotency key before accepting
-                        // an explicit retry; never blindly dispatch it again.
-                        match job.payload.query_committed(job.provider.as_ref()) {
-                            Ok(CaptureCommitState::Committed) => {
-                                submitted.insert(id);
-                                Ok(())
+                    // Axel's backend transaction/tombstone is authoritative;
+                    // provider ID alone cannot key an in-memory receipt across
+                    // two different selected brains in this process.
+                    let result =
+                        if submitted.contains(&id) && job.provider_id.as_str() != "axel-host" {
+                            Ok(())
+                        } else if let Err(error) = job.payload.dispatch(job.provider.as_ref()) {
+                            // The call may have committed before its acknowledgement
+                            // was lost. Reconcile by idempotency key before accepting
+                            // an explicit retry; never blindly dispatch it again.
+                            match job.payload.query_committed(job.provider.as_ref()) {
+                                Ok(CaptureCommitState::Committed) => {
+                                    submitted.insert(id);
+                                    Ok(())
+                                }
+                                Ok(CaptureCommitState::Absent) | Err(_) => {
+                                    worker_failures.fetch_add(1, Ordering::Relaxed);
+                                    Err(error)
+                                }
                             }
-                            Ok(CaptureCommitState::Absent) | Err(_) => {
-                                worker_failures.fetch_add(1, Ordering::Relaxed);
-                                Err(error)
-                            }
-                        }
-                    } else {
-                        submitted.insert(id);
-                        Ok(())
-                    };
+                        } else {
+                            submitted.insert(id);
+                            Ok(())
+                        };
                     if let Some(committed) = job.committed {
                         let _ = committed.send(result);
                     }

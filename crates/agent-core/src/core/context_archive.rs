@@ -18,8 +18,9 @@
 //!
 //! Fixed slots avoid unbounded directory enumeration/indexes: at most 128
 //! segments (including permanent tombstones), 256 MiB total, 16 MiB per file.
-//! Input is limited to 4096 messages, 16 MiB of JSON strings/structure, 65536
-//! nodes and depth 32; notes to 8 KiB. Fetch returns <=128 messages and <=16 MiB;
+//! Input is limited to 4096 messages, 16 MiB of eligible strings/structure,
+//! 65536 visited nodes and depth 32; excluded payload descendants are opaque.
+//! Notes are limited to 8 KiB. Fetch returns <=128 messages and <=16 MiB;
 //! search queries <=512 bytes, results <=32 with <=256-byte snippets. Every
 //! operation scans at most 128 files / 256 MiB; lock acquisition is nonblocking.
 //! Budget exhaustion and corruption fail closed, never silently truncate seal.
@@ -86,6 +87,78 @@ pub struct ArchivedMessage {
     pub message: SharedMessage,
 }
 
+/// Eligible, screened source evidence without filesystem state. `logical_id`
+/// is the legacy 64-hex hash of the raw host session ID; the digest deliberately
+/// excludes the hidden note and omitted content. Never log this payload.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveProjection {
+    pub logical_id: String,
+    pub source_message_count: usize,
+    pub messages: Vec<ArchivedMessage>,
+    pub note: String,
+    pub digest: String,
+}
+
+/// Pure projection: no path discovery, directory creation, or archive I/O.
+/// The trusted host supplies the raw logical session ID and optional sanitizer.
+pub fn project_archive(
+    logical_id: &str,
+    messages: &[SharedMessage],
+    note: &str,
+    redactor: Option<Arc<ArchiveRedactor>>,
+) -> io::Result<ArchiveProjection> {
+    validate_key(logical_id)?;
+    project_hashed(
+        &digest_parts(&[logical_id.as_bytes()]),
+        messages,
+        note,
+        redactor,
+    )
+}
+
+fn project_hashed(
+    logical_id: &str,
+    messages: &[SharedMessage],
+    note: &str,
+    redactor: Option<Arc<ArchiveRedactor>>,
+) -> io::Result<ArchiveProjection> {
+    if messages.len() > MAX_MESSAGES || note.len() > MAX_NOTE_BYTES {
+        return Err(invalid("archive message/note budget exceeded"));
+    }
+    let mut budget = InputBudget { bytes: 0, nodes: 0 };
+    for message in messages {
+        budget.message(message, redactor.is_some())?;
+    }
+    let projector = Projector { redactor };
+    let mut eligible = Vec::new();
+    for (source_index, message) in messages.iter().enumerate() {
+        if let Some((message, block_indices)) = projector.project(message)? {
+            eligible.push(ArchivedMessage {
+                source_index,
+                block_indices,
+                message: Arc::new(message),
+            });
+        }
+    }
+    let digest = projection_digest(logical_id, messages.len(), &eligible)?;
+    let note = projector.screen(note, DisclosureClass::ModelVisible)?;
+    if note.len() > MAX_NOTE_BYTES {
+        return Err(invalid("redacted note exceeds archive budget"));
+    }
+    Ok(ArchiveProjection {
+        logical_id: logical_id.to_owned(),
+        source_message_count: messages.len(),
+        messages: eligible,
+        note,
+        digest,
+    })
+}
+
+struct Projector {
+    redactor: Option<Arc<ArchiveRedactor>>,
+}
+
 /// No Debug implementation: do not accidentally log redactor state or content.
 pub struct ArchiveStore {
     fs: PrivateDir,
@@ -136,9 +209,7 @@ impl Record {
 impl ArchiveStore {
     pub fn new(base: &Path, scope_key: &str, logical_id: &str) -> io::Result<Self> {
         for key in [scope_key, logical_id] {
-            if key.is_empty() || key.len() > 4096 {
-                return Err(invalid("archive scope/logical id must be 1..4096 bytes"));
-            }
+            validate_key(key)?;
         }
         let scope = digest_parts(&[scope_key.as_bytes()]);
         let logical = digest_parts(&[logical_id.as_bytes()]);
@@ -159,28 +230,14 @@ impl ArchiveStore {
     }
 
     pub fn seal(&self, messages: &[SharedMessage], note: &str) -> io::Result<ArchiveRef> {
-        if messages.len() > MAX_MESSAGES || note.len() > MAX_NOTE_BYTES {
-            return Err(invalid("archive message/note budget exceeded"));
-        }
-        let mut budget = InputBudget { bytes: 0, nodes: 0 };
-        for message in messages {
-            budget.visit(message, 0)?;
-        }
-        let mut eligible = Vec::new();
-        for (source_index, message) in messages.iter().enumerate() {
-            if let Some((message, block_indices)) = self.project(message)? {
-                eligible.push(ArchivedMessage {
-                    source_index,
-                    block_indices,
-                    message: Arc::new(message),
-                });
-            }
-        }
-        let digest = projection_digest(&self.logical, messages.len(), &eligible)?;
-        let note = self.screen(note, DisclosureClass::ModelVisible)?;
-        if note.len() > MAX_NOTE_BYTES {
-            return Err(invalid("redacted note exceeds archive budget"));
-        }
+        let projection = project_hashed(&self.logical, messages, note, self.redactor.clone())?;
+        let ArchiveProjection {
+            digest,
+            source_message_count,
+            messages: eligible,
+            note,
+            ..
+        } = projection;
         let _lock = self.fs.lock()?;
         let (records, used) = self.scan()?;
         if let Some((_, record)) = records.iter().find(|(_, r)| r.digest == digest) {
@@ -204,7 +261,7 @@ impl ArchiveStore {
             id: uuid::Uuid::new_v4().simple().to_string(),
             digest,
             body: Body::Live {
-                source_message_count: messages.len(),
+                source_message_count,
                 messages: eligible,
                 note,
             },
@@ -324,11 +381,44 @@ impl ArchiveStore {
             .publish(slot, &bounded_json(&record, MAX_SEGMENT_BYTES)?)
     }
 
+    /// Migration-only export of validated eligible evidence and permanent
+    /// tombstones. Includes hidden notes: this is HOST data, never a model tool.
+    /// No files, directories, permissions or archive contents are changed.
+    pub fn export_records(&self) -> io::Result<Vec<Value>> {
+        let lock = self.fs.lock_existing()?;
+        let (records, _) = self.scan_with(true)?;
+        if lock.is_none() && !records.is_empty() {
+            return Err(corrupt());
+        }
+        Ok(records
+            .into_iter()
+            .map(|(_, record)| {
+                let (source_message_count, messages, note, tombstone) = match record.body {
+                    Body::Live {
+                        source_message_count,
+                        messages,
+                        note,
+                    } => (source_message_count, messages, note, false),
+                    Body::Tombstone => (0, Vec::new(), String::new(), true),
+                };
+                json!({
+                    "id": record.id, "digest": record.digest, "logical_id": record.logical,
+                    "source_message_count": source_message_count, "messages": messages,
+                    "note": note, "tombstone": tombstone,
+                })
+            })
+            .collect())
+    }
+
     fn scan(&self) -> io::Result<(Vec<(usize, Record)>, usize)> {
+        self.scan_with(false)
+    }
+
+    fn scan_with(&self, readonly: bool) -> io::Result<(Vec<(usize, Record)>, usize)> {
         let mut records = Vec::new();
         let mut used = 0;
         for slot in 0..MAX_SEGMENTS {
-            let Some(bytes) = self.fs.read(slot, MAX_STORE_BYTES - used)? else {
+            let Some(bytes) = self.fs.read_with(slot, MAX_STORE_BYTES - used, readonly)? else {
                 continue;
             };
             used += bytes.len();
@@ -336,6 +426,7 @@ impl ArchiveStore {
             if record.version != 1
                 || record.scope != self.scope
                 || record.logical.len() != 64
+                || !record.logical.bytes().all(|b| b.is_ascii_hexdigit())
                 || validate_id(&record.id).is_err()
                 || record.digest.len() != 64
                 || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
@@ -373,7 +464,9 @@ impl ArchiveStore {
         }
         Ok((records, used))
     }
+}
 
+impl Projector {
     fn screen(&self, text: &str, class: DisclosureClass) -> io::Result<String> {
         if class == DisclosureClass::ModelVisibleAfterRedaction && self.redactor.is_none() {
             return Ok(WITHHELD.to_owned());
@@ -401,19 +494,7 @@ impl ArchiveStore {
     }
 
     fn project(&self, message: &Value) -> io::Result<Option<(Value, Vec<usize>)>> {
-        // Host-generated continuation envelopes contain derived working notes,
-        // not source user evidence. Never re-index them on the next rollover.
-        if message.get("_synaps_context").is_some() {
-            return Ok(None);
-        }
-        let Some(class) = eligible_class(message) else {
-            return Ok(None);
-        };
-        let Some(role @ ("user" | "assistant")) = message.get("role").and_then(Value::as_str)
-        else {
-            return Ok(None);
-        };
-        let Some(content) = message.get("content") else {
+        let Some((class, role, content)) = projection_content(message) else {
             return Ok(None);
         };
         if let Some(text) = content.as_str() {
@@ -451,15 +532,8 @@ impl ArchiveStore {
                             // The working note has its own hidden field. Do not
                             // expose it a second time via tool arguments.
                             json!({"_archive_withheld":true})
-                        } else if self.redactor.is_some()
-                            && block.get("input").is_some_and(json_eligible)
-                        {
-                            let text = self.screen(
-                                &serde_json::to_string(&block["input"]).map_err(json_error)?,
-                                block_class,
-                            )?;
-                            serde_json::from_str(&text)
-                                .unwrap_or_else(|_| json!({"_archive_withheld":true}))
+                        } else if self.redactor.is_some() {
+                            self.tool_input(block.get("input"), block_class)?
                         } else {
                             json!({"_archive_withheld":true})
                         };
@@ -499,6 +573,29 @@ impl ArchiveStore {
         }
     }
 
+    fn tool_input(&self, input: Option<&Value>, class: DisclosureClass) -> io::Result<Value> {
+        if let Some(input) = input {
+            // The full preflight already enforced aggregate limits. Reuse its
+            // guarded admission predicate so recursion and withholding cannot
+            // drift. JSON escaping expands at most sixfold (node allowance
+            // covers punctuation/numbers); redactors may shrink that scratch
+            // string below the unchanged final output limit.
+            let mut budget = InputBudget { bytes: 0, nodes: 0 };
+            if let Some(bytes) = budget.input(input, 3)? {
+                budget.charge(bytes)?;
+                let limit = bytes
+                    .checked_mul(6)
+                    .ok_or_else(|| invalid("archive input byte budget exceeded"))?;
+                let encoded = bounded_json(input, limit)?;
+                let text =
+                    self.screen(std::str::from_utf8(&encoded).map_err(|_| corrupt())?, class)?;
+                return Ok(serde_json::from_str(&text)
+                    .unwrap_or_else(|_| json!({"_archive_withheld":true})));
+            }
+        }
+        Ok(json!({"_archive_withheld":true}))
+    }
+
     fn tool_result(&self, content: &Value, class: DisclosureClass) -> io::Result<Value> {
         if let Some(text) = content.as_str() {
             return Ok(json!(self.screen(text, class)?));
@@ -521,6 +618,26 @@ impl ArchiveStore {
             Ok(json!(output))
         }
     }
+}
+
+/// Read-only migration preview for an existing project archive. A missing
+/// archive is empty; corrupt, unsafe or locked paths fail closed. In particular,
+/// this never invokes `ArchiveStore::new`, mkdir, chmod, or lock-file creation.
+pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
+    validate_key(scope_key)?;
+    let scope = digest_parts(&[scope_key.as_bytes()]);
+    let fs = match PrivateDir::open_existing(base, &scope) {
+        Ok(fs) => fs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    ArchiveStore {
+        fs,
+        scope,
+        logical: String::new(), // export scans all logical conversations in this scope
+        redactor: None,
+    }
+    .export_records()
 }
 
 /// Project-wide archive lookup; base and scope are trusted host values, never
@@ -588,13 +705,17 @@ fn eligible_class(value: &Value) -> Option<DisclosureClass> {
     Some(class)
 }
 
-fn json_eligible(value: &Value) -> bool {
-    eligible_class(value).is_some()
-        && match value {
-            Value::Array(values) => values.iter().all(json_eligible),
-            Value::Object(values) => values.values().all(json_eligible),
-            _ => true,
-        }
+/// Shared message-envelope selection for preflight and projection. Host
+/// continuation notes are derived working context, never source evidence.
+fn projection_content(message: &Value) -> Option<(DisclosureClass, &str, &Value)> {
+    if message.get("_synaps_context").is_some() {
+        return None;
+    }
+    let class = eligible_class(message)?;
+    let role @ ("user" | "assistant") = message.get("role")?.as_str()? else {
+        return None;
+    };
+    Some((class, role, message.get("content")?))
 }
 
 fn identifier<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -639,31 +760,170 @@ struct InputBudget {
     nodes: usize,
 }
 impl InputBudget {
-    fn visit(&mut self, value: &Value, depth: usize) -> io::Result<()> {
+    fn node(&mut self, depth: usize) -> io::Result<()> {
         self.nodes += 1;
-        self.bytes += 8;
-        if depth > 32 || self.nodes > 65536 || self.bytes > MAX_INPUT_BYTES {
-            return Err(invalid("archive input budget exceeded"));
+        if depth > 32 || self.nodes > 65536 {
+            return Err(invalid("archive input structural budget exceeded"));
         }
-        match value {
-            Value::String(text) => self.bytes = self.bytes.saturating_add(text.len()),
-            Value::Array(values) => {
-                for value in values {
-                    self.visit(value, depth + 1)?;
-                }
-            }
-            Value::Object(values) => {
-                for (key, value) in values {
-                    self.bytes = self.bytes.saturating_add(key.len());
-                    self.visit(value, depth + 1)?;
-                }
-            }
-            _ => {}
-        }
+        Ok(())
+    }
+
+    fn charge(&mut self, bytes: usize) -> io::Result<()> {
+        self.bytes = self.bytes.saturating_add(bytes);
         if self.bytes > MAX_INPUT_BYTES {
             return Err(invalid("archive input byte budget exceeded"));
         }
         Ok(())
+    }
+
+    // Only selected fields are charged; ignored metadata is opaque. Include the
+    // old per-node/key allowance, never more than the corresponding raw subtree.
+    fn field(&mut self, key: &str, text: &str, depth: usize) -> io::Result<()> {
+        self.node(depth)?;
+        self.charge(key.len().saturating_add(8).saturating_add(text.len()))
+    }
+
+    fn text_field(
+        &mut self,
+        key: &str,
+        text: &str,
+        class: DisclosureClass,
+        redactor: bool,
+        depth: usize,
+    ) -> io::Result<()> {
+        if class == DisclosureClass::ModelVisibleAfterRedaction && !redactor {
+            return self.node(depth); // screen() returns the fixed placeholder
+        }
+        self.field(key, text, depth)
+    }
+
+    /// Allocation-free semantic preflight. Complete for ALL messages before
+    /// invoking a redactor or materializing the projection. Keep the selected
+    /// branches in sync with Projector; skipped payload descendants are opaque.
+    fn message(&mut self, message: &Value, redactor: bool) -> io::Result<()> {
+        self.node(0)?;
+        let Some((class, role, content)) = projection_content(message) else {
+            return Ok(());
+        };
+        self.charge(8)?;
+        self.field("role", role, 1)?;
+        if let Some(text) = content.as_str() {
+            return self.text_field("content", text, class, redactor, 1);
+        }
+        self.node(1)?;
+        let Some(blocks) = content.as_array() else {
+            return Ok(());
+        };
+        self.charge("content".len() + 8)?;
+        for block in blocks {
+            self.node(2)?;
+            let Some(mut block_class) = eligible_class(block) else {
+                continue;
+            };
+            if class == DisclosureClass::ModelVisibleAfterRedaction {
+                block_class = class;
+            }
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        self.charge(8)?;
+                        self.field("type", "text", 3)?;
+                        self.text_field("text", text, block_class, redactor, 3)?;
+                    }
+                }
+                Some("tool_use") if role == "assistant" => {
+                    if let (Some(id), Some(name)) =
+                        (identifier(block, "id"), identifier(block, "name"))
+                    {
+                        self.charge(8)?;
+                        self.field("type", "tool_use", 3)?;
+                        self.field("id", id, 3)?;
+                        self.field("name", name, 3)?;
+                        if name != "context_checkpoint" && redactor {
+                            if let Some(input) = block.get("input") {
+                                if let Some(bytes) = self.input(input, 3)? {
+                                    self.charge("input".len().saturating_add(bytes))?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("tool_result") if role == "user" => {
+                    if let Some(id) = identifier(block, "tool_use_id") {
+                        self.charge(8)?;
+                        self.field("type", "tool_result", 3)?;
+                        self.field("tool_use_id", id, 3)?;
+                        if block.get("is_error").and_then(Value::as_bool).is_some() {
+                            self.field("is_error", "", 3)?;
+                        }
+                        if redactor {
+                            if let Some(content) = block.get("content") {
+                                self.tool_result(content, block_class)?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn tool_result(&mut self, content: &Value, class: DisclosureClass) -> io::Result<()> {
+        if let Some(text) = content.as_str() {
+            return self.text_field("content", text, class, true, 3);
+        }
+        self.node(3)?;
+        if let Some(blocks) = content.as_array() {
+            self.charge("content".len() + 8)?;
+            for block in blocks {
+                self.node(4)?;
+                if let Some(class) = eligible_class(block) {
+                    if block["type"] == "text" {
+                        if let Some(text) = block["text"].as_str() {
+                            self.charge(8)?;
+                            self.field("type", "text", 5)?;
+                            self.text_field("text", text, class, true, 5)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Guarded whole-argument admission, shared with Projector. Byte accounting
+    /// is provisional until every visited child is eligible: a later excluded
+    /// child withholds the WHOLE input, regardless of tentative byte cost.
+    /// Structural visits are never rolled back. Arbitrary tool JSON is not a
+    /// content-block array; unclassified data/base64 fields remain eligible.
+    fn input(&mut self, value: &Value, depth: usize) -> io::Result<Option<usize>> {
+        self.node(depth)?;
+        if eligible_class(value).is_none() {
+            return Ok(None);
+        }
+        let mut bytes: usize = 8;
+        match value {
+            Value::String(text) => bytes = bytes.saturating_add(text.len()),
+            Value::Array(values) => {
+                for value in values {
+                    let Some(cost) = self.input(value, depth + 1)? else {
+                        return Ok(None);
+                    };
+                    bytes = bytes.saturating_add(cost);
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    let Some(cost) = self.input(value, depth + 1)? else {
+                        return Ok(None);
+                    };
+                    bytes = bytes.saturating_add(key.len()).saturating_add(cost);
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(bytes))
     }
 }
 
@@ -725,6 +985,13 @@ fn prefix(text: &str, bytes: usize) -> &str {
     }
     &text[..end]
 }
+fn validate_key(key: &str) -> io::Result<()> {
+    if key.is_empty() || key.len() > 4096 {
+        return Err(invalid("archive scope/logical id must be 1..4096 bytes"));
+    }
+    Ok(())
+}
+
 fn validate_id(id: &str) -> io::Result<()> {
     if id.len() != 32
         || !id
@@ -786,6 +1053,36 @@ impl PrivateDir {
         dir = dir.child("context-archives", true)?;
         dir.child(scope, true)
     }
+    fn open_existing(base: &Path, scope: &str) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !base.is_absolute() || base == Path::new("/") {
+            return Err(invalid("archive base must be an absolute non-root path"));
+        }
+        let mut dir = Self(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")?,
+        );
+        for component in base.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => {
+                    let name = c_name(
+                        name.to_str()
+                            .ok_or_else(|| invalid("archive path must be UTF-8"))?,
+                    )?;
+                    dir = Self(dir.open(&name, libc::O_RDONLY | libc::O_DIRECTORY)?);
+                }
+                _ => return Err(invalid("archive base contains traversal")),
+            }
+        }
+        for name in ["context-archives", scope] {
+            dir = Self(dir.open(&c_name(name)?, libc::O_RDONLY | libc::O_DIRECTORY)?);
+        }
+        Ok(dir)
+    }
+
     fn fd(&self) -> libc::c_int {
         use std::os::fd::AsRawFd;
         self.0.as_raw_fd()
@@ -805,9 +1102,9 @@ impl PrivateDir {
         if private || created {
             file.set_permissions(std::fs::Permissions::from_mode(DIR_MODE))?;
         }
-        if created {
-            self.sync()?;
-        }
+        // A previous mkdir may have succeeded but its parent fsync failed.
+        // EEXIST on retry is not evidence that the directory entry is durable.
+        self.sync()?;
         Ok(Self(file))
     }
     fn open(&self, name: &std::ffi::CStr, flags: i32) -> io::Result<std::fs::File> {
@@ -826,8 +1123,8 @@ impl PrivateDir {
             Ok(unsafe { std::fs::File::from_raw_fd(fd) })
         }
     }
-    fn check(file: &std::fs::File) -> io::Result<()> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fn check_readonly(file: &std::fs::File) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
             return Err(io::Error::new(
@@ -835,9 +1132,29 @@ impl PrivateDir {
                 "archive requires owned regular single-link files",
             ));
         }
+        Ok(())
+    }
+    fn check(file: &std::fs::File) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        Self::check_readonly(file)?;
         file.set_permissions(std::fs::Permissions::from_mode(
             crate::core::private_fs::FILE_MODE,
         ))
+    }
+    fn lock_existing(&self) -> io::Result<Option<std::fs::File>> {
+        let file = match self.open(&c_name("lock")?, libc::O_RDONLY) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Self::check_readonly(&file)?;
+        if !fs4::fs_std::FileExt::try_lock_shared(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "archive busy; retry export",
+            ));
+        }
+        Ok(Some(file))
     }
     fn lock(&self) -> io::Result<std::fs::File> {
         let file = self.open(&c_name("lock")?, libc::O_RDWR | libc::O_CREAT)?;
@@ -850,13 +1167,22 @@ impl PrivateDir {
         }
         Ok(file)
     }
-    fn read(&self, slot: usize, remaining: usize) -> io::Result<Option<Vec<u8>>> {
+    fn read_with(
+        &self,
+        slot: usize,
+        remaining: usize,
+        readonly: bool,
+    ) -> io::Result<Option<Vec<u8>>> {
         let file = match self.open(&c_name(&format!("{slot:03}.json"))?, libc::O_RDONLY) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        Self::check(&file)?;
+        if readonly {
+            Self::check_readonly(&file)?;
+        } else {
+            Self::check(&file)?;
+        }
         let limit = remaining.min(MAX_SEGMENT_BYTES);
         if file.metadata()?.len() > limit as u64 {
             return Err(corrupt());
@@ -929,7 +1255,13 @@ impl PrivateDir {
     fn lock(&self) -> io::Result<std::fs::File> {
         Self::unsupported()
     }
-    fn read(&self, _: usize, _: usize) -> io::Result<Option<Vec<u8>>> {
+    fn open_existing(_: &Path, _: &str) -> io::Result<Self> {
+        Self::unsupported()
+    }
+    fn lock_existing(&self) -> io::Result<Option<std::fs::File>> {
+        Self::unsupported()
+    }
+    fn read_with(&self, _: usize, _: usize, _: bool) -> io::Result<Option<Vec<u8>>> {
         Self::unsupported()
     }
     fn publish(&self, _: usize, _: &[u8]) -> io::Result<()> {
@@ -937,6 +1269,335 @@ impl PrivateDir {
     }
     fn sync(&self) -> io::Result<()> {
         Self::unsupported()
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn excluded_fixture(blob: &str) -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"system","content":blob})),
+            Arc::new(json!({"role":"developer","content":blob})),
+            Arc::new(json!({"role":"user","_synaps_context":{"note":blob},"content":blob})),
+            Arc::new(json!({"role":"user","retention":"local_only","content":blob})),
+            Arc::new(json!({"role":"assistant","metadata":blob,"content":[
+                {"type":"thinking","thinking":blob},
+                {"type":"text","private":true,"text":blob},
+                {"type":"image","source":{"data":blob}},
+                {"type":"document","source":{"data":blob}},
+                {"type":"text","text":" exact evidence αβ\n","metadata":blob},
+                {"type":"tool_use","id":"cp","name":"context_checkpoint","input":{"note":blob}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"r1","metadata":blob,"content":[
+                    {"type":"image","source":{"data":blob}},
+                    {"type":"text","sensitivity":"secret","text":blob},
+                    {"type":"text","text":"exact tool evidence\n","metadata":blob}
+                ]}
+            ]})),
+        ]
+    }
+
+    #[test]
+    fn excluded_aggregate_does_not_consume_eligible_budget_or_change_digest() {
+        // Every blob fits by itself; collectively the raw input exceeds 16MiB.
+        let messages = excluded_fixture(&"x".repeat(2 * 1024 * 1024));
+        let source = messages.clone();
+        for redactor in [None, Some(Arc::new(str::to_owned) as Arc<ArchiveRedactor>)] {
+            let small =
+                project_archive("excluded", &excluded_fixture("x"), "note", redactor.clone())
+                    .unwrap();
+            let large = project_archive("excluded", &messages, "note", redactor).unwrap();
+            assert!(small == large);
+            assert_eq!(large.source_message_count, 6);
+            assert_eq!(large.messages[0].source_index, 4);
+            assert_eq!(large.messages[0].block_indices, vec![4, 5]);
+        }
+        for (old, new) in source.iter().zip(&messages) {
+            assert!(Arc::ptr_eq(old, new));
+        }
+    }
+
+    #[test]
+    fn eligible_aggregate_refuses_before_any_redactor_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let redactor: Arc<ArchiveRedactor> = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            "small".to_owned()
+        });
+        let piece = "x".repeat(MAX_INPUT_BYTES / 2);
+        for messages in [
+            vec![
+                Arc::new(json!({"role":"user","content":piece})),
+                Arc::new(json!({"role":"assistant","content":piece})),
+            ],
+            vec![Arc::new(json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"r1","content":[
+                    {"type":"text","text":piece}, {"type":"text","text":piece}
+                ]
+            }]}))],
+        ] {
+            let before = messages.clone();
+            let error = project_archive("overflow", &messages, "", Some(redactor.clone()))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("input byte budget"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(before, messages);
+        }
+    }
+
+    #[test]
+    fn large_tool_results_exact_with_redactor_opaque_without_it() {
+        let text = "evidence αβ\n".repeat(250_000);
+        let make = |text: &str| {
+            vec![Arc::new(json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"r1","content":text
+            }]}))]
+        };
+        let p = project_archive("logs", &make(&text), "", Some(Arc::new(str::to_owned))).unwrap();
+        assert_eq!(p.messages[0].message["content"][0]["content"], text);
+        let huge = make(&"x".repeat(MAX_INPUT_BYTES + 1));
+        let p = project_archive("logs", &huge, "", None).unwrap();
+        assert_eq!(p.messages[0].message["content"][0]["content"], WITHHELD);
+        assert!(project_archive("logs", &huge, "", Some(Arc::new(str::to_owned))).is_err());
+    }
+
+    #[test]
+    fn whole_argument_withholding_discards_tentative_bytes_not_structural_guards() {
+        let huge = "x".repeat(MAX_INPUT_BYTES + 1);
+        let make = |input: Value| {
+            vec![Arc::new(json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"r1","name":"read","input":input
+            }]}))]
+        };
+        // Both orders: the otherwise eligible field can precede the exclusion.
+        for input in [
+            json!({"a":huge,"z":{"sensitivity":"secret","body":huge}}),
+            json!({"a":{"sensitivity":"secret","body":huge},"z":huge}),
+        ] {
+            let p =
+                project_archive("input", &make(input), "", Some(Arc::new(str::to_owned))).unwrap();
+            assert_eq!(
+                p.messages[0].message["content"][0]["input"],
+                json!({"_archive_withheld":true})
+            );
+        }
+        // Arbitrary binary-looking tool arguments are NOT content blocks.
+        let input = json!({"type":"image","data":"YWJj"});
+        let p = project_archive(
+            "input",
+            &make(input.clone()),
+            "",
+            Some(Arc::new(str::to_owned)),
+        )
+        .unwrap();
+        assert_eq!(p.messages[0].message["content"][0]["input"], input);
+        let large = make(json!({"type":"image","data":huge}));
+        assert!(project_archive("input", &large, "", Some(Arc::new(str::to_owned))).is_err());
+        assert!(project_archive("input", &large, "", None).is_ok());
+    }
+
+    #[test]
+    fn visited_structure_is_bounded_but_excluded_descendants_are_opaque() {
+        let mut deep = json!("leaf");
+        for _ in 0..40 {
+            deep = json!([deep]);
+        }
+        let make = |input: Value| {
+            vec![Arc::new(json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"r1","name":"read","input":input
+            }]}))]
+        };
+        let identity = Some(Arc::new(str::to_owned) as Arc<ArchiveRedactor>);
+        assert!(project_archive("depth", &make(deep.clone()), "", identity.clone()).is_err());
+        assert!(project_archive("depth", &make(deep.clone()), "", None).is_ok());
+        assert!(project_archive(
+            "depth",
+            &make(json!({"private":true,"blob":deep})),
+            "",
+            identity.clone()
+        )
+        .is_ok());
+        // A malformed content block isn't recursively interpreted as a block array.
+        assert!(project_archive(
+            "depth",
+            &[Arc::new(json!({"role":"user","content":deep}))],
+            "",
+            identity.clone()
+        )
+        .is_ok());
+        let wide = vec![Value::Null; 65536];
+        assert!(project_archive("nodes", &make(json!(wide)), "", identity.clone()).is_err());
+        let excluded = vec![Arc::new(json!({"role":"user","content":wide}))];
+        assert!(project_archive("nodes", &excluded, "", identity).is_err());
+    }
+
+    #[test]
+    fn withheld_after_redaction_text_is_not_scanned_without_redactor() {
+        let messages = vec![Arc::new(json!({"role":"user",
+            "disclosure":"model_visible_after_redaction", "content":"x".repeat(MAX_INPUT_BYTES+1)
+        }))];
+        let p = project_archive("withheld", &messages, "", None).unwrap();
+        assert_eq!(p.messages[0].message["content"], WITHHELD);
+        assert!(project_archive("withheld", &messages, "", Some(Arc::new(str::to_owned))).is_err());
+    }
+
+    #[test]
+    fn json_escape_scratch_can_exceed_segment_limit_before_redaction() {
+        // 3MiB source ->18MiB JSON, accepted by the old raw preflight and then
+        // reduced by the trusted redactor. Do not introduce a new 16MiB scratch cap.
+        let input = json!({"text":"\0".repeat(3 * 1024 * 1024)});
+        let messages = vec![Arc::new(json!({"role":"assistant","content":[{
+            "type":"tool_use","id":"r1","name":"read","input":input
+        }]}))];
+        let redactor: Arc<ArchiveRedactor> = Arc::new(|s| {
+            if s.starts_with('{') {
+                assert!(s.len() > MAX_SEGMENT_BYTES);
+                "{\"text\":\"screened\"}".to_owned()
+            } else {
+                s.to_owned()
+            }
+        });
+        let p = project_archive("escaping", &messages, "", Some(redactor)).unwrap();
+        assert_eq!(
+            p.messages[0].message["content"][0]["input"],
+            json!({"text":"screened"})
+        );
+        assert!(project_archive("escaping", &messages, "", Some(Arc::new(str::to_owned))).is_err());
+    }
+
+    fn compatibility_fixture() -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"system","content":"omitted"})),
+            Arc::new(json!({"role":"user","content":" exact αβ\n"})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"private"},
+                {"type":"text","text":"classified-value"},
+                {"type":"tool_use","id":"r1","name":"read","input":{"path":"src/lib.rs","n":7,"binary":{"type":"image","data":"YWJj"}}},
+                {"type":"tool_use","id":"c1","name":"context_checkpoint","input":{"note":"hidden"}},
+                {"type":"tool_use","id":"x1","name":"read","input":{"nested":{"disclosure":"local_only","body":"omitted"}}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"r1","is_error":false,"content":[
+                    {"type":"image","data":"omitted"},
+                    {"type":"text","text":"exact result\n"},
+                    {"type":"text","text":"classified-value","disclosure":"model_visible_after_redaction"}
+                ]}
+            ]})),
+            Arc::new(
+                json!({"role":"user","disclosure":"model_visible_after_redaction","content":"classified-value"}),
+            ),
+            Arc::new(json!({"role":"user","_synaps_context":{},"content":"hidden"})),
+        ]
+    }
+
+    #[test]
+    fn legacy_projection_golden() {
+        // Captured against the legacy raw-input preflight before this fix.
+        for (redactor, digest) in [
+            (
+                None,
+                "aeb544a71629f741def049575eefb1a765117d65aa914bdcc1657fa677622031",
+            ),
+            (
+                Some(
+                    Arc::new(|s: &str| s.replace("classified-value", "[redacted]"))
+                        as Arc<ArchiveRedactor>,
+                ),
+                "d70b321210ca3d2bc531b31a35cc02ee267eeb572e8a6dd88f1fb62725b082ec",
+            ),
+        ] {
+            let p = project_archive(
+                "compat-session",
+                &compatibility_fixture(),
+                "hidden note",
+                redactor,
+            )
+            .unwrap();
+            assert_eq!(p.digest, digest);
+        }
+    }
+
+    #[test]
+    fn pure_projection_keeps_legacy_logical_digest_and_never_opens_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logical = tmp
+            .path()
+            .join("not-created/session")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let messages = vec![
+            Arc::new(json!({"role":"system","content":"OMITTED"})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"OMITTED"},
+                {"type":"text","text":" exact αβ evidence\n"}
+            ]})),
+        ];
+        let source = serde_json::to_vec(&messages).unwrap();
+        let first = project_archive(&logical, &messages, "hidden note", None).unwrap();
+        assert_eq!(first.logical_id, digest_parts(&[logical.as_bytes()]));
+        assert_eq!(
+            first.digest,
+            projection_digest(&first.logical_id, 2, &first.messages).unwrap()
+        );
+        assert_eq!(first.messages[0].source_index, 1);
+        assert_eq!(first.messages[0].block_indices, vec![1]);
+        assert_eq!(first.source_message_count, 2);
+        let mut changed = messages.clone();
+        changed[0] = Arc::new(json!({"role":"developer","content":"DIFFERENT OMITTED"}));
+        let second = project_archive(&logical, &changed, "changed note", None).unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_ne!(
+            first.digest,
+            project_archive("other-session", &messages, "hidden note", None)
+                .unwrap()
+                .digest
+        );
+        assert_eq!(serde_json::to_vec(&messages).unwrap(), source);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn pure_projection_shares_disclosure_redaction_and_input_limits() {
+        let redactor: Arc<ArchiveRedactor> =
+            Arc::new(|s| s.replace("classified-value", "[redacted]"));
+        let messages = vec![
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"read_1","name":"read","input":{"path":"src/lib.rs"}},
+                {"type":"tool_use","id":"cp","name":"context_checkpoint","input":{"note":"NOTE_ONLY"}}
+            ]})),
+            Arc::new(
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"read_1","content":"classified-value"}]}),
+            ),
+            Arc::new(json!({"role":"user","sensitivity":"secret","content":"OMITTED"})),
+            Arc::new(json!({"role":"user","_synaps_context":{},"content":"NOTE_ONLY"})),
+        ];
+        let projected =
+            project_archive("session", &messages, "classified-value", Some(redactor)).unwrap();
+        assert_eq!(projected.note, "[redacted]");
+        let json = serde_json::to_string(&projected.messages).unwrap();
+        assert!(!json.contains("classified-value"));
+        assert!(!json.contains("NOTE_ONLY"));
+        assert!(!json.contains("OMITTED"));
+        assert!(json.contains("src/lib.rs"));
+        assert_eq!(projected.messages.len(), 2);
+        let withheld = project_archive("session", &messages, "password=bad", None).unwrap();
+        assert_eq!(withheld.note, WITHHELD);
+        assert!(!serde_json::to_string(&withheld.messages)
+            .unwrap()
+            .contains("src/lib.rs"));
+        assert!(project_archive("", &[], "", None).is_err());
+        assert!(project_archive(&"l".repeat(4097), &[], "", None).is_err());
+        assert!(project_archive("s", &[], &"n".repeat(MAX_NOTE_BYTES + 1), None).is_err());
+        assert!(
+            project_archive("s", &vec![messages[0].clone(); MAX_MESSAGES + 1], "", None).is_err()
+        );
     }
 }
 
@@ -956,6 +1617,138 @@ mod tests {
     }
     fn directory(tmp: &tempfile::TempDir, store: &ArchiveStore) -> std::path::PathBuf {
         tmp.path().join("context-archives").join(&store.scope)
+    }
+
+    #[test]
+    fn export_preview_is_read_only_and_matches_projection_including_tombstones() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(export_in(&tmp.path().join("missing"), "synthetic-project")
+            .unwrap()
+            .is_empty());
+        assert!(export_in(tmp.path(), "synthetic-project")
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let store =
+            ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical").unwrap();
+        let dir = directory(&tmp, &store);
+        // Even a newly opened empty store has no lock until its first operation.
+        assert!(export_in(tmp.path(), "synthetic-project")
+            .unwrap()
+            .is_empty());
+        assert!(!dir.join("lock").exists());
+        let messages = vec![msg("user", json!("migration evidence"))];
+        let reference = store.seal(&messages, "hidden note").unwrap();
+        let projection =
+            project_archive("synthetic-logical", &messages, "hidden note", None).unwrap();
+        let tombstone = store
+            .seal(&[msg("assistant", json!("remove me"))], "remove note")
+            .unwrap();
+        store.forget(&tombstone.id).unwrap();
+        let mut paths = vec![
+            tmp.path().to_path_buf(),
+            tmp.path().join("context-archives"),
+            dir.clone(),
+        ];
+        paths.extend(std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()));
+        // Export must not silently repair permissions, unlike normal archive IO.
+        for path in &paths {
+            let mode = if path.is_dir() { 0o750 } else { 0o640 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let snapshot = || {
+            paths
+                .iter()
+                .map(|p| {
+                    let m = std::fs::metadata(p).unwrap();
+                    (
+                        m.mode(),
+                        m.mtime(),
+                        m.mtime_nsec(),
+                        if m.is_file() {
+                            std::fs::read(p).unwrap()
+                        } else {
+                            vec![]
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let rows = export_in(tmp.path(), "synthetic-project").unwrap();
+        assert_eq!(rows, store.export_records().unwrap());
+        assert_eq!(before, snapshot());
+        assert_eq!(
+            rows[0],
+            json!({"id":reference.id,"digest":projection.digest,"logical_id":projection.logical_id,
+            "source_message_count":1,"messages":projection.messages,"note":"hidden note","tombstone":false})
+        );
+        assert_eq!(rows[1]["id"], tombstone.id);
+        assert_eq!(rows[1]["tombstone"], true);
+        assert_eq!(rows[1]["source_message_count"], 0);
+        assert_eq!(rows[1]["messages"], json!([]));
+        assert_eq!(rows[1]["note"], "");
+        let lock = store.fs.lock().unwrap();
+        assert_eq!(
+            export_in(tmp.path(), "synthetic-project")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(lock);
+        std::fs::write(dir.join("000.json"), b"corrupt").unwrap();
+        assert!(export_in(tmp.path(), "synthetic-project").is_err());
+    }
+
+    #[test]
+    fn export_preview_refuses_links_and_never_creates_a_missing_lock() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let r = store
+            .seal(&[msg("user", json!("evidence"))], "note")
+            .unwrap();
+        let path = dir.join("000.json");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(dir.join("lock")).unwrap();
+        assert!(export_in(tmp.path(), "synthetic-project").is_err());
+        assert!(!dir.join("lock").exists());
+        // The normal API may recreate its lock, but preview cannot.
+        assert!(store.fetch(&r.id, 0, 1).is_ok());
+        std::fs::remove_file(&path).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, &bytes).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(export_in(tmp.path(), "synthetic-project").is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&outside, &path).unwrap();
+        assert!(export_in(tmp.path(), "synthetic-project").is_err());
+        let alias = tmp.path().join("alias");
+        symlink(tmp.path(), &alias).unwrap();
+        assert!(export_in(&alias, "synthetic-project").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), bytes);
+    }
+
+    #[test]
+    fn attachments_remain_outside_eligible_memory_archive() {
+        let (tmp, store) = setup();
+        let messages = vec![msg(
+            "user",
+            json!([
+                {"type":"text","text":"Compare the selected files"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"ATTACHMENT_IMAGE_SECRET"}},
+                {"type":"document","title":"ATTACHMENT_FILENAME_SECRET","source":{"type":"base64","media_type":"application/pdf","data":"ATTACHMENT_PDF_SECRET"}},
+                {"type":"document","source":{"type":"text","media_type":"text/plain","data":"ATTACHMENT_TEXT_SECRET"}}
+            ]),
+        )];
+        let reference = store.seal(&messages, "safe checkpoint").unwrap();
+        let fetched = store.fetch(&reference.id, 0, 10).unwrap();
+        let serialized = serde_json::to_string(&fetched).unwrap();
+        assert!(serialized.contains("Compare the selected files"));
+        assert!(!serialized.contains("ATTACHMENT_"));
+        let raw = std::fs::read_to_string(directory(&tmp, &store).join("000.json")).unwrap();
+        assert!(!raw.contains("ATTACHMENT_"));
+        assert!(messages[0].to_string().contains("ATTACHMENT_TEXT_SECRET"));
     }
 
     #[test]
@@ -1223,7 +2016,16 @@ mod tests {
         for _ in 0..40 {
             deep = json!([deep]);
         }
-        assert!(store.seal(&[msg("user", deep)], "").is_err());
+        // Unknown content blocks are opaque; admitted tool JSON still has a
+        // strict recursion limit before serialization or redaction.
+        let deep = vec![msg(
+            "assistant",
+            json!([{
+                "type":"tool_use", "id":"r1", "name":"read", "input":deep
+            }]),
+        )];
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        assert!(store.seal(&deep, "").is_err());
         assert!(store.search(&"q".repeat(513), 1).is_err());
         assert!(store.search("", MAX_SEARCH_RESULTS + 1).is_err());
         assert!(store

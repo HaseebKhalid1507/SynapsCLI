@@ -531,6 +531,8 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -701,6 +703,8 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

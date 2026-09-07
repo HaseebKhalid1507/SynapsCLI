@@ -4,7 +4,9 @@
 //! and translates back to Anthropic-shaped events for the rest of the runtime.
 
 use super::translate;
-use super::types::{ChatMessage, OaiEvent, ProviderConfig, StreamOptions, ToolCall};
+use super::types::{
+    ChatContentPart, ChatMessage, OaiEvent, ProviderConfig, StreamOptions, ToolCall,
+};
 use super::wire::StreamDecoder;
 use crate::runtime::trace::openai as tr;
 use crate::runtime::types::StreamEvent;
@@ -68,6 +70,34 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
     )
 }
 
+/// Retrying a response never replays tools: only a complete Ok response reaches
+/// the agent tool loop. Reset uncommitted previews, not prior rounds or usage.
+async fn wait_stream_retry(
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+    retry: u32,
+    max_retries: u32,
+    suppress_stream_deltas: bool,
+) -> Result<(), super::net::BoxedProviderError> {
+    use crate::{LlmEvent, SessionEvent};
+    if cancel.is_cancelled() {
+        return Err("request canceled".into());
+    }
+    if !suppress_stream_deltas {
+        let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseReset));
+    }
+    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+        "Response incomplete — retrying response ({retry}/{max_retries}); incomplete output discarded, no tools replayed."
+    ))));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("request canceled".into()),
+        _ = tokio::time::sleep(retry_delay(retry)) => Ok(()),
+    }
+}
+
+pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
+
 /// Send a provider streaming request, retrying transient failures.
 ///
 /// Parity fix: the Anthropic path retries transient errors with backoff
@@ -93,11 +123,19 @@ async fn send_with_retries(
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
+    retries_used: &mut u32,
     trace_attempt: &mut tr::StreamAttempt,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
-    let mut attempt: u32 = 0;
     loop {
-        match build().send().await {
+        if cancel.is_cancelled() {
+            return Err("request canceled".into());
+        }
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => { trace_attempt.finish_canceled(None, None); return Err("request canceled".into()); }
+            sent = build().send() => sent,
+        };
+        match sent {
             Ok(resp) if resp.status().is_success() => {
                 trace_attempt.mark_headers();
                 return Ok(resp);
@@ -119,12 +157,12 @@ async fn send_with_retries(
                 // uses the canonical reason phrase, never server bytes.
                 drop(resp);
                 let code = format!("http_{}", status.as_u16());
-                if !retryable || attempt >= max_retries {
+                if !retryable || *retries_used >= max_retries {
                     trace_attempt.finish_failed(&code, Some(status.as_u16()), trace_rid);
                     return Err(format!("{label} request failed: {status}").into());
                 }
-                attempt += 1;
-                let delay = retry_delay(attempt);
+                *retries_used += 1;
+                let delay = retry_delay(*retries_used);
                 trace_attempt.attempt_failed(
                     tr::retry_class_for_status(status.as_u16()),
                     delay,
@@ -133,7 +171,7 @@ async fn send_with_retries(
                     &code,
                 );
                 tracing::warn!(
-                    "{label} API retry {attempt}/{max_retries} after {delay:?}: {status}"
+                    "{label} API retry {retries_used}/{max_retries} after {delay:?}: {status}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -148,7 +186,7 @@ async fn send_with_retries(
             Err(e) => {
                 let localhost_refusal = e.is_connect() && url.contains("localhost");
                 let transient = e.is_timeout() || e.is_connect() || e.is_request();
-                if localhost_refusal || !transient || attempt >= max_retries {
+                if localhost_refusal || !transient || *retries_used >= max_retries {
                     tracing::warn!(
                         "{label} request failed (no retry): {}",
                         crate::core::error::error_chain_string(&e)
@@ -156,8 +194,8 @@ async fn send_with_retries(
                     trace_attempt.finish_failed("transport_error", None, None);
                     return Err(e.into());
                 }
-                attempt += 1;
-                let delay = retry_delay(attempt);
+                *retries_used += 1;
+                let delay = retry_delay(*retries_used);
                 trace_attempt.attempt_failed(
                     if e.is_timeout() {
                         crate::runtime::trace::RetryClass::Timeout
@@ -170,7 +208,7 @@ async fn send_with_retries(
                     "transport_error",
                 );
                 tracing::warn!(
-                    "{label} transport retry {attempt}/{max_retries} after {delay:?}: {}",
+                    "{label} transport retry {retries_used}/{max_retries} after {delay:?}: {}",
                     crate::core::error::error_chain_string(&e)
                 );
                 tokio::select! {
@@ -208,6 +246,7 @@ pub(crate) async fn call_oai_stream_inner(
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
     suppress_stream_deltas: bool,
+    max_retries: u32,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -302,15 +341,23 @@ pub(crate) async fn call_oai_stream_inner(
     // broker; the same body a remote broker re-serializes) — body only,
     // headers and credentials structurally never reach this seam.
     if let Some(tracer) = &tracer {
-        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+        tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
 
-    // The broker owns the API key and executes/signs the request; this path
-    // never resolves or attaches a credential.
-    let stream = broker
-        .proxy_stream(proxy_request)
+    let mut stream_retry = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return Err("request canceled".into());
+        }
+        // The broker owns the API key and executes/signs the request; this path
+        // never resolves or attaches a credential.
+        let stream = crate::runtime::api::await_or_cancel(
+            cancel,
+            broker.proxy_stream(proxy_request.clone()),
+        )
         .await
+        .map_err(|_| "request canceled")?
         // Privacy (spec §5.1): a broker proxy error may carry an upstream
         // response-body snippet; redact it to status-only before surfacing.
         .map_err(|e| {
@@ -319,54 +366,84 @@ pub(crate) async fn call_oai_stream_inner(
                 super::net::redact_provider_proxy_error(&e.to_string())
             )
         });
-    let mut stream = match stream {
-        Ok(stream) => {
-            attempt.mark_headers();
-            stream
-        }
-        Err(msg) => {
-            // Status parsed from the redacted static-prefix message only;
-            // codes are `http_<status>` or the static `broker_error`.
-            let status = tr::broker_error_status(&msg);
-            let code = status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
-            attempt.finish_failed(&code, status, None);
-            return Err(msg.into());
-        }
-    };
-
-    let mut decoder = StreamDecoder::new();
-    let mut accumulated_text = String::new();
-    let mut tool_use_blocks: Vec<Value> = Vec::new();
-    let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
-    let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
-    let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
-
-    while let Some(chunk) = tokio::select! {
-        chunk = stream.next() => chunk,
-        _ = cancel.cancelled() => {
-            attempt.finish_canceled(None, trace_usage);
-            return Err("request canceled".into());
-        }
-    } {
-        let chunk = match chunk {
-            Ok(chunk) => {
-                attempt.mark_first_byte();
-                chunk
+        let mut stream = match stream {
+            Ok(stream) => {
+                attempt.mark_headers();
+                stream
             }
-            Err(e) => {
-                attempt.finish_failed("stream_error", None, None);
-                return Err(e.into());
+            Err(msg) => {
+                // Status parsed from the redacted static-prefix message only;
+                // codes are `http_<status>` or the static `broker_error`.
+                let status = tr::broker_error_status(&msg);
+                let code =
+                    status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
+                attempt.finish_failed(&code, status, None);
+                return Err(msg.into());
             }
         };
-        buf.extend_from_slice(&chunk);
 
-        // Scan for newline-delimited SSE lines (SIMD-accelerated via memchr)
-        while let Some(nl) = memchr::memchr(b'\n', &buf) {
-            let line_bytes = buf.split_to(nl + 1); // O(1) — ref-counted split
-            let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+        if !suppress_stream_deltas {
+            let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
+        }
+        let mut interrupted = false;
+        let mut saw_done = false;
+        let mut decoder = StreamDecoder::new();
+        let mut accumulated_text = String::new();
+        let mut tool_use_blocks: Vec<Value> = Vec::new();
+        let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
+        let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
+        let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
 
+        while let Some(chunk) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                attempt.finish_canceled(None, trace_usage);
+                return Err("request canceled".into());
+            }
+            chunk = stream.next() => chunk,
+        } {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    attempt.mark_first_byte();
+                    chunk
+                }
+                Err(e) => {
+                    if !matches!(e, crate::auth::BrokerError::Transport(_)) {
+                        attempt.finish_failed("broker_error", None, None);
+                        return Err(e.into());
+                    }
+                    interrupted = !saw_done && decoder.finish_reason.is_none();
+                    break;
+                }
+            };
+            buf.extend_from_slice(&chunk);
+
+            // Scan for newline-delimited SSE lines (SIMD-accelerated via memchr)
+            while let Some(nl) = memchr::memchr(b'\n', &buf) {
+                let line_bytes = buf.split_to(nl + 1); // O(1) — ref-counted split
+                let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
+
+                sink.clear();
+                decoder.push_line(line, &mut sink);
+                saw_done |= sink.iter().any(|e| matches!(e, OaiEvent::Done));
+                capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
+                handle_events(
+                    &sink,
+                    tx,
+                    &mut accumulated_text,
+                    &mut tool_use_blocks,
+                    &name_map,
+                    suppress_stream_deltas,
+                );
+            }
+        }
+
+        // Flush any remaining buffered line + final Done
+        if !interrupted && !buf.is_empty() {
+            let line = std::str::from_utf8(&buf).unwrap_or("");
             sink.clear();
             decoder.push_line(line, &mut sink);
+            saw_done |= sink.iter().any(|e| matches!(e, OaiEvent::Done));
             capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
             handle_events(
                 &sink,
@@ -377,13 +454,35 @@ pub(crate) async fn call_oai_stream_inner(
                 suppress_stream_deltas,
             );
         }
-    }
-
-    // Flush any remaining buffered line + final Done
-    if !buf.is_empty() {
-        let line = std::str::from_utf8(&buf).unwrap_or("");
+        if interrupted || (!saw_done && decoder.finish_reason.is_none()) {
+            if stream_retry >= max_retries {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(STREAM_INTERRUPTED.into());
+            }
+            stream_retry += 1;
+            attempt.attempt_failed(
+                crate::runtime::trace::RetryClass::Network,
+                retry_delay(stream_retry),
+                None,
+                None,
+                "stream_error",
+            );
+            wait_stream_retry(
+                tx,
+                cancel,
+                stream_retry,
+                max_retries,
+                suppress_stream_deltas,
+            )
+            .await
+            .inspect_err(|_| {
+                attempt.finish_canceled(None, None);
+            })?;
+            attempt.restart_clock();
+            continue;
+        }
         sink.clear();
-        decoder.push_line(line, &mut sink);
+        decoder.finish(&mut sink);
         capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
         handle_events(
             &sink,
@@ -393,39 +492,28 @@ pub(crate) async fn call_oai_stream_inner(
             &name_map,
             suppress_stream_deltas,
         );
+
+        // Normalized stop reason: only when a finish_reason was actually
+        // observed on the wire — never inferred.
+        let stop_reason = decoder
+            .finish_reason
+            .as_deref()
+            .map(tr::stop_reason_from_finish_reason);
+        // Broker paths never observe the upstream HTTP status: honest `None`.
+        attempt.finish_success(None, None, stop_reason, trace_usage);
+
+        // Build Anthropic-shaped final response
+        let mut content: Vec<Value> = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(json!({"type": "text", "text": accumulated_text}));
+        }
+        content.extend(tool_use_blocks);
+
+        return Ok(json!({
+            "role": "assistant",
+            "content": content,
+        }));
     }
-    sink.clear();
-    decoder.finish(&mut sink);
-    capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
-    handle_events(
-        &sink,
-        tx,
-        &mut accumulated_text,
-        &mut tool_use_blocks,
-        &name_map,
-        suppress_stream_deltas,
-    );
-
-    // Normalized stop reason: only when a finish_reason was actually
-    // observed on the wire — never inferred.
-    let stop_reason = decoder
-        .finish_reason
-        .as_deref()
-        .map(tr::stop_reason_from_finish_reason);
-    // Broker paths never observe the upstream HTTP status: honest `None`.
-    attempt.finish_success(None, None, stop_reason, trace_usage);
-
-    // Build Anthropic-shaped final response
-    let mut content: Vec<Value> = Vec::new();
-    if !accumulated_text.is_empty() {
-        content.push(json!({"type": "text", "text": accumulated_text}));
-    }
-    content.extend(tool_use_blocks);
-
-    Ok(json!({
-        "role": "assistant",
-        "content": content,
-    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -499,28 +587,20 @@ pub(crate) async fn call_codex_stream_inner(
     // Every Codex credential, local or remote, crosses the broker boundary:
     // the broker vends an access token + expiry only (refresh tokens are
     // broker-owned), and this path never opens auth.json.
-    let access = broker
-        .access_token(crate::auth::OAuthProviderId::OpenAiCodex)
-        .await
-        .map_err(|e| e.to_string())?
-        .token;
+    let access = crate::runtime::api::await_or_cancel(
+        cancel,
+        broker.access_token(crate::auth::OAuthProviderId::OpenAiCodex),
+    )
+    .await
+    .map_err(|_| "request canceled")?
+    .map_err(|e| e.to_string())?
+    .token;
     // Account id is provider-owned metadata carried inside the Codex JWT.
     let account_id = crate::auth::extract_codex_account_id(&access)
         .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
 
-    let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
+    let (tools, name_map) = translate::tools_to_responses(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
-    let tools: Vec<Value> = oai_tools
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.function.name,
-                "description": tool.function.description.unwrap_or_default(),
-                "parameters": tool.function.parameters,
-            })
-        })
-        .collect();
 
     // Use the shared pure helper so production and unit tests exercise identical
     // body construction — no duplication between call_codex_stream_inner and tests.
@@ -574,12 +654,15 @@ pub(crate) async fn call_codex_stream_inner(
     // broker; the same body a remote broker re-serializes) — body only,
     // headers and credentials structurally never reach this seam.
     if let Some(tracer) = &tracer {
-        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+        tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
 
     loop {
+        if cancel.is_cancelled() {
+            return Err("request canceled".into());
+        }
         let resp = send_with_retries(
             "codex",
             &url,
@@ -595,7 +678,8 @@ pub(crate) async fn call_codex_stream_inner(
                     .body(body_bytes.clone())
             },
             cancel,
-            max_retries.saturating_sub(stream_retry),
+            max_retries,
+            &mut stream_retry,
             &mut attempt,
         )
         .await?;
@@ -603,26 +687,29 @@ pub(crate) async fn call_codex_stream_inner(
         let http_status = Some(resp.status().as_u16());
         let trace_rid = tr::provider_request_id_from_headers(resp.headers());
 
+        let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
+        let mut interrupted = false;
         let mut accumulated_text = String::new();
         let mut parser = CodexSseDecoder::default();
         let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk) = tokio::select! {
-            chunk = stream.next() => chunk,
+            biased;
             _ = cancel.cancelled() => {
                 attempt.finish_canceled(http_status, parser.trace_usage());
                 return Err("request canceled".into());
             }
+            chunk = stream.next() => chunk,
         } {
             let chunk = match chunk {
                 Ok(chunk) => {
                     attempt.mark_first_byte();
                     chunk
                 }
-                Err(e) => {
-                    attempt.finish_failed("stream_error", http_status, trace_rid.clone());
-                    return Err(e.into());
+                Err(_) => {
+                    interrupted = !parser.terminal_success && parser.terminal_failure.is_none();
+                    break;
                 }
             };
             buf.extend_from_slice(&chunk);
@@ -635,9 +722,30 @@ pub(crate) async fn call_codex_stream_inner(
                 attempt.mark_first_model_event();
             }
         }
-        if !buf.is_empty() {
+        if !interrupted && !buf.is_empty() {
             let line = std::str::from_utf8(&buf).unwrap_or("");
             parser.push_line(line, tx, &mut accumulated_text);
+        }
+        if interrupted || (!parser.terminal_success && parser.terminal_failure.is_none()) {
+            if stream_retry >= max_retries {
+                attempt.finish_failed("stream_error", http_status, trace_rid);
+                return Err(format!("Codex{RESPONSES_MISSING_TERMINAL_SUFFIX}").into());
+            }
+            stream_retry += 1;
+            attempt.attempt_failed(
+                crate::runtime::trace::RetryClass::Network,
+                retry_delay(stream_retry),
+                http_status,
+                trace_rid,
+                "stream_error",
+            );
+            wait_stream_retry(tx, cancel, stream_retry, max_retries, false)
+                .await
+                .inspect_err(|_| {
+                    attempt.finish_canceled(None, None);
+                })?;
+            attempt.restart_clock();
+            continue;
         }
         parser.finish();
         // Trailing-buffer flush and finish() can surface the first (or only)
@@ -660,13 +768,11 @@ pub(crate) async fn call_codex_stream_inner(
                 tracing::warn!(
                     "codex stream retry {stream_retry}/{max_retries} after {delay:?}: completed without usable output"
                 );
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.cancelled() => {
+                wait_stream_retry(tx, cancel, stream_retry, max_retries, false)
+                    .await
+                    .inspect_err(|_| {
                         attempt.finish_canceled(None, None);
-                        return Err("request canceled".into());
-                    }
-                }
+                    })?;
                 attempt.restart_clock();
                 continue;
             }
@@ -842,6 +948,46 @@ fn codex_instructions(system_prompt: &Option<String>) -> String {
 fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
+        if msg.role == "tool" {
+            // Skip tool results with no call_id — sending an empty call_id
+            // to the Codex API would cause a 400 with a confusing error.
+            if let Some(call_id) = msg.tool_call_id {
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": msg.content.unwrap_or_default(),
+                }));
+            }
+            continue;
+        }
+        // A mixed assistant message carries BOTH text and calls. Emit its
+        // text first rather than continuing after the calls and losing it.
+        // Text-only messages retain the existing string wire representation.
+        if msg.content_parts.is_some() || msg.content.is_some() || msg.tool_calls.is_none() {
+            let content = if let Some(parts) = msg.content_parts {
+                Value::Array(parts.into_iter().map(|part| match part {
+                    ChatContentPart::Text { text } => json!({
+                        "type": if msg.role == "assistant" { "output_text" } else { "input_text" },
+                        "text": text,
+                    }),
+                    ChatContentPart::ImageUrl { image_url } => {
+                        let mut part = json!({"type": "input_image", "image_url": image_url.url});
+                        if let Some(detail) = image_url.detail {
+                            part["detail"] = json!(detail);
+                        }
+                        part
+                    }
+                    ChatContentPart::File { file } => json!({
+                        "type": "input_file",
+                        "filename": file.filename,
+                        "file_data": file.file_data,
+                    }),
+                }).collect())
+            } else {
+                Value::String(msg.content.unwrap_or_default())
+            };
+            out.push(json!({"role": msg.role, "content": content}));
+        }
         if let Some(tool_calls) = msg.tool_calls {
             for call in tool_calls {
                 // The Responses API rejects `id` values that are not the
@@ -861,24 +1007,7 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
                 }
                 out.push(item);
             }
-            continue;
         }
-        if msg.role == "tool" {
-            // Skip tool results with no call_id — sending an empty call_id
-            // to the Codex API would cause a 400 with a confusing error.
-            if let Some(call_id) = msg.tool_call_id {
-                out.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": msg.content.unwrap_or_default(),
-                }));
-            }
-            continue;
-        }
-        out.push(json!({
-            "role": msg.role,
-            "content": msg.content.unwrap_or_default(),
-        }));
     }
     out
 }
@@ -1026,6 +1155,10 @@ fn sanitize_error_identifier(raw: Option<&str>) -> &str {
 /// Static message suffixes for Responses terminal failures. The provider
 /// display label is prefixed at construction; `net.rs` classifies on these
 /// label-independent suffixes so every label maps to `ApiStatus`.
+pub(crate) const RESPONSES_AUTH_SUFFIX: &str =
+    " authentication rejected in stream. Sign in again or switch to an available account.";
+pub(crate) const RESPONSES_QUOTA_SUFFIX: &str =
+    " usage quota exhausted in stream. Add credit, wait for reset, or switch models.";
 pub(crate) const RESPONSES_FAILED_SUFFIX: &str =
     " response failed in stream. Provider error details withheld because they can echo request content.";
 pub(crate) const RESPONSES_CONTEXT_SUFFIX: &str = " rejected the request: the conversation exceeds this model's context window. Run /compact or start a fresh session to continue.";
@@ -1053,8 +1186,37 @@ fn user_message_for_terminal_failure(
     if error_code == "context_length_exceeded" || error_kind == "context_length_exceeded" {
         return format!("{label}{RESPONSES_CONTEXT_SUFFIX}");
     }
-    if capacity {
-        return format!("{label}{RESPONSES_CAPACITY_SUFFIX}");
+    // Both explicit identifiers must agree on a retry class. Unknown or policy
+    // classes (even with a capacity-looking message) are never retry signals.
+    let classify = |value: &str| match value {
+        "absent" | "error" => None,
+        "invalid_api_key" | "authentication_error" | "invalid_authentication_error" => Some("auth"),
+        "insufficient_quota" | "quota_exceeded" | "billing_error" => Some("quota"),
+        "rate_limit_exceeded"
+        | "rate_limit_error"
+        | "server_overloaded"
+        | "overloaded"
+        | "capacity"
+        | "server_error"
+        | "api_error"
+        | "overloaded_error" => Some("capacity"),
+        _ => Some("blocked"),
+    };
+    let (kind, code) = (classify(error_kind), classify(error_code));
+    if kind == Some("blocked")
+        || code == Some("blocked")
+        || (kind.is_some() && code.is_some() && kind != code)
+    {
+        return format!("{label}{RESPONSES_FAILED_SUFFIX}");
+    }
+    match code.or(kind) {
+        Some("auth") => return format!("{label}{RESPONSES_AUTH_SUFFIX}"),
+        Some("quota") => return format!("{label}{RESPONSES_QUOTA_SUFFIX}"),
+        Some("capacity") => return format!("{label}{RESPONSES_CAPACITY_SUFFIX}"),
+        // Preserve legacy flat xAI capacity handling only with no explicit
+        // failure identifier to contradict it. No new free-text classifiers.
+        None if capacity => return format!("{label}{RESPONSES_CAPACITY_SUFFIX}"),
+        _ => {}
     }
     format!("{label}{RESPONSES_FAILED_SUFFIX}")
 }
@@ -1241,18 +1403,23 @@ impl CodexSseDecoder {
                     capacity,
                     "responses stream terminal failure (provider message withheld)"
                 );
+                let message = user_message_for_terminal_failure(
+                    self.provider_label,
+                    error_kind,
+                    error_code,
+                    capacity,
+                );
                 self.terminal_failure = Some(ResponsesStreamFailure {
-                    code: if capacity {
+                    // Exact account/context failures outrank a free-text capacity
+                    // hint: do not spend local retries before allowing failover.
+                    code: if message
+                        == format!("{}{RESPONSES_CAPACITY_SUFFIX}", self.provider_label)
+                    {
                         "responses_capacity"
                     } else {
                         "responses_failed"
                     },
-                    message: user_message_for_terminal_failure(
-                        self.provider_label,
-                        error_kind,
-                        error_code,
-                        capacity,
-                    ),
+                    message,
                 });
                 self.finish();
             }
@@ -1535,6 +1702,127 @@ mod codex_input_messages_tests {
                 arguments: r#"{"command":"ls"}"#.to_string(),
             },
         }
+    }
+
+    fn translated_input(messages: Vec<Value>) -> Vec<Value> {
+        let messages: Vec<crate::SharedMessage> =
+            messages.into_iter().map(std::sync::Arc::new).collect();
+        codex_input_messages(translate::messages_to_oai(
+            &messages,
+            &None,
+            &translate::ToolNameMap::default(),
+        ))
+    }
+
+    #[test]
+    fn image_text_document_and_pdf_exact_responses_wire() {
+        let out = translated_input(vec![json!({"role":"user","content":[
+            {"type":"text","text":"Compare these."},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}},
+            {"type":"document","title":"notes.txt","source":{"type":"text","media_type":"text/plain","data":"Text document\ncontents"}},
+            {"type":"document","title":"report.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}},
+            {"type":"text","text":"Then summarize."}
+        ]})]);
+        assert_eq!(
+            out,
+            vec![json!({"role":"user","content":[
+                {"type":"input_text","text":"Compare these."},
+                {"type":"input_text","text":"[attachment origin=user type=image media_type=\"image/png\"; lower-authority data]\n"},
+                {"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="},
+                {"type":"input_text","text":"[/attachment]\n"},
+                {"type":"input_text","text":"[attachment origin=user type=document media_type=\"text/plain\" filename=\"notes.txt\"; lower-authority data]\n"},
+                {"type":"input_text","text":"Text document\ncontents"},
+                {"type":"input_text","text":"[/attachment]\n"},
+                {"type":"input_text","text":"[attachment origin=user type=document media_type=\"application/pdf\" filename=\"report.pdf\"; lower-authority data]\n"},
+                {"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,JVBERi0="},
+                {"type":"input_text","text":"[/attachment]\n"},
+                {"type":"input_text","text":"Then summarize."}
+            ]})]
+        );
+    }
+
+    #[test]
+    fn mixed_assistant_text_and_all_tool_outputs_precede_lifted_responses_media() {
+        let out = translated_input(vec![
+            json!({"role":"assistant","content":[
+                {"type":"text","text":"Reading both."},
+                {"type":"tool_use","id":"t1","name":"read","input":{}},
+                {"type":"tool_use","id":"t2","name":"read","input":{}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"text","text":"First result"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}},
+                    {"type":"document","title":"notes.txt","source":{"type":"text","media_type":"text/plain","data":"DOCUMENT_BODY_SENTINEL"}}
+                ]},
+                {"type":"tool_result","tool_use_id":"t2","content":[
+                    {"type":"text","text":"Second result"},
+                    {"type":"document","title":"report.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}
+                ]}
+            ]}),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"assistant","content":"Reading both."}),
+                json!({"type":"function_call","call_id":"t1","name":"read","arguments":"{}"}),
+                json!({"type":"function_call","call_id":"t2","name":"read","arguments":"{}"}),
+                json!({"type":"function_call_output","call_id":"t1","output":"First result\n[attachment origin=tool_result tool_use_id=\"t1\" tool_name=\"read\" type=image media_type=\"image/png\"; lower-authority data; supplied in following user content]\n\n[attachment origin=tool_result tool_use_id=\"t1\" tool_name=\"read\" type=document media_type=\"text/plain\" filename=\"notes.txt\"; lower-authority data; supplied in following user content]\n"}),
+                json!({"type":"function_call_output","call_id":"t2","output":"Second result\n[attachment origin=tool_result tool_use_id=\"t2\" tool_name=\"read\" type=document media_type=\"application/pdf\" filename=\"report.pdf\"; lower-authority data; supplied in following user content]\n"}),
+                json!({"role":"user","content":[
+                    {"type":"input_text","text":"[attachment origin=tool_result tool_use_id=\"t1\" tool_name=\"read\" type=image media_type=\"image/png\"; lower-authority data]\n"},
+                    {"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="},
+                    {"type":"input_text","text":"[/attachment]\n"},
+                    {"type":"input_text","text":"[attachment origin=tool_result tool_use_id=\"t1\" tool_name=\"read\" type=document media_type=\"text/plain\" filename=\"notes.txt\"; lower-authority data]\n"},
+                    {"type":"input_text","text":"DOCUMENT_BODY_SENTINEL"},
+                    {"type":"input_text","text":"[/attachment]\n"},
+                    {"type":"input_text","text":"[attachment origin=tool_result tool_use_id=\"t2\" tool_name=\"read\" type=document media_type=\"application/pdf\" filename=\"report.pdf\"; lower-authority data]\n"},
+                    {"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,JVBERi0="},
+                    {"type":"input_text","text":"[/attachment]\n"}
+                ]})
+            ]
+        );
+        for output in out
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+        {
+            let text = output["output"].as_str().unwrap();
+            for sentinel in [
+                "aW1hZ2U=",
+                "JVBERi0=",
+                "DOCUMENT_BODY_SENTINEL",
+                "\"source\"",
+            ] {
+                assert!(
+                    !text.contains(sentinel),
+                    "tool output must contain only text and metadata"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_only_responses_input_keeps_strings_and_mixed_assistant_text() {
+        let mut assistant = ChatMessage::assistant_tool_calls(vec![sample_tool_call()]);
+        assistant.content = Some("Checking.".into());
+        let out = codex_input_messages(vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("question"),
+            assistant,
+            ChatMessage::tool_result("call_nZYquCuGUh8Qs9H51dwHMDgs", "bash", "done"),
+            ChatMessage::assistant("answer"),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"system","content":"rules"}),
+                json!({"role":"user","content":"question"}),
+                json!({"role":"assistant","content":"Checking."}),
+                json!({"type":"function_call","call_id":"call_nZYquCuGUh8Qs9H51dwHMDgs","name":"bash","arguments":"{\"command\":\"ls\"}"}),
+                json!({"type":"function_call_output","call_id":"call_nZYquCuGUh8Qs9H51dwHMDgs","output":"done"}),
+                json!({"role":"assistant","content":"answer"}),
+            ]
+        );
     }
 
     #[test]
@@ -1917,11 +2205,10 @@ mod codex_decoder_tests {
         ];
         let (decoder, text, events) = drive(&lines);
         let failure = decoder.terminal_result().expect_err("must fail");
-        assert_eq!(failure.code, "responses_failed");
-        assert_eq!(
-            failure.message,
-            "Codex response failed in stream. Provider error details withheld because they can echo request content."
-        );
+        // Exact server_error is now preserved as a transient capacity class.
+        assert_eq!(failure.code, "responses_capacity");
+        assert!(failure.is_retryable());
+        assert_eq!(failure.message, format!("Codex{RESPONSES_CAPACITY_SUFFIX}"));
         assert!(!failure.message.contains("ECHOED"));
         assert!(text.is_empty());
         assert!(events.is_empty());
@@ -1936,7 +2223,7 @@ mod codex_decoder_tests {
         let (decoder, _text, _events) = drive(&lines);
         assert_eq!(
             decoder.terminal_result().expect_err("must fail").code,
-            "responses_failed"
+            "responses_capacity"
         );
     }
 
@@ -2290,6 +2577,7 @@ mod broker_stream_tests {
             &crate::runtime::trace::TraceContext::disabled(),
             true,
             false,
+            0,
         )
         .await
         .expect("stream must complete");
@@ -2341,6 +2629,7 @@ mod broker_stream_tests {
             &crate::runtime::trace::TraceContext::disabled(),
             true,
             true,
+            0,
         )
         .await
         .expect("stream must complete");
@@ -2377,6 +2666,7 @@ mod broker_stream_tests {
             &crate::runtime::trace::TraceContext::disabled(),
             true,
             false,
+            0,
         )
         .await
         .unwrap_err()
@@ -2443,6 +2733,7 @@ mod broker_stream_tests {
             &crate::runtime::trace::TraceContext::disabled(),
             true,
             false,
+            0,
         )
         .await
         .expect_err("500 must fail")
@@ -2476,19 +2767,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let (oai_tools, names) = translate::tools_to_oai(tools_schema);
+    let (tools, names) = translate::tools_to_responses(tools_schema);
     let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
-    let tools: Vec<Value> = oai_tools
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.function.name,
-                "description": tool.function.description.unwrap_or_default(),
-                "parameters": tool.function.parameters,
-            })
-        })
-        .collect();
     // Pure, validated body construction — rejects unsupported reasoning
     // combinations BEFORE any broker credential access or network I/O.
     let body = build_xai_body(
@@ -2531,18 +2811,24 @@ pub(crate) async fn call_xai_responses_stream_inner(
     // broker; the same body a remote broker re-serializes) — body only,
     // headers and credentials structurally never reach this seam.
     if let Some(tracer) = &tracer {
-        trace.capture_request_content(tracer.request_id(), body_bytes.as_ref());
+        tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
 
     loop {
-        let stream = broker
-            .proxy_stream(proxy_request.clone())
-            .await
-            // Privacy (spec §5.1): a broker proxy error may carry an upstream
-            // response-body snippet; redact it to status-only before surfacing.
-            .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+        if cancel.is_cancelled() {
+            return Err("request canceled".into());
+        }
+        let stream = crate::runtime::api::await_or_cancel(
+            cancel,
+            broker.proxy_stream(proxy_request.clone()),
+        )
+        .await
+        .map_err(|_| "request canceled")?
+        // Privacy (spec §5.1): a broker proxy error may carry an upstream
+        // response-body snippet; redact it to status-only before surfacing.
+        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
         let mut stream = match stream {
             Ok(stream) => {
                 attempt.mark_headers();
@@ -2553,18 +2839,21 @@ pub(crate) async fn call_xai_responses_stream_inner(
                 let code =
                     status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
                 attempt.finish_failed(&code, status, None);
-                return Err(msg.into());
+                return Err(super::net::normalize_broker_http_error(msg).into());
             }
         };
+        let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
+        let mut interrupted = false;
         let mut text = String::new();
         let mut parser = CodexSseDecoder::for_provider(XAI_PROVIDER_LABEL);
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = tokio::select! {
-            c = stream.next() => c,
+            biased;
             _ = cancel.cancelled() => {
                 attempt.finish_canceled(None, parser.trace_usage());
                 return Err("request canceled".into());
             }
+            c = stream.next() => c,
         } {
             let chunk = match chunk {
                 Ok(chunk) => {
@@ -2572,8 +2861,12 @@ pub(crate) async fn call_xai_responses_stream_inner(
                     chunk
                 }
                 Err(e) => {
-                    attempt.finish_failed("stream_error", None, None);
-                    return Err(e.into());
+                    if !matches!(e, crate::auth::BrokerError::Transport(_)) {
+                        attempt.finish_failed("broker_error", None, None);
+                        return Err(e.into());
+                    }
+                    interrupted = !parser.terminal_success && parser.terminal_failure.is_none();
+                    break;
                 }
             };
             buf.extend_from_slice(&chunk);
@@ -2585,8 +2878,29 @@ pub(crate) async fn call_xai_responses_stream_inner(
                 attempt.mark_first_model_event();
             }
         }
-        if !buf.is_empty() {
+        if !interrupted && !buf.is_empty() {
             parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
+        }
+        if interrupted || (!parser.terminal_success && parser.terminal_failure.is_none()) {
+            if stream_retry >= max_retries {
+                attempt.finish_failed("stream_error", None, None);
+                return Err(STREAM_INTERRUPTED.into());
+            }
+            stream_retry += 1;
+            attempt.attempt_failed(
+                crate::runtime::trace::RetryClass::Network,
+                retry_delay(stream_retry),
+                None,
+                None,
+                "stream_error",
+            );
+            wait_stream_retry(tx, cancel, stream_retry, max_retries, false)
+                .await
+                .inspect_err(|_| {
+                    attempt.finish_canceled(None, None);
+                })?;
+            attempt.restart_clock();
+            continue;
         }
         parser.finish();
         // Trailing-buffer flush and finish() can surface the first (or only)
@@ -3009,27 +3323,106 @@ mod xai_capacity_retry_tests {
         assert_eq!(text_events(&run.events), vec!["partial".to_string()]);
     }
 
-    /// Same guard for tool events: a started tool call must not be replayed.
+    /// An unfinished tool preview is not execution; reset it before retrying.
     #[tokio::test(start_paused = true)]
-    async fn xai_does_not_retry_after_tool_events_were_emitted() {
+    async fn xai_retries_eof_after_tool_preview_with_reset() {
         const TOOL_THEN_EOF: &str = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\"}}\n\n";
         let run = run_xai(vec![TOOL_THEN_EOF, XAI_SUCCESS_SSE], 3).await;
-        // EOF without a terminal event is itself retryable
-        // (`responses_missing_terminal`) — but the ToolUseStart already
-        // reached the UI, so the guard must keep it terminal.
-        let err = run
-            .result
-            .expect_err("missing terminal after a tool event stays terminal");
-        assert!(
-            err.to_string()
-                .starts_with("xAI response stream ended without a terminal event."),
-            "got: {err}"
-        );
-        assert_eq!(run.calls, 1, "no retry once a tool event reached the UI");
-        assert!(run.events.iter().any(|e| matches!(
-            e,
-            StreamEvent::Llm(crate::runtime::types::LlmEvent::ToolUseStart { .. })
-        )));
+        assert_eq!(run.result.unwrap()["content"][0]["text"], "GROK_OK");
+        assert_eq!(run.calls, 2);
+        assert_eq!(run.seen[0].body_bytes, run.seen[1].body_bytes);
+        assert!(run
+            .events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Llm(crate::LlmEvent::ResponseReset))));
+    }
+
+    #[test]
+    fn responses_exact_account_errors_survive_decoder_net_and_driver() {
+        for (code, suffix, expected) in [
+            ("invalid_api_key", RESPONSES_AUTH_SUFFIX, "auth"),
+            ("authentication_error", RESPONSES_AUTH_SUFFIX, "auth"),
+            (
+                "invalid_authentication_error",
+                RESPONSES_AUTH_SUFFIX,
+                "auth",
+            ),
+            ("insufficient_quota", RESPONSES_QUOTA_SUFFIX, "quota"),
+            ("quota_exceeded", RESPONSES_QUOTA_SUFFIX, "quota"),
+            ("billing_error", RESPONSES_QUOTA_SUFFIX, "quota"),
+        ] {
+            for label in ["Codex", "OpenAI", "xAI"] {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut decoder = CodexSseDecoder::for_provider(label);
+                let frame = format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.failed", "response":{
+                        "error":{"code":code,"message":"SECRET at capacity"}
+                    }})
+                );
+                let mut text = String::new();
+                for line in frame.lines() {
+                    decoder.push_line(line, &tx, &mut text);
+                }
+                let failure = decoder.terminal_result().unwrap_err();
+                assert_eq!(failure.message, format!("{label}{suffix}"));
+                assert!(!failure.is_retryable());
+                let runtime = super::super::net::provider_error_to_runtime(failure.message.into());
+                assert!(matches!(runtime, crate::RuntimeError::ApiStatus(_)));
+                let typed = crate::runtime::helpers::turn_error_for(&runtime, "test");
+                assert_eq!(
+                    crate::extensions::session_driver::classify_turn_error(&typed),
+                    (
+                        crate::extensions::session_driver::Outcome::ProviderError,
+                        expected.into()
+                    )
+                );
+                assert!(!typed.message.contains("SECRET"));
+            }
+        }
+        for code in [
+            "permission_denied",
+            "context_length_exceeded",
+            "invalid_request_error",
+            "unknown",
+        ] {
+            let message = user_message_for_terminal_failure("Codex", "absent", code, false);
+            assert_eq!(
+                crate::extensions::session_driver::classify_error(&message).0,
+                crate::extensions::session_driver::Outcome::Blocked
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_policy_and_conflicting_error_classes_outrank_capacity_prose() {
+        for (kind, code) in [
+            ("absent", "permission_denied"),
+            ("permission_error", "rate_limit_exceeded"),
+            ("invalid_request_error", "insufficient_quota"),
+            ("authentication_error", "quota_exceeded"),
+            ("server_error", "invalid_api_key"),
+            ("unknown", "absent"),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut decoder = CodexSseDecoder::for_provider("Codex");
+            let frame = format!(
+                "data: {}",
+                json!({"type":"response.failed", "response":{
+                    "error":{"type":kind, "code":code, "message":"private policy at capacity"}
+                }})
+            );
+            let mut text = String::new();
+            decoder.push_line(&frame, &tx, &mut text);
+            decoder.push_line("", &tx, &mut text);
+            let failure = decoder.terminal_result().unwrap_err();
+            assert!(!failure.is_retryable());
+            assert_eq!(
+                crate::extensions::session_driver::classify_error(&failure.message).0,
+                crate::extensions::session_driver::Outcome::Blocked
+            );
+            assert!(!failure.message.contains("private"));
+        }
     }
 
     /// Deterministic (non-capacity) failures are terminal on the first try
@@ -3040,10 +3433,7 @@ mod xai_capacity_retry_tests {
         let run = run_xai(vec![OTHER_ERROR, XAI_SUCCESS_SSE], 3).await;
         let err = run.result.expect_err("must fail");
         let msg = err.to_string();
-        assert_eq!(
-            msg,
-            "xAI response failed in stream. Provider error details withheld because they can echo request content."
-        );
+        assert_eq!(msg, format!("xAI{RESPONSES_AUTH_SUFFIX}"));
         assert!(!msg.contains("ECHOED"));
         assert_eq!(run.calls, 1);
     }
@@ -3712,6 +4102,206 @@ mod send_retry_tests {
         .await
     }
 
+    // Raw HTTP is intentional: axum's complete bodies cannot reproduce the
+    // reported EOF in an HTTP/1.1 chunk-size line.
+    async fn broken_chunk_server(
+        scripts: Vec<(&'static str, bool)>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let end = loop {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let length: usize = String::from_utf8_lossy(&request[..end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                while request.len() < end + length {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(request[end..end + length].to_vec());
+                let (body, broken) = scripts[attempt.min(scripts.len() - 1)];
+                attempt += 1;
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                socket
+                    .write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
+                    .await
+                    .unwrap();
+                // Omitting the 0 chunk produces precisely the user's failure.
+                if !broken {
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{address}"), requests, task)
+    }
+
+    async fn codex_with_events(
+        base: &str,
+        retries: u32,
+        cancel: &tokio_util::sync::CancellationToken,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<Value, super::super::net::BoxedProviderError> {
+        let cfg = ProviderConfig {
+            base_url: base.into(),
+            model: "gpt-5.6-sol".into(),
+            provider: "openai-codex".into(),
+        };
+        let broker: Arc<dyn crate::auth::CredentialBroker> = Arc::new(TokenOnlyBroker);
+        call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &Some("test".into()),
+            &[],
+            tx,
+            None,
+            None,
+            agent_core::reasoning::ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            cancel,
+            retries,
+            &crate::runtime::trace::TraceContext::disabled(),
+        )
+        .await
+    }
+
+    const PARTIAL_TOOL: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard me\"}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"old_call\",\"name\":\"write\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n",
+    );
+    const COMPLETE_TOOL: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"accepted\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"new_call\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"ok\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn interrupted_partial_tool_retries_identical_bytes_and_commits_only_success() {
+        use crate::LlmEvent;
+        let (url, requests, server) =
+            broken_chunk_server(vec![(PARTIAL_TOOL, true), (COMPLETE_TOOL, false)]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = codex_with_events(&url, 1, &tokio_util::sync::CancellationToken::new(), &tx)
+            .await
+            .unwrap();
+        server.abort();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        let tools: Vec<_> = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == "tool_use")
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["id"], "new_call");
+        assert_eq!(result["content"][0]["text"], "accepted");
+        let mut preview = String::from("prior completed round");
+        let mut baseline = 0;
+        let mut resets = 0;
+        let mut input_tokens = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Llm(LlmEvent::ResponseStart) => baseline = preview.len(),
+                StreamEvent::Llm(LlmEvent::ResponseReset) => {
+                    preview.truncate(baseline);
+                    resets += 1;
+                }
+                StreamEvent::Llm(LlmEvent::Text(t)) => preview.push_str(&t),
+                StreamEvent::Session(crate::SessionEvent::Usage {
+                    input_tokens: n, ..
+                }) => input_tokens += n,
+                _ => {}
+            }
+        }
+        assert_eq!(resets, 1);
+        assert_eq!(preview, "prior completed roundaccepted");
+        assert_eq!(input_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn completed_response_followed_by_chunk_error_is_not_replayed() {
+        let (url, requests, server) = broken_chunk_server(vec![(CODEX_SSE_SUCCESS, true)]).await;
+        assert!(run_codex(&url, 2).await.is_ok());
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_truncated_eof_retries_but_never_accepts_partial_tools() {
+        let (url, requests, server) = broken_chunk_server(vec![(PARTIAL_TOOL, false)]).await;
+        assert!(run_codex(&url, 1).await.is_err());
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn broken_chunk_retry_budget_is_finite() {
+        let (url, requests, server) = broken_chunk_server(vec![(PARTIAL_TOOL, true)]).await;
+        assert!(run_codex(&url, 1).await.is_err());
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_stream_retry_prevents_second_dispatch() {
+        let (url, requests, server) = broken_chunk_server(vec![(PARTIAL_TOOL, true)]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = cancel.clone();
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, StreamEvent::Session(crate::SessionEvent::Notice(_))) {
+                    waiter.cancel();
+                    break;
+                }
+            }
+        });
+        let error = codex_with_events(&url, 10, &cancel, &tx).await.unwrap_err();
+        task.await.unwrap();
+        server.abort();
+        assert_eq!(error.to_string(), "request canceled");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn direct_ultra_tool_guard_precedes_broker_access() {
         let access_calls = Arc::new(AtomicUsize::new(0));
@@ -3809,8 +4399,8 @@ mod send_retry_tests {
             .expect_err("response.failed must fail the request");
         let msg = err.to_string();
         assert!(
-            msg.starts_with("Codex response failed in stream."),
-            "static failure message expected: {msg}"
+            msg == format!("Codex{RESPONSES_CAPACITY_SUFFIX}"),
+            "static transient failure message expected: {msg}"
         );
         assert!(
             !msg.contains("ECHOED") && !msg.contains("secret prompt"),
@@ -3897,7 +4487,7 @@ mod send_retry_tests {
         let base_url = spawn_codex_sse(BODY).await;
         let err = run_codex(&base_url, 0).await.expect_err("must fail");
         let msg = err.to_string();
-        assert!(msg.starts_with("Codex response failed in stream."), "{msg}");
+        assert_eq!(msg, format!("Codex{RESPONSES_CAPACITY_SUFFIX}"));
         assert!(!msg.contains("empty response"), "{msg}");
         assert!(!msg.contains("ECHOED"), "provider text leaked: {msg}");
         assert!(
@@ -4120,6 +4710,7 @@ mod send_retry_tests {
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             3,
+            &mut 0,
             &mut tr::StreamAttempt::new(None),
         )
         .await
@@ -4150,6 +4741,7 @@ mod send_retry_tests {
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             1,
+            &mut 0,
             &mut tr::StreamAttempt::new(None),
         )
         .await
@@ -4172,5 +4764,222 @@ mod send_retry_tests {
             "retry log must keep the status for diagnosis: {logs}"
         );
         assert_no_banned(&logs, "retry tracing output");
+    }
+}
+
+#[cfg(test)]
+mod interrupted_broker_tests {
+    use super::*;
+    use crate::auth::{
+        AccessToken, BrokerError, CredentialBroker, ProxyByteStream, ProxyRequest, ProxyResponse,
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    struct Broker {
+        bodies: Vec<(&'static str, Option<BrokerError>)>,
+        seen: Mutex<Vec<ProxyRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl CredentialBroker for Broker {
+        async fn access_token(
+            &self,
+            _: crate::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy(&self, _: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy_stream(
+            &self,
+            request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            let mut seen = self.seen.lock().unwrap();
+            let (body, error) = &self.bodies[seen.len().min(self.bodies.len() - 1)];
+            seen.push(request);
+            let mut chunks = vec![Ok(bytes::Bytes::from_static(body.as_bytes()))];
+            if let Some(error) = error {
+                chunks.push(Err(error.clone()));
+            }
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+        async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+    const CHAT_PARTIAL: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"discard\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1}}\n\n"
+    );
+    const CHAT_OK: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"accepted\"}}]}\n\ndata: [DONE]\n\n";
+    const XAI_PARTIAL: &str =
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard\"}\n\n";
+    const XAI_OK: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"accepted\"}\n\ndata: {\"type\":\"response.completed\"}\n\n";
+
+    async fn drive(
+        broker: Arc<Broker>,
+        xai: bool,
+        retries: u32,
+        suppressed: bool,
+        cancel: &CancellationToken,
+    ) -> (
+        Result<Value, super::super::net::BoxedProviderError>,
+        Vec<StreamEvent>,
+    ) {
+        let cfg = ProviderConfig {
+            base_url: "http://unused.invalid".into(),
+            model: if xai { "grok-4.5" } else { "test" }.into(),
+            provider: if xai { "xai-auth" } else { "local" }.into(),
+        };
+        let broker: Arc<dyn CredentialBroker> = broker;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let trace = crate::runtime::trace::TraceContext::disabled();
+        let result = if xai {
+            call_xai_responses_stream_inner(
+                &cfg,
+                &broker,
+                &[],
+                &None,
+                &[],
+                &tx,
+                None,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                cancel,
+                retries,
+                &trace,
+                true,
+            )
+            .await
+        } else {
+            call_oai_stream_inner(
+                &cfg,
+                &broker,
+                &[],
+                &None,
+                &[],
+                &tx,
+                None,
+                None,
+                0,
+                agent_core::reasoning::ReasoningLevel::Medium,
+                cancel,
+                &trace,
+                true,
+                suppressed,
+                retries,
+            )
+            .await
+        };
+        let mut events = vec![];
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broker_transport_recovery_preserves_usage_and_identical_bytes() {
+        for xai in [false, true] {
+            let broker = Arc::new(Broker {
+                bodies: vec![
+                    (
+                        if xai { XAI_PARTIAL } else { CHAT_PARTIAL },
+                        Some(BrokerError::Transport(
+                            "unexpected EOF during chunk size line".into(),
+                        )),
+                    ),
+                    (if xai { XAI_OK } else { CHAT_OK }, None),
+                ],
+                seen: Mutex::new(vec![]),
+            });
+            let (result, events) =
+                drive(broker.clone(), xai, 1, false, &CancellationToken::new()).await;
+            assert_eq!(result.unwrap()["content"][0]["text"], "accepted");
+            let seen = broker.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].body_bytes, seen[1].body_bytes);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, StreamEvent::Llm(crate::LlmEvent::ResponseReset)))
+                    .count(),
+                1
+            );
+            if !xai {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter_map(|e| match e {
+                            StreamEvent::Session(crate::SessionEvent::Usage {
+                                input_tokens,
+                                ..
+                            }) => Some(*input_tokens),
+                            _ => None,
+                        })
+                        .sum::<u64>(),
+                    7
+                );
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn broker_nontransport_denial_never_retries_and_precancel_never_dispatches() {
+        for xai in [false, true] {
+            let broker = Arc::new(Broker {
+                bodies: vec![(
+                    if xai { XAI_PARTIAL } else { CHAT_PARTIAL },
+                    Some(BrokerError::Denied("blocked".into())),
+                )],
+                seen: Mutex::new(vec![]),
+            });
+            let (result, events) =
+                drive(broker.clone(), xai, 10, false, &CancellationToken::new()).await;
+            assert!(result.is_err());
+            assert_eq!(broker.seen.lock().unwrap().len(), 1);
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Llm(crate::LlmEvent::ResponseReset))));
+            let canceled = CancellationToken::new();
+            canceled.cancel();
+            assert!(drive(broker.clone(), xai, 10, false, &canceled)
+                .await
+                .0
+                .is_err());
+            assert_eq!(broker.seen.lock().unwrap().len(), 1);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn suppressed_retry_emits_no_llm_previews() {
+        let broker = Arc::new(Broker {
+            bodies: vec![
+                (CHAT_PARTIAL, Some(BrokerError::Transport("eof".into()))),
+                (CHAT_OK, None),
+            ],
+            seen: Mutex::new(vec![]),
+        });
+        let (result, events) = drive(broker, false, 1, true, &CancellationToken::new()).await;
+        assert!(result.is_ok());
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Llm(_))));
+    }
+    #[test]
+    fn exhaustion_is_transient_for_auto_driver_but_not_arbitrary_error_prose() {
+        use crate::extensions::session_driver::{classify_error, Outcome};
+        assert_eq!(
+            classify_error(STREAM_INTERRUPTED),
+            (Outcome::ProviderError, "transient".into())
+        );
+        assert_eq!(
+            classify_error(&format!("API error: {STREAM_INTERRUPTED}")),
+            (Outcome::ProviderError, "transient".into())
+        );
+        assert_eq!(
+            classify_error(&format!("denied: {STREAM_INTERRUPTED}")).0,
+            Outcome::Blocked
+        );
     }
 }

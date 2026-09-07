@@ -2473,6 +2473,34 @@ impl TranscriptStore {
         }
     }
 
+    /// Remove only uncommitted provider previews; retain human steering/events.
+    pub(crate) fn reset_response_preview(&mut self, start: usize, last: Option<ChatMessage>) {
+        let mut index = 0;
+        self.messages.retain(|m| {
+            let keep = index < start
+                || !matches!(
+                    m.msg,
+                    ChatMessage::Text(_)
+                        | ChatMessage::Thinking(_)
+                        | ChatMessage::ToolUseStart { .. }
+                        | ChatMessage::ToolUse { .. }
+                );
+            index += 1;
+            keep
+        });
+        if let Some(last) = last {
+            if let Some(message) = start.checked_sub(1).and_then(|i| self.messages.get_mut(i)) {
+                message.msg = last;
+            }
+        }
+        self.tool_start_times.retain(|id, _| self.messages.iter().any(|m| matches!(&m.msg, ChatMessage::ToolUseStart { tool_id, .. } | ChatMessage::ToolUse { tool_id, .. } if tool_id == id)));
+        if self.tool_start_times.is_empty() {
+            self.tool_start_time = None;
+        }
+        self.clear_selection();
+        self.invalidate();
+    }
+
     // ── Query surface (§3.4) ─────────────────────────────────────────────
 
     /// Read-only slice of all messages. Use this for iteration and assertions;
@@ -4112,6 +4140,33 @@ mod slice5_copy_promote_on_touch {
             "[T8] second copy: renders={renders_second} (expected 0); \
              output byte-identical: {}",
             first == second
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_reset_tests {
+    use super::*;
+    #[test]
+    fn reset_discards_only_current_response_and_keeps_steering() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        store.push_msg(ChatMessage::User("question".into()));
+        store.push_msg(ChatMessage::Text("previous round".into()));
+        let start = store.messages().len();
+        let last = store.messages().last().map(|m| m.msg.clone());
+        store.append_or_update_text(" failed continuation");
+        store.on_tool_use_start("failed_call".into(), "write".into());
+        store.push_msg(ChatMessage::User("human steering".into()));
+        store.push_msg(ChatMessage::System("retry notice".into()));
+        store.reset_response_preview(start, last);
+        assert_eq!(store.messages().len(), 4);
+        assert_eq!(store.messages()[1].msg.source_text(), "previous round");
+        assert_eq!(store.messages()[2].msg.source_text(), "human steering");
+        assert!(store.tool_start_time.is_none());
+        store.append_or_update_text("new response");
+        assert_eq!(
+            store.messages().last().unwrap().msg.source_text(),
+            "new response"
         );
     }
 }

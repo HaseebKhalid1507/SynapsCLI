@@ -93,6 +93,8 @@ fn manual_ctx() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

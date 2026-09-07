@@ -163,6 +163,7 @@ async fn drive_chat(
         trace,
         exact,
         false,
+        0,
     )
     .await
 }

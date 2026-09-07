@@ -12,11 +12,11 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 /// Maximum bytes per sidecar stdout/stderr line. A hostile or buggy sidecar
 /// sending a single unbounded line could OOM the host without this cap.
@@ -25,6 +25,8 @@ const MAX_SIDECAR_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB, matches MCP
 use super::protocol::{InsertTextMode, SidecarCommand, SidecarFrame, SIDECAR_PROTOCOL_VERSION};
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+/// Bound every command frame, including Init, when a sidecar stops reading.
+const COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// High-level events emitted by the manager. This is a curated subset
 /// of [`SidecarFrame`] tailored for chatui consumers; plugin-specific
@@ -63,7 +65,8 @@ pub enum SidecarError {
     PipesUnavailable,
     #[error("sidecar IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("sidecar process has already shut down")]
+    /// No more commands can be sent (shutdown, failed write, or cancelled write).
+    #[error("sidecar command input is closed")]
     AlreadyShutDown,
     #[error("failed to encode sidecar command: {0}")]
     Encode(#[from] serde_json::Error),
@@ -76,16 +79,19 @@ pub enum SidecarError {
 /// Construct via [`SidecarManager::spawn`]; drive with [`press`],
 /// [`release`], [`shutdown`]. Receive events with [`next_event`].
 pub struct SidecarManager {
+    hello_capabilities: Vec<String>,
     child: Option<Child>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdin: Option<ChildStdin>,
     rx: mpsc::Receiver<SidecarLifecycleEvent>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     stderr_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SidecarManager {
-    /// Spawn `bin` with `args`, send the [`Init`] handshake, and start
-    /// the background reader task.
+    /// Spawn `bin` with `args`, wait for Hello, send [`Init`], and start
+    /// the background reader task. Hello is readiness; no post-Init status
+    /// is required. Hello has a 10s deadline and command writes have a 2s
+    /// deadline. Cancelling startup drops the child and reader tasks.
     ///
     /// [`Init`]: SidecarCommand::Init
     pub async fn spawn(
@@ -111,7 +117,6 @@ impl SidecarManager {
         let stderr = child.stderr.take();
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let stdin = Arc::new(Mutex::new(Some(stdin)));
 
         // Reader task: parse line-JSON events and forward as SidecarLifecycleEvent.
         let event_tx = tx.clone();
@@ -209,8 +214,9 @@ impl SidecarManager {
         });
 
         let mut manager = Self {
+            hello_capabilities: Vec::new(),
             child: Some(child),
-            stdin,
+            stdin: Some(stdin),
             rx,
             reader_handle: Some(reader_handle),
             stderr_handle,
@@ -228,11 +234,16 @@ impl SidecarManager {
                 })?;
 
         match hello_timeout {
-            Some(SidecarLifecycleEvent::Ready { .. }) => {
-                // Hello received and protocol version is acceptable — proceed with Init
+            Some(SidecarLifecycleEvent::Ready { capabilities, .. }) => {
+                manager.hello_capabilities = capabilities;
             }
             Some(SidecarLifecycleEvent::Error(e)) => {
                 return Err(SidecarError::Protocol(format!("sidecar Hello failed: {e}")));
+            }
+            Some(SidecarLifecycleEvent::Exited) | None => {
+                return Err(SidecarError::Protocol(
+                    "sidecar exited before sending Hello".to_string(),
+                ));
             }
             Some(other) => {
                 return Err(SidecarError::Protocol(format!(
@@ -240,15 +251,27 @@ impl SidecarManager {
                     other
                 )));
             }
-            None => {
-                return Err(SidecarError::Protocol(
-                    "sidecar exited before sending Hello".to_string(),
-                ));
-            }
         }
 
         manager.send(SidecarCommand::Init { config }).await?;
         Ok(manager)
+    }
+
+    /// Optional initialization contract. Without it Hello+Init is the legacy
+    /// protocol-ready boundary, not proof that model/device loading finished.
+    pub fn ready_after_init(&self) -> bool {
+        self.hello_capabilities
+            .iter()
+            .any(|c| c == "ready_after_init")
+    }
+
+    /// Nonblocking drain for hosts about to publish readiness or activate.
+    pub fn try_next_event(&mut self) -> Option<SidecarLifecycleEvent> {
+        match self.rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(SidecarLifecycleEvent::Exited),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+        }
     }
 
     /// Send a trigger press command.
@@ -270,20 +293,19 @@ impl SidecarManager {
     }
 
     /// Send a graceful `shutdown` command and reap the child process.
+    /// A write error is returned only after cleanup; an already closed input
+    /// still permits cleanup and repeated shutdown calls.
     pub async fn shutdown(&mut self) -> Result<(), SidecarError> {
-        let _ = self.send(SidecarCommand::Shutdown).await;
-        // Drop the stdin so the sidecar sees EOF if it ignored shutdown.
-        if let Some(mut stdin) = self.stdin.lock().await.take() {
-            let _ = stdin.shutdown().await;
-        }
+        let send_result = match self.send(SidecarCommand::Shutdown).await {
+            Err(SidecarError::AlreadyShutDown) => Ok(()),
+            result => result,
+        };
+        // Closing the pipe is synchronous; no unbounded flush/shutdown await.
+        // The sidecar sees EOF even if it ignored the shutdown command.
+        drop(self.stdin.take());
         if let Some(mut child) = self.child.take() {
             // Grace period: wait up to 2s, then kill. Matches MCP/extension patterns.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                child.wait(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
                 Ok(_) => {} // exited gracefully
                 Err(_) => {
                     let _ = child.kill().await;
@@ -296,7 +318,7 @@ impl SidecarManager {
         if let Some(handle) = self.stderr_handle.take() {
             handle.abort();
         }
-        Ok(())
+        send_result
     }
 
     /// Receive the next high-level event, or `None` if the channel
@@ -305,13 +327,25 @@ impl SidecarManager {
         self.rx.recv().await
     }
 
-    async fn send(&self, cmd: SidecarCommand) -> Result<(), SidecarError> {
+    async fn send(&mut self, cmd: SidecarCommand) -> Result<(), SidecarError> {
         let mut buf = serde_json::to_vec(&cmd)?;
         buf.push(b'\n');
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or(SidecarError::AlreadyShutDown)?;
-        stdin.write_all(&buf).await?;
-        stdin.flush().await?;
+        // All callers hold &mut self. Take ownership across the await so an IO
+        // error, timeout, or cancelled future closes stdin and leaves it None.
+        // A partially written JSON frame must never be followed by a retry.
+        let mut stdin = self.stdin.take().ok_or(SidecarError::AlreadyShutDown)?;
+        tokio::time::timeout(COMMAND_WRITE_TIMEOUT, async {
+            stdin.write_all(&buf).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sidecar command write did not complete within 2s; command input closed",
+            )
+        })??;
+        self.stdin = Some(stdin);
         Ok(())
     }
 }

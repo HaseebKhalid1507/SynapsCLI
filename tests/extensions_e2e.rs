@@ -210,6 +210,8 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    launch_cancel: None,
+                    memory_backend: None,
                     watcher_exit_path: None,
                     tool_register_tx: None,
                     session_manager: None,
@@ -375,6 +377,8 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    launch_cancel: None,
+                    memory_backend: None,
                     watcher_exit_path: None,
                     tool_register_tx: None,
                     session_manager: None,

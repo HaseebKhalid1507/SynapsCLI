@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 mod api;
 mod api_sync;
+pub mod attachments;
 mod auth;
+mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
@@ -208,6 +210,46 @@ pub async fn emit_after_tool_call(
     crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
 }
 
+/// Validate rich non-stream output before hooks or history see it. Hooks and
+/// UI consumers use only the summary, never serialized attachment payloads.
+fn validated_single_tool_output(
+    model: &str,
+    output: crate::ToolOutput,
+) -> (String, Option<Vec<Value>>) {
+    let (summary, blocks) = output.into_parts();
+    if let Some(ref blocks) = blocks {
+        if let Err(error) = attachments::validate_tool_blocks(model, blocks) {
+            return (format!("Attachment not sent: {error}"), None);
+        }
+    }
+    (summary, blocks)
+}
+
+/// A summary rewrite (including the post-hook truncation) invalidates rich
+/// blocks: retaining them would bypass the hook's replacement/redaction.
+fn retain_single_tool_blocks(
+    blocks: Option<Vec<Value>>,
+    original: &str,
+    hooked: &str,
+) -> Option<Vec<Value>> {
+    if original == hooked {
+        blocks
+    } else {
+        None
+    }
+}
+
+fn single_tool_result_content(
+    result: &str,
+    blocks: Option<Vec<Value>>,
+    max_tool_output: usize,
+) -> Value {
+    match blocks {
+        Some(blocks) => Value::Array(blocks),
+        None => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
 /// A reasoning-level substitution performed during a model change because the
 /// newly selected model does not support the previously active level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +353,12 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// Immutable host-owned note backend and captured project scope.
+    memory_backend: crate::memory_backend::MemoryBinding,
+    /// First explicit host selection; never replace the captured binding.
+    memory_backend_config: Option<crate::config::MemoryBackendConfig>,
+    /// Sticky across same-session clones: live extension policy needs restart.
+    memory_backend_reconfigure_denied: Arc<std::sync::atomic::AtomicBool>,
     /// Production resolves the exact leased extension provider at dispatch.
     /// Tests may install this in-process provider to observe the same worker
     /// boundary without spawning an extension process.
@@ -606,16 +654,9 @@ fn terminal_capture_history(
             "assistant" => chat_capture::CaptureContentClass::AssistantFinal,
             _ => continue,
         };
-        let text = message
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                message
-                    .get("content")
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
-            });
+        let Some(text) = axel_context::capture_text(message) else {
+            continue;
+        };
         items.push(chat_capture::CanonicalCaptureItem {
             project_id: lease.project_id.clone(),
             class,
@@ -637,6 +678,81 @@ fn terminal_capture_history(
         items,
         compaction: None,
     }
+}
+
+/// Retain the source identity of this prompt's user boundary, before recall or
+/// steering can add messages. Tool-result envelopes are not new user turns.
+fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::SharedMessage> {
+    messages
+        .iter()
+        .rfind(|message| {
+            message["role"] == "user"
+                && (message["content"].is_string()
+                    || message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["type"] != "tool_result")
+                    }))
+        })
+        .cloned()
+}
+
+fn terminal_capture_messages<'a>(
+    messages: &'a [crate::SharedMessage],
+    start: &crate::SharedMessage,
+) -> Option<&'a [crate::SharedMessage]> {
+    // Identity, not an index (recall may prepend) or text equality (old turns
+    // can have identical prompts). If rollover removed the source, fail closed
+    // rather than recapturing its summary or unrelated earlier history.
+    let index = messages
+        .iter()
+        .position(|message| Arc::ptr_eq(message, start))?;
+    Some(&messages[index..])
+}
+
+/// The stream publishes history only after a valid terminal completion. Consume
+/// it once, never capture the pre-inference prompt or reselect a changed lease.
+fn dispatch_completed_terminal_capture(
+    completed: bool,
+    final_history: &std::sync::Mutex<Option<Vec<crate::SharedMessage>>>,
+    state: &std::sync::Mutex<memory_context::SessionMemoryState>,
+    selected: Option<(
+        memory_context::MemoryContextLease,
+        Arc<dyn capture_worker::CaptureProvider>,
+    )>,
+    started_at: std::time::SystemTime,
+    turn_start: Option<&crate::SharedMessage>,
+) -> bool {
+    let history = final_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (Some(messages), Some((lease, provider))) = (history, selected) else {
+        return false;
+    };
+    if !completed {
+        return false;
+    }
+    let Some(messages) = turn_start.and_then(|start| terminal_capture_messages(&messages, start))
+    else {
+        return false;
+    };
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state
+        .capture_lease_at(std::time::SystemTime::now())
+        .as_ref()
+        != Some(&lease)
+    {
+        return false;
+    }
+    memory_capture_worker()
+        .submit_terminal(
+            &lease,
+            terminal_capture_history(&lease, messages, started_at),
+            memory_context::RetentionClass::Standard,
+            provider,
+        )
+        .unwrap_or(false)
 }
 
 fn memory_provider_id() -> memory_context::ContextProviderId {
@@ -686,6 +802,34 @@ fn canonical_trusted_worker_model(model: &str) -> String {
 }
 
 impl Runtime {
+    fn memory_context_project_id(&self) -> memory_context::ProjectId {
+        if self.memory_backend.exclusive() {
+            self.memory_backend
+                .scope()
+                .ok()
+                .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
+                .unwrap_or_else(|| {
+                    memory_context::ProjectId::parse("project-unresolved").expect("static id")
+                })
+        } else {
+            memory_project_id()
+        }
+    }
+
+    /// Axel model tools may inspect/revoke existing host consent, never grant it.
+    /// Legacy wiring remains unchanged. Frontends grant through `/memory` only.
+    pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {
+        if !self.memory_backend.exclusive() {
+            return None;
+        }
+        let runtime = self.clone();
+        Some(memory_context::MemoryContextCapability::control_only(
+            self.memory_context_state.clone(),
+            self.memory_context_project_id(),
+            memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID).expect("static id"),
+            Arc::new(move || runtime.memory_context_disable()),
+        ))
+    }
     pub async fn new() -> Result<Self> {
         // Runtime construction is credential-blind. Credentials are acquired
         // lazily through the broker abstraction after configuration is applied;
@@ -756,6 +900,9 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend_config: None,
+            memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -854,6 +1001,9 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend_config: None,
+            memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -1485,6 +1635,12 @@ impl Runtime {
 
     /// Validate exact-model reasoning and Ultra orchestration prerequisites
     /// before refresh, broker access, or provider network work.
+    /// Offline policy/capability gate for a user-authorized candidate runtime.
+    /// Does not refresh credentials, invoke a provider or mutate live settings.
+    pub(crate) async fn validate_session_driver_preflight(&self) -> Result<()> {
+        self.validate_request_preflight().await
+    }
+
     async fn validate_request_preflight(&self) -> Result<()> {
         self.validate_request_preflight_for(&self.model, self.codex_request_role)
             .await
@@ -1495,6 +1651,14 @@ impl Runtime {
         model: &str,
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
+        if self
+            .memory_backend_reconfigure_denied
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::Config(
+                "memory backend cannot be reconfigured at runtime (including live legacy extension processes); restart required; request denied".into(),
+            ));
+        }
         let level = self.reasoning_level();
         if model.starts_with("anthropic/")
             && level == agent_core::reasoning::ReasoningLevel::UltraCode
@@ -1760,7 +1924,7 @@ impl Runtime {
         // only baseline model-visible records are accepted back.
         memory_context::validate_contribution(
             &contribution,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             budget,
             &memory_context::DisclosureGrantSet::model_visible_only(),
         )?;
@@ -1813,22 +1977,35 @@ impl Runtime {
     /// address plus the plugin's declared recall tool digest — an unroutable
     /// provider fails open as `provider_unavailable` without ever spawning.
     async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.clear_memory_contribution();
+            tracing::debug!("memory recall unavailable for the selected host backend");
+            return;
+        }
         let extension_runtime = self.extension_runtime.clone();
+        let binding = self.memory_backend.clone();
         let session = self.host_tool_session.clone();
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
             &self.retained_recall_turn,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             self.context_window(),
             messages,
             memory_context::RECALL_HARD_TIMEOUT,
             move |lease: memory_context::MemoryContextLease,
                   request: memory_context::RecallRequest| async move {
+                if binding.is_axel() {
+                    return axel_context::recall(binding, lease, request).await;
+                }
                 let Some(manager) = extension_runtime else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
                 let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                let (Some("extension"), Some(plugin), Some(_local)) =
+                let (Some("extension"), Some(plugin), Some(local)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
@@ -1838,15 +2015,25 @@ impl Runtime {
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
-                crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
-                    .call_exact(
-                        plugin,
-                        memory_context::MEMORY_RECALL_TOOL_NAME,
-                        &digest,
-                        memory_context::recall_request_wire(&request),
-                    )
-                    .await
-                    .map_err(|_| memory_context::RecallCallError::CallFailed)
+                let mut response =
+                    crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
+                        .call_exact(
+                            plugin,
+                            memory_context::MEMORY_RECALL_TOOL_NAME,
+                            &digest,
+                            memory_context::recall_request_wire(&request),
+                        )
+                        .await
+                        .map_err(|_| memory_context::RecallCallError::CallFailed)?;
+                // Legacy extension wire names the local declared provider;
+                // bind it to the exact host-qualified lease after validation.
+                if response["provider_id"] != local
+                    && response["provider_id"] != lease.provider_id.as_str()
+                {
+                    return Err(memory_context::RecallCallError::CallFailed);
+                }
+                response["provider_id"] = json!(lease.provider_id.as_str());
+                Ok(response)
             },
         )
         .await;
@@ -1993,8 +2180,59 @@ impl Runtime {
             .map_or(0, |manager| manager.lease_count())
     }
 
+    /// Inherit storage authority only, with a fresh worker execution author.
+    /// Oneshot, start, and resume share this path; even resume must not reuse
+    /// a prior actor. Off/no-lease context state and tool grants stay untouched.
+    pub(crate) fn inherit_memory_backend(&mut self, binding: crate::memory_backend::MemoryBinding) {
+        self.memory_backend = binding.fork_for_worker();
+    }
+
+    /// Bind standalone host entry points without applying unrelated settings.
+    pub fn apply_memory_backend_config(&mut self, config: &crate::config::MemoryBackendConfig) {
+        if let Some(selected) = &self.memory_backend_config {
+            if selected != config {
+                self.memory_backend_reconfigure_denied
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!("memory backend change denied: live extension processes cannot be reconfigured at runtime; original binding retained; restart required");
+                self.memory_context_disable();
+                self.clear_memory_contribution();
+            }
+            return;
+        }
+        if config.kind != crate::config::MemoryBackendKind::Legacy {
+            self.memory_context_disable();
+        }
+        self.memory_backend = crate::memory_backend::MemoryBinding::from_config(config);
+        self.memory_backend_config = Some(config.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_backend_for_test(&self) -> crate::memory_backend::MemoryBinding {
+        self.memory_backend.clone()
+    }
+
+    /// True when legacy note/history/provider access is forbidden by the host
+    /// selection, including invalid or unavailable backend configuration.
+    pub fn memory_backend_exclusive(&self) -> bool {
+        self.memory_backend.exclusive()
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
+        self.apply_memory_backend_config(&config.memory_backend);
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Unavailable selections revoke grants; never retain an extension escape hatch.
+            self.memory_context_disable();
+            self.clear_memory_contribution();
+            *self
+                .retained_recall_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -2321,12 +2559,17 @@ impl Runtime {
         memory_context::emit_memory_observability_event(
             &memory_context::MemoryObservabilityEvent::context_disabled(
                 &session,
-                &memory_project_id(),
+                &self.memory_context_project_id(),
             ),
         );
         // State mutex released before touching the lease manager: the
         // revocation below locks only the lease map (idempotent no-op when
         // nothing was ever spawned).
+        self.clear_memory_contribution();
+        *self
+            .retained_recall_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.revoke_memory_provider_leases(&bound);
         status
     }
@@ -2378,6 +2621,23 @@ impl Runtime {
         requested: Option<&str>,
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Invalid exclusive configurations never fall back to extensions.
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
+        if self.memory_backend.is_axel() {
+            self.memory_backend
+                .validate_axel_config()
+                .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?;
+            if requested.is_some_and(|id| id != axel_context::PROVIDER_ID) {
+                return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+            }
+            return memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID);
+        }
         use crate::extensions::context_provider as ext_cp;
         let Some(extension_runtime) = &self.extension_runtime else {
             return Ok(memory_provider_id());
@@ -2494,7 +2754,7 @@ impl Runtime {
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
             state.session_id().clone(),
-            memory_project_id(),
+            self.memory_context_project_id(),
             provider_id,
             mode,
             memory_context::CapturePolicy::default(),
@@ -2531,9 +2791,25 @@ impl Runtime {
         outcome: &compaction::CompactionOutcome,
         summarized_at: std::time::SystemTime,
     ) {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let Some(lease) = capture_lease else {
             return;
         };
+        // A summary cannot launder excluded source blocks into a normal capture.
+        // With no per-item redaction proof, conservatively withhold this summary.
+        if self.memory_backend.is_axel()
+            && api_messages
+                .iter()
+                .any(|m| !axel_context::capture_source_safe(m))
+        {
+            return;
+        }
         let Ok(source_session_id) = memory_context::SessionId::parse(&current.id) else {
             return;
         };
@@ -2612,6 +2888,25 @@ impl Runtime {
         &self,
         lease: &memory_context::MemoryContextLease,
     ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        if self.memory_backend.is_axel() {
+            if lease.provider_id.as_str() != axel_context::PROVIDER_ID
+                || lease.project_id != self.memory_context_project_id()
+            {
+                return None;
+            }
+            return Some(Arc::new(axel_context::AxelCaptureProvider {
+                binding: self.memory_backend.clone(),
+                state: self.memory_context_state.clone(),
+                lease: lease.clone(),
+            }));
+        }
         let manager = self.extension_runtime.clone()?;
         let mut parts = lease.provider_id.as_str().splitn(3, ':');
         let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
@@ -2637,7 +2932,32 @@ impl Runtime {
         &self,
     ) -> std::result::Result<memory_history::HistoryImportPreview, memory_history::HistoryImportError>
     {
-        let host = memory_history::HistoryImportHostState::from_current_host()?;
+        let host = if self.memory_backend.exclusive() {
+            if !self.memory_backend.is_axel() {
+                return Err(memory_history::HistoryImportError::CaptureProviderUnavailable);
+            }
+            let scope = self
+                .memory_backend
+                .scope()
+                .map_err(|_| memory_history::HistoryImportError::HostStateUnavailable)?;
+            memory_history::HistoryImportHostState {
+                project_id: scope.key().to_owned(),
+                // Source import remains explicit and current-checkout bounded;
+                // repository sharing must not silently import other sessions.
+                project_root: self
+                    .memory_backend
+                    .repository_identity()
+                    .map(|identity| identity.worktree_root)
+                    .unwrap_or_else(|_| scope.root().to_path_buf()),
+                destination_r8_path: self
+                    .memory_backend
+                    .brain_path()
+                    .map(std::path::Path::to_path_buf)
+                    .ok_or(memory_history::HistoryImportError::HostStateUnavailable)?,
+            }
+        } else {
+            memory_history::HistoryImportHostState::from_current_host()?
+        };
         let mut io = memory_history::CanonicalHistoryMetadataIo::new();
         let preview = memory_history::preview_history_import(&host, &mut io)?;
         *self
@@ -2654,6 +2974,13 @@ impl Runtime {
         &self,
     ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
     {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(memory_history::HistoryImportError::CaptureProviderUnavailable);
+        }
         let preview = self
             .pending_history_import_preview
             .lock()
@@ -2955,6 +3282,7 @@ impl Runtime {
             // Deliberately the BASE context: an internal compaction request
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
+                memory_backend: Some(self.memory_backend.clone()),
                 trace: self.trace_ctx.clone(),
                 telemetry: self.telemetry_writer.clone(),
                 ..api::ApiOptions::default()
@@ -2966,6 +3294,17 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            return Err(RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            ));
+        }
         if self.context_management_enabled() {
             return Err(RuntimeError::Config("automatic context management requires the streaming engine; run_single does not support rollover".into()));
         }
@@ -2991,6 +3330,7 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
+                    memory_backend: Some(self.memory_backend.clone()),
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -3077,7 +3417,8 @@ impl Runtime {
                         (tool_use["name"].as_str(), tool_use["id"].as_str())
                     {
                         let input = &tool_use["input"];
-                        let result = match self.tools.read().await.get(tool_name).cloned() {
+                        let tool = self.tools.read().await.get(tool_name).cloned();
+                        let (result, rich_blocks) = match tool {
                             Some(tool) => {
                                 let input = self
                                     .tools
@@ -3096,6 +3437,8 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        launch_cancel: None,
+                                        memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -3112,7 +3455,7 @@ impl Runtime {
                                         tool_activation: None,
                                         mcp_leases: None,
                                         extension_leases: None,
-                                        memory_context: None,
+                                        memory_context: self.memory_tool_capability(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3136,35 +3479,43 @@ impl Runtime {
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
-                                    format!("Tool call blocked by extension: {}", reason)
+                                    (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
                                     else {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    let output = match tool.execute(input, ctx).await {
-                                        Ok(output) => output,
-                                        Err(e) => e.to_string(),
-                                    };
-                                    let output = emit_after_tool_call(
+                                    let (output, rich_blocks) =
+                                        match tool.execute_rich(input, ctx).await {
+                                            Ok(output) => {
+                                                validated_single_tool_output(&self.model, output)
+                                            }
+                                            Err(e) => (e.to_string(), None),
+                                        };
+                                    let hooked_output = emit_after_tool_call(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
-                                        output,
+                                        output.clone(),
                                         self.max_tool_output,
                                     )
                                     .await;
-                                    output
+                                    let rich_blocks = retain_single_tool_blocks(
+                                        rich_blocks,
+                                        &output,
+                                        &hooked_output,
+                                    );
+                                    (hooked_output, rich_blocks)
                                 }
                             }
-                            None => format!("Unknown tool: {}", tool_name),
+                            None => (format!("Unknown tool: {}", tool_name), None),
                         };
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                            "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                         }));
                     }
                 } else {
@@ -3206,7 +3557,10 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let memory_backend_inner = self.memory_backend.clone();
+                            let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
+                            let attachment_model = self.model.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -3231,7 +3585,13 @@ impl Runtime {
                                             reason,
                                         } = decision
                                         {
-                                            format!("Tool call blocked by extension: {}", reason)
+                                            (
+                                                format!(
+                                                    "Tool call blocked by extension: {}",
+                                                    reason
+                                                ),
+                                                None,
+                                            )
                                         } else {
                                             let crate::runtime::BeforeToolCallDecision::Continue {
                                                 input,
@@ -3245,6 +3605,8 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    launch_cancel: None,
+                                                    memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
@@ -3257,7 +3619,7 @@ impl Runtime {
                                                     tool_activation: None,
                                                     mcp_leases: None,
                                                     extension_leases: None,
-                                                    memory_context: None,
+                                                    memory_context: memory_context_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3268,23 +3630,33 @@ impl Runtime {
                                                 },
                                             };
                                             let input_for_hook = input.clone();
-                                            let output = match t.execute(input, ctx).await {
-                                                Ok(output) => output,
-                                                Err(e) => e.to_string(),
-                                            };
-                                            let output = crate::runtime::emit_after_tool_call(
-                                                &hook_bus_inner,
-                                                &tool_name_for_hook,
-                                                Some(&runtime_name_for_hook),
-                                                input_for_hook,
-                                                output,
-                                                cfg_max_tool_output,
-                                            )
-                                            .await;
-                                            output
+                                            let (output, rich_blocks) =
+                                                match t.execute_rich(input, ctx).await {
+                                                    Ok(output) => validated_single_tool_output(
+                                                        &attachment_model,
+                                                        output,
+                                                    ),
+                                                    Err(e) => (e.to_string(), None),
+                                                };
+                                            let hooked_output =
+                                                crate::runtime::emit_after_tool_call(
+                                                    &hook_bus_inner,
+                                                    &tool_name_for_hook,
+                                                    Some(&runtime_name_for_hook),
+                                                    input_for_hook,
+                                                    output.clone(),
+                                                    cfg_max_tool_output,
+                                                )
+                                                .await;
+                                            let rich_blocks = retain_single_tool_blocks(
+                                                rich_blocks,
+                                                &output,
+                                                &hooked_output,
+                                            );
+                                            (hooked_output, rich_blocks)
                                         }
                                     }
-                                    None => format!("Unknown tool: {}", tool_name),
+                                    None => (format!("Unknown tool: {}", tool_name), None),
                                 };
                                 (tool_id, result)
                             });
@@ -3308,23 +3680,23 @@ impl Runtime {
                     // Build tool_results in original order — every tool_use MUST have a result
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map.remove(tool_id).unwrap_or_else(|| {
-                                "Tool execution failed: task panicked".to_string()
-                            });
+                            let (result, rich_blocks) =
+                                results_map.remove(tool_id).unwrap_or_else(|| {
+                                    ("Tool execution failed: task panicked".to_string(), None)
+                                });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                                "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                             }));
                         }
                     }
                 }
 
                 // Add tool results to conversation
-                messages.push(std::sync::Arc::new(json!({
-                    "role": "user",
-                    "content": tool_results
-                })));
+                let tool_batch =
+                    attachments::bounded_tool_results(&self.model, &messages, tool_results);
+                messages.push(std::sync::Arc::new(tool_batch));
 
                 // Continue the loop to get Claude's response with tool results
             } else {
@@ -3376,6 +3748,23 @@ impl Runtime {
         // (spec §5.2) so every frontend can tie the failure to trace lines.
         let turn_correlation_id = agent_core::next_turn_correlation_id();
 
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            let error = RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            );
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&error, &turn_correlation_id),
+            )));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
+        }
+
         if let Err(error) = self.validate_request_preflight().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                 helpers::turn_error_for(&error, &turn_correlation_id),
@@ -3414,6 +3803,7 @@ impl Runtime {
         // extension calls. Every recall failure fails OPEN: the turn itself
         // is never blocked or failed by memory.
         let capture_started_at = std::time::SystemTime::now();
+        let capture_turn_start = terminal_capture_start(&messages);
         // Snapshot the full prompt-time lease: terminal dispatch must never
         // reselect a provider after the user changes memory state.
         let capture_lease = self
@@ -3450,10 +3840,14 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
-        let capture_runtime = self.extension_runtime.clone();
-        let capture_session = self.host_tool_session.clone();
+        let capture_provider = capture_lease
+            .as_ref()
+            .and_then(|lease| self.extension_capture_provider(lease));
+        let capture_state = self.memory_context_state.clone();
+        let final_capture_history = Arc::new(std::sync::Mutex::new(None));
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
+            memory_backend: Some(self.memory_backend.clone()),
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -3479,6 +3873,9 @@ impl Runtime {
         };
 
         let session = crate::runtime::stream::StreamSession {
+            final_capture_history: final_capture_history.clone(),
+            memory_context: self.memory_tool_capability(),
+            memory_backend: self.memory_backend.clone(),
             auth,
             client,
             credential_source,
@@ -3521,7 +3918,6 @@ impl Runtime {
         };
 
         tokio::spawn(async move {
-            let capture_messages = messages.clone();
             let completed = match StreamMethods::run_stream_internal(session, messages).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -3531,37 +3927,14 @@ impl Runtime {
                     false
                 }
             };
-            if completed {
-                if let (Some(lease), Some(manager)) = (capture_lease, capture_runtime) {
-                    let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                    if let (Some("extension"), Some(plugin), Some(_)) =
-                        (parts.next(), parts.next(), parts.next())
-                    {
-                        if let Some(digest) = manager
-                            .declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)
-                        {
-                            let provider = std::sync::Arc::new(ExtensionCaptureProvider {
-                                manager,
-                                session: capture_session,
-                                plugin: plugin.to_owned(),
-                                digest,
-                                handle: tokio::runtime::Handle::current(),
-                            });
-                            let history = terminal_capture_history(
-                                &lease,
-                                &capture_messages,
-                                capture_started_at,
-                            );
-                            let _ = memory_capture_worker().submit_terminal(
-                                &lease,
-                                history,
-                                memory_context::RetentionClass::Standard,
-                                provider,
-                            );
-                        }
-                    }
-                }
-            }
+            dispatch_completed_terminal_capture(
+                completed,
+                &final_capture_history,
+                &capture_state,
+                capture_lease.zip(capture_provider),
+                capture_started_at,
+                capture_turn_start.as_ref(),
+            );
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.
@@ -3620,6 +3993,9 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            memory_backend: self.memory_backend.clone(),
+            memory_backend_config: self.memory_backend_config.clone(),
+            memory_backend_reconfigure_denied: self.memory_backend_reconfigure_denied.clone(),
             pending_history_import_preview: std::sync::Arc::clone(
                 &self.pending_history_import_preview,
             ),
@@ -3666,6 +4042,157 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod forum_author_tests {
+    use super::Runtime;
+
+    #[test]
+    fn runtime_clones_keep_author_and_each_worker_execution_forks() {
+        let mut parent = Runtime::new_headless();
+        let initial = parent.memory_backend.forum_author().clone();
+        // Foreground configuration starts a fresh execution binding.
+        parent.apply_memory_backend_config(&Default::default());
+        let author = parent.memory_backend.forum_author().clone();
+        assert_ne!(initial.actor, author.actor);
+        assert!(author.parent.is_none());
+        parent.apply_memory_backend_config(&Default::default());
+        assert_eq!(parent.memory_backend.forum_author(), &author);
+        let clone = parent.clone();
+        assert_eq!(clone.memory_backend.forum_author(), &author);
+        assert!(std::ptr::eq(
+            parent.memory_backend.forum_author(),
+            clone.memory_backend.forum_author()
+        ));
+
+        let mut actors = std::collections::HashSet::new();
+        for path in ["oneshot", "start", "resume"] {
+            let mut worker = Runtime::new_headless();
+            let worker_context = worker.memory_context_state.clone();
+            let worker_tools = worker.tools.clone();
+            worker.inherit_memory_backend(parent.memory_backend.clone());
+            let inherited = worker.memory_backend.forum_author();
+            assert_ne!(inherited.actor, author.actor, "{path}");
+            assert_eq!(inherited.group, author.group, "{path}");
+            assert_eq!(
+                inherited.parent.as_deref(),
+                Some(author.actor.as_str()),
+                "{path}"
+            );
+            assert!(actors.insert(inherited.actor.clone()), "{path}");
+            assert_eq!(worker.clone().memory_backend.forum_author(), inherited);
+            assert!(std::sync::Arc::ptr_eq(
+                &worker_context,
+                &worker.memory_context_state
+            ));
+            assert!(std::sync::Arc::ptr_eq(&worker_tools, &worker.tools));
+            assert_eq!(
+                worker.memory_context_status().durable,
+                super::memory_context::DurableStatus::Off
+            );
+            assert_eq!(
+                worker.memory_context_status().one_shot,
+                super::memory_context::OneShotStatus::Idle
+            );
+        }
+        assert_eq!(parent.memory_backend.forum_author(), &author);
+        assert_eq!(clone.memory_backend.forum_author(), &author);
+    }
+}
+
+#[cfg(test)]
+mod single_rich_output_tests {
+    use super::*;
+
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+    fn rich_output(summary: &str) -> crate::ToolOutput {
+        crate::ToolOutput::Blocks {
+            summary: summary.to_string(),
+            // Deliberately omit leading text to exercise into_parts normalization.
+            blocks: vec![json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l+QAAAAASUVORK5CYII="
+                }
+            })],
+        }
+    }
+
+    #[test]
+    fn unchanged_summary_retains_rich_array_without_text_truncation() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image"));
+        assert_eq!(summary, "image");
+        let expected = blocks.clone().expect("supported image");
+        assert_eq!(expected[0], json!({"type": "text", "text": summary}));
+        assert_eq!(expected[1]["type"], "image");
+        let retained = retain_single_tool_blocks(blocks, &summary, &summary);
+        assert_eq!(
+            single_tool_result_content(&summary, retained, summary.len()),
+            Value::Array(expected)
+        );
+    }
+
+    #[test]
+    fn rewritten_or_truncated_summary_drops_rich_blocks() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image summary"));
+        assert!(blocks.is_some());
+        for hooked in [
+            "redacted".to_string(),
+            String::new(),
+            HelperMethods::truncate_tool_result(&summary, 5),
+        ] {
+            let retained = retain_single_tool_blocks(blocks.clone(), &summary, &hooked);
+            assert!(retained.is_none());
+            assert_eq!(
+                single_tool_result_content(&hooked, retained, 5),
+                Value::String(HelperMethods::truncate_tool_result(&hooked, 5))
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_malformed_media_becomes_explicit_text() {
+        let mut malformed = rich_output("private summary");
+        if let crate::ToolOutput::Blocks { blocks, .. } = &mut malformed {
+            blocks[0]["source"]["data"] = json!("private invalid payload");
+        }
+        for (model, output) in [
+            (
+                "google-gemini/unsupported-rich-test",
+                rich_output("private summary"),
+            ),
+            (MODEL, malformed),
+        ] {
+            let (summary, blocks) = validated_single_tool_output(model, output);
+            assert!(summary.starts_with("Attachment not sent: "), "{summary}");
+            assert!(!summary.contains("private"));
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 1024),
+                Value::String(summary)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_and_errors_keep_legacy_truncation() {
+        for text in ["plain output", "tool error", "Unknown tool: missing"] {
+            let (summary, blocks) = validated_single_tool_output(
+                "google-gemini/unsupported-rich-test",
+                crate::ToolOutput::Text(text.to_string()),
+            );
+            assert_eq!(summary, text);
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 5),
+                Value::String(HelperMethods::truncate_tool_result(text, 5))
+            );
         }
     }
 }
@@ -5201,6 +5728,133 @@ mod memory_context_provider_tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+        for selector in ["axel", "invalid-selector"] {
+            let (mut runtime, _manager) =
+                memory_runtime_with_providers(&[("memory-test", "notes")]).await;
+            let provider = runtime.resolve_memory_provider(None).unwrap();
+            runtime.apply_config(&crate::config::load_config_from_str(&format!(
+                "memory.backend = {selector}\n"
+            )));
+            assert!(runtime.memory_backend.exclusive());
+            assert!(matches!(
+                runtime.resolve_memory_provider(None),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.resolve_memory_provider(Some(provider.as_str())),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            // Axel now has default paths even without explicit overrides; an
+            // unconsented preview still cannot start an import. Invalid selection
+            // remains provider-unavailable, never extension fallback.
+            assert!(matches!(
+                runtime.memory_history_confirm(),
+                Err(
+                    super::memory_history::HistoryImportError::CaptureProviderUnavailable
+                        | super::memory_history::HistoryImportError::ConsentRequired
+                )
+            ));
+            assert_memory_off_no_lease(&runtime);
+            let mut messages = vec![Arc::new(
+                serde_json::json!({"role": "user", "content": "test"}),
+            )];
+            let original = messages.clone();
+            runtime.apply_turn_memory_recall(&mut messages).await;
+            assert_eq!(messages, original);
+            let clone = runtime.clone();
+            assert!(clone.memory_backend.exclusive());
+            assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_first_config_is_immutable_and_changes_require_restart() {
+        for (first, different) in [("legacy", "axel"), ("axel", "legacy")] {
+            let mut runtime = Runtime::new_headless();
+            let config =
+                crate::config::load_config_from_str(&format!("memory.backend = {first}\n"));
+            runtime.apply_config(&config);
+            let binding = runtime.memory_backend.clone();
+            runtime.apply_config(&config);
+            assert!(!runtime
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst));
+            if let (Ok(a), Ok(b)) = (binding.scope(), runtime.memory_backend.scope()) {
+                assert!(std::ptr::eq(a, b));
+            }
+            let clone = runtime.clone();
+            runtime.apply_config(&crate::config::load_config_from_str(&format!(
+                "memory.backend = {different}\n"
+            )));
+            assert_eq!(runtime.memory_backend.exclusive(), binding.exclusive());
+            assert_eq!(
+                runtime.memory_backend_config.as_ref(),
+                Some(&config.memory_backend)
+            );
+            for denied in [&runtime, &clone] {
+                let error = denied
+                    .validate_request_preflight()
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("restart required"), "{error}");
+                assert!(denied.resolve_memory_provider(None).is_err());
+            }
+            runtime.apply_config(&config);
+            assert!(runtime.validate_request_preflight().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_path_changes_also_require_restart() {
+        for field in ["executable", "brain"] {
+            let mut runtime = Runtime::new_headless();
+            let config = crate::config::MemoryBackendConfig::default();
+            runtime.apply_memory_backend_config(&config);
+            let mut different = config.clone();
+            let path = std::env::temp_dir().join("synaps-memory-config-test");
+            if field == "executable" {
+                different.executable = Some(path);
+            } else {
+                different.brain = Some(path);
+            }
+            runtime.apply_memory_backend_config(&different);
+            assert_eq!(runtime.memory_backend_config.as_ref(), Some(&config));
+            assert!(!runtime.memory_backend.exclusive());
+            let error = runtime
+                .validate_request_preflight()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("restart required"), "{error}");
+            assert!(runtime.resolve_memory_provider(None).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {
+        let mut runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::UserIntentProof::ExplicitCommand {
+                    command_id: memory_context::mint_explicit_command_id(),
+                },
+            )
+            .unwrap();
+        let lease = runtime
+            .memory_context_lock()
+            .capture_lease_at(std::time::SystemTime::now())
+            .unwrap();
+        runtime.apply_config(&crate::config::load_config_from_str(
+            "memory.backend = axel\n",
+        ));
+        assert_memory_off_no_lease(&runtime);
+        assert!(runtime.extension_capture_provider(&lease).is_none());
+    }
+
     /// Task A6: enabling against a catalog that does not contain the
     /// requested provider fails closed — typed error, nothing granted,
     /// `SessionMemoryState` unchanged (Off/no-lease) — both for an
@@ -5447,5 +6101,213 @@ mod memory_context_provider_tests {
         fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
         assert_memory_off_no_lease(&fresh);
         assert_eq!(ext.lease_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod terminal_capture_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_source_boundary_excludes_prior_turns_and_survives_prepend_and_steering() {
+        let old = Arc::new(serde_json::json!({"role":"user","content":"same prompt"}));
+        let current = Arc::new(serde_json::json!({"role":"user","content":"same prompt"}));
+        let tool_result = Arc::new(
+            serde_json::json!({"role":"user","content":[{"type":"tool_result","content":"output"}]}),
+        );
+        let prompt = vec![old.clone(), current.clone(), tool_result.clone()];
+        let start = terminal_capture_start(&prompt).unwrap();
+        assert!(Arc::ptr_eq(&start, &current));
+        let mut completed = vec![Arc::new(
+            serde_json::json!({"role":"user","content":"recall"}),
+        )];
+        completed.extend(prompt);
+        completed.push(Arc::new(
+            serde_json::json!({"role":"user","content":"steering"}),
+        ));
+        completed.push(Arc::new(
+            serde_json::json!({"role":"assistant","content":"final"}),
+        ));
+        let slice = terminal_capture_messages(&completed, &start).unwrap();
+        assert_eq!(slice.len(), 4);
+        assert!(Arc::ptr_eq(&slice[0], &current));
+        assert_eq!(slice.last().unwrap()["content"], "final");
+        assert!(terminal_capture_messages(&[old], &start).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_memory_backend_config(&crate::config::MemoryBackendConfig {
+            kind: crate::config::MemoryBackendKind::Axel,
+            executable: Some(temp.path().join("missing-service")),
+            brain: Some(temp.path().join("brain.r8")),
+            user_scope: false,
+        });
+        assert!(runtime.memory_backend.is_axel());
+        assert_eq!(
+            runtime
+                .memory_context_enable(
+                    memory_context::MemoryContextMode::CaptureAndRecall,
+                    memory_context::mint_explicit_command_proof(),
+                )
+                .unwrap_err(),
+            memory_context::MemoryContextError::ProviderNotRegistered
+        );
+        assert_eq!(
+            runtime.memory_context_status().durable,
+            memory_context::DurableStatus::Off
+        );
+        assert!(!temp.path().join("brain.r8").exists());
+    }
+
+    /// Exercises the exact completion wrapper and asynchronous capture worker,
+    /// not the legacy helper or a direct CaptureProvider::capture call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    #[ignore = "requires SYNAPS_AXEL_TEST_BIN pointing to the separately built service"]
+    async fn real_axel_terminal_worker_consumes_final_assistant_once() {
+        use agent_core::memory::store::ProjectMemoryQuery;
+        use std::{os::unix::fs::PermissionsExt, time::SystemTime};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_memory_backend_config(&crate::config::MemoryBackendConfig {
+            kind: crate::config::MemoryBackendKind::Axel,
+            executable: Some(std::env::var_os("SYNAPS_AXEL_TEST_BIN").unwrap().into()),
+            brain: Some(root.join("brain.r8")),
+            user_scope: false,
+        });
+        assert!(runtime.extension_runtime.is_none());
+        let started = SystemTime::now();
+        let state = runtime.memory_context_state.clone();
+        let prompt = vec![
+            Arc::new(serde_json::json!({"role":"user","content":"OLD_USER_SENTINEL"})),
+            Arc::new(serde_json::json!({"role":"assistant","content":"OLD_ASSISTANT_SENTINEL"})),
+            Arc::new(serde_json::json!({"role":"user","content":"Remember the answer"})),
+        ];
+        let turn_start = terminal_capture_start(&prompt);
+        let mut final_messages = prompt.clone();
+        final_messages.extend([
+            Arc::new(serde_json::json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{}}]})),
+            Arc::new(serde_json::json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"TOOL_SENTINEL"}]})),
+            Arc::new(serde_json::json!({"role":"user","content":"Keep the answer short"})),
+            Arc::new(serde_json::json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"PRIVATE_SENTINEL"},
+                {"type":"text","text":"terminal_assistant_only_cobalt27 is the answer"}
+            ]})),
+        ]);
+        // No consent means no provider and no process, even with final history.
+        let off = std::sync::Mutex::new(Some(final_messages.clone()));
+        assert!(!dispatch_completed_terminal_capture(
+            true,
+            &off,
+            &state,
+            None,
+            started,
+            turn_start.as_ref()
+        ));
+        assert!(!root.join("brain.r8").exists());
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .unwrap();
+        let lease = runtime
+            .memory_context_lock()
+            .capture_lease_at(started)
+            .unwrap();
+        let provider = runtime.extension_capture_provider(&lease).unwrap();
+        let selected = Some((lease.clone(), provider.clone()));
+        // Ok without a published valid terminal history is not completion.
+        assert!(!dispatch_completed_terminal_capture(
+            true,
+            &std::sync::Mutex::new(None),
+            &state,
+            selected.clone(),
+            started,
+            turn_start.as_ref(),
+        ));
+        // Error cannot submit even if a slot was populated.
+        assert!(!dispatch_completed_terminal_capture(
+            false,
+            &std::sync::Mutex::new(Some(final_messages.clone())),
+            &state,
+            selected.clone(),
+            started,
+            turn_start.as_ref(),
+        ));
+        assert!(!root.join("brain.r8").exists());
+        let final_history = Arc::new(std::sync::Mutex::new(Some(final_messages.clone())));
+        assert!(dispatch_completed_terminal_capture(
+            true,
+            &final_history,
+            &state,
+            selected.clone(),
+            started,
+            turn_start.as_ref(),
+        ));
+        assert!(final_history.lock().unwrap().is_none());
+        assert!(!dispatch_completed_terminal_capture(
+            true,
+            &final_history,
+            &state,
+            selected.clone(),
+            started,
+            turn_start.as_ref(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            let records = runtime
+                .memory_backend
+                .search(ProjectMemoryQuery {
+                    content_contains: Some("terminal_assistant_only_cobalt27".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            if !records.is_empty() {
+                break records;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker never committed final assistant"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(found.len(), 1);
+        let fetched = runtime.memory_backend.fetch(&[&found[0].id]).await.unwrap();
+        assert!(fetched[0]
+            .content
+            .contains("terminal_assistant_only_cobalt27"));
+        // The canonical schema retains the latest user segment (steering)
+        // and final assistant; the source range still starts at this prompt.
+        assert!(fetched[0].content.contains("Keep the answer short"));
+        for excluded in [
+            "PRIVATE_SENTINEL",
+            "OLD_USER_SENTINEL",
+            "OLD_ASSISTANT_SENTINEL",
+            "TOOL_SENTINEL",
+        ] {
+            assert!(
+                !fetched[0].content.contains(excluded),
+                "captured {excluded}"
+            );
+        }
+        runtime.memory_tool_capability().unwrap().disable();
+        assert!(!dispatch_completed_terminal_capture(
+            true,
+            &std::sync::Mutex::new(Some(final_messages)),
+            &state,
+            selected,
+            started,
+            turn_start.as_ref(),
+        ));
     }
 }

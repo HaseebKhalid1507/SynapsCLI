@@ -1073,6 +1073,8 @@ mod tests {
                 tx_events: None,
             },
             capabilities: crate::tools::ToolCapabilities {
+                launch_cancel: None,
+                memory_backend: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,

@@ -430,20 +430,62 @@ pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 #[derive(Debug)]
 pub struct SubagentRegistry {
     pub(crate) handles: HashMap<String, SubagentHandle>,
+    // A local session driver owns worker launches until explicit user takeover.
+    // Keep the cancelled fence after revocation so racing late registrations
+    // are cancelled before their thread can start inference.
+    spawn_cancellation: Option<crate::CancellationToken>,
+    spawn_epoch: u64,
 }
 
 impl SubagentRegistry {
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
+            spawn_cancellation: None,
+            spawn_epoch: 0,
         }
     }
 
     /// Register a handle and return its id.
     pub fn register(&mut self, handle: SubagentHandle) -> String {
+        self.register_with_cancellation(handle, None)
+    }
+
+    pub fn register_with_cancellation(
+        &mut self,
+        mut handle: SubagentHandle,
+        origin: Option<&crate::CancellationToken>,
+    ) -> String {
+        if origin.is_some_and(|c| c.is_cancelled())
+            || self
+                .spawn_cancellation
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled())
+        {
+            handle.cancel();
+        }
         let id = handle.id.clone();
         self.handles.insert(id.clone(), handle);
         id
+    }
+
+    /// Frontend-owned launch fence. Model tools cannot clear or replace it.
+    pub fn set_spawn_cancellation(&mut self, cancel: Option<crate::CancellationToken>) -> u64 {
+        self.spawn_epoch = self
+            .spawn_epoch
+            .checked_add(1)
+            .expect("worker launch epoch exhausted");
+        self.spawn_cancellation = cancel;
+        self.spawn_epoch
+    }
+
+    /// A stale deadline/Drop must not cancel workers belonging to newer work.
+    pub fn cancel_spawn_epoch(&mut self, epoch: u64) {
+        if self.spawn_epoch == epoch {
+            for handle in self.iter_mut_handles() {
+                handle.cancel();
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&SubagentHandle> {
@@ -567,11 +609,25 @@ pub(crate) fn reap_finished_with_ttl(
         .map(|runtime| runtime.unreconciled_runtime_handles())
         .unwrap_or_default();
     let cleanup = |guard: &mut SubagentRegistry| {
+        let before = guard
+            .handles
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         guard.cleanup_finished_with_ttl_and_retention(ttl, |id| retained.contains(id));
+        before
+            .into_iter()
+            .filter(|id| !guard.handles.contains_key(id))
+            .collect::<std::collections::HashSet<_>>()
     };
-    match registry.lock() {
+    // Release the registry lock before entering orchestration (same lock order
+    // as the retention snapshot above). Live workers are never retired.
+    let removed = match registry.lock() {
         Ok(mut guard) => cleanup(&mut guard),
         Err(poisoned) => cleanup(&mut poisoned.into_inner()),
+    };
+    if let Some(orchestration) = orchestration {
+        orchestration.retire_reconciled(&removed);
     }
 }
 
@@ -678,6 +734,114 @@ mod tests {
         let rendered = format!("{:?}{:?}", state.status, state.terminal);
         assert!(!rendered.contains(canary));
         assert!(rendered.contains("credential_unavailable"));
+    }
+
+    #[test]
+    fn late_registration_cannot_inherit_new_turn_and_stale_sweep_cannot_cancel_it() {
+        let mut registry = SubagentRegistry::new();
+        let old = crate::CancellationToken::new();
+        let epoch = registry.set_spawn_cancellation(Some(old.clone()));
+        old.cancel();
+        registry.cancel_spawn_epoch(epoch);
+        // User takeover/new grant happened while old start was preempted.
+        registry.set_spawn_cancellation(None);
+        registry.register(make_handle("new-user"));
+        registry.register_with_cancellation(make_handle("old-late"), Some(&old));
+        assert!(
+            registry
+                .get("old-late")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        assert!(
+            !registry
+                .get("new-user")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        registry.cancel_spawn_epoch(epoch);
+        assert!(
+            !registry
+                .get("new-user")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        let new_grant = crate::CancellationToken::new();
+        let next = registry.set_spawn_cancellation(Some(new_grant));
+        registry.register(make_handle("new-grant"));
+        registry.register_with_cancellation(make_handle("old-later"), Some(&old));
+        registry.cancel_spawn_epoch(epoch);
+        assert!(
+            !registry
+                .get("new-grant")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        assert!(
+            registry
+                .get("old-later")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        registry.cancel_spawn_epoch(next);
+        assert!(
+            registry
+                .get("new-grant")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+    }
+
+    #[test]
+    fn revoked_launch_fence_cancels_late_registration_until_user_takeover() {
+        let mut registry = SubagentRegistry::new();
+        let cancel = crate::CancellationToken::new();
+        registry.set_spawn_cancellation(Some(cancel.clone()));
+        registry.register(make_handle("before"));
+        assert!(!registry.display_rows()[0].cancel_requested);
+        cancel.cancel();
+        let late = make_test_handle("late");
+        let mut shutdown = late._shutdown_rx;
+        registry.register(late.handle);
+        assert!(shutdown.try_recv().is_ok());
+        assert!(
+            registry
+                .get("late")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        registry.set_spawn_cancellation(None);
+        registry.register(make_handle("user"));
+        assert!(
+            !registry
+                .get("user")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
     }
 
     #[test]
