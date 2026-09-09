@@ -206,7 +206,7 @@ pub(crate) struct App {
     pub(crate) last_submitted: Option<String>,
     /// Consecutive auto-triggered model turns since the last real user send.
     /// Incremented by the event-reactor wake path; reset on Submit / queued user message.
-    /// When this reaches AUTO_TURN_CAP the reactor parks and shows a system message.
+    /// When this reaches `auto_turn_cap` the reactor parks and shows a system message.
     pub(crate) consecutive_auto_turns: u32,
     /// Cached model ping results: "provider/model" -> (status, latency_ms).
     pub(crate) model_health:
@@ -342,6 +342,7 @@ impl App {
         let (widget_tx_init, widget_rx_init) =
             tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
         let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let boot_config = synaps_cli::config::load_config();
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             editor: tui_textarea::TextArea::default(),
@@ -367,8 +368,9 @@ impl App {
             api_call_count: 0,
             session_cost: 0.0,
             session,
-            agent_name: synaps_cli::config::load_config()
+            agent_name: boot_config
                 .agent_name
+                .clone()
                 .unwrap_or_else(|| "agent".to_string()),
             needs_redraw: true,
             force_redraw: false,

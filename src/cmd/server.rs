@@ -16,7 +16,9 @@ use std::sync::Arc;
 use synaps_cli::core::config::load_config;
 use synaps_cli::core::config::resolve_write_path;
 use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
+use synaps_cli::engine::reactor::{
+    auto_turn_cap_reached, drain_event_queue, wake_action_with_cap, WakeAction,
+};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
@@ -61,8 +63,10 @@ struct ServerState {
     auto_turn_tx: tokio::sync::mpsc::Sender<()>,
     /// Counts consecutive event-triggered model turns without an intervening
     /// real client user message. Reset to 0 on every real user message.
-    /// Enforces AUTO_TURN_CAP — see reactor::AUTO_TURN_CAP.
+    /// Enforced against `auto_turn_cap` — see reactor::auto_turn_cap_reached.
     consecutive_auto_turns: std::sync::atomic::AtomicU32,
+    /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
+    auto_turn_cap: u32,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -277,6 +281,7 @@ pub async fn run(
     let (auto_turn_tx, auto_turn_rx) = tokio::sync::mpsc::channel::<()>(32);
 
     let events_auto_turn = config.events.auto_turn;
+    let auto_turn_cap = config.events.auto_turn_cap;
 
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
@@ -294,6 +299,7 @@ pub async fn run(
         events_auto_turn,
         auto_turn_tx,
         consecutive_auto_turns: std::sync::atomic::AtomicU32::new(0),
+        auto_turn_cap,
     });
 
     // ── Event drainer task (exactly one per Runtime) ──────────────────────
@@ -333,12 +339,13 @@ pub async fn run(
                     let consecutive = state_d
                         .consecutive_auto_turns
                         .load(std::sync::atomic::Ordering::Acquire);
-                    wake_action(
+                    wake_action_with_cap(
                         &drained,
                         &conv_ref.api_messages,
                         busy,
                         state_d.events_auto_turn,
                         consecutive,
+                        state_d.auto_turn_cap,
                     )
                 }; // conv write-lock released
 
@@ -850,9 +857,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     let cur = state
                         .consecutive_auto_turns
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    if cur >= AUTO_TURN_CAP {
+                    if auto_turn_cap_reached(cur, state.auto_turn_cap) {
                         tracing::info!(
-                            cap = AUTO_TURN_CAP,
+                            cap = state.auto_turn_cap,
                             "server: auto-turn cap reached (handle_user_message AutoTriggerEvents) — parking"
                         );
                         state.save_session().await;
@@ -1098,11 +1105,11 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     let prev = state
         .consecutive_auto_turns
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    if prev >= AUTO_TURN_CAP {
+    if auto_turn_cap_reached(prev, state.auto_turn_cap) {
         // Saturate at cap — leave counter elevated so further signals are
         // also discarded. handle_user_message is the only reset path.
         tracing::info!(
-            cap = AUTO_TURN_CAP,
+            cap = state.auto_turn_cap,
             "server: auto-turn cap reached — parking until real user input"
         );
         return;
@@ -1188,10 +1195,10 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     let cur = state
                         .consecutive_auto_turns
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    if cur >= AUTO_TURN_CAP {
+                    if auto_turn_cap_reached(cur, state.auto_turn_cap) {
                         // Saturate — leave counter elevated until real user input.
                         tracing::info!(
-                            cap = AUTO_TURN_CAP,
+                            cap = state.auto_turn_cap,
                             "server: auto-turn cap reached (AutoTriggerEvents) — parking"
                         );
                         state.save_session().await;
