@@ -35,9 +35,12 @@ impl McpConnection {
                 cmd.env(var, val);
             }
         }
-        // Apply user-configured env overrides from mcp.json.
+        // Apply user-configured env overrides from mcp.json. `${VAR}` /
+        // `${VAR:-default}` expand against THIS process env at spawn time —
+        // the explicit per-variable opt-in for forwarding a parent value
+        // through the cleared env (e.g. a per-run token-file path).
         for (k, v) in &config.env {
-            cmd.env(k, v);
+            cmd.env(k, super::expand_env_value(v, |name| std::env::var(name).ok()));
         }
 
         cmd.stdin(std::process::Stdio::piped())
