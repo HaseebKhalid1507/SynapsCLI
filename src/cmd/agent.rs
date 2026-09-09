@@ -321,6 +321,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         })
     };
     let agent_registration = synaps_cli::events::registry::SessionRegistration {
+        kind: synaps_cli::events::registry::REGISTRATION_KIND.to_string(),
         session_id: agent_session_id.clone(),
         name: Some(agent_name.clone()),
         socket_path: agent_socket_path.clone(),

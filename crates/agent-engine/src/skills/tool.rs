@@ -332,6 +332,7 @@ mod tests {
                 mcp_leases: None,
                 extension_leases: None,
                 memory_context: None,
+                cwd: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

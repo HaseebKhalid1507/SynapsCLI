@@ -138,8 +138,13 @@ pub(crate) struct GhostHint {
 }
 
 /// Render-safe projection of `PendingSecretPrompt`.
+///
+/// `kind` selects the modal: `Secret` → masked `password:` field;
+/// `Confirm` → y/n dialog with the full (word-wrapped) body visible and no
+/// input field at all (fail-closed: only `y` allows).
 #[derive(Clone)]
 pub(crate) struct SecretPromptSnap {
+    pub(crate) kind: synaps_cli::tools::PromptKind,
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) masked_buffer_chars: usize,

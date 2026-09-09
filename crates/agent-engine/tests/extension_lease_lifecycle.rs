@@ -136,6 +136,7 @@ fn ctx_with(cap: Option<ExtensionLeaseCapability>) -> ToolContext {
             mcp_leases: None,
             extension_leases: cap,
             memory_context: None,
+            cwd: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

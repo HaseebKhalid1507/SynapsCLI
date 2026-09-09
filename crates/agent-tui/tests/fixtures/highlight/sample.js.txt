@@ -1,0 +1,16 @@
+// comment
+import { thing } from './thing.js';
+const re = /ab+c/gi;
+export default class Foo extends Bar {
+  static #priv = 1;
+  constructor(x = 10, ...rest) {
+    super();
+    this.x = `template ${x + rest.length} text`;
+  }
+  async *gen() { yield await fetch('/api'); }
+}
+let obj = { a: 1, 'b': null, [key]: undefined, fn() { return typeof this; } };
+obj?.a ?? (() => { throw new Error("x"); })();
+/* block
+   comment */
+label: for (let i = 0; i < 3; i++) { if (i % 2 === 0) continue label; }

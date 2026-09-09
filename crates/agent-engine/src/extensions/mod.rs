@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod loader;
 pub mod manager;
 pub mod manifest;
+pub mod notify_router;
 pub mod permissions;
 pub mod providers;
 pub mod runtime;

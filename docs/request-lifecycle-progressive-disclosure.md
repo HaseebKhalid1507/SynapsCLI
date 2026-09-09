@@ -54,6 +54,12 @@ Lazy skill-body/index disclosure is Task 21's scope; until then the budget is
 guaranteed only for the tool catalog dimension, and the production-core test
 pins the skill-free baseline.
 
+Model-initiated `activate_tools` is gated by `tools.activation_confirm`
+(`auto` — default, granted without a prompt; `prompt` — the host is asked with
+a y/n "Confirm tool activation" dialog listing the exact ids, only `y`/`yes`
+allows; `deny` — always refused, no prompt). `server.auto_approve_confirms`
+grants regardless of the key.
+
 A successful `activate_tools` batch advances the session schema generation once.
 The next provider round recomputes one provider-neutral projection from that
 same retained `SessionToolSet`, so all transports receive the same logical

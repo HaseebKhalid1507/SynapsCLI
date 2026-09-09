@@ -350,6 +350,7 @@ pub(crate) async fn route_extension_provider(
                         mcp_leases: None,
                         extension_leases: None,
                         memory_context: None,
+                        cwd: None,
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

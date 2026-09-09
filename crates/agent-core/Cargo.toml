@@ -38,6 +38,11 @@ urlencoding        = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Gated identically to the jemalloc allocator in the synaps binary
+# (src/main.rs): stats + manual arena purge for `memstat` (§3.7).
+[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
