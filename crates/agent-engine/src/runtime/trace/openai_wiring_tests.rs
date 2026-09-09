@@ -935,3 +935,148 @@ fn stream_attempt_without_tracer_is_inert() {
     );
     attempt.finish_success(None, None, None, None);
 }
+
+/// Exercises actual serialized POST bodies, including identical retry bytes.
+#[tokio::test]
+async fn astra_ultra_posts_xhigh_for_foreground_and_worker_without_recursive_mode() {
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use agent_core::reasoning::ReasoningLevel;
+    for role in [CodexRequestRole::Foreground, CodexRequestRole::Worker] {
+        let (base_url, bodies, _) = spawn_codex_stub(vec![503]).await;
+        let cfg = ProviderConfig {
+            base_url,
+            model: "gpt-6-astra".into(),
+            provider: "openai-codex".into(),
+        };
+        let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
+        let tools = if role == CodexRequestRole::Foreground {
+            ["subagent_start", "subagent_status", "subagent_collect"].iter().map(|name| json!({"name":name, "description":"test", "input_schema":{"type":"object","properties":{}}})).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let h = harness();
+        call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &tools,
+            &Some("system".into()),
+            &messages(),
+            &tx,
+            None,
+            None,
+            ReasoningLevel::Ultra,
+            role,
+            &CancellationToken::new(),
+            1,
+            &h.trace,
+        )
+        .await
+        .unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1], "retries must preserve bytes");
+        let body: Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["reasoning"], json!({"effort":"xhigh"}));
+        assert_eq!(body["store"], false);
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(body["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("synaps-"));
+        assert_eq!(
+            body["input"].to_string().contains("Proactive multi-agent"),
+            role == CodexRequestRole::Foreground
+        );
+        assert_eq!(
+            body["input"].to_string().contains("<multi_agent_mode>"),
+            role == CodexRequestRole::Foreground
+        );
+        assert_eq!(h.sink.records().len(), 2);
+    }
+}
+
+/// Opt-in: uses the operator's broker-owned Codex OAuth session and makes two
+/// small real inference requests. Never prints credentials or response bodies.
+#[tokio::test]
+#[ignore = "live Codex OAuth smoke; consumes account usage"]
+async fn astra_ultra_live_smoke() {
+    use crate::runtime::openai::catalog::{
+        fetch_catalog_models, plan_codex_execution, CatalogSource, CodexRequestRole,
+        CodexWireEffort,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+    assert_eq!(
+        std::env::var("SYNAPS_ASTRA_LIVE_SMOKE").as_deref(),
+        Ok("1"),
+        "explicit live-smoke opt-in required"
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let models = fetch_catalog_models(&client, "openai-codex")
+        .await
+        .expect("live Codex catalog");
+    let astra = models
+        .iter()
+        .find(|row| row.id == "gpt-6-astra")
+        .expect("account must expose Astra");
+    assert_eq!(astra.source, CatalogSource::Live);
+    let cfg = ProviderConfig {
+        base_url: "https://chatgpt.com/backend-api".into(),
+        model: "gpt-6-astra".into(),
+        provider: "openai-codex".into(),
+    };
+    let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::new(client.clone()));
+    let messages = vec![Arc::new(
+        json!({"role":"user", "content":"Reply with exactly ASTRA_ULTRA_OK. Do not use tools or delegate."}),
+    )];
+    for role in [CodexRequestRole::Foreground, CodexRequestRole::Worker] {
+        // Uses the cache populated by the real catalog fetch, as production does.
+        let plan =
+            plan_codex_execution(&astra.runtime_id(), ReasoningLevel::Ultra, role, None).unwrap();
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::XHigh));
+        let tools = if role == CodexRequestRole::Foreground {
+            ["subagent_start", "subagent_status", "subagent_collect"].iter().map(|name| json!({"name":name, "description":"Unavailable in smoke test; do not call", "input_schema":{"type":"object","properties":{}}})).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            call_codex_stream_inner(
+                &cfg,
+                &client,
+                &broker,
+                &tools,
+                &Some("You are a terse assistant. No tools for this smoke test.".into()),
+                &messages,
+                &tx,
+                None,
+                None,
+                ReasoningLevel::Ultra,
+                role,
+                &CancellationToken::new(),
+                0,
+                &TraceContext::disabled(),
+            ),
+        )
+        .await
+        .expect("live request deadline")
+        .expect("live request succeeds");
+        let blocks = result["content"].as_array().expect("assistant content");
+        assert!(blocks.iter().all(|block| block["type"] != "tool_use"));
+        let text: String = blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(text.trim(), "ASTRA_ULTRA_OK");
+        println!(
+            "Astra live smoke: role={} logical=ultra wire=xhigh result=OK",
+            role.as_str()
+        );
+    }
+}

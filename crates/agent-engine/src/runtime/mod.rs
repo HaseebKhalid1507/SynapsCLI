@@ -1529,6 +1529,21 @@ impl Runtime {
         self.codex_request_role
     }
 
+    pub(crate) fn codex_delegation_plan(
+        model: &str,
+        level: agent_core::reasoning::ReasoningLevel,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) -> Option<crate::runtime::openai::catalog::CodexExecutionPlan> {
+        use crate::runtime::openai::catalog::{plan_codex_execution, CodexRequestRole};
+        if role != CodexRequestRole::Foreground
+            || level != agent_core::reasoning::ReasoningLevel::Ultra
+            || !model.starts_with("openai-codex/")
+        {
+            return None;
+        }
+        plan_codex_execution(model, level, role, None).ok()
+    }
+
     async fn authorized_anthropic_plan(
         &self,
     ) -> Result<Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>> {
@@ -3208,6 +3223,11 @@ impl Runtime {
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         delegation_parent: None,
+                                        codex_parent_plan: Self::codex_delegation_plan(
+                                            &self.model,
+                                            self.reasoning_level(),
+                                            self.codex_request_role(),
+                                        ),
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
@@ -3286,6 +3306,11 @@ impl Runtime {
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
                     let cfg_orchestration = self.orchestration.clone();
+                    let codex_parent_plan = Self::codex_delegation_plan(
+                        &self.model,
+                        self.reasoning_level(),
+                        self.codex_request_role(),
+                    );
                     let cfg_cwd = self.cwd.clone();
                     let cfg_session_id = self.session_id.clone();
 
@@ -3308,6 +3333,7 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
                             let session_id_inner = cfg_session_id.clone();
                             let tool_name_for_hook = tool_name.clone();
@@ -3354,6 +3380,7 @@ impl Runtime {
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
                                                     delegation_parent: None,
+                                                    codex_parent_plan: codex_parent_plan_inner,
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,

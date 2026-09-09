@@ -1,13 +1,33 @@
 {
   "models": [
     {
+      "slug": "gpt-6-astra",
+      "display_name": "GPT-6-Astra",
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 272000,
+      "multi_agent_version": "v2",
+      "multi_agent_reasoning_effort": "xhigh",
+      "minimal_client_version": "0.153.0",
+      "priority": 1,
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"},
+        {"effort": "max"},
+        {"effort": "ultra"}
+      ],
+      "default_reasoning_level": "medium"
+    },
+    {
       "slug": "gpt-5.6-sol",
       "display_name": "GPT-5.6-Sol",
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
       "multi_agent_version": "v2",
-      "priority": 1,
+      "priority": 2,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -25,7 +45,7 @@
       "supported_in_api": true,
       "context_window": 272000,
       "multi_agent_version": "v2",
-      "priority": 2,
+      "priority": 3,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -43,7 +63,7 @@
       "supported_in_api": true,
       "context_window": 272000,
       "multi_agent_version": "v1",
-      "priority": 3,
+      "priority": 4,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -59,7 +79,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 7,
+      "priority": 8,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -74,7 +94,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 16,
+      "priority": 17,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -89,7 +109,7 @@
       "visibility": "list",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 23,
+      "priority": 24,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -104,7 +124,7 @@
       "visibility": "list",
       "supported_in_api": false,
       "context_window": 128000,
-      "priority": 26,
+      "priority": 27,
       "supported_reasoning_levels": [
         {"effort": "low"},
         {"effort": "medium"},
@@ -119,7 +139,7 @@
       "visibility": "hide",
       "supported_in_api": true,
       "context_window": 272000,
-      "priority": 43
+      "priority": 44
     },
     {
       "slug": "codex-internal-eval",
@@ -127,7 +147,7 @@
       "visibility": "internal",
       "supported_in_api": false,
       "context_window": 272000,
-      "priority": 44
+      "priority": 45
     }
   ]
 }
