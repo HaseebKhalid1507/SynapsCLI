@@ -219,6 +219,39 @@ impl CacheTtl {
     }
 }
 
+/// `tools.activation_confirm` — host policy for model-initiated
+/// `activate_tools` (progressive tool disclosure).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivationConfirm {
+    /// Authorize model-initiated activation without prompting (default).
+    #[default]
+    Auto,
+    /// Ask the host: the y/n "Confirm tool activation" dialog; only an
+    /// explicit y/yes authorizes (fail-closed).
+    Prompt,
+    /// Never authorize model-initiated activation; no prompt is raised.
+    Deny,
+}
+
+impl ActivationConfirm {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "prompt" => Some(Self::Prompt),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Prompt => "prompt",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Animated theme-transition mode, parsed from `theme_transition`:
 /// - `"on"` (default): cross-fade theme changes over the default 350 ms.
 /// - `"off"`: instant snap — accessibility, and mercy on tmux-over-ssh.
@@ -271,8 +304,8 @@ impl ThemeTransitionMode {
 /// server and RPC modes.
 #[derive(Debug, Clone)]
 pub struct EventsConfig {
-    /// When `true` (default), the server/RPC session automatically triggers a
-    /// model turn when runtime events arrive while idle.  Set
+    /// When `true` (default), the server/RPC/daemon session automatically
+    /// triggers a model turn when runtime events arrive while idle.  Set
     /// `events.auto_turn = false` (or `0` / `no` / `off`) to opt out.
     /// Unrecognised values fail safe to `false` with a warning.
     /// The built-in cap (`AUTO_TURN_CAP = 5`) still applies regardless.
@@ -551,6 +584,12 @@ pub struct SynapsConfig {
     /// stream starts with the small essential local core plus discovery and
     /// authorization gateways; exact activations are added per session.
     pub progressive_tool_disclosure: bool,
+    /// Host confirmation policy for MODEL-INITIATED `activate_tools`
+    /// (`tools.activation_confirm`). `Auto` (default) authorizes without
+    /// prompting; `Prompt` asks the host (y/n confirm dialog); `Deny` never
+    /// authorizes (locked-down hosts). `server.auto_approve_confirms = true`
+    /// still authorizes regardless of this key.
+    pub tools_activation_confirm: ActivationConfirm,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -605,6 +644,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
+            tools_activation_confirm: ActivationConfirm::default(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
@@ -648,6 +688,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_skills",
     "disabled_tools",
     "progressive_tool_disclosure",
+    "tools.activation_confirm",
     "session_persistence",
 ];
 
@@ -687,8 +728,8 @@ fn parse_comma_list(val: &str) -> Vec<String> {
         .collect()
 }
 
-fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
-    write_config_value(key, &values.join(", "))
+fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> {
+    write_config_value_locked(key, &values.join(", "))
 }
 
 /// Parse shell.* configuration keys and update the ShellConfig.
@@ -1078,6 +1119,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "tools.activation_confirm" => match ActivationConfirm::parse(val) {
+                Some(mode) => config.tools_activation_confirm = mode,
+                None => config.warnings.push(format!(
+                    "tools.activation_confirm = {val} — expected auto, prompt or deny; \
+                     keeping the default (auto)"
+                )),
+            },
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,
@@ -1174,10 +1222,54 @@ pub fn read_config_value(key: &str) -> Option<String> {
     None
 }
 
+/// Exclusive advisory lock on `<config>.lock`, held around every
+/// read-modify-write of the config file (same pattern as `auth.json`).
+/// Two writers (`/settings` in two processes, a `/model` favorite toggle
+/// racing a settings edit) no longer lose each other's updates.
+///
+/// Held for the RMW only (< 1 ms); readers (`load_config`) never take it —
+/// they already tolerate the atomic rename. `SYNAPS_CONFIG_LOCK=0` bypasses.
+///
+/// NOT reentrant: flock on a fresh fd of the same file from the same process
+/// conflicts on Linux. Callers that already hold the guard must use the
+/// `_locked` inner fns.
+struct ConfigLock {
+    _file: Option<std::fs::File>,
+}
+
+impl ConfigLock {
+    fn acquire() -> std::io::Result<Self> {
+        if std::env::var("SYNAPS_CONFIG_LOCK").as_deref() == Ok("0") {
+            return Ok(Self { _file: None });
+        }
+        use fs4::fs_std::FileExt;
+        let lock_path = resolve_write_path("config").with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let file = open.open(&lock_path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { _file: Some(file) })
+    }
+}
+
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
 /// Replaces the first existing line that matches the key, or appends if absent.
 /// Preserves comments and unknown keys. Writes atomically via temp file + rename.
 pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
+    write_config_value_locked(key, value)
+}
+
+/// The RMW body; caller holds [`ConfigLock`].
+fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -1232,19 +1324,21 @@ pub fn add_favorite_model(id: &str) -> std::io::Result<()> {
     if trimmed.is_empty() {
         return Ok(());
     }
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     if !values.iter().any(|v| v == trimmed) {
         values.push(trimmed.to_string());
         values.sort();
     }
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Remove a favorite model id (`provider/model`) from config.
 pub fn remove_favorite_model(id: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     values.retain(|v| v != id.trim());
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Return whether a model id is marked as favorite.
@@ -1758,6 +1852,7 @@ mod tests {
         assert!(config.favorite_models.is_empty());
         assert!(config.disabled_skills.is_empty());
         assert!(!config.progressive_tool_disclosure);
+        assert_eq!(config.tools_activation_confirm, ActivationConfirm::Auto);
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
@@ -1769,6 +1864,32 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_tools_activation_confirm_modes() {
+        for (raw, expected, warns) in [
+            ("prompt", ActivationConfirm::Prompt, false),
+            ("deny", ActivationConfirm::Deny, false),
+            ("AUTO", ActivationConfirm::Auto, false),
+            ("garbage", ActivationConfirm::Auto, true),
+        ] {
+            let home = make_test_home(&format!("activation-confirm-{raw}"));
+            let cfg = home.join(".synaps-cli/config");
+            std::fs::write(&cfg, format!("tools.activation_confirm = {raw}\n")).unwrap();
+            with_home(&home, || {
+                let config = load_config();
+                assert_eq!(config.tools_activation_confirm, expected, "{raw}");
+                assert_eq!(
+                    config.warnings.iter().any(|w| w.contains("tools.activation_confirm")),
+                    warns,
+                    "{raw}: {:?}",
+                    config.warnings
+                );
+            });
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]
@@ -1987,6 +2108,77 @@ context_window = 200k\n\
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("model = claude-opus-4-6"));
         assert!(contents.contains("theme = dracula"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_concurrent_writers_lose_nothing() {
+        let home = make_test_home("concurrent");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "# keep\n").unwrap();
+
+        // HOME is process-global; set it for the whole test, not per thread.
+        with_home(&home, || {
+            let a = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("a_key", &i.to_string()).unwrap();
+                }
+            });
+            let b = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("b_key", &i.to_string()).unwrap();
+                }
+            });
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("# keep"), "{contents}");
+        assert!(contents.contains("a_key = 199"), "{contents}");
+        assert!(contents.contains("b_key = 199"), "{contents}");
+        assert_eq!(contents.matches("a_key").count(), 1);
+        assert_eq!(contents.matches("b_key").count(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = home.join(".synaps-cli/config.lock");
+            let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_lock_kill_switch_still_writes() {
+        let home = make_test_home("lock-off");
+        let cfg = home.join(".synaps-cli/config");
+        std::env::set_var("SYNAPS_CONFIG_LOCK", "0");
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+        std::env::remove_var("SYNAPS_CONFIG_LOCK");
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        assert!(!home.join(".synaps-cli/config.lock").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn add_favorite_model_end_to_end_does_not_deadlock() {
+        let home = make_test_home("favorite-lock");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            add_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+            add_favorite_model("openai/gpt-5").unwrap();
+            remove_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("favorite_models = openai/gpt-5"), "{contents}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
