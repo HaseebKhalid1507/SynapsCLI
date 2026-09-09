@@ -46,6 +46,7 @@ pub struct Pong {
 /// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
 /// frame grows it once; after any frame > 1 MiB it shrinks back to 64 KiB so
 /// the peak is not retained for the life of the connection (§2.1 #1).
+#[derive(Default)]
 pub struct FrameBuf {
     line: Vec<u8>,
     /// Length of the last decoded frame (bytes, without the newline).
@@ -54,12 +55,6 @@ pub struct FrameBuf {
 
 const FRAME_BUF_KEEP: usize = 64 * 1024;
 const FRAME_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
-
-impl Default for FrameBuf {
-    fn default() -> Self {
-        Self { line: Vec::new(), last_frame_bytes: 0 }
-    }
-}
 
 impl FrameBuf {
     fn after_frame(&mut self, n: usize) {

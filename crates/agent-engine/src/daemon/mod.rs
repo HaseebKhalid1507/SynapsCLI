@@ -561,8 +561,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let reason = tail
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .map(|l| l.trim_start_matches("synaps daemon: ").to_string());
     match (status, reason) {
         (Some(st), Some(r)) if st.code().is_some() => {

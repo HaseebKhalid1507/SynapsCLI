@@ -110,7 +110,7 @@ fn collect(pid: Option<u32>) -> Result<MemoryReport, Box<dyn std::error::Error>>
         }
         None => {
             let mut regs = synaps_cli::events::registry::list_active_sessions();
-            regs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+            regs.sort_by_key(|a| a.started_at);
             for reg in regs {
                 let Ok(procs) = memstat::tree(reg.pid) else {
                     continue;
@@ -154,8 +154,8 @@ fn print_table(report: &MemoryReport) {
         return;
     }
     println!(
-        "{:<8} {:<22} {:>8} {:>8} {:>8} {:>8} {:>4}  {}",
-        "PID", "ROLE", "RSS MB", "PSS MB", "USS MB", "ANON MB", "THR", "CMD"
+        "{:<8} {:<22} {:>8} {:>8} {:>8} {:>8} {:>4}  CMD",
+        "PID", "ROLE", "RSS MB", "PSS MB", "USS MB", "ANON MB", "THR"
     );
     for s in &report.sessions {
         let label = match (&s.name, &s.session_id) {
