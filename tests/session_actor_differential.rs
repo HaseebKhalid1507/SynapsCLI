@@ -34,6 +34,7 @@ mod support;
 #[path = "support/reference_reactor.rs"]
 mod reference_reactor;
 #[path = "support/reference_reactor_ext.rs"]
+#[allow(clippy::doc_overindented_list_items)]
 mod reference_reactor_ext;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -802,6 +803,7 @@ async fn cancel_captures_abort_context() {
     assert_eq!(o.r.abort_context, a.abort_context, "second abort context");
     // The fold: the second request's messages (captured at the stub) are
     // identical — oracle = hit 1, actor = hit 3.
+    {
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 4);
     let msgs = |i: usize| -> serde_json::Value {
@@ -813,6 +815,7 @@ async fn cancel_captures_abort_context() {
     assert_eq!(msgs_json(&o.r.api_messages), msgs_json(&a.api_messages));
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
     assert_eq!(o.saves, 2, "one save per abort (dispatch.rs:191)");
+    }
     a.end().await;
 }
 

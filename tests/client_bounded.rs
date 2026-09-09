@@ -25,7 +25,6 @@
 //! ```
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::path::{Path, PathBuf};

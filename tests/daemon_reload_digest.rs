@@ -9,7 +9,6 @@
 #![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::path::Path;
@@ -136,15 +135,12 @@ async fn reload_reconnects_digest_client_with_display_tail_only() {
     let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
     assert_eq!(gen, 2);
     let mut saw_reloading = false;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce") {
-            Some(env) => {
-                if let SessionEventWire::Reloading { generation, .. } = env.event {
-                    assert_eq!(generation, 2);
-                    saw_reloading = true;
-                }
-            }
-            None => break,
+    while let Some(env) =
+        tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce")
+    {
+        if let SessionEventWire::Reloading { generation, .. } = env.event {
+            assert_eq!(generation, 2);
+            saw_reloading = true;
         }
     }
     assert!(saw_reloading);

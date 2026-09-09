@@ -202,13 +202,13 @@ impl RuntimeSnapshot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Focus {
+pub(crate) enum Focus {
     Left,
     Right,
 }
 
 #[derive(Clone)]
-pub(super) enum ActiveEditor {
+pub(crate) enum ActiveEditor {
     Text {
         buffer: String,
         setting_key: &'static str,
@@ -250,7 +250,7 @@ pub(super) enum ActiveEditor {
 }
 
 #[derive(Clone)]
-pub(super) struct SettingsState {
+pub(crate) struct SettingsState {
     pub category_idx: usize,
     pub setting_idx: usize,
     /// Left/Right focus as read by draw code (`settings/draw.rs` reads it

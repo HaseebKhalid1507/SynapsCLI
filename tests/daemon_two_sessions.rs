@@ -2,7 +2,6 @@
 //! one daemon, each answered by a loopback Anthropic stub (PLAN-phase2 §5.3).
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::sync::Arc;
@@ -125,6 +124,7 @@ async fn two_sessions_one_daemon_isolated() {
 
     // provider saw exactly two requests, each carrying only its own session's prompt
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    {
     let bodies = bodies.lock().unwrap();
     let b0 = String::from_utf8_lossy(&bodies[0]);
     let b1 = String::from_utf8_lossy(&bodies[1]);
@@ -134,6 +134,7 @@ async fn two_sessions_one_daemon_isolated() {
     let (m0, m1) = (msgs(&b0), msgs(&b1));
     assert!(m0.contains("from a") && !m0.contains("from b"), "{m0}");
     assert!(m1.contains("from b") && !m1.contains("from a"), "{m1}");
+    }
 
     // detach a mid-life: session stays; b unaffected
     a.detach().await;

@@ -4,7 +4,6 @@
 //! control fast path, pump, detach-without-abort — is the real code.
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::sync::Arc;
@@ -179,7 +178,7 @@ async fn attach_to_session_with_history_over_1mib() {
     // echo: user + assistant both carry the text → history ≈ 2 × 700 KiB > 1 MiB
     let big = "z".repeat(700 * 1024);
     t.send(SessionCommand::Submit { text: big.clone(), attachments: vec![] }).await.unwrap();
-    let mut conv = None;
+    let conv;
     let mut saw_history = false;
     loop {
         let e = next(&mut t).await;

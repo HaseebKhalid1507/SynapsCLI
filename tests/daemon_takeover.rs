@@ -4,7 +4,6 @@
 //! `End{ClientQuit}` its session; `Observe` never owns.
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::sync::Arc;

@@ -12,7 +12,6 @@
 #![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::path::{Path, PathBuf};
@@ -157,16 +156,13 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
 
     // The attached client sees Reloading, then EOF flagged as a reload.
     let mut saw_reloading = false;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce") {
-            Some(env) => {
-                if let SessionEventWire::Reloading { generation, retry_after_ms } = env.event {
-                    assert_eq!(generation, 2);
-                    assert!(retry_after_ms > 0);
-                    saw_reloading = true;
-                }
-            }
-            None => break,
+    while let Some(env) =
+        tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce")
+    {
+        if let SessionEventWire::Reloading { generation, retry_after_ms } = env.event {
+            assert_eq!(generation, 2);
+            assert!(retry_after_ms > 0);
+            saw_reloading = true;
         }
     }
     assert!(saw_reloading);

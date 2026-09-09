@@ -15,7 +15,6 @@
 #![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::io::{BufRead, BufReader, Read, Write};

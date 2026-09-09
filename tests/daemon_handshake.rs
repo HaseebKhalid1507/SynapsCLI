@@ -2,7 +2,6 @@
 //! a raw client so the daemon's behaviour is tested, not the transport's.
 
 #[path = "support/phase2/mod.rs"]
-#[allow(dead_code)]
 mod phase2;
 
 use std::sync::Arc;
