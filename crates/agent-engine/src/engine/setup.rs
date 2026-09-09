@@ -5,7 +5,7 @@
 
 use crate::skills::keybinds::KeybindRegistry;
 use crate::skills::registry::CommandRegistry;
-use crate::{latest_session, resolve_session, Result, Runtime, Session};
+use crate::{latest_session, resolve_session, EngineHost, HostOpts, Result, Runtime, Session};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -14,6 +14,8 @@ pub struct EngineOpts {
     pub continue_session: Option<Option<String>>,
     pub system: Option<String>,
     pub prompt_manifest: Option<std::path::PathBuf>,
+    /// Honoured by the first `boot` in a process only: the `EngineHost` is
+    /// built once and later boots reuse it, profile included.
     pub profile: Option<String>,
     pub no_extensions: bool,
 }
@@ -27,6 +29,9 @@ pub struct BackgroundTasks {
     #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
+    /// Hook bus the session's `on_session_start` injection lives on; cleared
+    /// at shutdown so a long-lived process does not accumulate stale keys.
+    hook_bus: Arc<crate::extensions::hooks::HookBus>,
     /// File-appender flush guard. Holding this for the lifetime of the
     /// renderer keeps the non-blocking log writer's background thread
     /// alive — without it, log lines emitted after `boot()` returns can
@@ -44,6 +49,14 @@ impl BackgroundTasks {
         self.socket_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         crate::events::registry::unregister_session(&self.session_id);
+        // Cleanup only — fail-soft when no tokio runtime is current.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let hook_bus = Arc::clone(&self.hook_bus);
+            let session_id = self.session_id.clone();
+            handle.spawn(async move {
+                hook_bus.clear_session_injection(&session_id).await;
+            });
+        }
     }
 }
 
@@ -96,35 +109,91 @@ pub struct ContinueInfo {
 /// Run the full engine boot sequence:
 /// config → system prompt → skills → MCP → session → sockets → extensions
 pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
-    if let Some(ref prof) = opts.profile {
-        crate::config::set_profile(Some(prof.clone()));
+    // Process-global parts (profile, logging, HTTP client, registry, skills,
+    // MCP, extension manager) are built ONCE per process by `EngineHost`
+    // and reused by every later boot in the same process. The log-appender
+    // guard lives on the host — process lifetime ≥ renderer lifetime — so
+    // log lines emitted after boot() returns are never silently dropped.
+    let host = EngineHost::boot_and_install(HostOpts {
+        profile: opts.profile.clone(),
+        no_extensions: opts.no_extensions,
+    })
+    .await?;
+    // `apply_config` is applied inside `foreground_runtime()` — before
+    // session resolution, same relative order as before.
+    let mut runtime = host.foreground_runtime().await?;
+    let config: crate::SynapsConfig = (**host.config()).clone();
+
+    let sb = resolve_session_and_prompt(
+        &mut runtime,
+        &opts.continue_session,
+        opts.system.as_deref(),
+        opts.prompt_manifest.as_deref(),
+    )?;
+
+    // Skills, command registry, MCP setup and the MCP lease manager are
+    // host-owned (see `EngineHost::boot`); the runtime already holds them.
+    let registry = Arc::clone(host.command_registry());
+    let keybind_registry = Arc::clone(host.keybind_registry());
+    let mcp_server_count = host.mcp_server_count();
+
+    let system_prompt_path = crate::config::resolve_read_path("system.md");
+
+    // Session was resolved before policy compilation so its model is the immutable
+    // foreground identity used by worker inheritance and authorization.
+
+    let background = spawn_session_background(&runtime, &sb.session)?;
+
+    finish_session_setup(&mut runtime, &config, &sb.session, None, IndexRecord::Start);
+
+    // Extension manager: host-owned.
+    let ext_manager = Arc::clone(host.ext_manager());
+
+    if mcp_server_count > 0 {
+        tracing::info!(
+            "{} MCP servers available (use connect_mcp_server to activate)",
+            mcp_server_count
+        );
     }
 
-    // Capture the WorkerGuard from the file appender. tracing-appender's
-    // non-blocking writer uses a background flush thread; the guard is
-    // an RAII handle that stops that thread on drop. The previous code
-    // dropped it at the end of boot() with a comment claiming "this is
-    // fine because tracing-subscriber uses a global subscriber" — which
-    // is true for the subscriber, but NOT for the file appender's
-    // background thread. With the guard dropped, log lines emitted after
-    // boot() returned (Extension loaded, hook traces, etc.) could be
-    // silently lost. We hand the guard down through EngineBoot so the
-    // renderer (TUI / chat / server) keeps it alive for its lifetime.
-    let log_guard = crate::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
+    Ok(EngineBoot {
+        runtime,
+        config,
+        no_extensions: opts.no_extensions,
+        session: sb.session,
+        api_messages: sb.api_messages,
+        total_input_tokens: sb.total_input_tokens,
+        total_output_tokens: sb.total_output_tokens,
+        session_cost: sb.session_cost,
+        abort_context: sb.abort_context,
+        continued: sb.continued,
+        continue_info: sb.continue_info,
+        registry,
+        keybind_registry,
+        mcp_server_count,
+        system_prompt_path,
+        ext_manager,
+        background,
+    })
+}
 
-    // Load config and apply
-    let config = crate::config::load_config();
-    runtime.apply_config(&config);
-
+/// Session resolution + prompt/orchestration install (code motion from
+/// `boot()`; called per session by `SessionActor::create` too).
+pub(crate) fn resolve_session_and_prompt(
+    runtime: &mut Runtime,
+    continue_session: &Option<Option<String>>,
+    system: Option<&str>,
+    prompt_manifest: Option<&std::path::Path>,
+) -> Result<SessionBootResult> {
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
-    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    let sb = resolve_or_create_session(runtime, continue_session)?;
+    runtime.set_session_id(Some(sb.session.id.clone()));
     runtime.reset_context_continuation(&sb.session.id, &sb.api_messages);
 
     // Validate and compile an opted-in manifest before any session/network work.
-    let legacy_prompt = crate::config::resolve_system_prompt(opts.system.as_deref());
-    if let Some(path) = &opts.prompt_manifest {
+    let legacy_prompt = crate::config::resolve_system_prompt(system);
+    if let Some(path) = prompt_manifest {
         let raw = std::fs::read_to_string(path)
             .map_err(|_| crate::RuntimeError::Config("prompt manifest is unavailable".into()))?;
         let manifest = agent_core::prompt::PromptManifest::parse(&raw)
@@ -155,9 +224,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
                     .map_err(|error| crate::RuntimeError::Config(error.into()))?,
             ));
         }
-        let user = opts
-            .system
-            .as_ref()
+        let user = system
             .map(|_| {
                 agent_core::prompt::resolved_system_prompt_as_user_module(legacy_prompt.clone())
             })
@@ -171,7 +238,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime
             .apply_prompt_stack(stack)
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
-        runtime.retain_prompt_reload_source(path.clone(), context, user, delegation_policy_digest);
+        runtime.retain_prompt_reload_source(
+            path.to_path_buf(),
+            context,
+            user,
+            delegation_policy_digest,
+        );
     } else {
         let foreground = crate::orchestration::canonical_foreground_identity(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
@@ -182,31 +254,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         runtime.set_system_prompt(legacy_prompt);
     }
 
-    // Discover plugins/skills, build command registry, register load_skill tool.
-    let tools_shared = runtime.tools_shared();
-    let (registry, keybind_registry) = crate::skills::register(&tools_shared, &config).await;
+    Ok(sb)
+}
 
-    // Set up MCP loading (if configured in ~/.synaps-cli/mcp.json). Flag-off
-    // keeps the legacy connect gateway; progressive disclosure switches to
-    // exact descriptor-backed dormant tools (Task 19) with no gateway.
-    let mcp_server_count =
-        crate::mcp::setup_lazy_mcp(&runtime.tools_shared(), config.progressive_tool_disclosure)
-            .await;
-    if config.progressive_tool_disclosure {
-        // Exact MCP mode: one shared lease manager for the runtime. Streams
-        // mint session capabilities/guards from it; children die with the
-        // session (RAII) or on runtime drop.
-        runtime.install_mcp_runtime(std::sync::Arc::new(crate::mcp::McpRuntimeManager::new(
-            crate::mcp::lease::config_source_from_disk(),
-            crate::mcp::lease::DEFAULT_IDLE_MAX,
-        )));
-    }
-
-    let system_prompt_path = crate::config::resolve_read_path("system.md");
-
-    // Session was resolved before policy compilation so its model is the immutable
-    // foreground identity used by worker inheritance and authorization.
-
+/// Inbox watcher + per-session UDS listener + registry registration (code
+/// motion from `boot()`). Fails loudly when registration fails.
+pub(crate) fn spawn_session_background(
+    runtime: &Runtime,
+    session: &Session,
+) -> Result<BackgroundTasks> {
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher_task = {
@@ -227,15 +283,16 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Start per-session Unix socket listener + register in session registry
     let socket_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_socket_path = crate::events::registry::socket_path_for_session(&sb.session.id);
+    let session_socket_path = crate::events::registry::socket_path_for_session(&session.id);
     let socket_task = crate::events::socket::listen_session_socket(
         session_socket_path.clone(),
         runtime.event_queue().clone(),
         socket_shutdown.clone(),
     );
     let session_registration = crate::events::registry::SessionRegistration {
-        session_id: sb.session.id.clone(),
-        name: sb.session.name.clone(),
+        kind: crate::events::registry::REGISTRATION_KIND.to_string(),
+        session_id: session.id.clone(),
+        name: session.name.clone(),
         socket_path: session_socket_path.clone(),
         pid: std::process::id(),
         started_at: chrono::Utc::now(),
@@ -254,30 +311,42 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         )));
     }
 
+    Ok(BackgroundTasks {
+        watcher_shutdown,
+        watcher_task,
+        socket_shutdown,
+        socket_task,
+        session_socket_path,
+        session_id: session.id.clone(),
+        hook_bus: Arc::clone(runtime.hook_bus()),
+        // The appender guard lives on the `EngineHost` now.
+        log_guard: None,
+    })
+}
+
+/// Whether `finish_session_setup` appends the session START index record.
+/// `Skip` on unpark (B3) / reload rehydrate (C3): the session already has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexRecord {
+    Start,
+    Skip,
+}
+
+/// Foreground turn budget + session start index record (code motion from
+/// `boot()`). `cwd` = the session's configured cwd (`None` → process cwd).
+pub(crate) fn finish_session_setup(
+    runtime: &mut Runtime,
+    config: &crate::SynapsConfig,
+    session: &Session,
+    cwd: Option<std::path::PathBuf>,
+    index_record: IndexRecord,
+) {
     // Task 23: the engine's interactive session runs under the FOREGROUND
     // turn budget with typed per-role config overrides applied.
     runtime.set_turn_budget(crate::runtime::budget::TurnBudget::from_config(
         crate::runtime::budget::TurnRole::Foreground,
         &config.turn_budgets,
     ));
-
-    // Extension manager
-    let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
-        Arc::clone(runtime.hook_bus()),
-        runtime.tools_shared(),
-    );
-    // Task 20: progressive disclosure defers tool-only extension spawns
-    // (dormant descriptors only); flag-off keeps the legacy eager loads.
-    ext_mgr.bind_memory_backend(runtime.memory_backend_exclusive());
-    ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
-    if config.progressive_tool_disclosure {
-        // ONE shared extension runtime lease manager: the manager uses it
-        // for unload revocation; the runtime mints per-session capabilities
-        // and the durable session-end scope from the SAME instance.
-        runtime.install_extension_runtime(ext_mgr.extension_runtime());
-    }
-    let ext_manager = Arc::new(RwLock::new(ext_mgr));
-    crate::runtime::openai::set_extension_manager_for_routing(Arc::clone(&ext_manager));
 
     // Session start index record.
     //
@@ -287,66 +356,29 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // point delivered the event to an empty bus in every host — the hook had
     // never once reached an extension. It is now emitted by the loader, after
     // subscribers exist.
-    {
+    if index_record == IndexRecord::Start {
         let mut index_record =
-            crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
-        index_record.model = Some(sb.session.model.clone());
+            crate::core::session_index::SessionIndexRecord::start(&session.id);
+        index_record.model = Some(session.model.clone());
         index_record.profile = crate::core::config::get_profile();
-        index_record.cwd = std::env::current_dir().ok();
+        index_record.cwd = cwd.or_else(|| std::env::current_dir().ok());
         if let Err(err) = crate::core::session_index::append_record(&index_record) {
             tracing::warn!("failed to append session start index record: {}", err);
         }
     }
 
-    if mcp_server_count > 0 {
-        tracing::info!(
-            "{} MCP servers available (use connect_mcp_server to activate)",
-            mcp_server_count
-        );
-    }
-
-    let session_id = sb.session.id.clone();
-
-    Ok(EngineBoot {
-        runtime,
-        config,
-        no_extensions: opts.no_extensions,
-        session: sb.session,
-        api_messages: sb.api_messages,
-        total_input_tokens: sb.total_input_tokens,
-        total_output_tokens: sb.total_output_tokens,
-        session_cost: sb.session_cost,
-        abort_context: sb.abort_context,
-        continued: sb.continued,
-        continue_info: sb.continue_info,
-        registry,
-        keybind_registry,
-        mcp_server_count,
-        system_prompt_path,
-        ext_manager,
-        background: BackgroundTasks {
-            watcher_shutdown,
-            watcher_task,
-            socket_shutdown,
-            socket_task,
-            session_socket_path,
-            session_id,
-            log_guard,
-        },
-    })
 }
 
-/// Resolve a session to continue, or create a new one.
 /// Result of session resolution.
-struct SessionBootResult {
-    session: Session,
-    api_messages: Vec<crate::SharedMessage>,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    session_cost: f64,
-    abort_context: Option<String>,
-    continued: bool,
-    continue_info: Option<ContinueInfo>,
+pub(crate) struct SessionBootResult {
+    pub(crate) session: Session,
+    pub(crate) api_messages: Vec<crate::SharedMessage>,
+    pub(crate) total_input_tokens: u64,
+    pub(crate) total_output_tokens: u64,
+    pub(crate) session_cost: f64,
+    pub(crate) abort_context: Option<String>,
+    pub(crate) continued: bool,
+    pub(crate) continue_info: Option<ContinueInfo>,
 }
 
 fn resolve_or_create_session(
@@ -388,7 +420,7 @@ fn resolve_or_create_session(
                 let resolved_via = if *q != session.id {
                     if crate::chain::load_chain(q).is_ok() {
                         Some("chain".to_string())
-                    } else if crate::session::find_session_by_name(q).is_ok() {
+                    } else if agent_core::session::find_session_by_name(q).is_ok() {
                         Some("name".to_string())
                     } else {
                         None

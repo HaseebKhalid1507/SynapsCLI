@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext, ToolOutput};
+use super::{resolve_path_in, Tool, ToolContext, ToolOutput};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 
@@ -60,11 +60,11 @@ impl Tool for ReadTool {
             .map(ToolOutput::into_summary)
     }
 
-    async fn execute_rich(&self, params: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
-        let path = expand_path(raw_path);
+        let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
         // Size guard BEFORE reading: one stat, no bytes loaded.
         let meta = tokio::fs::metadata(&path).await.map_err(|e| {

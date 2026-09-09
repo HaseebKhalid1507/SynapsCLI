@@ -5,10 +5,13 @@ pub mod attachments;
 pub mod engine;
 pub mod events;
 pub mod extensions;
+pub mod daemon;
 pub mod help;
+pub mod host;
 pub mod mcp;
 pub mod memory_backend;
 pub mod runtime;
+pub mod session;
 pub mod sidecar;
 pub mod skills;
 #[cfg(test)]
@@ -19,7 +22,7 @@ pub mod tools;
 // Re-export core so that internal `crate::core::X`, `crate::config`, etc.
 // resolve inside agent-engine (mirrors root lib.rs approach).
 pub use agent_core::{
-    auth, chain, config, error, logging, models, protocol, session, watcher_types,
+    auth, chain, config, error, logging, models, protocol, watcher_types,
 };
 pub use agent_core::{core, memory, pricing};
 pub use agent_core::{epoch_millis, truncate_str, BoundedText};
@@ -31,9 +34,14 @@ pub use agent_core::SharedMessage;
 pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
 pub use config::{load_config, resolve_system_prompt, SynapsConfig};
 pub use error::{Result, RuntimeError};
+pub use host::{EngineHost, HostOpts, HostParts};
 pub use runtime::{AgentEvent, LlmEvent, Runtime, SessionEvent, StreamEvent};
-pub use serde_json::Value;
 pub use session::{
+    ClientTransport, Envelope, LocalTransport, SessionCommand, SessionConfig, SessionEventWire,
+    SessionHandle, SessionId,
+};
+pub use serde_json::Value;
+pub use agent_core::session::{
     find_session, find_session_by_name, latest_session, list_recent_sessions, list_sessions,
     resolve_session, validate_name, Session, SessionInfo,
 };

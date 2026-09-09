@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext};
+use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 
@@ -69,7 +69,7 @@ impl Tool for WriteTool {
             }
         }
 
-        let path = expand_path(raw_path);
+        let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# comment
+NAME="${1:-world}"
+arr=(a b "c d")
+for f in "${arr[@]}"; do
+  echo "hello $NAME ${f} $(date +%s) $((1 + 2))" >&2
+done
+if [[ -n "$NAME" && ! -f /tmp/x ]]; then
+  cat <<EOT
+heredoc $NAME
+EOT
+elif grep -q 'foo' file.txt; then :
+else exit 1; fi
+function fn() { local x=$1; return 0; }
+case "$NAME" in a|b) ;; *) echo 'single' ;; esac
+export PATH=/usr/bin:$PATH

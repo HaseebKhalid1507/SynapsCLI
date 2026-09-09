@@ -69,7 +69,7 @@ impl PendingAttachments {
 /// O_NONBLOCK avoids FIFO-open hangs and O_NOFOLLOW refuses symlink leaves.
 /// Parent symlinks are allowed: selection of a local path is explicit consent.
 pub async fn load_attachment(path: &Path) -> Result<LoadedAttachment, String> {
-    let path = crate::tools::expand_path(&path.to_string_lossy());
+    let path = crate::tools::util::expand_path(&path.to_string_lossy());
     tokio::task::spawn_blocking(move || load_blocking(&path))
         .await
         .map_err(|_| "Attachment reader failed".to_string())?

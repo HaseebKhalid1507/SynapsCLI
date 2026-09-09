@@ -151,7 +151,9 @@ impl Tool for SubagentTool {
                 let result = rt.block_on(async move {
                     use futures::StreamExt;
 
-                    let mut runtime = match crate::Runtime::new().await {
+                    // Host-built worker (shared client/creds/token cache, cached
+                    // registry) or the legacy fresh runtime — see `spawn_runtime`.
+                    let mut runtime = match super::spawn_runtime().await {
                         Ok(r) => r,
                         Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
@@ -165,7 +167,6 @@ impl Tool for SubagentTool {
                     runtime.set_model(model);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     super::apply_anthropic_worker_reasoning(&mut runtime);
-                    runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

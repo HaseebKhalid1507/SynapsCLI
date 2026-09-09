@@ -59,6 +59,11 @@ use std::sync::Arc;
 /// harness's driver surface directly.
 #[path = "testing/tape.rs"]
 pub mod tape;
+/// A3/A5 — the in-memory `ClientTransport` the harness drives commands
+/// through (`Set`/`EngineCommand`/`Query` answered from a headless
+/// `Runtime`; envelopes fed by tests).
+#[path = "testing/scripted.rs"]
+pub mod scripted;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -72,6 +77,8 @@ use synaps_cli::skills::BUILTIN_COMMANDS;
 use synaps_cli::{Runtime, Session};
 
 use super::app::{App, ChatMessage};
+use super::session_link::{PromptBridge, SessionLink};
+use agent_engine::session::SessionEventWire;
 use super::draw::{build_render_model, render_frame_into};
 use super::input::{self, InputAction};
 
@@ -81,7 +88,19 @@ use super::input::{self, InputAction};
 /// See the [module docs](self) for the loop it replicates and its limits.
 pub struct TestHarness {
     app: App,
-    runtime: Runtime,
+    /// The session behind a [`scripted::ScriptedTransport`] (+ the published
+    /// `RuntimeView` every getter reads).
+    link: SessionLink,
+    /// Feeds the secret-prompt pane exactly like production (`Prompt` envelopes).
+    prompt_bridge: PromptBridge,
+    scripted_log: std::sync::Arc<std::sync::Mutex<scripted::ScriptedLog>>,
+    /// The scripted session's engine-side history (`DisplayTail`/`Messages`).
+    scripted_history: std::sync::Arc<std::sync::Mutex<Vec<synaps_cli::SharedMessage>>>,
+    secret_prompt_rx: std::sync::Arc<
+        std::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<synaps_cli::tools::SecretPromptRequest>,
+        >,
+    >,
     registry: Arc<CommandRegistry>,
     keybinds: KeybindRegistry,
     terminal: Terminal<TestBackend>,
@@ -151,9 +170,17 @@ impl TestHarness {
         )
         .expect("TestBackend terminal construction is infallible");
 
+        let transport = scripted::ScriptedTransport::new(Runtime::new_headless());
+        let scripted_log = std::sync::Arc::clone(&transport.log);
+        let scripted_history = transport.history();
+        let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         TestHarness {
             app,
-            runtime: Runtime::new_headless(),
+            link: SessionLink::new(Box::new(transport)),
+            prompt_bridge: PromptBridge::new(secret_prompt_tx),
+            scripted_log,
+            scripted_history,
+            secret_prompt_rx: std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx)),
             registry: Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, Vec::new())),
             keybinds: KeybindRegistry::new(),
             terminal,
@@ -203,7 +230,7 @@ impl TestHarness {
         let action = input::handle_event(
             event,
             &mut self.app,
-            &self.runtime,
+            &**self.link.view(),
             streaming,
             &self.registry,
             &self.keybinds,
@@ -227,7 +254,7 @@ impl TestHarness {
     pub fn render(&mut self) -> &Buffer {
         let (model, patch) = build_render_model(
             &mut super::view_model::ViewInputs::from_app(&mut self.app),
-            &self.runtime,
+            &**self.link.view(),
             &self.registry,
             self.size,
         )
@@ -269,7 +296,7 @@ impl TestHarness {
     pub fn render_ansi(&mut self) -> Vec<u8> {
         let (model, patch) = build_render_model(
             &mut super::view_model::ViewInputs::from_app(&mut self.app),
-            &self.runtime,
+            &**self.link.view(),
             &self.registry,
             self.size,
         )
@@ -410,19 +437,48 @@ impl TestHarness {
     /// stack exactly as production does. The response receiver is dropped: the
     /// harness asserts on UI state (buffer / stack / frame), not the tool reply.
     pub fn activate_secret_prompt(&mut self, title: &str, prompt: &str) -> &mut Self {
+        let _rx = self.activate_prompt_with_kind(
+            synaps_cli::tools::PromptKind::Secret,
+            title,
+            prompt,
+        );
+        self
+    }
+
+    /// Inject a prompt of an explicit [`PromptKind`] and keep the answer
+    /// receiver so tests can assert what the pane sent back (`Some("y")` for
+    /// a confirm allow, `None` for deny/cancel). Same production path as
+    /// [`Self::activate_secret_prompt`].
+    pub fn activate_prompt_with_kind(
+        &mut self,
+        kind: synaps_cli::tools::PromptKind,
+        title: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         use synaps_cli::tools::SecretPromptRequest;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         tx.send(SecretPromptRequest {
+            kind,
             title: title.to_string(),
             prompt: prompt.to_string(),
             response_tx,
         })
-        .expect("secret prompt request send is infallible on a fresh channel");
+        .expect("prompt request send is infallible on a fresh channel");
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         self.app.secret_prompts.poll_requests(&rx);
         input::reconcile_secret_prompt(&mut self.app);
-        self
+        response_rx
+    }
+
+    /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
+    /// gate shape). Returns the answer receiver.
+    pub fn activate_confirm_prompt(
+        &mut self,
+        title: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
     }
 
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt
@@ -627,6 +683,65 @@ impl TestHarness {
         self
     }
 
+    // ── Session envelopes (PLAN-phase3 §5.1 layer 2) ─────────────────────────
+
+    /// Feed session events through the PRODUCTION presentation arm
+    /// (`stream_handler::handle_session_event_arm`) — the same code path the
+    /// `run()` loop executes for every envelope under either transport.
+    /// Rendering is skipped (no render thread): `render()`/`snapshot()`
+    /// show the resulting steady state, as the tmux differential does.
+    pub fn feed_events(&mut self, events: &[SessionEventWire]) -> &mut Self {
+        for ev in events {
+            self.feed_event(ev.clone());
+        }
+        self
+    }
+
+    /// One envelope through the production arm (bounded like the slash
+    /// drive). After it, the tick arm's secret-prompt poll + stack reconcile
+    /// run so a `Prompt` activates the pane exactly as in production.
+    pub fn feed_event(&mut self, event: SessionEventWire) -> &mut Self {
+        let env = agent_engine::session::Envelope {
+            session_id: self.link.transport().session_id().clone(),
+            seq: 0,
+            ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+            event,
+        };
+        let render_handle = super::render_thread::RenderHandle::headless();
+        let what = "handle_session_event_arm";
+        let flow = block_on_bounded(
+            what,
+            super::stream_handler::handle_session_event_arm(
+                env,
+                &mut self.app,
+                &mut self.link,
+                &self.registry,
+                &render_handle,
+                &mut self.prompt_bridge,
+                None,
+            ),
+        );
+        if let super::stream_handler::ArmFlow::Ended = flow {
+            self.actions.push("session-ended".to_string());
+        }
+        self.app.secret_prompts.poll_requests(&self.secret_prompt_rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        self
+    }
+
+    /// Stage the engine-side history the scripted session answers
+    /// `Query{DisplayTail|Messages}` from (phase 4 Digest-mode rebuilds).
+    pub fn set_history(&mut self, msgs: Vec<synaps_cli::SharedMessage>) -> &mut Self {
+        *self.scripted_history.lock().unwrap() = msgs;
+        self
+    }
+
+    /// Commands the harness sent to its scripted session so far
+    /// (`Debug` renderings; bodies redacted).
+    pub fn sent_commands(&self) -> Vec<String> {
+        self.scripted_log.lock().unwrap().sent.clone()
+    }
+
     // ── Bounded async slash drive (P6.3) ─────────────────────────────────────
 
     /// Execute every slash command recorded since the last drive through the
@@ -662,7 +777,7 @@ impl TestHarness {
                 cmd,
                 arg,
                 &mut self.app,
-                &mut self.runtime,
+                &mut self.link,
                 &system_prompt_path,
                 &self.registry,
                 &self.keybinds,
@@ -702,8 +817,8 @@ impl TestHarness {
                 // via the streaming-input route).
                 if !self.app.streaming {
                     self.app.effort = Some(super::effort::EffortModalState::new(
-                        self.runtime.model(),
-                        self.runtime.thinking_level(),
+                        &self.link.view().model,
+                        &self.link.view().thinking_level,
                     ));
                     self.app.modal_stack.push(super::focus::PaneId::Effort);
                 }
@@ -733,7 +848,7 @@ impl TestHarness {
                     super::commands::execute_command_action(
                         CommandAction::PluginCommand { command, arg },
                         &mut self.app,
-                        &self.runtime,
+                        &mut self.link,
                     ),
                 );
             }
@@ -773,6 +888,7 @@ impl TestHarness {
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
+            InputAction::GrantWorkerModel(model) => format!("grant-worker-model:{model}"),
             InputAction::EffortApply(apply) => format!(
                 "effort-apply:{}:{}:{}",
                 apply.model, apply.generation, apply.value

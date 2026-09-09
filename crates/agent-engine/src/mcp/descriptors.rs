@@ -55,6 +55,9 @@ const ERROR_ECHO_MAX_BYTES: usize = 160;
 /// (command, args, env). Cached descriptors are only trusted while the
 /// current config still fingerprints identically; any drift invalidates
 /// them. Pure local computation — no process, no network.
+///
+/// `shared` is deliberately EXCLUDED: it changes the lease key, not the
+/// launched process, so flipping it must not discard a valid listing.
 pub fn server_config_fingerprint(config: &McpServerConfig) -> String {
     let env: BTreeMap<&str, &str> = config
         .env
@@ -324,6 +327,93 @@ pub fn store_cache_at(path: &Path, cache: &McpDescriptorCache) -> Result<(), Des
         }
     }
     write_atomic_private(path, &bytes).map_err(map_fs)
+}
+
+/// `SYNAPS_MCP_CACHE_WRITEBACK=0` disables [`record_server_listing`].
+pub fn cache_writeback_enabled() -> bool {
+    !matches!(
+        std::env::var("SYNAPS_MCP_CACHE_WRITEBACK").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+/// Write-back after a successful, lease-authorized `tools/list` (daemon-mode
+/// phase 2, C4): merge `tools` into the cache at `path` under `server`,
+/// keyed by the launch `fingerprint`, so the NEXT boot's `setup_lazy_mcp`
+/// registers the same dormant descriptors without spawning anything (stable
+/// prompt-cache prefix across daemon restarts).
+///
+/// Only the exact-lease path calls this — the listing it records comes from
+/// a server the operator configured, started for an already gate-authorized
+/// call. The legacy server-wide gateway never writes here (cache-poisoning
+/// bridge, see module docs).
+///
+/// Concurrency: exclusive `fs4` lock on `<path>.lock` for the whole
+/// read-merge-write, then [`store_cache_at`] (0600, atomic rename). A cache
+/// that fails to load (corrupt/oversize/version) is REPLACED by a fresh one
+/// carrying only this server — the reader refuses such a file anyway.
+/// Entries are sanitized through the same bounds as a load, so a hostile
+/// listing cannot write what a load would reject. Returns the number of
+/// descriptors recorded for `server`.
+pub fn record_server_listing(
+    path: &Path,
+    server: &str,
+    fingerprint: &str,
+    tools: &[CachedToolDescriptor],
+) -> Result<usize, DescriptorCacheError> {
+    use fs4::fs_std::FileExt;
+
+    if !valid_server_name(server) {
+        return Err(DescriptorCacheError::Parse("invalid server name".to_string()));
+    }
+    let map_io = |err: std::io::Error| {
+        DescriptorCacheError::Io(BoundedText::new(&err.to_string(), ERROR_ECHO_MAX_BYTES).text)
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            agent_core::core::private_fs::ensure_private_dir(parent).map_err(|err| match err {
+                agent_core::core::private_fs::PrivateFsError::SymlinkRefused(_) => {
+                    DescriptorCacheError::NotRegularFile
+                }
+                agent_core::core::private_fs::PrivateFsError::Io(io) => map_io(io),
+            })?;
+        }
+    }
+    let lock_path = {
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(DESCRIPTOR_CACHE_FILE));
+        name.push(".lock");
+        path.with_file_name(name)
+    };
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(map_io)?;
+    FileExt::lock_exclusive(&lock_file).map_err(map_io)?;
+
+    let mut cache = match load_cache_from(path) {
+        Ok(cache) => cache,
+        Err(DescriptorCacheError::NotFound) => McpDescriptorCache::empty(),
+        Err(err) => {
+            tracing::warn!(error = %err,
+                "MCP descriptor cache unreadable; replacing with a fresh cache on write-back");
+            McpDescriptorCache::empty()
+        }
+    };
+    let entry = CachedServerDescriptors {
+        fingerprint: fingerprint.to_string(),
+        tools: tools.to_vec(),
+    };
+    cache.servers.insert(server.to_string(), entry);
+    let cache = sanitize_cache(cache)?;
+    let recorded = cache.servers.get(server).map_or(0, |e| e.tools.len());
+    store_cache_at(path, &cache)?;
+    let _ = FileExt::unlock(&lock_file);
+    Ok(recorded)
 }
 
 /// A dormant, descriptor-backed MCP tool. Registered like any live tool
